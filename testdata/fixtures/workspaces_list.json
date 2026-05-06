@@ -1,0 +1,26 @@
+{
+  "pagination": {
+    "total": 2,
+    "total_pages": 1,
+    "next": null,
+    "previous": null
+  },
+  "results": [
+    {
+      "id": 700852,
+      "url": "https://mock.rossum.app/api/v1/workspaces/700852",
+      "name": "Invoices AP",
+      "organization": "https://mock.rossum.app/api/v1/organizations/285704",
+      "queues": ["https://mock.rossum.app/api/v1/queues/100"],
+      "modified_at": "2026-03-15T11:00:00Z"
+    },
+    {
+      "id": 743213,
+      "url": "https://mock.rossum.app/api/v1/workspaces/743213",
+      "name": "Purchase Orders",
+      "organization": "https://mock.rossum.app/api/v1/organizations/285704",
+      "queues": [],
+      "modified_at": "2026-03-15T12:00:00Z"
+    }
+  ]
+}

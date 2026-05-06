@@ -49,6 +49,25 @@ impl RossumClient {
         Ok(out)
     }
 
+    pub async fn get_organization(&self, id: u64) -> Result<crate::model::Organization> {
+        let url = format!("{}/organizations/{id}", self.base_url);
+        self.get_json(&url).await
+    }
+
+    pub async fn list_workspaces(&self) -> Result<Vec<crate::model::Workspace>> {
+        let mut url = format!("{}/workspaces", self.base_url);
+        let mut out = Vec::new();
+        loop {
+            let page: Page<crate::model::Workspace> = self.get_json(&url).await?;
+            out.extend(page.results);
+            match page.pagination.next {
+                Some(next) => url = next,
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
         let resp = self
             .http

@@ -40,3 +40,36 @@ async fn auth_failure_surfaces_status_error() {
     let msg = format!("{err:#}");
     assert!(msg.contains("401"), "error should mention 401, got: {msg}");
 }
+
+#[tokio::test]
+async fn get_organization_returns_org() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/285704"))
+        .and(header("Authorization", "token TEST_TOKEN"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let org = client.get_organization(285704).await.unwrap();
+    assert_eq!(org.id, 285704);
+    assert_eq!(org.name, "Acme Test Org");
+}
+
+#[tokio::test]
+async fn list_workspaces_returns_workspaces() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .and(header("Authorization", "token TEST_TOKEN"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("workspaces_list.json")))
+        .mount(&server)
+        .await;
+
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let workspaces = client.list_workspaces().await.unwrap();
+    assert_eq!(workspaces.len(), 2);
+    assert_eq!(workspaces[0].name, "Invoices AP");
+    assert_eq!(workspaces[1].name, "Purchase Orders");
+}
