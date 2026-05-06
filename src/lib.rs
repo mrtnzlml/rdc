@@ -4,3 +4,4 @@ pub mod config;
 pub mod model;
 pub mod slug;
 pub mod snapshot;
+pub mod state;
