@@ -1,3 +1,3 @@
 pub mod lockfile;
 
-pub use lockfile::{Lockfile, ObjectEntry, LOCKFILE_VERSION};
+pub use lockfile::{content_hash, Lockfile, ObjectEntry, LOCKFILE_VERSION};

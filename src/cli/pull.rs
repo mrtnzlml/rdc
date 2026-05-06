@@ -47,11 +47,13 @@ pub async fn run(env: &str) -> Result<()> {
             &slug,
             ObjectEntry {
                 id: hook.id,
+                url: Some(hook.url.clone()),
                 modified_at: hook
                     .extra
                     .get("modified_at")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string()),
+                content_hash: None,
             },
         );
     }

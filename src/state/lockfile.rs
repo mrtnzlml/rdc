@@ -1,10 +1,15 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-pub const LOCKFILE_VERSION: u32 = 1;
+/// Current lockfile schema version.
+pub const LOCKFILE_VERSION: u32 = 2;
 
+/// rdc lockfile contents. One file per environment, stored at
+/// `.rdc/state/<env>.lock.json`. Records the slug↔ID mapping plus
+/// metadata used by future three-way-merge logic.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Lockfile {
     pub version: u32,
@@ -12,12 +17,21 @@ pub struct Lockfile {
     pub objects: BTreeMap<String, BTreeMap<String, ObjectEntry>>,
 }
 
+/// One row in the lockfile.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct ObjectEntry {
+    /// Numeric Rossum ID.
     pub id: u64,
-    /// ISO 8601 timestamp from the server (`modified_at`), if present.
+    /// Canonical Rossum URL for the object (used by M3+ for cross-reference resolution).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// ISO 8601 server timestamp from `modified_at`, if present.
     #[serde(default)]
     pub modified_at: Option<String>,
+    /// Hex-encoded SHA-256 of the snapshot bytes that produced this entry.
+    /// Used by M3+ to detect local drift without re-fetching the remote.
+    #[serde(default)]
+    pub content_hash: Option<String>,
 }
 
 impl Default for Lockfile {
@@ -27,21 +41,34 @@ impl Default for Lockfile {
 }
 
 impl Lockfile {
+    /// Load a lockfile from disk, returning the default value if the file
+    /// does not exist. v1 lockfiles are silently migrated to v2 (the new
+    /// fields default to None and will be populated on the next pull).
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?;
-        let lf: Lockfile = serde_json::from_str(&raw)
+        let mut lf: Lockfile = serde_json::from_str(&raw)
             .with_context(|| format!("parsing {}", path.display()))?;
-        if lf.version != LOCKFILE_VERSION {
-            anyhow::bail!(
-                "lockfile {} has version {} but this rdc supports {}",
-                path.display(),
-                lf.version,
-                LOCKFILE_VERSION
-            );
+
+        match lf.version {
+            1 => {
+                // v1 → v2: same top-level shape, but ObjectEntry's new fields
+                // default to None thanks to #[serde(default)]. Just bump the
+                // version field; the next pull will populate url and content_hash.
+                lf.version = LOCKFILE_VERSION;
+            }
+            v if v == LOCKFILE_VERSION => {}
+            v => {
+                anyhow::bail!(
+                    "lockfile {} has version {} but this rdc supports {}",
+                    path.display(),
+                    v,
+                    LOCKFILE_VERSION
+                );
+            }
         }
         Ok(lf)
     }
@@ -61,6 +88,19 @@ impl Lockfile {
     }
 }
 
+/// Compute a stable SHA-256 over canonical JSON bytes. Hex-encoded.
+pub fn content_hash(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        write!(&mut hex, "{:02x}", b).expect("writing to String cannot fail");
+    }
+    hex
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,17 +110,24 @@ mod tests {
     fn missing_file_returns_empty() {
         let lf = Lockfile::load(Path::new("/nope.json")).unwrap();
         assert_eq!(lf, Lockfile::default());
+        assert_eq!(lf.version, LOCKFILE_VERSION);
     }
 
     #[test]
-    fn round_trip() {
+    fn round_trip_v2() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("dev.lock.json");
         let mut lf = Lockfile::default();
-        lf.upsert("hooks", "validator-invoices", ObjectEntry {
-            id: 1,
-            modified_at: Some("2026-04-01T10:00:00Z".to_string()),
-        });
+        lf.upsert(
+            "hooks",
+            "validator-invoices",
+            ObjectEntry {
+                id: 1,
+                url: Some("https://x.rossum.app/api/v1/hooks/1".to_string()),
+                modified_at: Some("2026-04-01T10:00:00Z".to_string()),
+                content_hash: Some("a".repeat(64)),
+            },
+        );
         lf.save(&path).unwrap();
         let loaded = Lockfile::load(&path).unwrap();
         assert_eq!(loaded, lf);
@@ -93,5 +140,50 @@ mod tests {
         std::fs::write(&path, r#"{"version":999,"objects":{}}"#).unwrap();
         let err = Lockfile::load(&path).unwrap_err();
         assert!(format!("{err:#}").contains("version"));
+    }
+
+    #[test]
+    fn v1_lockfile_migrates_to_v2_in_memory() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dev.lock.json");
+        // Hand-write a v1 lockfile (no url, no content_hash).
+        std::fs::write(
+            &path,
+            r#"{
+  "version": 1,
+  "objects": {
+    "hooks": {
+      "old-hook": {
+        "id": 7,
+        "modified_at": "2026-03-01T09:00:00Z"
+      }
+    }
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let lf = Lockfile::load(&path).unwrap();
+        assert_eq!(lf.version, LOCKFILE_VERSION);
+        let entry = &lf.objects["hooks"]["old-hook"];
+        assert_eq!(entry.id, 7);
+        assert_eq!(entry.modified_at.as_deref(), Some("2026-03-01T09:00:00Z"));
+        assert!(entry.url.is_none());
+        assert!(entry.content_hash.is_none());
+    }
+
+    #[test]
+    fn content_hash_is_deterministic() {
+        let h1 = content_hash(b"hello");
+        let h2 = content_hash(b"hello");
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 64);
+        assert!(h1.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn content_hash_distinguishes_inputs() {
+        assert_ne!(content_hash(b"foo"), content_hash(b"bar"));
     }
 }
