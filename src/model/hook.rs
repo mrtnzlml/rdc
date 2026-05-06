@@ -20,6 +20,14 @@ pub struct Hook {
     pub extra: BTreeMap<String, Value>,
 }
 
+impl Hook {
+    /// The server-set `modified_at` timestamp, if present. Currently lives in
+    /// the forward-compat `extra` map; this accessor isolates that detail.
+    pub fn modified_at(&self) -> Option<&str> {
+        self.extra.get("modified_at").and_then(|v| v.as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,5 +69,27 @@ mod tests {
         let hook: Hook = serde_json::from_value(payload).unwrap();
         assert!(hook.queues.is_empty());
         assert!(hook.events.is_empty());
+    }
+
+    #[test]
+    fn modified_at_accessor() {
+        let payload = json!({
+            "id": 1,
+            "url": "https://x/api/v1/hooks/1",
+            "name": "T",
+            "type": "function",
+            "modified_at": "2026-04-01T10:00:00Z"
+        });
+        let hook: Hook = serde_json::from_value(payload).unwrap();
+        assert_eq!(hook.modified_at(), Some("2026-04-01T10:00:00Z"));
+
+        let payload = json!({
+            "id": 1,
+            "url": "https://x/api/v1/hooks/1",
+            "name": "T",
+            "type": "function"
+        });
+        let hook: Hook = serde_json::from_value(payload).unwrap();
+        assert_eq!(hook.modified_at(), None);
     }
 }

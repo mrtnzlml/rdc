@@ -30,11 +30,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<usize> {
             .with_context(|| format!("reading just-written {}", json_path.display()))?;
         let hash = hash_for_lockfile(&bytes);
 
-        let modified_at = hook
-            .extra
-            .get("modified_at")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let modified_at = hook.modified_at().map(|s| s.to_string());
 
         record_object(
             ctx.lockfile,
