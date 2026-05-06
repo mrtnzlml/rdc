@@ -69,6 +69,16 @@ impl Paths {
     pub fn workspace_dir(&self, slug: &str) -> PathBuf {
         self.workspaces_dir().join(slug)
     }
+
+    /// `<root>/envs/<env>/workspaces/<ws_slug>/queues/`
+    pub fn queues_dir(&self, ws_slug: &str) -> PathBuf {
+        self.workspace_dir(ws_slug).join("queues")
+    }
+
+    /// `<root>/envs/<env>/workspaces/<ws_slug>/queues/<queue_slug>/`
+    pub fn queue_dir(&self, ws_slug: &str, queue_slug: &str) -> PathBuf {
+        self.queues_dir(ws_slug).join(queue_slug)
+    }
 }
 
 #[cfg(test)]
@@ -119,5 +129,21 @@ mod tests {
         let pp = Paths::for_env("/proj", "dev");
         assert_eq!(pp.root(), Path::new("/proj"));
         assert_eq!(pp.env(), "dev");
+    }
+
+    #[test]
+    fn queues_dir_path() {
+        assert_eq!(
+            p().queues_dir("invoices-ap"),
+            Path::new("/proj/envs/dev/workspaces/invoices-ap/queues")
+        );
+    }
+
+    #[test]
+    fn queue_dir_path() {
+        assert_eq!(
+            p().queue_dir("invoices-ap", "cost-invoices"),
+            Path::new("/proj/envs/dev/workspaces/invoices-ap/queues/cost-invoices")
+        );
     }
 }
