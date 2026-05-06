@@ -86,6 +86,18 @@ impl Lockfile {
             .or_default()
             .insert(slug.to_string(), entry);
     }
+
+    /// Find the slug of an object by its URL within a kind.
+    /// Returns None if no entry matches.
+    pub fn slug_for_url(&self, kind: &str, url: &str) -> Option<&str> {
+        let by_kind = self.objects.get(kind)?;
+        for (slug, entry) in by_kind.iter() {
+            if entry.url.as_deref() == Some(url) {
+                return Some(slug.as_str());
+            }
+        }
+        None
+    }
 }
 
 /// Compute a stable SHA-256 over canonical JSON bytes. Hex-encoded.
@@ -185,5 +197,26 @@ mod tests {
     #[test]
     fn content_hash_distinguishes_inputs() {
         assert_ne!(content_hash(b"foo"), content_hash(b"bar"));
+    }
+
+    #[test]
+    fn slug_for_url_finds_match() {
+        let mut lf = Lockfile::default();
+        lf.upsert(
+            "workspaces",
+            "invoices-ap",
+            ObjectEntry {
+                id: 1,
+                url: Some("https://x/api/v1/workspaces/1".to_string()),
+                modified_at: None,
+                content_hash: None,
+            },
+        );
+        assert_eq!(
+            lf.slug_for_url("workspaces", "https://x/api/v1/workspaces/1"),
+            Some("invoices-ap"),
+        );
+        assert_eq!(lf.slug_for_url("workspaces", "https://nope"), None);
+        assert_eq!(lf.slug_for_url("hooks", "https://x/api/v1/workspaces/1"), None);
     }
 }
