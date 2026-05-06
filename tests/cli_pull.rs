@@ -10,7 +10,7 @@ fn fixture(name: &str) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn pull_writes_organization_and_hook_files() {
+async fn pull_writes_organization_workspaces_and_hook_files() {
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
@@ -24,6 +24,13 @@ async fn pull_writes_organization_and_hook_files() {
         .and(path("/api/v1/hooks"))
         .and(header("Authorization", "token TEST_TOKEN"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("hooks_list.json")))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .and(header("Authorization", "token TEST_TOKEN"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("workspaces_list.json")))
         .mount(&server)
         .await;
 
@@ -54,6 +61,7 @@ async fn pull_writes_organization_and_hook_files() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Pulled 1 organization"))
+        .stdout(predicate::str::contains("2 workspaces"))
         .stdout(predicate::str::contains("2 hooks"));
 
     let env_root = project.path().join("envs/dev");
@@ -65,9 +73,18 @@ async fn pull_writes_organization_and_hook_files() {
     assert!(hooks_dir.join("validator-invoices.json").exists());
     assert!(hooks_dir.join("sftp-import.json").exists());
 
+    let ws_root = env_root.join("workspaces");
+    assert!(ws_root.join("invoices-ap/workspace.json").exists());
+    assert!(ws_root.join("purchase-orders/workspace.json").exists());
+
+    let ws_raw = std::fs::read_to_string(ws_root.join("invoices-ap/workspace.json")).unwrap();
+    assert!(ws_raw.contains("Invoices AP"));
+
     let lf = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
     assert!(lf.contains("organization"));
     assert!(lf.contains("validator-invoices"));
+    assert!(lf.contains("workspaces"));
+    assert!(lf.contains("invoices-ap"));
 }
 
 #[tokio::test]
