@@ -95,7 +95,7 @@ async fn pull_writes_full_workspace_tree() {
         .stdout(predicate::str::contains("2 workspaces"))
         .stdout(predicate::str::contains("3 queues"))
         .stdout(predicate::str::contains("3 schemas"))
-        .stdout(predicate::str::contains("1 inboxes"))
+        .stdout(predicate::str::contains("1 inbox"))
         .stdout(predicate::str::contains("2 hooks"));
 
     let env_root = project.path().join("envs/dev");

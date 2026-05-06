@@ -7,6 +7,13 @@ use std::path::Path;
 /// Write a schema to `<queue_dir>/schema.json`, extracting any formula field
 /// `formula` strings into `<queue_dir>/formulas/<field_id>.py` files.
 /// Returns the JSON bytes written (for content_hash).
+///
+/// **Hash coverage gap:** The returned bytes are the post-extraction
+/// `schema.json` content. Changes to extracted `formulas/*.py` files are NOT
+/// reflected in the returned hash. M7's three-way merge must therefore
+/// recompute schema hashes by combining schema.json bytes with all formula
+/// file bytes — using the lockfile content_hash alone will miss formula-only
+/// drift.
 pub fn write_schema(queue_dir: &Path, schema: &Schema) -> Result<Vec<u8>> {
     let mut value = serde_json::to_value(schema)
         .context("serializing schema to value")?;

@@ -43,8 +43,13 @@ pub async fn run(env: &str) -> Result<()> {
 
     lockfile.save(&paths.lockfile())?;
     println!(
-        "Pulled {n_orgs} organization, {n_workspaces} workspaces, {} queues, {} schemas, {} inboxes, {n_hooks} hooks from env '{env}'",
-        qc.queues, qc.schemas, qc.inboxes
+        "Pulled {}, {}, {}, {}, {}, {} from env '{env}'",
+        common::pluralize(n_orgs, "organization", "organizations"),
+        common::pluralize(n_workspaces, "workspace", "workspaces"),
+        common::pluralize(qc.queues, "queue", "queues"),
+        common::pluralize(qc.schemas, "schema", "schemas"),
+        common::pluralize(qc.inboxes, "inbox", "inboxes"),
+        common::pluralize(n_hooks, "hook", "hooks"),
     );
     Ok(())
 }
