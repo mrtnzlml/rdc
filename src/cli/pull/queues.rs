@@ -1,4 +1,4 @@
-use super::common::{hash_for_lockfile, record_object, PullCtx};
+use super::common::{hash_for_lockfile, parse_id_from_url, record_object, PullCtx};
 use crate::slug::slugify_unique;
 use crate::snapshot::inbox::write_inbox;
 use crate::snapshot::queue::write_queue;
@@ -111,34 +111,3 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<QueueCounts> {
     Ok(counts)
 }
 
-/// Parse the trailing numeric ID out of a Rossum API URL, e.g.
-/// `https://x.rossum.app/api/v1/schemas/1234` -> `1234`.
-fn parse_id_from_url(url: &str) -> Result<u64> {
-    let trimmed = url.trim_end_matches('/');
-    let last = trimmed
-        .rsplit('/')
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("URL has no path segments: {url}"))?;
-    last.parse::<u64>()
-        .map_err(|e| anyhow::anyhow!("URL trailing segment '{last}' is not a u64: {e}"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_id_basic() {
-        assert_eq!(parse_id_from_url("https://x/api/v1/schemas/1234").unwrap(), 1234);
-    }
-
-    #[test]
-    fn parse_id_with_trailing_slash() {
-        assert_eq!(parse_id_from_url("https://x/api/v1/schemas/9/").unwrap(), 9);
-    }
-
-    #[test]
-    fn parse_id_non_numeric_errors() {
-        assert!(parse_id_from_url("https://x/api/v1/schemas/abc").is_err());
-    }
-}
