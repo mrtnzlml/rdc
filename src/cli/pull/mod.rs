@@ -8,6 +8,7 @@ use anyhow::{anyhow, Context, Result};
 mod common;
 mod hooks;
 mod organization;
+mod queues;
 mod workspaces;
 
 pub use common::PullCtx;
@@ -35,12 +36,15 @@ pub async fn run(env: &str) -> Result<()> {
         .with_context(|| format!("pulling organization for env '{env}'"))?;
     let n_workspaces = workspaces::pull(&mut ctx, env_cfg).await
         .with_context(|| format!("pulling workspaces for env '{env}'"))?;
+    let qc = queues::pull(&mut ctx).await
+        .with_context(|| format!("pulling queues for env '{env}'"))?;
     let n_hooks = hooks::pull(&mut ctx).await
         .with_context(|| format!("pulling hooks for env '{env}'"))?;
 
     lockfile.save(&paths.lockfile())?;
     println!(
-        "Pulled {n_orgs} organization, {n_workspaces} workspaces, {n_hooks} hooks from env '{env}'"
+        "Pulled {n_orgs} organization, {n_workspaces} workspaces, {} queues, {} schemas, {} inboxes, {n_hooks} hooks from env '{env}'",
+        qc.queues, qc.schemas, qc.inboxes
     );
     Ok(())
 }
