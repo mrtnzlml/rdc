@@ -1,0 +1,7 @@
+# Rust
+/target
+Cargo.lock.bak
+
+# rdc tool-managed paths (per design spec)
+/secrets
+/.rdc/cache
