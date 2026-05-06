@@ -2,9 +2,9 @@
 
 `rdc` (Rossum Deployment as Code) snapshots Rossum.ai configurations to disk for AI-assisted local development and deploys them across environments.
 
-**Status:** M1 (walking skeleton). Only `rdc init` and `rdc pull <env>` for hooks are implemented. See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full design and `docs/superpowers/plans/` for implementation plans.
+**Status:** M2 (foundations + organization + workspaces). Implements `rdc init`, `rdc pull <env>` for organizations, workspaces, and hooks. See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full design and `docs/superpowers/plans/` for implementation plans.
 
-## Quick start (M1)
+## Quick start
 
 ```sh
 cargo install --path .
@@ -18,7 +18,8 @@ echo '{"api_token":"YOUR_TOKEN"}' > secrets/dev.secrets.json
 # OR: export RDC_TOKEN_DEV=YOUR_TOKEN
 
 rdc pull dev
-ls envs/dev/hooks/
+ls envs/dev/
+# organization.json  hooks/  workspaces/
 ```
 
 ## Tests
