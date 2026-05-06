@@ -1,4 +1,5 @@
 use crate::config::{EnvConfig, ProjectConfig, ProjectMeta};
+use crate::paths::Paths;
 use crate::snapshot::writer::write_atomic;
 use anyhow::{anyhow, Context, Result};
 use std::collections::BTreeMap;
@@ -30,11 +31,11 @@ pub async fn run(name: &str, env_specs: &[String]) -> Result<()> {
     std::fs::create_dir_all(cwd.join("secrets"))
         .with_context(|| format!("creating {}", cwd.join("secrets").display()))?;
     for env in envs.keys() {
-        let env_dir = cwd.join("envs").join(env);
-        std::fs::create_dir_all(&env_dir)
-            .with_context(|| format!("creating {}", env_dir.display()))?;
-        std::fs::create_dir_all(env_dir.join("hooks"))
-            .with_context(|| format!("creating {}", env_dir.join("hooks").display()))?;
+        let paths = Paths::for_env(&cwd, env);
+        std::fs::create_dir_all(paths.env_root())
+            .with_context(|| format!("creating {}", paths.env_root().display()))?;
+        std::fs::create_dir_all(paths.hooks_dir())
+            .with_context(|| format!("creating {}", paths.hooks_dir().display()))?;
     }
 
     println!(

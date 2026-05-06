@@ -1,5 +1,6 @@
 use crate::api::RossumClient;
 use crate::config::ProjectConfig;
+use crate::paths::Paths;
 use crate::secrets::resolve_token;
 use crate::slug::slugify_unique;
 use crate::snapshot::hook::write_hook;
@@ -9,9 +10,10 @@ use std::collections::HashSet;
 
 pub async fn run(env: &str) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
-    let cfg_path = cwd.join("rdc.toml");
-    let cfg = ProjectConfig::load(&cfg_path)
-        .with_context(|| format!("loading project config from {}", cfg_path.display()))?;
+    let paths = Paths::for_env(&cwd, env);
+
+    let cfg = ProjectConfig::load(&paths.project_config())
+        .with_context(|| format!("loading project config from {}", paths.project_config().display()))?;
 
     let env_cfg = cfg
         .envs
@@ -26,23 +28,17 @@ pub async fn run(env: &str) -> Result<()> {
         .await
         .with_context(|| format!("listing hooks for env '{env}'"))?;
 
-    let env_root = cwd.join("envs").join(env);
-    let hooks_dir = env_root.join("hooks");
-    std::fs::create_dir_all(&hooks_dir)
-        .with_context(|| format!("creating {}", hooks_dir.display()))?;
+    std::fs::create_dir_all(paths.hooks_dir())
+        .with_context(|| format!("creating {}", paths.hooks_dir().display()))?;
 
-    let lockfile_path = cwd
-        .join(".rdc")
-        .join("state")
-        .join(format!("{env}.lock.json"));
-    let mut lockfile = Lockfile::load(&lockfile_path)?;
+    let mut lockfile = Lockfile::load(&paths.lockfile())?;
 
     let mut used_slugs: HashSet<String> = HashSet::new();
     for hook in &hooks {
         let slug = slugify_unique(&hook.name, &used_slugs);
         used_slugs.insert(slug.clone());
 
-        write_hook(&hooks_dir, &slug, hook)
+        write_hook(&paths.hooks_dir(), &slug, hook)
             .with_context(|| format!("writing hook '{}' to disk", hook.name))?;
 
         lockfile.upsert(
@@ -59,7 +55,7 @@ pub async fn run(env: &str) -> Result<()> {
         );
     }
 
-    lockfile.save(&lockfile_path)?;
+    lockfile.save(&paths.lockfile())?;
 
     println!("Pulled {} hooks from env '{env}'", hooks.len());
     Ok(())
