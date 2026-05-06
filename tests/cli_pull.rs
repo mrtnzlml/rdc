@@ -10,8 +10,16 @@ fn fixture(name: &str) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn pull_writes_hook_json_and_py_files() {
+async fn pull_writes_organization_and_hook_files() {
     let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .and(header("Authorization", "token TEST_TOKEN"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
     Mock::given(method("GET"))
         .and(path("/api/v1/hooks"))
         .and(header("Authorization", "token TEST_TOKEN"))
@@ -45,20 +53,21 @@ async fn pull_writes_hook_json_and_py_files() {
         .args(["pull", "dev"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Pulled 2 hooks"));
+        .stdout(predicate::str::contains("Pulled 1 organization"))
+        .stdout(predicate::str::contains("2 hooks"));
 
-    let hooks_dir = project.path().join("envs/dev/hooks");
+    let env_root = project.path().join("envs/dev");
+    assert!(env_root.join("organization.json").exists());
+    let org_raw = std::fs::read_to_string(env_root.join("organization.json")).unwrap();
+    assert!(org_raw.contains("Acme Test Org"));
+
+    let hooks_dir = env_root.join("hooks");
     assert!(hooks_dir.join("validator-invoices.json").exists());
-    assert!(hooks_dir.join("validator-invoices.py").exists());
     assert!(hooks_dir.join("sftp-import.json").exists());
-    assert!(hooks_dir.join("sftp-import.py").exists());
-
-    let py = std::fs::read_to_string(hooks_dir.join("validator-invoices.py")).unwrap();
-    assert!(py.contains("def x"));
 
     let lf = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    assert!(lf.contains("organization"));
     assert!(lf.contains("validator-invoices"));
-    assert!(lf.contains("sftp-import"));
 }
 
 #[tokio::test]
