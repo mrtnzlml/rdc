@@ -1084,6 +1084,7 @@ dependencies = [
  "clap",
  "predicates",
  "pretty_assertions",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
