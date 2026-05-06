@@ -79,6 +79,26 @@ impl Paths {
     pub fn queue_dir(&self, ws_slug: &str, queue_slug: &str) -> PathBuf {
         self.queues_dir(ws_slug).join(queue_slug)
     }
+
+    /// `<root>/envs/<env>/rules/`
+    pub fn rules_dir(&self) -> PathBuf {
+        self.env_root().join("rules")
+    }
+
+    /// `<root>/envs/<env>/labels/`
+    pub fn labels_dir(&self) -> PathBuf {
+        self.env_root().join("labels")
+    }
+
+    /// `<root>/envs/<env>/engines/`
+    pub fn engines_dir(&self) -> PathBuf {
+        self.env_root().join("engines")
+    }
+
+    /// `<root>/envs/<env>/engine-fields/`
+    pub fn engine_fields_dir(&self) -> PathBuf {
+        self.env_root().join("engine-fields")
+    }
 }
 
 #[cfg(test)]
@@ -145,5 +165,25 @@ mod tests {
             p().queue_dir("invoices-ap", "cost-invoices"),
             Path::new("/proj/envs/dev/workspaces/invoices-ap/queues/cost-invoices")
         );
+    }
+
+    #[test]
+    fn rules_dir_path() {
+        assert_eq!(p().rules_dir(), Path::new("/proj/envs/dev/rules"));
+    }
+
+    #[test]
+    fn labels_dir_path() {
+        assert_eq!(p().labels_dir(), Path::new("/proj/envs/dev/labels"));
+    }
+
+    #[test]
+    fn engines_dir_path() {
+        assert_eq!(p().engines_dir(), Path::new("/proj/envs/dev/engines"));
+    }
+
+    #[test]
+    fn engine_fields_dir_path() {
+        assert_eq!(p().engine_fields_dir(), Path::new("/proj/envs/dev/engine-fields"));
     }
 }
