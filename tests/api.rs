@@ -58,6 +58,50 @@ async fn get_organization_returns_org() {
 }
 
 #[tokio::test]
+async fn list_queues_returns_queues() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .and(header("Authorization", "token TEST_TOKEN"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("queues_list.json")))
+        .mount(&server)
+        .await;
+
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let queues = client.list_queues().await.unwrap();
+    assert_eq!(queues.len(), 3);
+    assert_eq!(queues[0].name, "Cost Invoices");
+}
+
+#[tokio::test]
+async fn get_inbox_returns_inbox() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/inboxes/300"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("inbox_1.json")))
+        .mount(&server)
+        .await;
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let inbox = client.get_inbox(300).await.unwrap();
+    assert_eq!(inbox.id, 300);
+    assert_eq!(inbox.email, "cost-invoices@mock.rossum.app");
+}
+
+#[tokio::test]
+async fn get_schema_returns_schema() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schemas/200"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("schema_1.json")))
+        .mount(&server)
+        .await;
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let schema = client.get_schema(200).await.unwrap();
+    assert_eq!(schema.id, 200);
+    assert_eq!(schema.content.len(), 1);
+}
+
+#[tokio::test]
 async fn list_workspaces_returns_workspaces() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

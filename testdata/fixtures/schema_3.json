@@ -1,0 +1,8 @@
+{
+  "id": 202,
+  "url": "https://mock.rossum.app/api/v1/schemas/202",
+  "name": "Purchase Orders Schema",
+  "queues": ["https://mock.rossum.app/api/v1/queues/102"],
+  "content": [],
+  "modified_at": "2026-04-10T10:00:00Z"
+}

@@ -1,0 +1,14 @@
+{
+  "id": 201,
+  "url": "https://mock.rossum.app/api/v1/schemas/201",
+  "name": "Credit Notes Schema",
+  "queues": ["https://mock.rossum.app/api/v1/queues/101"],
+  "content": [
+    {
+      "category": "datapoint",
+      "id": "credit_id",
+      "type": "string"
+    }
+  ],
+  "modified_at": "2026-04-10T09:30:00Z"
+}

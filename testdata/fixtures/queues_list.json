@@ -1,0 +1,35 @@
+{
+  "pagination": {
+    "total": 3,
+    "total_pages": 1,
+    "next": null,
+    "previous": null
+  },
+  "results": [
+    {
+      "id": 100,
+      "url": "https://mock.rossum.app/api/v1/queues/100",
+      "name": "Cost Invoices",
+      "workspace": "https://mock.rossum.app/api/v1/workspaces/700852",
+      "schema": "https://mock.rossum.app/api/v1/schemas/200",
+      "inbox": "https://mock.rossum.app/api/v1/inboxes/300",
+      "modified_at": "2026-04-10T09:00:00Z"
+    },
+    {
+      "id": 101,
+      "url": "https://mock.rossum.app/api/v1/queues/101",
+      "name": "Credit Notes",
+      "workspace": "https://mock.rossum.app/api/v1/workspaces/700852",
+      "schema": "https://mock.rossum.app/api/v1/schemas/201",
+      "modified_at": "2026-04-10T09:30:00Z"
+    },
+    {
+      "id": 102,
+      "url": "https://mock.rossum.app/api/v1/queues/102",
+      "name": "Purchase Orders",
+      "workspace": "https://mock.rossum.app/api/v1/workspaces/743213",
+      "schema": "https://mock.rossum.app/api/v1/schemas/202",
+      "modified_at": "2026-04-10T10:00:00Z"
+    }
+  ]
+}

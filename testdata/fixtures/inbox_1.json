@@ -1,0 +1,9 @@
+{
+  "id": 300,
+  "url": "https://mock.rossum.app/api/v1/inboxes/300",
+  "name": "Cost Invoices Inbox",
+  "email": "cost-invoices@mock.rossum.app",
+  "queues": ["https://mock.rossum.app/api/v1/queues/100"],
+  "modified_at": "2026-04-10T09:00:00Z",
+  "filters": []
+}

@@ -1,0 +1,27 @@
+{
+  "id": 200,
+  "url": "https://mock.rossum.app/api/v1/schemas/200",
+  "name": "Cost Invoices Schema",
+  "queues": ["https://mock.rossum.app/api/v1/queues/100"],
+  "content": [
+    {
+      "category": "section",
+      "id": "header",
+      "label": "Header",
+      "children": [
+        {
+          "category": "datapoint",
+          "id": "invoice_id",
+          "type": "string"
+        },
+        {
+          "category": "datapoint",
+          "id": "amount_total",
+          "type": "number",
+          "formula": "amount_due + amount_tax"
+        }
+      ]
+    }
+  ],
+  "modified_at": "2026-04-10T09:00:00Z"
+}
