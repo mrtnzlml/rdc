@@ -18,7 +18,7 @@ async fn list_hooks_paginates_until_done() {
         .mount(&server)
         .await;
 
-    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into());
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
     let hooks = client.list_hooks().await.unwrap();
     assert_eq!(hooks.len(), 2);
     assert_eq!(hooks[0].name, "Validator: invoices");
@@ -35,7 +35,7 @@ async fn auth_failure_surfaces_status_error() {
         .mount(&server)
         .await;
 
-    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "BAD".into());
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "BAD".into()).unwrap();
     let err = client.list_hooks().await.unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("401"), "error should mention 401, got: {msg}");

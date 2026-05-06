@@ -21,7 +21,8 @@ pub async fn run(env: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("env '{env}' is not defined in rdc.toml"))?;
 
     let token = resolve_token(&cwd, env)?;
-    let client = RossumClient::new(env_cfg.api_base.clone(), token);
+    let client = RossumClient::new(env_cfg.api_base.clone(), token)
+        .context("constructing Rossum API client")?;
 
     let hooks = client
         .list_hooks()

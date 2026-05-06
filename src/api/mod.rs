@@ -28,11 +28,11 @@ struct Pagination {
 }
 
 impl RossumClient {
-    pub fn new(base_url: String, token: String) -> Self {
+    pub fn new(base_url: String, token: String) -> Result<Self> {
         let http = Client::builder()
             .build()
-            .expect("reqwest client builder cannot fail with default config");
-        Self { base_url, token, http }
+            .map_err(|e| anyhow::anyhow!("building reqwest client: {e}"))?;
+        Ok(Self { base_url, token, http })
     }
 
     pub async fn list_hooks(&self) -> Result<Vec<Hook>> {
