@@ -33,14 +33,38 @@ pub fn write_hook(dir: &Path, slug: &str, hook: &Hook) -> Result<()> {
 
     if let Some(code) = code {
         let py_path = dir.join(format!("{slug}.py"));
-        let mut bytes = code.into_bytes();
-        if !bytes.ends_with(b"\n") {
-            bytes.push(b'\n');
-        }
-        write_atomic(&py_path, &bytes)?;
+        // Write code bytes exactly as received. Preserves byte-exact round-trip
+        // through the codec (read_hook returns Hook with identical config.code).
+        write_atomic(&py_path, code.as_bytes())?;
     }
 
     Ok(())
+}
+
+/// Read a hook back from disk: load `<dir>/<slug>.json`, then if `<dir>/<slug>.py`
+/// exists, splice its contents back into `config.code` so the in-memory `Hook`
+/// is byte-for-byte equivalent to what was originally serialized.
+pub fn read_hook(dir: &Path, slug: &str) -> Result<Hook> {
+    let json_path = dir.join(format!("{slug}.json"));
+    let raw = std::fs::read_to_string(&json_path)
+        .with_context(|| format!("reading {}", json_path.display()))?;
+    let mut value: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing {}", json_path.display()))?;
+
+    let py_path = dir.join(format!("{slug}.py"));
+    if py_path.exists() {
+        let code = std::fs::read_to_string(&py_path)
+            .with_context(|| format!("reading {}", py_path.display()))?;
+        // The .py file is the byte-exact canonical form (write_hook preserves
+        // bytes). No trailing-newline normalization on read either.
+        if let Some(config) = value.get_mut("config").and_then(|c| c.as_object_mut()) {
+            config.insert("code".to_string(), Value::String(code));
+        }
+    }
+
+    let hook: Hook = serde_json::from_value(value)
+        .with_context(|| format!("deserializing hook from {}", json_path.display()))?;
+    Ok(hook)
 }
 
 #[cfg(test)]
@@ -81,10 +105,11 @@ mod tests {
     }
 
     #[test]
-    fn py_contains_code_with_trailing_newline() {
+    fn py_contains_exact_code_bytes() {
         let dir = TempDir::new().unwrap();
         write_hook(dir.path(), "sample", &sample_hook()).unwrap();
         let py = std::fs::read_to_string(dir.path().join("sample.py")).unwrap();
+        // The sample's code already ends with \n; write preserves bytes exactly.
         assert_eq!(py, "def x():\n    return 1\n");
     }
 
@@ -99,5 +124,49 @@ mod tests {
         write_hook(dir.path(), "sample", &hook).unwrap();
         assert!(dir.path().join("sample.json").exists());
         assert!(!dir.path().join("sample.py").exists());
+    }
+
+    #[test]
+    fn round_trip_with_code() {
+        let dir = TempDir::new().unwrap();
+        let original = sample_hook();
+        write_hook(dir.path(), "sample", &original).unwrap();
+        let read = read_hook(dir.path(), "sample").unwrap();
+        assert_eq!(original, read);
+    }
+
+    #[test]
+    fn round_trip_without_code() {
+        let mut hook = sample_hook();
+        if let Value::Object(map) = &mut hook.config {
+            map.remove("code");
+        }
+        let dir = TempDir::new().unwrap();
+        write_hook(dir.path(), "no-code", &hook).unwrap();
+        let read = read_hook(dir.path(), "no-code").unwrap();
+        assert_eq!(hook, read);
+    }
+
+    #[test]
+    fn read_missing_file_errors_with_path() {
+        let dir = TempDir::new().unwrap();
+        let err = read_hook(dir.path(), "nope").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("nope.json"), "error should name the path: {msg}");
+    }
+
+    #[test]
+    fn read_with_unicode_code() {
+        let dir = TempDir::new().unwrap();
+        let mut hook = sample_hook();
+        if let Value::Object(map) = &mut hook.config {
+            map.insert(
+                "code".to_string(),
+                Value::String("# žluťoučký kůň\nprint('ok')".to_string()),
+            );
+        }
+        write_hook(dir.path(), "unicode", &hook).unwrap();
+        let read = read_hook(dir.path(), "unicode").unwrap();
+        assert_eq!(hook, read);
     }
 }
