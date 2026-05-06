@@ -2,7 +2,7 @@
 
 `rdc` (Rossum Deployment as Code) snapshots Rossum.ai configurations to disk for AI-assisted local development and deploys them across environments.
 
-**Status:** M2 (foundations + organization + workspaces). Implements `rdc init`, `rdc pull <env>` for organizations, workspaces, and hooks. See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full design and `docs/superpowers/plans/` for implementation plans.
+**Status:** M3 (workspace tree). Implements `rdc init`, `rdc pull <env>` for organizations, workspaces (with optional regex filter), queues, schemas (with formula extraction), inboxes, and hooks. See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full design and `docs/superpowers/plans/` for implementation plans.
 
 ## Quick start
 
@@ -18,8 +18,19 @@ echo '{"api_token":"YOUR_TOKEN"}' > secrets/dev.secrets.json
 # OR: export RDC_TOKEN_DEV=YOUR_TOKEN
 
 rdc pull dev
-ls envs/dev/
-# organization.json  hooks/  workspaces/
+tree envs/dev -L 5
+# envs/dev/
+# ├── hooks/
+# ├── organization.json
+# └── workspaces/
+#     └── <workspace>/
+#         ├── workspace.json
+#         └── queues/
+#             └── <queue>/
+#                 ├── queue.json
+#                 ├── schema.json
+#                 ├── inbox.json (if present)
+#                 └── formulas/<field_id>.py (one per formula field)
 ```
 
 ## Tests
