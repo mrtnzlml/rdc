@@ -26,12 +26,8 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<usize> {
         std::fs::create_dir_all(&ws_dir)
             .with_context(|| format!("creating {}", ws_dir.display()))?;
 
-        write_workspace(&ws_dir, ws)
+        let bytes = write_workspace(&ws_dir, ws)
             .with_context(|| format!("writing workspace '{}' to disk", ws.name))?;
-
-        let json_path = ws_dir.join("workspace.json");
-        let bytes = std::fs::read(&json_path)
-            .with_context(|| format!("reading just-written {}", json_path.display()))?;
         let hash = hash_for_lockfile(&bytes);
 
         record_object(

@@ -6,13 +6,13 @@ use std::path::Path;
 /// Write an organization to disk as a single JSON file at the given path.
 /// (The file path is fixed to `<env_root>/organization.json` by the caller;
 /// this codec is path-agnostic.)
-pub fn write_organization(path: &Path, org: &Organization) -> Result<()> {
+pub fn write_organization(path: &Path, org: &Organization) -> Result<Vec<u8>> {
     let bytes = serde_json::to_vec_pretty(org)
         .context("serializing organization")?;
     let mut bytes = bytes;
     bytes.push(b'\n');
     write_atomic(path, &bytes)?;
-    Ok(())
+    Ok(bytes)
 }
 
 /// Read an organization from disk.

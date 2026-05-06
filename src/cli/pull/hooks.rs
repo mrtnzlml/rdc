@@ -21,13 +21,8 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<usize> {
         let slug = slugify_unique(&hook.name, &used_slugs);
         used_slugs.insert(slug.clone());
 
-        write_hook(&ctx.paths.hooks_dir(), &slug, hook)
+        let bytes = write_hook(&ctx.paths.hooks_dir(), &slug, hook)
             .with_context(|| format!("writing hook '{}' to disk", hook.name))?;
-
-        // Hash the JSON we just wrote so the lockfile records it.
-        let json_path = ctx.paths.hooks_dir().join(format!("{slug}.json"));
-        let bytes = std::fs::read(&json_path)
-            .with_context(|| format!("reading just-written {}", json_path.display()))?;
         let hash = hash_for_lockfile(&bytes);
 
         let modified_at = hook.modified_at().map(|s| s.to_string());

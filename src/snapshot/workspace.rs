@@ -5,14 +5,14 @@ use std::path::Path;
 
 /// Write a workspace's metadata to `<workspace_dir>/workspace.json`.
 /// The caller is responsible for `workspace_dir` existing.
-pub fn write_workspace(workspace_dir: &Path, ws: &Workspace) -> Result<()> {
+pub fn write_workspace(workspace_dir: &Path, ws: &Workspace) -> Result<Vec<u8>> {
     let path = workspace_dir.join("workspace.json");
     let bytes = serde_json::to_vec_pretty(ws)
         .context("serializing workspace")?;
     let mut bytes = bytes;
     bytes.push(b'\n');
     write_atomic(&path, &bytes)?;
-    Ok(())
+    Ok(bytes)
 }
 
 /// Read a workspace from disk: loads `<workspace_dir>/workspace.json`.

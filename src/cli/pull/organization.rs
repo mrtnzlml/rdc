@@ -17,11 +17,8 @@ pub async fn pull(ctx: &mut PullCtx<'_>, org_id: u64) -> Result<usize> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
 
-    write_organization(&path, &org)
+    let bytes = write_organization(&path, &org)
         .with_context(|| format!("writing organization to {}", path.display()))?;
-
-    let bytes = std::fs::read(&path)
-        .with_context(|| format!("reading just-written {}", path.display()))?;
     let hash = hash_for_lockfile(&bytes);
 
     record_object(

@@ -10,7 +10,7 @@ use std::path::Path;
 /// source of truth.
 ///
 /// Returns the JSON path written.
-pub fn write_hook(dir: &Path, slug: &str, hook: &Hook) -> Result<()> {
+pub fn write_hook(dir: &Path, slug: &str, hook: &Hook) -> Result<Vec<u8>> {
     let mut json_value = serde_json::to_value(hook)
         .context("serializing hook to value")?;
 
@@ -38,7 +38,7 @@ pub fn write_hook(dir: &Path, slug: &str, hook: &Hook) -> Result<()> {
         write_atomic(&py_path, code.as_bytes())?;
     }
 
-    Ok(())
+    Ok(json_with_newline)
 }
 
 /// Read a hook back from disk: load `<dir>/<slug>.json`, then if `<dir>/<slug>.py`
