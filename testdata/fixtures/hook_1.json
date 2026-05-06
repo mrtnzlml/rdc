@@ -1,0 +1,9 @@
+{
+  "id": 1,
+  "url": "https://mock.rossum.app/api/v1/hooks/1",
+  "name": "Validator: invoices",
+  "type": "function",
+  "queues": ["https://mock.rossum.app/api/v1/queues/100"],
+  "events": ["annotation_content"],
+  "config": { "runtime": "python3.12", "code": "def x(payload):\n    return {}\n" }
+}

@@ -1,0 +1,9 @@
+{
+  "id": 2,
+  "url": "https://mock.rossum.app/api/v1/hooks/2",
+  "name": "SFTP import",
+  "type": "function",
+  "queues": [],
+  "events": ["annotation_status"],
+  "config": { "runtime": "python3.12", "code": "def import_files():\n    pass\n" }
+}

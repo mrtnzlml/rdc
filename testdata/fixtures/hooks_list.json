@@ -1,0 +1,28 @@
+{
+  "pagination": {
+    "total": 2,
+    "total_pages": 1,
+    "next": null,
+    "previous": null
+  },
+  "results": [
+    {
+      "id": 1,
+      "url": "https://mock.rossum.app/api/v1/hooks/1",
+      "name": "Validator: invoices",
+      "type": "function",
+      "queues": ["https://mock.rossum.app/api/v1/queues/100"],
+      "events": ["annotation_content"],
+      "config": { "runtime": "python3.12", "code": "def x(payload):\n    return {}\n" }
+    },
+    {
+      "id": 2,
+      "url": "https://mock.rossum.app/api/v1/hooks/2",
+      "name": "SFTP import",
+      "type": "function",
+      "queues": [],
+      "events": ["annotation_status"],
+      "config": { "runtime": "python3.12", "code": "def import_files():\n    pass\n" }
+    }
+  ]
+}
