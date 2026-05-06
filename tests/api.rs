@@ -102,6 +102,62 @@ async fn get_schema_returns_schema() {
 }
 
 #[tokio::test]
+async fn list_rules_returns_rules() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/rules"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("rules_list.json")))
+        .mount(&server)
+        .await;
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let rules = client.list_rules().await.unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].name, "E-invoice Validation");
+}
+
+#[tokio::test]
+async fn list_labels_returns_labels() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("labels_list.json")))
+        .mount(&server)
+        .await;
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let labels = client.list_labels().await.unwrap();
+    assert_eq!(labels.len(), 2);
+    assert_eq!(labels[1].name, "Needs Review");
+}
+
+#[tokio::test]
+async fn list_engines_returns_engines() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/engines"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("engines_list.json")))
+        .mount(&server)
+        .await;
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let engines = client.list_engines().await.unwrap();
+    assert_eq!(engines.len(), 1);
+    assert_eq!(engines[0].name, "Invoice Engine");
+}
+
+#[tokio::test]
+async fn list_engine_fields_returns_fields() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/engine_fields"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("engine_fields_list.json")))
+        .mount(&server)
+        .await;
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let fields = client.list_engine_fields().await.unwrap();
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0].name, "Invoice ID");
+}
+
+#[tokio::test]
 async fn list_workspaces_returns_workspaces() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

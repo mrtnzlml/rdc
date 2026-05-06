@@ -1,0 +1,11 @@
+{
+  "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+  "results": [
+    {
+      "id": 401,
+      "url": "https://mock.rossum.app/api/v1/engines/401",
+      "name": "Invoice Engine",
+      "modified_at": "2026-04-15T08:00:00Z"
+    }
+  ]
+}

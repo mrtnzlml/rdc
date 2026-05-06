@@ -1,0 +1,21 @@
+{
+  "pagination": { "total": 2, "total_pages": 1, "next": null, "previous": null },
+  "results": [
+    {
+      "id": 11,
+      "url": "https://mock.rossum.app/api/v1/labels/11",
+      "name": "Priority High",
+      "organization": "https://mock.rossum.app/api/v1/organizations/285704",
+      "color": "#ff0000",
+      "modified_at": "2026-04-15T08:00:00Z"
+    },
+    {
+      "id": 12,
+      "url": "https://mock.rossum.app/api/v1/labels/12",
+      "name": "Needs Review",
+      "organization": "https://mock.rossum.app/api/v1/organizations/285704",
+      "color": "#ffaa00",
+      "modified_at": "2026-04-15T08:00:00Z"
+    }
+  ]
+}

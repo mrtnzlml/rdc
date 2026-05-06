@@ -1,0 +1,19 @@
+{
+  "pagination": { "total": 2, "total_pages": 1, "next": null, "previous": null },
+  "results": [
+    {
+      "id": 501,
+      "url": "https://mock.rossum.app/api/v1/engine_fields/501",
+      "name": "Invoice ID",
+      "engine": "https://mock.rossum.app/api/v1/engines/401",
+      "modified_at": "2026-04-15T08:00:00Z"
+    },
+    {
+      "id": 502,
+      "url": "https://mock.rossum.app/api/v1/engine_fields/502",
+      "name": "Total Amount",
+      "engine": "https://mock.rossum.app/api/v1/engines/401",
+      "modified_at": "2026-04-15T08:00:00Z"
+    }
+  ]
+}

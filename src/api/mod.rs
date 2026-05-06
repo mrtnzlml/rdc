@@ -92,6 +92,62 @@ impl RossumClient {
         self.get_json(&url).await
     }
 
+    pub async fn list_rules(&self) -> Result<Vec<crate::model::Rule>> {
+        let mut url = format!("{}/rules", self.base_url);
+        let mut out = Vec::new();
+        loop {
+            let page: Page<crate::model::Rule> = self.get_json(&url).await?;
+            out.extend(page.results);
+            match page.pagination.next {
+                Some(next) => url = next,
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn list_labels(&self) -> Result<Vec<crate::model::Label>> {
+        let mut url = format!("{}/labels", self.base_url);
+        let mut out = Vec::new();
+        loop {
+            let page: Page<crate::model::Label> = self.get_json(&url).await?;
+            out.extend(page.results);
+            match page.pagination.next {
+                Some(next) => url = next,
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn list_engines(&self) -> Result<Vec<crate::model::Engine>> {
+        let mut url = format!("{}/engines", self.base_url);
+        let mut out = Vec::new();
+        loop {
+            let page: Page<crate::model::Engine> = self.get_json(&url).await?;
+            out.extend(page.results);
+            match page.pagination.next {
+                Some(next) => url = next,
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn list_engine_fields(&self) -> Result<Vec<crate::model::EngineField>> {
+        let mut url = format!("{}/engine_fields", self.base_url);
+        let mut out = Vec::new();
+        loop {
+            let page: Page<crate::model::EngineField> = self.get_json(&url).await?;
+            out.extend(page.results);
+            match page.pagination.next {
+                Some(next) => url = next,
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
         let resp = self
             .http

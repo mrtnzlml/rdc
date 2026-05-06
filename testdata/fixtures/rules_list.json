@@ -1,0 +1,12 @@
+{
+  "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+  "results": [
+    {
+      "id": 2597,
+      "url": "https://mock.rossum.app/api/v1/rules/2597",
+      "name": "E-invoice Validation",
+      "queues": ["https://mock.rossum.app/api/v1/queues/100"],
+      "modified_at": "2026-04-15T08:00:00Z"
+    }
+  ]
+}
