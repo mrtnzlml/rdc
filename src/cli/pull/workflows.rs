@@ -7,7 +7,7 @@ use std::collections::HashSet;
 /// Pull all workflows. Returns `(count, conflicts)`.
 pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<(usize, usize)> {
     let workflows = skip_on_permission_denied(
-        ctx.client.list_workflows().await.context("listing workflows"),
+        ctx.client.list_workflows(Some(progress)).await.context("listing workflows"),
         "workflows",
         progress,
     )?;

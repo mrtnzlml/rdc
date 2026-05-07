@@ -53,7 +53,7 @@ pub async fn push(
             .with_context(|| format!("deserializing overlay-applied inbox '{q_slug}'"))?;
 
         let id = entry.id;
-        let remote_inbox = client.get_inbox(id).await
+        let remote_inbox = client.get_inbox(id, Some(progress)).await
             .with_context(|| format!("fetching inbox {id} to verify drift before push"))?;
         let mut remote_bytes = serde_json::to_vec_pretty(&remote_inbox)
             .context("serializing remote inbox")?;
@@ -98,7 +98,7 @@ pub async fn push(
             }
         }
 
-        let updated = client.update_inbox(id, &payload_to_send).await
+        let updated = client.update_inbox(id, &payload_to_send, Some(progress)).await
             .with_context(|| format!("PATCH /inboxes/{id}"))?;
 
         let mut updated_bytes = serde_json::to_vec_pretty(&updated)

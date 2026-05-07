@@ -10,7 +10,7 @@ use std::collections::HashSet;
 /// Pull all labels. Returns `(count, conflicts)`.
 pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<(usize, usize)> {
     let labels = skip_on_permission_denied(
-        ctx.client.list_labels().await.context("listing labels"),
+        ctx.client.list_labels(Some(progress)).await.context("listing labels"),
         "labels",
         progress,
     )?;

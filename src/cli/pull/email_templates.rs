@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 /// Returns `(count, conflicts)`.
 pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<(usize, usize)> {
     let templates = skip_on_permission_denied(
-        ctx.client.list_email_templates().await.context("listing email templates"),
+        ctx.client.list_email_templates(Some(progress)).await.context("listing email templates"),
         "email_templates",
         progress,
     )?;

@@ -57,7 +57,7 @@ pub async fn push(
 
         let id = entry.id;
         if remote_cache.is_empty() {
-            let remotes = client.list_email_templates().await
+            let remotes = client.list_email_templates(Some(progress)).await
                 .context("listing email templates to verify no drift before push")?;
             for r in remotes {
                 remote_cache.insert(r.id, r);
@@ -113,7 +113,7 @@ pub async fn push(
             }
         }
 
-        let updated = client.update_email_template(id, &payload_to_send).await
+        let updated = client.update_email_template(id, &payload_to_send, Some(progress)).await
             .with_context(|| format!("PATCH /email_templates/{id}"))?;
 
         let mut updated_bytes = serde_json::to_vec_pretty(&updated)

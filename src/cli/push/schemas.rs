@@ -66,7 +66,7 @@ pub async fn push(
         let remote_schema = if let Some(s) = remote_cache.get(&id) {
             s.clone()
         } else {
-            let s = client.get_schema(id).await
+            let s = client.get_schema(id, Some(progress)).await
                 .with_context(|| format!("fetching schema {id} to verify drift before push"))?;
             remote_cache.insert(id, s.clone());
             s
@@ -114,7 +114,7 @@ pub async fn push(
             }
         }
 
-        let updated = client.update_schema(id, &payload_to_send).await
+        let updated = client.update_schema(id, &payload_to_send, Some(progress)).await
             .with_context(|| format!("PATCH /schemas/{id}"))?;
 
         let (updated_json, updated_formulas) = serialize_schema(&updated)?;

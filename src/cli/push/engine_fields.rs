@@ -55,7 +55,7 @@ pub async fn push(
 
         let id = entry.id;
         if remote_cache.is_none() {
-            remote_cache = Some(client.list_engine_fields().await
+            remote_cache = Some(client.list_engine_fields(Some(progress)).await
                 .context("listing engine fields to verify no drift before push")?);
         }
         let Some(remote_field) = remote_cache.as_ref().unwrap().iter().find(|f| f.id == id) else {
@@ -108,7 +108,7 @@ pub async fn push(
             }
         }
 
-        let updated = match client.update_engine_field(id, &payload_to_send).await
+        let updated = match client.update_engine_field(id, &payload_to_send, Some(progress)).await
             .with_context(|| format!("PATCH /engine_fields/{id}"))
         {
             Ok(u) => u,

@@ -10,7 +10,7 @@ use std::collections::HashSet;
 /// Pull all rules. Returns `(count, conflicts)`.
 pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<(usize, usize)> {
     let rules = skip_on_permission_denied(
-        ctx.client.list_rules().await.context("listing rules"),
+        ctx.client.list_rules(Some(progress)).await.context("listing rules"),
         "rules",
         progress,
     )?;

@@ -75,7 +75,7 @@ async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) -> Res
                 Some(i) => i,
                 None => continue,
             };
-            let remote = client.get_hook(id).await
+            let remote = client.get_hook(id, None).await
                 .with_context(|| format!("fetching hook {id} for diff"))?;
             let (remote_json, remote_code) = serialize_hook(&remote)?;
 
@@ -101,7 +101,7 @@ async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) -> Res
         &paths.rules_dir(), "rules", &lockfile, &client, &mut diffs_printed,
         |c, id| Box::pin(async move {
             // Fetch via list (no get_rule single endpoint exposed).
-            let list = c.list_rules().await?;
+            let list = c.list_rules(None).await?;
             list.into_iter().find(|r| r.id == id)
                 .ok_or_else(|| anyhow!("rule id {id} not found on remote"))
         }),
@@ -109,7 +109,7 @@ async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) -> Res
     diff_flat_remote::<crate::model::Label>(
         &paths.labels_dir(), "labels", &lockfile, &client, &mut diffs_printed,
         |c, id| Box::pin(async move {
-            let list = c.list_labels().await?;
+            let list = c.list_labels(None).await?;
             list.into_iter().find(|l| l.id == id)
                 .ok_or_else(|| anyhow!("label id {id} not found on remote"))
         }),
@@ -117,7 +117,7 @@ async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) -> Res
     diff_flat_remote::<crate::model::Engine>(
         &paths.engines_dir(), "engines", &lockfile, &client, &mut diffs_printed,
         |c, id| Box::pin(async move {
-            let list = c.list_engines().await?;
+            let list = c.list_engines(None).await?;
             list.into_iter().find(|e| e.id == id)
                 .ok_or_else(|| anyhow!("engine id {id} not found on remote"))
         }),
@@ -125,7 +125,7 @@ async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) -> Res
     diff_flat_remote::<crate::model::EngineField>(
         &paths.engine_fields_dir(), "engine_fields", &lockfile, &client, &mut diffs_printed,
         |c, id| Box::pin(async move {
-            let list = c.list_engine_fields().await?;
+            let list = c.list_engine_fields(None).await?;
             list.into_iter().find(|f| f.id == id)
                 .ok_or_else(|| anyhow!("engine field id {id} not found on remote"))
         }),
@@ -157,7 +157,7 @@ async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) -> Res
                     let id = match lookup_id(&lockfile, "queues", &q_slug) {
                         Some(i) => i, None => continue,
                     };
-                    let remotes = client.list_queues().await?;
+                    let remotes = client.list_queues(None).await?;
                     if let Some(remote) = remotes.into_iter().find(|q| q.id == id) {
                         let lj = canonical_json_for_diff(&local)?;
                         let rj = canonical_json_for_diff(&remote)?;
@@ -173,7 +173,7 @@ async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) -> Res
                     let id = match lookup_id(&lockfile, "schemas", &q_slug) {
                         Some(i) => i, None => continue,
                     };
-                    let remote = client.get_schema(id).await?;
+                    let remote = client.get_schema(id, None).await?;
                     let (lj, l_formulas) = serialize_schema(&local)?;
                     let (rj, r_formulas) = serialize_schema(&remote)?;
                     let ljs = String::from_utf8_lossy(&lj);
@@ -190,7 +190,7 @@ async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) -> Res
                     let id = match lookup_id(&lockfile, "inboxes", &q_slug) {
                         Some(i) => i, None => continue,
                     };
-                    let remote = client.get_inbox(id).await?;
+                    let remote = client.get_inbox(id, None).await?;
                     let lj = canonical_json_for_diff(&local)?;
                     let rj = canonical_json_for_diff(&remote)?;
                     print_unified(&format!("inboxes/{q_slug}/inbox.json (local)"),
@@ -215,7 +215,7 @@ async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) -> Res
                             Some(i) => i, None => continue,
                         };
                         if remote_cache.is_none() {
-                            remote_cache = Some(client.list_email_templates().await?);
+                            remote_cache = Some(client.list_email_templates(None).await?);
                         }
                         if let Some(remote) = remote_cache.as_ref().unwrap().iter().find(|t| t.id == id) {
                             let lj = canonical_json_for_diff(&local)?;

@@ -67,7 +67,7 @@ pub async fn push(
         // hash. Compare to base (which was recorded post-strip on pull).
         if remote_hooks.is_none() {
             remote_hooks = Some(
-                client.list_hooks().await
+                client.list_hooks(Some(progress)).await
                     .context("listing hooks to verify no drift before push")?,
             );
         }
@@ -131,7 +131,7 @@ pub async fn push(
             }
         }
 
-        let updated = client.update_hook(id, &payload_to_send).await
+        let updated = client.update_hook(id, &payload_to_send, Some(progress)).await
             .with_context(|| format!("PATCH /hooks/{id}"))?;
 
         // Refresh local file with the post-strip canonical form (matches

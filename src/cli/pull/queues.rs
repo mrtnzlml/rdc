@@ -38,7 +38,7 @@ struct QueueWork<'a> {
 
 pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<QueueCounts> {
     let queues = skip_on_permission_denied(
-        ctx.client.list_queues().await.context("listing queues"),
+        ctx.client.list_queues(Some(progress)).await.context("listing queues"),
         "queues",
         progress,
     )?;
@@ -137,12 +137,12 @@ pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<Queu
     )
     .map(|(qid, qname, sid_opt, iid_opt)| async move {
         let schema = match sid_opt {
-            Some(sid) => Some(client.get_schema(sid).await
+            Some(sid) => Some(client.get_schema(sid, None).await
                 .with_context(|| format!("fetching schema {sid} for queue '{qname}'"))?),
             None => None,
         };
         let inbox = match iid_opt {
-            Some(iid) => Some(client.get_inbox(iid).await
+            Some(iid) => Some(client.get_inbox(iid, None).await
                 .with_context(|| format!("fetching inbox {iid} for queue '{qname}'"))?),
             None => None,
         };

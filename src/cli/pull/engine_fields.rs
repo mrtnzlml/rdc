@@ -10,7 +10,7 @@ use std::collections::HashSet;
 /// Pull all engine fields. Returns `(count, conflicts)`.
 pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<(usize, usize)> {
     let fields = skip_on_permission_denied(
-        ctx.client.list_engine_fields().await.context("listing engine fields"),
+        ctx.client.list_engine_fields(Some(progress)).await.context("listing engine fields"),
         "engine_fields",
         progress,
     )?;

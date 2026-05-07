@@ -56,7 +56,7 @@ pub async fn push(
 
         let id = entry.id;
         if remote_cache.is_empty() {
-            let remotes = client.list_queues().await
+            let remotes = client.list_queues(Some(progress)).await
                 .context("listing queues to verify no drift before push")?;
             for r in remotes {
                 remote_cache.insert(r.id, r);
@@ -112,7 +112,7 @@ pub async fn push(
             }
         }
 
-        let updated = client.update_queue(id, &payload_to_send).await
+        let updated = client.update_queue(id, &payload_to_send, Some(progress)).await
             .with_context(|| format!("PATCH /queues/{id}"))?;
 
         let mut updated_bytes = serde_json::to_vec_pretty(&updated)

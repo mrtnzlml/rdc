@@ -8,7 +8,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, org_id: u64, progress: &KindProgress) -
     progress.set_total(1);
     let org = ctx
         .client
-        .get_organization(org_id)
+        .get_organization(org_id, Some(progress))
         .await
         .with_context(|| format!("fetching organization {org_id}"))?;
 

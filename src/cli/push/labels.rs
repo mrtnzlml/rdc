@@ -57,7 +57,7 @@ pub async fn push(
             .with_context(|| format!("deserializing overlay-applied label '{slug}'"))?;
 
         if remote_labels.is_none() {
-            remote_labels = Some(client.list_labels().await
+            remote_labels = Some(client.list_labels(Some(progress)).await
                 .context("listing labels to verify no drift before push")?);
         }
         let remote_list = remote_labels.as_ref().unwrap();
@@ -112,7 +112,7 @@ pub async fn push(
             }
         }
 
-        let updated = client.update_label(id, &payload_to_send).await
+        let updated = client.update_label(id, &payload_to_send, Some(progress)).await
             .with_context(|| format!("PATCH /labels/{id}"))?;
 
         let mut updated_bytes = serde_json::to_vec_pretty(&updated)

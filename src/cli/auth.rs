@@ -50,7 +50,7 @@ pub async fn run(env: &str, token_arg: Option<String>) -> Result<()> {
     let client = RossumClient::new(env_cfg.api_base.clone(), new_token.clone())
         .context("constructing Rossum API client")?;
     let org = client
-        .get_organization(env_cfg.org_id)
+        .get_organization(env_cfg.org_id, None)
         .await
         .with_context(|| format!("validating token against {}/organizations/{}", env_cfg.api_base, env_cfg.org_id))?;
 

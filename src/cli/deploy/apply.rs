@@ -60,7 +60,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         };
         let (payload_json_full, payload_code) = crate::snapshot::hook::serialize_hook(&payload_hook)?;
         // Drift check.
-        let remote_hook = tgt_client.get_hook(tgt_id).await
+        let remote_hook = tgt_client.get_hook(tgt_id, None).await
             .with_context(|| format!("fetching tgt hook {tgt_id} for drift check"))?;
         let (remote_json_full, remote_code) = crate::snapshot::hook::serialize_hook(&remote_hook)?;
         let in_sync = {
@@ -79,7 +79,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             continue;
         }
         // PATCH.
-        tgt_client.update_hook(tgt_id, &payload_hook).await
+        tgt_client.update_hook(tgt_id, &payload_hook, None).await
             .with_context(|| format!("PATCH tgt hooks/{tgt_id} (mapped from src '{src_slug}')"))?;
         applied.hooks += 1;
     }
@@ -109,7 +109,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         let mut payload_bytes = serde_json::to_vec_pretty(&payload_rule).context("serializing payload rule")?;
         payload_bytes.push(b'\n');
         if remote_rules_cache.is_none() {
-            remote_rules_cache = Some(tgt_client.list_rules().await.context("listing tgt rules for drift check")?);
+            remote_rules_cache = Some(tgt_client.list_rules(None).await.context("listing tgt rules for drift check")?);
         }
         let cache = remote_rules_cache.as_ref().unwrap();
         let Some(remote) = cache.iter().find(|r| r.id == tgt_id) else {
@@ -127,7 +127,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         if payload_matches_remote(&payload_bytes, &remote_bytes) {
             continue;
         }
-        tgt_client.update_rule(tgt_id, &payload_rule).await
+        tgt_client.update_rule(tgt_id, &payload_rule, None).await
             .with_context(|| format!("PATCH tgt rules/{tgt_id}"))?;
         applied.rules += 1;
     }
@@ -157,7 +157,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         let mut payload_bytes = serde_json::to_vec_pretty(&payload_label).context("serializing payload label")?;
         payload_bytes.push(b'\n');
         if remote_labels_cache.is_none() {
-            remote_labels_cache = Some(tgt_client.list_labels().await.context("listing tgt labels for drift check")?);
+            remote_labels_cache = Some(tgt_client.list_labels(None).await.context("listing tgt labels for drift check")?);
         }
         let cache = remote_labels_cache.as_ref().unwrap();
         let Some(remote) = cache.iter().find(|l| l.id == tgt_id) else {
@@ -175,7 +175,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         if payload_matches_remote(&payload_bytes, &remote_bytes) {
             continue;
         }
-        tgt_client.update_label(tgt_id, &payload_label).await
+        tgt_client.update_label(tgt_id, &payload_label, None).await
             .with_context(|| format!("PATCH tgt labels/{tgt_id}"))?;
         applied.labels += 1;
     }
@@ -210,7 +210,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         let mut payload_bytes = serde_json::to_vec_pretty(&payload_queue).context("serializing payload queue")?;
         payload_bytes.push(b'\n');
         if remote_queues_cache.is_none() {
-            remote_queues_cache = Some(tgt_client.list_queues().await.context("listing tgt queues for drift check")?);
+            remote_queues_cache = Some(tgt_client.list_queues(None).await.context("listing tgt queues for drift check")?);
         }
         let cache = remote_queues_cache.as_ref().unwrap();
         let Some(remote) = cache.iter().find(|q| q.id == tgt_id) else {
@@ -228,7 +228,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         if payload_matches_remote(&payload_bytes, &remote_bytes) {
             continue;
         }
-        tgt_client.update_queue(tgt_id, &payload_queue).await
+        tgt_client.update_queue(tgt_id, &payload_queue, None).await
             .with_context(|| format!("PATCH tgt queues/{tgt_id}"))?;
         applied.queues += 1;
     }
@@ -256,7 +256,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         };
         let (payload_json_full, payload_formulas) =
             crate::snapshot::schema::serialize_schema(&payload_schema)?;
-        let remote_schema = tgt_client.get_schema(tgt_id).await
+        let remote_schema = tgt_client.get_schema(tgt_id, None).await
             .with_context(|| format!("fetching tgt schema {tgt_id} for drift check"))?;
         let (remote_json_full, remote_formulas) =
             crate::snapshot::schema::serialize_schema(&remote_schema)?;
@@ -274,7 +274,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         if payload_json_full == remote_json_full && payload_formulas == remote_formulas {
             continue;
         }
-        tgt_client.update_schema(tgt_id, &payload_schema).await
+        tgt_client.update_schema(tgt_id, &payload_schema, None).await
             .with_context(|| format!("PATCH tgt schemas/{tgt_id}"))?;
         applied.schemas += 1;
     }
@@ -307,7 +307,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         };
         let mut payload_bytes = serde_json::to_vec_pretty(&payload_inbox).context("serializing payload inbox")?;
         payload_bytes.push(b'\n');
-        let remote_inbox = tgt_client.get_inbox(tgt_id).await
+        let remote_inbox = tgt_client.get_inbox(tgt_id, None).await
             .with_context(|| format!("fetching tgt inbox {tgt_id} for drift check"))?;
         let mut remote_bytes = serde_json::to_vec_pretty(&remote_inbox).context("serializing remote inbox")?;
         remote_bytes.push(b'\n');
@@ -319,7 +319,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         if payload_matches_remote(&payload_bytes, &remote_bytes) {
             continue;
         }
-        tgt_client.update_inbox(tgt_id, &payload_inbox).await
+        tgt_client.update_inbox(tgt_id, &payload_inbox, None).await
             .with_context(|| format!("PATCH tgt inboxes/{tgt_id}"))?;
         applied.inboxes += 1;
     }
@@ -351,7 +351,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         let mut payload_bytes = serde_json::to_vec_pretty(&payload_template).context("serializing payload email template")?;
         payload_bytes.push(b'\n');
         if remote_template_cache.is_none() {
-            remote_template_cache = Some(tgt_client.list_email_templates().await
+            remote_template_cache = Some(tgt_client.list_email_templates(None).await
                 .context("listing tgt email templates for drift check")?);
         }
         let cache = remote_template_cache.as_ref().unwrap();
@@ -370,7 +370,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         if payload_matches_remote(&payload_bytes, &remote_bytes) {
             continue;
         }
-        tgt_client.update_email_template(tgt_id, &payload_template).await
+        tgt_client.update_email_template(tgt_id, &payload_template, None).await
             .with_context(|| format!("PATCH tgt email_templates/{tgt_id}"))?;
         applied.email_templates += 1;
     }
@@ -398,7 +398,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         };
         let mut payload_bytes = serde_json::to_vec_pretty(&payload_engine).context("serializing payload engine")?;
         payload_bytes.push(b'\n');
-        let remotes = tgt_client.list_engines().await.context("listing tgt engines for drift check")?;
+        let remotes = tgt_client.list_engines(None).await.context("listing tgt engines for drift check")?;
         let Some(remote) = remotes.iter().find(|e| e.id == tgt_id) else {
             eprintln!("warning: engine id {tgt_id} not found on tgt remote; skipping");
             skipped += 1;
@@ -414,7 +414,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         if payload_matches_remote(&payload_bytes, &remote_bytes) {
             continue;
         }
-        match tgt_client.update_engine(tgt_id, &payload_engine).await
+        match tgt_client.update_engine(tgt_id, &payload_engine, None).await
             .with_context(|| format!("PATCH tgt engines/{tgt_id}"))
         {
             Ok(_) => applied.engines += 1,
@@ -450,7 +450,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         };
         let mut payload_bytes = serde_json::to_vec_pretty(&payload_field).context("serializing payload engine field")?;
         payload_bytes.push(b'\n');
-        let remotes = tgt_client.list_engine_fields().await.context("listing tgt engine fields for drift check")?;
+        let remotes = tgt_client.list_engine_fields(None).await.context("listing tgt engine fields for drift check")?;
         let Some(remote) = remotes.iter().find(|f| f.id == tgt_id) else {
             eprintln!("warning: engine_field id {tgt_id} not found on tgt remote; skipping");
             skipped += 1;
@@ -466,7 +466,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         if payload_matches_remote(&payload_bytes, &remote_bytes) {
             continue;
         }
-        match tgt_client.update_engine_field(tgt_id, &payload_field).await
+        match tgt_client.update_engine_field(tgt_id, &payload_field, None).await
             .with_context(|| format!("PATCH tgt engine_fields/{tgt_id}"))
         {
             Ok(_) => applied.engine_fields += 1,

@@ -19,7 +19,7 @@ async fn list_hooks_paginates_until_done() {
         .await;
 
     let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
-    let hooks = client.list_hooks().await.unwrap();
+    let hooks = client.list_hooks(None).await.unwrap();
     assert_eq!(hooks.len(), 2);
     assert_eq!(hooks[0].name, "Validator: invoices");
     assert_eq!(hooks[1].name, "SFTP import");
@@ -36,7 +36,7 @@ async fn auth_failure_surfaces_status_error() {
         .await;
 
     let client = RossumClient::new(format!("{}/api/v1", server.uri()), "BAD".into()).unwrap();
-    let err = client.list_hooks().await.unwrap_err();
+    let err = client.list_hooks(None).await.unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("401"), "error should mention 401, got: {msg}");
 }
@@ -52,7 +52,7 @@ async fn get_organization_returns_org() {
         .await;
 
     let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
-    let org = client.get_organization(285704).await.unwrap();
+    let org = client.get_organization(285704, None).await.unwrap();
     assert_eq!(org.id, 285704);
     assert_eq!(org.name, "Acme Test Org");
 }
@@ -68,7 +68,7 @@ async fn list_queues_returns_queues() {
         .await;
 
     let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
-    let queues = client.list_queues().await.unwrap();
+    let queues = client.list_queues(None).await.unwrap();
     assert_eq!(queues.len(), 3);
     assert_eq!(queues[0].name, "Cost Invoices");
 }
@@ -82,7 +82,7 @@ async fn get_inbox_returns_inbox() {
         .mount(&server)
         .await;
     let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
-    let inbox = client.get_inbox(300).await.unwrap();
+    let inbox = client.get_inbox(300, None).await.unwrap();
     assert_eq!(inbox.id, 300);
     assert_eq!(inbox.email, "cost-invoices@mock.rossum.app");
 }
@@ -96,7 +96,7 @@ async fn get_schema_returns_schema() {
         .mount(&server)
         .await;
     let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
-    let schema = client.get_schema(200).await.unwrap();
+    let schema = client.get_schema(200, None).await.unwrap();
     assert_eq!(schema.id, 200);
     assert_eq!(schema.content.len(), 1);
 }
@@ -110,7 +110,7 @@ async fn list_rules_returns_rules() {
         .mount(&server)
         .await;
     let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
-    let rules = client.list_rules().await.unwrap();
+    let rules = client.list_rules(None).await.unwrap();
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0].name, "E-invoice Validation");
 }
@@ -124,7 +124,7 @@ async fn list_labels_returns_labels() {
         .mount(&server)
         .await;
     let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
-    let labels = client.list_labels().await.unwrap();
+    let labels = client.list_labels(None).await.unwrap();
     assert_eq!(labels.len(), 2);
     assert_eq!(labels[1].name, "Needs Review");
 }
@@ -138,7 +138,7 @@ async fn list_engines_returns_engines() {
         .mount(&server)
         .await;
     let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
-    let engines = client.list_engines().await.unwrap();
+    let engines = client.list_engines(None).await.unwrap();
     assert_eq!(engines.len(), 1);
     assert_eq!(engines[0].name, "Invoice Engine");
 }
@@ -152,7 +152,7 @@ async fn list_engine_fields_returns_fields() {
         .mount(&server)
         .await;
     let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
-    let fields = client.list_engine_fields().await.unwrap();
+    let fields = client.list_engine_fields(None).await.unwrap();
     assert_eq!(fields.len(), 2);
     assert_eq!(fields[0].name, "Invoice ID");
 }
@@ -178,7 +178,7 @@ async fn update_rule_patches_and_returns_response() {
         "name": "E-invoice Validation",
         "queues": []
     })).unwrap();
-    let updated = client.update_rule(2597, &rule).await.unwrap();
+    let updated = client.update_rule(2597, &rule, None).await.unwrap();
     assert_eq!(updated.id, 2597);
 }
 
@@ -203,7 +203,7 @@ async fn update_label_patches_and_returns_response() {
         "name": "Priority High",
         "organization": "https://mock.rossum.app/api/v1/organizations/285704"
     })).unwrap();
-    let updated = client.update_label(11, &label).await.unwrap();
+    let updated = client.update_label(11, &label, None).await.unwrap();
     assert_eq!(updated.id, 11);
 }
 
@@ -218,7 +218,7 @@ async fn update_hook_patches_and_returns_response() {
 
     let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
     let hook: rdc::model::Hook = serde_json::from_value(fixture("hook_1.json")).unwrap();
-    let updated = client.update_hook(1, &hook).await.unwrap();
+    let updated = client.update_hook(1, &hook, None).await.unwrap();
     assert_eq!(updated.id, 1);
     assert_eq!(updated.name, "Validator: invoices");
 }
@@ -232,7 +232,7 @@ async fn list_workflows_returns_workflows() {
         .mount(&server)
         .await;
     let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
-    let workflows = client.list_workflows().await.unwrap();
+    let workflows = client.list_workflows(None).await.unwrap();
     assert_eq!(workflows.len(), 1);
     assert_eq!(workflows[0].name, "AP Approval Flow");
 }
@@ -246,7 +246,7 @@ async fn list_workflow_steps_returns_steps() {
         .mount(&server)
         .await;
     let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
-    let steps = client.list_workflow_steps().await.unwrap();
+    let steps = client.list_workflow_steps(None).await.unwrap();
     assert_eq!(steps.len(), 2);
     assert_eq!(steps[1].name, "Finance Approval");
 }
@@ -260,7 +260,7 @@ async fn list_email_templates_returns_templates() {
         .mount(&server)
         .await;
     let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
-    let templates = client.list_email_templates().await.unwrap();
+    let templates = client.list_email_templates(None).await.unwrap();
     assert_eq!(templates.len(), 1);
     assert_eq!(templates[0].subject, "Your invoice was rejected");
 }
@@ -277,7 +277,7 @@ async fn data_storage_list_collections() {
     let client = DataStorageClient::new(
         format!("{}/svc/data-storage/api", server.uri()), "TEST_TOKEN".into(),
     ).unwrap();
-    let cols = client.list_collections().await.unwrap();
+    let cols = client.list_collections(None).await.unwrap();
     assert_eq!(cols.len(), 2);
     assert_eq!(cols[0].name, "vendors");
 }
@@ -293,7 +293,7 @@ async fn data_storage_list_indexes() {
     let client = DataStorageClient::new(
         format!("{}/svc/data-storage/api", server.uri()), "TEST_TOKEN".into(),
     ).unwrap();
-    let ix = client.list_indexes("vendors").await.unwrap();
+    let ix = client.list_indexes("vendors", None).await.unwrap();
     assert_eq!(ix.len(), 2);
 }
 
@@ -308,7 +308,7 @@ async fn data_storage_list_search_indexes() {
     let client = DataStorageClient::new(
         format!("{}/svc/data-storage/api", server.uri()), "TEST_TOKEN".into(),
     ).unwrap();
-    let s = client.list_search_indexes("vendors").await.unwrap();
+    let s = client.list_search_indexes("vendors", None).await.unwrap();
     assert_eq!(s.len(), 1);
 }
 
@@ -327,7 +327,7 @@ async fn data_storage_returns_error_on_non_ok_envelope() {
     let client = DataStorageClient::new(
         format!("{}/svc/data-storage/api", server.uri()), "TEST_TOKEN".into(),
     ).unwrap();
-    let err = client.list_collections().await.unwrap_err();
+    let err = client.list_collections(None).await.unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("internal_error"), "msg: {msg}");
     assert!(msg.contains("boom"), "msg: {msg}");
@@ -354,7 +354,7 @@ async fn retries_on_429_then_succeeds() {
         .await;
 
     let client = RossumClient::new(format!("{}/api/v1", server.uri()), "T".into()).unwrap();
-    let org = client.get_organization(1).await.unwrap();
+    let org = client.get_organization(1, None).await.unwrap();
     // The 200 response uses fixture organization id 285704; we just care
     // that the retry succeeded (request didn't surface the 429 to the caller).
     assert_eq!(org.id, 285704);
@@ -378,7 +378,7 @@ async fn retries_on_503_then_succeeds() {
         .await;
 
     let client = RossumClient::new(format!("{}/api/v1", server.uri()), "T".into()).unwrap();
-    let org = client.get_organization(1).await.unwrap();
+    let org = client.get_organization(1, None).await.unwrap();
     assert_eq!(org.id, 285704);
 }
 
@@ -393,7 +393,7 @@ async fn does_not_retry_on_500() {
         .await;
 
     let client = RossumClient::new(format!("{}/api/v1", server.uri()), "T".into()).unwrap();
-    let err = client.get_organization(1).await.unwrap_err();
+    let err = client.get_organization(1, None).await.unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("500"), "msg: {msg}");
 }
@@ -409,7 +409,7 @@ async fn does_not_retry_on_404() {
         .await;
 
     let client = RossumClient::new(format!("{}/api/v1", server.uri()), "T".into()).unwrap();
-    let err = client.get_organization(1).await.unwrap_err();
+    let err = client.get_organization(1, None).await.unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("404"), "msg: {msg}");
 }
@@ -425,7 +425,7 @@ async fn list_workspaces_returns_workspaces() {
         .await;
 
     let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
-    let workspaces = client.list_workspaces().await.unwrap();
+    let workspaces = client.list_workspaces(None).await.unwrap();
     assert_eq!(workspaces.len(), 2);
     assert_eq!(workspaces[0].name, "Invoices AP");
     assert_eq!(workspaces[1].name, "Purchase Orders");

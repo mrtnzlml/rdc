@@ -14,7 +14,7 @@ use std::collections::HashSet;
 /// Returns the number of workspaces pulled.
 pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, progress: &KindProgress) -> Result<usize> {
     let workspaces = skip_on_permission_denied(
-        ctx.client.list_workspaces().await.context("listing workspaces"),
+        ctx.client.list_workspaces(Some(progress)).await.context("listing workspaces"),
         "workspaces",
         progress,
     )?;

@@ -12,7 +12,7 @@ use std::collections::HashSet;
 /// Pull all hooks. Returns `(count, conflicts)`.
 pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<(usize, usize)> {
     let hooks = skip_on_permission_denied(
-        ctx.client.list_hooks().await.context("listing hooks"),
+        ctx.client.list_hooks(Some(progress)).await.context("listing hooks"),
         "hooks",
         progress,
     )?;

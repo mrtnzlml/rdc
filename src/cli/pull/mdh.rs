@@ -25,7 +25,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str, progr
     let client = DataStorageClient::new(base, token.to_string())
         .context("constructing Data Storage client")?;
 
-    let collections = match client.list_collections().await {
+    let collections = match client.list_collections(Some(progress)).await {
         Ok(c) => c,
         Err(e) if anyhow_has_status(&e, 404) => {
             // MDH not enabled on this cluster — quietly skip, matching the
@@ -91,9 +91,9 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str, progr
         dataset_dirs.iter().map(|(slug, _, c)| (slug.clone(), c.name.clone()))
     )
     .map(|(slug, name)| async move {
-        let regular = client_ref.list_indexes(&name).await
+        let regular = client_ref.list_indexes(&name, None).await
             .with_context(|| format!("listing indexes for '{name}'"))?;
-        let search = client_ref.list_search_indexes(&name).await
+        let search = client_ref.list_search_indexes(&name, None).await
             .with_context(|| format!("listing search indexes for '{name}'"))?;
         Ok::<_, anyhow::Error>((slug, IndexSet { regular, search }))
     })

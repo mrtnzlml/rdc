@@ -58,7 +58,7 @@ pub async fn push(
             .with_context(|| format!("deserializing overlay-applied rule '{slug}'"))?;
 
         if remote_rules.is_none() {
-            remote_rules = Some(client.list_rules().await
+            remote_rules = Some(client.list_rules(Some(progress)).await
                 .context("listing rules to verify no drift before push")?);
         }
         let remote_list = remote_rules.as_ref().unwrap();
@@ -110,7 +110,7 @@ pub async fn push(
             }
         }
 
-        let updated = client.update_rule(id, &payload_to_send).await
+        let updated = client.update_rule(id, &payload_to_send, Some(progress)).await
             .with_context(|| format!("PATCH /rules/{id}"))?;
 
         let mut updated_bytes = serde_json::to_vec_pretty(&updated)
