@@ -4,19 +4,21 @@
 disk for AI-assisted local development, lets you edit them in place, and
 deploys them across environments.
 
-**Status:** M28. Pull all kinds (incl. MDH collections + indexes —
+**Status:** M29. Pull all kinds (incl. MDH collections + indexes —
 data storage URL derived from `api_base`, no extra config); push
 and deploy for hooks, rules, labels, queues, schemas (formula
 bodies round-trip), inboxes, email templates, engines, and engine
 fields. Overlays are bidirectional: applied on push, stripped on
-pull (spec §9.3). `_index.md` includes per-kind inventory plus a
-cross-references section that resolves `hook → queues`, `rule →
-queues`, `email_template → queue`. `rdc init` accepts flags or
-runs an interactive wizard; `rdc status` for a read-only health
-check; `rdc diff` for unified diffs (local vs remote, or two
-snapshots); `rdc auth` to set/refresh tokens; `rdc repair
---rebuild-lock` for lockfile recovery. Distributable via `curl |
-sh` or `cargo install`. See
+pull (spec §9.3). `rdc apply` rewrites cross-reference URLs from
+src to tgt, refuses to PATCH on tgt drift, and skips no-op
+deploys (idempotent). `_index.md` includes per-kind inventory
+plus a cross-references section that resolves `hook → queues`,
+`rule → queues`, `email_template → queue`. `rdc init` accepts
+flags or runs an interactive wizard; `rdc status` for a
+read-only health check; `rdc diff` for unified diffs (local vs
+remote, or two snapshots); `rdc auth` to set/refresh tokens;
+`rdc repair --rebuild-lock` for lockfile recovery. Distributable
+via `curl | sh` or `cargo install`. See
 `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full
 design.
 
@@ -388,12 +390,23 @@ queue's slug. For email templates, the key is the compound
 wherever both src and tgt have an object with the same key; you
 hand-edit for renames.
 
+**Apply is conservative and idempotent (M29):**
+- **URL rewriting.** Cross-references (hook.queues, queue.schema,
+  email_template.queue, etc.) get rewritten from src URLs to tgt
+  URLs via the lockfiles + mapping. Strings that don't match a
+  known src object are left alone.
+- **Drift detection.** Before each PATCH, apply fetches the tgt
+  remote and compares its post-overlay-strip hash to the tgt
+  lockfile. If they differ, someone changed tgt since you last
+  pulled it — apply skips that object with a warning instructing
+  you to `rdc pull <tgt>` first.
+- **Idempotency.** If the post-overlay payload already equals the
+  tgt remote, apply skips the PATCH. Re-running `rdc apply` on an
+  in-sync deploy results in `0 PATCHes`. Verified live with 256
+  mapped objects → 0 API calls.
+
 **Limitations:**
 - Updates only (no creates / deletes).
-- No drift detection between local tgt snapshot and remote tgt.
-- Apply is not idempotent — every run PATCHes mapped objects.
-- Overlays apply unconditionally; they override even if src has the
-  same value.
 
 ## Authentication
 

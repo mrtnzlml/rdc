@@ -113,6 +113,26 @@ impl Lockfile {
         }
         None
     }
+
+    /// Multi-kind reverse lookup: given a URL, find which `(kind, slug)`
+    /// owns it. Used by `rdc apply` to rewrite cross-references in a
+    /// payload from src URLs to tgt URLs (M29).
+    pub fn lookup_url(&self, url: &str) -> Option<(&str, &str)> {
+        for (kind, entries) in &self.objects {
+            for (slug, entry) in entries {
+                if entry.url.as_deref() == Some(url) {
+                    return Some((kind.as_str(), slug.as_str()));
+                }
+            }
+        }
+        None
+    }
+
+    /// Recover the URL for a given `(kind, slug)`. Returns `None` if
+    /// either the kind isn't tracked or the entry has no URL recorded.
+    pub fn url_for_slug(&self, kind: &str, slug: &str) -> Option<&str> {
+        self.objects.get(kind)?.get(slug)?.url.as_deref()
+    }
 }
 
 /// Compute a stable SHA-256 over canonical JSON bytes. Hex-encoded.

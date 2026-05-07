@@ -66,7 +66,19 @@ async fn map_plan_apply_full_flow() {
             }
         ]
     });
-    mount_full_pull(&prod_server, prod_hooks).await;
+    mount_full_pull(&prod_server, prod_hooks.clone()).await;
+
+    // M29 drift check: apply does GET /hooks/{id} per object — mock both.
+    let prod_hook_401 = prod_hooks["results"][0].clone();
+    let prod_hook_402 = prod_hooks["results"][1].clone();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks/401"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(prod_hook_401))
+        .mount(&prod_server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks/402"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(prod_hook_402))
+        .mount(&prod_server).await;
 
     let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
     let captured_clone = captured.clone();
@@ -125,6 +137,10 @@ async fn map_plan_apply_full_flow() {
         .stdout(predicate::str::contains("validator-invoices"))
         .stdout(predicate::str::contains("(id 401)"));
 
+    // Realistic workflow: set overlay BEFORE pull so the lockfile records
+    // the stripped hash. Pulling here re-baselines prod's lockfile with the
+    // overlay-stripped form (this is the same caveat that's documented in
+    // the README for "overlay added after first pull").
     std::fs::write(
         project.path().join("envs/prod/overlay.toml"),
         r#"
@@ -134,6 +150,10 @@ version = 1
 "name" = "Validator (PROD)"
 "#,
     ).unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "prod"])
+        .assert().success();
 
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
@@ -258,13 +278,28 @@ async fn deploy_queue_and_schema() {
         .args(["pull", "prod"])
         .assert().success();
 
-    // Edit test queue + schema formula to differ from prod.
+    // Edit test queue + schema formula to differ from prod (so apply has
+    // a real change to push; M29 idempotency would otherwise correctly
+    // skip the no-diff cases).
     let queue_path = project.path()
         .join("envs/test/workspaces/invoices-ap/queues/cost-invoices/queue.json");
     let raw = std::fs::read_to_string(&queue_path).unwrap();
     let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
     v["default_score_threshold"] = serde_json::json!(0.99);
     std::fs::write(&queue_path, format!("{}\n", serde_json::to_string_pretty(&v).unwrap())).unwrap();
+
+    // Edit test schema's first formula so it differs from prod's schema.
+    let formula_dir = project.path()
+        .join("envs/test/workspaces/invoices-ap/queues/cost-invoices/formulas");
+    if formula_dir.exists() {
+        for entry in std::fs::read_dir(&formula_dir).unwrap().flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("py") {
+                std::fs::write(&p, "amount_due * 1.21\n").unwrap();
+                break;
+            }
+        }
+    }
 
     // Map.
     Command::cargo_bin("rdc").unwrap()
