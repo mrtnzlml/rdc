@@ -53,6 +53,30 @@ impl RossumClient {
         Ok(out)
     }
 
+    /// PATCH /hooks/{id} with the given hook body. Returns the server's
+    /// authoritative response (including server-set fields like modified_at).
+    pub async fn update_hook(&self, id: u64, hook: &Hook) -> Result<Hook> {
+        let url = format!("{}/hooks/{id}", self.base_url);
+        let resp = self
+            .http
+            .patch(&url)
+            .header("Authorization", format!("token {}", self.token))
+            .json(hook)
+            .send()
+            .await
+            .with_context(|| format!("PATCH {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ApiError::Status { status: status.as_u16(), body }.into());
+        }
+        let value = resp
+            .json::<Hook>()
+            .await
+            .with_context(|| format!("decoding PATCH response from {url}"))?;
+        Ok(value)
+    }
+
     pub async fn get_organization(&self, id: u64) -> Result<crate::model::Organization> {
         let url = format!("{}/organizations/{id}", self.base_url);
         self.get_json(&url).await

@@ -5,7 +5,7 @@ use crate::secrets::resolve_token;
 use crate::state::Lockfile;
 use anyhow::{anyhow, Context, Result};
 
-mod common;
+pub(crate) mod common;
 mod email_templates;
 mod engine_fields;
 mod engines;
