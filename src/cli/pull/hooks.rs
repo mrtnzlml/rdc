@@ -1,8 +1,8 @@
-use super::common::{apply_pull_action, decide_pull_action, record_object, PullAction, PullCtx};
+use super::common::{apply_pull_action, record_object, PullAction, PullCtx};
 use crate::slug::slugify_unique;
-use crate::snapshot::hook::write_hook_code;
+use crate::snapshot::hook::{serialize_hook, write_hook_code};
+use crate::state::hook_combined_hash;
 use anyhow::{Context, Result};
-use serde_json::Value;
 use std::collections::HashSet;
 
 /// Pull all hooks. Returns `(count, conflicts)`.
@@ -18,48 +18,83 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
                 .with_context(|| format!("creating {}", ctx.paths.hooks_dir().display()))?;
             dir_created = true;
         }
-        // Reuse existing slug if this object has been pulled before (by ID),
-        // so remote renames don't create new files / orphan old ones.
+
         let slug = match ctx.lockfile.slug_for_id("hooks", hook.id) {
             Some(existing) => existing.to_string(),
             None => slugify_unique(&hook.name, &used_slugs),
         };
         used_slugs.insert(slug.clone());
 
-        // Build the JSON body the same way the codec would (without `code`).
-        let mut json_value = serde_json::to_value(hook).context("serializing hook")?;
-        let code = json_value
-            .get_mut("config")
-            .and_then(|c| c.as_object_mut())
-            .and_then(|m| m.remove("code"))
-            .and_then(|v| match v {
-                Value::String(s) => Some(s),
-                _ => None,
-            });
-        let mut proposed = serde_json::to_vec_pretty(&json_value)
-            .context("serializing hook json")?;
-        proposed.push(b'\n');
+        let (proposed_json, proposed_code) = serialize_hook(hook)?;
 
         let local_path = ctx.paths.hooks_dir().join(format!("{slug}.json"));
+        let py_path = ctx.paths.hooks_dir().join(format!("{slug}.py"));
+        let pre_local_json = if local_path.exists() {
+            Some(std::fs::read(&local_path)
+                .with_context(|| format!("reading {}", local_path.display()))?)
+        } else {
+            None
+        };
+        let pre_local_code = if py_path.exists() {
+            Some(std::fs::read_to_string(&py_path)
+                .with_context(|| format!("reading {}", py_path.display()))?)
+        } else {
+            None
+        };
+
+        let remote_combined_hash = hook_combined_hash(&proposed_json, &proposed_code);
+
         let base_hash = ctx
             .lockfile
             .objects
             .get("hooks")
             .and_then(|m| m.get(&slug))
             .and_then(|e| e.content_hash.clone());
+        let action = match (base_hash.as_deref(), &pre_local_json) {
+            (None, _) => PullAction::Write,
+            (_, None) => PullAction::Write,
+            (Some(base), Some(local_json)) => {
+                let local_combined = hook_combined_hash(local_json, &pre_local_code);
+                let local_matches = local_combined == base;
+                let remote_matches = remote_combined_hash == base;
+                match (local_matches, remote_matches) {
+                    (true, _) => PullAction::Write,
+                    (false, true) => PullAction::KeepLocal,
+                    (false, false) => PullAction::Conflict,
+                }
+            }
+        };
 
-        let (action, remote_hash) =
-            decide_pull_action(&local_path, base_hash.as_deref(), &proposed)?;
         if action == PullAction::Conflict {
             conflicts += 1;
         }
-        let recorded_hash = apply_pull_action(action, &local_path, &proposed, remote_hash)?;
 
-        // Hook code (.py) is always overwritten — out of M7 three-way scope.
-        if let Some(code) = code {
-            write_hook_code(&ctx.paths.hooks_dir(), &slug, &code)
-                .with_context(|| format!("writing hook code for '{}'", hook.name))?;
-        }
+        let recorded_hash = match action {
+            PullAction::Write => {
+                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone())?;
+                if let Some(code) = &proposed_code {
+                    write_hook_code(&ctx.paths.hooks_dir(), &slug, code)
+                        .with_context(|| format!("writing hook code for '{}'", hook.name))?;
+                } else if py_path.exists() {
+                    std::fs::remove_file(&py_path)
+                        .with_context(|| format!("removing stale {}", py_path.display()))?;
+                }
+                remote_combined_hash
+            }
+            PullAction::KeepLocal => {
+                let local_json = pre_local_json.as_ref().unwrap();
+                hook_combined_hash(local_json, &pre_local_code)
+            }
+            PullAction::Conflict => {
+                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone())?;
+                if let Some(code) = &proposed_code {
+                    let py_remote_path = ctx.paths.hooks_dir().join(format!("{slug}.py.remote"));
+                    crate::snapshot::writer::write_atomic(&py_remote_path, code.as_bytes())?;
+                }
+                let local_json = pre_local_json.as_ref().unwrap();
+                hook_combined_hash(local_json, &pre_local_code)
+            }
+        };
 
         record_object(
             ctx.lockfile,
