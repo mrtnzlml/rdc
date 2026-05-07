@@ -177,6 +177,92 @@ fn run_editor_with_markers(local: &[u8], remote: &[u8]) -> Result<Vec<u8>> {
     Ok(edited)
 }
 
+/// Resolve a single sub-file within a combined-hash entity (hook
+/// `.json`/`.py`, schema `schema.json`/formulas/`<id>.py`). M33 / spec §8.3.
+///
+/// The caller passes the in-memory bytes for both sides. Behavior:
+///
+/// - `local_bytes == remote_bytes` → no-op (no prompt, no write); returns
+///   `local_bytes`.
+/// - `interactive == false` → legacy shadow-file: writes
+///   `<local_path>.remote`, keeps local on disk, returns `local_bytes`.
+/// - `interactive == true && bytes differ` → prompt the user via
+///   [`prompt_resolve`] with `[label_index/label_total]`. On Skip / Keep
+///   semantics match [`apply_pull_action`]. On Abort: propagate
+///   [`PullAborted`] so the caller bubbles up.
+///
+/// Returns the bytes that are now on disk for `local_path`. The caller
+/// uses these to compute the entity's combined hash.
+pub fn resolve_combined_file(
+    label_index: usize,
+    label_total: usize,
+    local_path: &Path,
+    local_bytes: &[u8],
+    remote_bytes: &[u8],
+    interactive: bool,
+) -> Result<Vec<u8>> {
+    use crate::snapshot::writer::write_atomic;
+
+    if local_bytes == remote_bytes {
+        return Ok(local_bytes.to_vec());
+    }
+
+    if !interactive {
+        let conflict_path = shadow_path_for(local_path);
+        write_atomic(&conflict_path, remote_bytes)?;
+        eprintln!(
+            "warning: {} conflict — local preserved, remote at {}",
+            local_path.display(),
+            conflict_path.display()
+        );
+        return Ok(local_bytes.to_vec());
+    }
+
+    let stdin = std::io::stdin();
+    let stderr = std::io::stderr();
+    let resolution = prompt_resolve(
+        stdin.lock(),
+        stderr.lock(),
+        label_index,
+        label_total,
+        local_path,
+        remote_bytes,
+    )?;
+    match resolution {
+        Resolution::KeepLocal => Ok(local_bytes.to_vec()),
+        Resolution::KeepRemote => {
+            write_atomic(local_path, remote_bytes)?;
+            Ok(remote_bytes.to_vec())
+        }
+        Resolution::Edit(edited) => {
+            write_atomic(local_path, &edited)?;
+            Ok(edited)
+        }
+        Resolution::Skip => {
+            let conflict_path = shadow_path_for(local_path);
+            write_atomic(&conflict_path, remote_bytes)?;
+            eprintln!(
+                "warning: {} conflict — local preserved, remote at {}",
+                local_path.display(),
+                conflict_path.display()
+            );
+            Ok(local_bytes.to_vec())
+        }
+        Resolution::Abort => Err(anyhow::Error::new(PullAborted)),
+    }
+}
+
+/// Compute the `<file>.remote` shadow path for a given local file.
+fn shadow_path_for(local_path: &Path) -> std::path::PathBuf {
+    let mut conflict_path = local_path.to_path_buf();
+    let new_name = match conflict_path.file_name().and_then(|s| s.to_str()) {
+        Some(name) => format!("{name}.remote"),
+        None => "remote".to_string(),
+    };
+    conflict_path.set_file_name(new_name);
+    conflict_path
+}
+
 /// Sentinel error type signaling the user picked `[a]bort`. The pull
 /// runner downcasts to this and skips lockfile.save().
 #[derive(Debug, thiserror::Error)]
@@ -298,5 +384,40 @@ mod tests {
         assert!(!is_interactive(false));
         // --yes always returns false regardless of TTY.
         assert!(!is_interactive(true));
+    }
+
+    #[test]
+    fn resolve_combined_file_noop_when_equal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("a.py");
+        std::fs::write(&path, b"same\n").unwrap();
+        let out = resolve_combined_file(1, 2, &path, b"same\n", b"same\n", true).unwrap();
+        assert_eq!(out, b"same\n");
+        // No shadow file written.
+        assert!(!dir.path().join("a.py.remote").exists());
+    }
+
+    #[test]
+    fn resolve_combined_file_writes_shadow_when_non_interactive() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("a.py");
+        std::fs::write(&path, b"local\n").unwrap();
+        let out = resolve_combined_file(1, 1, &path, b"local\n", b"remote\n", false).unwrap();
+        assert_eq!(out, b"local\n");
+        assert_eq!(std::fs::read(dir.path().join("a.py.remote")).unwrap(), b"remote\n");
+        // Local file untouched.
+        assert_eq!(std::fs::read(&path).unwrap(), b"local\n");
+    }
+
+    #[test]
+    fn shadow_path_inserts_remote_suffix() {
+        let p = std::path::PathBuf::from("/tmp/x/y.json");
+        assert_eq!(shadow_path_for(&p), std::path::PathBuf::from("/tmp/x/y.json.remote"));
+    }
+
+    #[test]
+    fn shadow_path_for_py_extension() {
+        let p = std::path::PathBuf::from("/tmp/formulas/123.py");
+        assert_eq!(shadow_path_for(&p), std::path::PathBuf::from("/tmp/formulas/123.py.remote"));
     }
 }
