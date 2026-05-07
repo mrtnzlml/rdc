@@ -1,137 +1,168 @@
-//! Per-kind progress UX during pull/push.
+//! Overall progress UX during pull/push.
 //!
-//! - TTY: `indicatif` spinner → bar with ETA.
-//! - Non-TTY (CI, piped): plain `→ kind: …` then `✓ kind: N items, Xs` lines.
-//!
-//! Drivers receive a thin `&KindProgress` handle. Drop emits the done-line.
+//! - TTY: a single `indicatif` bar with a phase label that swaps as
+//!   drivers run. Warnings print above the bar via `println` (cleanly
+//!   redrawn). Cheap `Arc` clone for use inside concurrent closures.
+//! - Non-TTY (CI, piped): plain `→ phase: …` then `✓ phase: N items, Xs`
+//!   lines per phase. The same shape integration tests have asserted on.
 
-use std::io::IsTerminal;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// One progress UX surface for one pull/push kind.
-pub struct KindProgress {
+/// Cheaply cloneable handle to the run-wide progress UX. Wrap your only
+/// instance in `Arc<OverallProgress>` and clone it everywhere — concurrent
+/// closures included.
+pub struct OverallProgress {
     inner: Mutex<Inner>,
 }
 
 enum Inner {
     Bar {
-        kind: String,
+        title: String,
         started: Instant,
         bar: indicatif::ProgressBar,
+        current_phase: Option<String>,
+        phase_started: Option<Instant>,
+        phase_count: AtomicU64,
         orphans: AtomicUsize,
         finished: bool,
     },
     Log {
-        kind: String,
+        title: String,
         started: Instant,
-        count: AtomicU64,
+        current_phase: Option<String>,
+        phase_started: Option<Instant>,
+        phase_count: AtomicU64,
+        total_count: AtomicU64,
         orphans: AtomicUsize,
         finished: bool,
     },
 }
 
-impl KindProgress {
-    /// Create a new progress surface for `kind`. Auto-detects TTY and
-    /// chooses Bar or Log mode. The starting line is emitted immediately.
-    /// `kind` is owned (`String`) so dynamic prefixes like
-    /// `format!("push envs/{env}")` work alongside the common
-    /// `"workspaces"` static literals.
-    pub fn start(kind: impl Into<String>) -> Self {
-        let kind: String = kind.into();
-        if std::io::stderr().is_terminal() {
-            let bar = indicatif::ProgressBar::new_spinner();
-            bar.set_prefix(kind.clone());
-            bar.set_style(
-                indicatif::ProgressStyle::with_template("{spinner} {prefix}  listing…")
-                    .unwrap(),
-            );
-            bar.enable_steady_tick(std::time::Duration::from_millis(100));
-            Self {
-                inner: Mutex::new(Inner::Bar {
-                    kind,
-                    started: Instant::now(),
-                    bar,
-                    orphans: AtomicUsize::new(0),
-                    finished: false,
-                }),
-            }
-        } else {
-            eprintln!("→ {kind}: listing…");
-            Self {
-                inner: Mutex::new(Inner::Log {
-                    kind,
-                    started: Instant::now(),
-                    count: AtomicU64::new(0),
-                    orphans: AtomicUsize::new(0),
-                    finished: false,
-                }),
-            }
-        }
-    }
-
-    /// Switch from spinner-only to bar with denominator `n`. Called once
-    /// per kind, after `list_*` returns.
-    pub fn set_total(&self, n: u64) {
-        let inner = self.inner.lock().unwrap();
-        if let Inner::Bar { bar, .. } = &*inner {
-            bar.set_length(n);
+impl OverallProgress {
+    /// Create the run-wide progress. `title` is the prefix line, e.g.
+    /// `"pull envs/dev"` or `"push envs/dev"`.
+    pub fn start(title: impl Into<String>) -> Arc<Self> {
+        let title: String = title.into();
+        let inner = if std::io::stderr().is_terminal() {
+            let bar = indicatif::ProgressBar::new(0);
+            bar.set_prefix(title.clone());
             bar.set_style(
                 indicatif::ProgressStyle::with_template(
-                    "{spinner} {prefix}  [{wide_bar}] {pos}/{len}  ETA {eta}",
+                    "{spinner} {prefix}  [{wide_bar}] {pos}/{len}  ETA {eta}\n  ↳ {msg}",
                 )
                 .unwrap(),
             );
-        }
-        // Log mode: nothing to do here — count() is what we report.
+            bar.set_message("discovering items…");
+            bar.enable_steady_tick(std::time::Duration::from_millis(100));
+            Inner::Bar {
+                title,
+                started: Instant::now(),
+                bar,
+                current_phase: None,
+                phase_started: None,
+                phase_count: AtomicU64::new(0),
+                orphans: AtomicUsize::new(0),
+                finished: false,
+            }
+        } else {
+            eprintln!("→ {title}: discovering items…");
+            Inner::Log {
+                title,
+                started: Instant::now(),
+                current_phase: None,
+                phase_started: None,
+                phase_count: AtomicU64::new(0),
+                total_count: AtomicU64::new(0),
+                orphans: AtomicUsize::new(0),
+                finished: false,
+            }
+        };
+        Arc::new(Self { inner: Mutex::new(inner) })
     }
 
-    /// Advance by one item.
-    pub fn tick(&self) {
+    /// Increase the bar's total denominator by `n`. Call this each time a
+    /// phase reports its newly-listed item count, before any of those
+    /// items get processed.
+    pub fn inc_total(&self, n: u64) {
+        let inner = self.inner.lock().unwrap();
+        if let Inner::Bar { bar, .. } = &*inner {
+            bar.inc_length(n);
+        }
+        // Log mode: nothing to do; total is implicit.
+    }
+
+    /// Switch to a new phase. Emits a per-phase done-line (in log mode) or
+    /// updates the bar's sub-label (in TTY mode) for the previous phase
+    /// before transitioning. The phase counter resets.
+    ///
+    /// Returns the (count, orphans, duration) of the phase that just
+    /// ended, or None if this is the first phase.
+    pub fn start_phase(&self, name: impl Into<String>) -> Option<(u64, usize, std::time::Duration)> {
+        let mut inner = self.inner.lock().unwrap();
+        let (prev, ended_stats) = end_current_phase(&mut inner);
+        let name: String = name.into();
+        match &mut *inner {
+            Inner::Bar { current_phase, phase_started, phase_count, .. } => {
+                *current_phase = Some(name.clone());
+                *phase_started = Some(Instant::now());
+                phase_count.store(0, Ordering::Relaxed);
+            }
+            Inner::Log { current_phase, phase_started, phase_count, .. } => {
+                *current_phase = Some(name.clone());
+                *phase_started = Some(Instant::now());
+                phase_count.store(0, Ordering::Relaxed);
+                eprintln!("→ {name}: starting");
+            }
+        }
+        let _ = prev;
+        ended_stats
+    }
+
+    /// Advance the bar by one and update the sub-label to `item`. Safe to
+    /// call from concurrent closures (Arc + Mutex serializes; indicatif's
+    /// inc/set_message are thread-safe internally).
+    pub fn tick(&self, item: impl AsRef<str>) {
         let inner = self.inner.lock().unwrap();
         match &*inner {
-            Inner::Bar { bar, .. } => bar.inc(1),
-            Inner::Log { count, .. } => {
-                count.fetch_add(1, Ordering::Relaxed);
+            Inner::Bar { bar, current_phase, phase_count, .. } => {
+                phase_count.fetch_add(1, Ordering::Relaxed);
+                bar.inc(1);
+                let phase = current_phase.as_deref().unwrap_or("");
+                let item = item.as_ref();
+                bar.set_message(format!("{phase}: {item}"));
+            }
+            Inner::Log { phase_count, total_count, .. } => {
+                phase_count.fetch_add(1, Ordering::Relaxed);
+                total_count.fetch_add(1, Ordering::Relaxed);
+                let _ = item;
             }
         }
     }
 
-    /// Increment the orphan-skipped counter (does not advance the main tick).
+    /// Increment the orphan-skipped counter (does not advance the bar).
     pub fn skipped_orphan(&self) {
         let inner = self.inner.lock().unwrap();
         match &*inner {
-            Inner::Bar { orphans, .. } => {
-                orphans.fetch_add(1, Ordering::Relaxed);
-            }
-            Inner::Log { orphans, .. } => {
-                orphans.fetch_add(1, Ordering::Relaxed);
-            }
+            Inner::Bar { orphans, .. } => { orphans.fetch_add(1, Ordering::Relaxed); }
+            Inner::Log { orphans, .. } => { orphans.fetch_add(1, Ordering::Relaxed); }
         }
     }
 
-    /// Run `f` with the bar paused (in TTY mode), so the bar redraws
-    /// cleanly after stderr text. In log mode, `f` runs unchanged.
-    pub fn suspend<F: FnOnce()>(&self, f: F) {
+    /// Print a line above the bar (TTY) or to stderr (log). Use for
+    /// retry warnings, conflict notes, drift refusals, etc. Replaces the
+    /// older `suspend(|| eprintln!(...))` idiom.
+    pub fn println(&self, msg: impl AsRef<str>) {
         let inner = self.inner.lock().unwrap();
+        let msg = msg.as_ref();
         match &*inner {
-            Inner::Bar { bar, .. } => bar.suspend(f),
-            Inner::Log { .. } => f(),
+            Inner::Bar { bar, .. } => bar.println(msg),
+            Inner::Log { .. } => eprintln!("{msg}"),
         }
     }
 
-    /// Explicitly finish the bar/log line, emitting the `✓` done-line.
-    /// Called from the orchestrator after a successful driver run; on
-    /// driver-error the Drop impl skips the done-line so failed kinds
-    /// don't show `✓`.
-    pub fn finish(self) {
-        let mut inner = self.inner.lock().unwrap();
-        emit_done(&mut inner);
-    }
-
-    /// Read the current orphan-skipped count. Useful for accumulation in
-    /// the parent runner's stats struct.
+    /// Read the current orphan count. Useful for the final summary line.
     pub fn orphans(&self) -> usize {
         let inner = self.inner.lock().unwrap();
         match &*inner {
@@ -139,50 +170,77 @@ impl KindProgress {
             Inner::Log { orphans, .. } => orphans.load(Ordering::Relaxed),
         }
     }
-}
 
-impl Drop for KindProgress {
-    fn drop(&mut self) {
+    /// Read the bar's current position (total items processed across all
+    /// phases). Useful for the final summary line.
+    pub fn total_processed(&self) -> u64 {
+        let inner = self.inner.lock().unwrap();
+        match &*inner {
+            Inner::Bar { bar, .. } => bar.position(),
+            Inner::Log { total_count, .. } => total_count.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Finish the run. Closes the current phase, then the bar/log. Caller
+    /// holds the only `Arc<OverallProgress>` clone; we cannot consume
+    /// `self` (Arc forbids it), so this leaves `inner.finished = true`
+    /// and Drop is a no-op.
+    pub fn finish(&self) {
         let mut inner = self.inner.lock().unwrap();
-        // Suppress done-line on drop when not explicitly finished.
+        let _ended = end_current_phase(&mut inner);
         match &mut *inner {
-            Inner::Bar { bar, finished, .. } if !*finished => {
+            Inner::Bar { bar, finished, .. } => {
+                *finished = true;
                 bar.finish_and_clear();
             }
-            Inner::Log { finished, .. } if !*finished => {
-                // Nothing — caller bailed without emitting a done-line.
+            Inner::Log { finished, .. } => {
+                *finished = true;
             }
-            _ => {}
         }
     }
 }
 
-fn emit_done(inner: &mut Inner) {
+impl Drop for OverallProgress {
+    fn drop(&mut self) {
+        let inner = self.inner.try_lock();
+        if let Ok(mut inner) = inner {
+            let already_finished = matches!(
+                &*inner,
+                Inner::Bar { finished: true, .. } | Inner::Log { finished: true, .. }
+            );
+            if !already_finished {
+                if let Inner::Bar { bar, .. } = &*inner {
+                    bar.finish_and_clear();
+                }
+                let _ = end_current_phase(&mut inner);
+            }
+        }
+    }
+}
+
+fn end_current_phase(inner: &mut Inner) -> (Option<String>, Option<(u64, usize, std::time::Duration)>) {
     match inner {
-        Inner::Bar { kind, started, bar, orphans, finished } => {
-            *finished = true;
+        Inner::Bar { current_phase, phase_started, phase_count, orphans, .. } => {
+            let Some(name) = current_phase.take() else { return (None, None); };
+            let started = phase_started.take().unwrap_or_else(Instant::now);
             let dur = started.elapsed();
-            let count = bar.position();
+            let count = phase_count.swap(0, Ordering::Relaxed);
+            // Don't reset the orphan counter (orphans accumulate across phases).
             let orphans_n = orphans.load(Ordering::Relaxed);
-            bar.finish_and_clear();
-            eprintln!("{}", format_done(kind, count, orphans_n, dur));
+            (Some(name), Some((count, orphans_n, dur)))
         }
-        Inner::Log { kind, started, count, orphans, finished } => {
-            *finished = true;
+        Inner::Log { current_phase, phase_started, phase_count, orphans, .. } => {
+            let Some(name) = current_phase.take() else { return (None, None); };
+            let started = phase_started.take().unwrap_or_else(Instant::now);
             let dur = started.elapsed();
-            let n = count.load(Ordering::Relaxed);
+            let count = phase_count.swap(0, Ordering::Relaxed);
             let orphans_n = orphans.load(Ordering::Relaxed);
-            eprintln!("{}", format_done(kind, n, orphans_n, dur));
+            // Per-phase done line in log mode. (Per-phase orphans aren't
+            // tracked separately yet — the global counter is fine for
+            // the final summary; per-phase only matters in TTY's sub-label.)
+            eprintln!("✓ {name}: {count} items, {:.1}s", dur.as_secs_f32());
+            (Some(name), Some((count, orphans_n, dur)))
         }
-    }
-}
-
-fn format_done(kind: &str, count: u64, orphans: usize, dur: std::time::Duration) -> String {
-    let secs = dur.as_secs_f32();
-    if orphans > 0 {
-        format!("✓ {kind}: {count} items, {orphans} orphans skipped, {secs:.1}s")
-    } else {
-        format!("✓ {kind}: {count} items, {secs:.1}s")
     }
 }
 
@@ -191,20 +249,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn format_done_no_orphans() {
-        let s = format_done("workspaces", 12, 0, std::time::Duration::from_millis(2100));
-        assert_eq!(s, "✓ workspaces: 12 items, 2.1s");
+    fn arc_clone_smoke() {
+        let p = OverallProgress::start("pull envs/test");
+        let clone = Arc::clone(&p);
+        clone.tick("foo");
+        // No assertion on bar state — indicatif handles its own; just
+        // verify the call doesn't panic and clones share state.
+        p.skipped_orphan();
+        assert_eq!(p.orphans(), 1);
+        assert_eq!(clone.orphans(), 1);
     }
 
     #[test]
-    fn format_done_with_orphans() {
-        let s = format_done("queues", 23, 2, std::time::Duration::from_millis(4700));
-        assert_eq!(s, "✓ queues: 23 items, 2 orphans skipped, 4.7s");
+    fn finish_is_idempotent() {
+        let p = OverallProgress::start("test");
+        p.finish();
+        // Second call must not panic.
+        p.finish();
     }
 
     #[test]
-    fn format_done_zero_items() {
-        let s = format_done("hooks", 0, 0, std::time::Duration::from_millis(100));
-        assert_eq!(s, "✓ hooks: 0 items, 0.1s");
+    fn start_phase_returns_previous_stats() {
+        let p = OverallProgress::start("test");
+        // First phase → no previous.
+        assert!(p.start_phase("hooks").is_none());
+        p.tick("a");
+        p.tick("b");
+        // Second phase → previous stats present.
+        let prev = p.start_phase("rules");
+        assert!(prev.is_some());
+        let (count, _orphans, _dur) = prev.unwrap();
+        assert_eq!(count, 2);
     }
 }
