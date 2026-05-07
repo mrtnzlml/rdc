@@ -334,6 +334,87 @@ async fn data_storage_returns_error_on_non_ok_envelope() {
 }
 
 #[tokio::test]
+async fn retries_on_429_then_succeeds() {
+    let server = MockServer::start().await;
+
+    // First call → 429 (rate limited). Higher priority + up_to_n_times(1)
+    // means it matches once and is then exhausted, so the second mock takes
+    // over for subsequent calls.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "T".into()).unwrap();
+    let org = client.get_organization(1).await.unwrap();
+    // The 200 response uses fixture organization id 285704; we just care
+    // that the retry succeeded (request didn't surface the 429 to the caller).
+    assert_eq!(org.id, 285704);
+}
+
+#[tokio::test]
+async fn retries_on_503_then_succeeds() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "T".into()).unwrap();
+    let org = client.get_organization(1).await.unwrap();
+    assert_eq!(org.id, 285704);
+}
+
+#[tokio::test]
+async fn does_not_retry_on_500() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("real bug"))
+        .expect(1) // Must be hit exactly once — no retries.
+        .mount(&server)
+        .await;
+
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "T".into()).unwrap();
+    let err = client.get_organization(1).await.unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("500"), "msg: {msg}");
+}
+
+#[tokio::test]
+async fn does_not_retry_on_404() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "T".into()).unwrap();
+    let err = client.get_organization(1).await.unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("404"), "msg: {msg}");
+}
+
+#[tokio::test]
 async fn list_workspaces_returns_workspaces() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

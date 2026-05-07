@@ -4,7 +4,7 @@
 disk for AI-assisted local development, lets you edit them in place, and
 deploys them across environments.
 
-**Status:** M30. Pull all kinds (incl. MDH collections + indexes —
+**Status:** M31. Pull all kinds (incl. MDH collections + indexes —
 data storage URL derived from `api_base`, no extra config); push
 and deploy for hooks, rules, labels, queues, schemas (formula
 bodies round-trip), inboxes, email templates, engines, and engine
@@ -16,8 +16,8 @@ plus a cross-references section that resolves `hook → queues`,
 `rule → queues`, `email_template → queue`. Pull pipelines
 per-queue and per-MDH-collection sub-fetches via a bounded
 `--concurrency` (spec §7.2 / §16, default 5). All HTTP calls
-retry gracefully on `429 Too Many Requests` with `Retry-After` /
-exponential backoff. `rdc init` accepts flags or runs an
+retry gracefully on `429 Too Many Requests` and transient 5xx
+(502/503/504) with `Retry-After` / exponential backoff. `rdc init` accepts flags or runs an
 interactive wizard; `rdc status` for a read-only health check;
 `rdc diff` for unified diffs (local vs remote, or two
 snapshots); `rdc auth` to set/refresh tokens; `rdc repair
@@ -437,13 +437,20 @@ rdc --concurrency 10 pull dev
 RDC_CONCURRENCY=10 rdc pull dev   # equivalent
 ```
 
-**429 handling.** Every Rossum and Data Storage HTTP call retries
-on `429 Too Many Requests`: it sleeps for the `Retry-After`
-header if present, otherwise exponential backoff (1s, 2s, 4s, 8s,
-16s — capped at 60s), up to 5 attempts total. A stderr line is
-printed each time so the tool isn't quietly hung. Higher
-concurrency makes 429s more likely on busy clusters; the retry
-keeps pulls succeeding without intervention.
+**Transient-error handling.** Every Rossum and Data Storage HTTP
+call retries automatically on:
+
+- `429 Too Many Requests` — honors the `Retry-After` header if the
+  server provides one.
+- `502 Bad Gateway`, `503 Service Unavailable`, `504 Gateway
+  Timeout` — transient infrastructure errors.
+
+Up to 5 attempts total, with exponential backoff (1s, 2s, 4s, 8s,
+16s — capped at 60s) between attempts. A stderr line is printed
+each time so the tool isn't quietly hung. `500 Internal Server
+Error` is **not** retried — it usually indicates a real server
+bug and retrying papers over it. Other 4xx codes (auth, permission,
+not-found, method) are returned to the caller as-is.
 
 ## Authentication
 
