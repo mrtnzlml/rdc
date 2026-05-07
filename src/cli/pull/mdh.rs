@@ -4,12 +4,17 @@ use crate::config::EnvConfig;
 use crate::model::IndexSet;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
+use futures::stream::{StreamExt, TryStreamExt};
 use std::collections::HashSet;
 
 /// Pulls Master Data Hub collections + indexes for `env_cfg`. The Data
 /// Storage base URL is always derived from `env_cfg.api_base` (no separate
 /// config field). On clusters without MDH the first call returns 404, in
 /// which case we silently skip — same shape as the M15 403/permission skip.
+///
+/// M30: per-collection regular + search index fetches are pipelined with
+/// `buffer_unordered(N)` so a 10-dataset MDH no longer takes 20 sequential
+/// RTTs.
 ///
 /// Returns `(collection_count, conflicts)`.
 pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str) -> Result<(usize, usize)> {
@@ -29,17 +34,17 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str) -> Re
     };
 
     let mut used: HashSet<String> = HashSet::new();
-    let mut dir_created = false;
     let mut conflicts = 0usize;
 
-    for c in &collections {
-        if !dir_created {
-            std::fs::create_dir_all(ctx.paths.mdh_dir())
-                .with_context(|| format!("creating {}", ctx.paths.mdh_dir().display()))?;
-            dir_created = true;
-        }
+    if !collections.is_empty() {
+        std::fs::create_dir_all(ctx.paths.mdh_dir())
+            .with_context(|| format!("creating {}", ctx.paths.mdh_dir().display()))?;
+    }
 
-        // MDH collections have no numeric ID, so slug stability uses name-based slugify.
+    // === Phase 1: assign slugs + write collection.json. Build per-collection
+    //            dataset_dir map for use in Phase 3.
+    let mut dataset_dirs: Vec<(String, std::path::PathBuf, &crate::model::Collection)> = Vec::new();
+    for c in &collections {
         let slug = slugify_unique(&c.name, &used);
         used.insert(slug.clone());
 
@@ -47,7 +52,6 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str) -> Re
         std::fs::create_dir_all(&dataset_dir)
             .with_context(|| format!("creating {}", dataset_dir.display()))?;
 
-        // 1. collection.json — three-way
         let coll_path = dataset_dir.join("collection.json");
         let mut coll_proposed = serde_json::to_vec_pretty(c).context("serializing collection")?;
         coll_proposed.push(b'\n');
@@ -73,21 +77,40 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str) -> Re
             Some(c_recorded),
         );
 
-        // 2. indexes.json — three-way
-        let regular = client.list_indexes(&c.name).await
-            .with_context(|| format!("listing indexes for '{}'", c.name))?;
-        let search = client.list_search_indexes(&c.name).await
-            .with_context(|| format!("listing search indexes for '{}'", c.name))?;
-        let index_set = IndexSet { regular, search };
+        dataset_dirs.push((slug, dataset_dir, c));
+    }
+
+    // === Phase 2: concurrent index fetches per collection (regular +
+    //            search). Bounded by ctx.concurrency.
+    let client_ref = &client;
+    let fetched: Vec<(String, IndexSet)> = futures::stream::iter(
+        dataset_dirs.iter().map(|(slug, _, c)| (slug.clone(), c.name.clone()))
+    )
+    .map(|(slug, name)| async move {
+        let regular = client_ref.list_indexes(&name).await
+            .with_context(|| format!("listing indexes for '{name}'"))?;
+        let search = client_ref.list_search_indexes(&name).await
+            .with_context(|| format!("listing search indexes for '{name}'"))?;
+        Ok::<_, anyhow::Error>((slug, IndexSet { regular, search }))
+    })
+    .buffer_unordered(ctx.concurrency)
+    .try_collect()
+    .await?;
+    let by_slug: std::collections::HashMap<String, IndexSet> = fetched.into_iter().collect();
+
+    // === Phase 3: per-collection indexes.json write decision (sequential
+    //            because we mutate ctx.lockfile + counts).
+    for (slug, dataset_dir, _) in &dataset_dirs {
+        let Some(index_set) = by_slug.get(slug) else { continue };
 
         let ix_path = dataset_dir.join("indexes.json");
-        let mut ix_proposed = serde_json::to_vec_pretty(&index_set).context("serializing index set")?;
+        let mut ix_proposed = serde_json::to_vec_pretty(index_set).context("serializing index set")?;
         ix_proposed.push(b'\n');
         let ix_base = ctx
             .lockfile
             .objects
             .get("mdh_indexes")
-            .and_then(|m| m.get(&slug))
+            .and_then(|m| m.get(slug))
             .and_then(|e| e.content_hash.clone());
         let (i_action, i_remote_hash) =
             decide_pull_action(&ix_path, ix_base.as_deref(), &ix_proposed)?;
@@ -98,7 +121,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str) -> Re
         record_object(
             ctx.lockfile,
             "mdh_indexes",
-            &slug,
+            slug,
             0,
             None,
             None,

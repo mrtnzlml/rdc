@@ -50,7 +50,12 @@ pub async fn run(env: &str, rebuild_lock: bool) -> Result<()> {
         eprintln!("No existing lockfile at {} — proceeding with fresh pull.", lockfile_path.display());
     }
 
-    crate::cli::pull::run(env).await?;
+    // Repair always uses the spec-§16 default concurrency. We don't
+    // surface the global flag here because repair is itself a recovery
+    // path — the user can re-run with --concurrency on a regular pull
+    // afterward if they need to.
+    let concurrency = crate::cli::resolve_concurrency(None);
+    crate::cli::pull::run(env, concurrency).await?;
     println!("Lockfile rebuilt for env '{env}'.");
     Ok(())
 }
