@@ -14,6 +14,7 @@ name = "rdc"
 path = "src/lib.rs"
 
 [dependencies]
+anstyle = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
