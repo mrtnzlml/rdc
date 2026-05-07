@@ -30,6 +30,12 @@ pub struct Mapping {
     /// hand-editable for renames.
     #[serde(default)]
     pub email_templates: BTreeMap<String, String>,
+    /// Engine slug → engine slug.
+    #[serde(default)]
+    pub engines: BTreeMap<String, String>,
+    /// Engine field slug → engine field slug.
+    #[serde(default)]
+    pub engine_fields: BTreeMap<String, String>,
 }
 
 impl Default for Mapping {
@@ -43,6 +49,8 @@ impl Default for Mapping {
             queues: BTreeMap::new(),
             inboxes: BTreeMap::new(),
             email_templates: BTreeMap::new(),
+            engines: BTreeMap::new(),
+            engine_fields: BTreeMap::new(),
         }
     }
 }

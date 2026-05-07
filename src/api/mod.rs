@@ -2,7 +2,7 @@ pub mod data_storage;
 pub mod error;
 
 pub use data_storage::DataStorageClient;
-pub use error::ApiError;
+pub use error::{anyhow_has_status, ApiError};
 
 use crate::model::Hook;
 use anyhow::{Context, Result};
@@ -255,6 +255,41 @@ impl RossumClient {
             .with_context(|| format!("decoding PATCH response from {url}"))?;
         Ok(value)
     }
+
+    /// PATCH /engines/{id}.
+    pub async fn update_engine(&self, id: u64, engine: &crate::model::Engine)
+        -> Result<crate::model::Engine>
+    {
+        let url = format!("{}/engines/{id}", self.base_url);
+        let resp = self.http.patch(&url)
+            .header("Authorization", format!("token {}", self.token))
+            .json(engine).send().await.with_context(|| format!("PATCH {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ApiError::Status { status: status.as_u16(), body }.into());
+        }
+        resp.json::<crate::model::Engine>().await
+            .with_context(|| format!("decoding PATCH response from {url}"))
+    }
+
+    /// PATCH /engine_fields/{id}.
+    pub async fn update_engine_field(&self, id: u64, field: &crate::model::EngineField)
+        -> Result<crate::model::EngineField>
+    {
+        let url = format!("{}/engine_fields/{id}", self.base_url);
+        let resp = self.http.patch(&url)
+            .header("Authorization", format!("token {}", self.token))
+            .json(field).send().await.with_context(|| format!("PATCH {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ApiError::Status { status: status.as_u16(), body }.into());
+        }
+        resp.json::<crate::model::EngineField>().await
+            .with_context(|| format!("decoding PATCH response from {url}"))
+    }
+
 
     pub async fn list_rules(&self) -> Result<Vec<crate::model::Rule>> {
         let mut url = format!("{}/rules", self.base_url);

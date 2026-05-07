@@ -4,10 +4,11 @@
 disk for AI-assisted local development, lets you edit them in place, and
 deploys them across environments.
 
-**Status:** M19. Pull all kinds; push and deploy for hooks, rules,
-labels, queues, schemas (formula bodies round-trip), inboxes, and
-email templates. Distributable via `curl | sh` or `cargo install`.
-See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full
+**Status:** M20. Pull all kinds; push and deploy for hooks, rules,
+labels, queues, schemas (formula bodies round-trip), inboxes,
+email templates, engines, and engine fields. Distributable via
+`curl | sh` or `cargo install`. See
+`docs/superpowers/specs/2026-05-06-rdc-design.md` for the full
 design.
 
 ## Install
@@ -134,16 +135,25 @@ After a successful push, the local file is rewritten with the server's
 authoritative response so the lockfile hash matches the file bytes.
 Subsequent pulls are idempotent.
 
-**Writable kinds:** hooks, rules, labels, schemas (with formula bodies),
-queues, inboxes, email templates. Schema push splices extracted
-formulas back into `content[]` before sending. Email-template push
-walks the queue-scoped `email-templates/` directories.
+**Writable kinds:** hooks, rules, labels, schemas (with formula
+bodies), queues, inboxes, email templates, engines, engine fields.
+Schema push splices extracted formulas back into `content[]` before
+sending. Email-template push walks the queue-scoped
+`email-templates/` directories.
 
-**Pull-only kinds:** engines, engine_fields, workflows, workflow_steps,
-MDH collections + indexes. Push for these is future work.
+**Pull-only kinds:**
+- **Workflows + workflow steps** — Rossum's API is read-only for
+  these (`OPTIONS` returns `Allow: GET, HEAD, OPTIONS`). The
+  snapshot captures them so you can review changes, but `rdc push`
+  and `rdc apply` cannot send updates back.
+- **MDH collections + indexes** — push not yet implemented.
 
-**Out of scope:** Creates (POST) and deletes are not supported — `rdc
-push` only updates existing objects. No two-phase send for
+If your token lacks permission for a writable kind (e.g. engines on
+some plans return 403), `rdc pull` warns and skips that kind, leaving
+other kinds intact.
+
+**Out of scope:** Creates (POST) and deletes are not supported —
+`rdc push` only updates existing objects. No two-phase send for
 cross-references.
 
 ## Conflict handling
@@ -201,7 +211,8 @@ keys in the snapshot are silently overwritten by the overlay on push.
 
 **Sections:** `[hooks.<slug>]`, `[rules.<slug>]`, `[labels.<slug>]`,
 `[schemas.<queue-slug>]`, `[queues.<queue-slug>]`,
-`[inboxes.<queue-slug>]`,
+`[inboxes.<queue-slug>]`, `[engines.<slug>]`,
+`[engine_fields.<slug>]`,
 `[email_templates."<ws-slug>/<q-slug>/<template-slug>"]`.
 
 **Limitations:**
@@ -236,9 +247,9 @@ rdc pull prod                          # refresh prod snapshot post-apply
 ```
 
 **Deployable kinds:** hooks, rules, labels, queues, schemas (with
-formula bodies), inboxes, email templates. Same kinds as push, by
-design — if you can push it within an env, you can deploy it across
-envs.
+formula bodies), inboxes, email templates, engines, engine fields.
+Same kinds as push, by design — if you can push it within an env,
+you can deploy it across envs.
 
 The mapping file uses one section per kind:
 
