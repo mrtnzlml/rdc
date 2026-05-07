@@ -2,9 +2,9 @@
 
 `rdc` (Rossum Deployment as Code) snapshots Rossum.ai configurations to disk for AI-assisted local development and deploys them across environments.
 
-**Status:** M14 — distributable. Pull all kinds; push + deploy for hooks/rules/labels. Install via `curl | sh` or `cargo install`. See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full design.
+**Status:** M17 — distributable. Pull all kinds; push for hooks/rules/labels/schemas (incl. formula bodies); deploy for hooks/rules/labels. Install via `curl | sh` or `cargo install`. See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full design.
 
-**Coverage as of M13:** push and apply work for hooks, rules, and labels. Other kinds (queues, schemas, inboxes, engines, engine_fields, workflows, workflow_steps, email_templates, MDH) are pull-only — extending push to them is future work.
+**Coverage as of M17:** push works for hooks, rules, labels, and schemas (formula edits round-trip). Deploy (`map`/`plan`/`apply`) covers hooks, rules, and labels. Other kinds (queues, inboxes, engines, engine_fields, workflows, workflow_steps, email_templates, MDH) are pull-only.
 
 ## Install
 
@@ -75,25 +75,28 @@ indexes.
 `rdc pull` also generates `envs/<env>/_index.md` listing the per-kind
 inventory. The index is regenerated on every pull; do not edit it by hand.
 
-## Push (M10 — hooks only)
+## Push
 
-`rdc push <env>` PATCHes locally-edited hooks back to the Rossum API. Each
-hook is checked against the lockfile's content_hash:
+`rdc push <env>` PATCHes locally-edited objects back to the Rossum API.
+Each candidate is checked against the lockfile's `content_hash`:
 
 - No local edits → skipped silently.
 - Local edits AND remote unchanged since last pull → PATCH succeeds.
-- Local edits AND remote drifted → push aborted for that hook with a warning.
-  Run `rdc pull` to fetch the remote, resolve, then push again.
+- Local edits AND remote drifted → push aborted for that object with a
+  warning. Run `rdc pull` to fetch the remote, resolve, then push again.
 
-After a successful push, the lockfile is updated with the server's
-authoritative response.
+After a successful push, the local file is rewritten with the server's
+authoritative response so subsequent pulls are idempotent.
 
-**M10 limitations:**
-- Hooks only. Queues, schemas, rules, labels, etc. cannot be pushed yet.
-- Updates only. New objects (creates) and deletes are not supported.
-- Single-phase. No two-phase send for cross-references (not needed for hooks).
+**Writable kinds (M17):** hooks, rules, labels, schemas. Schema push
+splices extracted formulas (`formulas/<id>.py`) back into `content[]`
+before sending; the combined hash drives drift detection. Other kinds
+are pull-only — extending push to them is future work.
 
-## Overlays (M11 — push side, hooks only)
+**Out of scope:** Updates only. New objects (POST creates) and deletes
+are not yet supported. No two-phase send for cross-references.
+
+## Overlays
 
 `envs/<env>/overlay.toml` declares values that should always be set when
 pushing to that env, regardless of the canonical snapshot. Useful for
@@ -105,15 +108,18 @@ version = 1
 [hooks.validator-invoices]
 "name" = "Validator (PROD)"
 "config.runtime" = "python3.12-secure"
+
+[schemas.cost-invoices]
+"settings.default_score_threshold" = 0.95
 ```
 
 On `rdc push`, the overlay's dotted-path keys are merged into the outbound
 PATCH body, overwriting any value at that path. The overlay is the source
 of truth for declared keys; manual edits to those keys in the snapshot are
-overwritten by the overlay on push.
+overwritten by the overlay on push. Sections supported: `[hooks.<slug>]`,
+`[rules.<slug>]`, `[labels.<slug>]`, `[schemas.<queue-slug>]`.
 
-**M11 limitations:**
-- Hooks only (matches push scope).
+**Limitations:**
 - Push-side only — pull does not strip overlay-managed values yet.
 - Simple dotted paths only; no JMESPath wildcards or array filters.
 
