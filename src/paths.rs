@@ -127,8 +127,7 @@ impl Paths {
 
     /// `<root>/envs/<env>/workspaces/<ws_slug>/queues/<queue_slug>/email-templates/`.
     /// Email templates are queue-scoped in the live API; the snapshot mirrors
-    /// that nesting (M16). The flat `envs/<env>/email-templates/` layout from
-    /// M5 was wrong — kept as a fallback only for legacy lockfiles.
+    /// that nesting.
     pub fn queue_email_templates_dir(&self, ws_slug: &str, queue_slug: &str) -> PathBuf {
         self.queue_dir(ws_slug, queue_slug).join("email-templates")
     }

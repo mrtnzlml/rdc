@@ -7,7 +7,7 @@ use crate::state::{schema_combined_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
 
 /// Push locally-edited schemas. Walks every queue dir for a schema.json,
-/// hashes the on-disk bytes (already in stripped form thanks to M26 pull),
+/// hashes the on-disk bytes (already in overlay-stripped form from pull),
 /// reads the raw Value (with formulas spliced) for overlay re-apply,
 /// drift-checks remote post-strip, and PATCHes. Post-PATCH disk write is
 /// also stripped so the snapshot matches lockfile.content_hash.

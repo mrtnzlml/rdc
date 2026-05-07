@@ -22,14 +22,16 @@ pub struct Lockfile {
 pub struct ObjectEntry {
     /// Numeric Rossum ID.
     pub id: u64,
-    /// Canonical Rossum URL for the object (used by M3+ for cross-reference resolution).
+    /// Canonical Rossum URL for the object. Powers cross-reference
+    /// resolution (e.g. queue.workspace → workspace slug).
     #[serde(default)]
     pub url: Option<String>,
     /// ISO 8601 server timestamp from `modified_at`, if present.
     #[serde(default)]
     pub modified_at: Option<String>,
     /// Hex-encoded SHA-256 of the snapshot bytes that produced this entry.
-    /// Used by M3+ to detect local drift without re-fetching the remote.
+    /// The merge base for the three-way comparison on subsequent pulls
+    /// and pushes.
     #[serde(default)]
     pub content_hash: Option<String>,
 }
@@ -116,7 +118,7 @@ impl Lockfile {
 
     /// Multi-kind reverse lookup: given a URL, find which `(kind, slug)`
     /// owns it. Used by `rdc apply` to rewrite cross-references in a
-    /// payload from src URLs to tgt URLs (M29).
+    /// payload from src URLs to tgt URLs.
     pub fn lookup_url(&self, url: &str) -> Option<(&str, &str)> {
         for (kind, entries) in &self.objects {
             for (slug, entry) in entries {

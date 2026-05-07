@@ -18,10 +18,10 @@ pub async fn push(
         return Ok((0, 0));
     }
 
-    // Load overlay if present (M11). With M26, overlay drives both the
-    // outbound payload (apply_overrides) AND the strip applied to remote
-    // bytes for hashing — so disk-bytes (already stripped) and post-strip
-    // remote bytes can both be compared against `lockfile.content_hash`.
+    // Load overlay if present. Overlay drives both the outbound payload
+    // (apply_overrides) AND the strip applied to remote bytes for hashing
+    // — so disk-bytes (already stripped) and post-strip remote bytes can
+    // both be compared against `lockfile.content_hash`.
     let overlay = Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
@@ -60,7 +60,7 @@ pub async fn push(
 
         let entry = lockfile.objects.get("hooks").and_then(|m| m.get(slug));
         let Some(entry) = entry else {
-            eprintln!("warning: hooks/{slug}.json — no lockfile entry, skipping (creates not supported in M10)");
+            eprintln!("warning: hooks/{slug}.json — no lockfile entry, skipping (push only updates existing objects)");
             skipped += 1;
             continue;
         };
@@ -76,7 +76,7 @@ pub async fn push(
         let id = entry.id;
 
         // Read raw Value (with .py spliced in) so overlay can re-add fields
-        // stripped by pull (M26 / spec §9.3) BEFORE typed deserialize.
+        // stripped by pull (spec §9.3) BEFORE typed deserialize.
         let mut payload = read_hook_value(&hooks_dir, slug)
             .with_context(|| format!("reading local hook '{slug}'"))?;
         let overlay_paths = overlay.as_ref().and_then(|ov| ov.hook(slug));

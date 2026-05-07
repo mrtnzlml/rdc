@@ -178,7 +178,7 @@ fn run_editor_with_markers(local: &[u8], remote: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Resolve a single sub-file within a combined-hash entity (hook
-/// `.json`/`.py`, schema `schema.json`/formulas/`<id>.py`). M33 / spec §8.3.
+/// `.json`/`.py`, schema `schema.json`/formulas/`<id>.py`). Spec §8.3.
 ///
 /// The caller passes the in-memory bytes for both sides. Behavior:
 ///
@@ -263,9 +263,9 @@ fn shadow_path_for(local_path: &Path) -> std::path::PathBuf {
     conflict_path
 }
 
-/// Outcome of a push-drift prompt (M34 / spec §7.3 step 5). Different
-/// from a pull-side [`Resolution`] because the user's choices have
-/// different consequences on push:
+/// Outcome of a push-drift prompt (spec §7.3 step 5). Different from a
+/// pull-side [`Resolution`] because the user's choices have different
+/// consequences on push:
 ///
 /// - `Patch { payload_override: None }`: force-push the caller's prepared
 ///   payload, overwriting whatever drift exists on the remote. (`[k]`)
@@ -275,7 +275,7 @@ fn shadow_path_for(local_path: &Path) -> std::path::PathBuf {
 /// - `Adopt`: abandon the local edit. Write `remote_bytes` to the local
 ///   file and record `remote_hash` in the lockfile. No PATCH. (`[r]`)
 /// - `Skip`: do nothing — leave local and lockfile alone. Warn the user.
-///   This is the legacy default before M34. (`[s]`)
+///   This is the fallback when stdin isn't a TTY or `--yes` is set. (`[s]`)
 ///
 /// `[a]bort` propagates as a [`PullAborted`] error so the push runner
 /// can stop and skip lockfile.save().

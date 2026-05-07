@@ -33,8 +33,9 @@ pub async fn run(env: &str, interactive: bool) -> Result<()> {
 
     let mut lockfile = Lockfile::load(&paths.lockfile())?;
 
-    // Run drivers in a closure so we can detect [a]bort and skip
-    // lockfile.save(). Mirrors the pull-side abort flow (M32).
+    // Run drivers in a separate function so we can detect [a]bort
+    // (PullAborted) and skip lockfile.save(). Mirrors the pull-side
+    // abort flow (spec §8.3 "rolls back lockfile; nothing written").
     let push_outcome = run_drivers(&paths, &client, &mut lockfile, env, interactive).await;
 
     let counts = match push_outcome {

@@ -32,8 +32,8 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
         used_slugs.insert(slug.clone());
 
         let (proposed_json, proposed_code) = serialize_hook(hook)?;
-        // Strip overlay-managed paths from the JSON (M26 / spec §9.3).
-        // Code in <slug>.py is the canonical form for hook code, so strip
+        // Strip overlay-managed paths from the JSON (spec §9.3). Code in
+        // <slug>.py is the canonical form for hook code, so strip
         // doesn't touch the .py side; users rarely overlay `config.code`.
         let proposed_json = maybe_strip_overlay(
             proposed_json,
@@ -84,8 +84,8 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
 
         let recorded_hash = match action {
             PullAction::Write => {
-                // Write branch — the `interactive` flag is irrelevant (no
-                // resolver path); pass `ctx.interactive` for consistency.
+                // The `interactive` flag is irrelevant on Write (no resolver
+                // path); pass `ctx.interactive` for consistency.
                 apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone(), ctx.interactive)?;
                 if let Some(code) = &proposed_code {
                     write_hook_code(&ctx.paths.hooks_dir(), &slug, code)
@@ -101,10 +101,10 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
                 hook_combined_hash(local_json, &pre_local_code)
             }
             PullAction::Conflict => {
-                // Combined-hash conflict (M33 / spec §8.3). When both
-                // sides have code, walk json and py separately so the user
+                // Combined-hash conflict (spec §8.3). When both sides
+                // have code, walk json and py separately so the user
                 // resolves each. Asymmetric cases (one side has code, the
-                // other doesn't) keep the legacy shadow-file flow because
+                // other doesn't) keep the shadow-file flow because
                 // adding/removing a file isn't "[k]eep / [r]emote / [e]dit"
                 // shaped — it's a Write/Delete decision the resolver
                 // doesn't model in v1.
@@ -136,8 +136,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
                         None
                     }
                 } else {
-                    // Asymmetric — fall back to shadow for the .py side
-                    // (matches pre-M33 behavior).
+                    // Asymmetric — fall back to shadow for the .py side.
                     if let Some(remote_code_str) = &proposed_code {
                         let py_remote_path = ctx.paths.hooks_dir().join(format!("{slug}.py.remote"));
                         crate::snapshot::writer::write_atomic(&py_remote_path, remote_code_str.as_bytes())?;

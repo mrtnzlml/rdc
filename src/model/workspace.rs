@@ -3,7 +3,8 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 /// Rossum workspace. Each env has 0..N workspaces, each holding queues.
-/// In M2 we only snapshot the workspace metadata; queues are M3.
+/// The workspace itself is just metadata; queues are pulled separately
+/// and nested under `envs/<env>/workspaces/<slug>/queues/<slug>/`.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Workspace {
     pub id: u64,

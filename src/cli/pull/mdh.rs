@@ -10,11 +10,12 @@ use std::collections::HashSet;
 /// Pulls Master Data Hub collections + indexes for `env_cfg`. The Data
 /// Storage base URL is always derived from `env_cfg.api_base` (no separate
 /// config field). On clusters without MDH the first call returns 404, in
-/// which case we silently skip — same shape as the M15 403/permission skip.
+/// which case we silently skip — same shape as the 403/permission skip
+/// applied to other kinds.
 ///
-/// M30: per-collection regular + search index fetches are pipelined with
-/// `buffer_unordered(N)` so a 10-dataset MDH no longer takes 20 sequential
-/// RTTs.
+/// Per-collection regular + search index fetches are pipelined with
+/// `buffer_unordered(N)` (per spec §16, default N=5) so a 10-dataset MDH
+/// doesn't take 20 sequential round-trips.
 ///
 /// Returns `(collection_count, conflicts)`.
 pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str) -> Result<(usize, usize)> {

@@ -41,8 +41,8 @@ pub struct PullCtx<'a> {
     /// Per-env overlay loaded once at pull entry. When `Some`, pull drivers
     /// strip overlay-managed paths from the incoming remote bytes before
     /// hashing/writing — this keeps `<env>` snapshots in their canonical
-    /// pre-overlay form so cross-env diffs and deploys are quiet (M26 /
-    /// spec §9.3). `None` when the env has no `overlay.toml`.
+    /// pre-overlay form so cross-env diffs and deploys are quiet (spec
+    /// §9.3). `None` when the env has no `overlay.toml`.
     pub overlay: Option<crate::overlay::Overlay>,
     /// Maximum parallel API calls used by drivers that fan out per-object
     /// fetches (queues, mdh). Default 5 per spec §16; overridable via
@@ -54,10 +54,6 @@ pub struct PullCtx<'a> {
     /// shadow-file behavior. Drivers consult `ctx.interactive` and pass
     /// it to `apply_pull_action`.
     pub interactive: bool,
-    /// Running counter of conflicts that the user resolved interactively
-    /// during this pull. Surfaced in the summary line so the user sees
-    /// "N conflicts (resolved)" instead of just N.
-    pub conflicts_resolved: usize,
 }
 
 /// Compute the content hash of an object's serialized form. The pull drivers
@@ -70,7 +66,7 @@ pub fn hash_for_lockfile(bytes: &[u8]) -> String {
 /// If `paths` is `Some` and non-empty, strip those overlay-managed dotted
 /// paths from `bytes` (parse to Value, strip, re-serialize). Otherwise
 /// return `bytes` unchanged. Used by every writable-kind pull driver to
-/// keep the snapshot in its canonical pre-overlay form (spec §9.3 / M26).
+/// keep the snapshot in its canonical pre-overlay form (spec §9.3).
 pub fn maybe_strip_overlay(
     bytes: Vec<u8>,
     paths: Option<&std::collections::BTreeMap<String, serde_json::Value>>,

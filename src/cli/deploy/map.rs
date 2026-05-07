@@ -32,7 +32,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
     let i_new = match_inboxes(&mut mapping.inboxes, &src_paths, &tgt_paths)?;
     let e_new = match_email_templates(&mut mapping.email_templates, &src_paths, &tgt_paths)?;
 
-    // Other org-wide flat kinds (M20). Workflows + workflow_steps are
+    // Other org-wide flat kinds. Workflows + workflow_steps are
     // intentionally excluded — Rossum's workflow API is read-only via PATCH
     // on every plan we've checked (OPTIONS returns "GET, HEAD, OPTIONS"),
     // so push/deploy can never succeed.

@@ -7,7 +7,7 @@
 //! `data/find`, `data/insert_*`) are intentionally not implemented here
 //! because the snapshot scope is collection metadata + indexes, not rows.
 //!
-//! Base URL convention (M24): `<host>/svc/data-storage/api`. For example,
+//! Base URL convention: `<host>/svc/data-storage/api`. For example,
 //! `https://elis.rossum.ai/svc/data-storage/api`. We append `/v1/...` per
 //! call.
 //!

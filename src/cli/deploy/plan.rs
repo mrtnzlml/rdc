@@ -61,8 +61,8 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         &tgt_lockfile, tgt, &mut total_warnings,
     );
 
-    // Other org-wide flat kinds (M20). Workflows + workflow_steps excluded
-    // — Rossum's workflow API is read-only.
+    // Other org-wide flat kinds. Workflows + workflow_steps excluded —
+    // Rossum's workflow API is read-only.
     total_count += plan_flat_kind(
         "engines", &mapping.engines,
         &src_paths.engines_dir(),

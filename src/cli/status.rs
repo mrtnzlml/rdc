@@ -14,7 +14,7 @@ use crate::config::ProjectConfig;
 use crate::paths::Paths;
 use crate::secrets::resolve_token;
 use crate::snapshot::hook::serialize_hook;
-use crate::snapshot::schema::{read_local_formulas, serialize_schema};
+use crate::snapshot::schema::serialize_schema;
 use crate::state::{
     content_hash, hook_combined_hash, schema_combined_hash, Lockfile,
 };
@@ -180,8 +180,6 @@ fn local_edits(paths: &Paths, lockfile: &Lockfile) -> Result<Vec<(String, String
                 if schema_path.exists() {
                     if let Ok(schema) = crate::snapshot::schema::read_schema(&queue_dir) {
                         let (json, formulas) = serialize_schema(&schema)?;
-                        // M9 combined hash.
-                        let _ = read_local_formulas; // suppress unused warning if pruned
                         let local = schema_combined_hash(&json, &formulas);
                         if differs("schemas", &q_slug, lockfile, &local) {
                             out.push(("schemas".into(), q_slug.clone()));
