@@ -215,6 +215,18 @@ async fn push_applies_overlay_values_to_outbound_patch() {
         r#"{"api_token":"TEST_TOKEN"}"#,
     ).unwrap();
 
+    // Set overlay BEFORE pull so the pull strips overlay-managed paths
+    // (M26 / spec §9.3). Push then re-applies them on the outbound body.
+    let overlay_path = project.path().join("envs/dev/overlay.toml");
+    std::fs::create_dir_all(overlay_path.parent().unwrap()).unwrap();
+    std::fs::write(&overlay_path, r#"
+version = 1
+
+[hooks.validator-invoices]
+"name" = "Validator (DEV-OVERLAY)"
+"config.runtime" = "python3.12-overlay"
+"#).unwrap();
+
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
         .args(["pull", "dev"])
@@ -223,15 +235,6 @@ async fn push_applies_overlay_values_to_outbound_patch() {
     let py_path = project.path().join("envs/dev/hooks/validator-invoices.py");
     let original = std::fs::read_to_string(&py_path).unwrap();
     std::fs::write(&py_path, format!("{original}# local edit\n")).unwrap();
-
-    let overlay_path = project.path().join("envs/dev/overlay.toml");
-    std::fs::write(&overlay_path, r#"
-version = 1
-
-[hooks.validator-invoices]
-"name" = "Validator (DEV-OVERLAY)"
-"config.runtime" = "python3.12-overlay"
-"#).unwrap();
 
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())

@@ -1,4 +1,7 @@
-use super::common::{apply_pull_action, decide_pull_action, record_object, skip_on_permission_denied, PullAction, PullCtx};
+use super::common::{
+    apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
+    skip_on_permission_denied, PullAction, PullCtx,
+};
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -27,6 +30,10 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
 
         let mut proposed = serde_json::to_vec_pretty(r).context("serializing rule")?;
         proposed.push(b'\n');
+        let proposed = maybe_strip_overlay(
+            proposed,
+            ctx.overlay.as_ref().and_then(|o| o.rule(&slug)),
+        )?;
 
         let local_path = ctx.paths.rules_dir().join(format!("{slug}.json"));
         let base_hash = ctx

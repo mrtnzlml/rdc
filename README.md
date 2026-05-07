@@ -4,16 +4,17 @@
 disk for AI-assisted local development, lets you edit them in place, and
 deploys them across environments.
 
-**Status:** M25. Pull all kinds (incl. MDH collections + indexes —
+**Status:** M26. Pull all kinds (incl. MDH collections + indexes —
 data storage URL derived from `api_base`, no extra config); push
 and deploy for hooks, rules, labels, queues, schemas (formula
 bodies round-trip), inboxes, email templates, engines, and engine
-fields. `rdc status` for a read-only health check; `rdc diff` for
-unified diffs (local vs remote, or two snapshots); `rdc auth` to
-set/refresh tokens; `rdc repair --rebuild-lock` for lockfile
-recovery. Distributable via `curl | sh` or `cargo install`. See
-`docs/superpowers/specs/2026-05-06-rdc-design.md` for the full
-design.
+fields. Overlays are bidirectional: applied on push, stripped on
+pull (spec §9.3). `rdc status` for a read-only health check; `rdc
+diff` for unified diffs (local vs remote, or two snapshots); `rdc
+auth` to set/refresh tokens; `rdc repair --rebuild-lock` for
+lockfile recovery. Distributable via `curl | sh` or `cargo
+install`. See `docs/superpowers/specs/2026-05-06-rdc-design.md`
+for the full design.
 
 ## Install
 
@@ -267,9 +268,20 @@ version = 1
 "subject" = "[PROD] Your invoice was rejected"
 ```
 
-The overlay's dotted-path keys are merged into the outbound PATCH body,
-overwriting any value at that path. Manual edits to overlay-managed
-keys in the snapshot are silently overwritten by the overlay on push.
+The overlay's dotted-path keys are bidirectional:
+
+- **On push**, they're merged into the outbound PATCH body, overwriting
+  any value at that path. The remote ends up with the env-specific
+  value.
+- **On pull** (M26 / spec §9.3), they're stripped from the snapshot
+  before write. The on-disk JSON reflects the canonical (pre-overlay)
+  form, so `rdc diff test prod` and `rdc map test prod` stay quiet
+  about env-specific differences. The lockfile records the stripped
+  hash, so subsequent pulls and pushes are idempotent.
+
+Round-trip: TEST and PROD snapshots agree on the canonical content.
+Each env's `overlay.toml` declares the env-specific deltas. Push
+re-applies them on the way out; pull strips them on the way in.
 
 **Sections:** `[hooks.<slug>]`, `[rules.<slug>]`, `[labels.<slug>]`,
 `[schemas.<queue-slug>]`, `[queues.<queue-slug>]`,
@@ -278,8 +290,12 @@ keys in the snapshot are silently overwritten by the overlay on push.
 `[email_templates."<ws-slug>/<q-slug>/<template-slug>"]`.
 
 **Limitations:**
-- Push-side only — pull does not strip overlay-managed values yet.
 - Simple dotted paths only; no JMESPath wildcards or array filters.
+- The overlay must exist BEFORE you pull. If you add an overlay
+  after pulling, the next pull strips and the next push re-applies
+  — but the lockfile's pre-strip hash will now mismatch, which the
+  drift check surfaces as "remote has changed". Run `rdc pull` once
+  more after editing the overlay to re-baseline.
 
 ## Deploy — copy from one env to another
 
@@ -411,7 +427,7 @@ Commit your snapshot to git first if you might have unsaved edits.
 | `secrets/<env>.secrets.json` | Per-env API token (gitignored) |
 | `envs/<env>/_index.md` | Generated inventory; do not edit |
 | `envs/<env>/organization.json` | Org metadata (read-only on remote) |
-| `envs/<env>/overlay.toml` | Per-env push-side overrides (optional) |
+| `envs/<env>/overlay.toml` | Per-env overrides (applied on push, stripped on pull; optional) |
 | `envs/<env>/workspaces/<ws>/...` | Workspace + nested queues |
 | `envs/<env>/<kind>/<slug>.json` | Org-scoped kinds (hooks, rules, etc.) |
 | `.rdc/state/<env>.lock.json` | Merge base; auto-managed |

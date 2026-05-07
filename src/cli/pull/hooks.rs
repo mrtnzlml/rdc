@@ -1,4 +1,7 @@
-use super::common::{apply_pull_action, record_object, skip_on_permission_denied, PullAction, PullCtx};
+use super::common::{
+    apply_pull_action, maybe_strip_overlay, record_object, skip_on_permission_denied,
+    PullAction, PullCtx,
+};
 use crate::slug::slugify_unique;
 use crate::snapshot::hook::{serialize_hook, write_hook_code};
 use crate::state::hook_combined_hash;
@@ -29,6 +32,13 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
         used_slugs.insert(slug.clone());
 
         let (proposed_json, proposed_code) = serialize_hook(hook)?;
+        // Strip overlay-managed paths from the JSON (M26 / spec §9.3).
+        // Code in <slug>.py is the canonical form for hook code, so strip
+        // doesn't touch the .py side; users rarely overlay `config.code`.
+        let proposed_json = maybe_strip_overlay(
+            proposed_json,
+            ctx.overlay.as_ref().and_then(|o| o.hook(&slug)),
+        )?;
 
         let local_path = ctx.paths.hooks_dir().join(format!("{slug}.json"));
         let py_path = ctx.paths.hooks_dir().join(format!("{slug}.py"));

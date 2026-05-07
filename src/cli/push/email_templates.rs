@@ -1,15 +1,11 @@
 use crate::api::RossumClient;
+use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::snapshot::email_template::{read_email_template, write_email_template};
+use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
 
-/// Push locally-edited email templates. Templates are queue-scoped (M16);
-/// the lockfile keys them as `<ws_slug>/<q_slug>/<template_slug>`. The
-/// driver walks every queue's `email-templates/` directory.
-///
-/// Returns `(pushed, skipped)`.
 pub async fn push(
     paths: &Paths,
     client: &RossumClient,
@@ -64,24 +60,11 @@ pub async fn push(
                     continue;
                 }
                 let lockfile_key = format!("{ws_slug}/{q_slug}/{template_slug}");
+                let template_path = templates_dir.join(format!("{template_slug}.json"));
 
-                let local_template = read_email_template(&templates_dir, template_slug)
-                    .with_context(|| format!("reading local email template '{lockfile_key}'"))?;
-
-                let mut payload = serde_json::to_value(&local_template)
-                    .context("serializing local email template to value")?;
-                if let Some(ov) = &overlay {
-                    if let Some(t_overrides) = ov.email_template(&lockfile_key) {
-                        apply_overrides(&mut payload, t_overrides);
-                    }
-                }
-                let payload_template: crate::model::EmailTemplate = serde_json::from_value(payload)
-                    .with_context(|| format!("re-deserializing overlay-applied email template '{lockfile_key}'"))?;
-
-                let mut post_overlay_bytes = serde_json::to_vec_pretty(&payload_template)
-                    .context("serializing email template")?;
-                post_overlay_bytes.push(b'\n');
-                let local_combined = content_hash(&post_overlay_bytes);
+                let disk_bytes = std::fs::read(&template_path)
+                    .with_context(|| format!("reading {}", template_path.display()))?;
+                let local_combined = content_hash(&disk_bytes);
 
                 let entry = lockfile.objects.get("email_templates").and_then(|m| m.get(&lockfile_key));
                 let Some(entry) = entry else {
@@ -97,6 +80,15 @@ pub async fn push(
                 if &local_combined == base {
                     continue;
                 }
+
+                let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
+                    .with_context(|| format!("parsing {}", template_path.display()))?;
+                let overlay_paths = overlay.as_ref().and_then(|ov| ov.email_template(&lockfile_key));
+                if let Some(p) = overlay_paths {
+                    apply_overrides(&mut payload, p);
+                }
+                let payload_template: crate::model::EmailTemplate = serde_json::from_value(payload)
+                    .with_context(|| format!("deserializing overlay-applied email template '{lockfile_key}'"))?;
 
                 let id = entry.id;
                 if remote_cache.is_empty() {
@@ -114,6 +106,7 @@ pub async fn push(
                 let mut remote_bytes = serde_json::to_vec_pretty(&remote_template)
                     .context("serializing remote email template")?;
                 remote_bytes.push(b'\n');
+                let remote_bytes = maybe_strip_overlay(remote_bytes, overlay_paths)?;
                 let remote_combined = content_hash(&remote_bytes);
                 if &remote_combined != base {
                     eprintln!(
@@ -126,13 +119,13 @@ pub async fn push(
                 let updated = client.update_email_template(id, &payload_template).await
                     .with_context(|| format!("PATCH /email_templates/{id}"))?;
 
-                write_email_template(&templates_dir, template_slug, &updated)
-                    .with_context(|| format!("writing post-push canonical form for email template '{lockfile_key}'"))?;
-
                 let mut updated_bytes = serde_json::to_vec_pretty(&updated)
                     .context("serializing updated email template")?;
                 updated_bytes.push(b'\n');
+                let updated_bytes = maybe_strip_overlay(updated_bytes, overlay_paths)?;
                 let updated_hash = content_hash(&updated_bytes);
+                write_atomic(&template_path, &updated_bytes)
+                    .with_context(|| format!("writing post-push canonical form for email template '{lockfile_key}'"))?;
 
                 lockfile.upsert(
                     "email_templates",

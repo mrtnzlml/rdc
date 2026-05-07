@@ -101,6 +101,36 @@ pub fn apply_overrides(value: &mut Value, overrides: &BTreeMap<String, Value>) {
     }
 }
 
+/// Remove the leaf key at each dotted path from `value`. Intermediate
+/// objects that become empty are NOT cleaned up — the strip is shallow.
+/// Missing paths are silently ignored.
+///
+/// Used on the pull side (per spec §9.3) so the snapshot reflects the
+/// canonical form (without env-specific overlay values), keeping diffs
+/// across envs quiet. The push side re-applies the overlay before
+/// sending, so the round-trip is preserved.
+pub fn strip_paths(value: &mut Value, paths: &BTreeMap<String, Value>) {
+    for path in paths.keys() {
+        delete_at_path(value, path);
+    }
+}
+
+fn delete_at_path(value: &mut Value, path: &str) {
+    let segments: Vec<&str> = path.split('.').collect();
+    if segments.is_empty() {
+        return;
+    }
+    let mut current = value;
+    for segment in &segments[..segments.len() - 1] {
+        let Some(obj) = current.as_object_mut() else { return };
+        let Some(next) = obj.get_mut(*segment) else { return };
+        current = next;
+    }
+    if let Some(obj) = current.as_object_mut() {
+        obj.remove(*segments.last().unwrap());
+    }
+}
+
 fn set_at_path(value: &mut Value, path: &str, new_value: Value) {
     let segments: Vec<&str> = path.split('.').collect();
     if segments.is_empty() {
@@ -210,5 +240,49 @@ version = 1
         overrides.insert("config.runtime".to_string(), Value::String("py".into()));
         apply_overrides(&mut v, &overrides);
         assert_eq!(v["config"]["runtime"], Value::String("py".into()));
+    }
+
+    #[test]
+    fn strip_removes_top_level_key() {
+        let mut v = json!({ "name": "Validator (PROD)", "id": 1 });
+        let mut paths = BTreeMap::new();
+        paths.insert("name".to_string(), Value::Null);
+        strip_paths(&mut v, &paths);
+        assert!(v.get("name").is_none(), "name should be removed");
+        assert_eq!(v["id"], Value::Number(1.into()), "other fields untouched");
+    }
+
+    #[test]
+    fn strip_removes_nested_key_keeps_parent() {
+        let mut v = json!({ "config": { "runtime": "py-prod", "timeout": 30 } });
+        let mut paths = BTreeMap::new();
+        paths.insert("config.runtime".to_string(), Value::Null);
+        strip_paths(&mut v, &paths);
+        assert!(v["config"].get("runtime").is_none());
+        assert_eq!(v["config"]["timeout"], Value::Number(30.into()));
+    }
+
+    #[test]
+    fn strip_silently_ignores_missing_path() {
+        let mut v = json!({ "id": 1 });
+        let mut paths = BTreeMap::new();
+        paths.insert("config.missing.deep".to_string(), Value::Null);
+        strip_paths(&mut v, &paths);
+        assert_eq!(v, json!({ "id": 1 }));
+    }
+
+    #[test]
+    fn strip_handles_multiple_paths() {
+        let mut v = json!({
+            "name": "Validator",
+            "config": { "runtime": "py", "timeout": 30 }
+        });
+        let mut paths = BTreeMap::new();
+        paths.insert("name".to_string(), Value::Null);
+        paths.insert("config.runtime".to_string(), Value::Null);
+        strip_paths(&mut v, &paths);
+        assert!(v.get("name").is_none());
+        assert!(v["config"].get("runtime").is_none());
+        assert_eq!(v["config"]["timeout"], Value::Number(30.into()));
     }
 }

@@ -53,9 +53,34 @@ pub fn write_schema(queue_dir: &Path, schema: &Schema) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Read a schema from disk. If a `formulas/` subdirectory exists, splice each
-/// `<id>.py` back into the corresponding datapoint's `formula` property.
-pub fn read_schema(queue_dir: &Path) -> Result<Schema> {
+/// Write pre-serialized schema bytes + formulas. Bypasses the typed
+/// re-serialize done by `write_schema` — used by the pull driver after
+/// applying overlay strip to the schema's JSON Value (M26).
+pub fn write_schema_bytes(
+    queue_dir: &Path,
+    json_bytes: &[u8],
+    formulas: &[(String, Vec<u8>)],
+) -> Result<()> {
+    let json_path = queue_dir.join("schema.json");
+    write_atomic(&json_path, json_bytes)?;
+    if !formulas.is_empty() {
+        let formulas_dir = queue_dir.join("formulas");
+        std::fs::create_dir_all(&formulas_dir)
+            .with_context(|| format!("creating {}", formulas_dir.display()))?;
+        for (field_id, code) in formulas {
+            let py_path = formulas_dir.join(format!("{field_id}.py"));
+            // Byte-exact: code is whatever serialize_schema returned.
+            write_atomic(&py_path, code)?;
+        }
+    }
+    Ok(())
+}
+
+/// Read a schema from disk as an untyped `Value`, with formula `.py` files
+/// spliced back into their datapoints. Used by overlay-aware push/apply
+/// callers: apply overlay first, then `serde_json::from_value(value)?`
+/// to type into `Schema`.
+pub fn read_schema_value(queue_dir: &Path) -> Result<Value> {
     let json_path = queue_dir.join("schema.json");
     let raw = std::fs::read_to_string(&json_path)
         .with_context(|| format!("reading {}", json_path.display()))?;
@@ -71,6 +96,14 @@ pub fn read_schema(queue_dir: &Path) -> Result<Schema> {
         }
     }
 
+    Ok(value)
+}
+
+/// Read a schema from disk into a typed `Schema`. Convenience wrapper
+/// around `read_schema_value` + typed deserialize.
+pub fn read_schema(queue_dir: &Path) -> Result<Schema> {
+    let value = read_schema_value(queue_dir)?;
+    let json_path = queue_dir.join("schema.json");
     let schema: Schema = serde_json::from_value(value)
         .with_context(|| format!("deserializing schema from {}", json_path.display()))?;
     Ok(schema)

@@ -1,13 +1,11 @@
 use crate::api::RossumClient;
+use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::snapshot::inbox::{read_inbox, write_inbox};
+use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
 
-/// Push locally-edited inboxes. Inboxes are 1:1 with queues; the lockfile
-/// keys them by queue slug. Walks every queue dir and looks for an
-/// `inbox.json` file. Returns `(pushed, skipped)`.
 pub async fn push(
     paths: &Paths,
     client: &RossumClient,
@@ -51,23 +49,9 @@ pub async fn push(
                 continue;
             }
 
-            let local_inbox = read_inbox(&queue_dir)
-                .with_context(|| format!("reading local inbox for queue '{q_slug}'"))?;
-
-            let mut payload = serde_json::to_value(&local_inbox)
-                .context("serializing local inbox to value")?;
-            if let Some(ov) = &overlay {
-                if let Some(inbox_overrides) = ov.inbox(&q_slug) {
-                    apply_overrides(&mut payload, inbox_overrides);
-                }
-            }
-            let payload_inbox: crate::model::Inbox = serde_json::from_value(payload)
-                .with_context(|| format!("re-deserializing overlay-applied inbox '{q_slug}'"))?;
-
-            let mut post_overlay_bytes = serde_json::to_vec_pretty(&payload_inbox)
-                .context("serializing inbox")?;
-            post_overlay_bytes.push(b'\n');
-            let local_combined = content_hash(&post_overlay_bytes);
+            let disk_bytes = std::fs::read(&inbox_path)
+                .with_context(|| format!("reading {}", inbox_path.display()))?;
+            let local_combined = content_hash(&disk_bytes);
 
             let entry = lockfile.objects.get("inboxes").and_then(|m| m.get(&q_slug));
             let Some(entry) = entry else {
@@ -84,12 +68,22 @@ pub async fn push(
                 continue;
             }
 
+            let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
+                .with_context(|| format!("parsing {}", inbox_path.display()))?;
+            let overlay_paths = overlay.as_ref().and_then(|ov| ov.inbox(&q_slug));
+            if let Some(p) = overlay_paths {
+                apply_overrides(&mut payload, p);
+            }
+            let payload_inbox: crate::model::Inbox = serde_json::from_value(payload)
+                .with_context(|| format!("deserializing overlay-applied inbox '{q_slug}'"))?;
+
             let id = entry.id;
             let remote_inbox = client.get_inbox(id).await
                 .with_context(|| format!("fetching inbox {id} to verify drift before push"))?;
             let mut remote_bytes = serde_json::to_vec_pretty(&remote_inbox)
                 .context("serializing remote inbox")?;
             remote_bytes.push(b'\n');
+            let remote_bytes = maybe_strip_overlay(remote_bytes, overlay_paths)?;
             let remote_combined = content_hash(&remote_bytes);
             if &remote_combined != base {
                 eprintln!(
@@ -102,13 +96,13 @@ pub async fn push(
             let updated = client.update_inbox(id, &payload_inbox).await
                 .with_context(|| format!("PATCH /inboxes/{id}"))?;
 
-            write_inbox(&queue_dir, &updated)
-                .with_context(|| format!("writing post-push canonical form for inbox '{q_slug}'"))?;
-
             let mut updated_bytes = serde_json::to_vec_pretty(&updated)
                 .context("serializing updated inbox")?;
             updated_bytes.push(b'\n');
+            let updated_bytes = maybe_strip_overlay(updated_bytes, overlay_paths)?;
             let updated_hash = content_hash(&updated_bytes);
+            write_atomic(&inbox_path, &updated_bytes)
+                .with_context(|| format!("writing post-push canonical form for inbox '{q_slug}'"))?;
 
             lockfile.upsert(
                 "inboxes",

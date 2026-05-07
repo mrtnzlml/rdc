@@ -1148,3 +1148,153 @@ async fn pull_with_unknown_env_fails() {
         .failure()
         .stderr(predicate::str::contains("env 'prod' is not defined"));
 }
+
+/// M26: pull strips overlay-managed paths from the snapshot. The user
+/// configures `overlay.toml` with `name = "Validator (PROD)"` for a hook;
+/// after pulling, the on-disk JSON should NOT contain the `name` field.
+#[tokio::test]
+async fn pull_strips_overlay_paths_from_snapshot() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("hooks_list.json")))
+        .mount(&server).await;
+    let empty_list = serde_json::json!({ "pagination": { "next": null }, "results": [] });
+    for ep in [
+        "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list.clone()))
+            .mount(&server).await;
+    }
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+
+    // Write overlay BEFORE first pull so it's applied during the pull.
+    let overlay_path = project.path().join("envs/dev/overlay.toml");
+    std::fs::create_dir_all(overlay_path.parent().unwrap()).unwrap();
+    std::fs::write(&overlay_path, r#"
+version = 1
+
+[hooks.validator-invoices]
+"name" = "Validator (PROD)"
+"config.runtime" = "python3.12-secure"
+"#).unwrap();
+
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert().success();
+
+    let json_path = project.path().join("envs/dev/hooks/validator-invoices.json");
+    let raw = std::fs::read_to_string(&json_path).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert!(v.get("name").is_none(), "name was overlay-managed and should be stripped: {raw}");
+    assert!(
+        v.get("config").and_then(|c| c.get("runtime")).is_none(),
+        "config.runtime was overlay-managed and should be stripped: {raw}"
+    );
+    // Other fields untouched.
+    assert_eq!(v["id"], serde_json::json!(1));
+    assert_eq!(v["url"], serde_json::json!("https://mock.rossum.app/api/v1/hooks/1"));
+}
+
+/// M26: round-trip — after overlay strip on pull, push re-applies the
+/// overlay so the PATCH body has the env-specific value. Verifies that
+/// `read_hook_value` + apply-overlay-then-deserialize handles a file
+/// missing the typed `name` field.
+#[tokio::test]
+async fn push_succeeds_after_overlay_strip_on_pull() {
+    use std::sync::{Arc, Mutex};
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("hooks_list.json")))
+        .mount(&server).await;
+    let empty_list = serde_json::json!({ "pagination": { "next": null }, "results": [] });
+    for ep in [
+        "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list.clone()))
+            .mount(&server).await;
+    }
+
+    let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let captured_clone = captured.clone();
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/hooks/1"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            *captured_clone.lock().unwrap() = Some(body.clone());
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+
+    let overlay_path = project.path().join("envs/dev/overlay.toml");
+    std::fs::create_dir_all(overlay_path.parent().unwrap()).unwrap();
+    std::fs::write(&overlay_path, r#"
+version = 1
+
+[hooks.validator-invoices]
+"name" = "Validator (PROD)"
+"#).unwrap();
+
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert().success();
+
+    // Edit the .py file to trigger a push (combined hash changes).
+    let py_path = project.path().join("envs/dev/hooks/validator-invoices.py");
+    let original = std::fs::read_to_string(&py_path).unwrap();
+    std::fs::write(&py_path, format!("{original}# overlay-strip round-trip\n")).unwrap();
+
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["push", "dev"])
+        .assert().success();
+
+    let body = captured.lock().unwrap().clone()
+        .expect("PATCH should have been called once we triggered a real edit");
+    assert_eq!(
+        body["name"],
+        serde_json::Value::String("Validator (PROD)".into()),
+        "overlay re-applies name on push: {body}",
+    );
+}

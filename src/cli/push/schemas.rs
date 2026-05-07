@@ -1,19 +1,16 @@
 use crate::api::RossumClient;
+use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::snapshot::schema::{read_schema, serialize_schema, write_schema};
+use crate::snapshot::schema::{read_local_formulas, read_schema_value, serialize_schema, write_schema_bytes};
 use crate::state::{schema_combined_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
 
-/// Push locally-edited schemas to the Rossum API.
-///
-/// Schemas live nested under `envs/<env>/workspaces/<ws>/queues/<q>/schema.json`
-/// alongside the per-formula `formulas/<field_id>.py` files. The driver walks
-/// every queue directory under the env, splices formulas back into the
-/// schema's `content[]` tree (via `read_schema`), and PATCHes the result.
-///
-/// The combined hash (schema.json + sorted formulas) is the merge base,
-/// matching the M9 pull-side algorithm. Returns `(pushed, skipped)`.
+/// Push locally-edited schemas. Walks every queue dir for a schema.json,
+/// hashes the on-disk bytes (already in stripped form thanks to M26 pull),
+/// reads the raw Value (with formulas spliced) for overlay re-apply,
+/// drift-checks remote post-strip, and PATCHes. Post-PATCH disk write is
+/// also stripped so the snapshot matches lockfile.content_hash.
 pub async fn push(
     paths: &Paths,
     client: &RossumClient,
@@ -59,27 +56,15 @@ pub async fn push(
                 continue;
             }
 
-            // Read full schema (formulas spliced back inline).
-            let local_schema = read_schema(&queue_dir)
-                .with_context(|| format!("reading local schema for queue '{q_slug}'"))?;
-
-            // Apply overlay (if any) to a JSON Value, then re-deserialize.
-            let mut payload = serde_json::to_value(&local_schema)
-                .context("serializing local schema to value")?;
-            if let Some(ov) = &overlay {
-                if let Some(schema_overrides) = ov.schema(&q_slug) {
-                    apply_overrides(&mut payload, schema_overrides);
-                }
-            }
-            let payload_schema: crate::model::Schema = serde_json::from_value(payload)
-                .with_context(|| format!("re-deserializing overlay-applied schema '{q_slug}'"))?;
-
-            let (post_overlay_json, post_overlay_formulas) = serialize_schema(&payload_schema)?;
-            let local_combined = schema_combined_hash(&post_overlay_json, &post_overlay_formulas);
+            // Hash from disk: already-stripped JSON + formulas/*.py.
+            let disk_json = std::fs::read(&schema_path)
+                .with_context(|| format!("reading {}", schema_path.display()))?;
+            let disk_formulas = read_local_formulas(&queue_dir)?;
+            let local_combined = schema_combined_hash(&disk_json, &disk_formulas);
 
             let entry = lockfile.objects.get("schemas").and_then(|m| m.get(&q_slug));
             let Some(entry) = entry else {
-                eprintln!("warning: schema for queue '{q_slug}' — no lockfile entry, skipping (creates not supported)");
+                eprintln!("warning: schema for queue '{q_slug}' — no lockfile entry, skipping");
                 skipped += 1;
                 continue;
             };
@@ -88,13 +73,22 @@ pub async fn push(
                 skipped += 1;
                 continue;
             };
-
             if &local_combined == base {
                 continue;
             }
 
-            let id = entry.id;
+            // Read raw Value (formulas spliced inline), apply overlay,
+            // deserialize for the PATCH body.
+            let mut payload = read_schema_value(&queue_dir)
+                .with_context(|| format!("reading local schema for queue '{q_slug}'"))?;
+            let overlay_paths = overlay.as_ref().and_then(|ov| ov.schema(&q_slug));
+            if let Some(p) = overlay_paths {
+                apply_overrides(&mut payload, p);
+            }
+            let payload_schema: crate::model::Schema = serde_json::from_value(payload)
+                .with_context(|| format!("deserializing overlay-applied schema '{q_slug}'"))?;
 
+            let id = entry.id;
             let remote_schema = if let Some(s) = remote_cache.get(&id) {
                 s.clone()
             } else {
@@ -104,8 +98,8 @@ pub async fn push(
                 s
             };
             let (remote_json, remote_formulas) = serialize_schema(&remote_schema)?;
+            let remote_json = maybe_strip_overlay(remote_json, overlay_paths)?;
             let remote_combined = schema_combined_hash(&remote_json, &remote_formulas);
-
             if &remote_combined != base {
                 eprintln!(
                     "warning: schema for queue '{q_slug}' — remote has changed since last pull, skipping push (run `rdc pull` first)"
@@ -117,13 +111,11 @@ pub async fn push(
             let updated = client.update_schema(id, &payload_schema).await
                 .with_context(|| format!("PATCH /schemas/{id}"))?;
 
-            // Write canonical form back so the local snapshot matches the
-            // server response immediately (mirrors hooks/rules/labels post-push refresh).
-            write_schema(&queue_dir, &updated)
-                .with_context(|| format!("writing post-push canonical form for schema '{q_slug}'"))?;
-
             let (updated_json, updated_formulas) = serialize_schema(&updated)?;
+            let updated_json = maybe_strip_overlay(updated_json, overlay_paths)?;
             let updated_hash = schema_combined_hash(&updated_json, &updated_formulas);
+            write_schema_bytes(&queue_dir, &updated_json, &updated_formulas)
+                .with_context(|| format!("writing post-push canonical form for schema '{q_slug}'"))?;
 
             lockfile.upsert(
                 "schemas",
