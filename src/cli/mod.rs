@@ -41,6 +41,13 @@ pub enum Command {
     Status {
         env: Option<String>,
     },
+    /// Show diffs.
+    /// `rdc diff <env>` — local snapshot vs remote (one GET per edited object).
+    /// `rdc diff <a> <b>` — two local snapshots, no API calls.
+    Diff {
+        left: String,
+        right: Option<String>,
+    },
 }
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
@@ -52,6 +59,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Plan { from, to }) => crate::cli::deploy::plan::run(&from, &to).await,
         Some(Command::Apply { from, to }) => crate::cli::deploy::apply::run(&from, &to).await,
         Some(Command::Status { env }) => crate::cli::status::run(env).await,
+        Some(Command::Diff { left, right }) => crate::cli::diff::run(left, right).await,
         None => {
             use clap::CommandFactory;
             Cli::command().print_help()?;
@@ -62,6 +70,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 }
 
 pub mod deploy;
+pub mod diff;
 pub mod index;
 pub mod init;
 pub mod pull;

@@ -122,6 +122,12 @@ impl RossumClient {
         self.get_json(&url).await
     }
 
+    /// GET /hooks/{id}. Used by `rdc diff` for single-hook fetch.
+    pub async fn get_hook(&self, id: u64) -> Result<Hook> {
+        let url = format!("{}/hooks/{id}", self.base_url);
+        self.get_json(&url).await
+    }
+
     pub async fn list_workspaces(&self) -> Result<Vec<crate::model::Workspace>> {
         let mut url = format!("{}/workspaces", self.base_url);
         let mut out = Vec::new();
