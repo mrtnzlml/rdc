@@ -1426,3 +1426,80 @@ version = 1
         "overlay re-applies name on push: {body}",
     );
 }
+
+#[tokio::test]
+async fn pull_with_orphan_queue_surfaces_count_in_done_line() {
+    let server = MockServer::start().await;
+
+    // Organization endpoint required for bootstrap.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // All non-queue endpoints return empty results.
+    let empty = serde_json::json!({ "pagination": { "next": null }, "results": [] });
+    for ep in [
+        "/api/v1/hooks", "/api/v1/workspaces",
+        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty.clone()))
+            .mount(&server)
+            .await;
+    }
+
+    // One queue with workspace: null (orphan — no parent workspace known).
+    let queues_resp = serde_json::json!({
+        "pagination": { "next": null },
+        "results": [{
+            "id": 7,
+            "url": format!("{}/api/v1/queues/7", server.uri()),
+            "name": "orphan-q",
+            "workspace": null,
+            "schema": null
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&queues_resp))
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let out = Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "pull should succeed. stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("✓ queues:") && stderr.contains("orphans skipped"),
+        "expected orphans-skipped count in queues done-line. stderr was: {stderr}"
+    );
+}

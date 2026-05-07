@@ -775,3 +775,167 @@ async fn inbox_push_succeeds_when_edited() {
         .assert().success()
         .stdout(predicate::str::contains("1 inbox"));
 }
+
+/// Phase-1 fast path: after a clean pull with no local edits, push immediately
+/// should emit one "no changes" line on stderr and zero per-kind ✓ bars.
+#[tokio::test]
+async fn push_with_no_changes_prints_no_bars() {
+    let server = MockServer::start().await;
+    mount_get_only_hooks_org(&server, fixture("hooks_list.json")).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+
+    // Pull first to populate lockfile with correct hashes.
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert().success();
+
+    // Immediately push — phase-1 fast path, nothing changed.
+    let out = Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["push", "dev"])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "push should succeed. stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no changes"),
+        "expected no-changes shortcut on stderr. stderr: {stderr}"
+    );
+    // No per-kind ✓ lines should appear (phase-2 was skipped entirely).
+    let kind_lines: Vec<_> = stderr
+        .lines()
+        .filter(|l| l.starts_with("✓ ") && l.contains(": ") && !l.contains("envs/"))
+        .collect();
+    assert!(kind_lines.is_empty(), "expected no per-kind ✓ lines, got: {kind_lines:?}");
+}
+
+/// Drift check must NOT fire when the remote only differs in `modified_at`.
+/// `content_hash` strips noise fields, so the canonical hash of the remote
+/// (with bumped `modified_at`) equals the lockfile base hash → no drift,
+/// PATCH proceeds.
+#[tokio::test]
+async fn push_no_drift_when_only_modified_at_differs() {
+    let server = MockServer::start().await;
+
+    // Bootstrap: org + all-empty endpoints except labels.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server).await;
+    let empty = empty_list();
+    for ep in [
+        "/api/v1/hooks", "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/rules", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty.clone()))
+            .mount(&server).await;
+    }
+
+    // First pull: label with initial modified_at.
+    let base_label = serde_json::json!({
+        "pagination": { "next": null },
+        "results": [{
+            "id": 99,
+            "url": format!("{}/api/v1/labels/99", server.uri()),
+            "name": "audit-hold",
+            "organization": format!("{}/api/v1/organizations/1", server.uri()),
+            "color": "#aabbcc",
+            "modified_at": "2026-01-01T00:00:00Z"
+        }]
+    });
+    let _g = Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&base_label))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+
+    // First pull — establishes lockfile base hash.
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert().success();
+
+    drop(_g); // release the scoped mock
+
+    // Edit the local label file — this triggers a change in phase-1 scan.
+    let label_path = project.path().join("envs/dev/labels/audit-hold.json");
+    let raw = std::fs::read_to_string(&label_path).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    v["color"] = serde_json::json!("#112233");
+    std::fs::write(&label_path, format!("{}\n", serde_json::to_string_pretty(&v).unwrap())).unwrap();
+
+    // Remote GET /labels: same content as original base but bumped modified_at.
+    // content_hash strips modified_at, so remote_combined == base → no drift.
+    let remote_label_bumped_ts = serde_json::json!({
+        "pagination": { "next": null },
+        "results": [{
+            "id": 99,
+            "url": format!("{}/api/v1/labels/99", server.uri()),
+            "name": "audit-hold",
+            "organization": format!("{}/api/v1/organizations/1", server.uri()),
+            "color": "#aabbcc",
+            "modified_at": "2026-12-31T23:59:59Z"
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&remote_label_bumped_ts))
+        .mount(&server).await;
+
+    // PATCH /labels/99 — server confirms the edit.
+    let patch_response = serde_json::json!({
+        "id": 99,
+        "url": format!("{}/api/v1/labels/99", server.uri()),
+        "name": "audit-hold",
+        "organization": format!("{}/api/v1/organizations/1", server.uri()),
+        "color": "#112233",
+        "modified_at": "2026-12-31T23:59:59Z"
+    });
+    Mock::given(wiremock::matchers::method("PATCH"))
+        .and(wiremock::matchers::path("/api/v1/labels/99"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&patch_response))
+        .mount(&server).await;
+
+    let out = Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["push", "dev"])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "push should succeed. stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stderr.contains("drifted") && !stdout.contains("drifted"),
+        "expected no drift refusal on modified_at-only difference. stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        stdout.contains("1 label"),
+        "expected one label patched in summary. stdout={stdout}\nstderr={stderr}"
+    );
+}
