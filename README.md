@@ -2,15 +2,42 @@
 
 `rdc` (Rossum Deployment as Code) snapshots Rossum.ai configurations to disk for AI-assisted local development and deploys them across environments.
 
-**Status:** M13. Pull side complete. Push + deploy (`rdc push`/`map`/`plan`/`apply`) for hooks, rules, and labels. See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full design.
+**Status:** M14 — distributable. Pull all kinds; push + deploy for hooks/rules/labels. Install via `curl | sh` or `cargo install`. See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full design.
 
 **Coverage as of M13:** push and apply work for hooks, rules, and labels. Other kinds (queues, schemas, inboxes, engines, engine_fields, workflows, workflow_steps, email_templates, MDH) are pull-only — extending push to them is future work.
+
+## Install
+
+Quickest path (macOS + Linux x86_64):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mrtnzlml/rossum-deployment-manager-experiment/main/install.sh | sh
+```
+
+This downloads the right pre-built binary from the latest GitHub release and
+installs it to `~/.local/bin/rdc`. Add that directory to your `PATH` if it
+isn't already.
+
+To install a specific version:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mrtnzlml/rossum-deployment-manager-experiment/main/install.sh | sh -s -- v0.0.1
+```
+
+Or build from source with Rust:
+
+```sh
+cargo install --git https://github.com/mrtnzlml/rossum-deployment-manager-experiment
+```
+
+Or clone the repo and `cargo install --path .`.
+
+**Supported platforms (pre-built):** macOS (Intel + Apple Silicon), Linux x86_64.
+For Linux aarch64, Windows, or other platforms, build from source.
 
 ## Quick start
 
 ```sh
-cargo install --path .
-
 mkdir my-rossum-project && cd my-rossum-project
 rdc init --name my-project \
   --env dev=https://YOUR-ORG.rossum.app/api/v1:YOUR_ORG_ID
