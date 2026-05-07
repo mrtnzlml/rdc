@@ -13,18 +13,28 @@ pub enum Command {
     Init {
         #[arg(long)]
         name: String,
-
         #[arg(long = "env", value_name = "ENV_SPEC", required = true)]
         envs: Vec<String>,
     },
     /// Pull a Rossum environment's configuration into the local snapshot.
-    Pull {
-        env: String,
-    },
+    Pull { env: String },
     /// Push locally-edited hooks back to the Rossum environment.
-    /// (M10: hooks only; other kinds in future milestones.)
-    Push {
-        env: String,
+    Push { env: String },
+    /// Auto-match hooks by slug between two envs and write the mapping file.
+    Map { src: String, tgt: String },
+    /// Show what `rdc apply --from <src> --to <tgt>` would do.
+    Plan {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+    },
+    /// Push src env's hooks (with tgt overlay applied) to tgt env per the mapping.
+    Apply {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
     },
 }
 
@@ -33,6 +43,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Init { name, envs }) => crate::cli::init::run(&name, &envs).await,
         Some(Command::Pull { env }) => crate::cli::pull::run(&env).await,
         Some(Command::Push { env }) => crate::cli::push::run(&env).await,
+        Some(Command::Map { src, tgt }) => crate::cli::deploy::map::run(&src, &tgt).await,
+        Some(Command::Plan { from, to }) => crate::cli::deploy::plan::run(&from, &to).await,
+        Some(Command::Apply { from, to }) => crate::cli::deploy::apply::run(&from, &to).await,
         None => {
             use clap::CommandFactory;
             Cli::command().print_help()?;
@@ -42,6 +55,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
+pub mod deploy;
 pub mod index;
 pub mod init;
 pub mod pull;
