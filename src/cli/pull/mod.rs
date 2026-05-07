@@ -63,11 +63,12 @@ pub async fn run(env: &str) -> Result<()> {
         .with_context(|| format!("pulling workflow steps for env '{env}'"))?;
     let (n_email_templates, c_email_templates) = email_templates::pull(&mut ctx).await
         .with_context(|| format!("pulling email templates for env '{env}'"))?;
-    let n_datasets = mdh::pull(&mut ctx, env_cfg, &token).await
+    let (n_datasets, c_datasets) = mdh::pull(&mut ctx, env_cfg, &token).await
         .with_context(|| format!("pulling MDH datasets for env '{env}'"))?;
 
     let total_conflicts = c_orgs + c_hooks + c_rules + c_labels + c_engines
-        + c_engine_fields + c_workflows + c_workflow_steps + c_email_templates;
+        + c_engine_fields + c_workflows + c_workflow_steps + c_email_templates
+        + qc.conflicts + c_datasets;
 
     lockfile.save(&paths.lockfile())?;
     let mut summary = format!(
