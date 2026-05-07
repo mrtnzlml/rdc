@@ -38,7 +38,12 @@ pub async fn run(env: &str) -> Result<()> {
         .context("constructing Rossum API client")?;
 
     let mut lockfile = Lockfile::load(&paths.lockfile())?;
-    let mut ctx = PullCtx { paths: &paths, client: &client, lockfile: &mut lockfile };
+    let mut ctx = PullCtx {
+        paths: &paths,
+        client: &client,
+        lockfile: &mut lockfile,
+        queue_locations: std::collections::BTreeMap::new(),
+    };
 
     // Flat-list kinds (M7 three-way detection):
     let (n_orgs, c_orgs) = organization::pull(&mut ctx, env_cfg.org_id).await

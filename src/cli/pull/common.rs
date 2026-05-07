@@ -2,6 +2,7 @@ use crate::api::{ApiError, RossumClient};
 use crate::paths::Paths;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
 use anyhow::{anyhow, Context, Result};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// If `result` is a 403 permission_denied from the Rossum API, log a warning
@@ -33,6 +34,10 @@ pub struct PullCtx<'a> {
     pub paths: &'a Paths,
     pub client: &'a RossumClient,
     pub lockfile: &'a mut Lockfile,
+    /// Map of queue URL → `(ws_slug, q_slug)`, populated by the queues driver
+    /// and consumed by drivers for queue-nested kinds (currently
+    /// email_templates). Empty until queues run.
+    pub queue_locations: BTreeMap<String, (String, String)>,
 }
 
 /// Compute the content hash of an object's serialized form. The pull drivers

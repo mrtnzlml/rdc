@@ -125,9 +125,12 @@ impl Paths {
         self.env_root().join("workflow-steps")
     }
 
-    /// `<root>/envs/<env>/email-templates/`
-    pub fn email_templates_dir(&self) -> PathBuf {
-        self.env_root().join("email-templates")
+    /// `<root>/envs/<env>/workspaces/<ws_slug>/queues/<queue_slug>/email-templates/`.
+    /// Email templates are queue-scoped in the live API; the snapshot mirrors
+    /// that nesting (M16). The flat `envs/<env>/email-templates/` layout from
+    /// M5 was wrong — kept as a fallback only for legacy lockfiles.
+    pub fn queue_email_templates_dir(&self, ws_slug: &str, queue_slug: &str) -> PathBuf {
+        self.queue_dir(ws_slug, queue_slug).join("email-templates")
     }
 
     /// `<root>/envs/<env>/mdh/`
@@ -256,8 +259,11 @@ mod tests {
     }
 
     #[test]
-    fn email_templates_dir_path() {
-        assert_eq!(p().email_templates_dir(), Path::new("/proj/envs/dev/email-templates"));
+    fn queue_email_templates_dir_path() {
+        assert_eq!(
+            p().queue_email_templates_dir("invoices-ap", "cost-invoices"),
+            Path::new("/proj/envs/dev/workspaces/invoices-ap/queues/cost-invoices/email-templates")
+        );
     }
 
     #[test]

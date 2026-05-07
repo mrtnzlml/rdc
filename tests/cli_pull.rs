@@ -233,7 +233,10 @@ async fn pull_writes_full_workspace_tree() {
     assert!(env_root.join("workflows/ap-approval-flow.json").exists());
     assert!(env_root.join("workflow-steps/manager-approval.json").exists());
     assert!(env_root.join("workflow-steps/finance-approval.json").exists());
-    assert!(env_root.join("email-templates/rejection-notice.json").exists());
+    // M16: email templates nest under their queue.
+    assert!(env_root
+        .join("workspaces/invoices-ap/queues/cost-invoices/email-templates/rejection-notice.json")
+        .exists());
 
     assert!(lf.contains("\"workflows\""));
     assert!(lf.contains("\"workflow_steps\""));

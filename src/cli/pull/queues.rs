@@ -50,6 +50,10 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<QueueCounts> {
         std::fs::create_dir_all(&queue_dir)
             .with_context(|| format!("creating {}", queue_dir.display()))?;
 
+        // Record location so subsequent queue-nested drivers (email_templates)
+        // can resolve queue URL → (ws_slug, q_slug).
+        ctx.queue_locations.insert(q.url.clone(), (ws_slug.clone(), q_slug.clone()));
+
         // 1. queue.json — three-way
         let queue_path = queue_dir.join("queue.json");
         let mut queue_proposed = serde_json::to_vec_pretty(q).context("serializing queue")?;
