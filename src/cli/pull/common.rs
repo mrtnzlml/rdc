@@ -48,6 +48,16 @@ pub struct PullCtx<'a> {
     /// fetches (queues, mdh). Default 5 per spec §16; overridable via
     /// `--concurrency` flag or `RDC_CONCURRENCY` env var.
     pub concurrency: usize,
+    /// When true, conflicts trigger an interactive [k]/[r]/[e]/[s]/[a]
+    /// prompt (spec §8.3). False on non-TTY or when `--yes` was passed —
+    /// in that case `apply_pull_action` falls back to the legacy
+    /// shadow-file behavior. Drivers consult `ctx.interactive` and pass
+    /// it to `apply_pull_action`.
+    pub interactive: bool,
+    /// Running counter of conflicts that the user resolved interactively
+    /// during this pull. Surfaced in the summary line so the user sees
+    /// "N conflicts (resolved)" instead of just N.
+    pub conflicts_resolved: usize,
 }
 
 /// Compute the content hash of an object's serialized form. The pull drivers
@@ -171,11 +181,18 @@ pub fn decide_pull_action(
 
 /// Apply the decision to the filesystem and return the hash that should be
 /// recorded in the lockfile (which differs depending on the action).
+///
+/// On [`PullAction::Conflict`] with `interactive == true`, the function
+/// invokes the spec §8.3 resolver TUI. With `interactive == false` (CI,
+/// non-TTY, or `--yes`), it preserves the legacy shadow-file behavior:
+/// writes `<file>.remote` next to the local file, keeps local, returns
+/// the local hash.
 pub fn apply_pull_action(
     action: PullAction,
     local_path: &Path,
     remote_bytes: &[u8],
     remote_hash: String,
+    interactive: bool,
 ) -> Result<String> {
     use crate::snapshot::writer::write_atomic;
     match action {
@@ -189,22 +206,76 @@ pub fn apply_pull_action(
             Ok(content_hash(&local_bytes))
         }
         PullAction::Conflict => {
-            let mut conflict_path = local_path.to_path_buf();
-            let new_name = match conflict_path.file_name().and_then(|s| s.to_str()) {
-                Some(name) => format!("{name}.remote"),
-                None => "remote".to_string(),
-            };
-            conflict_path.set_file_name(new_name);
-            write_atomic(&conflict_path, remote_bytes)?;
-            eprintln!(
-                "warning: {} conflict — local preserved, remote at {}",
-                local_path.display(),
-                conflict_path.display()
-            );
+            if interactive {
+                resolve_conflict_interactive(local_path, remote_bytes, &remote_hash)
+            } else {
+                shadow_file_conflict(local_path, remote_bytes)
+            }
+        }
+    }
+}
+
+/// The legacy shadow-file behavior for a conflict: write
+/// `<file>.remote`, keep local on disk, return the local hash. Used when
+/// `interactive == false` (CI/non-TTY/--yes) and as a fallback from the
+/// resolver when the user picks `[s]kip`.
+fn shadow_file_conflict(local_path: &Path, remote_bytes: &[u8]) -> Result<String> {
+    use crate::snapshot::writer::write_atomic;
+    let mut conflict_path = local_path.to_path_buf();
+    let new_name = match conflict_path.file_name().and_then(|s| s.to_str()) {
+        Some(name) => format!("{name}.remote"),
+        None => "remote".to_string(),
+    };
+    conflict_path.set_file_name(new_name);
+    write_atomic(&conflict_path, remote_bytes)?;
+    eprintln!(
+        "warning: {} conflict — local preserved, remote at {}",
+        local_path.display(),
+        conflict_path.display()
+    );
+    let local_bytes = std::fs::read(local_path)
+        .with_context(|| format!("reading {}", local_path.display()))?;
+    Ok(content_hash(&local_bytes))
+}
+
+/// Drive the spec §8.3 resolver TUI on stdin/stderr. On
+/// [`crate::cli::resolve::Resolution::Abort`] this returns a
+/// [`crate::cli::resolve::PullAborted`]-wrapping anyhow error so the
+/// pull runner can downcast and skip lockfile.save().
+fn resolve_conflict_interactive(
+    local_path: &Path,
+    remote_bytes: &[u8],
+    remote_hash: &str,
+) -> Result<String> {
+    use crate::cli::resolve::{prompt_resolve, PullAborted, Resolution};
+    use crate::snapshot::writer::write_atomic;
+
+    let stdin = std::io::stdin();
+    let stderr = std::io::stderr();
+    let resolution = prompt_resolve(
+        stdin.lock(),
+        stderr.lock(),
+        1, // No global counter yet — drivers don't share an index/total.
+        1,
+        local_path,
+        remote_bytes,
+    )?;
+    match resolution {
+        Resolution::KeepLocal => {
             let local_bytes = std::fs::read(local_path)
                 .with_context(|| format!("reading {}", local_path.display()))?;
             Ok(content_hash(&local_bytes))
         }
+        Resolution::KeepRemote => {
+            write_atomic(local_path, remote_bytes)?;
+            Ok(remote_hash.to_string())
+        }
+        Resolution::Edit(edited) => {
+            write_atomic(local_path, &edited)?;
+            Ok(content_hash(&edited))
+        }
+        Resolution::Skip => shadow_file_conflict(local_path, remote_bytes),
+        Resolution::Abort => Err(anyhow::Error::new(PullAborted)),
     }
 }
 
@@ -294,17 +365,18 @@ mod tests {
     fn apply_write_creates_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
-        let h = apply_pull_action(PullAction::Write, &path, b"hello", "h".repeat(64)).unwrap();
+        let h = apply_pull_action(PullAction::Write, &path, b"hello", "h".repeat(64), false).unwrap();
         assert_eq!(h, "h".repeat(64));
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
     }
 
     #[test]
-    fn apply_conflict_writes_remote_sibling() {
+    fn apply_conflict_non_interactive_writes_remote_sibling() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"local").unwrap();
-        let _ = apply_pull_action(PullAction::Conflict, &path, b"remote", "h".repeat(64)).unwrap();
+        // interactive=false → legacy shadow-file behavior.
+        let _ = apply_pull_action(PullAction::Conflict, &path, b"remote", "h".repeat(64), false).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"local");
         assert_eq!(std::fs::read(dir.path().join("x.json.remote")).unwrap(), b"remote");
     }

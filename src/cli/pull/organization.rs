@@ -28,7 +28,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, org_id: u64) -> Result<(usize, usize)> 
 
     let (action, remote_hash) = decide_pull_action(&path, base_hash.as_deref(), &proposed)?;
     let conflicts = if action == PullAction::Conflict { 1 } else { 0 };
-    let recorded_hash = apply_pull_action(action, &path, &proposed, remote_hash)?;
+    let recorded_hash = apply_pull_action(action, &path, &proposed, remote_hash, ctx.interactive)?;
 
     record_object(
         ctx.lockfile,

@@ -4,7 +4,7 @@
 disk for AI-assisted local development, lets you edit them in place, and
 deploys them across environments.
 
-**Status:** M31. Pull all kinds (incl. MDH collections + indexes —
+**Status:** M32. Pull all kinds (incl. MDH collections + indexes —
 data storage URL derived from `api_base`, no extra config); push
 and deploy for hooks, rules, labels, queues, schemas (formula
 bodies round-trip), inboxes, email templates, engines, and engine
@@ -17,12 +17,14 @@ plus a cross-references section that resolves `hook → queues`,
 per-queue and per-MDH-collection sub-fetches via a bounded
 `--concurrency` (spec §7.2 / §16, default 5). All HTTP calls
 retry gracefully on `429 Too Many Requests` and transient 5xx
-(502/503/504) with `Retry-After` / exponential backoff. `rdc init` accepts flags or runs an
-interactive wizard; `rdc status` for a read-only health check;
-`rdc diff` for unified diffs (local vs remote, or two
-snapshots); `rdc auth` to set/refresh tokens; `rdc repair
---rebuild-lock` for lockfile recovery. Distributable via
-`curl | sh` or `cargo install`. See
+(502/503/504) with `Retry-After` / exponential backoff. Pull
+conflicts open an interactive `[k]/[r]/[e]/[s]/[a]` resolver on
+TTY (spec §8.3); CI / non-TTY / `--yes` keeps the shadow-file
+flow. `rdc init` accepts flags or runs an interactive wizard;
+`rdc status` for a read-only health check; `rdc diff` for unified
+diffs (local vs remote, or two snapshots); `rdc auth` to
+set/refresh tokens; `rdc repair --rebuild-lock` for lockfile
+recovery. Distributable via `curl | sh` or `cargo install`. See
 `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full
 design.
 
@@ -237,21 +239,59 @@ does not modify any files.
 
 ## Conflict handling
 
-`rdc pull` does field-level three-way merge for every kind:
+`rdc pull` does three-way merge for every kind:
 
 | Local edited? | Remote changed? | Action |
 |---|---|---|
 | no | no | (no-op) |
 | no | yes | write the remote |
 | yes | no | keep local |
-| yes | yes | **conflict** — keep local, write remote next to it as `<file>.remote` |
-
-A per-conflict warning goes to stderr and the count appears in the
-summary line.
+| yes | yes | **conflict** — see resolver below |
 
 For schemas, the "combined hash" covers `schema.json` plus every
 `formulas/<id>.py` file, so a formula-only edit is detected correctly.
 For hooks, the combined hash covers `<slug>.json` plus `<slug>.py`.
+
+### Interactive resolver (TTY)
+
+When stdin is a TTY and `--yes` was not passed, `rdc pull` opens an
+inline resolver per conflict (spec §8.3):
+
+```text
+[1/3]  envs/dev/labels/audit-hold.json — conflict
+
+--- local
++++ remote
+@@ -1,7 +1,7 @@
+ {
+   "id": 9931,
+-  "name": "Audit hold (LOCAL EDIT)",
++  "name": "Audit hold",
+   ...
+
+[k]eep local  [r]emote  [e]dit  [s]kip (shadow file)  [a]bort >
+```
+
+| Choice | Effect |
+|--------|--------|
+| `k` | Keep local. No write. Lockfile records the local hash. |
+| `r` | Overwrite local with the remote bytes. Lockfile records the remote hash. |
+| `e` | Open `$EDITOR` on a temp file containing git-style conflict markers. Saved bytes become the new local + lockfile hash. |
+| `s` | Skip — fall back to the shadow-file behavior (writes `<file>.remote`, keeps local). |
+| `a` | Abort the entire pull. The lockfile is **not** saved; nothing else is written from this point on. |
+
+Currently the resolver covers single-file JSON conflicts (queues,
+inboxes, rules, labels, engines, engine fields, workflows, workflow
+steps, email templates, MDH metadata). Hook and schema combined-hash
+conflicts (where the `.json` and `.py`/formula files diverge together)
+keep the shadow-file flow for now.
+
+### Non-interactive / CI (`--yes` or non-TTY)
+
+Without a TTY (CI, output piped, or `--yes`), conflicts fall back to
+the legacy shadow-file behavior: the local file is preserved and the
+remote is written to `<file>.remote` next to it. A per-conflict
+warning goes to stderr and the count appears in the summary line.
 
 After a conflict, the local copy is canonical; review the
 `<file>.remote` (and `<dir>.remote/` for schema formulas), then either

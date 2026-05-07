@@ -66,7 +66,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str) -> Re
         if c_action == PullAction::Conflict {
             conflicts += 1;
         }
-        let c_recorded = apply_pull_action(c_action, &coll_path, &coll_proposed, c_remote_hash)?;
+        let c_recorded = apply_pull_action(c_action, &coll_path, &coll_proposed, c_remote_hash, ctx.interactive)?;
         record_object(
             ctx.lockfile,
             "mdh_collections",
@@ -117,7 +117,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str) -> Re
         if i_action == PullAction::Conflict {
             conflicts += 1;
         }
-        let i_recorded = apply_pull_action(i_action, &ix_path, &ix_proposed, i_remote_hash)?;
+        let i_recorded = apply_pull_action(i_action, &ix_path, &ix_proposed, i_remote_hash, ctx.interactive)?;
         record_object(
             ctx.lockfile,
             "mdh_indexes",

@@ -84,7 +84,9 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
 
         let recorded_hash = match action {
             PullAction::Write => {
-                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone())?;
+                // Write branch — the `interactive` flag is irrelevant (no
+                // resolver path); pass `ctx.interactive` for consistency.
+                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone(), ctx.interactive)?;
                 if let Some(code) = &proposed_code {
                     write_hook_code(&ctx.paths.hooks_dir(), &slug, code)
                         .with_context(|| format!("writing hook code for '{}'", hook.name))?;
@@ -99,7 +101,12 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
                 hook_combined_hash(local_json, &pre_local_code)
             }
             PullAction::Conflict => {
-                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone())?;
+                // Hooks are a combined-hash kind (json + py). The §8.3
+                // resolver currently only handles single-file JSON conflicts,
+                // so we force `interactive=false` here and stay on the
+                // shadow-file path: <slug>.json.remote + <slug>.py.remote.
+                // M33 (or later) extends the resolver to walk both files.
+                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone(), false)?;
                 if let Some(code) = &proposed_code {
                     let py_remote_path = ctx.paths.hooks_dir().join(format!("{slug}.py.remote"));
                     crate::snapshot::writer::write_atomic(&py_remote_path, code.as_bytes())?;
