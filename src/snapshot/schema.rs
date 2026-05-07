@@ -10,10 +10,16 @@ use std::path::Path;
 ///
 /// **Hash coverage gap:** The returned bytes are the post-extraction
 /// `schema.json` content. Changes to extracted `formulas/*.py` files are NOT
-/// reflected in the returned hash. M7's three-way merge must therefore
-/// recompute schema hashes by combining schema.json bytes with all formula
-/// file bytes — using the lockfile content_hash alone will miss formula-only
-/// drift.
+/// reflected in the returned hash.
+///
+/// **Combined-hash algorithm for M7's three-way merge:** When implementing
+/// drift detection, compute the canonical schema content hash as
+/// `SHA-256(schema_json_bytes || 0x00 || formula_1_path || 0x00 ||
+/// formula_1_bytes || 0x00 || formula_2_path || 0x00 || formula_2_bytes ||
+/// ...)` where formulas are sorted by `field_id`. The 0x00 separator makes
+/// boundaries unambiguous; sorting makes the hash deterministic across
+/// platforms with non-stable filesystem listing order. Until M7, the
+/// lockfile stores the simpler `schema.json`-only hash.
 pub fn write_schema(queue_dir: &Path, schema: &Schema) -> Result<Vec<u8>> {
     let mut value = serde_json::to_value(schema)
         .context("serializing schema to value")?;

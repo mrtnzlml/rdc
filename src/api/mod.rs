@@ -8,8 +8,10 @@ use reqwest::Client;
 use serde::Deserialize;
 
 /// Rossum API client. Holds a base URL (e.g. `https://X.rossum.app/api/v1`)
-/// and a static API token. M1 only implements the methods needed for `pull`
-/// of hooks. Pagination is followed transparently.
+/// and a static API token. Pagination is followed transparently for `list_*`
+/// methods. As of M5, supports list/get for organizations, workspaces, queues,
+/// inboxes, schemas, hooks, rules, labels, engines, engine fields, workflows,
+/// workflow steps, and email templates.
 pub struct RossumClient {
     base_url: String,
     token: String,
