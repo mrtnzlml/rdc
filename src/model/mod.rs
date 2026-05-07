@@ -1,8 +1,10 @@
+pub mod collection;
 pub mod email_template;
 pub mod engine;
 pub mod engine_field;
 pub mod hook;
 pub mod inbox;
+pub mod index_set;
 pub mod label;
 pub mod organization;
 pub mod queue;
@@ -12,11 +14,13 @@ pub mod workflow;
 pub mod workflow_step;
 pub mod workspace;
 
+pub use collection::Collection;
 pub use email_template::EmailTemplate;
 pub use engine::Engine;
 pub use engine_field::EngineField;
 pub use hook::Hook;
 pub use inbox::Inbox;
+pub use index_set::IndexSet;
 pub use label::Label;
 pub use organization::Organization;
 pub use queue::Queue;
