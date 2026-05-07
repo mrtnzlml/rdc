@@ -1,8 +1,10 @@
+pub mod collection;
 pub mod email_template;
 pub mod engine;
 pub mod engine_field;
 pub mod hook;
 pub mod inbox;
+pub mod index_set;
 pub mod label;
 pub mod organization;
 pub mod queue;
