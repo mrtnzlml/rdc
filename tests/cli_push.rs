@@ -220,3 +220,75 @@ async fn push_with_no_local_edits_is_noop() {
         .assert().success()
         .stdout(predicate::str::contains("0 hooks"));
 }
+
+/// Regression: after a successful push, the local file should be rewritten
+/// with the canonical (server-authoritative) form. Without this, files
+/// edited by tooling that escapes Unicode differently (e.g. Python with
+/// ensure_ascii=True) leave the disk bytes diverged from the lockfile hash,
+/// and the user sees their file mutate on the next pull.
+#[tokio::test]
+async fn push_rewrites_local_file_with_canonical_form() {
+    let server = MockServer::start().await;
+    mount_get_only_hooks_org(&server, fixture("hooks_list.json")).await;
+
+    // Server response: description has a real em-dash character (UTF-8).
+    let canonical_response = serde_json::json!({
+        "id": 1,
+        "url": "https://mock.rossum.app/api/v1/hooks/1",
+        "name": "Validator: invoices",
+        "type": "function",
+        "description": "post-push canonical \u{2014} value",
+        "queues": ["https://mock.rossum.app/api/v1/queues/100"],
+        "events": ["annotation_content"],
+        "config": { "runtime": "python3.12", "code": "def validate(payload):\n    return {}\n" }
+    });
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/hooks/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(canonical_response))
+        .mount(&server).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert().success();
+
+    // Mangle the local JSON: inject an ASCII-escaped em-dash literal (`—`).
+    // `serde_json::to_vec_pretty` writes `—` as a raw 3-byte UTF-8 sequence;
+    // `python -c "json.dump(..., ensure_ascii=True)"` writes the same character
+    // as a 6-byte ASCII escape. Both decode to the same string at parse time.
+    let json_path = project.path().join("envs/dev/hooks/validator-invoices.json");
+    let raw = std::fs::read_to_string(&json_path).unwrap();
+    let mangled = raw.replace(
+        "\"name\": \"Validator: invoices\",",
+        "\"name\": \"Validator: invoices\",\n  \"description\": \"local \\u2014 mangle\",",
+    );
+    std::fs::write(&json_path, &mangled).unwrap();
+    let pre_push = std::fs::read(&json_path).unwrap();
+    assert!(pre_push.windows(6).any(|w| w == b"\\u2014"),
+            "test setup: file should contain literal \\u2014 escape");
+
+    let py_path = project.path().join("envs/dev/hooks/validator-invoices.py");
+    let py = std::fs::read_to_string(&py_path).unwrap();
+    std::fs::write(&py_path, format!("{py}# trigger push\n")).unwrap();
+
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["push", "dev"])
+        .assert().success()
+        .stdout(predicate::str::contains("Pushed 1 hook"));
+
+    let post_push = std::fs::read(&json_path).unwrap();
+    assert!(!post_push.windows(6).any(|w| w == b"\\u2014"),
+            "after push, literal \\u2014 escape should be gone — file should match canonical server response");
+    assert!(post_push.windows(3).any(|w| w == "—".as_bytes()),
+            "after push, the em-dash should be present as raw UTF-8 (3 bytes)");
+}
