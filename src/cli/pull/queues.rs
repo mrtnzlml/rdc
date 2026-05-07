@@ -12,6 +12,7 @@ use super::common::{
     record_object, skip_on_permission_denied, PullAction, PullCtx,
 };
 use crate::model::{Inbox, Queue, Schema};
+use crate::progress::KindProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use futures::stream::{StreamExt, TryStreamExt};
@@ -35,12 +36,13 @@ struct QueueWork<'a> {
     inbox_id: Option<u64>,
 }
 
-pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<QueueCounts> {
+pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<QueueCounts> {
     let queues = skip_on_permission_denied(
         ctx.client.list_queues().await.context("listing queues"),
         "queues",
     )?;
 
+    progress.set_total(queues.len() as u64);
     let mut per_ws_used_slugs: HashMap<String, HashSet<String>> = HashMap::new();
     let mut counts = QueueCounts { queues: 0, schemas: 0, inboxes: 0, conflicts: 0 };
 
@@ -50,10 +52,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<QueueCounts> {
         let ws_url = match &q.workspace {
             Some(u) => u,
             None => {
-                eprintln!(
-                    "warning: skipping queue '{}' (id {}) — no workspace (orphan/hidden)",
-                    q.name, q.id
-                );
+                progress.skipped_orphan();
                 continue;
             }
         };
@@ -112,10 +111,11 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<QueueCounts> {
             Some(url) => Some(parse_id_from_url(url)
                 .with_context(|| format!("parsing schema URL '{}' for queue '{}'", url, q.name))?),
             None => {
-                eprintln!(
-                    "warning: queue '{}' (id {}) has no schema — skipping schema + inbox",
-                    q.name, q.id
-                );
+                let q_name = q.name.clone();
+                let q_id = q.id;
+                progress.suspend(move || eprintln!(
+                    "warning: queue '{q_name}' (id {q_id}) has no schema — skipping schema + inbox"
+                ));
                 None
             }
         };
@@ -158,11 +158,12 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<QueueCounts> {
         let Some((schema_opt, inbox_opt)) = fetched.get(&w.q.id) else { continue };
 
         if let Some(schema) = schema_opt {
-            write_schema_for_queue(ctx, &mut counts, w, schema)?;
+            write_schema_for_queue(ctx, &mut counts, w, schema, progress)?;
         }
         if let Some(inbox) = inbox_opt {
             write_inbox_for_queue(ctx, &mut counts, w, inbox)?;
         }
+        progress.tick();
     }
 
     Ok(counts)
@@ -173,6 +174,7 @@ fn write_schema_for_queue(
     counts: &mut QueueCounts,
     w: &QueueWork<'_>,
     schema: &Schema,
+    progress: &KindProgress,
 ) -> Result<()> {
     let queue_dir = &w.queue_dir;
     let schema_path = queue_dir.join("schema.json");
@@ -285,12 +287,12 @@ fn write_schema_for_queue(
                         crate::snapshot::writer::write_atomic(&p, bytes)?;
                     }
                 }
-                eprintln!(
-                    "warning: {} conflict — local preserved, remote at {} (formulas at {})",
-                    schema_path.display(),
-                    queue_dir.join("schema.json.remote").display(),
-                    queue_dir.join("formulas.remote").display()
-                );
+                let schema_path_disp = schema_path.display().to_string();
+                let remote_path_disp = queue_dir.join("schema.json.remote").display().to_string();
+                let formulas_remote_disp = queue_dir.join("formulas.remote").display().to_string();
+                progress.suspend(move || eprintln!(
+                    "warning: {schema_path_disp} conflict — local preserved, remote at {remote_path_disp} (formulas at {formulas_remote_disp})"
+                ));
                 crate::state::schema_combined_hash(local_json, &pre_local_formulas)
             }
         }

@@ -157,8 +157,13 @@ async fn run_drivers(
         p.finish();
         result
     };
-    let qc = queues::pull(ctx).await
-        .with_context(|| format!("pulling queues for env '{env}'"))?;
+    let qc = {
+        let p = KindProgress::start("queues");
+        let result = queues::pull(ctx, &p).await
+            .with_context(|| format!("pulling queues for env '{env}'"))?;
+        p.finish();
+        result
+    };
     let (n_hooks, c_hooks) = {
         let p = KindProgress::start("hooks");
         let result = hooks::pull(ctx, &p).await
