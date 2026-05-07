@@ -2,7 +2,7 @@
 
 `rdc` (Rossum Deployment as Code) snapshots Rossum.ai configurations to disk for AI-assisted local development and deploys them across environments.
 
-**Status:** M11. Pull side feature-complete. `rdc push` for hooks with optional per-env overlays. See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full design.
+**Status:** M12. Pull side complete. Push for hooks. Deploy workflow (`rdc map`/`plan`/`apply`) for hooks across envs. See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full design.
 
 ## Quick start
 
@@ -87,6 +87,37 @@ overwritten by the overlay on push.
 - Hooks only (matches push scope).
 - Push-side only — pull does not strip overlay-managed values yet.
 - Simple dotted paths only; no JMESPath wildcards or array filters.
+
+## Deploy (M12 — TEST → PROD for hooks)
+
+`rdc map <src> <tgt>` — auto-match hook slugs between two envs and write
+`.rdc/map/<src>→<tgt>.toml`. The mapping file is hand-editable; entries
+that auto-match by slug are added on each run.
+
+`rdc plan --from <src> --to <tgt>` — show what apply would do
+(read-only, no API calls).
+
+`rdc apply --from <src> --to <tgt>` — for each mapped hook, read the src
+snapshot, apply tgt's overlay, PATCH tgt's API. Used after pushing changes
+through TEST and ready to roll them to PROD.
+
+**Typical flow:**
+
+```sh
+rdc pull test                          # pull both envs once
+rdc pull prod
+rdc map test prod                      # auto-match by slug
+$EDITOR .rdc/map/test→prod.toml        # hand-curate any rename mappings
+rdc plan --from test --to prod         # preview
+rdc apply --from test --to prod        # execute
+```
+
+**M12 limitations:**
+- Hooks only.
+- Updates only (no creates / deletes).
+- No drift detection between local tgt snapshot and remote tgt.
+- No overlay-managed diff exclusion (overlay always overrides).
+- Apply is not idempotent — every run PATCHes mapped hooks.
 
 ## Tests
 
