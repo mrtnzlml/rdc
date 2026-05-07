@@ -35,6 +35,12 @@ pub struct Overlay {
     /// matching the lockfile key for queue-scoped email templates (M16).
     #[serde(default)]
     pub email_templates: BTreeMap<String, BTreeMap<String, Value>>,
+    /// Engine overrides keyed by engine slug.
+    #[serde(default)]
+    pub engines: BTreeMap<String, BTreeMap<String, Value>>,
+    /// Engine field overrides keyed by engine field slug.
+    #[serde(default)]
+    pub engine_fields: BTreeMap<String, BTreeMap<String, Value>>,
 }
 
 impl Overlay {
@@ -75,6 +81,14 @@ impl Overlay {
 
     pub fn email_template(&self, key: &str) -> Option<&BTreeMap<String, Value>> {
         self.email_templates.get(key)
+    }
+
+    pub fn engine(&self, slug: &str) -> Option<&BTreeMap<String, Value>> {
+        self.engines.get(slug)
+    }
+
+    pub fn engine_field(&self, slug: &str) -> Option<&BTreeMap<String, Value>> {
+        self.engine_fields.get(slug)
     }
 }
 

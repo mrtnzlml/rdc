@@ -1,4 +1,4 @@
-use crate::api::RossumClient;
+use crate::api::{anyhow_has_status, RossumClient};
 use crate::config::ProjectConfig;
 use crate::mapping::Mapping;
 use crate::overlay::{apply_overrides, Overlay};
@@ -39,6 +39,8 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
     let mut applied_schemas = 0usize;
     let mut applied_inboxes = 0usize;
     let mut applied_email_templates = 0usize;
+    let mut applied_engines = 0usize;
+    let mut applied_engine_fields = 0usize;
     let mut skipped = 0usize;
 
     // Hooks (M12)
@@ -208,12 +210,80 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         applied_email_templates += 1;
     }
 
+    // Engines (M20)
+    for (src_slug, tgt_slug) in &mapping.engines {
+        let Some(tgt_id) = lookup_tgt_id(&tgt_lockfile, "engines", tgt_slug, &mut skipped) else { continue };
+        let path = src_paths.engines_dir().join(format!("{src_slug}.json"));
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(r) => r,
+            Err(e) => { eprintln!("warning: cannot read src engines/{src_slug}: {e:#}"); skipped += 1; continue; }
+        };
+        let src_engine: crate::model::Engine = serde_json::from_str(&raw)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        let mut payload = serde_json::to_value(&src_engine).context("serializing src engine")?;
+        if let Some(ov) = &tgt_overlay {
+            if let Some(overrides) = ov.engine(tgt_slug) {
+                apply_overrides(&mut payload, overrides);
+            }
+        }
+        let payload_engine: crate::model::Engine = serde_json::from_value(payload)
+            .with_context(|| format!("re-deserializing overlay-applied engine for tgt slug '{tgt_slug}'"))?;
+        match tgt_client.update_engine(tgt_id, &payload_engine).await
+            .with_context(|| format!("PATCH tgt engines/{tgt_id}"))
+        {
+            Ok(_) => applied_engines += 1,
+            Err(e) if anyhow_has_status(&e, 405) => {
+                eprintln!(
+                    "warning: engines are not writable via PATCH on tgt org/plan (405). Skipping all engine apply."
+                );
+                skipped += 1;
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Engine fields (M20)
+    for (src_slug, tgt_slug) in &mapping.engine_fields {
+        let Some(tgt_id) = lookup_tgt_id(&tgt_lockfile, "engine_fields", tgt_slug, &mut skipped) else { continue };
+        let path = src_paths.engine_fields_dir().join(format!("{src_slug}.json"));
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(r) => r,
+            Err(e) => { eprintln!("warning: cannot read src engine-fields/{src_slug}: {e:#}"); skipped += 1; continue; }
+        };
+        let src_field: crate::model::EngineField = serde_json::from_str(&raw)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        let mut payload = serde_json::to_value(&src_field).context("serializing src engine field")?;
+        if let Some(ov) = &tgt_overlay {
+            if let Some(overrides) = ov.engine_field(tgt_slug) {
+                apply_overrides(&mut payload, overrides);
+            }
+        }
+        let payload_field: crate::model::EngineField = serde_json::from_value(payload)
+            .with_context(|| format!("re-deserializing overlay-applied engine field for tgt slug '{tgt_slug}'"))?;
+        match tgt_client.update_engine_field(tgt_id, &payload_field).await
+            .with_context(|| format!("PATCH tgt engine_fields/{tgt_id}"))
+        {
+            Ok(_) => applied_engine_fields += 1,
+            Err(e) if anyhow_has_status(&e, 405) => {
+                eprintln!(
+                    "warning: engine fields are not writable via PATCH on tgt org/plan (405). Skipping all engine field apply."
+                );
+                skipped += 1;
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
     let total = applied_hooks + applied_rules + applied_labels
-        + applied_queues + applied_schemas + applied_inboxes + applied_email_templates;
+        + applied_queues + applied_schemas + applied_inboxes + applied_email_templates
+        + applied_engines + applied_engine_fields;
     let mut summary = format!(
         "Applied {applied_hooks} hooks, {applied_rules} rules, {applied_labels} labels, \
 {applied_queues} queues, {applied_schemas} schemas, {applied_inboxes} inboxes, \
-{applied_email_templates} email templates ({total} PATCHes) from {src} to {tgt}"
+{applied_email_templates} email templates, {applied_engines} engines, \
+{applied_engine_fields} engine fields ({total} PATCHes) from {src} to {tgt}"
     );
     if skipped > 0 {
         summary.push_str(&format!(", {skipped} skipped"));

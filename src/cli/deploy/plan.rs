@@ -61,6 +61,19 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         &tgt_lockfile, tgt, &mut total_warnings,
     );
 
+    // Other org-wide flat kinds (M20). Workflows + workflow_steps excluded
+    // — Rossum's workflow API is read-only.
+    total_count += plan_flat_kind(
+        "engines", &mapping.engines,
+        &src_paths.engines_dir(),
+        &tgt_lockfile, tgt, &mut total_warnings,
+    );
+    total_count += plan_flat_kind(
+        "engine_fields", &mapping.engine_fields,
+        &src_paths.engine_fields_dir(),
+        &tgt_lockfile, tgt, &mut total_warnings,
+    );
+
     if total_count == 0 && total_warnings == 0 {
         println!("  (no mapped objects)");
     }

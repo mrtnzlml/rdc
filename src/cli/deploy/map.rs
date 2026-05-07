@@ -32,13 +32,22 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
     let i_new = match_inboxes(&mut mapping.inboxes, &src_paths, &tgt_paths)?;
     let e_new = match_email_templates(&mut mapping.email_templates, &src_paths, &tgt_paths)?;
 
+    // Other org-wide flat kinds (M20). Workflows + workflow_steps are
+    // intentionally excluded — Rossum's workflow API is read-only via PATCH
+    // on every plan we've checked (OPTIONS returns "GET, HEAD, OPTIONS"),
+    // so push/deploy can never succeed.
+    let eng_new = match_kind(&mut mapping.engines, &src_paths.engines_dir(), &tgt_paths.engines_dir())?;
+    let ef_new = match_kind(&mut mapping.engine_fields, &src_paths.engine_fields_dir(), &tgt_paths.engine_fields_dir())?;
+
     let any_total = mapping.hooks.len()
         + mapping.rules.len()
         + mapping.labels.len()
         + mapping.queues.len()
         + mapping.schemas.len()
         + mapping.inboxes.len()
-        + mapping.email_templates.len();
+        + mapping.email_templates.len()
+        + mapping.engines.len()
+        + mapping.engine_fields.len();
     if any_total > 0 {
         std::fs::create_dir_all(src_paths.mapping_dir())
             .with_context(|| format!("creating {}", src_paths.mapping_dir().display()))?;
@@ -48,7 +57,8 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
     println!(
         "Auto-matched {h_new} new hooks, {r_new} new rules, {l_new} new labels, \
 {q_new} new queues, {s_new} new schemas, {i_new} new inboxes, \
-{e_new} new email templates by slug. Wrote {}.",
+{e_new} new email templates, {eng_new} new engines, {ef_new} new engine fields \
+by slug. Wrote {}.",
         mapping_path.display()
     );
     Ok(())
