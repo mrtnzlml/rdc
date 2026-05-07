@@ -263,10 +263,82 @@ fn shadow_path_for(local_path: &Path) -> std::path::PathBuf {
     conflict_path
 }
 
-/// Sentinel error type signaling the user picked `[a]bort`. The pull
-/// runner downcasts to this and skips lockfile.save().
+/// Outcome of a push-drift prompt (M34 / spec §7.3 step 5). Different
+/// from a pull-side [`Resolution`] because the user's choices have
+/// different consequences on push:
+///
+/// - `Patch { payload_override: None }`: force-push the caller's prepared
+///   payload, overwriting whatever drift exists on the remote. (`[k]`)
+/// - `Patch { payload_override: Some(bytes) }`: same, but PATCH `bytes`
+///   instead of the prepared payload (user picked `[e]dit`). The caller
+///   re-deserializes the bytes to its typed model.
+/// - `Adopt`: abandon the local edit. Write `remote_bytes` to the local
+///   file and record `remote_hash` in the lockfile. No PATCH. (`[r]`)
+/// - `Skip`: do nothing — leave local and lockfile alone. Warn the user.
+///   This is the legacy default before M34. (`[s]`)
+///
+/// `[a]bort` propagates as a [`PullAborted`] error so the push runner
+/// can stop and skip lockfile.save().
+#[derive(Debug)]
+pub enum PushDriftOutcome {
+    /// Proceed with PATCH. `payload_override`: when `Some`, the user
+    /// edited the proposed bytes; the caller should use these instead
+    /// of its prepared payload.
+    Patch { payload_override: Option<Vec<u8>> },
+    /// Abandon local edit, take remote into local + lockfile.
+    Adopt,
+    /// Skip this object — current behavior, leaves both alone.
+    Skip,
+}
+
+/// Resolve a push-side drift conflict (spec §7.3 step 5). Caller passes
+/// the on-disk local path, the bytes the user wants to push, and the
+/// (overlay-stripped) bytes currently on the server.
+///
+/// When `interactive == false` (CI / non-TTY / `--yes`), returns
+/// `PushDriftOutcome::Skip` to preserve legacy behavior.
+///
+/// On `[k]eep local`: returns `Patch { payload_override: None }` —
+/// caller PATCHes its prepared payload (force-push).
+/// On `[r]emote`: returns `Adopt` — caller writes remote to local +
+/// lockfile, no PATCH.
+/// On `[e]dit`: opens `$EDITOR`, returns `Patch { payload_override:
+/// Some(edited_bytes) }`.
+/// On `[s]kip`: returns `Skip`.
+/// On `[a]bort`: returns a `PullAborted` error.
+pub fn resolve_push_drift(
+    interactive: bool,
+    local_path: &Path,
+    remote_bytes: &[u8],
+) -> Result<PushDriftOutcome> {
+    if !interactive {
+        return Ok(PushDriftOutcome::Skip);
+    }
+
+    let stdin = std::io::stdin();
+    let stderr = std::io::stderr();
+    let resolution = prompt_resolve(
+        stdin.lock(),
+        stderr.lock(),
+        1,
+        1,
+        local_path,
+        remote_bytes,
+    )?;
+    match resolution {
+        Resolution::KeepLocal => Ok(PushDriftOutcome::Patch { payload_override: None }),
+        Resolution::KeepRemote => Ok(PushDriftOutcome::Adopt),
+        Resolution::Edit(edited) => Ok(PushDriftOutcome::Patch { payload_override: Some(edited) }),
+        Resolution::Skip => Ok(PushDriftOutcome::Skip),
+        Resolution::Abort => Err(anyhow::Error::new(PullAborted)),
+    }
+}
+
+/// Sentinel error type signaling the user picked `[a]bort` at any
+/// resolver prompt (pull or push). The pull / push runner downcasts to
+/// this and skips lockfile.save().
 #[derive(Debug, thiserror::Error)]
-#[error("pull aborted by user at conflict resolver")]
+#[error("aborted by user at conflict resolver")]
 pub struct PullAborted;
 
 #[cfg(test)]
@@ -419,5 +491,14 @@ mod tests {
     fn shadow_path_for_py_extension() {
         let p = std::path::PathBuf::from("/tmp/formulas/123.py");
         assert_eq!(shadow_path_for(&p), std::path::PathBuf::from("/tmp/formulas/123.py.remote"));
+    }
+
+    #[test]
+    fn resolve_push_drift_non_interactive_returns_skip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        std::fs::write(&path, b"local\n").unwrap();
+        let r = resolve_push_drift(false, &path, b"remote\n").unwrap();
+        assert!(matches!(r, PushDriftOutcome::Skip));
     }
 }

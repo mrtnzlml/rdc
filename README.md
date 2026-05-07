@@ -4,7 +4,7 @@
 disk for AI-assisted local development, lets you edit them in place, and
 deploys them across environments.
 
-**Status:** M33. Pull all kinds (incl. MDH collections + indexes —
+**Status:** M34. Pull all kinds (incl. MDH collections + indexes —
 data storage URL derived from `api_base`, no extra config); push
 and deploy for hooks, rules, labels, queues, schemas (formula
 bodies round-trip), inboxes, email templates, engines, and engine
@@ -17,11 +17,13 @@ plus a cross-references section that resolves `hook → queues`,
 per-queue and per-MDH-collection sub-fetches via a bounded
 `--concurrency` (spec §7.2 / §16, default 5). All HTTP calls
 retry gracefully on `429 Too Many Requests` and transient 5xx
-(502/503/504) with `Retry-After` / exponential backoff. Pull
-conflicts open an interactive `[k]/[r]/[e]/[s]/[a]` resolver on
-TTY (spec §8.3) — including combined-hash kinds (hooks json+py,
-schemas json+formulas), with one prompt per differing sub-file;
-CI / non-TTY / `--yes` keeps the shadow-file flow. `rdc init` accepts flags or runs an interactive wizard;
+(502/503/504) with `Retry-After` / exponential backoff. Both pull
+and push open an interactive `[k]/[r]/[e]/[s]/[a]` resolver on
+TTY when a conflict / drift is detected (spec §8.3 / §7.3 step
+5) — including combined-hash kinds (hooks json+py, schemas
+json+formulas), with one prompt per differing sub-file;
+CI / non-TTY / `--yes` keeps the shadow-file / skip-with-warning
+flow. `rdc init` accepts flags or runs an interactive wizard;
 `rdc status` for a read-only health check; `rdc diff` for unified
 diffs (local vs remote, or two snapshots); `rdc auth` to
 set/refresh tokens; `rdc repair --rebuild-lock` for lockfile
@@ -151,13 +153,29 @@ Each candidate is compared against the lockfile's `content_hash`:
 
 - **No local edits** → skipped silently.
 - **Local edits, remote unchanged since last pull** → PATCH succeeds.
-- **Local edits AND remote drifted** → push aborted for that object
-  with a warning. Run `rdc pull` to fetch the remote, resolve, then
-  push again.
+- **Local edits AND remote drifted** → resolver opens (TTY) or skip
+  + warning (non-TTY / `--yes`). See "Push drift resolver" below.
 
 After a successful push, the local file is rewritten with the server's
 authoritative response so the lockfile hash matches the file bytes.
 Subsequent pulls are idempotent.
+
+### Push drift resolver
+
+When a remote object has changed since you last pulled, push uses the
+same `[k]/[r]/[e]/[s]/[a]` shape as pull but with push-side semantics
+(spec §7.3 step 5):
+
+| Choice | Effect |
+|--------|--------|
+| `k` | **Force-push.** Send the local payload to the API anyway, overwriting the remote drift. |
+| `r` | **Adopt remote.** Write the remote bytes to the local file and update the lockfile to match. No PATCH. Your local edit is discarded. |
+| `e` | **Edit then force-push.** Open `$EDITOR` on a temp file with conflict markers; the saved bytes become the PATCH payload. |
+| `s` | **Skip.** Leave both local and remote alone. Same as the pre-M34 default. |
+| `a` | **Abort.** Stop the push entirely; lockfile is not saved. Re-running picks up where you left off. |
+
+Without a TTY (or with `--yes`), every drift falls back to `s` (skip
+with warning) — same as before.
 
 **Writable kinds:** hooks, rules, labels, schemas (with formula
 bodies), queues, inboxes, email templates, engines, engine fields.

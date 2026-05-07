@@ -10,6 +10,7 @@ pub async fn push(
     paths: &Paths,
     client: &RossumClient,
     lockfile: &mut Lockfile,
+    interactive: bool,
 ) -> Result<(usize, usize)> {
     let kind_dir = paths.rules_dir();
     if !kind_dir.exists() {
@@ -86,13 +87,41 @@ pub async fn push(
         remote_bytes.push(b'\n');
         let remote_bytes = maybe_strip_overlay(remote_bytes, overlay_paths)?;
         let remote_combined = content_hash(&remote_bytes);
+        let mut payload_to_send = payload_rule;
         if &remote_combined != base {
-            eprintln!("warning: rules/{slug}.json — remote has changed since last pull, skipping push");
-            skipped += 1;
-            continue;
+            use crate::cli::resolve::{resolve_push_drift, PushDriftOutcome};
+            match resolve_push_drift(interactive, &path, &remote_bytes)? {
+                PushDriftOutcome::Patch { payload_override } => {
+                    if let Some(bytes) = payload_override {
+                        payload_to_send = serde_json::from_slice(&bytes)
+                            .with_context(|| format!("re-deserializing edited rule '{slug}'"))?;
+                    }
+                }
+                PushDriftOutcome::Adopt => {
+                    write_atomic(&path, &remote_bytes)
+                        .with_context(|| format!("adopting remote into {}", path.display()))?;
+                    lockfile.upsert(
+                        "rules",
+                        slug,
+                        ObjectEntry {
+                            id,
+                            url: Some(remote_rule.url.clone()),
+                            modified_at: remote_rule.modified_at().map(|s| s.to_string()),
+                            content_hash: Some(remote_combined),
+                        },
+                    );
+                    skipped += 1;
+                    continue;
+                }
+                PushDriftOutcome::Skip => {
+                    eprintln!("warning: rules/{slug}.json — remote has changed since last pull, skipping push");
+                    skipped += 1;
+                    continue;
+                }
+            }
         }
 
-        let updated = client.update_rule(id, &payload_rule).await
+        let updated = client.update_rule(id, &payload_to_send).await
             .with_context(|| format!("PATCH /rules/{id}"))?;
 
         let mut updated_bytes = serde_json::to_vec_pretty(&updated)
