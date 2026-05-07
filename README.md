@@ -4,12 +4,13 @@
 disk for AI-assisted local development, lets you edit them in place, and
 deploys them across environments.
 
-**Status:** M22. Pull all kinds; push and deploy for hooks, rules,
+**Status:** M23. Pull all kinds; push and deploy for hooks, rules,
 labels, queues, schemas (formula bodies round-trip), inboxes,
 email templates, engines, and engine fields. `rdc status` for a
 read-only health check; `rdc diff` for unified diffs (local vs
-remote, or two snapshots). Distributable via `curl | sh` or
-`cargo install`. See
+remote, or two snapshots); `rdc auth` to set/refresh tokens; `rdc
+repair --rebuild-lock` for lockfile recovery. Distributable via
+`curl | sh` or `cargo install`. See
 `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full
 design.
 
@@ -352,10 +353,40 @@ Tokens are loaded per env, in priority order:
 2. `secrets/<env>.secrets.json` — `{"api_token": "..."}`. Recommended
    locally; add `secrets/` to `.gitignore` (`rdc init` does this).
 
+To set or rotate a token:
+
+```sh
+# Validates the token by hitting GET /organizations/{org_id} before
+# writing. Writes secrets/<env>.secrets.json with mode 0600 on Unix.
+rdc auth dev --token <new-token>
+
+# Or pipe via stdin (token never appears in shell history):
+read -s T && echo "$T" | rdc auth dev
+```
+
 Loud error if neither is set.
 
 For Master Data Hub, `data_storage_base` is set under
 `[envs.<name>]` in `rdc.toml`. The same API token is reused.
+
+## Repair — recover a broken lockfile
+
+If your `.rdc/state/<env>.lock.json` becomes corrupted or you've
+lost it, `rdc repair --rebuild-lock <env>` backs it up (to
+`<name>.bak.<unix-ts>`) and runs `rdc pull <env>` from a clean
+slate to reconstruct it.
+
+```sh
+rdc repair dev --rebuild-lock
+# Backed up existing lockfile to .rdc/state/dev.lock.json.bak.1762000000
+# Note: rdc pull will now overwrite local snapshot files with remote contents.
+# ...
+# Lockfile rebuilt for env 'dev'.
+```
+
+**Warning:** because the rebuilt pull has no merge base, every
+local file is overwritten with what the remote currently has.
+Commit your snapshot to git first if you might have unsaved edits.
 
 ## Layout cheat sheet
 

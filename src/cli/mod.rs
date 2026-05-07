@@ -48,6 +48,23 @@ pub enum Command {
         left: String,
         right: Option<String>,
     },
+    /// Set or refresh an env's API token. Validates the token before
+    /// writing to `secrets/<env>.secrets.json` (mode 0600 on Unix).
+    /// Provide the token via `--token` or pipe it on stdin.
+    Auth {
+        env: String,
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Recover from a corrupted or stale lockfile by re-pulling and
+    /// reconstructing it. Backs up the existing lockfile to
+    /// `<name>.bak.<unix-ts>`. Local snapshot files are overwritten with
+    /// remote contents — back up first if you have unsaved edits.
+    Repair {
+        env: String,
+        #[arg(long = "rebuild-lock")]
+        rebuild_lock: bool,
+    },
 }
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
@@ -60,6 +77,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Apply { from, to }) => crate::cli::deploy::apply::run(&from, &to).await,
         Some(Command::Status { env }) => crate::cli::status::run(env).await,
         Some(Command::Diff { left, right }) => crate::cli::diff::run(left, right).await,
+        Some(Command::Auth { env, token }) => crate::cli::auth::run(&env, token).await,
+        Some(Command::Repair { env, rebuild_lock }) => {
+            crate::cli::repair::run(&env, rebuild_lock).await
+        }
         None => {
             use clap::CommandFactory;
             Cli::command().print_help()?;
@@ -69,10 +90,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
+pub mod auth;
 pub mod deploy;
 pub mod diff;
 pub mod index;
 pub mod init;
 pub mod pull;
 pub mod push;
+pub mod repair;
 pub mod status;
