@@ -137,6 +137,64 @@ async fn push_skips_when_remote_has_drifted() {
 }
 
 #[tokio::test]
+async fn push_applies_overlay_values_to_outbound_patch() {
+    use std::sync::{Arc, Mutex};
+
+    let server = MockServer::start().await;
+    mount_get_only_hooks_org(&server, fixture("hooks_list.json")).await;
+
+    let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let captured_clone = captured.clone();
+
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/hooks/1"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            *captured_clone.lock().unwrap() = Some(body.clone());
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert().success();
+
+    let py_path = project.path().join("envs/dev/hooks/validator-invoices.py");
+    let original = std::fs::read_to_string(&py_path).unwrap();
+    std::fs::write(&py_path, format!("{original}# local edit\n")).unwrap();
+
+    let overlay_path = project.path().join("envs/dev/overlay.toml");
+    std::fs::write(&overlay_path, r#"
+version = 1
+
+[hooks.validator-invoices]
+"name" = "Validator (DEV-OVERLAY)"
+"config.runtime" = "python3.12-overlay"
+"#).unwrap();
+
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["push", "dev"])
+        .assert().success()
+        .stdout(predicate::str::contains("Pushed 1 hook"));
+
+    let body = captured.lock().unwrap().clone().expect("PATCH body should be captured");
+    assert_eq!(body["name"], serde_json::Value::String("Validator (DEV-OVERLAY)".into()));
+    assert_eq!(body["config"]["runtime"], serde_json::Value::String("python3.12-overlay".into()));
+}
+
+#[tokio::test]
 async fn push_with_no_local_edits_is_noop() {
     let server = MockServer::start().await;
     mount_get_only_hooks_org(&server, fixture("hooks_list.json")).await;
