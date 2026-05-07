@@ -9,8 +9,12 @@
 //!
 //! Base URL convention (M24): `<host>/svc/data-storage/api`. For example,
 //! `https://elis.rossum.ai/svc/data-storage/api`. We append `/v1/...` per
-//! call. The data-storage host is the same as the Rossum web host (NOT the
-//! `api.` API host).
+//! call.
+//!
+//! Note on host: the API and Data Storage services share the same parent
+//! domain. The API lives under the `api.` subdomain
+//! (`api.elis.rossum.ai/v1/...`) while Data Storage lives at the bare
+//! parent domain plus a service path (`elis.rossum.ai/svc/data-storage/api`).
 
 use crate::api::ApiError;
 use crate::model::Collection;

@@ -62,8 +62,10 @@ export RDC_TOKEN_DEV=YOUR_TOKEN
 # rdc.toml:
 #   [envs.dev]
 #   data_storage_base = "https://YOUR-ORG.rossum.ai/svc/data-storage/api"
-# Note: the MDH host is the Rossum web host (NOT the api. host), and the
-# path ends at /svc/data-storage/api — rdc appends /v1/... per call.
+# Note: api_base and data_storage_base share the same parent domain
+# (e.g. elis.rossum.ai), but the API host has an `api.` subdomain
+# prefix and the Data Storage host does not. rdc appends /v1/...
+# per call to the data-storage base.
 
 # Pull a complete snapshot of the env into envs/dev/.
 rdc pull dev
@@ -371,7 +373,7 @@ Loud error if neither is set.
 
 For Master Data Hub, set `data_storage_base` under `[envs.<name>]` in
 `rdc.toml`. The same API token is reused. The URL points at the data
-storage service root — rdc appends the `/v1/...` paths per call.
+storage service root — rdc appends the `/v1/...` RPC paths per call.
 
 ```toml
 [envs.dev]
@@ -379,6 +381,12 @@ api_base = "https://api.elis.rossum.ai/v1"
 org_id = 214757
 data_storage_base = "https://elis.rossum.ai/svc/data-storage/api"
 ```
+
+Both URLs share the same parent domain (`elis.rossum.ai`); the API
+sits under the `api.` subdomain (`api.elis.rossum.ai/v1`) while the
+Data Storage service sits at the bare domain plus a service path
+(`elis.rossum.ai/svc/data-storage/api`). For other Rossum
+environments, substitute the parent domain accordingly.
 
 If `data_storage_base` is omitted, MDH is silently skipped on pull
 (no `mdh/` directory created, no count in the summary).
