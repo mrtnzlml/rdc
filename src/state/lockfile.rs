@@ -161,6 +161,33 @@ pub fn schema_combined_hash(json_bytes: &[u8], formulas: &[(String, Vec<u8>)]) -
     hex
 }
 
+/// Compute the combined hash for a hook: the post-extraction `<slug>.json`
+/// bytes plus the extracted code (when present).
+///
+/// ```text
+/// SHA-256(
+///     json_bytes
+///     [|| 0x00 || "code" || 0x00 || code_bytes]
+/// )
+/// ```
+pub fn hook_combined_hash(json_bytes: &[u8], code: &Option<String>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(json_bytes);
+    if let Some(code) = code {
+        hasher.update([0u8]);
+        hasher.update(b"code");
+        hasher.update([0u8]);
+        hasher.update(code.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        write!(&mut hex, "{:02x}", b).expect("writing to String cannot fail");
+    }
+    hex
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,6 +314,29 @@ mod tests {
             schema_combined_hash(json, &f1),
             schema_combined_hash(json, &f2)
         );
+    }
+
+    #[test]
+    fn hook_combined_hash_no_code() {
+        let h1 = hook_combined_hash(b"{}", &None);
+        let h2 = hook_combined_hash(b"{}", &None);
+        assert_eq!(h1, h2);
+        assert_eq!(h1, content_hash(b"{}"));
+    }
+
+    #[test]
+    fn hook_combined_hash_with_code_differs_from_no_code() {
+        let h_no = hook_combined_hash(b"{}", &None);
+        let h_with = hook_combined_hash(b"{}", &Some("def x(): pass".to_string()));
+        assert_ne!(h_no, h_with);
+    }
+
+    #[test]
+    fn hook_combined_hash_changes_when_code_changes() {
+        let json = b"{}";
+        let h1 = hook_combined_hash(json, &Some("v1".to_string()));
+        let h2 = hook_combined_hash(json, &Some("v2".to_string()));
+        assert_ne!(h1, h2);
     }
 
     #[test]

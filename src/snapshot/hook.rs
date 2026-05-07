@@ -41,6 +41,30 @@ pub fn write_hook(dir: &Path, slug: &str, hook: &Hook) -> Result<Vec<u8>> {
     Ok(json_with_newline)
 }
 
+/// Serialize a hook to its on-disk byte form WITHOUT writing. Returns the JSON
+/// bytes (post-extraction) and the optional extracted code string. Used by
+/// pull/push drivers to compute `hook_combined_hash` before deciding whether
+/// to write or send.
+pub fn serialize_hook(hook: &Hook) -> Result<(Vec<u8>, Option<String>)> {
+    let mut json_value = serde_json::to_value(hook)
+        .context("serializing hook to value")?;
+
+    let code = json_value
+        .get_mut("config")
+        .and_then(|c| c.as_object_mut())
+        .and_then(|m| m.remove("code"))
+        .and_then(|v| match v {
+            Value::String(s) => Some(s),
+            _ => None,
+        });
+
+    let bytes = serde_json::to_vec_pretty(&json_value)
+        .context("serializing hook json")?;
+    let mut bytes = bytes;
+    bytes.push(b'\n');
+    Ok((bytes, code))
+}
+
 /// Write only the hook's `.py` file (extracted from `config.code`). Used by
 /// pull drivers that compute the JSON write decision separately and only need
 /// to overwrite the code file.
@@ -133,6 +157,15 @@ mod tests {
         write_hook(dir.path(), "sample", &hook).unwrap();
         assert!(dir.path().join("sample.json").exists());
         assert!(!dir.path().join("sample.py").exists());
+    }
+
+    #[test]
+    fn serialize_hook_returns_json_and_code() {
+        let h = sample_hook();
+        let (bytes, code) = serialize_hook(&h).unwrap();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(!s.contains("def x"), "code should be extracted from json");
+        assert_eq!(code.as_deref(), Some("def x():\n    return 1\n"));
     }
 
     #[test]
