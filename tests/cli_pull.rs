@@ -367,6 +367,164 @@ async fn pull_with_workspace_filter_skips_non_matching() {
 }
 
 #[tokio::test]
+async fn pull_mdh_when_data_storage_base_is_set() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let empty_list = serde_json::json!({ "pagination": { "next": null }, "results": [] });
+    for ep in [
+        "/api/v1/hooks", "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list.clone()))
+            .mount(&server)
+            .await;
+    }
+
+    Mock::given(method("GET"))
+        .and(path("/data/v1/collections"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("mdh_collections.json")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/data/v1/collections/vendors/indexes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("mdh_indexes_vendors.json")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/data/v1/collections/vendors/search-indexes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("mdh_search_indexes_vendors.json")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/data/v1/collections/purchase_orders/indexes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("mdh_indexes_purchase_orders.json")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/data/v1/collections/purchase_orders/search-indexes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("mdh_search_indexes_purchase_orders.json")))
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args([
+            "init",
+            "--name", "test-pull",
+            "--env",
+            &format!("dev={}/api/v1:1", server.uri()),
+        ])
+        .assert()
+        .success();
+
+    let cfg_path = project.path().join("rdc.toml");
+    let cfg = std::fs::read_to_string(&cfg_path).unwrap();
+    let cfg = cfg.replace(
+        "[envs.dev]",
+        &format!("[envs.dev]\ndata_storage_base = \"{}/data/v1\"", server.uri()),
+    );
+    std::fs::write(&cfg_path, cfg).unwrap();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2 datasets"));
+
+    let env_root = project.path().join("envs/dev");
+    let mdh = env_root.join("mdh");
+    assert!(mdh.join("vendors/collection.json").exists());
+    assert!(mdh.join("vendors/indexes.json").exists());
+    assert!(mdh.join("purchase-orders/collection.json").exists());
+    assert!(mdh.join("purchase-orders/indexes.json").exists());
+
+    let ix_raw = std::fs::read_to_string(mdh.join("vendors/indexes.json")).unwrap();
+    let ix_value: serde_json::Value = serde_json::from_str(&ix_raw).unwrap();
+    assert_eq!(ix_value["regular"].as_array().unwrap().len(), 2);
+    assert_eq!(ix_value["search"].as_array().unwrap().len(), 1);
+
+    let lf = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    assert!(lf.contains("\"mdh_collections\""));
+    assert!(lf.contains("\"mdh_indexes\""));
+}
+
+#[tokio::test]
+async fn pull_skips_mdh_when_data_storage_base_is_absent() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let empty_list = serde_json::json!({ "pagination": { "next": null }, "results": [] });
+    for ep in [
+        "/api/v1/hooks", "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list.clone()))
+            .mount(&server)
+            .await;
+    }
+    // NO data storage endpoints mocked — if MDH driver runs, the test will fail.
+
+    let project = TempDir::new().unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args([
+            "init",
+            "--name", "test-pull",
+            "--env",
+            &format!("dev={}/api/v1:1", server.uri()),
+        ])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let assert_result = Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&assert_result.get_output().stdout).to_string();
+    assert!(!stdout.contains("dataset"), "MDH should be skipped when data_storage_base is not set: {stdout}");
+    assert!(!project.path().join("envs/dev/mdh").exists(), "no mdh/ dir should be created");
+}
+
+#[tokio::test]
 async fn pull_with_missing_token_fails_with_helpful_error() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc")
