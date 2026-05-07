@@ -1,3 +1,4 @@
+pub mod email_template;
 pub mod engine;
 pub mod engine_field;
 pub mod hook;
@@ -7,8 +8,11 @@ pub mod organization;
 pub mod queue;
 pub mod rule;
 pub mod schema;
+pub mod workflow;
+pub mod workflow_step;
 pub mod workspace;
 
+pub use email_template::EmailTemplate;
 pub use engine::Engine;
 pub use engine_field::EngineField;
 pub use hook::Hook;
@@ -18,4 +22,6 @@ pub use organization::Organization;
 pub use queue::Queue;
 pub use rule::Rule;
 pub use schema::Schema;
+pub use workflow::Workflow;
+pub use workflow_step::WorkflowStep;
 pub use workspace::Workspace;
