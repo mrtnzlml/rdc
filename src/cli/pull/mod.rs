@@ -71,6 +71,8 @@ pub async fn run(env: &str) -> Result<()> {
         + qc.conflicts + c_datasets;
 
     lockfile.save(&paths.lockfile())?;
+    crate::cli::index::generate(&paths, &lockfile)
+        .with_context(|| format!("generating _index.md for env '{env}'"))?;
     let mut summary = format!(
         "Pulled {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}",
         common::pluralize(n_orgs, "organization", "organizations"),

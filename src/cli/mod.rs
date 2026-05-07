@@ -40,5 +40,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
+pub mod index;
 pub mod init;
 pub mod pull;
