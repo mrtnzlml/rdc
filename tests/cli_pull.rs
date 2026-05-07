@@ -403,28 +403,33 @@ async fn pull_mdh_when_data_storage_base_is_set() {
             .await;
     }
 
-    Mock::given(method("GET"))
-        .and(path("/data/v1/collections"))
+    use wiremock::matchers::body_partial_json;
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/collections/list"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("mdh_collections.json")))
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/data/v1/collections/vendors/indexes"))
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/indexes/list"))
+        .and(body_partial_json(serde_json::json!({"collectionName": "vendors"})))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("mdh_indexes_vendors.json")))
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/data/v1/collections/vendors/search-indexes"))
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/search_indexes/list"))
+        .and(body_partial_json(serde_json::json!({"collectionName": "vendors"})))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("mdh_search_indexes_vendors.json")))
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/data/v1/collections/purchase_orders/indexes"))
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/indexes/list"))
+        .and(body_partial_json(serde_json::json!({"collectionName": "purchase_orders"})))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("mdh_indexes_purchase_orders.json")))
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/data/v1/collections/purchase_orders/search-indexes"))
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/search_indexes/list"))
+        .and(body_partial_json(serde_json::json!({"collectionName": "purchase_orders"})))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("mdh_search_indexes_purchase_orders.json")))
         .mount(&server)
         .await;
@@ -447,7 +452,10 @@ async fn pull_mdh_when_data_storage_base_is_set() {
     let cfg = std::fs::read_to_string(&cfg_path).unwrap();
     let cfg = cfg.replace(
         "[envs.dev]",
-        &format!("[envs.dev]\ndata_storage_base = \"{}/data/v1\"", server.uri()),
+        &format!(
+            "[envs.dev]\ndata_storage_base = \"{}/svc/data-storage/api\"",
+            server.uri()
+        ),
     );
     std::fs::write(&cfg_path, cfg).unwrap();
 

@@ -1,5 +1,7 @@
 {
-  "search_indexes": [
+  "code": "ok",
+  "message": "",
+  "result": [
     {
       "name": "vendor_search",
       "definition": { "mappings": { "dynamic": true } }

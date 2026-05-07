@@ -268,12 +268,15 @@ async fn list_email_templates_returns_templates() {
 #[tokio::test]
 async fn data_storage_list_collections() {
     let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/data/v1/collections"))
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/collections/list"))
+        .and(header("Authorization", "Bearer TEST_TOKEN"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("mdh_collections.json")))
         .mount(&server)
         .await;
-    let client = DataStorageClient::new(format!("{}/data/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let client = DataStorageClient::new(
+        format!("{}/svc/data-storage/api", server.uri()), "TEST_TOKEN".into(),
+    ).unwrap();
     let cols = client.list_collections().await.unwrap();
     assert_eq!(cols.len(), 2);
     assert_eq!(cols[0].name, "vendors");
@@ -282,12 +285,14 @@ async fn data_storage_list_collections() {
 #[tokio::test]
 async fn data_storage_list_indexes() {
     let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/data/v1/collections/vendors/indexes"))
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/indexes/list"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("mdh_indexes_vendors.json")))
         .mount(&server)
         .await;
-    let client = DataStorageClient::new(format!("{}/data/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let client = DataStorageClient::new(
+        format!("{}/svc/data-storage/api", server.uri()), "TEST_TOKEN".into(),
+    ).unwrap();
     let ix = client.list_indexes("vendors").await.unwrap();
     assert_eq!(ix.len(), 2);
 }
@@ -295,14 +300,37 @@ async fn data_storage_list_indexes() {
 #[tokio::test]
 async fn data_storage_list_search_indexes() {
     let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/data/v1/collections/vendors/search-indexes"))
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/search_indexes/list"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("mdh_search_indexes_vendors.json")))
         .mount(&server)
         .await;
-    let client = DataStorageClient::new(format!("{}/data/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let client = DataStorageClient::new(
+        format!("{}/svc/data-storage/api", server.uri()), "TEST_TOKEN".into(),
+    ).unwrap();
     let s = client.list_search_indexes("vendors").await.unwrap();
     assert_eq!(s.len(), 1);
+}
+
+#[tokio::test]
+async fn data_storage_returns_error_on_non_ok_envelope() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/collections/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "internal_error",
+            "message": "boom",
+            "result": serde_json::Value::Null
+        })))
+        .mount(&server)
+        .await;
+    let client = DataStorageClient::new(
+        format!("{}/svc/data-storage/api", server.uri()), "TEST_TOKEN".into(),
+    ).unwrap();
+    let err = client.list_collections().await.unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("internal_error"), "msg: {msg}");
+    assert!(msg.contains("boom"), "msg: {msg}");
 }
 
 #[tokio::test]

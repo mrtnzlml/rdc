@@ -4,13 +4,14 @@
 disk for AI-assisted local development, lets you edit them in place, and
 deploys them across environments.
 
-**Status:** M23. Pull all kinds; push and deploy for hooks, rules,
-labels, queues, schemas (formula bodies round-trip), inboxes,
-email templates, engines, and engine fields. `rdc status` for a
-read-only health check; `rdc diff` for unified diffs (local vs
-remote, or two snapshots); `rdc auth` to set/refresh tokens; `rdc
-repair --rebuild-lock` for lockfile recovery. Distributable via
-`curl | sh` or `cargo install`. See
+**Status:** M24. Pull all kinds (incl. MDH collections + indexes
+against the real Data Storage API); push and deploy for hooks,
+rules, labels, queues, schemas (formula bodies round-trip),
+inboxes, email templates, engines, and engine fields. `rdc status`
+for a read-only health check; `rdc diff` for unified diffs (local
+vs remote, or two snapshots); `rdc auth` to set/refresh tokens;
+`rdc repair --rebuild-lock` for lockfile recovery. Distributable
+via `curl | sh` or `cargo install`. See
 `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full
 design.
 
@@ -60,7 +61,9 @@ export RDC_TOKEN_DEV=YOUR_TOKEN
 # Optional: enable MDH (Master Data Hub) dataset snapshots by editing
 # rdc.toml:
 #   [envs.dev]
-#   data_storage_base = "https://YOUR-ORG.rossum.app/data/v1"
+#   data_storage_base = "https://YOUR-ORG.rossum.ai/svc/data-storage/api"
+# Note: the MDH host is the Rossum web host (NOT the api. host), and the
+# path ends at /svc/data-storage/api — rdc appends /v1/... per call.
 
 # Pull a complete snapshot of the env into envs/dev/.
 rdc pull dev
@@ -366,8 +369,19 @@ read -s T && echo "$T" | rdc auth dev
 
 Loud error if neither is set.
 
-For Master Data Hub, `data_storage_base` is set under
-`[envs.<name>]` in `rdc.toml`. The same API token is reused.
+For Master Data Hub, set `data_storage_base` under `[envs.<name>]` in
+`rdc.toml`. The same API token is reused. The URL points at the data
+storage service root — rdc appends the `/v1/...` paths per call.
+
+```toml
+[envs.dev]
+api_base = "https://api.elis.rossum.ai/v1"
+org_id = 214757
+data_storage_base = "https://elis.rossum.ai/svc/data-storage/api"
+```
+
+If `data_storage_base` is omitted, MDH is silently skipped on pull
+(no `mdh/` directory created, no count in the summary).
 
 ## Repair — recover a broken lockfile
 
