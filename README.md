@@ -4,16 +4,19 @@
 disk for AI-assisted local development, lets you edit them in place, and
 deploys them across environments.
 
-**Status:** M27. Pull all kinds (incl. MDH collections + indexes —
+**Status:** M28. Pull all kinds (incl. MDH collections + indexes —
 data storage URL derived from `api_base`, no extra config); push
 and deploy for hooks, rules, labels, queues, schemas (formula
 bodies round-trip), inboxes, email templates, engines, and engine
 fields. Overlays are bidirectional: applied on push, stripped on
-pull (spec §9.3). `rdc init` accepts flags or runs an interactive
-wizard; `rdc status` for a read-only health check; `rdc diff` for
-unified diffs (local vs remote, or two snapshots); `rdc auth` to
-set/refresh tokens; `rdc repair --rebuild-lock` for lockfile
-recovery. Distributable via `curl | sh` or `cargo install`. See
+pull (spec §9.3). `_index.md` includes per-kind inventory plus a
+cross-references section that resolves `hook → queues`, `rule →
+queues`, `email_template → queue`. `rdc init` accepts flags or
+runs an interactive wizard; `rdc status` for a read-only health
+check; `rdc diff` for unified diffs (local vs remote, or two
+snapshots); `rdc auth` to set/refresh tokens; `rdc repair
+--rebuild-lock` for lockfile recovery. Distributable via `curl |
+sh` or `cargo install`. See
 `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full
 design.
 
@@ -250,7 +253,31 @@ delete it (keep local) or overwrite the local file with it (take
 remote) and re-run pull.
 
 `rdc pull` also regenerates `envs/<env>/_index.md`, an
-inventory-by-kind. Don't edit it by hand.
+inventory-by-kind plus a cross-references section. Don't edit it
+by hand.
+
+The cross-references section answers "what's attached to what" without
+needing to grep every JSON. It maps each writable kind that holds queue
+references to its queue slug(s):
+
+```markdown
+## Cross-references
+
+### hooks → queues
+- `master-data-hub` → playground-vol-1, playground-vol-2
+- `validator-invoices` → cost-invoices
+- `sftp-import` → (none)
+
+### rules → queues
+- `validate-totals` → cost-invoices
+
+### email_templates → queue
+- `invoices-ap/cost-invoices/default-rejection-template` → `cost-invoices`
+```
+
+URLs are resolved to slugs via the lockfile, so the section reflects
+exactly what's in the snapshot. Orphan refs (URLs whose target isn't
+in the snapshot) are silently dropped.
 
 ## Overlays — per-env values
 
