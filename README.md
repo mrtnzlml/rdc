@@ -4,7 +4,7 @@
 disk for AI-assisted local development, lets you edit them in place, and
 deploys them across environments.
 
-**Status:** M32. Pull all kinds (incl. MDH collections + indexes —
+**Status:** M33. Pull all kinds (incl. MDH collections + indexes —
 data storage URL derived from `api_base`, no extra config); push
 and deploy for hooks, rules, labels, queues, schemas (formula
 bodies round-trip), inboxes, email templates, engines, and engine
@@ -19,8 +19,9 @@ per-queue and per-MDH-collection sub-fetches via a bounded
 retry gracefully on `429 Too Many Requests` and transient 5xx
 (502/503/504) with `Retry-After` / exponential backoff. Pull
 conflicts open an interactive `[k]/[r]/[e]/[s]/[a]` resolver on
-TTY (spec §8.3); CI / non-TTY / `--yes` keeps the shadow-file
-flow. `rdc init` accepts flags or runs an interactive wizard;
+TTY (spec §8.3) — including combined-hash kinds (hooks json+py,
+schemas json+formulas), with one prompt per differing sub-file;
+CI / non-TTY / `--yes` keeps the shadow-file flow. `rdc init` accepts flags or runs an interactive wizard;
 `rdc status` for a read-only health check; `rdc diff` for unified
 diffs (local vs remote, or two snapshots); `rdc auth` to
 set/refresh tokens; `rdc repair --rebuild-lock` for lockfile
@@ -280,11 +281,19 @@ inline resolver per conflict (spec §8.3):
 | `s` | Skip — fall back to the shadow-file behavior (writes `<file>.remote`, keeps local). |
 | `a` | Abort the entire pull. The lockfile is **not** saved; nothing else is written from this point on. |
 
-Currently the resolver covers single-file JSON conflicts (queues,
+The resolver covers every kind that uses a single JSON file (queues,
 inboxes, rules, labels, engines, engine fields, workflows, workflow
-steps, email templates, MDH metadata). Hook and schema combined-hash
-conflicts (where the `.json` and `.py`/formula files diverge together)
-keep the shadow-file flow for now.
+steps, email templates, MDH metadata) **and** combined-hash kinds
+(hooks `.json` + `.py`, schemas `schema.json` + `formulas/*.py`). For
+combined-hash kinds the resolver walks each sub-file in turn — you
+can keep the local JSON but take the remote `.py`, for example. The
+`[N/M]` header reflects the per-entity sub-file count (e.g. `[2/2]`
+for the second of two files in a hook). One niche case stays on the
+shadow-file flow even on TTY: a hook that adds/removes its `.py` file
+between local and remote, or a schema whose formula set differs (one
+side added a formula the other doesn't have). Add/remove decisions
+aren't `[k]/[r]/[e]` shaped; resolve them by editing locally and
+re-running pull.
 
 ### Non-interactive / CI (`--yes` or non-TTY)
 

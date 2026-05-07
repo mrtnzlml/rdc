@@ -226,26 +226,68 @@ fn write_schema_for_queue(
             crate::state::schema_combined_hash(local_json, &pre_local_formulas)
         }
         PullAction::Conflict => {
-            let remote_path = queue_dir.join("schema.json.remote");
-            crate::snapshot::writer::write_atomic(&remote_path, &remote_json_bytes)?;
-            if !remote_formulas.is_empty() {
-                let remote_formulas_dir = queue_dir.join("formulas.remote");
-                std::fs::create_dir_all(&remote_formulas_dir)
-                    .with_context(|| format!("creating {}", remote_formulas_dir.display()))?;
-                for (field_id, bytes) in &remote_formulas {
-                    let p = remote_formulas_dir.join(format!("{field_id}.py"));
-                    crate::snapshot::writer::write_atomic(&p, bytes)?;
-                }
-            }
-            eprintln!(
-                "warning: {} conflict — local preserved, remote at {} (formulas at {})",
-                schema_path.display(),
-                queue_dir.join("schema.json.remote").display(),
-                queue_dir.join("formulas.remote").display()
-            );
             counts.conflicts += 1;
             let local_json = pre_local_json.as_ref().unwrap();
-            crate::state::schema_combined_hash(local_json, &pre_local_formulas)
+
+            // M33 / spec §8.3: when interactive AND the formula sets
+            // align on both sides (same field IDs), prompt per file.
+            // Asymmetric formula sets (added/removed formulas) stay on
+            // the legacy shadow-file flow — modeling adds/deletes isn't
+            // a [k]/[r]/[e]/[s]/[a] decision shape.
+            let local_ids: std::collections::BTreeSet<&str> =
+                pre_local_formulas.iter().map(|(id, _)| id.as_str()).collect();
+            let remote_ids: std::collections::BTreeSet<&str> =
+                remote_formulas.iter().map(|(id, _)| id.as_str()).collect();
+            let symmetric = local_ids == remote_ids;
+
+            if ctx.interactive && symmetric {
+                let total = 1 + remote_formulas.len();
+                let resolved_json = crate::cli::resolve::resolve_combined_file(
+                    1, total,
+                    &schema_path,
+                    local_json,
+                    &remote_json_bytes,
+                    ctx.interactive,
+                )?;
+                let mut resolved_formulas: Vec<(String, Vec<u8>)> =
+                    Vec::with_capacity(remote_formulas.len());
+                let local_by_id: std::collections::BTreeMap<&str, &Vec<u8>> =
+                    pre_local_formulas.iter().map(|(id, b)| (id.as_str(), b)).collect();
+                for (i, (field_id, remote_bytes)) in remote_formulas.iter().enumerate() {
+                    let local_bytes = local_by_id.get(field_id.as_str()).copied()
+                        .cloned().unwrap_or_default();
+                    let formula_path = queue_dir.join("formulas").join(format!("{field_id}.py"));
+                    let bytes = crate::cli::resolve::resolve_combined_file(
+                        i + 2, total,
+                        &formula_path,
+                        &local_bytes,
+                        remote_bytes,
+                        ctx.interactive,
+                    )?;
+                    resolved_formulas.push((field_id.clone(), bytes));
+                }
+                crate::state::schema_combined_hash(&resolved_json, &resolved_formulas)
+            } else {
+                // Legacy shadow-file flow.
+                let remote_path = queue_dir.join("schema.json.remote");
+                crate::snapshot::writer::write_atomic(&remote_path, &remote_json_bytes)?;
+                if !remote_formulas.is_empty() {
+                    let remote_formulas_dir = queue_dir.join("formulas.remote");
+                    std::fs::create_dir_all(&remote_formulas_dir)
+                        .with_context(|| format!("creating {}", remote_formulas_dir.display()))?;
+                    for (field_id, bytes) in &remote_formulas {
+                        let p = remote_formulas_dir.join(format!("{field_id}.py"));
+                        crate::snapshot::writer::write_atomic(&p, bytes)?;
+                    }
+                }
+                eprintln!(
+                    "warning: {} conflict — local preserved, remote at {} (formulas at {})",
+                    schema_path.display(),
+                    queue_dir.join("schema.json.remote").display(),
+                    queue_dir.join("formulas.remote").display()
+                );
+                crate::state::schema_combined_hash(local_json, &pre_local_formulas)
+            }
         }
     };
     record_object(

@@ -101,18 +101,51 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
                 hook_combined_hash(local_json, &pre_local_code)
             }
             PullAction::Conflict => {
-                // Hooks are a combined-hash kind (json + py). The §8.3
-                // resolver currently only handles single-file JSON conflicts,
-                // so we force `interactive=false` here and stay on the
-                // shadow-file path: <slug>.json.remote + <slug>.py.remote.
-                // M33 (or later) extends the resolver to walk both files.
-                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone(), false)?;
-                if let Some(code) = &proposed_code {
-                    let py_remote_path = ctx.paths.hooks_dir().join(format!("{slug}.py.remote"));
-                    crate::snapshot::writer::write_atomic(&py_remote_path, code.as_bytes())?;
-                }
+                // Combined-hash conflict (M33 / spec §8.3). When both
+                // sides have code, walk json and py separately so the user
+                // resolves each. Asymmetric cases (one side has code, the
+                // other doesn't) keep the legacy shadow-file flow because
+                // adding/removing a file isn't "[k]eep / [r]emote / [e]dit"
+                // shaped — it's a Write/Delete decision the resolver
+                // doesn't model in v1.
                 let local_json = pre_local_json.as_ref().unwrap();
-                hook_combined_hash(local_json, &pre_local_code)
+                let symmetric = matches!((&pre_local_code, &proposed_code), (Some(_), Some(_)))
+                    || matches!((&pre_local_code, &proposed_code), (None, None));
+                let total = if symmetric && pre_local_code.is_some() { 2 } else { 1 };
+
+                let resolved_json = crate::cli::resolve::resolve_combined_file(
+                    1, total,
+                    &local_path,
+                    local_json,
+                    &proposed_json,
+                    ctx.interactive && symmetric,
+                )?;
+
+                let resolved_code = if symmetric {
+                    if let (Some(loc), Some(rem)) = (&pre_local_code, &proposed_code) {
+                        let bytes = crate::cli::resolve::resolve_combined_file(
+                            2, total,
+                            &py_path,
+                            loc.as_bytes(),
+                            rem.as_bytes(),
+                            ctx.interactive,
+                        )?;
+                        Some(String::from_utf8(bytes)
+                            .with_context(|| format!("hook code resolved bytes for '{}' are not UTF-8", hook.name))?)
+                    } else {
+                        None
+                    }
+                } else {
+                    // Asymmetric — fall back to shadow for the .py side
+                    // (matches pre-M33 behavior).
+                    if let Some(remote_code_str) = &proposed_code {
+                        let py_remote_path = ctx.paths.hooks_dir().join(format!("{slug}.py.remote"));
+                        crate::snapshot::writer::write_atomic(&py_remote_path, remote_code_str.as_bytes())?;
+                    }
+                    pre_local_code.clone()
+                };
+
+                hook_combined_hash(&resolved_json, &resolved_code)
             }
         };
 
