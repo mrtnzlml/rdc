@@ -93,7 +93,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<QueueCounts> {
         if q_action == PullAction::Conflict {
             counts.conflicts += 1;
         }
-        let q_recorded = apply_pull_action(q_action, &queue_path, &queue_proposed, q_remote_hash)?;
+        let q_recorded = apply_pull_action(q_action, &queue_path, &queue_proposed, q_remote_hash, ctx.interactive)?;
         record_object(
             ctx.lockfile,
             "queues",
@@ -285,7 +285,7 @@ fn write_inbox_for_queue(
     if i_action == PullAction::Conflict {
         counts.conflicts += 1;
     }
-    let i_recorded = apply_pull_action(i_action, &inbox_path, &inbox_proposed, i_remote_hash)?;
+    let i_recorded = apply_pull_action(i_action, &inbox_path, &inbox_proposed, i_remote_hash, ctx.interactive)?;
     record_object(
         ctx.lockfile,
         "inboxes",
