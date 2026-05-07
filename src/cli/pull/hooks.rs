@@ -13,11 +13,14 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<usize> {
         .await
         .context("listing hooks")?;
 
-    std::fs::create_dir_all(ctx.paths.hooks_dir())
-        .with_context(|| format!("creating {}", ctx.paths.hooks_dir().display()))?;
-
     let mut used_slugs: HashSet<String> = HashSet::new();
+    let mut dir_created = false;
     for hook in &hooks {
+        if !dir_created {
+            std::fs::create_dir_all(ctx.paths.hooks_dir())
+                .with_context(|| format!("creating {}", ctx.paths.hooks_dir().display()))?;
+            dir_created = true;
+        }
         let slug = slugify_unique(&hook.name, &used_slugs);
         used_slugs.insert(slug.clone());
 

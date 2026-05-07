@@ -26,16 +26,20 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig) -> Result<usize> {
         None => None,
     };
 
-    std::fs::create_dir_all(ctx.paths.workspaces_dir())
-        .with_context(|| format!("creating {}", ctx.paths.workspaces_dir().display()))?;
-
     let mut used_slugs: HashSet<String> = HashSet::new();
+    let mut dir_created = false;
     let mut count = 0usize;
     for ws in &workspaces {
         if let Some(re) = &filter {
             if !re.is_match(&ws.name) {
                 continue;
             }
+        }
+
+        if !dir_created {
+            std::fs::create_dir_all(ctx.paths.workspaces_dir())
+                .with_context(|| format!("creating {}", ctx.paths.workspaces_dir().display()))?;
+            dir_created = true;
         }
 
         let slug = slugify_unique(&ws.name, &used_slugs);

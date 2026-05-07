@@ -12,11 +12,14 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<usize> {
         .await
         .context("listing engine fields")?;
 
-    std::fs::create_dir_all(ctx.paths.engine_fields_dir())
-        .with_context(|| format!("creating {}", ctx.paths.engine_fields_dir().display()))?;
-
     let mut used: HashSet<String> = HashSet::new();
+    let mut dir_created = false;
     for f in &fields {
+        if !dir_created {
+            std::fs::create_dir_all(ctx.paths.engine_fields_dir())
+                .with_context(|| format!("creating {}", ctx.paths.engine_fields_dir().display()))?;
+            dir_created = true;
+        }
         let slug = slugify_unique(&f.name, &used);
         used.insert(slug.clone());
 

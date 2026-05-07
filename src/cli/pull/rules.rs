@@ -8,11 +8,14 @@ use std::collections::HashSet;
 pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<usize> {
     let rules = ctx.client.list_rules().await.context("listing rules")?;
 
-    std::fs::create_dir_all(ctx.paths.rules_dir())
-        .with_context(|| format!("creating {}", ctx.paths.rules_dir().display()))?;
-
     let mut used: HashSet<String> = HashSet::new();
+    let mut dir_created = false;
     for r in &rules {
+        if !dir_created {
+            std::fs::create_dir_all(ctx.paths.rules_dir())
+                .with_context(|| format!("creating {}", ctx.paths.rules_dir().display()))?;
+            dir_created = true;
+        }
         let slug = slugify_unique(&r.name, &used);
         used.insert(slug.clone());
 
