@@ -1,20 +1,32 @@
 use super::common::{apply_pull_action, decide_pull_action, record_object, PullAction, PullCtx};
-use crate::api::DataStorageClient;
+use crate::api::{anyhow_has_status, DataStorageClient};
 use crate::config::EnvConfig;
 use crate::model::IndexSet;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 
+/// Pulls Master Data Hub collections + indexes for `env_cfg`. The Data
+/// Storage base URL is always derived from `env_cfg.api_base` (no separate
+/// config field). On clusters without MDH the first call returns 404, in
+/// which case we silently skip — same shape as the M15 403/permission skip.
+///
+/// Returns `(collection_count, conflicts)`.
 pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str) -> Result<(usize, usize)> {
-    let Some(base) = &env_cfg.data_storage_base else {
-        return Ok((0, 0));
-    };
+    let base = env_cfg.data_storage_base();
 
-    let client = DataStorageClient::new(base.clone(), token.to_string())
+    let client = DataStorageClient::new(base, token.to_string())
         .context("constructing Data Storage client")?;
 
-    let collections = client.list_collections().await.context("listing MDH collections")?;
+    let collections = match client.list_collections().await {
+        Ok(c) => c,
+        Err(e) if anyhow_has_status(&e, 404) => {
+            // MDH not enabled on this cluster — quietly skip, matching the
+            // pull-time tolerance for 403 on permission-gated kinds.
+            return Ok((0, 0));
+        }
+        Err(e) => return Err(e.context("listing MDH collections")),
+    };
 
     let mut used: HashSet<String> = HashSet::new();
     let mut dir_created = false;

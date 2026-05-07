@@ -381,7 +381,7 @@ async fn pull_with_workspace_filter_skips_non_matching() {
 }
 
 #[tokio::test]
-async fn pull_mdh_when_data_storage_base_is_set() {
+async fn pull_mdh_when_endpoints_present() {
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
@@ -448,16 +448,10 @@ async fn pull_mdh_when_data_storage_base_is_set() {
         .assert()
         .success();
 
-    let cfg_path = project.path().join("rdc.toml");
-    let cfg = std::fs::read_to_string(&cfg_path).unwrap();
-    let cfg = cfg.replace(
-        "[envs.dev]",
-        &format!(
-            "[envs.dev]\ndata_storage_base = \"{}/svc/data-storage/api\"",
-            server.uri()
-        ),
-    );
-    std::fs::write(&cfg_path, cfg).unwrap();
+    // No data_storage_base in rdc.toml — the URL is derived from
+    // api_base via EnvConfig::data_storage_base() (M25). Both pull
+    // helpers (Rossum API and Data Storage API) hit the same mock
+    // server's URL space.
 
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -491,7 +485,7 @@ async fn pull_mdh_when_data_storage_base_is_set() {
 }
 
 #[tokio::test]
-async fn pull_skips_mdh_when_data_storage_base_is_absent() {
+async fn pull_skips_mdh_when_endpoint_returns_404() {
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
@@ -512,7 +506,10 @@ async fn pull_skips_mdh_when_data_storage_base_is_absent() {
             .mount(&server)
             .await;
     }
-    // NO data storage endpoints mocked — if MDH driver runs, the test will fail.
+    // NO data storage endpoints mocked — wiremock returns 404 for unknown
+    // paths and the MDH driver tolerates that (M25), so pull still
+    // succeeds and `mdh/` is never created. Mirrors the real-world case
+    // of a Rossum cluster that doesn't have MDH enabled.
 
     let project = TempDir::new().unwrap();
 
@@ -542,7 +539,7 @@ async fn pull_skips_mdh_when_data_storage_base_is_absent() {
         .success();
 
     let stdout = String::from_utf8_lossy(&assert_result.get_output().stdout).to_string();
-    assert!(!stdout.contains("dataset"), "MDH should be skipped when data_storage_base is not set: {stdout}");
+    assert!(!stdout.contains("dataset"), "MDH should be silently skipped on 404: {stdout}");
     assert!(!project.path().join("envs/dev/mdh").exists(), "no mdh/ dir should be created");
 }
 
