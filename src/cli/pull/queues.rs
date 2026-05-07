@@ -1,10 +1,11 @@
 //! Queue pull driver: writes queue.json + schema.json (with formula
 //! sidecars) + inbox.json under `envs/<env>/workspaces/<ws>/queues/<q>/`.
 //!
-//! M30: schema + inbox fetches are pipelined via `buffer_unordered(N)` so
-//! a queue tree of 25+ queues no longer takes 50 sequential RTTs. The
-//! per-queue write decisions stay sequential — they touch shared state
-//! (lockfile, queue_locations, conflict counts).
+//! Schema + inbox fetches are pipelined via `buffer_unordered(N)` (per
+//! spec §16, default N=5) so a queue tree of 25+ queues doesn't take 50
+//! sequential round-trips. The per-queue write decisions stay sequential
+//! because they touch shared state (lockfile, queue_locations, conflict
+//! counts).
 
 use super::common::{
     apply_pull_action, decide_pull_action, maybe_strip_overlay, parse_id_from_url,
@@ -229,10 +230,10 @@ fn write_schema_for_queue(
             counts.conflicts += 1;
             let local_json = pre_local_json.as_ref().unwrap();
 
-            // M33 / spec §8.3: when interactive AND the formula sets
-            // align on both sides (same field IDs), prompt per file.
-            // Asymmetric formula sets (added/removed formulas) stay on
-            // the legacy shadow-file flow — modeling adds/deletes isn't
+            // Spec §8.3: when interactive AND the formula sets align on
+            // both sides (same field IDs), prompt per file. Asymmetric
+            // formula sets (added/removed formulas) fall back to the
+            // shadow-file flow — modeling adds/deletes isn't
             // a [k]/[r]/[e]/[s]/[a] decision shape.
             let local_ids: std::collections::BTreeSet<&str> =
                 pre_local_formulas.iter().map(|(id, _)| id.as_str()).collect();

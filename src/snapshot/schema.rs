@@ -6,20 +6,8 @@ use std::path::Path;
 
 /// Write a schema to `<queue_dir>/schema.json`, extracting any formula field
 /// `formula` strings into `<queue_dir>/formulas/<field_id>.py` files.
-/// Returns the JSON bytes written (for content_hash).
-///
-/// **Hash coverage gap:** The returned bytes are the post-extraction
-/// `schema.json` content. Changes to extracted `formulas/*.py` files are NOT
-/// reflected in the returned hash.
-///
-/// **Combined-hash algorithm for M7's three-way merge:** When implementing
-/// drift detection, compute the canonical schema content hash as
-/// `SHA-256(schema_json_bytes || 0x00 || formula_1_path || 0x00 ||
-/// formula_1_bytes || 0x00 || formula_2_path || 0x00 || formula_2_bytes ||
-/// ...)` where formulas are sorted by `field_id`. The 0x00 separator makes
-/// boundaries unambiguous; sorting makes the hash deterministic across
-/// platforms with non-stable filesystem listing order. Until M7, the
-/// lockfile stores the simpler `schema.json`-only hash.
+/// Returns the post-extraction JSON bytes (used for content_hash via
+/// `crate::state::schema_combined_hash` together with the formula bytes).
 pub fn write_schema(queue_dir: &Path, schema: &Schema) -> Result<Vec<u8>> {
     let mut value = serde_json::to_value(schema)
         .context("serializing schema to value")?;
@@ -55,7 +43,7 @@ pub fn write_schema(queue_dir: &Path, schema: &Schema) -> Result<Vec<u8>> {
 
 /// Write pre-serialized schema bytes + formulas. Bypasses the typed
 /// re-serialize done by `write_schema` — used by the pull driver after
-/// applying overlay strip to the schema's JSON Value (M26).
+/// applying overlay strip to the schema's JSON Value.
 pub fn write_schema_bytes(
     queue_dir: &Path,
     json_bytes: &[u8],

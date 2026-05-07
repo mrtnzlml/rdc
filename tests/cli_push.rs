@@ -216,7 +216,7 @@ async fn push_applies_overlay_values_to_outbound_patch() {
     ).unwrap();
 
     // Set overlay BEFORE pull so the pull strips overlay-managed paths
-    // (M26 / spec §9.3). Push then re-applies them on the outbound body.
+    // (spec §9.3). Push then re-applies them on the outbound body.
     let overlay_path = project.path().join("envs/dev/overlay.toml");
     std::fs::create_dir_all(overlay_path.parent().unwrap()).unwrap();
     std::fs::write(&overlay_path, r#"
@@ -642,7 +642,7 @@ async fn email_template_push_succeeds_when_subject_edited() {
             "id": 555,
             "url": "https://mock.rossum.app/api/v1/email_templates/555",
             "name": "Rejection Notice",
-            "subject": "M18 marker subject",
+            "subject": "patched subject",
             "queue": "https://mock.rossum.app/api/v1/queues/100",
             "modified_at": "2026-05-08T10:00:00Z"
         })))
@@ -668,7 +668,7 @@ async fn email_template_push_succeeds_when_subject_edited() {
     assert!(template_path.exists(), "template pulled into queue dir");
     let raw = std::fs::read_to_string(&template_path).unwrap();
     let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    v["subject"] = serde_json::json!("M18 marker subject");
+    v["subject"] = serde_json::json!("patched subject");
     std::fs::write(&template_path, format!("{}\n", serde_json::to_string_pretty(&v).unwrap())).unwrap();
 
     Command::cargo_bin("rdc").unwrap()
@@ -737,7 +737,7 @@ async fn inbox_push_succeeds_when_edited() {
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": 300,
             "url": "https://mock.rossum.app/api/v1/inboxes/300",
-            "name": "M18 inbox marker",
+            "name": "patched inbox name",
             "email": "x@mock",
             "queues": ["https://mock.rossum.app/api/v1/queues/100"]
         })))
@@ -761,7 +761,7 @@ async fn inbox_push_succeeds_when_edited() {
         .join("envs/dev/workspaces/invoices-ap/queues/cost-invoices/inbox.json");
     let raw = std::fs::read_to_string(&inbox_path).unwrap();
     let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    v["name"] = serde_json::json!("M18 inbox marker");
+    v["name"] = serde_json::json!("patched inbox name");
     std::fs::write(&inbox_path, format!("{}\n", serde_json::to_string_pretty(&v).unwrap())).unwrap();
 
     Command::cargo_bin("rdc").unwrap()

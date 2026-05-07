@@ -4,31 +4,47 @@
 disk for AI-assisted local development, lets you edit them in place, and
 deploys them across environments.
 
-**Status:** M34. Pull all kinds (incl. MDH collections + indexes —
-data storage URL derived from `api_base`, no extra config); push
-and deploy for hooks, rules, labels, queues, schemas (formula
-bodies round-trip), inboxes, email templates, engines, and engine
-fields. Overlays are bidirectional: applied on push, stripped on
-pull (spec §9.3). `rdc apply` rewrites cross-reference URLs from
-src to tgt, refuses to PATCH on tgt drift, and skips no-op
-deploys (idempotent). `_index.md` includes per-kind inventory
-plus a cross-references section that resolves `hook → queues`,
-`rule → queues`, `email_template → queue`. Pull pipelines
-per-queue and per-MDH-collection sub-fetches via a bounded
-`--concurrency` (spec §7.2 / §16, default 5). All HTTP calls
-retry gracefully on `429 Too Many Requests` and transient 5xx
-(502/503/504) with `Retry-After` / exponential backoff. Both pull
-and push open an interactive `[k]/[r]/[e]/[s]/[a]` resolver on
-TTY when a conflict / drift is detected (spec §8.3 / §7.3 step
-5) — including combined-hash kinds (hooks json+py, schemas
-json+formulas), with one prompt per differing sub-file;
-CI / non-TTY / `--yes` keeps the shadow-file / skip-with-warning
-flow. `rdc init` accepts flags or runs an interactive wizard;
-`rdc status` for a read-only health check; `rdc diff` for unified
-diffs (local vs remote, or two snapshots); `rdc auth` to
-set/refresh tokens; `rdc repair --rebuild-lock` for lockfile
-recovery. Distributable via `curl | sh` or `cargo install`. See
-`docs/superpowers/specs/2026-05-06-rdc-design.md` for the full
+## Capabilities
+
+- **Pull** every kind in scope: organization, workspaces, queues,
+  schemas (formula bodies extracted to `formulas/<id>.py`), inboxes,
+  hooks (code extracted to `<slug>.py`), rules, labels, engines,
+  engine fields, workflows, workflow steps, email templates, and MDH
+  collections + indexes. The Data Storage URL is derived from
+  `api_base` — no extra config. Per-queue sub-fetches (schema +
+  inbox) and per-MDH-collection index fetches are pipelined via a
+  bounded `--concurrency` (spec §7.2 / §16, default 5).
+- **Push** locally-edited objects back to the API for hooks, rules,
+  labels, queues, schemas (formula round-trip), inboxes, email
+  templates, engines, and engine fields. Workflows and workflow
+  steps are pull-only (Rossum's API rejects PATCH on these with 405).
+- **Deploy** across environments via `rdc map` / `rdc plan` / `rdc
+  apply`. Apply rewrites cross-reference URLs from src to tgt, refuses
+  to PATCH on tgt drift, and skips no-op deploys (idempotent).
+- **Overlays** are bidirectional: applied on push, stripped on pull
+  (spec §9.3) so cross-env diffs and deploys stay quiet about
+  intentional per-env divergence.
+- **Conflict + drift resolver.** Both pull and push open an
+  interactive `[k]/[r]/[e]/[s]/[a]` resolver on TTY (spec §8.3 / §7.3
+  step 5), including the combined-hash kinds (hooks json+py, schemas
+  json+formulas) — one prompt per differing sub-file. CI / non-TTY /
+  `--yes` keeps the shadow-file / skip-with-warning flow.
+- **Resilience.** Every Rossum and Data Storage HTTP call retries on
+  `429 Too Many Requests` and transient 5xx (502/503/504) with
+  `Retry-After` / exponential backoff (up to 5 attempts).
+- **Auxiliary commands.** `rdc init` accepts flags or runs an
+  interactive wizard; `rdc status` is a read-only health check;
+  `rdc diff` shows unified diffs (local vs remote, or two snapshots);
+  `rdc auth` sets/refreshes tokens; `rdc repair --rebuild-lock`
+  recovers a corrupted lockfile.
+- **Distribution.** Single static binary via `curl | sh` (pre-built
+  for darwin x86_64/aarch64 + linux x86_64) or `cargo install`.
+- **AI-friendly snapshot.** `_index.md` includes a per-kind inventory
+  plus a cross-references section that resolves `hook → queues`,
+  `rule → queues`, and `email_template → queue` so AI agents can
+  navigate without parsing every JSON.
+
+See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full
 design.
 
 ## Install
@@ -171,7 +187,7 @@ same `[k]/[r]/[e]/[s]/[a]` shape as pull but with push-side semantics
 | `k` | **Force-push.** Send the local payload to the API anyway, overwriting the remote drift. |
 | `r` | **Adopt remote.** Write the remote bytes to the local file and update the lockfile to match. No PATCH. Your local edit is discarded. |
 | `e` | **Edit then force-push.** Open `$EDITOR` on a temp file with conflict markers; the saved bytes become the PATCH payload. |
-| `s` | **Skip.** Leave both local and remote alone. Same as the pre-M34 default. |
+| `s` | **Skip.** Leave both local and remote alone — same as the non-TTY fallback. |
 | `a` | **Abort.** Stop the push entirely; lockfile is not saved. Re-running picks up where you left off. |
 
 Without a TTY (or with `--yes`), every drift falls back to `s` (skip
@@ -380,7 +396,7 @@ The overlay's dotted-path keys are bidirectional:
 - **On push**, they're merged into the outbound PATCH body, overwriting
   any value at that path. The remote ends up with the env-specific
   value.
-- **On pull** (M26 / spec §9.3), they're stripped from the snapshot
+- **On pull** (spec §9.3), they're stripped from the snapshot
   before write. The on-disk JSON reflects the canonical (pre-overlay)
   form, so `rdc diff test prod` and `rdc map test prod` stay quiet
   about env-specific differences. The lockfile records the stripped
@@ -461,7 +477,7 @@ queue's slug. For email templates, the key is the compound
 wherever both src and tgt have an object with the same key; you
 hand-edit for renames.
 
-**Apply is conservative and idempotent (M29):**
+**Apply is conservative and idempotent:**
 - **URL rewriting.** Cross-references (hook.queues, queue.schema,
   email_template.queue, etc.) get rewritten from src URLs to tgt
   URLs via the lockfiles + mapping. Strings that don't match a

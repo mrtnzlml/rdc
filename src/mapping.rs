@@ -76,7 +76,7 @@ impl Mapping {
 
     /// Look up the tgt slug for a `(kind, src_slug)` pair. Returns `None`
     /// if the kind isn't deployable or the pair isn't mapped. Used by
-    /// `rdc apply`'s URL-rewrite step (M29).
+    /// `rdc apply`'s URL-rewrite step.
     pub fn lookup_tgt_slug(&self, kind: &str, src_slug: &str) -> Option<&str> {
         let map = match kind {
             "hooks" => &self.hooks,

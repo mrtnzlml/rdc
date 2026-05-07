@@ -1,5 +1,5 @@
-//! Shared helpers for `rdc apply` (M29 hardening): URL rewriting from src
-//! to tgt URLs, plus drift + idempotency checks.
+//! Shared helpers for `rdc apply`: URL rewriting from src to tgt URLs
+//! across cross-references, plus drift + idempotency checks.
 
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::mapping::Mapping;

@@ -1,9 +1,8 @@
-//! HTTP retry-with-backoff helper (M30 + M31).
+//! HTTP retry-with-backoff helper for transient errors (spec §13).
 //!
 //! Used by both `RossumClient` and `DataStorageClient`. The Rossum API
-//! sometimes returns 429 under load, and concurrent pulls (M30) make that
-//! more likely. Transient gateway errors (502/503/504) are also retriable
-//! per spec §13.
+//! sometimes returns 429 under load, and concurrent pulls make that more
+//! likely. Transient gateway errors (502/503/504) are also retried.
 //!
 //! Strategy:
 //!

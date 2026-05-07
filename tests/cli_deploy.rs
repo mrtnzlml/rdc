@@ -68,7 +68,7 @@ async fn map_plan_apply_full_flow() {
     });
     mount_full_pull(&prod_server, prod_hooks.clone()).await;
 
-    // M29 drift check: apply does GET /hooks/{id} per object — mock both.
+    // Apply's drift check does GET /hooks/{id} per object — mock both.
     let prod_hook_401 = prod_hooks["results"][0].clone();
     let prod_hook_402 = prod_hooks["results"][1].clone();
     Mock::given(method("GET"))
@@ -279,8 +279,8 @@ async fn deploy_queue_and_schema() {
         .assert().success();
 
     // Edit test queue + schema formula to differ from prod (so apply has
-    // a real change to push; M29 idempotency would otherwise correctly
-    // skip the no-diff cases).
+    // a real change to push; otherwise apply's idempotency would
+    // correctly skip the no-diff cases).
     let queue_path = project.path()
         .join("envs/test/workspaces/invoices-ap/queues/cost-invoices/queue.json");
     let raw = std::fs::read_to_string(&queue_path).unwrap();

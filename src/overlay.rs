@@ -1,8 +1,11 @@
 //! Per-env overlays — declarative env-specific values that override the
 //! canonical snapshot when pushing to that env. Per spec §9.
 //!
-//! M11: simple dotted-path keys, push-side only. JMESPath wildcards and
-//! pull-side stripping deferred to a future milestone.
+//! Bidirectional: applied on push (merged into the outbound PATCH body)
+//! and stripped on pull (the snapshot stays in canonical pre-overlay
+//! form so cross-env diffs and deploys are quiet). The override format
+//! is simple dotted-path keys; JMESPath wildcards / array filters are
+//! out of scope for v1.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -32,7 +35,7 @@ pub struct Overlay {
     #[serde(default)]
     pub inboxes: BTreeMap<String, BTreeMap<String, Value>>,
     /// Email-template overrides keyed by `<ws_slug>/<q_slug>/<template_slug>`,
-    /// matching the lockfile key for queue-scoped email templates (M16).
+    /// matching the lockfile key for queue-scoped email templates.
     #[serde(default)]
     pub email_templates: BTreeMap<String, BTreeMap<String, Value>>,
     /// Engine overrides keyed by engine slug.

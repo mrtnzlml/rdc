@@ -198,13 +198,14 @@ async fn pull_writes_full_workspace_tree() {
     assert!(lf.contains("\"hooks\""));
     assert!(lf.contains("invoices-ap"));
     assert!(lf.contains("cost-invoices"));
-    // content_hash is populated (M2 reviewer's recommendation)
+    // content_hash is populated for every entry (used by the three-way
+    // merge as the base hash on subsequent pulls/pushes).
     assert!(lf.contains("\"content_hash\""), "lockfile should record content_hash for entries");
     // Hashes are 64-char hex (SHA-256). Spot-check by counting at least one full hash.
     let hash_re = regex::Regex::new(r#""content_hash":\s*"[0-9a-f]{64}""#).unwrap();
     assert!(hash_re.is_match(&lf), "expected at least one 64-char hex content_hash in lockfile");
 
-    // M8: _index.md generated
+    // _index.md generated.
     let index_path = env_root.join("_index.md");
     assert!(index_path.exists(), "_index.md should be generated");
     let index_body = std::fs::read_to_string(&index_path).unwrap();
@@ -215,7 +216,7 @@ async fn pull_writes_full_workspace_tree() {
     assert!(index_body.contains("- hooks: 2"));
     assert!(index_body.contains("`validator-invoices`"));
 
-    // M4 kinds present
+    // Org-level kinds.
     assert!(env_root.join("rules/e-invoice-validation.json").exists());
     assert!(env_root.join("labels/priority-high.json").exists());
     assert!(env_root.join("labels/needs-review.json").exists());
@@ -223,17 +224,18 @@ async fn pull_writes_full_workspace_tree() {
     assert!(env_root.join("engine-fields/invoice-id.json").exists());
     assert!(env_root.join("engine-fields/total-amount.json").exists());
 
-    // Lockfile records new kinds
+    // Lockfile records the kinds.
     assert!(lf.contains("\"rules\""));
     assert!(lf.contains("\"labels\""));
     assert!(lf.contains("\"engines\""));
     assert!(lf.contains("\"engine_fields\""));
 
-    // M5 kinds present
+    // Workflow kinds.
     assert!(env_root.join("workflows/ap-approval-flow.json").exists());
     assert!(env_root.join("workflow-steps/manager-approval.json").exists());
     assert!(env_root.join("workflow-steps/finance-approval.json").exists());
-    // M16: email templates nest under their queue.
+    // Email templates nest under their queue (the live API associates
+    // each template with exactly one queue).
     assert!(env_root
         .join("workspaces/invoices-ap/queues/cost-invoices/email-templates/rejection-notice.json")
         .exists());
@@ -364,8 +366,7 @@ async fn pull_with_workspace_filter_skips_non_matching() {
     assert!(ws_root.join("invoices-ap").is_dir());
     assert!(!ws_root.join("purchase-orders").exists(), "filtered workspace should not be pulled");
 
-    // Parse the lockfile JSON and assert exact entry counts/keys (more robust than
-    // the old `lf.contains(...)` substring checks, per M4 reviewer recommendation).
+    // Parse the lockfile JSON and assert exact entry counts/keys.
     let lf = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
     let lf_value: serde_json::Value = serde_json::from_str(&lf).unwrap();
 
@@ -449,9 +450,9 @@ async fn pull_mdh_when_endpoints_present() {
         .success();
 
     // No data_storage_base in rdc.toml — the URL is derived from
-    // api_base via EnvConfig::data_storage_base() (M25). Both pull
-    // helpers (Rossum API and Data Storage API) hit the same mock
-    // server's URL space.
+    // api_base via EnvConfig::data_storage_base(). Both pull helpers
+    // (Rossum API and Data Storage API) hit the same mock server's URL
+    // space.
 
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -507,9 +508,9 @@ async fn pull_skips_mdh_when_endpoint_returns_404() {
             .await;
     }
     // NO data storage endpoints mocked — wiremock returns 404 for unknown
-    // paths and the MDH driver tolerates that (M25), so pull still
-    // succeeds and `mdh/` is never created. Mirrors the real-world case
-    // of a Rossum cluster that doesn't have MDH enabled.
+    // paths and the MDH driver tolerates that, so pull still succeeds
+    // and `mdh/` is never created. Mirrors the real-world case of a
+    // Rossum cluster that doesn't have MDH enabled.
 
     let project = TempDir::new().unwrap();
 
@@ -1149,9 +1150,10 @@ async fn pull_with_unknown_env_fails() {
         .stderr(predicate::str::contains("env 'prod' is not defined"));
 }
 
-/// M26: pull strips overlay-managed paths from the snapshot. The user
-/// configures `overlay.toml` with `name = "Validator (PROD)"` for a hook;
-/// after pulling, the on-disk JSON should NOT contain the `name` field.
+/// Pull strips overlay-managed paths from the snapshot (spec §9.3).
+/// The user configures `overlay.toml` with `name = "Validator (PROD)"`
+/// for a hook; after pulling, the on-disk JSON should NOT contain the
+/// `name` field.
 #[tokio::test]
 async fn pull_strips_overlay_paths_from_snapshot() {
     let server = MockServer::start().await;
@@ -1215,7 +1217,7 @@ version = 1
     assert_eq!(v["url"], serde_json::json!("https://mock.rossum.app/api/v1/hooks/1"));
 }
 
-/// M26: round-trip — after overlay strip on pull, push re-applies the
+/// Round-trip — after overlay strip on pull, push re-applies the
 /// overlay so the PATCH body has the env-specific value. Verifies that
 /// `read_hook_value` + apply-overlay-then-deserialize handles a file
 /// missing the typed `name` field.

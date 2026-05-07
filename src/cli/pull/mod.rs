@@ -82,7 +82,6 @@ pub async fn run(env: &str, concurrency: usize, interactive: bool) -> Result<()>
             overlay,
             concurrency,
             interactive,
-            conflicts_resolved: 0,
         };
         run_drivers(&mut ctx, env_cfg, env, &token).await
     };
