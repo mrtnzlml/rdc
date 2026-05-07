@@ -158,6 +158,56 @@ async fn list_engine_fields_returns_fields() {
 }
 
 #[tokio::test]
+async fn update_rule_patches_and_returns_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/rules/2597"))
+        .and(header("Authorization", "token TEST_TOKEN"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 2597,
+            "url": "https://mock.rossum.app/api/v1/rules/2597",
+            "name": "E-invoice Validation",
+            "queues": []
+        })))
+        .mount(&server).await;
+
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let rule: rdc::model::Rule = serde_json::from_value(serde_json::json!({
+        "id": 2597,
+        "url": "https://mock.rossum.app/api/v1/rules/2597",
+        "name": "E-invoice Validation",
+        "queues": []
+    })).unwrap();
+    let updated = client.update_rule(2597, &rule).await.unwrap();
+    assert_eq!(updated.id, 2597);
+}
+
+#[tokio::test]
+async fn update_label_patches_and_returns_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/labels/11"))
+        .and(header("Authorization", "token TEST_TOKEN"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 11,
+            "url": "https://mock.rossum.app/api/v1/labels/11",
+            "name": "Priority High",
+            "organization": "https://mock.rossum.app/api/v1/organizations/285704"
+        })))
+        .mount(&server).await;
+
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let label: rdc::model::Label = serde_json::from_value(serde_json::json!({
+        "id": 11,
+        "url": "https://mock.rossum.app/api/v1/labels/11",
+        "name": "Priority High",
+        "organization": "https://mock.rossum.app/api/v1/organizations/285704"
+    })).unwrap();
+    let updated = client.update_label(11, &label).await.unwrap();
+    assert_eq!(updated.id, 11);
+}
+
+#[tokio::test]
 async fn update_hook_patches_and_returns_response() {
     let server = MockServer::start().await;
     Mock::given(method("PATCH"))

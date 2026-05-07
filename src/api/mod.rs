@@ -53,6 +53,46 @@ impl RossumClient {
         Ok(out)
     }
 
+    pub async fn update_rule(&self, id: u64, rule: &crate::model::Rule) -> Result<crate::model::Rule> {
+        let url = format!("{}/rules/{id}", self.base_url);
+        let resp = self
+            .http
+            .patch(&url)
+            .header("Authorization", format!("token {}", self.token))
+            .json(rule)
+            .send()
+            .await
+            .with_context(|| format!("PATCH {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ApiError::Status { status: status.as_u16(), body }.into());
+        }
+        let value = resp.json::<crate::model::Rule>().await
+            .with_context(|| format!("decoding PATCH response from {url}"))?;
+        Ok(value)
+    }
+
+    pub async fn update_label(&self, id: u64, label: &crate::model::Label) -> Result<crate::model::Label> {
+        let url = format!("{}/labels/{id}", self.base_url);
+        let resp = self
+            .http
+            .patch(&url)
+            .header("Authorization", format!("token {}", self.token))
+            .json(label)
+            .send()
+            .await
+            .with_context(|| format!("PATCH {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ApiError::Status { status: status.as_u16(), body }.into());
+        }
+        let value = resp.json::<crate::model::Label>().await
+            .with_context(|| format!("decoding PATCH response from {url}"))?;
+        Ok(value)
+    }
+
     /// PATCH /hooks/{id} with the given hook body. Returns the server's
     /// authoritative response (including server-set fields like modified_at).
     pub async fn update_hook(&self, id: u64, hook: &Hook) -> Result<Hook> {
