@@ -1,6 +1,7 @@
 use crate::api::RossumClient;
 use crate::config::ProjectConfig;
 use crate::paths::Paths;
+use crate::progress::KindProgress;
 use crate::secrets::resolve_token;
 use crate::state::Lockfile;
 use anyhow::{anyhow, Context, Result};
@@ -152,8 +153,13 @@ async fn run_drivers(
         .with_context(|| format!("pulling hooks for env '{env}'"))?;
     let (n_rules, c_rules) = rules::pull(ctx).await
         .with_context(|| format!("pulling rules for env '{env}'"))?;
-    let (n_labels, c_labels) = labels::pull(ctx).await
-        .with_context(|| format!("pulling labels for env '{env}'"))?;
+    let (n_labels, c_labels) = {
+        let p = KindProgress::start("labels");
+        let result = labels::pull(ctx, &p).await
+            .with_context(|| format!("pulling labels for env '{env}'"))?;
+        p.finish();
+        result
+    };
     let (n_engines, c_engines) = engines::pull(ctx).await
         .with_context(|| format!("pulling engines for env '{env}'"))?;
     let (n_engine_fields, c_engine_fields) = engine_fields::pull(ctx).await
