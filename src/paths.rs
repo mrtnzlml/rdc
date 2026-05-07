@@ -114,6 +114,16 @@ impl Paths {
     pub fn email_templates_dir(&self) -> PathBuf {
         self.env_root().join("email-templates")
     }
+
+    /// `<root>/envs/<env>/mdh/`
+    pub fn mdh_dir(&self) -> PathBuf {
+        self.env_root().join("mdh")
+    }
+
+    /// `<root>/envs/<env>/mdh/<dataset_slug>/`
+    pub fn dataset_dir(&self, dataset_slug: &str) -> PathBuf {
+        self.mdh_dir().join(dataset_slug)
+    }
 }
 
 #[cfg(test)]
@@ -215,5 +225,15 @@ mod tests {
     #[test]
     fn email_templates_dir_path() {
         assert_eq!(p().email_templates_dir(), Path::new("/proj/envs/dev/email-templates"));
+    }
+
+    #[test]
+    fn mdh_dir_path() {
+        assert_eq!(p().mdh_dir(), Path::new("/proj/envs/dev/mdh"));
+    }
+
+    #[test]
+    fn dataset_dir_path() {
+        assert_eq!(p().dataset_dir("vendors"), Path::new("/proj/envs/dev/mdh/vendors"));
     }
 }

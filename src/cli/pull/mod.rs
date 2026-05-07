@@ -11,6 +11,7 @@ mod engine_fields;
 mod engines;
 mod hooks;
 mod labels;
+mod mdh;
 mod organization;
 mod queues;
 mod rules;
@@ -33,7 +34,7 @@ pub async fn run(env: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("env '{env}' is not defined in rdc.toml"))?;
 
     let token = resolve_token(&cwd, env)?;
-    let client = RossumClient::new(env_cfg.api_base.clone(), token)
+    let client = RossumClient::new(env_cfg.api_base.clone(), token.clone())
         .context("constructing Rossum API client")?;
 
     let mut lockfile = Lockfile::load(&paths.lockfile())?;
@@ -61,10 +62,12 @@ pub async fn run(env: &str) -> Result<()> {
         .with_context(|| format!("pulling workflow steps for env '{env}'"))?;
     let n_email_templates = email_templates::pull(&mut ctx).await
         .with_context(|| format!("pulling email templates for env '{env}'"))?;
+    let n_datasets = mdh::pull(&mut ctx, env_cfg, &token).await
+        .with_context(|| format!("pulling MDH datasets for env '{env}'"))?;
 
     lockfile.save(&paths.lockfile())?;
-    println!(
-        "Pulled {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} from env '{env}'",
+    let mut summary = format!(
+        "Pulled {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}",
         common::pluralize(n_orgs, "organization", "organizations"),
         common::pluralize(n_workspaces, "workspace", "workspaces"),
         common::pluralize(qc.queues, "queue", "queues"),
@@ -79,5 +82,10 @@ pub async fn run(env: &str) -> Result<()> {
         common::pluralize(n_workflow_steps, "workflow step", "workflow steps"),
         common::pluralize(n_email_templates, "email template", "email templates"),
     );
+    if env_cfg.data_storage_base.is_some() {
+        summary.push_str(&format!(", {}", common::pluralize(n_datasets, "dataset", "datasets")));
+    }
+    summary.push_str(&format!(" from env '{env}'"));
+    println!("{summary}");
     Ok(())
 }
