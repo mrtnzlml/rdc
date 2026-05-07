@@ -16,7 +16,10 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
                 .with_context(|| format!("creating {}", ctx.paths.labels_dir().display()))?;
             dir_created = true;
         }
-        let slug = slugify_unique(&l.name, &used);
+        let slug = match ctx.lockfile.slug_for_id("labels", l.id) {
+            Some(existing) => existing.to_string(),
+            None => slugify_unique(&l.name, &used),
+        };
         used.insert(slug.clone());
 
         let mut proposed = serde_json::to_vec_pretty(l).context("serializing label")?;

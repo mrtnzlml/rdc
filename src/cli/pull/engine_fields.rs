@@ -20,7 +20,10 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
                 .with_context(|| format!("creating {}", ctx.paths.engine_fields_dir().display()))?;
             dir_created = true;
         }
-        let slug = slugify_unique(&f.name, &used);
+        let slug = match ctx.lockfile.slug_for_id("engine_fields", f.id) {
+            Some(existing) => existing.to_string(),
+            None => slugify_unique(&f.name, &used),
+        };
         used.insert(slug.clone());
 
         let mut proposed = serde_json::to_vec_pretty(f).context("serializing engine field")?;

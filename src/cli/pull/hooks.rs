@@ -18,7 +18,12 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
                 .with_context(|| format!("creating {}", ctx.paths.hooks_dir().display()))?;
             dir_created = true;
         }
-        let slug = slugify_unique(&hook.name, &used_slugs);
+        // Reuse existing slug if this object has been pulled before (by ID),
+        // so remote renames don't create new files / orphan old ones.
+        let slug = match ctx.lockfile.slug_for_id("hooks", hook.id) {
+            Some(existing) => existing.to_string(),
+            None => slugify_unique(&hook.name, &used_slugs),
+        };
         used_slugs.insert(slug.clone());
 
         // Build the JSON body the same way the codec would (without `code`).

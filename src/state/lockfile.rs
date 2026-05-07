@@ -98,6 +98,21 @@ impl Lockfile {
         }
         None
     }
+
+    /// Find the slug of an object by its numeric ID within a kind.
+    /// Returns None if no entry matches.
+    /// Used by pull drivers to keep slugs stable across remote renames:
+    /// once an object has a slug, that slug stays even if the remote
+    /// `name` changes.
+    pub fn slug_for_id(&self, kind: &str, id: u64) -> Option<&str> {
+        let by_kind = self.objects.get(kind)?;
+        for (slug, entry) in by_kind.iter() {
+            if entry.id == id {
+                return Some(slug.as_str());
+            }
+        }
+        None
+    }
 }
 
 /// Compute a stable SHA-256 over canonical JSON bytes. Hex-encoded.
@@ -197,6 +212,19 @@ mod tests {
     #[test]
     fn content_hash_distinguishes_inputs() {
         assert_ne!(content_hash(b"foo"), content_hash(b"bar"));
+    }
+
+    #[test]
+    fn slug_for_id_finds_match() {
+        let mut lf = Lockfile::default();
+        lf.upsert(
+            "hooks",
+            "validator-invoices",
+            ObjectEntry { id: 42, url: None, modified_at: None, content_hash: None },
+        );
+        assert_eq!(lf.slug_for_id("hooks", 42), Some("validator-invoices"));
+        assert_eq!(lf.slug_for_id("hooks", 99), None);
+        assert_eq!(lf.slug_for_id("rules", 42), None);
     }
 
     #[test]

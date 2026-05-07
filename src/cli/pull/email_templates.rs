@@ -16,7 +16,10 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
                 .with_context(|| format!("creating {}", ctx.paths.email_templates_dir().display()))?;
             dir_created = true;
         }
-        let slug = slugify_unique(&t.name, &used);
+        let slug = match ctx.lockfile.slug_for_id("email_templates", t.id) {
+            Some(existing) => existing.to_string(),
+            None => slugify_unique(&t.name, &used),
+        };
         used.insert(slug.clone());
 
         let mut proposed = serde_json::to_vec_pretty(t).context("serializing email template")?;

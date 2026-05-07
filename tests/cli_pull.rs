@@ -525,6 +525,257 @@ async fn pull_skips_mdh_when_data_storage_base_is_absent() {
 }
 
 #[tokio::test]
+async fn re_pull_with_no_changes_is_idempotent() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let empty = serde_json::json!({ "pagination": { "next": null }, "results": [] });
+    for ep in [
+        "/api/v1/hooks", "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty.clone()))
+            .mount(&server)
+            .await;
+    }
+
+    let project = TempDir::new().unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert()
+        .success();
+
+    let lf_path = project.path().join(".rdc/state/dev.lock.json");
+    let first_lf = std::fs::read_to_string(&lf_path).unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("conflict").not());
+
+    let second_lf = std::fs::read_to_string(&lf_path).unwrap();
+    assert_eq!(first_lf, second_lf, "lockfile should be byte-identical after no-op re-pull");
+}
+
+#[tokio::test]
+async fn re_pull_preserves_local_edits_when_remote_unchanged() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("hooks_list.json")))
+        .mount(&server)
+        .await;
+    let empty = serde_json::json!({ "pagination": { "next": null }, "results": [] });
+    for ep in [
+        "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty.clone()))
+            .mount(&server)
+            .await;
+    }
+
+    let project = TempDir::new().unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert()
+        .success();
+
+    let hook_path = project.path().join("envs/dev/hooks/validator-invoices.json");
+    let original = std::fs::read_to_string(&hook_path).unwrap();
+    let edited = original.replace("Validator: invoices", "Validator: invoices (LOCAL EDIT)");
+    std::fs::write(&hook_path, &edited).unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("conflict").not());
+
+    let after = std::fs::read_to_string(&hook_path).unwrap();
+    assert_eq!(after, edited, "local edit must be preserved on re-pull when remote unchanged");
+}
+
+#[tokio::test]
+async fn re_pull_emits_remote_file_on_real_conflict() {
+    // Two MockServers: server1 returns the original payload (used for the
+    // first pull), server2 returns a modified payload (used for the second
+    // pull). Between pulls we rewrite rdc.toml to point at server2.
+    let server1 = MockServer::start().await;
+    let server2 = MockServer::start().await;
+
+    let modified_hooks = serde_json::json!({
+        "pagination": { "total": 2, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 1,
+                "url": "https://mock.rossum.app/api/v1/hooks/1",
+                "name": "Validator: invoices (REMOTE EDIT)",
+                "type": "function",
+                "queues": ["https://mock.rossum.app/api/v1/queues/100"],
+                "events": ["annotation_content"],
+                "config": { "runtime": "python3.12", "code": "def x(payload):\n    return {}\n" }
+            },
+            {
+                "id": 2,
+                "url": "https://mock.rossum.app/api/v1/hooks/2",
+                "name": "SFTP import",
+                "type": "function",
+                "queues": [],
+                "events": ["annotation_status"],
+                "config": { "runtime": "python3.12", "code": "def import_files():\n    pass\n" }
+            }
+        ]
+    });
+
+    let empty = serde_json::json!({ "pagination": { "next": null }, "results": [] });
+
+    // Wire both servers identically except for /hooks.
+    for srv in [&server1, &server2] {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/organizations/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+            .mount(srv)
+            .await;
+        for ep in [
+            "/api/v1/workspaces", "/api/v1/queues",
+            "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+            "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+        ] {
+            Mock::given(method("GET"))
+                .and(path(ep))
+                .respond_with(ResponseTemplate::new(200).set_body_json(empty.clone()))
+                .mount(srv)
+                .await;
+        }
+    }
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("hooks_list.json")))
+        .mount(&server1)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(modified_hooks))
+        .mount(&server2)
+        .await;
+
+    let project = TempDir::new().unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server1.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // First pull against server1.
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert()
+        .success();
+
+    let hook_path = project.path().join("envs/dev/hooks/validator-invoices.json");
+    let original = std::fs::read_to_string(&hook_path).unwrap();
+    let local_edit = original.replace("Validator: invoices", "Validator: invoices (LOCAL EDIT)");
+    std::fs::write(&hook_path, &local_edit).unwrap();
+
+    // Repoint to server2 (which returns the modified hooks).
+    let cfg_path = project.path().join("rdc.toml");
+    let cfg = std::fs::read_to_string(&cfg_path).unwrap();
+    let new_cfg = cfg.replace(&format!("{}/api/v1", server1.uri()), &format!("{}/api/v1", server2.uri()));
+    assert_ne!(cfg, new_cfg, "rdc.toml should change after repoint");
+    std::fs::write(&cfg_path, new_cfg).unwrap();
+
+    let assert = Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert()
+        .success();
+    let out = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    let err = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    let lockfile = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    let actual = std::fs::read_to_string(&hook_path).unwrap();
+    assert!(
+        out.contains("1 conflict"),
+        "expected '1 conflict' in stdout. stdout={out}\nstderr={err}\nhook_local={actual}\nlockfile={lockfile}"
+    );
+
+    let after_local = std::fs::read_to_string(&hook_path).unwrap();
+    assert_eq!(after_local, local_edit, "local must be preserved on conflict");
+
+    let remote_path = project.path().join("envs/dev/hooks/validator-invoices.json.remote");
+    assert!(remote_path.exists(), "<slug>.json.remote should be written on conflict");
+    let remote_content = std::fs::read_to_string(&remote_path).unwrap();
+    assert!(remote_content.contains("REMOTE EDIT"), "remote file should contain remote content");
+}
+
+#[tokio::test]
 async fn pull_with_missing_token_fails_with_helpful_error() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc")

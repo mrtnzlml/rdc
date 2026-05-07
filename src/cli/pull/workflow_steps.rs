@@ -16,7 +16,10 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
                 .with_context(|| format!("creating {}", ctx.paths.workflow_steps_dir().display()))?;
             dir_created = true;
         }
-        let slug = slugify_unique(&s.name, &used);
+        let slug = match ctx.lockfile.slug_for_id("workflow_steps", s.id) {
+            Some(existing) => existing.to_string(),
+            None => slugify_unique(&s.name, &used),
+        };
         used.insert(slug.clone());
 
         let mut proposed = serde_json::to_vec_pretty(s).context("serializing workflow step")?;
