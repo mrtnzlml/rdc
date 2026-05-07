@@ -4,11 +4,11 @@
 disk for AI-assisted local development, lets you edit them in place, and
 deploys them across environments.
 
-**Status:** M18. Pull all kinds; push for hooks, rules, labels, schemas
-(formula bodies round-trip), queues, inboxes, and email templates;
-deploy for hooks, rules, and labels. Distributable via `curl | sh` or
-`cargo install`. See `docs/superpowers/specs/2026-05-06-rdc-design.md`
-for the full design.
+**Status:** M19. Pull all kinds; push and deploy for hooks, rules,
+labels, queues, schemas (formula bodies round-trip), inboxes, and
+email templates. Distributable via `curl | sh` or `cargo install`.
+See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full
+design.
 
 ## Install
 
@@ -235,7 +235,35 @@ rdc apply --from test --to prod        # execute
 rdc pull prod                          # refresh prod snapshot post-apply
 ```
 
-**Deployable kinds:** hooks, rules, labels.
+**Deployable kinds:** hooks, rules, labels, queues, schemas (with
+formula bodies), inboxes, email templates. Same kinds as push, by
+design — if you can push it within an env, you can deploy it across
+envs.
+
+The mapping file uses one section per kind:
+
+```toml
+version = 1
+
+[hooks]
+validator-invoices = "validator-invoices"
+sftp-import = "sftp-import-prod"   # rename across envs
+
+[queues]
+cost-invoices = "cost-invoices"
+
+[schemas]
+cost-invoices = "cost-invoices"
+
+[email_templates]
+"invoices-ap/cost-invoices/default-rejection-template" = "invoices-ap/cost-invoices/default-rejection-template"
+```
+
+For queue-nested kinds (queues, schemas, inboxes), the key is the
+queue's slug. For email templates, the key is the compound
+`<ws-slug>/<q-slug>/<template-slug>`. Auto-match writes 1:1 entries
+wherever both src and tgt have an object with the same key; you
+hand-edit for renames.
 
 **Limitations:**
 - Updates only (no creates / deletes).

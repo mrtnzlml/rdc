@@ -15,6 +15,21 @@ pub struct Mapping {
     pub rules: BTreeMap<String, String>,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// Schema slug (= queue slug) → schema slug.
+    #[serde(default)]
+    pub schemas: BTreeMap<String, String>,
+    /// Queue slug → queue slug.
+    #[serde(default)]
+    pub queues: BTreeMap<String, String>,
+    /// Inbox slug (= queue slug) → inbox slug.
+    #[serde(default)]
+    pub inboxes: BTreeMap<String, String>,
+    /// Email-template compound key `<ws>/<q>/<template>` → compound key.
+    /// The `<ws>` and `<q>` segments may differ between src and tgt envs;
+    /// auto-match in `rdc map` uses the full key, but the file is
+    /// hand-editable for renames.
+    #[serde(default)]
+    pub email_templates: BTreeMap<String, String>,
 }
 
 impl Default for Mapping {
@@ -24,6 +39,10 @@ impl Default for Mapping {
             hooks: BTreeMap::new(),
             rules: BTreeMap::new(),
             labels: BTreeMap::new(),
+            schemas: BTreeMap::new(),
+            queues: BTreeMap::new(),
+            inboxes: BTreeMap::new(),
+            email_templates: BTreeMap::new(),
         }
     }
 }
