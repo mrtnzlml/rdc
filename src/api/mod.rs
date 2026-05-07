@@ -1,5 +1,6 @@
 pub mod data_storage;
 pub mod error;
+pub mod retry;
 
 pub use data_storage::DataStorageClient;
 pub use error::{anyhow_has_status, ApiError};
@@ -53,68 +54,21 @@ impl RossumClient {
         Ok(out)
     }
 
-    pub async fn update_rule(&self, id: u64, rule: &crate::model::Rule) -> Result<crate::model::Rule> {
-        let url = format!("{}/rules/{id}", self.base_url);
-        let resp = self
-            .http
-            .patch(&url)
-            .header("Authorization", format!("token {}", self.token))
-            .json(rule)
-            .send()
-            .await
-            .with_context(|| format!("PATCH {url}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status: status.as_u16(), body }.into());
-        }
-        let value = resp.json::<crate::model::Rule>().await
-            .with_context(|| format!("decoding PATCH response from {url}"))?;
-        Ok(value)
+    pub async fn update_rule(&self, id: u64, rule: &crate::model::Rule)
+        -> Result<crate::model::Rule>
+    {
+        self.patch_json(&format!("/rules/{id}"), rule).await
     }
 
-    pub async fn update_label(&self, id: u64, label: &crate::model::Label) -> Result<crate::model::Label> {
-        let url = format!("{}/labels/{id}", self.base_url);
-        let resp = self
-            .http
-            .patch(&url)
-            .header("Authorization", format!("token {}", self.token))
-            .json(label)
-            .send()
-            .await
-            .with_context(|| format!("PATCH {url}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status: status.as_u16(), body }.into());
-        }
-        let value = resp.json::<crate::model::Label>().await
-            .with_context(|| format!("decoding PATCH response from {url}"))?;
-        Ok(value)
+    pub async fn update_label(&self, id: u64, label: &crate::model::Label)
+        -> Result<crate::model::Label>
+    {
+        self.patch_json(&format!("/labels/{id}"), label).await
     }
 
-    /// PATCH /hooks/{id} with the given hook body. Returns the server's
-    /// authoritative response (including server-set fields like modified_at).
+    /// PATCH /hooks/{id}. Returns the server's authoritative response.
     pub async fn update_hook(&self, id: u64, hook: &Hook) -> Result<Hook> {
-        let url = format!("{}/hooks/{id}", self.base_url);
-        let resp = self
-            .http
-            .patch(&url)
-            .header("Authorization", format!("token {}", self.token))
-            .json(hook)
-            .send()
-            .await
-            .with_context(|| format!("PATCH {url}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status: status.as_u16(), body }.into());
-        }
-        let value = resp
-            .json::<Hook>()
-            .await
-            .with_context(|| format!("decoding PATCH response from {url}"))?;
-        Ok(value)
+        self.patch_json(&format!("/hooks/{id}"), hook).await
     }
 
     pub async fn get_organization(&self, id: u64) -> Result<crate::model::Organization> {
@@ -166,136 +120,41 @@ impl RossumClient {
         self.get_json(&url).await
     }
 
-    /// PATCH /schemas/{id} with the given schema body. Returns the server's
-    /// authoritative response (including server-set fields like modified_at).
-    /// Used by `rdc push` to apply local schema edits (including formula
-    /// changes spliced back via `read_schema`).
     pub async fn update_schema(&self, id: u64, schema: &crate::model::Schema)
         -> Result<crate::model::Schema>
     {
-        let url = format!("{}/schemas/{id}", self.base_url);
-        let resp = self
-            .http
-            .patch(&url)
-            .header("Authorization", format!("token {}", self.token))
-            .json(schema)
-            .send()
-            .await
-            .with_context(|| format!("PATCH {url}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status: status.as_u16(), body }.into());
-        }
-        let value = resp.json::<crate::model::Schema>().await
-            .with_context(|| format!("decoding PATCH response from {url}"))?;
-        Ok(value)
+        self.patch_json(&format!("/schemas/{id}"), schema).await
     }
 
-    /// PATCH /queues/{id}. Used to push queue settings (columns, automation,
-    /// locale, etc.) back to Rossum.
     pub async fn update_queue(&self, id: u64, queue: &crate::model::Queue)
         -> Result<crate::model::Queue>
     {
-        let url = format!("{}/queues/{id}", self.base_url);
-        let resp = self
-            .http
-            .patch(&url)
-            .header("Authorization", format!("token {}", self.token))
-            .json(queue)
-            .send()
-            .await
-            .with_context(|| format!("PATCH {url}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status: status.as_u16(), body }.into());
-        }
-        let value = resp.json::<crate::model::Queue>().await
-            .with_context(|| format!("decoding PATCH response from {url}"))?;
-        Ok(value)
+        self.patch_json(&format!("/queues/{id}"), queue).await
     }
 
-    /// PATCH /inboxes/{id}.
     pub async fn update_inbox(&self, id: u64, inbox: &crate::model::Inbox)
         -> Result<crate::model::Inbox>
     {
-        let url = format!("{}/inboxes/{id}", self.base_url);
-        let resp = self
-            .http
-            .patch(&url)
-            .header("Authorization", format!("token {}", self.token))
-            .json(inbox)
-            .send()
-            .await
-            .with_context(|| format!("PATCH {url}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status: status.as_u16(), body }.into());
-        }
-        let value = resp.json::<crate::model::Inbox>().await
-            .with_context(|| format!("decoding PATCH response from {url}"))?;
-        Ok(value)
+        self.patch_json(&format!("/inboxes/{id}"), inbox).await
     }
 
-    /// PATCH /email_templates/{id}.
-    pub async fn update_email_template(&self, id: u64, template: &crate::model::EmailTemplate)
+    pub async fn update_email_template(&self, id: u64, t: &crate::model::EmailTemplate)
         -> Result<crate::model::EmailTemplate>
     {
-        let url = format!("{}/email_templates/{id}", self.base_url);
-        let resp = self
-            .http
-            .patch(&url)
-            .header("Authorization", format!("token {}", self.token))
-            .json(template)
-            .send()
-            .await
-            .with_context(|| format!("PATCH {url}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status: status.as_u16(), body }.into());
-        }
-        let value = resp.json::<crate::model::EmailTemplate>().await
-            .with_context(|| format!("decoding PATCH response from {url}"))?;
-        Ok(value)
+        self.patch_json(&format!("/email_templates/{id}"), t).await
     }
 
-    /// PATCH /engines/{id}.
     pub async fn update_engine(&self, id: u64, engine: &crate::model::Engine)
         -> Result<crate::model::Engine>
     {
-        let url = format!("{}/engines/{id}", self.base_url);
-        let resp = self.http.patch(&url)
-            .header("Authorization", format!("token {}", self.token))
-            .json(engine).send().await.with_context(|| format!("PATCH {url}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status: status.as_u16(), body }.into());
-        }
-        resp.json::<crate::model::Engine>().await
-            .with_context(|| format!("decoding PATCH response from {url}"))
+        self.patch_json(&format!("/engines/{id}"), engine).await
     }
 
-    /// PATCH /engine_fields/{id}.
     pub async fn update_engine_field(&self, id: u64, field: &crate::model::EngineField)
         -> Result<crate::model::EngineField>
     {
-        let url = format!("{}/engine_fields/{id}", self.base_url);
-        let resp = self.http.patch(&url)
-            .header("Authorization", format!("token {}", self.token))
-            .json(field).send().await.with_context(|| format!("PATCH {url}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status: status.as_u16(), body }.into());
-        }
-        resp.json::<crate::model::EngineField>().await
-            .with_context(|| format!("decoding PATCH response from {url}"))
+        self.patch_json(&format!("/engine_fields/{id}"), field).await
     }
-
 
     pub async fn list_rules(&self) -> Result<Vec<crate::model::Rule>> {
         let mut url = format!("{}/rules", self.base_url);
@@ -396,13 +255,10 @@ impl RossumClient {
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
-        let resp = self
-            .http
-            .get(url)
-            .header("Authorization", format!("token {}", self.token))
-            .send()
-            .await
-            .with_context(|| format!("GET {url}"))?;
+        let resp = retry::send_with_retry(
+            || self.http.get(url).header("Authorization", format!("token {}", self.token)),
+            &format!("GET {url}"),
+        ).await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -418,5 +274,29 @@ impl RossumClient {
             .await
             .with_context(|| format!("decoding response from {url}"))?;
         Ok(value)
+    }
+
+    /// Generic PATCH `<base>/<path>` with `body` as JSON. Used by every
+    /// `update_X` method. Centralises 429 retry/backoff via `retry::send_with_retry`.
+    async fn patch_json<TBody, TResp>(&self, path: &str, body: &TBody) -> Result<TResp>
+    where
+        TBody: serde::Serialize,
+        TResp: serde::de::DeserializeOwned,
+    {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = retry::send_with_retry(
+            || self.http
+                .patch(&url)
+                .header("Authorization", format!("token {}", self.token))
+                .json(body),
+            &format!("PATCH {url}"),
+        ).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ApiError::Status { status: status.as_u16(), body }.into());
+        }
+        resp.json::<TResp>().await
+            .with_context(|| format!("decoding PATCH response from {url}"))
     }
 }

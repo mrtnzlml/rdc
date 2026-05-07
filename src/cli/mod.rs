@@ -3,8 +3,46 @@ use clap::{Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(name = "rdc", version, about = "Rossum Deployment as Code")]
 pub struct Cli {
+    /// Maximum parallel API calls during pull (default 5; also respects
+    /// the `RDC_CONCURRENCY` env var).
+    #[arg(long, global = true, value_name = "N")]
+    pub concurrency: Option<usize>,
+    /// Emit machine-readable JSON output where applicable.
+    /// (Reserved; currently a no-op.)
+    #[arg(long, global = true)]
+    pub json: bool,
+    /// Disable ANSI color in output.
+    /// (Reserved; rdc currently emits plain text.)
+    #[arg(long = "no-color", global = true)]
+    pub no_color: bool,
+    /// Verbose logging.
+    /// (Reserved; currently a no-op.)
+    #[arg(long, global = true)]
+    pub verbose: bool,
+    /// Debug logging.
+    /// (Reserved; currently a no-op.)
+    #[arg(long, global = true)]
+    pub debug: bool,
+    /// Skip interactive confirmations (for CI use).
+    /// (Reserved; rdc currently has no interactive confirmations beyond
+    /// `rdc init`'s wizard, which auto-disables when stdin isn't a TTY.)
+    #[arg(long, global = true)]
+    pub yes: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+/// Resolve the effective concurrency for this invocation.
+///
+/// Priority order: `--concurrency` flag, then `RDC_CONCURRENCY` env var,
+/// then the spec §16 default of 5. Used by the pull driver to bound the
+/// number of in-flight HTTP requests.
+pub fn resolve_concurrency(flag: Option<usize>) -> usize {
+    flag
+        .or_else(|| std::env::var("RDC_CONCURRENCY").ok().and_then(|s| s.parse().ok()))
+        .unwrap_or(5)
+        .max(1)
 }
 
 #[derive(Debug, Subcommand)]
@@ -72,7 +110,10 @@ pub enum Command {
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Some(Command::Init { name, envs }) => crate::cli::init::run(name, envs).await,
-        Some(Command::Pull { env }) => crate::cli::pull::run(&env).await,
+        Some(Command::Pull { env }) => {
+            let concurrency = resolve_concurrency(cli.concurrency);
+            crate::cli::pull::run(&env, concurrency).await
+        }
         Some(Command::Push { env }) => crate::cli::push::run(&env).await,
         Some(Command::Map { src, tgt }) => crate::cli::deploy::map::run(&src, &tgt).await,
         Some(Command::Plan { from, to }) => crate::cli::deploy::plan::run(&from, &to).await,

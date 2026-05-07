@@ -75,14 +75,13 @@ impl DataStorageClient {
         body: Value,
     ) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
-        let resp = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.token))
-            .json(&body)
-            .send()
-            .await
-            .with_context(|| format!("POST {url}"))?;
+        let resp = crate::api::retry::send_with_retry(
+            || self.http
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", self.token))
+                .json(&body),
+            &format!("POST {url}"),
+        ).await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();

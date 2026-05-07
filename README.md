@@ -4,7 +4,7 @@
 disk for AI-assisted local development, lets you edit them in place, and
 deploys them across environments.
 
-**Status:** M29. Pull all kinds (incl. MDH collections + indexes —
+**Status:** M30. Pull all kinds (incl. MDH collections + indexes —
 data storage URL derived from `api_base`, no extra config); push
 and deploy for hooks, rules, labels, queues, schemas (formula
 bodies round-trip), inboxes, email templates, engines, and engine
@@ -13,12 +13,16 @@ pull (spec §9.3). `rdc apply` rewrites cross-reference URLs from
 src to tgt, refuses to PATCH on tgt drift, and skips no-op
 deploys (idempotent). `_index.md` includes per-kind inventory
 plus a cross-references section that resolves `hook → queues`,
-`rule → queues`, `email_template → queue`. `rdc init` accepts
-flags or runs an interactive wizard; `rdc status` for a
-read-only health check; `rdc diff` for unified diffs (local vs
-remote, or two snapshots); `rdc auth` to set/refresh tokens;
-`rdc repair --rebuild-lock` for lockfile recovery. Distributable
-via `curl | sh` or `cargo install`. See
+`rule → queues`, `email_template → queue`. Pull pipelines
+per-queue and per-MDH-collection sub-fetches via a bounded
+`--concurrency` (spec §7.2 / §16, default 5). All HTTP calls
+retry gracefully on `429 Too Many Requests` with `Retry-After` /
+exponential backoff. `rdc init` accepts flags or runs an
+interactive wizard; `rdc status` for a read-only health check;
+`rdc diff` for unified diffs (local vs remote, or two
+snapshots); `rdc auth` to set/refresh tokens; `rdc repair
+--rebuild-lock` for lockfile recovery. Distributable via
+`curl | sh` or `cargo install`. See
 `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full
 design.
 
@@ -407,6 +411,39 @@ hand-edit for renames.
 
 **Limitations:**
 - Updates only (no creates / deletes).
+
+## Global flags
+
+These flags can be passed to any subcommand:
+
+| Flag | Description |
+|------|-------------|
+| `--concurrency N` | Maximum parallel API calls inside `rdc pull`. Default 5 (spec §16). Also reads `RDC_CONCURRENCY`. |
+| `--json` | Reserved for machine-readable output (no-op today). |
+| `--no-color` | Reserved for disabling ANSI color (rdc currently emits plain text). |
+| `--verbose`, `--debug` | Reserved for log level (no-op today). |
+| `--yes` | Skip interactive prompts. Today only `rdc init`'s wizard is interactive, and it auto-disables on non-TTY stdin. |
+
+**Concurrency.** `rdc pull` lists every kind sequentially (one
+`list_*` call per kind), but a queue tree of 25 queues otherwise
+needs 50 sequential round-trips for schema + inbox, and a 10-MDH
+deploy needs 20 sequential round-trips for regular + search
+indexes. With `--concurrency N`, the per-queue and per-collection
+sub-fetches are pipelined `N` at a time. Beyond ~5 the gains
+flatten because the upstream `list_*` calls remain serial.
+
+```sh
+rdc --concurrency 10 pull dev
+RDC_CONCURRENCY=10 rdc pull dev   # equivalent
+```
+
+**429 handling.** Every Rossum and Data Storage HTTP call retries
+on `429 Too Many Requests`: it sleeps for the `Retry-After`
+header if present, otherwise exponential backoff (1s, 2s, 4s, 8s,
+16s — capped at 60s), up to 5 attempts total. A stderr line is
+printed each time so the tool isn't quietly hung. Higher
+concurrency makes 429s more likely on busy clusters; the retry
+keeps pulls succeeding without intervention.
 
 ## Authentication
 

@@ -44,6 +44,10 @@ pub struct PullCtx<'a> {
     /// pre-overlay form so cross-env diffs and deploys are quiet (M26 /
     /// spec §9.3). `None` when the env has no `overlay.toml`.
     pub overlay: Option<crate::overlay::Overlay>,
+    /// Maximum parallel API calls used by drivers that fan out per-object
+    /// fetches (queues, mdh). Default 5 per spec §16; overridable via
+    /// `--concurrency` flag or `RDC_CONCURRENCY` env var.
+    pub concurrency: usize,
 }
 
 /// Compute the content hash of an object's serialized form. The pull drivers

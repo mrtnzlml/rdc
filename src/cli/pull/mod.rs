@@ -21,7 +21,7 @@ mod workspaces;
 
 pub use common::PullCtx;
 
-pub async fn run(env: &str) -> Result<()> {
+pub async fn run(env: &str, concurrency: usize) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let paths = Paths::for_env(&cwd, env);
 
@@ -46,6 +46,7 @@ pub async fn run(env: &str) -> Result<()> {
         lockfile: &mut lockfile,
         queue_locations: std::collections::BTreeMap::new(),
         overlay,
+        concurrency,
     };
 
     // Flat-list kinds (M7 three-way detection):
