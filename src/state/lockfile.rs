@@ -128,6 +128,39 @@ pub fn content_hash(bytes: &[u8]) -> String {
     hex
 }
 
+/// Compute a stable SHA-256 over a schema's combined content: the
+/// post-extraction `schema.json` bytes plus each formula file (path + body).
+/// Formulas must be passed sorted by `field_id` for determinism.
+///
+/// Algorithm matches the documentation on `write_schema` in
+/// `src/snapshot/schema.rs`:
+///
+/// ```text
+/// SHA-256(
+///     json_bytes
+///     || 0x00 || "formulas/<id>.py" || 0x00 || formula_bytes
+///     || ...   (continued for every formula, in field_id order)
+/// )
+/// ```
+pub fn schema_combined_hash(json_bytes: &[u8], formulas: &[(String, Vec<u8>)]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(json_bytes);
+    for (field_id, bytes) in formulas {
+        hasher.update([0u8]);
+        let path = format!("formulas/{field_id}.py");
+        hasher.update(path.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(bytes);
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        write!(&mut hex, "{:02x}", b).expect("writing to String cannot fail");
+    }
+    hex
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +245,48 @@ mod tests {
     #[test]
     fn content_hash_distinguishes_inputs() {
         assert_ne!(content_hash(b"foo"), content_hash(b"bar"));
+    }
+
+    #[test]
+    fn schema_combined_hash_no_formulas() {
+        let h1 = schema_combined_hash(b"{}", &[]);
+        let h2 = schema_combined_hash(b"{}", &[]);
+        assert_eq!(h1, h2);
+        assert_eq!(h1, content_hash(b"{}"));
+    }
+
+    #[test]
+    fn schema_combined_hash_with_formulas_is_deterministic() {
+        let formulas = vec![
+            ("amount_total".to_string(), b"a + b".to_vec()),
+            ("invoice_id".to_string(), b"x".to_vec()),
+        ];
+        let h1 = schema_combined_hash(b"{}", &formulas);
+        let h2 = schema_combined_hash(b"{}", &formulas);
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 64);
+    }
+
+    #[test]
+    fn schema_combined_hash_changes_when_formula_changes() {
+        let json = b"{}";
+        let f1 = vec![("amount_total".to_string(), b"a + b".to_vec())];
+        let f2 = vec![("amount_total".to_string(), b"a + b + c".to_vec())];
+        assert_ne!(
+            schema_combined_hash(json, &f1),
+            schema_combined_hash(json, &f2)
+        );
+    }
+
+    #[test]
+    fn schema_combined_hash_changes_when_field_id_changes() {
+        let json = b"{}";
+        let f1 = vec![("amount_total".to_string(), b"x".to_vec())];
+        let f2 = vec![("amount_due".to_string(), b"x".to_vec())];
+        assert_ne!(
+            schema_combined_hash(json, &f1),
+            schema_combined_hash(json, &f2)
+        );
     }
 
     #[test]

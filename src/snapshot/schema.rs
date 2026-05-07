@@ -76,6 +76,60 @@ pub fn read_schema(queue_dir: &Path) -> Result<Schema> {
     Ok(schema)
 }
 
+/// Serialize a schema to its on-disk byte form WITHOUT writing. Returns the
+/// JSON bytes (post-extraction) and the list of `(field_id, formula_bytes)`
+/// pairs sorted by field_id. Used by the queues driver to compute
+/// `schema_combined_hash` for 3-way merge before deciding whether to write.
+pub fn serialize_schema(schema: &Schema) -> Result<(Vec<u8>, Vec<(String, Vec<u8>)>)> {
+    let mut value = serde_json::to_value(schema)
+        .context("serializing schema to value")?;
+
+    let mut formulas: Vec<(String, String)> = Vec::new();
+    if let Some(content) = value.get_mut("content").and_then(|c| c.as_array_mut()) {
+        for node in content.iter_mut() {
+            extract_formulas(node, &mut formulas);
+        }
+    }
+    formulas.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let bytes = serde_json::to_vec_pretty(&value)
+        .context("serializing schema json")?;
+    let mut bytes = bytes;
+    bytes.push(b'\n');
+
+    let formulas_bytes: Vec<(String, Vec<u8>)> = formulas
+        .into_iter()
+        .map(|(id, code)| (id, code.into_bytes()))
+        .collect();
+
+    Ok((bytes, formulas_bytes))
+}
+
+/// Walk the on-disk `<queue_dir>/formulas/` directory and return
+/// `(field_id, bytes)` pairs sorted by `field_id`. Returns an empty vec if the
+/// directory does not exist. Used to compute the LOCAL combined hash.
+pub fn read_local_formulas(queue_dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+    let formulas_dir = queue_dir.join("formulas");
+    if !formulas_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+    for entry in std::fs::read_dir(&formulas_dir)
+        .with_context(|| format!("reading {}", formulas_dir.display()))?
+    {
+        let entry = entry
+            .with_context(|| format!("listing {}", formulas_dir.display()))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(field_id) = name.strip_suffix(".py") {
+            let bytes = std::fs::read(entry.path())
+                .with_context(|| format!("reading {}", entry.path().display()))?;
+            out.push((field_id.to_string(), bytes));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
 /// Recursively walk a schema content node. For any datapoint with a string
 /// `formula`, remove it and append (id, formula) to `out`. Recurses into
 /// `children` arrays.
@@ -214,6 +268,52 @@ mod tests {
         write_schema(&dir.path().join("q2"), &schema).unwrap();
         assert!(dir.path().join("q2/schema.json").exists());
         assert!(!dir.path().join("q2/formulas").exists(), "formulas dir should not be created when no formulas exist");
+    }
+
+    #[test]
+    fn serialize_schema_returns_json_and_formulas() {
+        let s = sample_with_formula();
+        let (json_bytes, formulas) = serialize_schema(&s).unwrap();
+        let json_str = std::str::from_utf8(&json_bytes).unwrap();
+        assert!(!json_str.contains("amount_due + amount_tax"));
+        assert_eq!(formulas.len(), 1);
+        assert_eq!(formulas[0].0, "amount_total");
+        assert_eq!(formulas[0].1, b"amount_due + amount_tax".to_vec());
+    }
+
+    #[test]
+    fn serialize_schema_returns_empty_formulas_when_none() {
+        let v = json!({
+            "id": 1,
+            "url": "https://x/api/v1/schemas/1",
+            "name": "S",
+            "queues": [],
+            "content": [{ "category": "datapoint", "id": "f", "type": "string" }]
+        });
+        let s: Schema = serde_json::from_value(v).unwrap();
+        let (_, formulas) = serialize_schema(&s).unwrap();
+        assert!(formulas.is_empty());
+    }
+
+    #[test]
+    fn read_local_formulas_returns_empty_when_dir_missing() {
+        let dir = TempDir::new().unwrap();
+        let res = read_local_formulas(dir.path()).unwrap();
+        assert!(res.is_empty());
+    }
+
+    #[test]
+    fn read_local_formulas_returns_sorted_by_field_id() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("formulas")).unwrap();
+        std::fs::write(dir.path().join("formulas/zeta.py"), b"z").unwrap();
+        std::fs::write(dir.path().join("formulas/alpha.py"), b"a").unwrap();
+        std::fs::write(dir.path().join("formulas/mid.py"), b"m").unwrap();
+        let f = read_local_formulas(dir.path()).unwrap();
+        assert_eq!(f.len(), 3);
+        assert_eq!(f[0].0, "alpha");
+        assert_eq!(f[1].0, "mid");
+        assert_eq!(f[2].0, "zeta");
     }
 
     #[test]
