@@ -2,7 +2,7 @@
 
 `rdc` (Rossum Deployment as Code) snapshots Rossum.ai configurations to disk for AI-assisted local development and deploys them across environments.
 
-**Status:** M10. Pull side feature-complete (M7-M9). `rdc push` for hooks (round-trip closed). Other kinds still pull-only — push for queues/schemas/rules/etc. is future work. See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full design.
+**Status:** M11. Pull side feature-complete. `rdc push` for hooks with optional per-env overlays. See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full design.
 
 ## Quick start
 
@@ -63,6 +63,30 @@ authoritative response.
 - Hooks only. Queues, schemas, rules, labels, etc. cannot be pushed yet.
 - Updates only. New objects (creates) and deletes are not supported.
 - Single-phase. No two-phase send for cross-references (not needed for hooks).
+
+## Overlays (M11 — push side, hooks only)
+
+`envs/<env>/overlay.toml` declares values that should always be set when
+pushing to that env, regardless of the canonical snapshot. Useful for
+per-env names, secrets, URLs.
+
+```toml
+version = 1
+
+[hooks.validator-invoices]
+"name" = "Validator (PROD)"
+"config.runtime" = "python3.12-secure"
+```
+
+On `rdc push`, the overlay's dotted-path keys are merged into the outbound
+PATCH body, overwriting any value at that path. The overlay is the source
+of truth for declared keys; manual edits to those keys in the snapshot are
+overwritten by the overlay on push.
+
+**M11 limitations:**
+- Hooks only (matches push scope).
+- Push-side only — pull does not strip overlay-managed values yet.
+- Simple dotted paths only; no JMESPath wildcards or array filters.
 
 ## Tests
 
