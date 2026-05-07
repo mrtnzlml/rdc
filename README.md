@@ -2,7 +2,7 @@
 
 `rdc` (Rossum Deployment as Code) snapshots Rossum.ai configurations to disk for AI-assisted local development and deploys them across environments.
 
-**Status:** M9. Pull side feature-complete with three-way conflict detection across all kinds (M7, M8, M9), per-env `_index.md` generation, and formula-aware schema hashes. See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full design.
+**Status:** M10. Pull side feature-complete (M7-M9). `rdc push` for hooks (round-trip closed). Other kinds still pull-only — push for queues/schemas/rules/etc. is future work. See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full design.
 
 ## Quick start
 
@@ -45,6 +45,24 @@ indexes.
 
 `rdc pull` also generates `envs/<env>/_index.md` listing the per-kind
 inventory. The index is regenerated on every pull; do not edit it by hand.
+
+## Push (M10 — hooks only)
+
+`rdc push <env>` PATCHes locally-edited hooks back to the Rossum API. Each
+hook is checked against the lockfile's content_hash:
+
+- No local edits → skipped silently.
+- Local edits AND remote unchanged since last pull → PATCH succeeds.
+- Local edits AND remote drifted → push aborted for that hook with a warning.
+  Run `rdc pull` to fetch the remote, resolve, then push again.
+
+After a successful push, the lockfile is updated with the server's
+authoritative response.
+
+**M10 limitations:**
+- Hooks only. Queues, schemas, rules, labels, etc. cannot be pushed yet.
+- Updates only. New objects (creates) and deletes are not supported.
+- Single-phase. No two-phase send for cross-references (not needed for hooks).
 
 ## Tests
 
