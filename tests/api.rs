@@ -158,6 +158,22 @@ async fn list_engine_fields_returns_fields() {
 }
 
 #[tokio::test]
+async fn update_hook_patches_and_returns_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/hooks/1"))
+        .and(header("Authorization", "token TEST_TOKEN"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("hook_1.json")))
+        .mount(&server).await;
+
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let hook: rdc::model::Hook = serde_json::from_value(fixture("hook_1.json")).unwrap();
+    let updated = client.update_hook(1, &hook).await.unwrap();
+    assert_eq!(updated.id, 1);
+    assert_eq!(updated.name, "Validator: invoices");
+}
+
+#[tokio::test]
 async fn list_workflows_returns_workflows() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
