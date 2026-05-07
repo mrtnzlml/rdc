@@ -1,16 +1,17 @@
 use crate::api::{anyhow_has_status, RossumClient};
+use crate::cli::deploy::common::{payload_matches_remote, rewrite_urls, tgt_in_sync};
+use crate::cli::pull::common::maybe_strip_overlay;
 use crate::config::ProjectConfig;
 use crate::mapping::Mapping;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
 use crate::secrets::resolve_token;
 use crate::snapshot::email_template::read_email_template;
-use crate::snapshot::hook::read_hook;
-use crate::snapshot::inbox::read_inbox;
-use crate::snapshot::queue::read_queue;
-use crate::snapshot::schema::read_schema;
+use crate::snapshot::hook::read_hook_value;
+use crate::snapshot::schema::read_schema_value;
 use crate::state::Lockfile;
 use anyhow::{anyhow, Context, Result};
+use serde_json::Value;
 use std::path::PathBuf;
 
 pub async fn run(src: &str, tgt: &str) -> Result<()> {
@@ -28,42 +29,63 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         .context("constructing tgt API client")?;
 
     let mapping = Mapping::load(&src_paths.mapping_file(src, tgt))?;
+    let src_lockfile = Lockfile::load(&src_paths.lockfile())
+        .with_context(|| format!("loading src lockfile from {}", src_paths.lockfile().display()))?;
     let tgt_lockfile = Lockfile::load(&tgt_paths.lockfile())?;
     let tgt_overlay = Overlay::load(&tgt_paths.overlay_file())
         .with_context(|| format!("loading tgt overlay from {}", tgt_paths.overlay_file().display()))?;
 
-    let mut applied_hooks = 0usize;
-    let mut applied_rules = 0usize;
-    let mut applied_labels = 0usize;
-    let mut applied_queues = 0usize;
-    let mut applied_schemas = 0usize;
-    let mut applied_inboxes = 0usize;
-    let mut applied_email_templates = 0usize;
-    let mut applied_engines = 0usize;
-    let mut applied_engine_fields = 0usize;
+    let mut applied = ApplyCounts::default();
     let mut skipped = 0usize;
 
-    // Hooks (M12)
+    // Hooks ------------------------------------------------------------
     for (src_slug, tgt_slug) in &mapping.hooks {
         let Some(tgt_id) = lookup_tgt_id(&tgt_lockfile, "hooks", tgt_slug, &mut skipped) else { continue };
-        let src_hook = match read_hook(&src_paths.hooks_dir(), src_slug) {
-            Ok(h) => h,
+        let mut payload = match read_hook_value(&src_paths.hooks_dir(), src_slug) {
+            Ok(v) => v,
             Err(e) => { eprintln!("warning: cannot read src hooks/{src_slug}: {e:#}"); skipped += 1; continue; }
         };
-        let mut payload = serde_json::to_value(&src_hook).context("serializing src hook")?;
-        if let Some(ov) = &tgt_overlay {
-            if let Some(overrides) = ov.hook(tgt_slug) {
-                apply_overrides(&mut payload, overrides);
-            }
+        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping);
+        let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.hook(tgt_slug));
+        if let Some(p) = overlay_paths {
+            apply_overrides(&mut payload, p);
         }
-        let payload_hook: crate::model::Hook = serde_json::from_value(payload)
-            .with_context(|| format!("re-deserializing overlay-applied hook for tgt slug '{tgt_slug}'"))?;
+        let payload_hook: crate::model::Hook = match serde_json::from_value(payload.clone()) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("warning: hooks/{src_slug} → {tgt_slug}: payload not a valid Hook ({e:#}); skipping. Did you forget to set tgt overlay for required fields?");
+                skipped += 1;
+                continue;
+            }
+        };
+        let (payload_json_full, payload_code) = crate::snapshot::hook::serialize_hook(&payload_hook)?;
+        // Drift check.
+        let remote_hook = tgt_client.get_hook(tgt_id).await
+            .with_context(|| format!("fetching tgt hook {tgt_id} for drift check"))?;
+        let (remote_json_full, remote_code) = crate::snapshot::hook::serialize_hook(&remote_hook)?;
+        let in_sync = {
+            let stripped = maybe_strip_overlay(remote_json_full.clone(), overlay_paths)?;
+            let h = crate::state::hook_combined_hash(&stripped, &remote_code);
+            let base = tgt_lockfile.objects.get("hooks").and_then(|m| m.get(tgt_slug)).and_then(|e| e.content_hash.as_deref());
+            base.map(|b| b == h).unwrap_or(true)
+        };
+        if !in_sync {
+            eprintln!("warning: tgt hooks/{tgt_slug} has drifted from tgt lockfile (run `rdc pull {tgt}` first); skipping");
+            skipped += 1;
+            continue;
+        }
+        // Idempotency.
+        if payload_json_full == remote_json_full && payload_code == remote_code {
+            continue;
+        }
+        // PATCH.
         tgt_client.update_hook(tgt_id, &payload_hook).await
             .with_context(|| format!("PATCH tgt hooks/{tgt_id} (mapped from src '{src_slug}')"))?;
-        applied_hooks += 1;
+        applied.hooks += 1;
     }
 
-    // Rules (M13)
+    // Rules ------------------------------------------------------------
+    let mut remote_rules_cache: Option<Vec<crate::model::Rule>> = None;
     for (src_slug, tgt_slug) in &mapping.rules {
         let Some(tgt_id) = lookup_tgt_id(&tgt_lockfile, "rules", tgt_slug, &mut skipped) else { continue };
         let path = src_paths.rules_dir().join(format!("{src_slug}.json"));
@@ -71,22 +93,47 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             Ok(r) => r,
             Err(e) => { eprintln!("warning: cannot read src rules/{src_slug}: {e:#}"); skipped += 1; continue; }
         };
-        let src_rule: crate::model::Rule = serde_json::from_str(&raw)
-            .with_context(|| format!("parsing {}", path.display()))?;
-        let mut payload = serde_json::to_value(&src_rule).context("serializing src rule")?;
-        if let Some(ov) = &tgt_overlay {
-            if let Some(overrides) = ov.rule(tgt_slug) {
-                apply_overrides(&mut payload, overrides);
-            }
+        let mut payload: Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => { eprintln!("warning: parsing rules/{src_slug}: {e:#}"); skipped += 1; continue; }
+        };
+        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping);
+        let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.rule(tgt_slug));
+        if let Some(p) = overlay_paths {
+            apply_overrides(&mut payload, p);
         }
-        let payload_rule: crate::model::Rule = serde_json::from_value(payload)
-            .with_context(|| format!("re-deserializing overlay-applied rule for tgt slug '{tgt_slug}'"))?;
+        let payload_rule: crate::model::Rule = match serde_json::from_value(payload) {
+            Ok(v) => v,
+            Err(e) => { eprintln!("warning: rules/{src_slug} → {tgt_slug}: payload not a valid Rule ({e:#}); skipping"); skipped += 1; continue; }
+        };
+        let mut payload_bytes = serde_json::to_vec_pretty(&payload_rule).context("serializing payload rule")?;
+        payload_bytes.push(b'\n');
+        if remote_rules_cache.is_none() {
+            remote_rules_cache = Some(tgt_client.list_rules().await.context("listing tgt rules for drift check")?);
+        }
+        let cache = remote_rules_cache.as_ref().unwrap();
+        let Some(remote) = cache.iter().find(|r| r.id == tgt_id) else {
+            eprintln!("warning: rule id {tgt_id} not found on tgt remote; skipping");
+            skipped += 1;
+            continue;
+        };
+        let mut remote_bytes = serde_json::to_vec_pretty(remote).context("serializing remote rule")?;
+        remote_bytes.push(b'\n');
+        if !tgt_in_sync(remote_bytes.clone(), overlay_paths, &tgt_lockfile, "rules", tgt_slug)? {
+            eprintln!("warning: tgt rules/{tgt_slug} has drifted from tgt lockfile (run `rdc pull {tgt}` first); skipping");
+            skipped += 1;
+            continue;
+        }
+        if payload_matches_remote(&payload_bytes, &remote_bytes) {
+            continue;
+        }
         tgt_client.update_rule(tgt_id, &payload_rule).await
             .with_context(|| format!("PATCH tgt rules/{tgt_id}"))?;
-        applied_rules += 1;
+        applied.rules += 1;
     }
 
-    // Labels (M13)
+    // Labels -----------------------------------------------------------
+    let mut remote_labels_cache: Option<Vec<crate::model::Label>> = None;
     for (src_slug, tgt_slug) in &mapping.labels {
         let Some(tgt_id) = lookup_tgt_id(&tgt_lockfile, "labels", tgt_slug, &mut skipped) else { continue };
         let path = src_paths.labels_dir().join(format!("{src_slug}.json"));
@@ -94,22 +141,47 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             Ok(r) => r,
             Err(e) => { eprintln!("warning: cannot read src labels/{src_slug}: {e:#}"); skipped += 1; continue; }
         };
-        let src_label: crate::model::Label = serde_json::from_str(&raw)
-            .with_context(|| format!("parsing {}", path.display()))?;
-        let mut payload = serde_json::to_value(&src_label).context("serializing src label")?;
-        if let Some(ov) = &tgt_overlay {
-            if let Some(overrides) = ov.label(tgt_slug) {
-                apply_overrides(&mut payload, overrides);
-            }
+        let mut payload: Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => { eprintln!("warning: parsing labels/{src_slug}: {e:#}"); skipped += 1; continue; }
+        };
+        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping);
+        let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.label(tgt_slug));
+        if let Some(p) = overlay_paths {
+            apply_overrides(&mut payload, p);
         }
-        let payload_label: crate::model::Label = serde_json::from_value(payload)
-            .with_context(|| format!("re-deserializing overlay-applied label for tgt slug '{tgt_slug}'"))?;
+        let payload_label: crate::model::Label = match serde_json::from_value(payload) {
+            Ok(v) => v,
+            Err(e) => { eprintln!("warning: labels/{src_slug} → {tgt_slug}: payload not a valid Label ({e:#}); skipping"); skipped += 1; continue; }
+        };
+        let mut payload_bytes = serde_json::to_vec_pretty(&payload_label).context("serializing payload label")?;
+        payload_bytes.push(b'\n');
+        if remote_labels_cache.is_none() {
+            remote_labels_cache = Some(tgt_client.list_labels().await.context("listing tgt labels for drift check")?);
+        }
+        let cache = remote_labels_cache.as_ref().unwrap();
+        let Some(remote) = cache.iter().find(|l| l.id == tgt_id) else {
+            eprintln!("warning: label id {tgt_id} not found on tgt remote; skipping");
+            skipped += 1;
+            continue;
+        };
+        let mut remote_bytes = serde_json::to_vec_pretty(remote).context("serializing remote label")?;
+        remote_bytes.push(b'\n');
+        if !tgt_in_sync(remote_bytes.clone(), overlay_paths, &tgt_lockfile, "labels", tgt_slug)? {
+            eprintln!("warning: tgt labels/{tgt_slug} has drifted from tgt lockfile (run `rdc pull {tgt}` first); skipping");
+            skipped += 1;
+            continue;
+        }
+        if payload_matches_remote(&payload_bytes, &remote_bytes) {
+            continue;
+        }
         tgt_client.update_label(tgt_id, &payload_label).await
             .with_context(|| format!("PATCH tgt labels/{tgt_id}"))?;
-        applied_labels += 1;
+        applied.labels += 1;
     }
 
-    // Queues (M19)
+    // Queues -----------------------------------------------------------
+    let mut remote_queues_cache: Option<Vec<crate::model::Queue>> = None;
     for (src_slug, tgt_slug) in &mapping.queues {
         let Some(tgt_id) = lookup_tgt_id(&tgt_lockfile, "queues", tgt_slug, &mut skipped) else { continue };
         let Some(src_queue_dir) = locate_queue_dir(&src_paths, src_slug) else {
@@ -117,24 +189,51 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             skipped += 1;
             continue;
         };
-        let src_queue = match read_queue(&src_queue_dir) {
-            Ok(q) => q,
+        let queue_path = src_queue_dir.join("queue.json");
+        let raw = match std::fs::read_to_string(&queue_path) {
+            Ok(r) => r,
             Err(e) => { eprintln!("warning: cannot read src queues/{src_slug}: {e:#}"); skipped += 1; continue; }
         };
-        let mut payload = serde_json::to_value(&src_queue).context("serializing src queue")?;
-        if let Some(ov) = &tgt_overlay {
-            if let Some(overrides) = ov.queue(tgt_slug) {
-                apply_overrides(&mut payload, overrides);
-            }
+        let mut payload: Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => { eprintln!("warning: parsing queue '{src_slug}': {e:#}"); skipped += 1; continue; }
+        };
+        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping);
+        let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.queue(tgt_slug));
+        if let Some(p) = overlay_paths {
+            apply_overrides(&mut payload, p);
         }
-        let payload_queue: crate::model::Queue = serde_json::from_value(payload)
-            .with_context(|| format!("re-deserializing overlay-applied queue for tgt slug '{tgt_slug}'"))?;
+        let payload_queue: crate::model::Queue = match serde_json::from_value(payload) {
+            Ok(v) => v,
+            Err(e) => { eprintln!("warning: queues/{src_slug} → {tgt_slug}: payload not a valid Queue ({e:#}); skipping"); skipped += 1; continue; }
+        };
+        let mut payload_bytes = serde_json::to_vec_pretty(&payload_queue).context("serializing payload queue")?;
+        payload_bytes.push(b'\n');
+        if remote_queues_cache.is_none() {
+            remote_queues_cache = Some(tgt_client.list_queues().await.context("listing tgt queues for drift check")?);
+        }
+        let cache = remote_queues_cache.as_ref().unwrap();
+        let Some(remote) = cache.iter().find(|q| q.id == tgt_id) else {
+            eprintln!("warning: queue id {tgt_id} not found on tgt remote; skipping");
+            skipped += 1;
+            continue;
+        };
+        let mut remote_bytes = serde_json::to_vec_pretty(remote).context("serializing remote queue")?;
+        remote_bytes.push(b'\n');
+        if !tgt_in_sync(remote_bytes.clone(), overlay_paths, &tgt_lockfile, "queues", tgt_slug)? {
+            eprintln!("warning: tgt queues/{tgt_slug} has drifted from tgt lockfile (run `rdc pull {tgt}` first); skipping");
+            skipped += 1;
+            continue;
+        }
+        if payload_matches_remote(&payload_bytes, &remote_bytes) {
+            continue;
+        }
         tgt_client.update_queue(tgt_id, &payload_queue).await
             .with_context(|| format!("PATCH tgt queues/{tgt_id}"))?;
-        applied_queues += 1;
+        applied.queues += 1;
     }
 
-    // Schemas (M19) — read with formula splice.
+    // Schemas ----------------------------------------------------------
     for (src_slug, tgt_slug) in &mapping.schemas {
         let Some(tgt_id) = lookup_tgt_id(&tgt_lockfile, "schemas", tgt_slug, &mut skipped) else { continue };
         let Some(src_queue_dir) = locate_queue_dir(&src_paths, src_slug) else {
@@ -142,24 +241,45 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             skipped += 1;
             continue;
         };
-        let src_schema = match read_schema(&src_queue_dir) {
-            Ok(s) => s,
+        let mut payload = match read_schema_value(&src_queue_dir) {
+            Ok(v) => v,
             Err(e) => { eprintln!("warning: cannot read src schema for queue '{src_slug}': {e:#}"); skipped += 1; continue; }
         };
-        let mut payload = serde_json::to_value(&src_schema).context("serializing src schema")?;
-        if let Some(ov) = &tgt_overlay {
-            if let Some(overrides) = ov.schema(tgt_slug) {
-                apply_overrides(&mut payload, overrides);
-            }
+        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping);
+        let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.schema(tgt_slug));
+        if let Some(p) = overlay_paths {
+            apply_overrides(&mut payload, p);
         }
-        let payload_schema: crate::model::Schema = serde_json::from_value(payload)
-            .with_context(|| format!("re-deserializing overlay-applied schema for tgt slug '{tgt_slug}'"))?;
+        let payload_schema: crate::model::Schema = match serde_json::from_value(payload) {
+            Ok(s) => s,
+            Err(e) => { eprintln!("warning: schemas/{src_slug} → {tgt_slug}: payload not a valid Schema ({e:#}); skipping"); skipped += 1; continue; }
+        };
+        let (payload_json_full, payload_formulas) =
+            crate::snapshot::schema::serialize_schema(&payload_schema)?;
+        let remote_schema = tgt_client.get_schema(tgt_id).await
+            .with_context(|| format!("fetching tgt schema {tgt_id} for drift check"))?;
+        let (remote_json_full, remote_formulas) =
+            crate::snapshot::schema::serialize_schema(&remote_schema)?;
+        let in_sync = {
+            let stripped = maybe_strip_overlay(remote_json_full.clone(), overlay_paths)?;
+            let h = crate::state::schema_combined_hash(&stripped, &remote_formulas);
+            let base = tgt_lockfile.objects.get("schemas").and_then(|m| m.get(tgt_slug)).and_then(|e| e.content_hash.as_deref());
+            base.map(|b| b == h).unwrap_or(true)
+        };
+        if !in_sync {
+            eprintln!("warning: tgt schemas/{tgt_slug} has drifted from tgt lockfile (run `rdc pull {tgt}` first); skipping");
+            skipped += 1;
+            continue;
+        }
+        if payload_json_full == remote_json_full && payload_formulas == remote_formulas {
+            continue;
+        }
         tgt_client.update_schema(tgt_id, &payload_schema).await
             .with_context(|| format!("PATCH tgt schemas/{tgt_id}"))?;
-        applied_schemas += 1;
+        applied.schemas += 1;
     }
 
-    // Inboxes (M19)
+    // Inboxes ----------------------------------------------------------
     for (src_slug, tgt_slug) in &mapping.inboxes {
         let Some(tgt_id) = lookup_tgt_id(&tgt_lockfile, "inboxes", tgt_slug, &mut skipped) else { continue };
         let Some(src_queue_dir) = locate_queue_dir(&src_paths, src_slug) else {
@@ -167,24 +287,45 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             skipped += 1;
             continue;
         };
-        let src_inbox = match read_inbox(&src_queue_dir) {
-            Ok(i) => i,
+        let inbox_path = src_queue_dir.join("inbox.json");
+        let raw = match std::fs::read_to_string(&inbox_path) {
+            Ok(r) => r,
             Err(e) => { eprintln!("warning: cannot read src inbox for queue '{src_slug}': {e:#}"); skipped += 1; continue; }
         };
-        let mut payload = serde_json::to_value(&src_inbox).context("serializing src inbox")?;
-        if let Some(ov) = &tgt_overlay {
-            if let Some(overrides) = ov.inbox(tgt_slug) {
-                apply_overrides(&mut payload, overrides);
-            }
+        let mut payload: Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => { eprintln!("warning: parsing inbox for queue '{src_slug}': {e:#}"); skipped += 1; continue; }
+        };
+        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping);
+        let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.inbox(tgt_slug));
+        if let Some(p) = overlay_paths {
+            apply_overrides(&mut payload, p);
         }
-        let payload_inbox: crate::model::Inbox = serde_json::from_value(payload)
-            .with_context(|| format!("re-deserializing overlay-applied inbox for tgt slug '{tgt_slug}'"))?;
+        let payload_inbox: crate::model::Inbox = match serde_json::from_value(payload) {
+            Ok(i) => i,
+            Err(e) => { eprintln!("warning: inboxes/{src_slug} → {tgt_slug}: payload not a valid Inbox ({e:#}); skipping"); skipped += 1; continue; }
+        };
+        let mut payload_bytes = serde_json::to_vec_pretty(&payload_inbox).context("serializing payload inbox")?;
+        payload_bytes.push(b'\n');
+        let remote_inbox = tgt_client.get_inbox(tgt_id).await
+            .with_context(|| format!("fetching tgt inbox {tgt_id} for drift check"))?;
+        let mut remote_bytes = serde_json::to_vec_pretty(&remote_inbox).context("serializing remote inbox")?;
+        remote_bytes.push(b'\n');
+        if !tgt_in_sync(remote_bytes.clone(), overlay_paths, &tgt_lockfile, "inboxes", tgt_slug)? {
+            eprintln!("warning: tgt inboxes/{tgt_slug} has drifted from tgt lockfile (run `rdc pull {tgt}` first); skipping");
+            skipped += 1;
+            continue;
+        }
+        if payload_matches_remote(&payload_bytes, &remote_bytes) {
+            continue;
+        }
         tgt_client.update_inbox(tgt_id, &payload_inbox).await
             .with_context(|| format!("PATCH tgt inboxes/{tgt_id}"))?;
-        applied_inboxes += 1;
+        applied.inboxes += 1;
     }
 
-    // Email templates (M19)
+    // Email templates --------------------------------------------------
+    let mut remote_template_cache: Option<Vec<crate::model::EmailTemplate>> = None;
     for (src_key, tgt_key) in &mapping.email_templates {
         let Some(tgt_id) = lookup_tgt_id(&tgt_lockfile, "email_templates", tgt_key, &mut skipped) else { continue };
         let Some((ws, q, t)) = split_template_key(src_key) else {
@@ -197,20 +338,44 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             Ok(t) => t,
             Err(e) => { eprintln!("warning: cannot read src email_template '{src_key}': {e:#}"); skipped += 1; continue; }
         };
-        let mut payload = serde_json::to_value(&src_template).context("serializing src email template")?;
-        if let Some(ov) = &tgt_overlay {
-            if let Some(overrides) = ov.email_template(tgt_key) {
-                apply_overrides(&mut payload, overrides);
-            }
+        let mut payload = serde_json::to_value(&src_template).context("serializing src email template to value")?;
+        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping);
+        let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.email_template(tgt_key));
+        if let Some(p) = overlay_paths {
+            apply_overrides(&mut payload, p);
         }
-        let payload_template: crate::model::EmailTemplate = serde_json::from_value(payload)
-            .with_context(|| format!("re-deserializing overlay-applied email template for tgt key '{tgt_key}'"))?;
+        let payload_template: crate::model::EmailTemplate = match serde_json::from_value(payload) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("warning: email_templates/{src_key} → {tgt_key}: payload not a valid EmailTemplate ({e:#}); skipping"); skipped += 1; continue; }
+        };
+        let mut payload_bytes = serde_json::to_vec_pretty(&payload_template).context("serializing payload email template")?;
+        payload_bytes.push(b'\n');
+        if remote_template_cache.is_none() {
+            remote_template_cache = Some(tgt_client.list_email_templates().await
+                .context("listing tgt email templates for drift check")?);
+        }
+        let cache = remote_template_cache.as_ref().unwrap();
+        let Some(remote_template) = cache.iter().find(|t| t.id == tgt_id) else {
+            eprintln!("warning: email_template id {tgt_id} not found on tgt remote; skipping");
+            skipped += 1;
+            continue;
+        };
+        let mut remote_bytes = serde_json::to_vec_pretty(remote_template).context("serializing remote email template")?;
+        remote_bytes.push(b'\n');
+        if !tgt_in_sync(remote_bytes.clone(), overlay_paths, &tgt_lockfile, "email_templates", tgt_key)? {
+            eprintln!("warning: tgt email_templates/{tgt_key} has drifted from tgt lockfile (run `rdc pull {tgt}` first); skipping");
+            skipped += 1;
+            continue;
+        }
+        if payload_matches_remote(&payload_bytes, &remote_bytes) {
+            continue;
+        }
         tgt_client.update_email_template(tgt_id, &payload_template).await
             .with_context(|| format!("PATCH tgt email_templates/{tgt_id}"))?;
-        applied_email_templates += 1;
+        applied.email_templates += 1;
     }
 
-    // Engines (M20)
+    // Engines ----------------------------------------------------------
     for (src_slug, tgt_slug) in &mapping.engines {
         let Some(tgt_id) = lookup_tgt_id(&tgt_lockfile, "engines", tgt_slug, &mut skipped) else { continue };
         let path = src_paths.engines_dir().join(format!("{src_slug}.json"));
@@ -218,24 +383,43 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             Ok(r) => r,
             Err(e) => { eprintln!("warning: cannot read src engines/{src_slug}: {e:#}"); skipped += 1; continue; }
         };
-        let src_engine: crate::model::Engine = serde_json::from_str(&raw)
-            .with_context(|| format!("parsing {}", path.display()))?;
-        let mut payload = serde_json::to_value(&src_engine).context("serializing src engine")?;
-        if let Some(ov) = &tgt_overlay {
-            if let Some(overrides) = ov.engine(tgt_slug) {
-                apply_overrides(&mut payload, overrides);
-            }
+        let mut payload: Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => { eprintln!("warning: parsing engines/{src_slug}: {e:#}"); skipped += 1; continue; }
+        };
+        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping);
+        let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.engine(tgt_slug));
+        if let Some(p) = overlay_paths {
+            apply_overrides(&mut payload, p);
         }
-        let payload_engine: crate::model::Engine = serde_json::from_value(payload)
-            .with_context(|| format!("re-deserializing overlay-applied engine for tgt slug '{tgt_slug}'"))?;
+        let payload_engine: crate::model::Engine = match serde_json::from_value(payload) {
+            Ok(e) => e,
+            Err(e) => { eprintln!("warning: engines/{src_slug} → {tgt_slug}: payload not a valid Engine ({e:#}); skipping"); skipped += 1; continue; }
+        };
+        let mut payload_bytes = serde_json::to_vec_pretty(&payload_engine).context("serializing payload engine")?;
+        payload_bytes.push(b'\n');
+        let remotes = tgt_client.list_engines().await.context("listing tgt engines for drift check")?;
+        let Some(remote) = remotes.iter().find(|e| e.id == tgt_id) else {
+            eprintln!("warning: engine id {tgt_id} not found on tgt remote; skipping");
+            skipped += 1;
+            continue;
+        };
+        let mut remote_bytes = serde_json::to_vec_pretty(remote).context("serializing remote engine")?;
+        remote_bytes.push(b'\n');
+        if !tgt_in_sync(remote_bytes.clone(), overlay_paths, &tgt_lockfile, "engines", tgt_slug)? {
+            eprintln!("warning: tgt engines/{tgt_slug} has drifted from tgt lockfile (run `rdc pull {tgt}` first); skipping");
+            skipped += 1;
+            continue;
+        }
+        if payload_matches_remote(&payload_bytes, &remote_bytes) {
+            continue;
+        }
         match tgt_client.update_engine(tgt_id, &payload_engine).await
             .with_context(|| format!("PATCH tgt engines/{tgt_id}"))
         {
-            Ok(_) => applied_engines += 1,
+            Ok(_) => applied.engines += 1,
             Err(e) if anyhow_has_status(&e, 405) => {
-                eprintln!(
-                    "warning: engines are not writable via PATCH on tgt org/plan (405). Skipping all engine apply."
-                );
+                eprintln!("warning: engines are not writable via PATCH on tgt org/plan (405). Skipping all engine apply.");
                 skipped += 1;
                 break;
             }
@@ -243,7 +427,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         }
     }
 
-    // Engine fields (M20)
+    // Engine fields ----------------------------------------------------
     for (src_slug, tgt_slug) in &mapping.engine_fields {
         let Some(tgt_id) = lookup_tgt_id(&tgt_lockfile, "engine_fields", tgt_slug, &mut skipped) else { continue };
         let path = src_paths.engine_fields_dir().join(format!("{src_slug}.json"));
@@ -251,24 +435,43 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             Ok(r) => r,
             Err(e) => { eprintln!("warning: cannot read src engine-fields/{src_slug}: {e:#}"); skipped += 1; continue; }
         };
-        let src_field: crate::model::EngineField = serde_json::from_str(&raw)
-            .with_context(|| format!("parsing {}", path.display()))?;
-        let mut payload = serde_json::to_value(&src_field).context("serializing src engine field")?;
-        if let Some(ov) = &tgt_overlay {
-            if let Some(overrides) = ov.engine_field(tgt_slug) {
-                apply_overrides(&mut payload, overrides);
-            }
+        let mut payload: Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => { eprintln!("warning: parsing engine-fields/{src_slug}: {e:#}"); skipped += 1; continue; }
+        };
+        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping);
+        let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.engine_field(tgt_slug));
+        if let Some(p) = overlay_paths {
+            apply_overrides(&mut payload, p);
         }
-        let payload_field: crate::model::EngineField = serde_json::from_value(payload)
-            .with_context(|| format!("re-deserializing overlay-applied engine field for tgt slug '{tgt_slug}'"))?;
+        let payload_field: crate::model::EngineField = match serde_json::from_value(payload) {
+            Ok(f) => f,
+            Err(e) => { eprintln!("warning: engine-fields/{src_slug} → {tgt_slug}: payload not a valid EngineField ({e:#}); skipping"); skipped += 1; continue; }
+        };
+        let mut payload_bytes = serde_json::to_vec_pretty(&payload_field).context("serializing payload engine field")?;
+        payload_bytes.push(b'\n');
+        let remotes = tgt_client.list_engine_fields().await.context("listing tgt engine fields for drift check")?;
+        let Some(remote) = remotes.iter().find(|f| f.id == tgt_id) else {
+            eprintln!("warning: engine_field id {tgt_id} not found on tgt remote; skipping");
+            skipped += 1;
+            continue;
+        };
+        let mut remote_bytes = serde_json::to_vec_pretty(remote).context("serializing remote engine field")?;
+        remote_bytes.push(b'\n');
+        if !tgt_in_sync(remote_bytes.clone(), overlay_paths, &tgt_lockfile, "engine_fields", tgt_slug)? {
+            eprintln!("warning: tgt engine-fields/{tgt_slug} has drifted from tgt lockfile (run `rdc pull {tgt}` first); skipping");
+            skipped += 1;
+            continue;
+        }
+        if payload_matches_remote(&payload_bytes, &remote_bytes) {
+            continue;
+        }
         match tgt_client.update_engine_field(tgt_id, &payload_field).await
             .with_context(|| format!("PATCH tgt engine_fields/{tgt_id}"))
         {
-            Ok(_) => applied_engine_fields += 1,
+            Ok(_) => applied.engine_fields += 1,
             Err(e) if anyhow_has_status(&e, 405) => {
-                eprintln!(
-                    "warning: engine fields are not writable via PATCH on tgt org/plan (405). Skipping all engine field apply."
-                );
+                eprintln!("warning: engine fields are not writable via PATCH on tgt org/plan (405). Skipping all engine field apply.");
                 skipped += 1;
                 break;
             }
@@ -276,20 +479,38 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         }
     }
 
-    let total = applied_hooks + applied_rules + applied_labels
-        + applied_queues + applied_schemas + applied_inboxes + applied_email_templates
-        + applied_engines + applied_engine_fields;
+    let total = applied.total();
     let mut summary = format!(
-        "Applied {applied_hooks} hooks, {applied_rules} rules, {applied_labels} labels, \
-{applied_queues} queues, {applied_schemas} schemas, {applied_inboxes} inboxes, \
-{applied_email_templates} email templates, {applied_engines} engines, \
-{applied_engine_fields} engine fields ({total} PATCHes) from {src} to {tgt}"
+        "Applied {} hooks, {} rules, {} labels, {} queues, {} schemas, {} inboxes, \
+{} email templates, {} engines, {} engine fields ({} PATCHes) from {src} to {tgt}",
+        applied.hooks, applied.rules, applied.labels, applied.queues,
+        applied.schemas, applied.inboxes, applied.email_templates,
+        applied.engines, applied.engine_fields, total,
     );
     if skipped > 0 {
         summary.push_str(&format!(", {skipped} skipped"));
     }
     println!("{summary}");
     Ok(())
+}
+
+#[derive(Default)]
+struct ApplyCounts {
+    hooks: usize,
+    rules: usize,
+    labels: usize,
+    queues: usize,
+    schemas: usize,
+    inboxes: usize,
+    email_templates: usize,
+    engines: usize,
+    engine_fields: usize,
+}
+impl ApplyCounts {
+    fn total(&self) -> usize {
+        self.hooks + self.rules + self.labels + self.queues + self.schemas
+            + self.inboxes + self.email_templates + self.engines + self.engine_fields
+    }
 }
 
 fn lookup_tgt_id(

@@ -73,6 +73,25 @@ impl Mapping {
         crate::snapshot::writer::write_atomic(path, s.as_bytes())?;
         Ok(())
     }
+
+    /// Look up the tgt slug for a `(kind, src_slug)` pair. Returns `None`
+    /// if the kind isn't deployable or the pair isn't mapped. Used by
+    /// `rdc apply`'s URL-rewrite step (M29).
+    pub fn lookup_tgt_slug(&self, kind: &str, src_slug: &str) -> Option<&str> {
+        let map = match kind {
+            "hooks" => &self.hooks,
+            "rules" => &self.rules,
+            "labels" => &self.labels,
+            "queues" => &self.queues,
+            "schemas" => &self.schemas,
+            "inboxes" => &self.inboxes,
+            "email_templates" => &self.email_templates,
+            "engines" => &self.engines,
+            "engine_fields" => &self.engine_fields,
+            _ => return None,
+        };
+        map.get(src_slug).map(|s| s.as_str())
+    }
 }
 
 #[cfg(test)]
