@@ -1,3 +1,4 @@
+pub mod email_template;
 pub mod engine;
 pub mod engine_field;
 pub mod hook;
@@ -7,5 +8,7 @@ pub mod organization;
 pub mod queue;
 pub mod rule;
 pub mod schema;
+pub mod workflow;
+pub mod workflow_step;
 pub mod workspace;
 pub mod writer;
