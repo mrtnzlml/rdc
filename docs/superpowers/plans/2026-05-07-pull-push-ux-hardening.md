@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2021 edition, `serde_json` (existing), `sha2` (existing), `similar` (existing), new deps `indicatif = "0.17"` and `anstyle = "1"`.
 
-**Three-phase shipping option:** Each phase is independently mergeable. If desired, ship as M33 (Phase 1: noise), M34 (Phase 2: colors), M35 (Phase 3: progress). Or merge all together — tasks are ordered so each subsequent phase builds on earlier ones cleanly.
+**Three-phase shipping option:** Each phase is independently mergeable. Ship them one at a time or merge all together — tasks are ordered so each subsequent phase builds on earlier ones cleanly.
 
 **Spec:** [`docs/superpowers/specs/2026-05-07-pull-push-progress-bar-design.md`](../specs/2026-05-07-pull-push-progress-bar-design.md)
 
@@ -420,7 +420,7 @@ pub fn hook_combined_hash(json_bytes: &[u8], code: &Option<String>) -> String {
 - [ ] **Step 4: Run all tests to verify pass + no regressions**
 
 Run: `cargo test --lib`
-Expected: PASS — all existing lib tests + new five tests pass. (~250 tests; same count as M32 plus 4-5 new, since unchanged-input fixtures still hash deterministically.)
+Expected: PASS — all existing lib tests + new five tests pass. (~250 tests; 4-5 new, since unchanged-input fixtures still hash deterministically.)
 
 If any existing test fails because a fixture now hashes differently than the test asserted (e.g., a hard-coded hex hash literal in a test that included `modified_at`), update the literal. Most existing tests use either non-JSON bytes (fall-back path) or JSON without noise fields, so they won't be affected.
 
@@ -435,7 +435,7 @@ content_hash, schema_combined_hash, hook_combined_hash now strip noise fields
 (modified_at, modifier) before hashing. Server-managed timestamp churn no
 longer triggers false-positive conflicts on re-pull.
 
-Backward compat: existing M32 lockfiles will see one-time false conflicts on
+Backward compat: existing lockfiles will see one-time false conflicts on
 first re-pull (hash-algorithm change). rdc repair --rebuild-lock clears.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
@@ -752,7 +752,7 @@ EOF
 
 ### Task 6: Integration test — pull twice with modified_at-only change
 
-**Why:** End-to-end verification that the noise-field stack (Tasks 1-5) actually suppresses the conflict that today's M32 build produces.
+**Why:** End-to-end verification that the noise-field stack (Tasks 1-5) actually suppresses spurious conflicts caused by server-managed field churn.
 
 **Files:**
 - Modify: `tests/cli_pull.rs` (append new test)
@@ -857,7 +857,7 @@ If it fails because the fixture wiring is missing other GET endpoints, copy the 
 - [ ] **Step 4: Run the full test suite to verify no regressions**
 
 Run: `cargo test`
-Expected: PASS — all unit + integration tests succeed. Existing M32 test count + ~10 new (5 noise unit + 4 hash unit + 2 PullAction unit + 1 resolver unit + 1 integration).
+Expected: PASS — all unit + integration tests succeed. ~10 new tests (5 noise unit + 4 hash unit + 2 PullAction unit + 1 resolver unit + 1 integration).
 
 - [ ] **Step 5: Commit**
 
@@ -877,7 +877,7 @@ EOF
 
 ---
 
-**Phase 1 checkpoint.** At this point noise-field suppression is fully shippable. Six commits. ~10 new tests. Optional: tag this as M33 if shipping in milestones, then continue.
+**Phase 1 checkpoint.** At this point noise-field suppression is fully shippable. Six commits. ~10 new tests. Continue with Phase 2 or merge as a standalone improvement.
 
 ---
 
@@ -1325,7 +1325,7 @@ EOF
 
 ---
 
-**Phase 2 checkpoint.** Conflict resolver coloring shippable. Three commits. ~12 new tests. Optional: tag as M34.
+**Phase 2 checkpoint.** Conflict resolver coloring shippable. Three commits. ~12 new tests. Continue with Phase 3 or merge as a standalone improvement.
 
 ---
 
@@ -2237,7 +2237,7 @@ EOF
 
 - [ ] **Step 1: Inspect the current `run_drivers` and `run` functions**
 
-Open `src/cli/pull/mod.rs`. Note the existing `PullStats` struct (referenced in M32 memory) and the final `println!("{summary}")` at line 133.
+Open `src/cli/pull/mod.rs`. Note the existing `PullStats` struct and the final `println!("{summary}")` at line 133.
 
 - [ ] **Step 2: Add orphan totals to `PullStats` and the summary line**
 
@@ -2957,7 +2957,7 @@ Expected: PASS for all three.
 - [ ] **Step 5: Run the full test suite**
 
 Run: `cargo test`
-Expected: PASS — full suite green. Final test count is roughly: M32's 249 + ~25 new (5 noise + 4 hash + 2 PullAction + 1 resolver-noise + 7 colorize/prompt + 3 progress format + 3 integration).
+Expected: PASS — full suite green. Final new-test count is roughly ~25 (5 noise + 4 hash + 2 PullAction + 1 resolver-noise + 7 colorize/prompt + 3 progress format + 3 integration).
 
 - [ ] **Step 6: Commit**
 
@@ -2985,12 +2985,12 @@ EOF
 **Files:**
 - Modify: `README.md`
 
-- [ ] **Step 1: Add an "Upgrading from M32" section**
+- [ ] **Step 1: Add an "Upgrading older lockfiles" section**
 
 Insert near the top of the README, after the install / quick-start section:
 
 ```markdown
-## Upgrading from M32
+## Upgrading older lockfiles
 
 This release changes how `content_hash` is computed: server-managed fields
 (`modified_at`, `modifier`) are now stripped before hashing. The first
@@ -3001,8 +3001,8 @@ To clear the storm without resolving each conflict by hand:
 
     rdc repair --rebuild-lock <env>
 
-Subsequent pulls will be clean. Real edits between M32 and this release
-remain visible — `repair` only re-baselines the hash; it does not discard
+Subsequent pulls will be clean. Real edits made before upgrading remain
+visible — `repair` only re-baselines the hash; it does not discard
 local edits.
 ```
 
@@ -3023,9 +3023,9 @@ hunk markers are cyan, and action letters (`[k]/[r]/[e]/[s]/[a]`) are
 bold cyan. To force plain output, set `NO_COLOR=1` or pass `--no-color`.
 ```
 
-- [ ] **Step 4: Update the Status line at the top**
+- [ ] **Step 4: Update the tagline at the top**
 
-If the README has a milestone status line ("Status: M32 …"), bump it. If shipping all three phases together, "Status: M33 — pull/push UX hardening". If splitting, bump per-phase.
+If the README has an old milestone status line, replace it with a stable project description (e.g. "Rossum Deployment as Code — snapshot, edit, and deploy Rossum configurations reliably.").
 
 - [ ] **Step 5: Commit**
 
@@ -3034,7 +3034,7 @@ git add README.md
 git commit -m "$(cat <<'EOF'
 docs: document UX hardening (progress bars, colors, noise suppression)
 
-Adds upgrade-from-M32 note pointing at rdc repair --rebuild-lock for the
+Adds upgrade note pointing at rdc repair --rebuild-lock for the
 one-time hash-algorithm migration. Updates pull/push output samples to
 the new ✓-line shape. Documents NO_COLOR and conflict color scheme.
 
@@ -3047,7 +3047,7 @@ EOF
 
 ### Task 24: Live verification against @mrtnzlml sandbox
 
-**Why:** Per the M15-onward convention. Spec acceptance criteria 1-9 all need real-world confirmation.
+**Why:** Spec acceptance criteria 1-9 all need real-world confirmation.
 
 **Files:** none — verification only.
 
@@ -3107,11 +3107,11 @@ Expected: identical mtime — `NoChange` action skipped the rewrite.
 
 - [ ] **Step 10: Document any deviations**
 
-If any acceptance criterion fails, file a TODO at the top of `docs/superpowers/specs/2026-05-07-pull-push-progress-bar-design.md` and address before merging. If all pass: ready to merge / ship as M33 (or M33+M34+M35 if splitting).
+If any acceptance criterion fails, file a TODO at the top of `docs/superpowers/specs/2026-05-07-pull-push-progress-bar-design.md` and address before merging. If all pass: ready to merge.
 
 - [ ] **Step 11: Capture the verified state in project memory**
 
-Update `~/.claude/projects/-Users-martin-zlamal-rossum-ai-Work-github-com-mrtnzlml-rossum-deployment-manager-experiment/memory/project_rdc.md` with an M33 status section summarizing what shipped, the test count, and live-verification results. (This is a memory write — see superpowers:using-superpowers if needed.)
+Update `~/.claude/projects/-Users-martin-zlamal-rossum-ai-Work-github-com-mrtnzlml-rossum-deployment-manager-experiment/memory/project_rdc.md` with a status section summarizing what shipped, the test count, and live-verification results. (This is a memory write — see superpowers:using-superpowers if needed.)
 
 - [ ] **Step 12: Final commit (memory only — code already committed across earlier tasks)**
 

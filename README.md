@@ -1,6 +1,6 @@
 # rdc
 
-**Status: M35 — pull/push UX hardening (per-kind bars, conflict colors, noise-field suppression)**
+**Rossum Deployment as Code — snapshot, edit, and deploy Rossum configurations reliably.**
 
 `rdc` (Rossum Deployment as Code) snapshots Rossum.ai configurations to
 disk for AI-assisted local development, lets you edit them in place, and
@@ -49,7 +49,7 @@ deploys them across environments.
 See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full
 design.
 
-## Upgrading from M32
+## Upgrading older lockfiles
 
 This release changes how `content_hash` is computed: server-managed fields
 (`modified_at`, `modifier`) are now stripped before hashing. The first
@@ -62,8 +62,8 @@ To clear the storm without resolving each conflict by hand:
 rdc repair --rebuild-lock <env>
 ```
 
-Subsequent pulls will be clean. Real edits between M32 and this release
-remain visible — `repair` only re-baselines the hash; it does not discard
+Subsequent pulls will be clean. Real edits made before upgrading remain
+visible — `repair` only re-baselines the hash; it does not discard
 local edits.
 
 ## Install
@@ -326,8 +326,8 @@ does not modify any files.
 **Noise-field suppression:** Server-managed fields (`modified_at`, `modifier`)
 no longer contribute to the `content_hash`. A re-pull where only those fields
 have changed is a no-op — the bar shows zero conflicts and the on-disk file
-is unchanged. This eliminates a class of spurious conflicts that affected
-M32 and earlier releases.
+is unchanged. This eliminates a class of spurious conflicts that previously
+affected all lockfiles written before this algorithm change.
 
 `rdc pull` does three-way merge for every kind:
 

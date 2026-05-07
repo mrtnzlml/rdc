@@ -78,7 +78,7 @@ Conflict / drift-refusal / 403-permission / 405-method-not-allowed / 429-retry /
 
 ### Conflict resolver — colorized
 
-The M32 resolver already prints a unified diff and a prompt. This change colorizes both. Colors honor the same TTY/`--no-color`/`NO_COLOR` rules as the progress bar (§Section 6 below).
+The existing resolver already prints a unified diff and a prompt. This change colorizes both. Colors honor the same TTY/`--no-color`/`NO_COLOR` rules as the progress bar (§Section 6 below).
 
 Sample (TTY, colors approximated in markdown):
 
@@ -227,16 +227,16 @@ pub fn strip_noise_fields(value: &mut serde_json::Value);
 
 A new helper `hash_canonical(bytes: &[u8]) -> Result<[u8; 32]>` parses, strips, re-serializes (sorted keys via `serde_json::to_vec`'s default object ordering matches existing canonical form), and SHA-256s. All hash sites that compute `content_hash` for storage in the lockfile or for comparison go through this helper. The combined-hash variants (`hook_combined_hash`, `schema_combined_hash`) call `hash_canonical` for the JSON portion and feed the formula `.py` bytes through unchanged.
 
-**Backward compat.** Existing M32 lockfiles have hashes computed without stripping. After this change, every kind's hash will diverge from its lockfile entry on first pull → false-positive conflicts on every object. Mitigations:
+**Backward compat.** Existing lockfiles have hashes computed without stripping. After this change, every kind's hash will diverge from its lockfile entry on first pull → false-positive conflicts on every object. Mitigations:
 
-1. **Documented one-time effect.** The README's "upgrading from M32" note explains the one-time conflict storm and says "if nothing meaningful is different, run `rdc repair --rebuild-lock <env>` to re-baseline without per-conflict prompts."
-2. **No lockfile schema bump.** The hash algorithm change is internal; the file shape stays at v2. (M10 set the precedent here.)
+1. **Documented one-time effect.** The README's "Upgrading older lockfiles" note explains the one-time conflict storm and says "if nothing meaningful is different, run `rdc repair --rebuild-lock <env>` to re-baseline without per-conflict prompts."
+2. **No lockfile schema bump.** The hash algorithm change is internal; the file shape stays at v2. (A previous hash-algorithm change set the precedent for this approach.)
 3. **Live verification.** Ahead of merging, run pull twice on the @mrtnzlml sandbox: first pull surfaces the false conflicts; `rdc repair --rebuild-lock` clears them; subsequent pulls are clean.
 
 **What this does NOT change.**
 
 - The on-disk JSON files keep every field, including `modified_at`. Users who edit them in `$EDITOR` see the full object.
-- Lockfile `ObjectEntry::modified_at` (a separate metadata field, set during M2) is unchanged.
+- Lockfile `ObjectEntry::modified_at` (a separate metadata field) is unchanged.
 - Real diffs — anything other than `modified_at` / `modifier` — surface as before.
 
 ### Driver integration pattern
@@ -347,7 +347,7 @@ No bar-rendering tests; trusting indicatif's coverage. No real-color rendering t
 
 ### Manual verification (against @mrtnzlml sandbox)
 
-Per the M15-onward convention. Live-pull, live-push (edit hook description, push, pull, verify idempotent). Confirm:
+Live-pull, live-push (edit hook description, push, pull, verify idempotent). Confirm:
 - TTY output renders cleanly (no torn lines on retry warnings).
 - Non-TTY (`rdc pull dev 2>&1 | tee /tmp/log`) produces log-mode output.
 - Orphan queue (live sandbox has known orphans) produces `✓ queues: N items, M orphans skipped` line.
@@ -377,8 +377,8 @@ None — all design choices made during 2026-05-07 brainstorm:
 - **R: Push two-phase refactor breaks existing tests.** Mitigation: refactor is mechanical (extract hash logic from each driver into `scan.rs`); existing test assertions update to new output shape only. No behavior change.
 - **R: Retry warnings during the bar might still tear in narrow terminals.** Mitigation: indicatif's `suspend()` handles redraw correctly; if not, fall back to plain eprintln in log mode.
 - **R: `indicatif` + `anstyle` add binary size.** ~60KB combined on a release binary. Acceptable per spec §16 ("single static binary, distribute via brew/curl"). Cargo.lock churn is largely transitive deps already in use.
-- **R: One-time false-conflict storm after upgrade (noise-field hash-algorithm change).** Mitigation: documented in README upgrade note; `rdc repair --rebuild-lock` is the recovery path; live-verified before merge. Same shape as the M10 hash-algorithm migration.
-- **R: A field we should be stripping isn't on the noise list and surfaces as a noisy conflict.** Mitigation: `NOISE_FIELDS` is one constant in one file; adding a field is a one-line code change. Existing customers stay on the M32 behavior until they upgrade. Rationale per addition is documented in the source comment.
+- **R: One-time false-conflict storm after upgrade (noise-field hash-algorithm change).** Mitigation: documented in README upgrade note; `rdc repair --rebuild-lock` is the recovery path; live-verified before merge.
+- **R: A field we should be stripping isn't on the noise list and surfaces as a noisy conflict.** Mitigation: `NOISE_FIELDS` is one constant in one file; adding a field is a one-line code change. Existing lockfiles see a one-time hash divergence on upgrade. Rationale per addition is documented in the source comment.
 - **R: Stripping `modified_at` from the hash means we can't detect "remote was touched but content unchanged" anymore.** Accepted: that is exactly the goal. The lockfile's separate `modified_at` metadata field still records the timestamp for audit purposes; only the *conflict-detection* path stops looking at it.
 
 ## Acceptance criteria
@@ -393,7 +393,7 @@ The change is shippable when:
 6. Triggering a real conflict on a TTY surfaces a colored prompt: bold-yellow header, red `-` lines, green `+` lines, cyan hunk markers, cyan action letters. `NO_COLOR=1` (or `--no-color`) renders the same content with no escape codes.
 7. Pulling twice in a row with no remote changes between the two pulls produces zero conflicts (the `modified_at` server churn is invisible to conflict detection).
 8. Pushing a real edit succeeds even when the server has bumped `modified_at` since the last pull (`modified_at`-only divergence does not trigger drift refusal).
-9. After upgrade from M32, the first `rdc pull` warns the user about the one-time hash-algorithm change and points at `rdc repair --rebuild-lock`. Running `repair` clears the storm; subsequent pulls are clean.
+9. After upgrading with an older lockfile, the first `rdc pull` warns the user about the one-time hash-algorithm change and points at `rdc repair --rebuild-lock`. Running `repair` clears the storm; subsequent pulls are clean.
 6. New tests pass: orphan-count surface, no-change-push silence, log-mode formatting.
 7. Live verification on @mrtnzlml sandbox confirms TTY rendering, non-TTY fallback, and orphan handling.
 
