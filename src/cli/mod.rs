@@ -10,10 +10,12 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Bootstrap a new rdc project in the current directory.
+    /// Both `--name` and `--env` are optional; when omitted, prompts
+    /// interactively (if stdin is a TTY).
     Init {
         #[arg(long)]
-        name: String,
-        #[arg(long = "env", value_name = "ENV_SPEC", required = true)]
+        name: Option<String>,
+        #[arg(long = "env", value_name = "ENV_SPEC")]
         envs: Vec<String>,
     },
     /// Pull a Rossum environment's configuration into the local snapshot.
@@ -69,7 +71,7 @@ pub enum Command {
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
-        Some(Command::Init { name, envs }) => crate::cli::init::run(&name, &envs).await,
+        Some(Command::Init { name, envs }) => crate::cli::init::run(name, envs).await,
         Some(Command::Pull { env }) => crate::cli::pull::run(&env).await,
         Some(Command::Push { env }) => crate::cli::push::run(&env).await,
         Some(Command::Map { src, tgt }) => crate::cli::deploy::map::run(&src, &tgt).await,

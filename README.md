@@ -4,17 +4,18 @@
 disk for AI-assisted local development, lets you edit them in place, and
 deploys them across environments.
 
-**Status:** M26. Pull all kinds (incl. MDH collections + indexes —
+**Status:** M27. Pull all kinds (incl. MDH collections + indexes —
 data storage URL derived from `api_base`, no extra config); push
 and deploy for hooks, rules, labels, queues, schemas (formula
 bodies round-trip), inboxes, email templates, engines, and engine
 fields. Overlays are bidirectional: applied on push, stripped on
-pull (spec §9.3). `rdc status` for a read-only health check; `rdc
-diff` for unified diffs (local vs remote, or two snapshots); `rdc
-auth` to set/refresh tokens; `rdc repair --rebuild-lock` for
-lockfile recovery. Distributable via `curl | sh` or `cargo
-install`. See `docs/superpowers/specs/2026-05-06-rdc-design.md`
-for the full design.
+pull (spec §9.3). `rdc init` accepts flags or runs an interactive
+wizard; `rdc status` for a read-only health check; `rdc diff` for
+unified diffs (local vs remote, or two snapshots); `rdc auth` to
+set/refresh tokens; `rdc repair --rebuild-lock` for lockfile
+recovery. Distributable via `curl | sh` or `cargo install`. See
+`docs/superpowers/specs/2026-05-06-rdc-design.md` for the full
+design.
 
 ## Install
 
@@ -51,11 +52,17 @@ from source.
 ```sh
 mkdir my-rossum-project && cd my-rossum-project
 
-# Bootstrap: name + at least one env (api_base:org_id).
+# Bootstrap. Two modes:
+#   1. Non-interactive (CI-friendly):
 rdc init --name my-project \
   --env dev=https://YOUR-ORG.rossum.app/api/v1:YOUR_ORG_ID
+#   2. Interactive wizard (when run from a terminal with no flags):
+rdc init
+# → prompts for project name, then loops over env name + api_base + org_id
+# → blank env name finishes the loop
 
-# Provide a token for the dev env (one of these):
+# After init, set the API token (one of these):
+rdc auth dev --token YOUR_TOKEN          # validates + writes secrets/dev.secrets.json (mode 0600)
 echo '{"api_token":"YOUR_TOKEN"}' > secrets/dev.secrets.json
 export RDC_TOKEN_DEV=YOUR_TOKEN
 
