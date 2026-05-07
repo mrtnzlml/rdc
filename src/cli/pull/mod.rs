@@ -94,7 +94,10 @@ pub async fn run(env: &str) -> Result<()> {
         common::pluralize(n_workflow_steps, "workflow step", "workflow steps"),
         common::pluralize(n_email_templates, "email template", "email templates"),
     );
-    if env_cfg.data_storage_base.is_some() {
+    // MDH is always attempted; we surface its count whenever any
+    // datasets came back (or stay quiet when the cluster has no MDH /
+    // returned 404).
+    if n_datasets > 0 {
         summary.push_str(&format!(", {}", common::pluralize(n_datasets, "dataset", "datasets")));
     }
     if total_conflicts > 0 {

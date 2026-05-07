@@ -4,14 +4,14 @@
 disk for AI-assisted local development, lets you edit them in place, and
 deploys them across environments.
 
-**Status:** M24. Pull all kinds (incl. MDH collections + indexes
-against the real Data Storage API); push and deploy for hooks,
-rules, labels, queues, schemas (formula bodies round-trip),
-inboxes, email templates, engines, and engine fields. `rdc status`
-for a read-only health check; `rdc diff` for unified diffs (local
-vs remote, or two snapshots); `rdc auth` to set/refresh tokens;
-`rdc repair --rebuild-lock` for lockfile recovery. Distributable
-via `curl | sh` or `cargo install`. See
+**Status:** M25. Pull all kinds (incl. MDH collections + indexes —
+data storage URL derived from `api_base`, no extra config); push
+and deploy for hooks, rules, labels, queues, schemas (formula
+bodies round-trip), inboxes, email templates, engines, and engine
+fields. `rdc status` for a read-only health check; `rdc diff` for
+unified diffs (local vs remote, or two snapshots); `rdc auth` to
+set/refresh tokens; `rdc repair --rebuild-lock` for lockfile
+recovery. Distributable via `curl | sh` or `cargo install`. See
 `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full
 design.
 
@@ -58,14 +58,10 @@ rdc init --name my-project \
 echo '{"api_token":"YOUR_TOKEN"}' > secrets/dev.secrets.json
 export RDC_TOKEN_DEV=YOUR_TOKEN
 
-# Optional: enable MDH (Master Data Hub) dataset snapshots by editing
-# rdc.toml:
-#   [envs.dev]
-#   data_storage_base = "https://YOUR-ORG.rossum.ai/svc/data-storage/api"
-# Note: api_base and data_storage_base share the same parent domain
-# (e.g. elis.rossum.ai), but the API host has an `api.` subdomain
-# prefix and the Data Storage host does not. rdc appends /v1/...
-# per call to the data-storage base.
+# MDH (Master Data Hub) is pulled automatically when available — the
+# data storage URL is derived from api_base, so there's no extra
+# config to set. On clusters without MDH the lookup returns 404 and
+# rdc skips silently.
 
 # Pull a complete snapshot of the env into envs/dev/.
 rdc pull dev
@@ -99,7 +95,7 @@ envs/dev/
 ├── engine-fields/
 ├── workflows/
 ├── workflow-steps/
-└── mdh/                         (only if data_storage_base is set)
+└── mdh/                         (only when the cluster has MDH)
     └── <dataset-slug>/
         ├── collection.json
         └── indexes.json
@@ -371,25 +367,22 @@ read -s T && echo "$T" | rdc auth dev
 
 Loud error if neither is set.
 
-For Master Data Hub, set `data_storage_base` under `[envs.<name>]` in
-`rdc.toml`. The same API token is reused. The URL points at the data
-storage service root — rdc appends the `/v1/...` RPC paths per call.
+**Master Data Hub** is pulled automatically when the cluster has it
+enabled — no extra config. The data storage URL is derived from
+`api_base`. Examples:
 
-```toml
-[envs.dev]
-api_base = "https://api.elis.rossum.ai/v1"
-org_id = 214757
-data_storage_base = "https://elis.rossum.ai/svc/data-storage/api"
-```
+| `api_base`                                  | derived data storage URL                              |
+|---------------------------------------------|-------------------------------------------------------|
+| `https://api.elis.rossum.ai/v1`             | `https://elis.rossum.ai/svc/data-storage/api`         |
+| `https://customer.rossum.app/api/v1`        | `https://customer.rossum.app/svc/data-storage/api`    |
 
-Both URLs share the same parent domain (`elis.rossum.ai`); the API
-sits under the `api.` subdomain (`api.elis.rossum.ai/v1`) while the
-Data Storage service sits at the bare domain plus a service path
-(`elis.rossum.ai/svc/data-storage/api`). For other Rossum
-environments, substitute the parent domain accordingly.
-
-If `data_storage_base` is omitted, MDH is silently skipped on pull
-(no `mdh/` directory created, no count in the summary).
+The API and Data Storage services share the same parent domain on
+every Rossum cluster; the API is reached via the `api.` subdomain
+(or a `/api` path prefix on clusters that use the bare domain),
+while Data Storage sits at the bare parent domain plus
+`/svc/data-storage/api`. On clusters without MDH, the first call
+returns 404 and rdc skips silently — no `mdh/` directory created,
+no count in the summary.
 
 ## Repair — recover a broken lockfile
 
@@ -414,7 +407,7 @@ Commit your snapshot to git first if you might have unsaved edits.
 
 | File | Purpose |
 |------|---------|
-| `rdc.toml` | Project config: name, envs, optional `data_storage_base` |
+| `rdc.toml` | Project config: project name, envs (api_base + org_id) |
 | `secrets/<env>.secrets.json` | Per-env API token (gitignored) |
 | `envs/<env>/_index.md` | Generated inventory; do not edit |
 | `envs/<env>/organization.json` | Org metadata (read-only on remote) |
