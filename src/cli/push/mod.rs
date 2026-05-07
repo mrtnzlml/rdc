@@ -6,6 +6,8 @@ use crate::state::Lockfile;
 use anyhow::{anyhow, Context, Result};
 
 mod hooks;
+mod labels;
+mod rules;
 
 pub async fn run(env: &str) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
@@ -25,17 +27,26 @@ pub async fn run(env: &str) -> Result<()> {
 
     let mut lockfile = Lockfile::load(&paths.lockfile())?;
 
-    let (n_pushed, n_skipped) = hooks::push(&paths, &client, &mut lockfile).await
+    let (n_hooks, c_hooks) = hooks::push(&paths, &client, &mut lockfile).await
         .with_context(|| format!("pushing hooks for env '{env}'"))?;
+    let (n_rules, c_rules) = rules::push(&paths, &client, &mut lockfile).await
+        .with_context(|| format!("pushing rules for env '{env}'"))?;
+    let (n_labels, c_labels) = labels::push(&paths, &client, &mut lockfile).await
+        .with_context(|| format!("pushing labels for env '{env}'"))?;
 
     lockfile.save(&paths.lockfile())?;
     crate::cli::index::generate(&paths, &lockfile)
         .with_context(|| format!("regenerating _index.md for env '{env}'"))?;
 
-    let mut summary = format!("Pushed {} to env '{env}'",
-        crate::cli::pull::common::pluralize(n_pushed, "hook", "hooks"));
-    if n_skipped > 0 {
-        summary.push_str(&format!(", {} skipped (conflict)", n_skipped));
+    let mut summary = format!(
+        "Pushed {}, {}, {} to env '{env}'",
+        crate::cli::pull::common::pluralize(n_hooks, "hook", "hooks"),
+        crate::cli::pull::common::pluralize(n_rules, "rule", "rules"),
+        crate::cli::pull::common::pluralize(n_labels, "label", "labels"),
+    );
+    let total_skipped = c_hooks + c_rules + c_labels;
+    if total_skipped > 0 {
+        summary.push_str(&format!(", {} skipped (conflict)", total_skipped));
     }
     println!("{summary}");
     Ok(())

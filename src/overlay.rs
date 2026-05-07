@@ -15,6 +15,10 @@ pub struct Overlay {
     pub version: u32,
     #[serde(default)]
     pub hooks: BTreeMap<String, BTreeMap<String, Value>>,
+    #[serde(default)]
+    pub rules: BTreeMap<String, BTreeMap<String, Value>>,
+    #[serde(default)]
+    pub labels: BTreeMap<String, BTreeMap<String, Value>>,
 }
 
 impl Overlay {
@@ -31,6 +35,14 @@ impl Overlay {
 
     pub fn hook(&self, slug: &str) -> Option<&BTreeMap<String, Value>> {
         self.hooks.get(slug)
+    }
+
+    pub fn rule(&self, slug: &str) -> Option<&BTreeMap<String, Value>> {
+        self.rules.get(slug)
+    }
+
+    pub fn label(&self, slug: &str) -> Option<&BTreeMap<String, Value>> {
+        self.labels.get(slug)
     }
 }
 
