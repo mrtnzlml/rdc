@@ -1,0 +1,6 @@
+{
+  "indexes": [
+    { "name": "_id_", "key": { "_id": 1 } },
+    { "name": "ix_vendor_id", "key": { "vendor_id": 1 }, "unique": true }
+  ]
+}

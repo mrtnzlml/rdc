@@ -1,0 +1,6 @@
+{
+  "collections": [
+    { "name": "vendors", "size": 1024 },
+    { "name": "purchase_orders", "size": 512 }
+  ]
+}

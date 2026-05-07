@@ -1,0 +1,8 @@
+{
+  "search_indexes": [
+    {
+      "name": "vendor_search",
+      "definition": { "mappings": { "dynamic": true } }
+    }
+  ]
+}

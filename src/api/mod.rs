@@ -1,5 +1,7 @@
+pub mod data_storage;
 pub mod error;
 
+pub use data_storage::DataStorageClient;
 pub use error::ApiError;
 
 use crate::model::Hook;

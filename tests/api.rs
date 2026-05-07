@@ -1,4 +1,4 @@
-use rdc::api::RossumClient;
+use rdc::api::{DataStorageClient, RossumClient};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -197,6 +197,46 @@ async fn list_email_templates_returns_templates() {
     let templates = client.list_email_templates().await.unwrap();
     assert_eq!(templates.len(), 1);
     assert_eq!(templates[0].subject, "Your invoice was rejected");
+}
+
+#[tokio::test]
+async fn data_storage_list_collections() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/data/v1/collections"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("mdh_collections.json")))
+        .mount(&server)
+        .await;
+    let client = DataStorageClient::new(format!("{}/data/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let cols = client.list_collections().await.unwrap();
+    assert_eq!(cols.len(), 2);
+    assert_eq!(cols[0].name, "vendors");
+}
+
+#[tokio::test]
+async fn data_storage_list_indexes() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/data/v1/collections/vendors/indexes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("mdh_indexes_vendors.json")))
+        .mount(&server)
+        .await;
+    let client = DataStorageClient::new(format!("{}/data/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let ix = client.list_indexes("vendors").await.unwrap();
+    assert_eq!(ix.len(), 2);
+}
+
+#[tokio::test]
+async fn data_storage_list_search_indexes() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/data/v1/collections/vendors/search-indexes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("mdh_search_indexes_vendors.json")))
+        .mount(&server)
+        .await;
+    let client = DataStorageClient::new(format!("{}/data/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let s = client.list_search_indexes("vendors").await.unwrap();
+    assert_eq!(s.len(), 1);
 }
 
 #[tokio::test]
