@@ -1,7 +1,8 @@
 use crate::api::RossumClient;
 use crate::paths::Paths;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
+use std::path::Path;
 
 /// Shared state passed through every per-kind pull driver.
 pub struct PullCtx<'a> {
@@ -56,6 +57,97 @@ pub fn parse_id_from_url(url: &str) -> Result<u64> {
         .map_err(|e| anyhow!("URL trailing segment '{last}' is not a u64: {e}"))
 }
 
+/// Outcome of a three-way comparison for a single object on pull.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullAction {
+    /// First pull, or local hasn't been edited, or remote is unchanged from base —
+    /// safe to write the remote bytes.
+    Write,
+    /// Local has edits and remote is unchanged from base — keep the local file.
+    KeepLocal,
+    /// Both local and remote have diverged from base — real conflict.
+    Conflict,
+}
+
+/// Decide what to do on pull for a single object.
+///
+/// `local_path` — the on-disk JSON file path (may not exist).
+/// `base_hash` — the lockfile's recorded content_hash for this object (None if no prior entry).
+/// `remote_bytes` — the just-serialized remote candidate bytes that would be written.
+///
+/// Returns: `(action, remote_hash)`. The remote_hash is always returned because the
+/// caller may need it for the lockfile.
+pub fn decide_pull_action(
+    local_path: &Path,
+    base_hash: Option<&str>,
+    remote_bytes: &[u8],
+) -> Result<(PullAction, String)> {
+    let remote_hash = content_hash(remote_bytes);
+
+    let Some(base) = base_hash else {
+        return Ok((PullAction::Write, remote_hash));
+    };
+
+    if !local_path.exists() {
+        return Ok((PullAction::Write, remote_hash));
+    }
+
+    let local_bytes = std::fs::read(local_path)
+        .with_context(|| format!("reading {}", local_path.display()))?;
+    let local_hash = content_hash(&local_bytes);
+
+    let local_matches_base = local_hash == base;
+    let remote_matches_base = remote_hash == base;
+
+    let action = match (local_matches_base, remote_matches_base) {
+        (true, true) => PullAction::Write,
+        (true, false) => PullAction::Write,
+        (false, true) => PullAction::KeepLocal,
+        (false, false) => PullAction::Conflict,
+    };
+
+    Ok((action, remote_hash))
+}
+
+/// Apply the decision to the filesystem and return the hash that should be
+/// recorded in the lockfile (which differs depending on the action).
+pub fn apply_pull_action(
+    action: PullAction,
+    local_path: &Path,
+    remote_bytes: &[u8],
+    remote_hash: String,
+) -> Result<String> {
+    use crate::snapshot::writer::write_atomic;
+    match action {
+        PullAction::Write => {
+            write_atomic(local_path, remote_bytes)?;
+            Ok(remote_hash)
+        }
+        PullAction::KeepLocal => {
+            let local_bytes = std::fs::read(local_path)
+                .with_context(|| format!("reading {}", local_path.display()))?;
+            Ok(content_hash(&local_bytes))
+        }
+        PullAction::Conflict => {
+            let mut conflict_path = local_path.to_path_buf();
+            let new_name = match conflict_path.file_name().and_then(|s| s.to_str()) {
+                Some(name) => format!("{name}.remote"),
+                None => "remote".to_string(),
+            };
+            conflict_path.set_file_name(new_name);
+            write_atomic(&conflict_path, remote_bytes)?;
+            eprintln!(
+                "warning: {} conflict — local preserved, remote at {}",
+                local_path.display(),
+                conflict_path.display()
+            );
+            let local_bytes = std::fs::read(local_path)
+                .with_context(|| format!("reading {}", local_path.display()))?;
+            Ok(content_hash(&local_bytes))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +178,74 @@ mod tests {
     #[test]
     fn parse_id_non_numeric_errors() {
         assert!(parse_id_from_url("https://x/api/v1/schemas/abc").is_err());
+    }
+
+    #[test]
+    fn first_pull_writes_when_no_base_hash() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        let (action, _hash) = decide_pull_action(&path, None, b"{}").unwrap();
+        assert_eq!(action, PullAction::Write);
+    }
+
+    #[test]
+    fn write_when_no_local_file_exists() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        let (action, _hash) = decide_pull_action(&path, Some("any-hash"), b"{}").unwrap();
+        assert_eq!(action, PullAction::Write);
+    }
+
+    #[test]
+    fn keep_local_when_only_local_edited() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        std::fs::write(&path, b"{ \"local\": true }").unwrap();
+        let remote = b"{}";
+        let base = content_hash(remote);
+        let (action, _hash) = decide_pull_action(&path, Some(&base), remote).unwrap();
+        assert_eq!(action, PullAction::KeepLocal);
+    }
+
+    #[test]
+    fn write_when_only_remote_changed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        let original = b"{ \"original\": true }";
+        std::fs::write(&path, original).unwrap();
+        let base = content_hash(original);
+        let remote = b"{ \"updated\": true }";
+        let (action, _hash) = decide_pull_action(&path, Some(&base), remote).unwrap();
+        assert_eq!(action, PullAction::Write);
+    }
+
+    #[test]
+    fn conflict_when_both_changed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        std::fs::write(&path, b"{ \"local\": true }").unwrap();
+        let base = "0".repeat(64);
+        let remote = b"{ \"remote\": true }";
+        let (action, _hash) = decide_pull_action(&path, Some(&base), remote).unwrap();
+        assert_eq!(action, PullAction::Conflict);
+    }
+
+    #[test]
+    fn apply_write_creates_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        let h = apply_pull_action(PullAction::Write, &path, b"hello", "h".repeat(64)).unwrap();
+        assert_eq!(h, "h".repeat(64));
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn apply_conflict_writes_remote_sibling() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        std::fs::write(&path, b"local").unwrap();
+        let _ = apply_pull_action(PullAction::Conflict, &path, b"remote", "h".repeat(64)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"local");
+        assert_eq!(std::fs::read(dir.path().join("x.json.remote")).unwrap(), b"remote");
     }
 }
