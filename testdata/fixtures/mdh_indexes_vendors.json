@@ -1,6 +1,8 @@
 {
-  "indexes": [
-    { "name": "_id_", "key": { "_id": 1 } },
-    { "name": "ix_vendor_id", "key": { "vendor_id": 1 }, "unique": true }
+  "code": "ok",
+  "message": "",
+  "result": [
+    { "v": 2, "name": "_id_", "key": { "_id": 1 } },
+    { "v": 2, "name": "ix_vendor_id", "key": { "vendor_id": 1 }, "unique": true }
   ]
 }

@@ -1,5 +1,7 @@
 {
-  "indexes": [
-    { "name": "_id_", "key": { "_id": 1 } }
+  "code": "ok",
+  "message": "",
+  "result": [
+    { "v": 2, "name": "_id_", "key": { "_id": 1 } }
   ]
 }

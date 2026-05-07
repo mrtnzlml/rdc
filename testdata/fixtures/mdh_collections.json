@@ -1,6 +1,26 @@
 {
-  "collections": [
-    { "name": "vendors", "size": 1024 },
-    { "name": "purchase_orders", "size": 512 }
+  "code": "ok",
+  "message": "",
+  "result": [
+    {
+      "name": "vendors",
+      "type": "collection",
+      "options": {},
+      "info": {
+        "readOnly": false,
+        "uuid": { "$binary": { "base64": "AA==", "subType": "04" } }
+      },
+      "idIndex": { "v": 2, "key": { "_id": 1 }, "name": "_id_" }
+    },
+    {
+      "name": "purchase_orders",
+      "type": "collection",
+      "options": {},
+      "info": {
+        "readOnly": false,
+        "uuid": { "$binary": { "base64": "AQ==", "subType": "04" } }
+      },
+      "idIndex": { "v": 2, "key": { "_id": 1 }, "name": "_id_" }
+    }
   ]
 }
