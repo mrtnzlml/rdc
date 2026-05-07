@@ -33,7 +33,7 @@ mod tests {
             "url": "https://x/api/v1/email_templates/1",
             "name": "T",
             "subject": "Subj",
-            "queues": []
+            "queue": "https://x/api/v1/queues/1"
         });
         serde_json::from_value(v).unwrap()
     }

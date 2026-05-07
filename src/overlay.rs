@@ -24,6 +24,17 @@ pub struct Overlay {
     /// classifier thresholds, queue-specific defaults, etc.
     #[serde(default)]
     pub schemas: BTreeMap<String, BTreeMap<String, Value>>,
+    /// Queue overrides keyed by queue slug. Useful for per-env automation
+    /// levels, score thresholds, locale, etc.
+    #[serde(default)]
+    pub queues: BTreeMap<String, BTreeMap<String, Value>>,
+    /// Inbox overrides keyed by queue slug (one inbox per queue).
+    #[serde(default)]
+    pub inboxes: BTreeMap<String, BTreeMap<String, Value>>,
+    /// Email-template overrides keyed by `<ws_slug>/<q_slug>/<template_slug>`,
+    /// matching the lockfile key for queue-scoped email templates (M16).
+    #[serde(default)]
+    pub email_templates: BTreeMap<String, BTreeMap<String, Value>>,
 }
 
 impl Overlay {
@@ -52,6 +63,18 @@ impl Overlay {
 
     pub fn schema(&self, slug: &str) -> Option<&BTreeMap<String, Value>> {
         self.schemas.get(slug)
+    }
+
+    pub fn queue(&self, slug: &str) -> Option<&BTreeMap<String, Value>> {
+        self.queues.get(slug)
+    }
+
+    pub fn inbox(&self, slug: &str) -> Option<&BTreeMap<String, Value>> {
+        self.inboxes.get(slug)
+    }
+
+    pub fn email_template(&self, key: &str) -> Option<&BTreeMap<String, Value>> {
+        self.email_templates.get(key)
     }
 }
 
