@@ -89,6 +89,24 @@ async fn pull_writes_full_workspace_tree() {
         .mount(&server)
         .await;
 
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workflows"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("workflows_list.json")))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workflow_steps"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("workflow_steps_list.json")))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/email_templates"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("email_templates_list.json")))
+        .mount(&server)
+        .await;
+
     let project = TempDir::new().unwrap();
 
     Command::cargo_bin("rdc")
@@ -124,7 +142,10 @@ async fn pull_writes_full_workspace_tree() {
         .stdout(predicate::str::contains("1 rule"))
         .stdout(predicate::str::contains("2 labels"))
         .stdout(predicate::str::contains("1 engine"))
-        .stdout(predicate::str::contains("2 engine fields"));
+        .stdout(predicate::str::contains("2 engine fields"))
+        .stdout(predicate::str::contains("1 workflow"))
+        .stdout(predicate::str::contains("2 workflow steps"))
+        .stdout(predicate::str::contains("1 email template"));
 
     let env_root = project.path().join("envs/dev");
 
@@ -196,6 +217,16 @@ async fn pull_writes_full_workspace_tree() {
     assert!(lf.contains("\"labels\""));
     assert!(lf.contains("\"engines\""));
     assert!(lf.contains("\"engine_fields\""));
+
+    // M5 kinds present
+    assert!(env_root.join("workflows/ap-approval-flow.json").exists());
+    assert!(env_root.join("workflow-steps/manager-approval.json").exists());
+    assert!(env_root.join("workflow-steps/finance-approval.json").exists());
+    assert!(env_root.join("email-templates/rejection-notice.json").exists());
+
+    assert!(lf.contains("\"workflows\""));
+    assert!(lf.contains("\"workflow_steps\""));
+    assert!(lf.contains("\"email_templates\""));
 }
 
 #[tokio::test]
@@ -262,6 +293,21 @@ async fn pull_with_workspace_filter_skips_non_matching() {
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("engine_fields_list.json")))
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workflows"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("workflows_list.json")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workflow_steps"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("workflow_steps_list.json")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/email_templates"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("email_templates_list.json")))
+        .mount(&server)
+        .await;
 
     let project = TempDir::new().unwrap();
 
@@ -304,10 +350,20 @@ async fn pull_with_workspace_filter_skips_non_matching() {
     assert!(ws_root.join("invoices-ap").is_dir());
     assert!(!ws_root.join("purchase-orders").exists(), "filtered workspace should not be pulled");
 
-    // The Purchase Orders queue (whose workspace was filtered) is skipped.
+    // Parse the lockfile JSON and assert exact entry counts/keys (more robust than
+    // the old `lf.contains(...)` substring checks, per M4 reviewer recommendation).
     let lf = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
-    assert!(lf.contains("invoices-ap"));
-    assert!(!lf.contains("purchase-orders"), "queue from filtered workspace should not appear in lockfile");
+    let lf_value: serde_json::Value = serde_json::from_str(&lf).unwrap();
+
+    let ws_obj = lf_value["objects"]["workspaces"].as_object().unwrap();
+    assert_eq!(ws_obj.len(), 1, "expected 1 workspace, got {}: {:?}", ws_obj.len(), ws_obj.keys().collect::<Vec<_>>());
+    assert!(ws_obj.contains_key("invoices-ap"));
+
+    let q_obj = lf_value["objects"]["queues"].as_object().unwrap();
+    assert_eq!(q_obj.len(), 2, "expected 2 queues, got {}: {:?}", q_obj.len(), q_obj.keys().collect::<Vec<_>>());
+    assert!(q_obj.contains_key("cost-invoices"));
+    assert!(q_obj.contains_key("credit-notes"));
+    assert!(!q_obj.contains_key("purchase-orders"));
 }
 
 #[tokio::test]
