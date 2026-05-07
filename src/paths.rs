@@ -60,6 +60,16 @@ impl Paths {
         self.env_root().join("overlay.toml")
     }
 
+    /// `<root>/.rdc/map/`
+    pub fn mapping_dir(&self) -> PathBuf {
+        self.root.join(".rdc").join("map")
+    }
+
+    /// `<root>/.rdc/map/<src>→<tgt>.toml`
+    pub fn mapping_file(&self, src: &str, tgt: &str) -> PathBuf {
+        self.mapping_dir().join(format!("{src}→{tgt}.toml"))
+    }
+
     /// `<root>/envs/<env>/hooks/`
     pub fn hooks_dir(&self) -> PathBuf {
         self.env_root().join("hooks")
@@ -167,6 +177,19 @@ mod tests {
     #[test]
     fn overlay_file_path() {
         assert_eq!(p().overlay_file(), Path::new("/proj/envs/dev/overlay.toml"));
+    }
+
+    #[test]
+    fn mapping_dir_path() {
+        assert_eq!(p().mapping_dir(), Path::new("/proj/.rdc/map"));
+    }
+
+    #[test]
+    fn mapping_file_path() {
+        assert_eq!(
+            p().mapping_file("test", "prod"),
+            Path::new("/proj/.rdc/map/test→prod.toml")
+        );
     }
 
     #[test]

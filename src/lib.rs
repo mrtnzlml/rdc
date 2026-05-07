@@ -1,6 +1,7 @@
 pub mod api;
 pub mod cli;
 pub mod config;
+pub mod mapping;
 pub mod model;
 pub mod overlay;
 pub mod paths;
