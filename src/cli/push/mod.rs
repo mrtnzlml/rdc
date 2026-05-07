@@ -53,7 +53,7 @@ pub async fn run(env: &str, interactive: bool) -> Result<()> {
     // Run drivers in a separate function so we can detect [a]bort
     // (PullAborted) and skip lockfile.save(). Mirrors the pull-side
     // abort flow (spec §8.3 "rolls back lockfile; nothing written").
-    let push_outcome = run_drivers(&paths, &client, &mut lockfile, env, interactive).await;
+    let push_outcome = run_drivers(&paths, &client, &mut lockfile, env, interactive, &changes).await;
 
     let counts = match push_outcome {
         Ok(c) => c,
@@ -108,25 +108,107 @@ async fn run_drivers(
     lockfile: &mut Lockfile,
     env: &str,
     interactive: bool,
+    changes: &scan::ChangeList,
 ) -> Result<PushCounts> {
-    let (n_hooks, c_hooks) = hooks::push(paths, client, lockfile, interactive).await
-        .with_context(|| format!("pushing hooks for env '{env}'"))?;
-    let (n_rules, c_rules) = rules::push(paths, client, lockfile, interactive).await
-        .with_context(|| format!("pushing rules for env '{env}'"))?;
-    let (n_labels, c_labels) = labels::push(paths, client, lockfile, interactive).await
-        .with_context(|| format!("pushing labels for env '{env}'"))?;
-    let (n_queues, c_queues) = queues::push(paths, client, lockfile, interactive).await
-        .with_context(|| format!("pushing queues for env '{env}'"))?;
-    let (n_schemas, c_schemas) = schemas::push(paths, client, lockfile, interactive).await
-        .with_context(|| format!("pushing schemas for env '{env}'"))?;
-    let (n_inboxes, c_inboxes) = inboxes::push(paths, client, lockfile, interactive).await
-        .with_context(|| format!("pushing inboxes for env '{env}'"))?;
-    let (n_email_templates, c_email_templates) = email_templates::push(paths, client, lockfile, interactive).await
-        .with_context(|| format!("pushing email templates for env '{env}'"))?;
-    let (n_engines, c_engines) = engines::push(paths, client, lockfile, interactive).await
-        .with_context(|| format!("pushing engines for env '{env}'"))?;
-    let (n_engine_fields, c_engine_fields) = engine_fields::push(paths, client, lockfile, interactive).await
-        .with_context(|| format!("pushing engine fields for env '{env}'"))?;
+    let (n_hooks, c_hooks) = if !changes.hooks.is_empty() {
+        let p = KindProgress::start("hooks");
+        p.set_total(changes.hooks.len() as u64);
+        let result = hooks::push(paths, client, lockfile, interactive, &changes.hooks, &p).await
+            .with_context(|| format!("pushing hooks for env '{env}'"))?;
+        p.finish();
+        result
+    } else {
+        (0, 0)
+    };
+
+    let (n_rules, c_rules) = if !changes.rules.is_empty() {
+        let p = KindProgress::start("rules");
+        p.set_total(changes.rules.len() as u64);
+        let result = rules::push(paths, client, lockfile, interactive, &changes.rules, &p).await
+            .with_context(|| format!("pushing rules for env '{env}'"))?;
+        p.finish();
+        result
+    } else {
+        (0, 0)
+    };
+
+    let (n_labels, c_labels) = if !changes.labels.is_empty() {
+        let p = KindProgress::start("labels");
+        p.set_total(changes.labels.len() as u64);
+        let result = labels::push(paths, client, lockfile, interactive, &changes.labels, &p).await
+            .with_context(|| format!("pushing labels for env '{env}'"))?;
+        p.finish();
+        result
+    } else {
+        (0, 0)
+    };
+
+    let (n_queues, c_queues) = if !changes.queues.is_empty() {
+        let p = KindProgress::start("queues");
+        p.set_total(changes.queues.len() as u64);
+        let result = queues::push(paths, client, lockfile, interactive, &changes.queues, &p).await
+            .with_context(|| format!("pushing queues for env '{env}'"))?;
+        p.finish();
+        result
+    } else {
+        (0, 0)
+    };
+
+    let (n_schemas, c_schemas) = if !changes.schemas.is_empty() {
+        let p = KindProgress::start("schemas");
+        p.set_total(changes.schemas.len() as u64);
+        let result = schemas::push(paths, client, lockfile, interactive, &changes.schemas, &p).await
+            .with_context(|| format!("pushing schemas for env '{env}'"))?;
+        p.finish();
+        result
+    } else {
+        (0, 0)
+    };
+
+    let (n_inboxes, c_inboxes) = if !changes.inboxes.is_empty() {
+        let p = KindProgress::start("inboxes");
+        p.set_total(changes.inboxes.len() as u64);
+        let result = inboxes::push(paths, client, lockfile, interactive, &changes.inboxes, &p).await
+            .with_context(|| format!("pushing inboxes for env '{env}'"))?;
+        p.finish();
+        result
+    } else {
+        (0, 0)
+    };
+
+    let (n_email_templates, c_email_templates) = if !changes.email_templates.is_empty() {
+        let p = KindProgress::start("email_templates");
+        p.set_total(changes.email_templates.len() as u64);
+        let result = email_templates::push(paths, client, lockfile, interactive, &changes.email_templates, &p).await
+            .with_context(|| format!("pushing email templates for env '{env}'"))?;
+        p.finish();
+        result
+    } else {
+        (0, 0)
+    };
+
+    let (n_engines, c_engines) = if !changes.engines.is_empty() {
+        let p = KindProgress::start("engines");
+        p.set_total(changes.engines.len() as u64);
+        let result = engines::push(paths, client, lockfile, interactive, &changes.engines, &p).await
+            .with_context(|| format!("pushing engines for env '{env}'"))?;
+        p.finish();
+        result
+    } else {
+        (0, 0)
+    };
+
+    let (n_engine_fields, c_engine_fields) = if !changes.engine_fields.is_empty() {
+        let p = KindProgress::start("engine_fields");
+        p.set_total(changes.engine_fields.len() as u64);
+        let result = engine_fields::push(paths, client, lockfile, interactive, &changes.engine_fields, &p).await
+            .with_context(|| format!("pushing engine fields for env '{env}'"))?;
+        p.finish();
+        result
+    } else {
+        (0, 0)
+    };
+
     Ok(PushCounts {
         n_hooks, c_hooks,
         n_rules, c_rules,

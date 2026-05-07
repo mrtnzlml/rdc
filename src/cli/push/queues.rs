@@ -2,21 +2,20 @@ use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
+use crate::progress::KindProgress;
 use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
+use std::collections::BTreeMap;
 
 pub async fn push(
     paths: &Paths,
     client: &RossumClient,
     lockfile: &mut Lockfile,
     interactive: bool,
+    changes: &BTreeMap<String, std::path::PathBuf>,
+    progress: &KindProgress,
 ) -> Result<(usize, usize)> {
-    let workspaces_dir = paths.workspaces_dir();
-    if !workspaces_dir.exists() {
-        return Ok((0, 0));
-    }
-
     let overlay = Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
@@ -25,138 +24,117 @@ pub async fn push(
     let mut remote_cache: std::collections::HashMap<u64, crate::model::Queue> =
         std::collections::HashMap::new();
 
-    for ws_entry in std::fs::read_dir(&workspaces_dir)
-        .with_context(|| format!("reading {}", workspaces_dir.display()))?
-    {
-        let ws_entry = ws_entry?;
-        if !ws_entry.file_type()?.is_dir() {
-            continue;
-        }
-        let ws_slug = ws_entry.file_name().to_string_lossy().to_string();
-        let queues_dir = paths.queues_dir(&ws_slug);
-        if !queues_dir.exists() {
-            continue;
-        }
+    for (q_slug, queue_path) in changes {
+        let disk_bytes = std::fs::read(queue_path)
+            .with_context(|| format!("reading {}", queue_path.display()))?;
 
-        for q_entry in std::fs::read_dir(&queues_dir)
-            .with_context(|| format!("reading {}", queues_dir.display()))?
-        {
-            let q_entry = q_entry?;
-            if !q_entry.file_type()?.is_dir() {
-                continue;
-            }
-            let q_slug = q_entry.file_name().to_string_lossy().to_string();
-            let queue_dir = paths.queue_dir(&ws_slug, &q_slug);
-            let queue_path = queue_dir.join("queue.json");
-            if !queue_path.exists() {
-                continue;
-            }
-
-            let disk_bytes = std::fs::read(&queue_path)
-                .with_context(|| format!("reading {}", queue_path.display()))?;
-            let local_combined = content_hash(&disk_bytes);
-
-            let entry = lockfile.objects.get("queues").and_then(|m| m.get(&q_slug));
-            let Some(entry) = entry else {
+        let entry = lockfile.objects.get("queues").and_then(|m| m.get(q_slug.as_str()));
+        let Some(entry) = entry else {
+            progress.suspend(|| {
                 eprintln!("warning: queue '{q_slug}' — no lockfile entry, skipping");
-                skipped += 1;
-                continue;
-            };
-            let Some(base) = &entry.content_hash else {
+            });
+            skipped += 1;
+            continue;
+        };
+        let Some(base) = &entry.content_hash else {
+            progress.suspend(|| {
                 eprintln!("warning: queue '{q_slug}' — lockfile entry has no content_hash, skipping");
-                skipped += 1;
-                continue;
-            };
-            if &local_combined == base {
-                continue;
-            }
+            });
+            skipped += 1;
+            continue;
+        };
+        let base = base.clone();
 
-            let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
-                .with_context(|| format!("parsing {}", queue_path.display()))?;
-            let overlay_paths = overlay.as_ref().and_then(|ov| ov.queue(&q_slug));
-            if let Some(p) = overlay_paths {
-                apply_overrides(&mut payload, p);
-            }
-            let payload_queue: crate::model::Queue = serde_json::from_value(payload)
-                .with_context(|| format!("deserializing overlay-applied queue '{q_slug}'"))?;
+        let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
+            .with_context(|| format!("parsing {}", queue_path.display()))?;
+        let overlay_paths = overlay.as_ref().and_then(|ov| ov.queue(q_slug));
+        if let Some(p) = overlay_paths {
+            apply_overrides(&mut payload, p);
+        }
+        let payload_queue: crate::model::Queue = serde_json::from_value(payload)
+            .with_context(|| format!("deserializing overlay-applied queue '{q_slug}'"))?;
 
-            let id = entry.id;
-            if remote_cache.is_empty() {
-                let remotes = client.list_queues().await
-                    .context("listing queues to verify no drift before push")?;
-                for r in remotes {
-                    remote_cache.insert(r.id, r);
-                }
+        let id = entry.id;
+        if remote_cache.is_empty() {
+            let remotes = client.list_queues().await
+                .context("listing queues to verify no drift before push")?;
+            for r in remotes {
+                remote_cache.insert(r.id, r);
             }
-            let Some(remote_queue) = remote_cache.get(&id).cloned() else {
+        }
+        let Some(remote_queue) = remote_cache.get(&id).cloned() else {
+            progress.suspend(|| {
                 eprintln!("warning: queue '{q_slug}' — id {id} not found on remote, skipping");
-                skipped += 1;
-                continue;
-            };
-            let mut remote_bytes = serde_json::to_vec_pretty(&remote_queue)
-                .context("serializing remote queue")?;
-            remote_bytes.push(b'\n');
-            let remote_bytes = maybe_strip_overlay(remote_bytes, overlay_paths)?;
-            let remote_combined = content_hash(&remote_bytes);
-            let mut payload_to_send = payload_queue;
-            if &remote_combined != base {
-                use crate::cli::resolve::{resolve_push_drift, PushDriftOutcome};
-                match resolve_push_drift(interactive, &queue_path, &remote_bytes)? {
-                    PushDriftOutcome::Patch { payload_override } => {
-                        if let Some(bytes) = payload_override {
-                            payload_to_send = serde_json::from_slice(&bytes)
-                                .with_context(|| format!("re-deserializing edited queue '{q_slug}'"))?;
-                        }
+            });
+            skipped += 1;
+            continue;
+        };
+        let mut remote_bytes = serde_json::to_vec_pretty(&remote_queue)
+            .context("serializing remote queue")?;
+        remote_bytes.push(b'\n');
+        let remote_bytes = maybe_strip_overlay(remote_bytes, overlay_paths)?;
+        let remote_combined = content_hash(&remote_bytes);
+        let mut payload_to_send = payload_queue;
+        if &remote_combined != &base {
+            use crate::cli::resolve::{resolve_push_drift, PushDriftOutcome};
+            match resolve_push_drift(interactive, queue_path, &remote_bytes)? {
+                PushDriftOutcome::Patch { payload_override } => {
+                    if let Some(bytes) = payload_override {
+                        payload_to_send = serde_json::from_slice(&bytes)
+                            .with_context(|| format!("re-deserializing edited queue '{q_slug}'"))?;
                     }
-                    PushDriftOutcome::Adopt => {
-                        write_atomic(&queue_path, &remote_bytes)
-                            .with_context(|| format!("adopting remote into {}", queue_path.display()))?;
-                        lockfile.upsert(
-                            "queues",
-                            &q_slug,
-                            ObjectEntry {
-                                id,
-                                url: Some(remote_queue.url.clone()),
-                                modified_at: remote_queue.modified_at().map(|s| s.to_string()),
-                                content_hash: Some(remote_combined),
-                            },
-                        );
-                        skipped += 1;
-                        continue;
-                    }
-                    PushDriftOutcome::Skip => {
+                }
+                PushDriftOutcome::Adopt => {
+                    write_atomic(queue_path, &remote_bytes)
+                        .with_context(|| format!("adopting remote into {}", queue_path.display()))?;
+                    lockfile.upsert(
+                        "queues",
+                        q_slug,
+                        ObjectEntry {
+                            id,
+                            url: Some(remote_queue.url.clone()),
+                            modified_at: remote_queue.modified_at().map(|s| s.to_string()),
+                            content_hash: Some(remote_combined),
+                        },
+                    );
+                    skipped += 1;
+                    continue;
+                }
+                PushDriftOutcome::Skip => {
+                    progress.suspend(|| {
                         eprintln!(
                             "warning: queue '{q_slug}' — remote has changed since last pull, skipping push (run `rdc pull` first)"
                         );
-                        skipped += 1;
-                        continue;
-                    }
+                    });
+                    skipped += 1;
+                    continue;
                 }
             }
-
-            let updated = client.update_queue(id, &payload_to_send).await
-                .with_context(|| format!("PATCH /queues/{id}"))?;
-
-            let mut updated_bytes = serde_json::to_vec_pretty(&updated)
-                .context("serializing updated queue")?;
-            updated_bytes.push(b'\n');
-            let updated_bytes = maybe_strip_overlay(updated_bytes, overlay_paths)?;
-            let updated_hash = content_hash(&updated_bytes);
-            write_atomic(&queue_path, &updated_bytes)
-                .with_context(|| format!("writing post-push canonical form for queue '{q_slug}'"))?;
-
-            lockfile.upsert(
-                "queues",
-                &q_slug,
-                ObjectEntry {
-                    id: updated.id,
-                    url: Some(updated.url.clone()),
-                    modified_at: updated.modified_at().map(|s| s.to_string()),
-                    content_hash: Some(updated_hash),
-                },
-            );
-            pushed += 1;
         }
+
+        let updated = client.update_queue(id, &payload_to_send).await
+            .with_context(|| format!("PATCH /queues/{id}"))?;
+
+        let mut updated_bytes = serde_json::to_vec_pretty(&updated)
+            .context("serializing updated queue")?;
+        updated_bytes.push(b'\n');
+        let updated_bytes = maybe_strip_overlay(updated_bytes, overlay_paths)?;
+        let updated_hash = content_hash(&updated_bytes);
+        write_atomic(queue_path, &updated_bytes)
+            .with_context(|| format!("writing post-push canonical form for queue '{q_slug}'"))?;
+
+        lockfile.upsert(
+            "queues",
+            q_slug,
+            ObjectEntry {
+                id: updated.id,
+                url: Some(updated.url.clone()),
+                modified_at: updated.modified_at().map(|s| s.to_string()),
+                content_hash: Some(updated_hash),
+            },
+        );
+        progress.tick();
+        pushed += 1;
     }
 
     Ok((pushed, skipped))
