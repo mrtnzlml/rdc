@@ -37,19 +37,24 @@ struct QueueWork<'a> {
     inbox_id: Option<u64>,
 }
 
-pub async fn pull(ctx: &mut PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<QueueCounts> {
-    progress.start_phase("queues");
-    let queues = skip_on_permission_denied(
+/// Phase 1: list all queues from the API.
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<Vec<Queue>> {
+    skip_on_permission_denied(
         ctx.client.list_queues(Some(progress.clone())).await.context("listing queues"),
         "queues",
         progress,
-    )?;
+    )
+}
 
-    progress.inc_total(queues.len() as u64);
+/// Phase 2: process listed queues — filter, slug, write queue.json + schema +
+/// inbox. Also populates `ctx.queue_locations` for email_templates.
+pub async fn process(ctx: &mut PullCtx<'_>, queues: Vec<Queue>, progress: &Arc<OverallProgress>) -> Result<QueueCounts> {
+    progress.start_phase("queues");
+
     let mut per_ws_used_slugs: HashMap<String, HashSet<String>> = HashMap::new();
     let mut counts = QueueCounts { queues: 0, schemas: 0, inboxes: 0, conflicts: 0 };
 
-    // === Phase 1: filter, slug, queue.json write, build work list ===
+    // === Sub-phase A: filter, slug, queue.json write, build work list ===
     let mut work: Vec<QueueWork> = Vec::new();
     for q in &queues {
         let ws_url = match &q.workspace {
@@ -130,7 +135,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, progress: &Arc<OverallProgress>) -> Res
         work.push(QueueWork { q, q_slug, queue_dir, schema_id, inbox_id });
     }
 
-    // === Phase 2: concurrent schema + inbox fetches ===
+    // === Sub-phase B: concurrent schema + inbox fetches ===
     // Per spec §16 #4 + §7.2: bounded by ctx.concurrency.
     let client = ctx.client;
     let progress_inner = progress.clone();
@@ -159,7 +164,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, progress: &Arc<OverallProgress>) -> Res
     let fetched: HashMap<u64, (Option<Schema>, Option<Inbox>)> =
         fetched_vec.into_iter().map(|(qid, s, i)| (qid, (s, i))).collect();
 
-    // === Phase 3: schema + inbox write decisions (sequential, mutates lockfile) ===
+    // === Sub-phase C: schema + inbox write decisions (sequential, mutates lockfile) ===
     for w in &work {
         let Some((schema_opt, inbox_opt)) = fetched.get(&w.q.id) else { continue };
 

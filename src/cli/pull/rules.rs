@@ -2,21 +2,25 @@ use super::common::{
     apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
     skip_on_permission_denied, PullAction, PullCtx,
 };
+use crate::model::Rule;
 use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-/// Pull all rules. Returns `(count, conflicts)`.
-pub async fn pull(ctx: &mut PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
-    progress.start_phase("rules");
-    let rules = skip_on_permission_denied(
+/// Phase 1: list all rules from the API.
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<Vec<Rule>> {
+    skip_on_permission_denied(
         ctx.client.list_rules(Some(progress.clone())).await.context("listing rules"),
         "rules",
         progress,
-    )?;
-    progress.inc_total(rules.len() as u64);
+    )
+}
+
+/// Phase 2: write listed rules to disk. Returns `(count, conflicts)`.
+pub async fn process(ctx: &mut PullCtx<'_>, rules: Vec<Rule>, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
+    progress.start_phase("rules");
 
     let mut used: HashSet<String> = HashSet::new();
     let mut dir_created = false;

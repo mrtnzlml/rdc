@@ -1,7 +1,7 @@
 use super::common::{apply_pull_action, decide_pull_action, record_object, PullAction, PullCtx};
 use crate::api::{anyhow_has_status, DataStorageClient};
 use crate::config::EnvConfig;
-use crate::model::IndexSet;
+use crate::model::{Collection, IndexSet};
 use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
@@ -9,48 +9,59 @@ use futures::stream::{StreamExt, TryStreamExt};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-/// Pulls Master Data Hub collections + indexes for `env_cfg`. The Data
-/// Storage base URL is always derived from `env_cfg.api_base` (no separate
-/// config field). On clusters without MDH the first call returns 404, in
-/// which case we silently skip — same shape as the 403/permission skip
-/// applied to other kinds.
-///
-/// Per-collection regular + search index fetches are pipelined with
-/// `buffer_unordered(N)` (per spec §16, default N=5) so a 10-dataset MDH
-/// doesn't take 20 sequential round-trips.
-///
-/// Returns `(collection_count, conflicts)`.
-pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
-    progress.start_phase("mdh");
-    let base = env_cfg.data_storage_base();
+/// Opaque listed state for MDH — the client handle plus the collection list.
+/// We carry the client here because it's constructed from env_cfg + token,
+/// which live in `run_drivers` scope.
+pub struct MdhListed {
+    pub client: DataStorageClient,
+    pub collections: Vec<Collection>,
+}
 
+/// Phase 1: list MDH collections (or return an empty list if MDH is not
+/// enabled on this cluster — 404 → quiet skip matching the 403 pattern).
+pub async fn list(env_cfg: &EnvConfig, token: &str, progress: &Arc<OverallProgress>) -> Result<MdhListed> {
+    let base = env_cfg.data_storage_base();
     let client = DataStorageClient::new(base, token.to_string())
         .context("constructing Data Storage client")?;
 
     let collections = match client.list_collections(Some(progress.clone())).await {
         Ok(c) => c,
         Err(e) if anyhow_has_status(&e, 404) => {
-            // MDH not enabled on this cluster — quietly skip, matching the
-            // pull-time tolerance for 403 on permission-gated kinds.
-            return Ok((0, 0));
+            // MDH not enabled on this cluster — quietly skip.
+            Vec::new()
         }
         Err(e) => return Err(e.context("listing MDH collections")),
     };
 
-    progress.inc_total(collections.len() as u64);
+    Ok(MdhListed { client, collections })
+}
+
+/// Phase 2: write listed collections + indexes to disk.
+///
+/// Per-collection regular + search index fetches are pipelined with
+/// `buffer_unordered(N)` (per spec §16, default N=5) so a 10-dataset MDH
+/// doesn't take 20 sequential round-trips.
+///
+/// Returns `(collection_count, conflicts)`.
+pub async fn process(ctx: &mut PullCtx<'_>, listed: MdhListed, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
+    progress.start_phase("mdh");
+
+    let MdhListed { client, collections } = listed;
+
+    if collections.is_empty() {
+        return Ok((0, 0));
+    }
 
     let mut used: HashSet<String> = HashSet::new();
     let mut conflicts = 0usize;
 
-    if !collections.is_empty() {
-        std::fs::create_dir_all(ctx.paths.mdh_dir())
-            .with_context(|| format!("creating {}", ctx.paths.mdh_dir().display()))?;
-    }
+    std::fs::create_dir_all(ctx.paths.mdh_dir())
+        .with_context(|| format!("creating {}", ctx.paths.mdh_dir().display()))?;
 
-    // === Phase 1: assign slugs + write collection.json. Build per-collection
-    //            dataset_dir map for use in Phase 3.
-    let mut dataset_dirs: Vec<(String, std::path::PathBuf, &crate::model::Collection)> = Vec::new();
-    for c in &collections {
+    // === Sub-phase A: assign slugs + write collection.json. Build per-collection
+    //            dataset_dir map for use in sub-phase C.
+    let mut dataset_dirs: Vec<(String, std::path::PathBuf, Collection)> = Vec::new();
+    for c in collections {
         let slug = slugify_unique(&c.name, &used);
         used.insert(slug.clone());
 
@@ -59,7 +70,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str, progr
             .with_context(|| format!("creating {}", dataset_dir.display()))?;
 
         let coll_path = dataset_dir.join("collection.json");
-        let mut coll_proposed = serde_json::to_vec_pretty(c).context("serializing collection")?;
+        let mut coll_proposed = serde_json::to_vec_pretty(&c).context("serializing collection")?;
         coll_proposed.push(b'\n');
         let coll_base = ctx
             .lockfile
@@ -86,7 +97,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str, progr
         dataset_dirs.push((slug, dataset_dir, c));
     }
 
-    // === Phase 2: concurrent index fetches per collection (regular +
+    // === Sub-phase B: concurrent index fetches per collection (regular +
     //            search). Bounded by ctx.concurrency.
     let client_ref = &client;
     let progress_inner = progress.clone();
@@ -108,7 +119,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str, progr
     .await?;
     let by_slug: std::collections::HashMap<String, IndexSet> = fetched.into_iter().collect();
 
-    // === Phase 3: per-collection indexes.json write decision (sequential
+    // === Sub-phase C: per-collection indexes.json write decision (sequential
     //            because we mutate ctx.lockfile + counts).
     for (slug, dataset_dir, c) in &dataset_dirs {
         let Some(index_set) = by_slug.get(slug) else { continue };
@@ -140,5 +151,5 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str, progr
         progress.tick(&c.name);
     }
 
-    Ok((collections.len(), conflicts))
+    Ok((dataset_dirs.len(), conflicts))
 }

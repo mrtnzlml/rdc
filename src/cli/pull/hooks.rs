@@ -2,6 +2,7 @@ use super::common::{
     apply_pull_action, maybe_strip_overlay, record_object, skip_on_permission_denied,
     PullAction, PullCtx,
 };
+use crate::model::Hook;
 use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use crate::snapshot::hook::{serialize_hook, write_hook_code};
@@ -10,15 +11,18 @@ use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-/// Pull all hooks. Returns `(count, conflicts)`.
-pub async fn pull(ctx: &mut PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
-    progress.start_phase("hooks");
-    let hooks = skip_on_permission_denied(
+/// Phase 1: list all hooks from the API.
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<Vec<Hook>> {
+    skip_on_permission_denied(
         ctx.client.list_hooks(Some(progress.clone())).await.context("listing hooks"),
         "hooks",
         progress,
-    )?;
-    progress.inc_total(hooks.len() as u64);
+    )
+}
+
+/// Phase 2: write listed hooks to disk. Returns `(count, conflicts)`.
+pub async fn process(ctx: &mut PullCtx<'_>, hooks: Vec<Hook>, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
+    progress.start_phase("hooks");
 
     let mut used_slugs: HashSet<String> = HashSet::new();
     let mut dir_created = false;

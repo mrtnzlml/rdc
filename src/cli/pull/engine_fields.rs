@@ -2,21 +2,25 @@ use super::common::{
     apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
     skip_on_permission_denied, PullAction, PullCtx,
 };
+use crate::model::EngineField;
 use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-/// Pull all engine fields. Returns `(count, conflicts)`.
-pub async fn pull(ctx: &mut PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
-    progress.start_phase("engine_fields");
-    let fields = skip_on_permission_denied(
+/// Phase 1: list all engine fields from the API.
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<Vec<EngineField>> {
+    skip_on_permission_denied(
         ctx.client.list_engine_fields(Some(progress.clone())).await.context("listing engine fields"),
         "engine_fields",
         progress,
-    )?;
-    progress.inc_total(fields.len() as u64);
+    )
+}
+
+/// Phase 2: write listed engine fields to disk. Returns `(count, conflicts)`.
+pub async fn process(ctx: &mut PullCtx<'_>, fields: Vec<EngineField>, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
+    progress.start_phase("engine_fields");
 
     let mut used: HashSet<String> = HashSet::new();
     let mut dir_created = false;

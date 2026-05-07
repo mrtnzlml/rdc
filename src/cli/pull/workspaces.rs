@@ -1,5 +1,6 @@
 use super::common::{hash_for_lockfile, record_object, skip_on_permission_denied, PullCtx};
 use crate::config::EnvConfig;
+use crate::model::Workspace;
 use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use crate::snapshot::workspace::write_workspace;
@@ -8,19 +9,21 @@ use regex::Regex;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-/// Pull workspaces from the env's remote that match the configured
-/// `workspace_filter` (an optional regex applied to `workspace.name`).
-/// When the filter is `None`, all workspaces are pulled.
-/// Each workspace is written as `envs/<env>/workspaces/<slug>/workspace.json`.
-/// Returns the number of workspaces pulled.
-pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, progress: &Arc<OverallProgress>) -> Result<usize> {
-    progress.start_phase("workspaces");
-    let workspaces = skip_on_permission_denied(
+/// Phase 1: list all workspaces from the API.
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<Vec<Workspace>> {
+    skip_on_permission_denied(
         ctx.client.list_workspaces(Some(progress.clone())).await.context("listing workspaces"),
         "workspaces",
         progress,
-    )?;
-    progress.inc_total(workspaces.len() as u64);
+    )
+}
+
+/// Phase 2: filter and write listed workspaces to disk.
+/// When the env's `workspace_filter` is set, only matching workspaces are
+/// written; all others are ticked (counted) but not written.
+/// Returns the number of workspaces written.
+pub async fn process(ctx: &mut PullCtx<'_>, workspaces: Vec<Workspace>, env_cfg: &EnvConfig, progress: &Arc<OverallProgress>) -> Result<usize> {
+    progress.start_phase("workspaces");
 
     let filter = match &env_cfg.workspace_filter {
         Some(pat) => Some(

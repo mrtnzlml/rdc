@@ -115,9 +115,21 @@ async fn run_drivers(
     changes: &scan::ChangeList,
     progress: &Arc<OverallProgress>,
 ) -> Result<PushCounts> {
+    // Phase 1: accumulate the bar's total denominator for all changed kinds
+    // upfront so the percentage only grows monotonically during phase 2.
+    progress.inc_total(changes.hooks.len() as u64);
+    progress.inc_total(changes.rules.len() as u64);
+    progress.inc_total(changes.labels.len() as u64);
+    progress.inc_total(changes.queues.len() as u64);
+    progress.inc_total(changes.schemas.len() as u64);
+    progress.inc_total(changes.inboxes.len() as u64);
+    progress.inc_total(changes.email_templates.len() as u64);
+    progress.inc_total(changes.engines.len() as u64);
+    progress.inc_total(changes.engine_fields.len() as u64);
+
+    // Phase 2: push each kind; drivers call progress.tick() per item.
     let (n_hooks, c_hooks) = if !changes.hooks.is_empty() {
         progress.start_phase("hooks");
-        progress.inc_total(changes.hooks.len() as u64);
         hooks::push(paths, client, lockfile, interactive, &changes.hooks, progress).await
             .with_context(|| format!("pushing hooks for env '{env}'"))?
     } else {
@@ -126,7 +138,6 @@ async fn run_drivers(
 
     let (n_rules, c_rules) = if !changes.rules.is_empty() {
         progress.start_phase("rules");
-        progress.inc_total(changes.rules.len() as u64);
         rules::push(paths, client, lockfile, interactive, &changes.rules, progress).await
             .with_context(|| format!("pushing rules for env '{env}'"))?
     } else {
@@ -135,7 +146,6 @@ async fn run_drivers(
 
     let (n_labels, c_labels) = if !changes.labels.is_empty() {
         progress.start_phase("labels");
-        progress.inc_total(changes.labels.len() as u64);
         labels::push(paths, client, lockfile, interactive, &changes.labels, progress).await
             .with_context(|| format!("pushing labels for env '{env}'"))?
     } else {
@@ -144,7 +154,6 @@ async fn run_drivers(
 
     let (n_queues, c_queues) = if !changes.queues.is_empty() {
         progress.start_phase("queues");
-        progress.inc_total(changes.queues.len() as u64);
         queues::push(paths, client, lockfile, interactive, &changes.queues, progress).await
             .with_context(|| format!("pushing queues for env '{env}'"))?
     } else {
@@ -153,7 +162,6 @@ async fn run_drivers(
 
     let (n_schemas, c_schemas) = if !changes.schemas.is_empty() {
         progress.start_phase("schemas");
-        progress.inc_total(changes.schemas.len() as u64);
         schemas::push(paths, client, lockfile, interactive, &changes.schemas, progress).await
             .with_context(|| format!("pushing schemas for env '{env}'"))?
     } else {
@@ -162,7 +170,6 @@ async fn run_drivers(
 
     let (n_inboxes, c_inboxes) = if !changes.inboxes.is_empty() {
         progress.start_phase("inboxes");
-        progress.inc_total(changes.inboxes.len() as u64);
         inboxes::push(paths, client, lockfile, interactive, &changes.inboxes, progress).await
             .with_context(|| format!("pushing inboxes for env '{env}'"))?
     } else {
@@ -171,7 +178,6 @@ async fn run_drivers(
 
     let (n_email_templates, c_email_templates) = if !changes.email_templates.is_empty() {
         progress.start_phase("email_templates");
-        progress.inc_total(changes.email_templates.len() as u64);
         email_templates::push(paths, client, lockfile, interactive, &changes.email_templates, progress).await
             .with_context(|| format!("pushing email templates for env '{env}'"))?
     } else {
@@ -180,7 +186,6 @@ async fn run_drivers(
 
     let (n_engines, c_engines) = if !changes.engines.is_empty() {
         progress.start_phase("engines");
-        progress.inc_total(changes.engines.len() as u64);
         engines::push(paths, client, lockfile, interactive, &changes.engines, progress).await
             .with_context(|| format!("pushing engines for env '{env}'"))?
     } else {
@@ -189,7 +194,6 @@ async fn run_drivers(
 
     let (n_engine_fields, c_engine_fields) = if !changes.engine_fields.is_empty() {
         progress.start_phase("engine_fields");
-        progress.inc_total(changes.engine_fields.len() as u64);
         engine_fields::push(paths, client, lockfile, interactive, &changes.engine_fields, progress).await
             .with_context(|| format!("pushing engine fields for env '{env}'"))?
     } else {

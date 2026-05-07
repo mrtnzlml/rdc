@@ -1,18 +1,20 @@
 use super::common::{apply_pull_action, decide_pull_action, record_object, PullAction, PullCtx};
+use crate::model::Organization;
 use crate::progress::OverallProgress;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
-/// Pull the env's organization. The org_id comes from the env's config in
-/// rdc.toml. Returns `(count, conflicts)`.
-pub async fn pull(ctx: &mut PullCtx<'_>, org_id: u64, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
-    progress.start_phase("organization");
-    progress.inc_total(1);
-    let org = ctx
-        .client
+/// Phase 1: fetch the org singleton from the API.
+pub async fn list(ctx: &PullCtx<'_>, org_id: u64, progress: &Arc<OverallProgress>) -> Result<Organization> {
+    ctx.client
         .get_organization(org_id, Some(progress.clone()))
         .await
-        .with_context(|| format!("fetching organization {org_id}"))?;
+        .with_context(|| format!("fetching organization {org_id}"))
+}
+
+/// Phase 2: write the org to disk. Returns `(count, conflicts)`.
+pub async fn process(ctx: &mut PullCtx<'_>, org: Organization, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
+    progress.start_phase("organization");
 
     let path = ctx.paths.organization_file();
     if let Some(parent) = path.parent() {
