@@ -1,0 +1,113 @@
+use assert_cmd::Command;
+use predicates::prelude::*;
+use tempfile::TempDir;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn fixture(name: &str) -> serde_json::Value {
+    let raw = std::fs::read_to_string(format!("testdata/fixtures/{name}")).unwrap();
+    serde_json::from_str(&raw).unwrap()
+}
+
+fn empty_list() -> serde_json::Value {
+    serde_json::json!({ "pagination": { "next": null }, "results": [] })
+}
+
+async fn mount_minimal_pull(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(server).await;
+    for ep in [
+        "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/hooks", "/api/v1/rules", "/api/v1/labels",
+        "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(server).await;
+    }
+}
+
+#[tokio::test]
+async fn repair_requires_rebuild_lock_flag() {
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--name", "x", "--env", "dev=https://x/api/v1:1"])
+        .assert().success();
+
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["repair", "dev"])
+        .assert().failure()
+        .stderr(predicate::str::contains("--rebuild-lock"));
+}
+
+#[tokio::test]
+async fn repair_backs_up_lockfile_and_repulls() {
+    let server = MockServer::start().await;
+    mount_minimal_pull(&server).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert().success();
+
+    let lockfile_path = project.path().join(".rdc/state/dev.lock.json");
+    assert!(lockfile_path.exists(), "lockfile created by initial pull");
+
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["repair", "dev", "--rebuild-lock"])
+        .assert().success()
+        .stdout(predicate::str::contains("Lockfile rebuilt"))
+        .stderr(predicate::str::contains("Backed up existing lockfile"));
+
+    assert!(lockfile_path.exists(), "lockfile re-created by pull");
+
+    // Backup file should exist.
+    let state_dir = project.path().join(".rdc/state");
+    let backups: Vec<_> = std::fs::read_dir(&state_dir).unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".bak."))
+        .collect();
+    assert_eq!(backups.len(), 1, "exactly one backup file");
+}
+
+#[tokio::test]
+async fn repair_works_when_lockfile_is_missing() {
+    let server = MockServer::start().await;
+    mount_minimal_pull(&server).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+
+    // No lockfile yet.
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["repair", "dev", "--rebuild-lock"])
+        .assert().success()
+        .stdout(predicate::str::contains("Lockfile rebuilt"))
+        .stderr(predicate::str::contains("No existing lockfile"));
+
+    assert!(project.path().join(".rdc/state/dev.lock.json").exists());
+}
