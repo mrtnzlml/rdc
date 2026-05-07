@@ -226,6 +226,10 @@ fn write_schema_for_queue(
             let local_json = pre_local_json.as_ref().unwrap();
             crate::state::schema_combined_hash(local_json, &pre_local_formulas)
         }
+        PullAction::NoChange => {
+            // Combined hash is already equal — no file writes needed.
+            remote_combined_hash
+        }
         PullAction::Conflict => {
             counts.conflicts += 1;
             let local_json = pre_local_json.as_ref().unwrap();

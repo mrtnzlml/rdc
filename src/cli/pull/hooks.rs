@@ -100,6 +100,10 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
                 let local_json = pre_local_json.as_ref().unwrap();
                 hook_combined_hash(local_json, &pre_local_code)
             }
+            PullAction::NoChange => {
+                // Combined hash is already equal — no file writes needed.
+                remote_combined_hash
+            }
             PullAction::Conflict => {
                 // Combined-hash conflict (spec §8.3). When both sides
                 // have code, walk json and py separately so the user

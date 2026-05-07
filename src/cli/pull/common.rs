@@ -133,6 +133,10 @@ pub enum PullAction {
     KeepLocal,
     /// Both local and remote have diverged from base — real conflict.
     Conflict,
+    /// Local and remote canonicalize to the same bytes (only noise fields
+    /// like `modified_at` differ). Skip the write to preserve on-disk
+    /// byte-stability across re-pulls.
+    NoChange,
 }
 
 /// Decide what to do on pull for a single object.
@@ -161,6 +165,12 @@ pub fn decide_pull_action(
     let local_bytes = std::fs::read(local_path)
         .with_context(|| format!("reading {}", local_path.display()))?;
     let local_hash = content_hash(&local_bytes);
+
+    // Short-circuit: canonicalized local == canonicalized remote means
+    // any difference is noise (modified_at etc.). Don't rewrite the file.
+    if local_hash == remote_hash {
+        return Ok((PullAction::NoChange, remote_hash));
+    }
 
     let local_matches_base = local_hash == base;
     let remote_matches_base = remote_hash == base;
@@ -200,6 +210,11 @@ pub fn apply_pull_action(
             let local_bytes = std::fs::read(local_path)
                 .with_context(|| format!("reading {}", local_path.display()))?;
             Ok(content_hash(&local_bytes))
+        }
+        PullAction::NoChange => {
+            // Local and remote canonicalize equal — preserve disk bytes.
+            // Hash is identical to remote_hash by construction.
+            Ok(remote_hash)
         }
         PullAction::Conflict => {
             if interactive {
@@ -401,5 +416,38 @@ mod tests {
         let v: Result<Vec<u32>> = Ok(vec![1, 2, 3]);
         let out = skip_on_permission_denied(v, "engines").unwrap();
         assert_eq!(out, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn decide_returns_nochange_when_canonical_local_equals_canonical_remote() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        // Local has modified_at = t1
+        std::fs::write(&path, b"{\"name\":\"x\",\"modified_at\":\"t1\"}").unwrap();
+        // Remote has modified_at = t2 (newer); same other content
+        let remote = b"{\"name\":\"x\",\"modified_at\":\"t2\"}";
+        // Base hash matches both (canonical strips modified_at)
+        let base = content_hash(remote);
+        let (action, _hash) = decide_pull_action(&path, Some(&base), remote).unwrap();
+        assert_eq!(action, PullAction::NoChange);
+    }
+
+    #[test]
+    fn apply_nochange_does_not_modify_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        std::fs::write(&path, b"original").unwrap();
+        let original_bytes = std::fs::read(&path).unwrap();
+        let h = apply_pull_action(
+            PullAction::NoChange,
+            &path,
+            b"different remote bytes",
+            "h".repeat(64),
+            false,
+        )
+        .unwrap();
+        assert_eq!(h, "h".repeat(64));
+        // Local file unchanged byte-for-byte.
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
     }
 }
