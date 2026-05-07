@@ -349,6 +349,94 @@ pub fn resolve_push_drift(
 #[error("aborted by user at conflict resolver")]
 pub struct PullAborted;
 
+/// Whether to emit ANSI color codes in resolver output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorMode {
+    Plain,
+    Color,
+}
+
+/// Decide the color mode at runtime. `--no-color` flag has highest priority,
+/// then NO_COLOR env var, then stderr TTY detection.
+pub fn detect_color_mode(no_color_flag: bool) -> ColorMode {
+    if no_color_flag {
+        return ColorMode::Plain;
+    }
+    if std::env::var_os("NO_COLOR").is_some() {
+        return ColorMode::Plain;
+    }
+    if std::io::stderr().is_terminal() {
+        ColorMode::Color
+    } else {
+        ColorMode::Plain
+    }
+}
+
+/// Apply color to a single line of unified-diff output. Returns `line`
+/// unchanged in [`ColorMode::Plain`].
+pub fn colorize_diff_line(line: &str, mode: ColorMode) -> String {
+    if mode == ColorMode::Plain {
+        return line.to_string();
+    }
+    let prefix = if line.starts_with("--- ") {
+        "\x1b[91m" // bright red
+    } else if line.starts_with("+++ ") {
+        "\x1b[92m" // bright green
+    } else if line.starts_with("@@") {
+        "\x1b[36m" // cyan
+    } else if line.starts_with('-') {
+        "\x1b[91m" // bright red
+    } else if line.starts_with('+') {
+        "\x1b[92m" // bright green
+    } else {
+        return line.to_string();
+    };
+    format!("{prefix}{line}\x1b[0m")
+}
+
+/// Colorize the conflict header line. Bold yellow.
+pub fn colorize_header(text: &str, mode: ColorMode) -> String {
+    if mode == ColorMode::Plain {
+        return text.to_string();
+    }
+    format!("\x1b[1;93m{text}\x1b[0m")
+}
+
+/// Colorize the action-letter prompt line. Bracketed single-letter tokens
+/// like `[k]` are wrapped in bold cyan; the rest of the prompt is unchanged.
+pub fn colorize_prompt(text: &str, mode: ColorMode) -> String {
+    if mode == ColorMode::Plain {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '[' {
+            if let Some(&letter) = chars.peek() {
+                if letter.is_ascii_alphabetic() {
+                    chars.next(); // consume letter
+                    if matches!(chars.peek(), Some(']')) {
+                        chars.next(); // consume ]
+                        out.push_str("[\x1b[1;96m");
+                        out.push(letter);
+                        out.push_str("\x1b[0m]");
+                        continue;
+                    } else {
+                        // Not a single-letter bracketed token — emit as-is.
+                        out.push('[');
+                        out.push(letter);
+                        continue;
+                    }
+                }
+            }
+            out.push(c);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,5 +620,85 @@ mod tests {
         // No prompt was rendered (short-circuit).
         let s = String::from_utf8(output).unwrap();
         assert!(!s.contains("[k]eep"), "should not have prompted: {s}");
+    }
+
+    #[test]
+    fn colorize_plain_mode_returns_unchanged() {
+        let line = "-  \"name\": \"old\"";
+        assert_eq!(colorize_diff_line(line, ColorMode::Plain), line.to_string());
+    }
+
+    #[test]
+    fn colorize_color_mode_renders_minus_red() {
+        let line = "-  \"name\": \"old\"";
+        let out = colorize_diff_line(line, ColorMode::Color);
+        // Bright-red SGR = \x1b[91m, reset = \x1b[0m.
+        assert!(out.contains("\x1b[91m"), "expected bright red prefix in: {out:?}");
+        assert!(out.ends_with("\x1b[0m"), "expected reset suffix in: {out:?}");
+    }
+
+    #[test]
+    fn colorize_color_mode_renders_plus_green() {
+        let line = "+  \"name\": \"new\"";
+        let out = colorize_diff_line(line, ColorMode::Color);
+        assert!(out.contains("\x1b[92m"), "expected bright green prefix in: {out:?}");
+    }
+
+    #[test]
+    fn colorize_color_mode_leaves_context_lines_alone() {
+        let line = "   \"unchanged\": true";
+        assert_eq!(
+            colorize_diff_line(line, ColorMode::Color),
+            line.to_string()
+        );
+    }
+
+    #[test]
+    fn colorize_color_mode_hunk_header_is_cyan() {
+        let line = "@@ -1,3 +1,3 @@";
+        let out = colorize_diff_line(line, ColorMode::Color);
+        assert!(out.contains("\x1b[36m"), "expected cyan in: {out:?}");
+    }
+
+    #[test]
+    fn colorize_file_headers_are_red_and_green() {
+        let minus_hdr = colorize_diff_line("--- local", ColorMode::Color);
+        let plus_hdr = colorize_diff_line("+++ remote", ColorMode::Color);
+        assert!(minus_hdr.contains("\x1b[91m"), "got: {minus_hdr:?}");
+        assert!(plus_hdr.contains("\x1b[92m"), "got: {plus_hdr:?}");
+    }
+
+    #[test]
+    fn detect_color_mode_no_color_env_returns_plain() {
+        let prev = std::env::var("NO_COLOR").ok();
+        std::env::set_var("NO_COLOR", "1");
+        assert!(matches!(detect_color_mode(false), ColorMode::Plain));
+        match prev {
+            Some(v) => std::env::set_var("NO_COLOR", v),
+            None => std::env::remove_var("NO_COLOR"),
+        }
+    }
+
+    #[test]
+    fn detect_color_mode_no_color_flag_returns_plain() {
+        let prev = std::env::var("NO_COLOR").ok();
+        std::env::remove_var("NO_COLOR");
+        assert!(matches!(detect_color_mode(true), ColorMode::Plain));
+        if let Some(v) = prev {
+            std::env::set_var("NO_COLOR", v);
+        }
+    }
+
+    #[test]
+    fn colorize_prompt_wraps_bracketed_letters() {
+        let s = colorize_prompt("[k]eep local  [r]emote", ColorMode::Color);
+        // Expect both letters wrapped in bold-cyan SGR.
+        assert!(s.matches("\x1b[1;96m").count() == 2, "got: {s:?}");
+    }
+
+    #[test]
+    fn colorize_prompt_plain_returns_unchanged() {
+        let s = colorize_prompt("[k]eep local", ColorMode::Plain);
+        assert_eq!(s, "[k]eep local");
     }
 }
