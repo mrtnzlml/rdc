@@ -19,6 +19,11 @@ pub struct Overlay {
     pub rules: BTreeMap<String, BTreeMap<String, Value>>,
     #[serde(default)]
     pub labels: BTreeMap<String, BTreeMap<String, Value>>,
+    /// Schema overrides keyed by queue slug (schemas use the queue's slug
+    /// since each queue has exactly one schema). Useful for per-env
+    /// classifier thresholds, queue-specific defaults, etc.
+    #[serde(default)]
+    pub schemas: BTreeMap<String, BTreeMap<String, Value>>,
 }
 
 impl Overlay {
@@ -43,6 +48,10 @@ impl Overlay {
 
     pub fn label(&self, slug: &str) -> Option<&BTreeMap<String, Value>> {
         self.labels.get(slug)
+    }
+
+    pub fn schema(&self, slug: &str) -> Option<&BTreeMap<String, Value>> {
+        self.schemas.get(slug)
     }
 }
 
@@ -109,6 +118,22 @@ version = 1
         let hook = overlay.hook("validator-invoices").unwrap();
         assert_eq!(hook.get("name").unwrap(), &Value::String("Validator (PROD)".into()));
         assert_eq!(hook.get("config.runtime").unwrap(), &Value::String("python3.12-secure".into()));
+    }
+
+    #[test]
+    fn load_parses_schema_overrides() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("overlay.toml");
+        std::fs::write(&path, r#"
+version = 1
+
+[schemas.cost-invoices]
+"settings.default_score_threshold" = 0.95
+"#).unwrap();
+        let overlay = Overlay::load(&path).unwrap().unwrap();
+        let s = overlay.schema("cost-invoices").unwrap();
+        let v = s.get("settings.default_score_threshold").unwrap();
+        assert_eq!(v.as_f64().unwrap(), 0.95);
     }
 
     #[test]
