@@ -4,10 +4,11 @@
 disk for AI-assisted local development, lets you edit them in place, and
 deploys them across environments.
 
-**Status:** M20. Pull all kinds; push and deploy for hooks, rules,
+**Status:** M21. Pull all kinds; push and deploy for hooks, rules,
 labels, queues, schemas (formula bodies round-trip), inboxes,
-email templates, engines, and engine fields. Distributable via
-`curl | sh` or `cargo install`. See
+email templates, engines, and engine fields. `rdc status` for a
+read-only health check. Distributable via `curl | sh` or
+`cargo install`. See
 `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full
 design.
 
@@ -155,6 +156,29 @@ other kinds intact.
 **Out of scope:** Creates (POST) and deletes are not supported —
 `rdc push` only updates existing objects. No two-phase send for
 cross-references.
+
+## Status — health check
+
+`rdc status [env]` prints a read-only summary per env: token
+presence, auth, lockfile, and which local files differ from the
+lockfile (= what `rdc push` would attempt to send). With no
+argument, runs for every env defined in `rdc.toml`.
+
+```
+$ rdc status dev
+Env 'dev'
+  api_base: https://YOUR-ORG.rossum.app/api/v1
+  org_id:   123456
+  token:    present
+  auth:     ok (org 'YOUR-ORG', id 123456)
+  lockfile: v2, 48 objects across 10 kinds
+  edits:    1 file(s) differ from lockfile:
+            hooks/validator-invoices
+```
+
+The `edits:` line lists everything `rdc push` would consider
+sending. It does not call the API beyond the auth check, and it
+does not modify any files.
 
 ## Conflict handling
 
