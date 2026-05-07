@@ -55,6 +55,11 @@ impl Paths {
         self.env_root().join("organization.json")
     }
 
+    /// `<root>/envs/<env>/overlay.toml`
+    pub fn overlay_file(&self) -> PathBuf {
+        self.env_root().join("overlay.toml")
+    }
+
     /// `<root>/envs/<env>/hooks/`
     pub fn hooks_dir(&self) -> PathBuf {
         self.env_root().join("hooks")
@@ -157,6 +162,11 @@ mod tests {
     #[test]
     fn organization_file_path() {
         assert_eq!(p().organization_file(), Path::new("/proj/envs/dev/organization.json"));
+    }
+
+    #[test]
+    fn overlay_file_path() {
+        assert_eq!(p().overlay_file(), Path::new("/proj/envs/dev/overlay.toml"));
     }
 
     #[test]
