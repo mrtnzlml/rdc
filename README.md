@@ -4,10 +4,11 @@
 disk for AI-assisted local development, lets you edit them in place, and
 deploys them across environments.
 
-**Status:** M21. Pull all kinds; push and deploy for hooks, rules,
+**Status:** M22. Pull all kinds; push and deploy for hooks, rules,
 labels, queues, schemas (formula bodies round-trip), inboxes,
 email templates, engines, and engine fields. `rdc status` for a
-read-only health check. Distributable via `curl | sh` or
+read-only health check; `rdc diff` for unified diffs (local vs
+remote, or two snapshots). Distributable via `curl | sh` or
 `cargo install`. See
 `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full
 design.
@@ -163,6 +164,41 @@ cross-references.
 presence, auth, lockfile, and which local files differ from the
 lockfile (= what `rdc push` would attempt to send). With no
 argument, runs for every env defined in `rdc.toml`.
+
+## Diff — see what changed
+
+Two modes, both read-only:
+
+`rdc diff <env>` — compares the local snapshot against what the
+remote API currently returns. One GET per object; no PATCHes.
+
+```sh
+$ rdc diff dev
+--- hooks/validator-invoices.py (local)
++++ hooks/validator-invoices.py (remote)
+@@ -1,3 +1,2 @@
+ def validate(payload):
+     return {}
+-# my local edit
+```
+
+`rdc diff <a> <b>` — compares two local snapshots without touching
+the API. Useful for "what's different between TEST and PROD?".
+
+```sh
+$ rdc diff test prod
+--- hooks/validator-invoices.json (in test)
++++ hooks/validator-invoices.json (in prod)
+@@ -3,4 +3,4 @@
+   "name": "Validator: invoices",
+-  "config": { "runtime": "python3.12" }
++  "config": { "runtime": "python3.11" }
+```
+
+Output is a standard unified diff (3 lines of context). If a file
+exists in only one snapshot, the missing side is reported.
+
+
 
 ```
 $ rdc status dev
