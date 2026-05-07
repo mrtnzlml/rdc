@@ -8,7 +8,11 @@ use std::path::Path;
 /// If `result` is a 403 permission_denied from the Rossum API, log a warning
 /// and return an empty list — the kind is unavailable to this token, but
 /// other kinds should still pull. Otherwise propagate the error unchanged.
-pub fn skip_on_permission_denied<T>(result: Result<Vec<T>>, kind: &str) -> Result<Vec<T>> {
+pub fn skip_on_permission_denied<T>(
+    result: Result<Vec<T>>,
+    kind: &str,
+    progress: &crate::progress::KindProgress,
+) -> Result<Vec<T>> {
     match result {
         Ok(v) => Ok(v),
         Err(e) => {
@@ -18,9 +22,10 @@ pub fn skip_on_permission_denied<T>(result: Result<Vec<T>>, kind: &str) -> Resul
                     .unwrap_or(false)
             });
             if is_403 {
-                eprintln!(
-                    "warning: skipping {kind} — token lacks permission (403)"
-                );
+                let kind_owned = kind.to_string();
+                progress.suspend(move || {
+                    eprintln!("warning: skipping {kind_owned} — token lacks permission (403)");
+                });
                 Ok(Vec::new())
             } else {
                 Err(e)
@@ -199,6 +204,7 @@ pub fn apply_pull_action(
     remote_bytes: &[u8],
     remote_hash: String,
     interactive: bool,
+    progress: &crate::progress::KindProgress,
 ) -> Result<String> {
     use crate::snapshot::writer::write_atomic;
     match action {
@@ -218,9 +224,9 @@ pub fn apply_pull_action(
         }
         PullAction::Conflict => {
             if interactive {
-                resolve_conflict_interactive(local_path, remote_bytes, &remote_hash)
+                resolve_conflict_interactive(local_path, remote_bytes, &remote_hash, progress)
             } else {
-                shadow_file_conflict(local_path, remote_bytes)
+                shadow_file_conflict(local_path, remote_bytes, progress)
             }
         }
     }
@@ -230,7 +236,11 @@ pub fn apply_pull_action(
 /// `<file>.remote`, keep local on disk, return the local hash. Used when
 /// `interactive == false` (CI/non-TTY/--yes) and as a fallback from the
 /// resolver when the user picks `[s]kip`.
-fn shadow_file_conflict(local_path: &Path, remote_bytes: &[u8]) -> Result<String> {
+fn shadow_file_conflict(
+    local_path: &Path,
+    remote_bytes: &[u8],
+    progress: &crate::progress::KindProgress,
+) -> Result<String> {
     use crate::snapshot::writer::write_atomic;
     let mut conflict_path = local_path.to_path_buf();
     let new_name = match conflict_path.file_name().and_then(|s| s.to_str()) {
@@ -239,11 +249,13 @@ fn shadow_file_conflict(local_path: &Path, remote_bytes: &[u8]) -> Result<String
     };
     conflict_path.set_file_name(new_name);
     write_atomic(&conflict_path, remote_bytes)?;
-    eprintln!(
-        "warning: {} conflict — local preserved, remote at {}",
-        local_path.display(),
-        conflict_path.display()
-    );
+    let local_path_disp = local_path.display().to_string();
+    let conflict_path_disp = conflict_path.display().to_string();
+    progress.suspend(move || {
+        eprintln!(
+            "warning: {local_path_disp} conflict — local preserved, remote at {conflict_path_disp}"
+        );
+    });
     let local_bytes = std::fs::read(local_path)
         .with_context(|| format!("reading {}", local_path.display()))?;
     Ok(content_hash(&local_bytes))
@@ -257,20 +269,27 @@ fn resolve_conflict_interactive(
     local_path: &Path,
     remote_bytes: &[u8],
     remote_hash: &str,
+    progress: &crate::progress::KindProgress,
 ) -> Result<String> {
     use crate::cli::resolve::{prompt_resolve, PullAborted, Resolution};
     use crate::snapshot::writer::write_atomic;
 
-    let stdin = std::io::stdin();
-    let stderr = std::io::stderr();
-    let resolution = prompt_resolve(
-        stdin.lock(),
-        stderr.lock(),
-        1, // No global counter yet — drivers don't share an index/total.
-        1,
-        local_path,
-        remote_bytes,
-    )?;
+    // Suspend the bar while the user is interacting so the prompt isn't
+    // overwritten by ticks.
+    let mut result_holder: Option<Result<Resolution>> = None;
+    progress.suspend(|| {
+        let stdin = std::io::stdin();
+        let stderr = std::io::stderr();
+        result_holder = Some(prompt_resolve(
+            stdin.lock(),
+            stderr.lock(),
+            1, // No global counter yet — drivers don't share an index/total.
+            1,
+            local_path,
+            remote_bytes,
+        ));
+    });
+    let resolution = result_holder.expect("prompt_resolve ran inside suspend")?;
     match resolution {
         Resolution::KeepLocal => {
             let local_bytes = std::fs::read(local_path)
@@ -285,7 +304,7 @@ fn resolve_conflict_interactive(
             write_atomic(local_path, &edited)?;
             Ok(content_hash(&edited))
         }
-        Resolution::Skip => shadow_file_conflict(local_path, remote_bytes),
+        Resolution::Skip => shadow_file_conflict(local_path, remote_bytes, progress),
         Resolution::Abort => Err(anyhow::Error::new(PullAborted)),
     }
 }
@@ -376,7 +395,9 @@ mod tests {
     fn apply_write_creates_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
-        let h = apply_pull_action(PullAction::Write, &path, b"hello", "h".repeat(64), false).unwrap();
+        let p = crate::progress::KindProgress::start("test");
+        let h = apply_pull_action(PullAction::Write, &path, b"hello", "h".repeat(64), false, &p).unwrap();
+        p.finish();
         assert_eq!(h, "h".repeat(64));
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
     }
@@ -387,7 +408,9 @@ mod tests {
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"local").unwrap();
         // interactive=false → legacy shadow-file behavior.
-        let _ = apply_pull_action(PullAction::Conflict, &path, b"remote", "h".repeat(64), false).unwrap();
+        let p = crate::progress::KindProgress::start("test");
+        let _ = apply_pull_action(PullAction::Conflict, &path, b"remote", "h".repeat(64), false, &p).unwrap();
+        p.finish();
         assert_eq!(std::fs::read(&path).unwrap(), b"local");
         assert_eq!(std::fs::read(dir.path().join("x.json.remote")).unwrap(), b"remote");
     }
@@ -398,7 +421,9 @@ mod tests {
             status: 403,
             body: "permission_denied".into()
         }));
-        let out = skip_on_permission_denied(err, "engines").unwrap();
+        let p = crate::progress::KindProgress::start("test");
+        let out = skip_on_permission_denied(err, "engines", &p).unwrap();
+        p.finish();
         assert!(out.is_empty());
     }
 
@@ -408,13 +433,16 @@ mod tests {
             status: 500,
             body: "boom".into()
         }));
-        assert!(skip_on_permission_denied(err, "engines").is_err());
+        let p = crate::progress::KindProgress::start("test");
+        assert!(skip_on_permission_denied(err, "engines", &p).is_err());
     }
 
     #[test]
     fn skip_on_permission_denied_passes_through_ok() {
         let v: Result<Vec<u32>> = Ok(vec![1, 2, 3]);
-        let out = skip_on_permission_denied(v, "engines").unwrap();
+        let p = crate::progress::KindProgress::start("test");
+        let out = skip_on_permission_denied(v, "engines", &p).unwrap();
+        p.finish();
         assert_eq!(out, vec![1, 2, 3]);
     }
 
@@ -438,14 +466,17 @@ mod tests {
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"original").unwrap();
         let original_bytes = std::fs::read(&path).unwrap();
+        let p = crate::progress::KindProgress::start("test");
         let h = apply_pull_action(
             PullAction::NoChange,
             &path,
             b"different remote bytes",
             "h".repeat(64),
             false,
+            &p,
         )
         .unwrap();
+        p.finish();
         assert_eq!(h, "h".repeat(64));
         // Local file unchanged byte-for-byte.
         assert_eq!(std::fs::read(&path).unwrap(), original_bytes);

@@ -16,6 +16,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, progress: &KindPro
     let workspaces = skip_on_permission_denied(
         ctx.client.list_workspaces().await.context("listing workspaces"),
         "workspaces",
+        progress,
     )?;
     progress.set_total(workspaces.len() as u64);
 

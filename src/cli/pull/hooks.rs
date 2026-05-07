@@ -14,6 +14,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<(usi
     let hooks = skip_on_permission_denied(
         ctx.client.list_hooks().await.context("listing hooks"),
         "hooks",
+        progress,
     )?;
     progress.set_total(hooks.len() as u64);
 
@@ -88,7 +89,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<(usi
             PullAction::Write => {
                 // The `interactive` flag is irrelevant on Write (no resolver
                 // path); pass `ctx.interactive` for consistency.
-                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone(), ctx.interactive)?;
+                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone(), ctx.interactive, progress)?;
                 if let Some(code) = &proposed_code {
                     write_hook_code(&ctx.paths.hooks_dir(), &slug, code)
                         .with_context(|| format!("writing hook code for '{}'", hook.name))?;

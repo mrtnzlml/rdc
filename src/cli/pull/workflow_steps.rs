@@ -9,6 +9,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<(usi
     let steps = skip_on_permission_denied(
         ctx.client.list_workflow_steps().await.context("listing workflow steps"),
         "workflow_steps",
+        progress,
     )?;
     progress.set_total(steps.len() as u64);
 
@@ -43,7 +44,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<(usi
         if action == PullAction::Conflict {
             conflicts += 1;
         }
-        let recorded_hash = apply_pull_action(action, &local_path, &proposed, remote_hash, ctx.interactive)?;
+        let recorded_hash = apply_pull_action(action, &local_path, &proposed, remote_hash, ctx.interactive, progress)?;
 
         record_object(
             ctx.lockfile,

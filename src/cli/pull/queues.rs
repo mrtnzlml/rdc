@@ -40,6 +40,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<Queu
     let queues = skip_on_permission_denied(
         ctx.client.list_queues().await.context("listing queues"),
         "queues",
+        progress,
     )?;
 
     progress.set_total(queues.len() as u64);
@@ -93,7 +94,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<Queu
         if q_action == PullAction::Conflict {
             counts.conflicts += 1;
         }
-        let q_recorded = apply_pull_action(q_action, &queue_path, &queue_proposed, q_remote_hash, ctx.interactive)?;
+        let q_recorded = apply_pull_action(q_action, &queue_path, &queue_proposed, q_remote_hash, ctx.interactive, progress)?;
         record_object(
             ctx.lockfile,
             "queues",
@@ -161,7 +162,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<Queu
             write_schema_for_queue(ctx, &mut counts, w, schema, progress)?;
         }
         if let Some(inbox) = inbox_opt {
-            write_inbox_for_queue(ctx, &mut counts, w, inbox)?;
+            write_inbox_for_queue(ctx, &mut counts, w, inbox, progress)?;
         }
         progress.tick();
     }
@@ -315,6 +316,7 @@ fn write_inbox_for_queue(
     counts: &mut QueueCounts,
     w: &QueueWork<'_>,
     inbox: &Inbox,
+    progress: &KindProgress,
 ) -> Result<()> {
     let inbox_path = w.queue_dir.join("inbox.json");
     let mut inbox_proposed = serde_json::to_vec_pretty(inbox).context("serializing inbox")?;
@@ -334,7 +336,7 @@ fn write_inbox_for_queue(
     if i_action == PullAction::Conflict {
         counts.conflicts += 1;
     }
-    let i_recorded = apply_pull_action(i_action, &inbox_path, &inbox_proposed, i_remote_hash, ctx.interactive)?;
+    let i_recorded = apply_pull_action(i_action, &inbox_path, &inbox_proposed, i_remote_hash, ctx.interactive, progress)?;
     record_object(
         ctx.lockfile,
         "inboxes",
