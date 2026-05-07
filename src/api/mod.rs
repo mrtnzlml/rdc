@@ -160,6 +160,32 @@ impl RossumClient {
         self.get_json(&url).await
     }
 
+    /// PATCH /schemas/{id} with the given schema body. Returns the server's
+    /// authoritative response (including server-set fields like modified_at).
+    /// Used by `rdc push` to apply local schema edits (including formula
+    /// changes spliced back via `read_schema`).
+    pub async fn update_schema(&self, id: u64, schema: &crate::model::Schema)
+        -> Result<crate::model::Schema>
+    {
+        let url = format!("{}/schemas/{id}", self.base_url);
+        let resp = self
+            .http
+            .patch(&url)
+            .header("Authorization", format!("token {}", self.token))
+            .json(schema)
+            .send()
+            .await
+            .with_context(|| format!("PATCH {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ApiError::Status { status: status.as_u16(), body }.into());
+        }
+        let value = resp.json::<crate::model::Schema>().await
+            .with_context(|| format!("decoding PATCH response from {url}"))?;
+        Ok(value)
+    }
+
     pub async fn list_rules(&self) -> Result<Vec<crate::model::Rule>> {
         let mut url = format!("{}/rules", self.base_url);
         let mut out = Vec::new();
