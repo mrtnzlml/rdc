@@ -35,12 +35,12 @@ const MAX_SLEEP_SECS: u64 = 60;
 /// (since `RequestBuilder` is consumed by `.send()`).
 ///
 /// `progress` — when `Some`, retry warnings are printed via
-/// `progress.suspend()` so the progress bar isn't corrupted. Pass `None`
+/// `progress.println()` so the progress bar isn't corrupted. Pass `None`
 /// when no progress bar is active (e.g. `rdc auth`, `rdc diff`).
 pub async fn send_with_retry(
     mut build: impl FnMut() -> reqwest::RequestBuilder,
     desc: &str,
-    progress: Option<&crate::progress::KindProgress>,
+    progress: Option<std::sync::Arc<crate::progress::OverallProgress>>,
 ) -> Result<Response> {
     for attempt in 0..MAX_ATTEMPTS {
         let resp = build()
@@ -57,8 +57,8 @@ pub async fn send_with_retry(
                     attempt + 1,
                     MAX_ATTEMPTS,
                 );
-                match progress {
-                    Some(p) => p.suspend(move || eprintln!("{msg}")),
+                match &progress {
+                    Some(p) => p.println(&msg),
                     None => eprintln!("{msg}"),
                 }
                 tokio::time::sleep(wait).await;

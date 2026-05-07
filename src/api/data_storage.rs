@@ -48,13 +48,13 @@ impl DataStorageClient {
 
     /// `POST /v1/collections/list` with `{nameOnly: false}` returns full
     /// collection metadata (name, type, options, info, idIndex).
-    pub async fn list_collections(&self, progress: Option<&crate::progress::KindProgress>) -> Result<Vec<Collection>> {
+    pub async fn list_collections(&self, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<Vec<Collection>> {
         self.post_envelope("/v1/collections/list", json!({"nameOnly": false}), progress).await
     }
 
     /// `POST /v1/indexes/list` with `{collectionName, nameOnly: false}` —
     /// regular MongoDB-style indexes (incl. the implicit `_id_` index).
-    pub async fn list_indexes(&self, collection: &str, progress: Option<&crate::progress::KindProgress>) -> Result<Vec<Value>> {
+    pub async fn list_indexes(&self, collection: &str, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<Vec<Value>> {
         self.post_envelope("/v1/indexes/list", json!({
             "collectionName": collection,
             "nameOnly": false,
@@ -62,7 +62,7 @@ impl DataStorageClient {
     }
 
     /// `POST /v1/search_indexes/list` — Atlas Search indexes.
-    pub async fn list_search_indexes(&self, collection: &str, progress: Option<&crate::progress::KindProgress>) -> Result<Vec<Value>> {
+    pub async fn list_search_indexes(&self, collection: &str, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<Vec<Value>> {
         self.post_envelope("/v1/search_indexes/list", json!({
             "collectionName": collection,
             "nameOnly": false,
@@ -73,7 +73,7 @@ impl DataStorageClient {
         &self,
         path: &str,
         body: Value,
-        progress: Option<&crate::progress::KindProgress>,
+        progress: Option<std::sync::Arc<crate::progress::OverallProgress>>,
     ) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
         let resp = crate::api::retry::send_with_retry(

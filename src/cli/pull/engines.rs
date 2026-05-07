@@ -2,19 +2,21 @@ use super::common::{
     apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
     skip_on_permission_denied, PullAction, PullCtx,
 };
-use crate::progress::KindProgress;
+use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// Pull all engines. Returns `(count, conflicts)`.
-pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<(usize, usize)> {
+pub async fn pull(ctx: &mut PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
+    progress.start_phase("engines");
     let engines = skip_on_permission_denied(
-        ctx.client.list_engines(Some(progress)).await.context("listing engines"),
+        ctx.client.list_engines(Some(progress.clone())).await.context("listing engines"),
         "engines",
         progress,
     )?;
-    progress.set_total(engines.len() as u64);
+    progress.inc_total(engines.len() as u64);
 
     let mut used: HashSet<String> = HashSet::new();
     let mut dir_created = false;
@@ -62,7 +64,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<(usi
             e.modified_at().map(|s| s.to_string()),
             Some(recorded_hash),
         );
-        progress.tick();
+        progress.tick(&e.name);
     }
 
     Ok((engines.len(), conflicts))

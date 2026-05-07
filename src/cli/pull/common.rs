@@ -1,9 +1,11 @@
 use crate::api::{ApiError, RossumClient};
 use crate::paths::Paths;
+use crate::progress::OverallProgress;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
 use anyhow::{anyhow, Context, Result};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 /// If `result` is a 403 permission_denied from the Rossum API, log a warning
 /// and return an empty list — the kind is unavailable to this token, but
@@ -11,7 +13,7 @@ use std::path::Path;
 pub fn skip_on_permission_denied<T>(
     result: Result<Vec<T>>,
     kind: &str,
-    progress: &crate::progress::KindProgress,
+    progress: &Arc<OverallProgress>,
 ) -> Result<Vec<T>> {
     match result {
         Ok(v) => Ok(v),
@@ -22,10 +24,7 @@ pub fn skip_on_permission_denied<T>(
                     .unwrap_or(false)
             });
             if is_403 {
-                let kind_owned = kind.to_string();
-                progress.suspend(move || {
-                    eprintln!("warning: skipping {kind_owned} — token lacks permission (403)");
-                });
+                progress.println(format!("warning: skipping {kind} — token lacks permission (403)"));
                 Ok(Vec::new())
             } else {
                 Err(e)
@@ -204,7 +203,7 @@ pub fn apply_pull_action(
     remote_bytes: &[u8],
     remote_hash: String,
     interactive: bool,
-    progress: &crate::progress::KindProgress,
+    progress: &Arc<OverallProgress>,
 ) -> Result<String> {
     use crate::snapshot::writer::write_atomic;
     match action {
@@ -239,7 +238,7 @@ pub fn apply_pull_action(
 fn shadow_file_conflict(
     local_path: &Path,
     remote_bytes: &[u8],
-    progress: &crate::progress::KindProgress,
+    progress: &Arc<OverallProgress>,
 ) -> Result<String> {
     use crate::snapshot::writer::write_atomic;
     let mut conflict_path = local_path.to_path_buf();
@@ -249,13 +248,11 @@ fn shadow_file_conflict(
     };
     conflict_path.set_file_name(new_name);
     write_atomic(&conflict_path, remote_bytes)?;
-    let local_path_disp = local_path.display().to_string();
-    let conflict_path_disp = conflict_path.display().to_string();
-    progress.suspend(move || {
-        eprintln!(
-            "warning: {local_path_disp} conflict — local preserved, remote at {conflict_path_disp}"
-        );
-    });
+    progress.println(format!(
+        "warning: {} conflict — local preserved, remote at {}",
+        local_path.display(),
+        conflict_path.display(),
+    ));
     let local_bytes = std::fs::read(local_path)
         .with_context(|| format!("reading {}", local_path.display()))?;
     Ok(content_hash(&local_bytes))
@@ -269,27 +266,22 @@ fn resolve_conflict_interactive(
     local_path: &Path,
     remote_bytes: &[u8],
     remote_hash: &str,
-    progress: &crate::progress::KindProgress,
+    progress: &Arc<OverallProgress>,
 ) -> Result<String> {
     use crate::cli::resolve::{prompt_resolve, PullAborted, Resolution};
     use crate::snapshot::writer::write_atomic;
 
-    // Suspend the bar while the user is interacting so the prompt isn't
-    // overwritten by ticks.
-    let mut result_holder: Option<Result<Resolution>> = None;
-    progress.suspend(|| {
-        let stdin = std::io::stdin();
-        let stderr = std::io::stderr();
-        result_holder = Some(prompt_resolve(
-            stdin.lock(),
-            stderr.lock(),
-            1, // No global counter yet — drivers don't share an index/total.
-            1,
-            local_path,
-            remote_bytes,
-        ));
-    });
-    let resolution = result_holder.expect("prompt_resolve ran inside suspend")?;
+    let stdin = std::io::stdin();
+    let stderr = std::io::stderr();
+    let resolution = prompt_resolve(
+        stdin.lock(),
+        stderr.lock(),
+        1, // No global counter yet — drivers don't share an index/total.
+        1,
+        local_path,
+        remote_bytes,
+    )?;
+
     match resolution {
         Resolution::KeepLocal => {
             let local_bytes = std::fs::read(local_path)
@@ -395,7 +387,7 @@ mod tests {
     fn apply_write_creates_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
-        let p = crate::progress::KindProgress::start("test");
+        let p = crate::progress::OverallProgress::start("test");
         let h = apply_pull_action(PullAction::Write, &path, b"hello", "h".repeat(64), false, &p).unwrap();
         p.finish();
         assert_eq!(h, "h".repeat(64));
@@ -408,7 +400,7 @@ mod tests {
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"local").unwrap();
         // interactive=false → legacy shadow-file behavior.
-        let p = crate::progress::KindProgress::start("test");
+        let p = crate::progress::OverallProgress::start("test");
         let _ = apply_pull_action(PullAction::Conflict, &path, b"remote", "h".repeat(64), false, &p).unwrap();
         p.finish();
         assert_eq!(std::fs::read(&path).unwrap(), b"local");
@@ -421,7 +413,7 @@ mod tests {
             status: 403,
             body: "permission_denied".into()
         }));
-        let p = crate::progress::KindProgress::start("test");
+        let p = crate::progress::OverallProgress::start("test");
         let out = skip_on_permission_denied(err, "engines", &p).unwrap();
         p.finish();
         assert!(out.is_empty());
@@ -433,14 +425,14 @@ mod tests {
             status: 500,
             body: "boom".into()
         }));
-        let p = crate::progress::KindProgress::start("test");
+        let p = crate::progress::OverallProgress::start("test");
         assert!(skip_on_permission_denied(err, "engines", &p).is_err());
     }
 
     #[test]
     fn skip_on_permission_denied_passes_through_ok() {
         let v: Result<Vec<u32>> = Ok(vec![1, 2, 3]);
-        let p = crate::progress::KindProgress::start("test");
+        let p = crate::progress::OverallProgress::start("test");
         let out = skip_on_permission_denied(v, "engines", &p).unwrap();
         p.finish();
         assert_eq!(out, vec![1, 2, 3]);
@@ -466,7 +458,7 @@ mod tests {
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"original").unwrap();
         let original_bytes = std::fs::read(&path).unwrap();
-        let p = crate::progress::KindProgress::start("test");
+        let p = crate::progress::OverallProgress::start("test");
         let h = apply_pull_action(
             PullAction::NoChange,
             &path,

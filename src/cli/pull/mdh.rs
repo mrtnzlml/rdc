@@ -2,11 +2,12 @@ use super::common::{apply_pull_action, decide_pull_action, record_object, PullAc
 use crate::api::{anyhow_has_status, DataStorageClient};
 use crate::config::EnvConfig;
 use crate::model::IndexSet;
-use crate::progress::KindProgress;
+use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use futures::stream::{StreamExt, TryStreamExt};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// Pulls Master Data Hub collections + indexes for `env_cfg`. The Data
 /// Storage base URL is always derived from `env_cfg.api_base` (no separate
@@ -19,13 +20,14 @@ use std::collections::HashSet;
 /// doesn't take 20 sequential round-trips.
 ///
 /// Returns `(collection_count, conflicts)`.
-pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str, progress: &KindProgress) -> Result<(usize, usize)> {
+pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
+    progress.start_phase("mdh");
     let base = env_cfg.data_storage_base();
 
     let client = DataStorageClient::new(base, token.to_string())
         .context("constructing Data Storage client")?;
 
-    let collections = match client.list_collections(Some(progress)).await {
+    let collections = match client.list_collections(Some(progress.clone())).await {
         Ok(c) => c,
         Err(e) if anyhow_has_status(&e, 404) => {
             // MDH not enabled on this cluster — quietly skip, matching the
@@ -35,7 +37,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str, progr
         Err(e) => return Err(e.context("listing MDH collections")),
     };
 
-    progress.set_total(collections.len() as u64);
+    progress.inc_total(collections.len() as u64);
 
     let mut used: HashSet<String> = HashSet::new();
     let mut conflicts = 0usize;
@@ -87,15 +89,19 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str, progr
     // === Phase 2: concurrent index fetches per collection (regular +
     //            search). Bounded by ctx.concurrency.
     let client_ref = &client;
+    let progress_inner = progress.clone();
     let fetched: Vec<(String, IndexSet)> = futures::stream::iter(
         dataset_dirs.iter().map(|(slug, _, c)| (slug.clone(), c.name.clone()))
     )
-    .map(|(slug, name)| async move {
-        let regular = client_ref.list_indexes(&name, None).await
-            .with_context(|| format!("listing indexes for '{name}'"))?;
-        let search = client_ref.list_search_indexes(&name, None).await
-            .with_context(|| format!("listing search indexes for '{name}'"))?;
-        Ok::<_, anyhow::Error>((slug, IndexSet { regular, search }))
+    .map(|(slug, name)| {
+        let p = progress_inner.clone();
+        async move {
+            let regular = client_ref.list_indexes(&name, Some(p.clone())).await
+                .with_context(|| format!("listing indexes for '{name}'"))?;
+            let search = client_ref.list_search_indexes(&name, Some(p.clone())).await
+                .with_context(|| format!("listing search indexes for '{name}'"))?;
+            Ok::<_, anyhow::Error>((slug, IndexSet { regular, search }))
+        }
     })
     .buffer_unordered(ctx.concurrency)
     .try_collect()
@@ -104,7 +110,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str, progr
 
     // === Phase 3: per-collection indexes.json write decision (sequential
     //            because we mutate ctx.lockfile + counts).
-    for (slug, dataset_dir, _) in &dataset_dirs {
+    for (slug, dataset_dir, c) in &dataset_dirs {
         let Some(index_set) = by_slug.get(slug) else { continue };
 
         let ix_path = dataset_dir.join("indexes.json");
@@ -131,7 +137,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str, progr
             None,
             Some(i_recorded),
         );
-        progress.tick();
+        progress.tick(&c.name);
     }
 
     Ok((collections.len(), conflicts))

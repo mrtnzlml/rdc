@@ -1497,9 +1497,12 @@ async fn pull_with_orphan_queue_surfaces_count_in_done_line() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    // With the single-bar design, orphan counts accumulate globally and
+    // appear in the final pull summary line (stdout) rather than per-phase
+    // stderr lines.
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stderr.contains("✓ queues:") && stderr.contains("orphans skipped"),
-        "expected orphans-skipped count in queues done-line. stderr was: {stderr}"
+        stdout.contains("orphans skipped"),
+        "expected orphans-skipped count in pull summary. stdout was: {stdout}"
     );
 }

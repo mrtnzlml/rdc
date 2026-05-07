@@ -1,10 +1,11 @@
 use crate::api::RossumClient;
 use crate::config::ProjectConfig;
 use crate::paths::Paths;
-use crate::progress::KindProgress;
+use crate::progress::OverallProgress;
 use crate::secrets::resolve_token;
 use crate::state::Lockfile;
 use anyhow::{anyhow, Context, Result};
+use std::sync::Arc;
 
 pub(crate) mod common;
 mod email_templates;
@@ -46,7 +47,6 @@ struct PullStats {
     n_datasets: usize,
     c_datasets: usize,
     c_orgs: usize,
-    orphans: usize,
 }
 
 pub async fn run(env: &str, concurrency: usize, interactive: bool) -> Result<()> {
@@ -69,6 +69,8 @@ pub async fn run(env: &str, concurrency: usize, interactive: bool) -> Result<()>
     let overlay = crate::overlay::Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
+    let progress = OverallProgress::start(format!("pull envs/{env}"));
+
     // Run drivers in a separate scope so the &mut borrow of `lockfile`
     // ends before we save it. If the user picks `[a]bort` at any
     // resolver prompt, a `PullAborted` error bubbles up; we detect it
@@ -85,12 +87,13 @@ pub async fn run(env: &str, concurrency: usize, interactive: bool) -> Result<()>
             concurrency,
             interactive,
         };
-        run_drivers(&mut ctx, env_cfg, env, &token).await
+        run_drivers(&mut ctx, env_cfg, env, &token, &progress).await
     };
 
     let stats = match pull_outcome {
         Ok(s) => s,
         Err(e) if is_aborted(&e) => {
+            progress.finish();
             eprintln!("pull aborted by user at conflict resolver; lockfile not saved.");
             return Ok(());
         }
@@ -105,6 +108,9 @@ pub async fn run(env: &str, concurrency: usize, interactive: bool) -> Result<()>
     lockfile.save(&paths.lockfile())?;
     crate::cli::index::generate(&paths, &lockfile)
         .with_context(|| format!("generating _index.md for env '{env}'"))?;
+
+    let orphans = progress.orphans();
+    progress.finish();
 
     let mut summary = format!(
         "Pulled {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}",
@@ -128,8 +134,8 @@ pub async fn run(env: &str, concurrency: usize, interactive: bool) -> Result<()>
     if stats.n_datasets > 0 {
         summary.push_str(&format!(", {}", common::pluralize(stats.n_datasets, "dataset", "datasets")));
     }
-    if stats.orphans > 0 {
-        summary.push_str(&format!(", {} orphans skipped", stats.orphans));
+    if orphans > 0 {
+        summary.push_str(&format!(", {} orphans skipped", orphans));
     }
     if total_conflicts > 0 {
         summary.push_str(&format!(", {}", common::pluralize(total_conflicts, "conflict", "conflicts")));
@@ -146,94 +152,32 @@ async fn run_drivers(
     env_cfg: &crate::config::EnvConfig,
     env: &str,
     token: &str,
+    progress: &Arc<OverallProgress>,
 ) -> Result<PullStats> {
-    let (n_orgs, c_orgs) = {
-        let p = KindProgress::start("organization");
-        let result = organization::pull(ctx, env_cfg.org_id, &p).await
-            .with_context(|| format!("pulling organization for env '{env}'"))?;
-        p.finish();
-        result
-    };
-    let n_workspaces = {
-        let p = KindProgress::start("workspaces");
-        let result = workspaces::pull(ctx, env_cfg, &p).await
-            .with_context(|| format!("pulling workspaces for env '{env}'"))?;
-        p.finish();
-        result
-    };
-    let (qc, queues_orphans) = {
-        let p = KindProgress::start("queues");
-        let result = queues::pull(ctx, &p).await
-            .with_context(|| format!("pulling queues for env '{env}'"))?;
-        let orphans = p.orphans();
-        p.finish();
-        (result, orphans)
-    };
-    let (n_hooks, c_hooks) = {
-        let p = KindProgress::start("hooks");
-        let result = hooks::pull(ctx, &p).await
-            .with_context(|| format!("pulling hooks for env '{env}'"))?;
-        p.finish();
-        result
-    };
-    let (n_rules, c_rules) = {
-        let p = KindProgress::start("rules");
-        let result = rules::pull(ctx, &p).await
-            .with_context(|| format!("pulling rules for env '{env}'"))?;
-        p.finish();
-        result
-    };
-    let (n_labels, c_labels) = {
-        let p = KindProgress::start("labels");
-        let result = labels::pull(ctx, &p).await
-            .with_context(|| format!("pulling labels for env '{env}'"))?;
-        p.finish();
-        result
-    };
-    let (n_engines, c_engines) = {
-        let p = KindProgress::start("engines");
-        let result = engines::pull(ctx, &p).await
-            .with_context(|| format!("pulling engines for env '{env}'"))?;
-        p.finish();
-        result
-    };
-    let (n_engine_fields, c_engine_fields) = {
-        let p = KindProgress::start("engine_fields");
-        let result = engine_fields::pull(ctx, &p).await
-            .with_context(|| format!("pulling engine fields for env '{env}'"))?;
-        p.finish();
-        result
-    };
-    let (n_workflows, c_workflows) = {
-        let p = KindProgress::start("workflows");
-        let result = workflows::pull(ctx, &p).await
-            .with_context(|| format!("pulling workflows for env '{env}'"))?;
-        p.finish();
-        result
-    };
-    let (n_workflow_steps, c_workflow_steps) = {
-        let p = KindProgress::start("workflow_steps");
-        let result = workflow_steps::pull(ctx, &p).await
-            .with_context(|| format!("pulling workflow steps for env '{env}'"))?;
-        p.finish();
-        result
-    };
-    let (n_email_templates, c_email_templates, email_templates_orphans) = {
-        let p = KindProgress::start("email_templates");
-        let result = email_templates::pull(ctx, &p).await
-            .with_context(|| format!("pulling email templates for env '{env}'"))?;
-        let orphans = p.orphans();
-        p.finish();
-        let (n, c) = result;
-        (n, c, orphans)
-    };
-    let (n_datasets, c_datasets) = {
-        let p = KindProgress::start("mdh");
-        let result = mdh::pull(ctx, env_cfg, token, &p).await
-            .with_context(|| format!("pulling MDH datasets for env '{env}'"))?;
-        p.finish();
-        result
-    };
+    let (n_orgs, c_orgs) = organization::pull(ctx, env_cfg.org_id, progress).await
+        .with_context(|| format!("pulling organization for env '{env}'"))?;
+    let n_workspaces = workspaces::pull(ctx, env_cfg, progress).await
+        .with_context(|| format!("pulling workspaces for env '{env}'"))?;
+    let qc = queues::pull(ctx, progress).await
+        .with_context(|| format!("pulling queues for env '{env}'"))?;
+    let (n_hooks, c_hooks) = hooks::pull(ctx, progress).await
+        .with_context(|| format!("pulling hooks for env '{env}'"))?;
+    let (n_rules, c_rules) = rules::pull(ctx, progress).await
+        .with_context(|| format!("pulling rules for env '{env}'"))?;
+    let (n_labels, c_labels) = labels::pull(ctx, progress).await
+        .with_context(|| format!("pulling labels for env '{env}'"))?;
+    let (n_engines, c_engines) = engines::pull(ctx, progress).await
+        .with_context(|| format!("pulling engines for env '{env}'"))?;
+    let (n_engine_fields, c_engine_fields) = engine_fields::pull(ctx, progress).await
+        .with_context(|| format!("pulling engine fields for env '{env}'"))?;
+    let (n_workflows, c_workflows) = workflows::pull(ctx, progress).await
+        .with_context(|| format!("pulling workflows for env '{env}'"))?;
+    let (n_workflow_steps, c_workflow_steps) = workflow_steps::pull(ctx, progress).await
+        .with_context(|| format!("pulling workflow steps for env '{env}'"))?;
+    let (n_email_templates, c_email_templates) = email_templates::pull(ctx, progress).await
+        .with_context(|| format!("pulling email templates for env '{env}'"))?;
+    let (n_datasets, c_datasets) = mdh::pull(ctx, env_cfg, token, progress).await
+        .with_context(|| format!("pulling MDH datasets for env '{env}'"))?;
 
     Ok(PullStats {
         n_orgs, c_orgs,
@@ -248,7 +192,6 @@ async fn run_drivers(
         n_workflow_steps, c_workflow_steps,
         n_email_templates, c_email_templates,
         n_datasets, c_datasets,
-        orphans: queues_orphans + email_templates_orphans,
     })
 }
 

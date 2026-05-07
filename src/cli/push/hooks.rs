@@ -2,12 +2,13 @@ use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::KindProgress;
+use crate::progress::OverallProgress;
 use crate::snapshot::hook::{read_hook_value, serialize_hook, write_hook_code};
 use crate::snapshot::writer::write_atomic;
 use crate::state::{hook_combined_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub async fn push(
     paths: &Paths,
@@ -15,7 +16,7 @@ pub async fn push(
     lockfile: &mut Lockfile,
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
-    progress: &KindProgress,
+    progress: &Arc<OverallProgress>,
 ) -> Result<(usize, usize)> {
     // Load overlay if present. Overlay drives both the outbound payload
     // (apply_overrides) AND the strip applied to remote bytes for hashing
@@ -35,16 +36,16 @@ pub async fn push(
 
         let entry = lockfile.objects.get("hooks").and_then(|m| m.get(slug.as_str()));
         let Some(entry) = entry else {
-            progress.suspend(|| {
-                eprintln!("warning: hooks/{slug}.json — no lockfile entry, skipping (push only updates existing objects)");
-            });
+            progress.println(format!(
+                "warning: hooks/{slug}.json — no lockfile entry, skipping (push only updates existing objects)"
+            ));
             skipped += 1;
             continue;
         };
         let Some(base) = &entry.content_hash else {
-            progress.suspend(|| {
-                eprintln!("warning: hooks/{slug}.json — lockfile entry has no content_hash, skipping");
-            });
+            progress.println(format!(
+                "warning: hooks/{slug}.json — lockfile entry has no content_hash, skipping"
+            ));
             skipped += 1;
             continue;
         };
@@ -67,15 +68,15 @@ pub async fn push(
         // hash. Compare to base (which was recorded post-strip on pull).
         if remote_hooks.is_none() {
             remote_hooks = Some(
-                client.list_hooks(Some(progress)).await
+                client.list_hooks(Some(progress.clone())).await
                     .context("listing hooks to verify no drift before push")?,
             );
         }
         let remote_list = remote_hooks.as_ref().unwrap();
         let Some(remote_hook) = remote_list.iter().find(|h| h.id == id) else {
-            progress.suspend(|| {
-                eprintln!("warning: hooks/{slug}.json — id {id} not found on remote, skipping");
-            });
+            progress.println(format!(
+                "warning: hooks/{slug}.json — id {id} not found on remote, skipping"
+            ));
             skipped += 1;
             continue;
         };
@@ -120,18 +121,16 @@ pub async fn push(
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    progress.suspend(|| {
-                        eprintln!(
-                            "warning: hooks/{slug}.json — remote has changed since last pull, skipping push (run `rdc pull` first)"
-                        );
-                    });
+                    progress.println(format!(
+                        "warning: hooks/{slug}.json — remote has changed since last pull, skipping push (run `rdc pull` first)"
+                    ));
                     skipped += 1;
                     continue;
                 }
             }
         }
 
-        let updated = client.update_hook(id, &payload_to_send, Some(progress)).await
+        let updated = client.update_hook(id, &payload_to_send, Some(progress.clone())).await
             .with_context(|| format!("PATCH /hooks/{id}"))?;
 
         // Refresh local file with the post-strip canonical form (matches
@@ -156,7 +155,7 @@ pub async fn push(
                 content_hash: Some(updated_hash),
             },
         );
-        progress.tick();
+        progress.tick(slug.as_str());
         pushed += 1;
     }
 

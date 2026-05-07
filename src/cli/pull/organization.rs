@@ -1,14 +1,16 @@
 use super::common::{apply_pull_action, decide_pull_action, record_object, PullAction, PullCtx};
-use crate::progress::KindProgress;
+use crate::progress::OverallProgress;
 use anyhow::{Context, Result};
+use std::sync::Arc;
 
 /// Pull the env's organization. The org_id comes from the env's config in
 /// rdc.toml. Returns `(count, conflicts)`.
-pub async fn pull(ctx: &mut PullCtx<'_>, org_id: u64, progress: &KindProgress) -> Result<(usize, usize)> {
-    progress.set_total(1);
+pub async fn pull(ctx: &mut PullCtx<'_>, org_id: u64, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
+    progress.start_phase("organization");
+    progress.inc_total(1);
     let org = ctx
         .client
-        .get_organization(org_id, Some(progress))
+        .get_organization(org_id, Some(progress.clone()))
         .await
         .with_context(|| format!("fetching organization {org_id}"))?;
 
@@ -41,7 +43,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, org_id: u64, progress: &KindProgress) -
         org.modified_at().map(|s| s.to_string()),
         Some(recorded_hash),
     );
-    progress.tick();
+    progress.tick(&org.name);
 
     Ok((1, conflicts))
 }

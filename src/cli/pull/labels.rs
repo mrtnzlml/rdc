@@ -2,19 +2,21 @@ use super::common::{
     apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
     skip_on_permission_denied, PullAction, PullCtx,
 };
-use crate::progress::KindProgress;
+use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// Pull all labels. Returns `(count, conflicts)`.
-pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<(usize, usize)> {
+pub async fn pull(ctx: &mut PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
+    progress.start_phase("labels");
     let labels = skip_on_permission_denied(
-        ctx.client.list_labels(Some(progress)).await.context("listing labels"),
+        ctx.client.list_labels(Some(progress.clone())).await.context("listing labels"),
         "labels",
         progress,
     )?;
-    progress.set_total(labels.len() as u64);
+    progress.inc_total(labels.len() as u64);
 
     let mut used: HashSet<String> = HashSet::new();
     let mut dir_created = false;
@@ -62,7 +64,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<(usi
             l.modified_at().map(|s| s.to_string()),
             Some(recorded_hash),
         );
-        progress.tick();
+        progress.tick(&l.name);
     }
 
     Ok((labels.len(), conflicts))

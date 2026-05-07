@@ -2,11 +2,12 @@ use crate::api::{anyhow_has_status, RossumClient};
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::KindProgress;
+use crate::progress::OverallProgress;
 use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub async fn push(
     paths: &Paths,
@@ -14,7 +15,7 @@ pub async fn push(
     lockfile: &mut Lockfile,
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
-    progress: &KindProgress,
+    progress: &Arc<OverallProgress>,
 ) -> Result<(usize, usize)> {
     let overlay = Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
@@ -29,16 +30,12 @@ pub async fn push(
 
         let entry = lockfile.objects.get("engine_fields").and_then(|m| m.get(slug.as_str()));
         let Some(entry) = entry else {
-            progress.suspend(|| {
-                eprintln!("warning: engine-fields/{slug}.json — no lockfile entry, skipping");
-            });
+            progress.println(format!("warning: engine-fields/{slug}.json — no lockfile entry, skipping"));
             skipped += 1;
             continue;
         };
         let Some(base) = &entry.content_hash else {
-            progress.suspend(|| {
-                eprintln!("warning: engine-fields/{slug}.json — lockfile has no content_hash, skipping");
-            });
+            progress.println(format!("warning: engine-fields/{slug}.json — lockfile has no content_hash, skipping"));
             skipped += 1;
             continue;
         };
@@ -55,13 +52,11 @@ pub async fn push(
 
         let id = entry.id;
         if remote_cache.is_none() {
-            remote_cache = Some(client.list_engine_fields(Some(progress)).await
+            remote_cache = Some(client.list_engine_fields(Some(progress.clone())).await
                 .context("listing engine fields to verify no drift before push")?);
         }
         let Some(remote_field) = remote_cache.as_ref().unwrap().iter().find(|f| f.id == id) else {
-            progress.suspend(|| {
-                eprintln!("warning: engine-fields/{slug}.json — id {id} not found on remote, skipping");
-            });
+            progress.println(format!("warning: engine-fields/{slug}.json — id {id} not found on remote, skipping"));
             skipped += 1;
             continue;
         };
@@ -97,27 +92,23 @@ pub async fn push(
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    progress.suspend(|| {
-                        eprintln!(
-                            "warning: engine-fields/{slug}.json — remote has changed since last pull, skipping push (run `rdc pull` first)"
-                        );
-                    });
+                    progress.println(format!(
+                        "warning: engine-fields/{slug}.json — remote has changed since last pull, skipping push (run `rdc pull` first)"
+                    ));
                     skipped += 1;
                     continue;
                 }
             }
         }
 
-        let updated = match client.update_engine_field(id, &payload_to_send, Some(progress)).await
+        let updated = match client.update_engine_field(id, &payload_to_send, Some(progress.clone())).await
             .with_context(|| format!("PATCH /engine_fields/{id}"))
         {
             Ok(u) => u,
             Err(e) if anyhow_has_status(&e, 405) => {
-                progress.suspend(|| {
-                    eprintln!(
-                        "warning: engine fields are not writable via PATCH on this Rossum org/plan (405 Method Not Allowed). Skipping all engine field pushes."
-                    );
-                });
+                progress.println(
+                    "warning: engine fields are not writable via PATCH on this Rossum org/plan (405 Method Not Allowed). Skipping all engine field pushes."
+                );
                 skipped += 1;
                 break;
             }
@@ -142,7 +133,7 @@ pub async fn push(
                 content_hash: Some(updated_hash),
             },
         );
-        progress.tick();
+        progress.tick(slug.as_str());
         pushed += 1;
     }
 

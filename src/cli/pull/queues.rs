@@ -12,11 +12,12 @@ use super::common::{
     record_object, skip_on_permission_denied, PullAction, PullCtx,
 };
 use crate::model::{Inbox, Queue, Schema};
-use crate::progress::KindProgress;
+use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use futures::stream::{StreamExt, TryStreamExt};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Counts of objects pulled by the queues driver.
 pub struct QueueCounts {
@@ -36,14 +37,15 @@ struct QueueWork<'a> {
     inbox_id: Option<u64>,
 }
 
-pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<QueueCounts> {
+pub async fn pull(ctx: &mut PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<QueueCounts> {
+    progress.start_phase("queues");
     let queues = skip_on_permission_denied(
-        ctx.client.list_queues(Some(progress)).await.context("listing queues"),
+        ctx.client.list_queues(Some(progress.clone())).await.context("listing queues"),
         "queues",
         progress,
     )?;
 
-    progress.set_total(queues.len() as u64);
+    progress.inc_total(queues.len() as u64);
     let mut per_ws_used_slugs: HashMap<String, HashSet<String>> = HashMap::new();
     let mut counts = QueueCounts { queues: 0, schemas: 0, inboxes: 0, conflicts: 0 };
 
@@ -112,10 +114,9 @@ pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<Queu
             Some(url) => Some(parse_id_from_url(url)
                 .with_context(|| format!("parsing schema URL '{}' for queue '{}'", url, q.name))?),
             None => {
-                let q_name = q.name.clone();
-                let q_id = q.id;
-                progress.suspend(move || eprintln!(
-                    "warning: queue '{q_name}' (id {q_id}) has no schema — skipping schema + inbox"
+                progress.println(format!(
+                    "warning: queue '{}' (id {}) has no schema — skipping schema + inbox",
+                    q.name, q.id,
                 ));
                 None
             }
@@ -132,21 +133,25 @@ pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<Queu
     // === Phase 2: concurrent schema + inbox fetches ===
     // Per spec §16 #4 + §7.2: bounded by ctx.concurrency.
     let client = ctx.client;
+    let progress_inner = progress.clone();
     let fetched_vec: Vec<(u64, Option<Schema>, Option<Inbox>)> = futures::stream::iter(
         work.iter().map(|w| (w.q.id, w.q.name.clone(), w.schema_id, w.inbox_id))
     )
-    .map(|(qid, qname, sid_opt, iid_opt)| async move {
-        let schema = match sid_opt {
-            Some(sid) => Some(client.get_schema(sid, None).await
-                .with_context(|| format!("fetching schema {sid} for queue '{qname}'"))?),
-            None => None,
-        };
-        let inbox = match iid_opt {
-            Some(iid) => Some(client.get_inbox(iid, None).await
-                .with_context(|| format!("fetching inbox {iid} for queue '{qname}'"))?),
-            None => None,
-        };
-        Ok::<_, anyhow::Error>((qid, schema, inbox))
+    .map(|(qid, qname, sid_opt, iid_opt)| {
+        let p = progress_inner.clone();
+        async move {
+            let schema = match sid_opt {
+                Some(sid) => Some(client.get_schema(sid, Some(p.clone())).await
+                    .with_context(|| format!("fetching schema {sid} for queue '{qname}'"))?),
+                None => None,
+            };
+            let inbox = match iid_opt {
+                Some(iid) => Some(client.get_inbox(iid, Some(p.clone())).await
+                    .with_context(|| format!("fetching inbox {iid} for queue '{qname}'"))?),
+                None => None,
+            };
+            Ok::<_, anyhow::Error>((qid, schema, inbox))
+        }
     })
     .buffer_unordered(ctx.concurrency)
     .try_collect()
@@ -164,7 +169,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<Queu
         if let Some(inbox) = inbox_opt {
             write_inbox_for_queue(ctx, &mut counts, w, inbox, progress)?;
         }
-        progress.tick();
+        progress.tick(&w.q.name);
     }
 
     Ok(counts)
@@ -175,7 +180,7 @@ fn write_schema_for_queue(
     counts: &mut QueueCounts,
     w: &QueueWork<'_>,
     schema: &Schema,
-    progress: &KindProgress,
+    progress: &Arc<OverallProgress>,
 ) -> Result<()> {
     let queue_dir = &w.queue_dir;
     let schema_path = queue_dir.join("schema.json");
@@ -288,11 +293,11 @@ fn write_schema_for_queue(
                         crate::snapshot::writer::write_atomic(&p, bytes)?;
                     }
                 }
-                let schema_path_disp = schema_path.display().to_string();
-                let remote_path_disp = queue_dir.join("schema.json.remote").display().to_string();
-                let formulas_remote_disp = queue_dir.join("formulas.remote").display().to_string();
-                progress.suspend(move || eprintln!(
-                    "warning: {schema_path_disp} conflict — local preserved, remote at {remote_path_disp} (formulas at {formulas_remote_disp})"
+                progress.println(format!(
+                    "warning: {} conflict — local preserved, remote at {} (formulas at {})",
+                    schema_path.display(),
+                    queue_dir.join("schema.json.remote").display(),
+                    queue_dir.join("formulas.remote").display(),
                 ));
                 crate::state::schema_combined_hash(local_json, &pre_local_formulas)
             }
@@ -316,7 +321,7 @@ fn write_inbox_for_queue(
     counts: &mut QueueCounts,
     w: &QueueWork<'_>,
     inbox: &Inbox,
-    progress: &KindProgress,
+    progress: &Arc<OverallProgress>,
 ) -> Result<()> {
     let inbox_path = w.queue_dir.join("inbox.json");
     let mut inbox_proposed = serde_json::to_vec_pretty(inbox).context("serializing inbox")?;

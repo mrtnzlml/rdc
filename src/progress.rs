@@ -6,6 +6,7 @@
 //! - Non-TTY (CI, piped): plain `→ phase: …` then `✓ phase: N items, Xs`
 //!   lines per phase. The same shape integration tests have asserted on.
 
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;

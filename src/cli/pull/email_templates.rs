@@ -2,10 +2,11 @@ use super::common::{
     apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
     skip_on_permission_denied, PullAction, PullCtx,
 };
-use crate::progress::KindProgress;
+use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Pull all email templates. Templates are queue-scoped in the live API
 /// (each carries a `queue` URL), so the snapshot nests them under the
@@ -20,13 +21,14 @@ use std::collections::{HashMap, HashSet};
 /// same five built-in templates).
 ///
 /// Returns `(count, conflicts)`.
-pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<(usize, usize)> {
+pub async fn pull(ctx: &mut PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
+    progress.start_phase("email_templates");
     let templates = skip_on_permission_denied(
-        ctx.client.list_email_templates(Some(progress)).await.context("listing email templates"),
+        ctx.client.list_email_templates(Some(progress.clone())).await.context("listing email templates"),
         "email_templates",
         progress,
     )?;
-    progress.set_total(templates.len() as u64);
+    progress.inc_total(templates.len() as u64);
 
     let mut per_queue_used_slugs: HashMap<(String, String), HashSet<String>> = HashMap::new();
     let mut count = 0usize;
@@ -97,7 +99,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<(usi
             Some(recorded_hash),
         );
         count += 1;
-        progress.tick();
+        progress.tick(&t.name);
     }
 
     Ok((count, conflicts))

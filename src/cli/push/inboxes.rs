@@ -2,11 +2,12 @@ use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::KindProgress;
+use crate::progress::OverallProgress;
 use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub async fn push(
     paths: &Paths,
@@ -14,7 +15,7 @@ pub async fn push(
     lockfile: &mut Lockfile,
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
-    progress: &KindProgress,
+    progress: &Arc<OverallProgress>,
 ) -> Result<(usize, usize)> {
     let overlay = Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
@@ -28,16 +29,12 @@ pub async fn push(
 
         let entry = lockfile.objects.get("inboxes").and_then(|m| m.get(q_slug.as_str()));
         let Some(entry) = entry else {
-            progress.suspend(|| {
-                eprintln!("warning: inbox for queue '{q_slug}' — no lockfile entry, skipping");
-            });
+            progress.println(format!("warning: inbox for queue '{q_slug}' — no lockfile entry, skipping"));
             skipped += 1;
             continue;
         };
         let Some(base) = &entry.content_hash else {
-            progress.suspend(|| {
-                eprintln!("warning: inbox for queue '{q_slug}' — lockfile entry has no content_hash, skipping");
-            });
+            progress.println(format!("warning: inbox for queue '{q_slug}' — lockfile entry has no content_hash, skipping"));
             skipped += 1;
             continue;
         };
@@ -53,7 +50,7 @@ pub async fn push(
             .with_context(|| format!("deserializing overlay-applied inbox '{q_slug}'"))?;
 
         let id = entry.id;
-        let remote_inbox = client.get_inbox(id, Some(progress)).await
+        let remote_inbox = client.get_inbox(id, Some(progress.clone())).await
             .with_context(|| format!("fetching inbox {id} to verify drift before push"))?;
         let mut remote_bytes = serde_json::to_vec_pretty(&remote_inbox)
             .context("serializing remote inbox")?;
@@ -87,18 +84,16 @@ pub async fn push(
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    progress.suspend(|| {
-                        eprintln!(
-                            "warning: inbox for queue '{q_slug}' — remote has changed since last pull, skipping push (run `rdc pull` first)"
-                        );
-                    });
+                    progress.println(format!(
+                        "warning: inbox for queue '{q_slug}' — remote has changed since last pull, skipping push (run `rdc pull` first)"
+                    ));
                     skipped += 1;
                     continue;
                 }
             }
         }
 
-        let updated = client.update_inbox(id, &payload_to_send, Some(progress)).await
+        let updated = client.update_inbox(id, &payload_to_send, Some(progress.clone())).await
             .with_context(|| format!("PATCH /inboxes/{id}"))?;
 
         let mut updated_bytes = serde_json::to_vec_pretty(&updated)
@@ -119,7 +114,7 @@ pub async fn push(
                 content_hash: Some(updated_hash),
             },
         );
-        progress.tick();
+        progress.tick(q_slug.as_str());
         pushed += 1;
     }
 

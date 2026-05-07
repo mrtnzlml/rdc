@@ -2,11 +2,12 @@ use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::KindProgress;
+use crate::progress::OverallProgress;
 use crate::snapshot::schema::{read_schema_value, serialize_schema, write_schema_bytes};
 use crate::state::{schema_combined_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// Push locally-edited schemas. Iterates the pre-computed change list (from
 /// phase 1 scan). Each entry's path is the schema.json file; the queue dir
@@ -19,7 +20,7 @@ pub async fn push(
     lockfile: &mut Lockfile,
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
-    progress: &KindProgress,
+    progress: &Arc<OverallProgress>,
 ) -> Result<(usize, usize)> {
     let overlay = Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
@@ -36,16 +37,12 @@ pub async fn push(
 
         let entry = lockfile.objects.get("schemas").and_then(|m| m.get(q_slug.as_str()));
         let Some(entry) = entry else {
-            progress.suspend(|| {
-                eprintln!("warning: schema for queue '{q_slug}' — no lockfile entry, skipping");
-            });
+            progress.println(format!("warning: schema for queue '{q_slug}' — no lockfile entry, skipping"));
             skipped += 1;
             continue;
         };
         let Some(base) = &entry.content_hash else {
-            progress.suspend(|| {
-                eprintln!("warning: schema for queue '{q_slug}' — lockfile entry has no content_hash, skipping");
-            });
+            progress.println(format!("warning: schema for queue '{q_slug}' — lockfile entry has no content_hash, skipping"));
             skipped += 1;
             continue;
         };
@@ -66,7 +63,7 @@ pub async fn push(
         let remote_schema = if let Some(s) = remote_cache.get(&id) {
             s.clone()
         } else {
-            let s = client.get_schema(id, Some(progress)).await
+            let s = client.get_schema(id, Some(progress.clone())).await
                 .with_context(|| format!("fetching schema {id} to verify drift before push"))?;
             remote_cache.insert(id, s.clone());
             s
@@ -103,18 +100,16 @@ pub async fn push(
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    progress.suspend(|| {
-                        eprintln!(
-                            "warning: schema for queue '{q_slug}' — remote has changed since last pull, skipping push (run `rdc pull` first)"
-                        );
-                    });
+                    progress.println(format!(
+                        "warning: schema for queue '{q_slug}' — remote has changed since last pull, skipping push (run `rdc pull` first)"
+                    ));
                     skipped += 1;
                     continue;
                 }
             }
         }
 
-        let updated = client.update_schema(id, &payload_to_send, Some(progress)).await
+        let updated = client.update_schema(id, &payload_to_send, Some(progress.clone())).await
             .with_context(|| format!("PATCH /schemas/{id}"))?;
 
         let (updated_json, updated_formulas) = serialize_schema(&updated)?;
@@ -133,7 +128,7 @@ pub async fn push(
                 content_hash: Some(updated_hash),
             },
         );
-        progress.tick();
+        progress.tick(q_slug.as_str());
         pushed += 1;
     }
 
