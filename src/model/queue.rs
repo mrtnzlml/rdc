@@ -2,16 +2,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-/// Rossum queue. Each queue belongs to a workspace and carries one schema
-/// (and optionally one inbox).
+/// Rossum queue. Most queues belong to a workspace and carry one schema
+/// (and optionally one inbox). Workspace can be null for orphan/hidden
+/// queues; schema can be null for templates or unconfigured queues.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Queue {
     pub id: u64,
     pub url: String,
     pub name: String,
-    pub workspace: String,
-    pub schema: String,
-    /// Optional inbox URL. Many queues do not have an inbox.
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub schema: Option<String>,
     #[serde(default)]
     pub inbox: Option<String>,
     #[serde(flatten)]
@@ -61,5 +63,19 @@ mod tests {
         });
         let q: Queue = serde_json::from_value(payload).unwrap();
         assert!(q.inbox.is_none());
+    }
+
+    #[test]
+    fn null_workspace_and_schema_decode() {
+        let payload = json!({
+            "id": 99,
+            "url": "https://x/api/v1/queues/99",
+            "name": "Hidden queue (no workspace)",
+            "workspace": null,
+            "schema": null
+        });
+        let q: Queue = serde_json::from_value(payload).unwrap();
+        assert!(q.workspace.is_none());
+        assert!(q.schema.is_none());
     }
 }
