@@ -95,14 +95,23 @@ pub fn prompt_resolve<R: BufRead, W: Write>(
 ) -> Result<Resolution> {
     let local_bytes = read_local(local_path)?;
 
+    // Strip noise fields before diff display so the user only sees real
+    // changes. modified_at server-churn must not appear in the resolver.
+    let local_canonical = crate::snapshot::noise::canonicalize_for_hash(&local_bytes);
+    let remote_canonical = crate::snapshot::noise::canonicalize_for_hash(remote_bytes);
+
+    if local_canonical == remote_canonical {
+        // No meaningful difference — short-circuit before printing anything.
+        return Ok(Resolution::KeepLocal);
+    }
+
     writeln!(output, "")?;
     writeln!(output, "[{index}/{total}]  {} — conflict", local_path.display())?;
     writeln!(output, "")?;
 
-    let diff = unified_diff("local", &local_bytes, "remote", remote_bytes);
+    let diff = unified_diff("local", &local_canonical, "remote", &remote_canonical);
     if diff.is_empty() {
-        // Defensive: caller already determined a conflict, but if local
-        // and remote are byte-identical we just keep local.
+        // Defensive (canonicalize already short-circuited above).
         return Ok(Resolution::KeepLocal);
     }
     write!(output, "{diff}")?;
@@ -113,7 +122,6 @@ pub fn prompt_resolve<R: BufRead, W: Write>(
         output.flush().ok();
         let mut line = String::new();
         if input.read_line(&mut line)? == 0 {
-            // EOF — treat as skip (preserve legacy behavior).
             return Ok(Resolution::Skip);
         }
         match line.trim().chars().next() {
@@ -500,5 +508,29 @@ mod tests {
         std::fs::write(&path, b"local\n").unwrap();
         let r = resolve_push_drift(false, &path, b"remote\n").unwrap();
         assert!(matches!(r, PushDriftOutcome::Skip));
+    }
+
+    #[test]
+    fn prompt_short_circuits_when_only_noise_differs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        std::fs::write(&path, b"{\"name\":\"x\",\"modified_at\":\"t1\"}").unwrap();
+
+        // Empty input — function must not block on read_line.
+        let input = Cursor::new(b"");
+        let mut output: Vec<u8> = Vec::new();
+        let r = prompt_resolve(
+            input,
+            &mut output,
+            1,
+            1,
+            &path,
+            b"{\"name\":\"x\",\"modified_at\":\"t2\"}",
+        )
+        .unwrap();
+        assert!(matches!(r, Resolution::KeepLocal));
+        // No prompt was rendered (short-circuit).
+        let s = String::from_utf8(output).unwrap();
+        assert!(!s.contains("[k]eep"), "should not have prompted: {s}");
     }
 }
