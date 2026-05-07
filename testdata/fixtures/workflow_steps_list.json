@@ -1,0 +1,19 @@
+{
+  "pagination": { "total": 2, "total_pages": 1, "next": null, "previous": null },
+  "results": [
+    {
+      "id": 1,
+      "url": "https://mock.rossum.app/api/v1/workflow_steps/1",
+      "name": "Manager Approval",
+      "workflow": "https://mock.rossum.app/api/v1/workflows/700",
+      "modified_at": "2026-04-20T08:00:00Z"
+    },
+    {
+      "id": 2,
+      "url": "https://mock.rossum.app/api/v1/workflow_steps/2",
+      "name": "Finance Approval",
+      "workflow": "https://mock.rossum.app/api/v1/workflows/700",
+      "modified_at": "2026-04-20T08:00:00Z"
+    }
+  ]
+}

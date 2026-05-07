@@ -150,6 +150,48 @@ impl RossumClient {
         Ok(out)
     }
 
+    pub async fn list_workflows(&self) -> Result<Vec<crate::model::Workflow>> {
+        let mut url = format!("{}/workflows", self.base_url);
+        let mut out = Vec::new();
+        loop {
+            let page: Page<crate::model::Workflow> = self.get_json(&url).await?;
+            out.extend(page.results);
+            match page.pagination.next {
+                Some(next) => url = next,
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn list_workflow_steps(&self) -> Result<Vec<crate::model::WorkflowStep>> {
+        let mut url = format!("{}/workflow_steps", self.base_url);
+        let mut out = Vec::new();
+        loop {
+            let page: Page<crate::model::WorkflowStep> = self.get_json(&url).await?;
+            out.extend(page.results);
+            match page.pagination.next {
+                Some(next) => url = next,
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn list_email_templates(&self) -> Result<Vec<crate::model::EmailTemplate>> {
+        let mut url = format!("{}/email_templates", self.base_url);
+        let mut out = Vec::new();
+        loop {
+            let page: Page<crate::model::EmailTemplate> = self.get_json(&url).await?;
+            out.extend(page.results);
+            match page.pagination.next {
+                Some(next) => url = next,
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
         let resp = self
             .http

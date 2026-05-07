@@ -1,0 +1,15 @@
+{
+  "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+  "results": [
+    {
+      "id": 700,
+      "url": "https://mock.rossum.app/api/v1/workflows/700",
+      "name": "AP Approval Flow",
+      "steps": [
+        "https://mock.rossum.app/api/v1/workflow_steps/1",
+        "https://mock.rossum.app/api/v1/workflow_steps/2"
+      ],
+      "modified_at": "2026-04-20T08:00:00Z"
+    }
+  ]
+}

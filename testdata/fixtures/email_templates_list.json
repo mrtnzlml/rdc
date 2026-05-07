@@ -1,0 +1,13 @@
+{
+  "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+  "results": [
+    {
+      "id": 9001,
+      "url": "https://mock.rossum.app/api/v1/email_templates/9001",
+      "name": "Rejection Notice",
+      "subject": "Your invoice was rejected",
+      "queues": ["https://mock.rossum.app/api/v1/queues/100"],
+      "modified_at": "2026-04-20T08:00:00Z"
+    }
+  ]
+}

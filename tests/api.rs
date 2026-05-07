@@ -158,6 +158,48 @@ async fn list_engine_fields_returns_fields() {
 }
 
 #[tokio::test]
+async fn list_workflows_returns_workflows() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workflows"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("workflows_list.json")))
+        .mount(&server)
+        .await;
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let workflows = client.list_workflows().await.unwrap();
+    assert_eq!(workflows.len(), 1);
+    assert_eq!(workflows[0].name, "AP Approval Flow");
+}
+
+#[tokio::test]
+async fn list_workflow_steps_returns_steps() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workflow_steps"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("workflow_steps_list.json")))
+        .mount(&server)
+        .await;
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let steps = client.list_workflow_steps().await.unwrap();
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[1].name, "Finance Approval");
+}
+
+#[tokio::test]
+async fn list_email_templates_returns_templates() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/email_templates"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("email_templates_list.json")))
+        .mount(&server)
+        .await;
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let templates = client.list_email_templates().await.unwrap();
+    assert_eq!(templates.len(), 1);
+    assert_eq!(templates[0].subject, "Your invoice was rejected");
+}
+
+#[tokio::test]
 async fn list_workspaces_returns_workspaces() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
