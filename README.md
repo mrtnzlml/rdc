@@ -1,5 +1,7 @@
 # rdc
 
+**Status: M35 — pull/push UX hardening (per-kind bars, conflict colors, noise-field suppression)**
+
 `rdc` (Rossum Deployment as Code) snapshots Rossum.ai configurations to
 disk for AI-assisted local development, lets you edit them in place, and
 deploys them across environments.
@@ -46,6 +48,23 @@ deploys them across environments.
 
 See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full
 design.
+
+## Upgrading from M32
+
+This release changes how `content_hash` is computed: server-managed fields
+(`modified_at`, `modifier`) are now stripped before hashing. The first
+pull after upgrade may surface false-positive conflicts on every object
+because the lockfile was written with the old algorithm.
+
+To clear the storm without resolving each conflict by hand:
+
+```sh
+rdc repair --rebuild-lock <env>
+```
+
+Subsequent pulls will be clean. Real edits between M32 and this release
+remain visible — `repair` only re-baselines the hash; it does not discard
+local edits.
 
 ## Install
 
@@ -104,6 +123,21 @@ export RDC_TOKEN_DEV=YOUR_TOKEN
 # Pull a complete snapshot of the env into envs/dev/.
 rdc pull dev
 ```
+
+Sample pull output (TTY):
+
+```
+⠁ workspaces  listing…
+✓ workspaces: 12 items, 2.1s
+⠁ queues      listing…
+✓ queues: 23 items, 2 orphans skipped, 4.7s
+⠁ hooks       listing…
+✓ hooks: 30 items, 3.4s
+…
+✓ pull envs/dev: 256 items, 2 orphans skipped, 0 conflicts  18.6s
+```
+
+In non-TTY mode (CI / piped output), spinners are replaced with `→ kind: listing…` lines.
 
 After `rdc pull dev`, `envs/dev/` contains:
 
@@ -164,7 +198,22 @@ After any edit, `rdc push <env>` sends the change.
 
 ## Push
 
-`rdc push <env>` PATCHes locally-edited objects back to the Rossum API.
+`rdc push <env>` runs in two phases: first it scans all local files against
+the lockfile hashes (phase 1), then PATCHes only the changed objects (phase 2).
+If nothing has changed, push exits immediately with a single summary line.
+
+Sample push output (TTY):
+
+```
+⠁ push envs/dev  listing…
+✓ push envs/dev: 256 files scanned, 1 changed
+⠁ hooks  listing…
+✓ hooks: 1 patched, 0.6s
+✓ push envs/dev: 1 patched  1.0s
+```
+
+In non-TTY mode (CI / piped output), spinners are replaced with `→ kind: listing…` lines.
+
 Each candidate is compared against the lockfile's `content_hash`:
 
 - **No local edits** → skipped silently.
@@ -274,6 +323,12 @@ does not modify any files.
 
 ## Conflict handling
 
+**Noise-field suppression:** Server-managed fields (`modified_at`, `modifier`)
+no longer contribute to the `content_hash`. A re-pull where only those fields
+have changed is a no-op — the bar shows zero conflicts and the on-disk file
+is unchanged. This eliminates a class of spurious conflicts that affected
+M32 and earlier releases.
+
 `rdc pull` does three-way merge for every kind:
 
 | Local edited? | Remote changed? | Action |
@@ -328,6 +383,13 @@ between local and remote, or a schema whose formula set differs (one
 side added a formula the other doesn't have). Add/remove decisions
 aren't `[k]/[r]/[e]` shaped; resolve them by editing locally and
 re-running pull.
+
+### Conflict colors
+
+When run in a TTY, `rdc pull` colorizes conflict prompts: the header is
+bold yellow, `-` (local) lines are red, `+` (remote) lines are green,
+hunk markers (`@@`) are cyan, and action letters (`[k]/[r]/[e]/[s]/[a]`)
+are bold cyan. To force plain output, set `NO_COLOR=1` or pass `--no-color`.
 
 ### Non-interactive / CI (`--yes` or non-TTY)
 
@@ -503,7 +565,7 @@ These flags can be passed to any subcommand:
 |------|-------------|
 | `--concurrency N` | Maximum parallel API calls inside `rdc pull`. Default 5 (spec §16). Also reads `RDC_CONCURRENCY`. |
 | `--json` | Reserved for machine-readable output (no-op today). |
-| `--no-color` | Reserved for disabling ANSI color (rdc currently emits plain text). |
+| `--no-color` | Disable ANSI color output. Also honored via the `NO_COLOR` environment variable. |
 | `--verbose`, `--debug` | Reserved for log level (no-op today). |
 | `--yes` | Skip interactive prompts. Today only `rdc init`'s wizard is interactive, and it auto-disables on non-TTY stdin. |
 
