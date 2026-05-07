@@ -1,4 +1,4 @@
-use super::common::{apply_pull_action, record_object, PullAction, PullCtx};
+use super::common::{apply_pull_action, record_object, skip_on_permission_denied, PullAction, PullCtx};
 use crate::slug::slugify_unique;
 use crate::snapshot::hook::{serialize_hook, write_hook_code};
 use crate::state::hook_combined_hash;
@@ -7,7 +7,10 @@ use std::collections::HashSet;
 
 /// Pull all hooks. Returns `(count, conflicts)`.
 pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
-    let hooks = ctx.client.list_hooks().await.context("listing hooks")?;
+    let hooks = skip_on_permission_denied(
+        ctx.client.list_hooks().await.context("listing hooks"),
+        "hooks",
+    )?;
 
     let mut used_slugs: HashSet<String> = HashSet::new();
     let mut dir_created = false;

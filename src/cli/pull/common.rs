@@ -1,8 +1,32 @@
-use crate::api::RossumClient;
+use crate::api::{ApiError, RossumClient};
 use crate::paths::Paths;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
+
+/// If `result` is a 403 permission_denied from the Rossum API, log a warning
+/// and return an empty list — the kind is unavailable to this token, but
+/// other kinds should still pull. Otherwise propagate the error unchanged.
+pub fn skip_on_permission_denied<T>(result: Result<Vec<T>>, kind: &str) -> Result<Vec<T>> {
+    match result {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let is_403 = e.chain().any(|c| {
+                c.downcast_ref::<ApiError>()
+                    .map(|api| matches!(api, ApiError::Status { status: 403, .. }))
+                    .unwrap_or(false)
+            });
+            if is_403 {
+                eprintln!(
+                    "warning: skipping {kind} — token lacks permission (403)"
+                );
+                Ok(Vec::new())
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
 
 /// Shared state passed through every per-kind pull driver.
 pub struct PullCtx<'a> {
@@ -247,5 +271,31 @@ mod tests {
         let _ = apply_pull_action(PullAction::Conflict, &path, b"remote", "h".repeat(64)).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"local");
         assert_eq!(std::fs::read(dir.path().join("x.json.remote")).unwrap(), b"remote");
+    }
+
+    #[test]
+    fn skip_on_permission_denied_returns_empty_for_403() {
+        let err: Result<Vec<u32>> = Err(anyhow!(ApiError::Status {
+            status: 403,
+            body: "permission_denied".into()
+        }));
+        let out = skip_on_permission_denied(err, "engines").unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn skip_on_permission_denied_propagates_other_errors() {
+        let err: Result<Vec<u32>> = Err(anyhow!(ApiError::Status {
+            status: 500,
+            body: "boom".into()
+        }));
+        assert!(skip_on_permission_denied(err, "engines").is_err());
+    }
+
+    #[test]
+    fn skip_on_permission_denied_passes_through_ok() {
+        let v: Result<Vec<u32>> = Ok(vec![1, 2, 3]);
+        let out = skip_on_permission_denied(v, "engines").unwrap();
+        assert_eq!(out, vec![1, 2, 3]);
     }
 }
