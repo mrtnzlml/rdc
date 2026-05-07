@@ -2,7 +2,9 @@
 
 `rdc` (Rossum Deployment as Code) snapshots Rossum.ai configurations to disk for AI-assisted local development and deploys them across environments.
 
-**Status:** M12. Pull side complete. Push for hooks. Deploy workflow (`rdc map`/`plan`/`apply`) for hooks across envs. See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full design.
+**Status:** M13. Pull side complete. Push + deploy (`rdc push`/`map`/`plan`/`apply`) for hooks, rules, and labels. See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full design.
+
+**Coverage as of M13:** push and apply work for hooks, rules, and labels. Other kinds (queues, schemas, inboxes, engines, engine_fields, workflows, workflow_steps, email_templates, MDH) are pull-only — extending push to them is future work.
 
 ## Quick start
 
