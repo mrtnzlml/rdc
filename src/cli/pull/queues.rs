@@ -1,9 +1,7 @@
 use super::common::{
-    apply_pull_action, decide_pull_action, hash_for_lockfile, parse_id_from_url,
-    record_object, PullAction, PullCtx,
+    apply_pull_action, decide_pull_action, parse_id_from_url, record_object, PullAction, PullCtx,
 };
 use crate::slug::slugify_unique;
-use crate::snapshot::schema::write_schema;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 
@@ -78,29 +76,35 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<QueueCounts> {
             .await
             .with_context(|| format!("fetching schema {schema_id} for queue '{}'", q.name))?;
 
+        // Combined-hash 3-way over schema.json + formulas/*.py (M9).
         let schema_path = queue_dir.join("schema.json");
-        let pre_schema_local = if schema_path.exists() {
+        let pre_local_json = if schema_path.exists() {
             Some(std::fs::read(&schema_path)
                 .with_context(|| format!("reading {}", schema_path.display()))?)
         } else {
             None
         };
-        let schema_proposed_bytes = write_schema(&queue_dir, &schema)
-            .with_context(|| format!("writing schema for queue '{}'", q.name))?;
-        let schema_remote_hash = hash_for_lockfile(&schema_proposed_bytes);
+        let pre_local_formulas = crate::snapshot::schema::read_local_formulas(&queue_dir)?;
+
+        let (remote_json_bytes, remote_formulas) =
+            crate::snapshot::schema::serialize_schema(&schema)?;
+        let remote_combined_hash =
+            crate::state::schema_combined_hash(&remote_json_bytes, &remote_formulas);
+
         let schema_base = ctx
             .lockfile
             .objects
             .get("schemas")
             .and_then(|m| m.get(&q_slug))
             .and_then(|e| e.content_hash.clone());
-        let s_action = match (schema_base.as_deref(), &pre_schema_local) {
+        let s_action = match (schema_base.as_deref(), &pre_local_json) {
             (None, _) => PullAction::Write,
             (_, None) => PullAction::Write,
-            (Some(base), Some(local)) => {
-                let local_hash = hash_for_lockfile(local);
-                let local_matches = local_hash == base;
-                let remote_matches = schema_remote_hash == base;
+            (Some(base), Some(local_json)) => {
+                let local_combined =
+                    crate::state::schema_combined_hash(local_json, &pre_local_formulas);
+                let local_matches = local_combined == base;
+                let remote_matches = remote_combined_hash == base;
                 match (local_matches, remote_matches) {
                     (true, _) => PullAction::Write,
                     (false, true) => PullAction::KeepLocal,
@@ -108,25 +112,38 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<QueueCounts> {
                 }
             }
         };
+
         let schema_recorded = match s_action {
-            PullAction::Write => schema_remote_hash,
+            PullAction::Write => {
+                crate::snapshot::schema::write_schema(&queue_dir, &schema)
+                    .with_context(|| format!("writing schema for queue '{}'", q.name))?;
+                remote_combined_hash
+            }
             PullAction::KeepLocal => {
-                let local = pre_schema_local.as_ref().unwrap();
-                crate::snapshot::writer::write_atomic(&schema_path, local)?;
-                hash_for_lockfile(local)
+                let local_json = pre_local_json.as_ref().unwrap();
+                crate::state::schema_combined_hash(local_json, &pre_local_formulas)
             }
             PullAction::Conflict => {
-                let local = pre_schema_local.as_ref().unwrap();
-                crate::snapshot::writer::write_atomic(&schema_path, local)?;
                 let remote_path = queue_dir.join("schema.json.remote");
-                crate::snapshot::writer::write_atomic(&remote_path, &schema_proposed_bytes)?;
+                crate::snapshot::writer::write_atomic(&remote_path, &remote_json_bytes)?;
+                if !remote_formulas.is_empty() {
+                    let remote_formulas_dir = queue_dir.join("formulas.remote");
+                    std::fs::create_dir_all(&remote_formulas_dir)
+                        .with_context(|| format!("creating {}", remote_formulas_dir.display()))?;
+                    for (field_id, bytes) in &remote_formulas {
+                        let p = remote_formulas_dir.join(format!("{field_id}.py"));
+                        crate::snapshot::writer::write_atomic(&p, bytes)?;
+                    }
+                }
                 eprintln!(
-                    "warning: {} conflict — local preserved, remote at {}",
+                    "warning: {} conflict — local preserved, remote at {} (formulas at {})",
                     schema_path.display(),
-                    remote_path.display()
+                    queue_dir.join("schema.json.remote").display(),
+                    queue_dir.join("formulas.remote").display()
                 );
                 counts.conflicts += 1;
-                hash_for_lockfile(local)
+                let local_json = pre_local_json.as_ref().unwrap();
+                crate::state::schema_combined_hash(local_json, &pre_local_formulas)
             }
         };
         record_object(
