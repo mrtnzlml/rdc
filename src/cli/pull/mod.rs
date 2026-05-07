@@ -46,6 +46,7 @@ struct PullStats {
     n_datasets: usize,
     c_datasets: usize,
     c_orgs: usize,
+    orphans: usize,
 }
 
 pub async fn run(env: &str, concurrency: usize, interactive: bool) -> Result<()> {
@@ -127,6 +128,9 @@ pub async fn run(env: &str, concurrency: usize, interactive: bool) -> Result<()>
     if stats.n_datasets > 0 {
         summary.push_str(&format!(", {}", common::pluralize(stats.n_datasets, "dataset", "datasets")));
     }
+    if stats.orphans > 0 {
+        summary.push_str(&format!(", {} orphans skipped", stats.orphans));
+    }
     if total_conflicts > 0 {
         summary.push_str(&format!(", {}", common::pluralize(total_conflicts, "conflict", "conflicts")));
     }
@@ -157,12 +161,13 @@ async fn run_drivers(
         p.finish();
         result
     };
-    let qc = {
+    let (qc, queues_orphans) = {
         let p = KindProgress::start("queues");
         let result = queues::pull(ctx, &p).await
             .with_context(|| format!("pulling queues for env '{env}'"))?;
+        let orphans = p.orphans();
         p.finish();
-        result
+        (result, orphans)
     };
     let (n_hooks, c_hooks) = {
         let p = KindProgress::start("hooks");
@@ -213,12 +218,14 @@ async fn run_drivers(
         p.finish();
         result
     };
-    let (n_email_templates, c_email_templates) = {
+    let (n_email_templates, c_email_templates, email_templates_orphans) = {
         let p = KindProgress::start("email_templates");
         let result = email_templates::pull(ctx, &p).await
             .with_context(|| format!("pulling email templates for env '{env}'"))?;
+        let orphans = p.orphans();
         p.finish();
-        result
+        let (n, c) = result;
+        (n, c, orphans)
     };
     let (n_datasets, c_datasets) = {
         let p = KindProgress::start("mdh");
@@ -241,6 +248,7 @@ async fn run_drivers(
         n_workflow_steps, c_workflow_steps,
         n_email_templates, c_email_templates,
         n_datasets, c_datasets,
+        orphans: queues_orphans + email_templates_orphans,
     })
 }
 
