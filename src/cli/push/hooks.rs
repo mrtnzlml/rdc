@@ -1,11 +1,10 @@
 use crate::api::RossumClient;
+use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
 use crate::snapshot::hook::{read_hook, serialize_hook};
 use crate::state::{hook_combined_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
 
-/// Push locally-edited hooks to the remote.
-/// Returns `(pushed, skipped_due_to_conflict)`.
 pub async fn push(
     paths: &Paths,
     client: &RossumClient,
@@ -16,6 +15,10 @@ pub async fn push(
         return Ok((0, 0));
     }
 
+    // Load overlay if present (M11).
+    let overlay = Overlay::load(&paths.overlay_file())
+        .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
+
     let mut pushed = 0usize;
     let mut skipped = 0usize;
 
@@ -24,7 +27,6 @@ pub async fn push(
         .collect::<std::io::Result<Vec<_>>>()
         .with_context(|| format!("listing {}", hooks_dir.display()))?;
 
-    // Lazy-fetch remote list (only if we find a hook with local edits).
     let mut remote_hooks: Option<Vec<crate::model::Hook>> = None;
 
     for entry in &entries {
@@ -37,8 +39,19 @@ pub async fn push(
         let local_hook = read_hook(&hooks_dir, slug)
             .with_context(|| format!("reading local hook '{slug}'"))?;
 
-        let (local_json, local_code) = serialize_hook(&local_hook)?;
-        let local_combined = hook_combined_hash(&local_json, &local_code);
+        // Apply overlay (if any) to a JSON Value, then re-deserialize back to Hook.
+        let mut payload = serde_json::to_value(&local_hook)
+            .context("serializing local hook to value")?;
+        if let Some(ov) = &overlay {
+            if let Some(hook_overrides) = ov.hook(slug) {
+                apply_overrides(&mut payload, hook_overrides);
+            }
+        }
+        let payload_hook: crate::model::Hook = serde_json::from_value(payload.clone())
+            .with_context(|| format!("re-deserializing overlay-applied hook '{slug}'"))?;
+
+        let (post_overlay_json, post_overlay_code) = serialize_hook(&payload_hook)?;
+        let local_combined = hook_combined_hash(&post_overlay_json, &post_overlay_code);
 
         let entry = lockfile.objects.get("hooks").and_then(|m| m.get(slug));
         let Some(entry) = entry else {
@@ -54,13 +67,11 @@ pub async fn push(
         };
 
         if &local_combined == base {
-            // No local edits.
             continue;
         }
 
         let id = entry.id;
 
-        // Lazy-fetch remote.
         if remote_hooks.is_none() {
             remote_hooks = Some(
                 client.list_hooks().await
@@ -85,7 +96,7 @@ pub async fn push(
             continue;
         }
 
-        let updated = client.update_hook(id, &local_hook).await
+        let updated = client.update_hook(id, &payload_hook).await
             .with_context(|| format!("PATCH /hooks/{id}"))?;
 
         let (updated_json, updated_code) = serialize_hook(&updated)?;
