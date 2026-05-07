@@ -1,4 +1,4 @@
-use super::common::{hash_for_lockfile, record_object, PullCtx};
+use super::common::{hash_for_lockfile, record_object, skip_on_permission_denied, PullCtx};
 use crate::config::EnvConfig;
 use crate::slug::slugify_unique;
 use crate::snapshot::workspace::write_workspace;
@@ -12,11 +12,10 @@ use std::collections::HashSet;
 /// Each workspace is written as `envs/<env>/workspaces/<slug>/workspace.json`.
 /// Returns the number of workspaces pulled.
 pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig) -> Result<usize> {
-    let workspaces = ctx
-        .client
-        .list_workspaces()
-        .await
-        .context("listing workspaces")?;
+    let workspaces = skip_on_permission_denied(
+        ctx.client.list_workspaces().await.context("listing workspaces"),
+        "workspaces",
+    )?;
 
     let filter = match &env_cfg.workspace_filter {
         Some(pat) => Some(
@@ -42,7 +41,10 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig) -> Result<usize> {
             dir_created = true;
         }
 
-        let slug = slugify_unique(&ws.name, &used_slugs);
+        let slug = match ctx.lockfile.slug_for_id("workspaces", ws.id) {
+            Some(existing) => existing.to_string(),
+            None => slugify_unique(&ws.name, &used_slugs),
+        };
         used_slugs.insert(slug.clone());
 
         let ws_dir = ctx.paths.workspace_dir(&slug);

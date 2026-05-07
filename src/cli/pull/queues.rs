@@ -1,5 +1,6 @@
 use super::common::{
-    apply_pull_action, decide_pull_action, parse_id_from_url, record_object, PullAction, PullCtx,
+    apply_pull_action, decide_pull_action, parse_id_from_url, record_object,
+    skip_on_permission_denied, PullAction, PullCtx,
 };
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
@@ -14,17 +15,26 @@ pub struct QueueCounts {
 }
 
 pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<QueueCounts> {
-    let queues = ctx
-        .client
-        .list_queues()
-        .await
-        .context("listing queues")?;
+    let queues = skip_on_permission_denied(
+        ctx.client.list_queues().await.context("listing queues"),
+        "queues",
+    )?;
 
     let mut per_ws_used_slugs: HashMap<String, HashSet<String>> = HashMap::new();
     let mut counts = QueueCounts { queues: 0, schemas: 0, inboxes: 0, conflicts: 0 };
 
     for q in &queues {
-        let ws_slug = match ctx.lockfile.slug_for_url("workspaces", &q.workspace) {
+        let ws_url = match &q.workspace {
+            Some(u) => u,
+            None => {
+                eprintln!(
+                    "warning: skipping queue '{}' (id {}) — no workspace (orphan/hidden)",
+                    q.name, q.id
+                );
+                continue;
+            }
+        };
+        let ws_slug = match ctx.lockfile.slug_for_url("workspaces", ws_url) {
             Some(s) => s.to_string(),
             None => continue,
         };
@@ -67,9 +77,20 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<QueueCounts> {
         );
         counts.queues += 1;
 
-        // 2. schema.json — three-way (formula .py files always overwritten in M8)
-        let schema_id = parse_id_from_url(&q.schema)
-            .with_context(|| format!("parsing schema URL '{}' for queue '{}'", q.schema, q.name))?;
+        // 2. schema.json — three-way (formula .py files always overwritten in M8).
+        // If the queue has no schema URL, skip schema + inbox steps for this queue.
+        let schema_url = match &q.schema {
+            Some(u) => u,
+            None => {
+                eprintln!(
+                    "warning: queue '{}' (id {}) has no schema — skipping schema + inbox",
+                    q.name, q.id
+                );
+                continue;
+            }
+        };
+        let schema_id = parse_id_from_url(schema_url)
+            .with_context(|| format!("parsing schema URL '{}' for queue '{}'", schema_url, q.name))?;
         let schema = ctx
             .client
             .get_schema(schema_id)

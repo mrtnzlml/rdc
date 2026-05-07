@@ -1,6 +1,7 @@
 use crate::api::RossumClient;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
+use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
 
@@ -102,6 +103,12 @@ pub async fn push(
             .context("serializing updated label")?;
         updated_bytes.push(b'\n');
         let updated_hash = content_hash(&updated_bytes);
+
+        // Refresh the on-disk file with the canonical server response so
+        // the local bytes match the lockfile hash going forward.
+        write_atomic(&path, &updated_bytes)
+            .with_context(|| format!("writing post-push canonical form for '{slug}'"))?;
+
         lockfile.upsert(
             "labels",
             slug,

@@ -1,7 +1,7 @@
 use crate::api::RossumClient;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::snapshot::hook::{read_hook, serialize_hook};
+use crate::snapshot::hook::{read_hook, serialize_hook, write_hook};
 use crate::state::{hook_combined_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
 
@@ -98,6 +98,14 @@ pub async fn push(
 
         let updated = client.update_hook(id, &payload_hook).await
             .with_context(|| format!("PATCH /hooks/{id}"))?;
+
+        // Write the canonical (server-authoritative) form to disk so the
+        // local file matches the lockfile hash. Without this, files written
+        // by external tooling (e.g. Python with ensure_ascii=True) leave the
+        // disk bytes diverged from the canonical form, and subsequent pulls
+        // need two iterations to settle.
+        write_hook(&hooks_dir, slug, &updated)
+            .with_context(|| format!("writing post-push canonical form for '{slug}'"))?;
 
         let (updated_json, updated_code) = serialize_hook(&updated)?;
         let updated_hash = hook_combined_hash(&updated_json, &updated_code);

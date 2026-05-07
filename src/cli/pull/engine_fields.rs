@@ -1,15 +1,14 @@
-use super::common::{apply_pull_action, decide_pull_action, record_object, PullAction, PullCtx};
+use super::common::{apply_pull_action, decide_pull_action, record_object, skip_on_permission_denied, PullAction, PullCtx};
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 
 /// Pull all engine fields. Returns `(count, conflicts)`.
 pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
-    let fields = ctx
-        .client
-        .list_engine_fields()
-        .await
-        .context("listing engine fields")?;
+    let fields = skip_on_permission_denied(
+        ctx.client.list_engine_fields().await.context("listing engine fields"),
+        "engine_fields",
+    )?;
 
     let mut used: HashSet<String> = HashSet::new();
     let mut dir_created = false;
