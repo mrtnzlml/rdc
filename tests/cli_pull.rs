@@ -909,6 +909,193 @@ async fn re_pull_emits_remote_file_on_queue_conflict() {
 }
 
 #[tokio::test]
+async fn re_pull_preserves_local_formula_edit_when_remote_unchanged() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("workspaces_list.json")))
+        .mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("queues_list.json")))
+        .mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schemas/200"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("schema_1.json")))
+        .mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schemas/201"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("schema_2.json")))
+        .mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schemas/202"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("schema_3.json")))
+        .mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/inboxes/300"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("inbox_1.json")))
+        .mount(&server).await;
+    let empty = serde_json::json!({ "pagination": { "next": null }, "results": [] });
+    for ep in [
+        "/api/v1/hooks", "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty.clone()))
+            .mount(&server).await;
+    }
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+
+    Command::cargo_bin("rdc").unwrap().current_dir(project.path()).args(["pull", "dev"]).assert().success();
+
+    let formula_path = project.path().join("envs/dev/workspaces/invoices-ap/queues/cost-invoices/formulas/amount_total.py");
+    let original = std::fs::read_to_string(&formula_path).unwrap();
+    let edited = format!("{original} + 0  # local tweak");
+    std::fs::write(&formula_path, &edited).unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert().success()
+        .stdout(predicate::str::contains("conflict").not());
+
+    let after = std::fs::read_to_string(&formula_path).unwrap();
+    assert_eq!(after, edited, "local formula edit must be preserved");
+}
+
+#[tokio::test]
+async fn re_pull_emits_remote_files_on_formula_conflict() {
+    let server1 = MockServer::start().await;
+    let server2 = MockServer::start().await;
+
+    let modified_schema = serde_json::json!({
+        "id": 200,
+        "url": "https://mock.rossum.app/api/v1/schemas/200",
+        "name": "Cost Invoices Schema",
+        "queues": ["https://mock.rossum.app/api/v1/queues/100"],
+        "content": [
+            {
+                "category": "section",
+                "id": "header",
+                "label": "Header",
+                "children": [
+                    { "category": "datapoint", "id": "invoice_id", "type": "string" },
+                    {
+                        "category": "datapoint",
+                        "id": "amount_total",
+                        "type": "number",
+                        "formula": "amount_due + amount_tax + REMOTE_FORMULA_EDIT"
+                    }
+                ]
+            }
+        ],
+        "modified_at": "2026-04-10T09:00:00Z"
+    });
+
+    let empty = serde_json::json!({ "pagination": { "next": null }, "results": [] });
+
+    for srv in [&server1, &server2] {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/organizations/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+            .mount(srv).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/workspaces"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("workspaces_list.json")))
+            .mount(srv).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/queues"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("queues_list.json")))
+            .mount(srv).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/schemas/201"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("schema_2.json")))
+            .mount(srv).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/schemas/202"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("schema_3.json")))
+            .mount(srv).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/inboxes/300"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("inbox_1.json")))
+            .mount(srv).await;
+        for ep in [
+            "/api/v1/hooks", "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+            "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+        ] {
+            Mock::given(method("GET"))
+                .and(path(ep))
+                .respond_with(ResponseTemplate::new(200).set_body_json(empty.clone()))
+                .mount(srv).await;
+        }
+    }
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schemas/200"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("schema_1.json")))
+        .mount(&server1).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schemas/200"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(modified_schema))
+        .mount(&server2).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server1.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+
+    Command::cargo_bin("rdc").unwrap().current_dir(project.path()).args(["pull", "dev"]).assert().success();
+
+    let formula_path = project.path().join("envs/dev/workspaces/invoices-ap/queues/cost-invoices/formulas/amount_total.py");
+    let local_edit = "LOCAL_FORMULA_EDIT".to_string();
+    std::fs::write(&formula_path, &local_edit).unwrap();
+
+    let cfg_path = project.path().join("rdc.toml");
+    let cfg = std::fs::read_to_string(&cfg_path).unwrap();
+    let new_cfg = cfg.replace(&format!("{}/api/v1", server1.uri()), &format!("{}/api/v1", server2.uri()));
+    std::fs::write(&cfg_path, new_cfg).unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert().success()
+        .stdout(predicate::str::contains("1 conflict"));
+
+    let after = std::fs::read_to_string(&formula_path).unwrap();
+    assert_eq!(after, local_edit);
+
+    let queue_dir = project.path().join("envs/dev/workspaces/invoices-ap/queues/cost-invoices");
+    assert!(queue_dir.join("schema.json.remote").exists());
+    assert!(queue_dir.join("formulas.remote/amount_total.py").exists());
+    let remote_formula = std::fs::read_to_string(queue_dir.join("formulas.remote/amount_total.py")).unwrap();
+    assert!(remote_formula.contains("REMOTE_FORMULA_EDIT"));
+}
+
+#[tokio::test]
 async fn pull_with_missing_token_fails_with_helpful_error() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc")
