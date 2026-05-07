@@ -79,19 +79,31 @@ fn read_local(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("reading {}", path.display()))
 }
 
-/// Prompt the user to resolve a conflict on `local_path` between the
-/// current local bytes and proposed `remote_bytes`. Caller passes
-/// `(index, total)` for the `[N/M]` header.
-///
-/// Reads from stdin via `BufRead` so tests can supply a `Cursor`. The
-/// production caller wraps `std::io::stdin().lock()`.
+/// Top-level entry point. Auto-detects color mode from environment and TTY.
+/// Production callers use this; tests use `prompt_resolve_with_color` to
+/// pin the mode.
 pub fn prompt_resolve<R: BufRead, W: Write>(
+    input: R,
+    output: W,
+    index: usize,
+    total: usize,
+    local_path: &Path,
+    remote_bytes: &[u8],
+) -> Result<Resolution> {
+    let mode = detect_color_mode(false);
+    prompt_resolve_with_color(input, output, index, total, local_path, remote_bytes, mode)
+}
+
+/// Color-aware core. Tests pin the mode here; production goes through
+/// `prompt_resolve` which auto-detects.
+pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
     mut input: R,
     mut output: W,
     index: usize,
     total: usize,
     local_path: &Path,
     remote_bytes: &[u8],
+    mode: ColorMode,
 ) -> Result<Resolution> {
     let local_bytes = read_local(local_path)?;
 
@@ -101,24 +113,26 @@ pub fn prompt_resolve<R: BufRead, W: Write>(
     let remote_canonical = crate::snapshot::noise::canonicalize_for_hash(remote_bytes);
 
     if local_canonical == remote_canonical {
-        // No meaningful difference — short-circuit before printing anything.
         return Ok(Resolution::KeepLocal);
     }
 
     writeln!(output, "")?;
-    writeln!(output, "[{index}/{total}]  {} — conflict", local_path.display())?;
+    let header = format!("[{index}/{total}]  {} — conflict", local_path.display());
+    writeln!(output, "{}", colorize_header(&header, mode))?;
     writeln!(output, "")?;
 
     let diff = unified_diff("local", &local_canonical, "remote", &remote_canonical);
     if diff.is_empty() {
-        // Defensive (canonicalize already short-circuited above).
         return Ok(Resolution::KeepLocal);
     }
-    write!(output, "{diff}")?;
+    for line in diff.lines() {
+        writeln!(output, "{}", colorize_diff_line(line, mode))?;
+    }
     writeln!(output, "")?;
 
     loop {
-        write!(output, "[k]eep local  [r]emote  [e]dit  [s]kip (shadow file)  [a]bort > ")?;
+        let prompt_text = "[k]eep local  [r]emote  [e]dit  [s]kip (shadow file)  [a]bort > ";
+        write!(output, "{}", colorize_prompt(prompt_text, mode))?;
         output.flush().ok();
         let mut line = String::new();
         if input.read_line(&mut line)? == 0 {
@@ -700,5 +714,52 @@ mod tests {
     fn colorize_prompt_plain_returns_unchanged() {
         let s = colorize_prompt("[k]eep local", ColorMode::Plain);
         assert_eq!(s, "[k]eep local");
+    }
+
+    #[test]
+    fn prompt_emits_color_codes_when_color_mode() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        std::fs::write(&path, b"{\"name\":\"old\"}").unwrap();
+
+        let input = Cursor::new(b"k\n");
+        let mut output: Vec<u8> = Vec::new();
+        prompt_resolve_with_color(
+            input,
+            &mut output,
+            1,
+            1,
+            &path,
+            b"{\"name\":\"new\"}",
+            ColorMode::Color,
+        )
+        .unwrap();
+        let s = String::from_utf8(output).unwrap();
+        // Header bold yellow, action letters bold cyan, diff lines red/green.
+        assert!(s.contains("\x1b[1;93m"), "no header color: {s:?}");
+        assert!(s.contains("\x1b[91m") || s.contains("\x1b[92m"), "no diff color: {s:?}");
+        assert!(s.contains("\x1b[1;96m"), "no prompt color: {s:?}");
+    }
+
+    #[test]
+    fn prompt_plain_mode_emits_no_color_codes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        std::fs::write(&path, b"{\"name\":\"old\"}").unwrap();
+
+        let input = Cursor::new(b"k\n");
+        let mut output: Vec<u8> = Vec::new();
+        prompt_resolve_with_color(
+            input,
+            &mut output,
+            1,
+            1,
+            &path,
+            b"{\"name\":\"new\"}",
+            ColorMode::Plain,
+        )
+        .unwrap();
+        let s = String::from_utf8(output).unwrap();
+        assert!(!s.contains("\x1b["), "expected no SGR codes: {s:?}");
     }
 }
