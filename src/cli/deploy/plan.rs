@@ -3,6 +3,7 @@ use crate::mapping::Mapping;
 use crate::paths::Paths;
 use crate::state::Lockfile;
 use anyhow::{anyhow, Context, Result};
+use std::collections::BTreeMap;
 
 pub async fn run(src: &str, tgt: &str) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
@@ -23,31 +24,46 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
 
     println!("Plan: {src} → {tgt}");
 
+    let mut total_count = 0;
+    let mut total_warnings = 0;
+    total_count += plan_kind("hooks", &mapping.hooks, &src_paths.hooks_dir(), &tgt_lockfile, tgt, &mut total_warnings);
+    total_count += plan_kind("rules", &mapping.rules, &src_paths.rules_dir(), &tgt_lockfile, tgt, &mut total_warnings);
+    total_count += plan_kind("labels", &mapping.labels, &src_paths.labels_dir(), &tgt_lockfile, tgt, &mut total_warnings);
+
+    if total_count == 0 && total_warnings == 0 {
+        println!("  (no mapped objects)");
+    }
+    Ok(())
+}
+
+fn plan_kind(
+    kind: &str,
+    pairs: &BTreeMap<String, String>,
+    src_dir: &std::path::Path,
+    tgt_lockfile: &Lockfile,
+    tgt: &str,
+    warnings: &mut usize,
+) -> usize {
     let mut count = 0;
-    let mut warnings = 0;
-    for (src_slug, tgt_slug) in &mapping.hooks {
-        let src_hook_path = src_paths.hooks_dir().join(format!("{src_slug}.json"));
-        if !src_hook_path.exists() {
-            eprintln!("warning: src hooks/{src_slug}.json missing — skipping in plan");
-            warnings += 1;
+    for (src_slug, tgt_slug) in pairs {
+        let src_path = src_dir.join(format!("{src_slug}.json"));
+        if !src_path.exists() {
+            eprintln!("warning: src {kind}/{src_slug}.json missing — skipping in plan");
+            *warnings += 1;
             continue;
         }
         let tgt_id = tgt_lockfile
             .objects
-            .get("hooks")
+            .get(kind)
             .and_then(|m| m.get(tgt_slug))
             .map(|e| e.id);
         let Some(tgt_id) = tgt_id else {
-            eprintln!("warning: tgt lockfile has no entry for hooks/{tgt_slug} — run `rdc pull {tgt}` first");
-            warnings += 1;
+            eprintln!("warning: tgt lockfile has no entry for {kind}/{tgt_slug} — run `rdc pull {tgt}` first");
+            *warnings += 1;
             continue;
         };
-        println!("  ~ hooks/{src_slug}  →  {tgt}/{tgt_slug} (id {tgt_id})");
+        println!("  ~ {kind}/{src_slug}  →  {tgt}/{tgt_slug} (id {tgt_id})");
         count += 1;
     }
-
-    if count == 0 && warnings == 0 {
-        println!("  (no mapped hooks)");
-    }
-    Ok(())
+    count
 }

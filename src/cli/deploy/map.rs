@@ -18,51 +18,57 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         return Err(anyhow!("env '{tgt}' is not defined in rdc.toml"));
     }
 
-    let src_hooks = list_hook_slugs(&src_paths.hooks_dir())?;
-    let tgt_hooks = list_hook_slugs(&tgt_paths.hooks_dir())?;
-    let tgt_set: std::collections::HashSet<_> = tgt_hooks.iter().cloned().collect();
-
     let mapping_path = src_paths.mapping_file(src, tgt);
     let mut mapping = Mapping::load(&mapping_path)?;
 
-    let pre_count = mapping.hooks.len();
-    let mut newly_matched: BTreeMap<String, String> = BTreeMap::new();
-    for src_slug in &src_hooks {
-        if mapping.hooks.contains_key(src_slug) {
-            continue;
-        }
-        if tgt_set.contains(src_slug) {
-            newly_matched.insert(src_slug.clone(), src_slug.clone());
-        }
-    }
-    let new_count = newly_matched.len();
-    mapping.hooks.extend(newly_matched);
+    let h_new = match_kind(&mut mapping.hooks, &src_paths.hooks_dir(), &tgt_paths.hooks_dir())?;
+    let r_new = match_kind(&mut mapping.rules, &src_paths.rules_dir(), &tgt_paths.rules_dir())?;
+    let l_new = match_kind(&mut mapping.labels, &src_paths.labels_dir(), &tgt_paths.labels_dir())?;
 
-    if !mapping.hooks.is_empty() {
+    let any_total = mapping.hooks.len() + mapping.rules.len() + mapping.labels.len();
+    if any_total > 0 {
         std::fs::create_dir_all(src_paths.mapping_dir())
             .with_context(|| format!("creating {}", src_paths.mapping_dir().display()))?;
         mapping.save(&mapping_path)?;
     }
 
     println!(
-        "Auto-matched {} new hooks by slug ({} total in mapping). Wrote {}.",
-        new_count,
-        pre_count + new_count,
-        mapping_path.display()
+        "Auto-matched {} new hooks, {} new rules, {} new labels by slug. Wrote {}.",
+        h_new, r_new, l_new, mapping_path.display()
     );
     Ok(())
 }
 
-fn list_hook_slugs(hooks_dir: &std::path::Path) -> Result<Vec<String>> {
-    if !hooks_dir.exists() {
+fn match_kind(
+    existing: &mut BTreeMap<String, String>,
+    src_dir: &std::path::Path,
+    tgt_dir: &std::path::Path,
+) -> Result<usize> {
+    let src_slugs = list_slugs(src_dir)?;
+    let tgt_slugs: std::collections::HashSet<_> = list_slugs(tgt_dir)?.into_iter().collect();
+    let mut added = 0;
+    for src_slug in &src_slugs {
+        if existing.contains_key(src_slug) {
+            continue;
+        }
+        if tgt_slugs.contains(src_slug) {
+            existing.insert(src_slug.clone(), src_slug.clone());
+            added += 1;
+        }
+    }
+    Ok(added)
+}
+
+fn list_slugs(dir: &std::path::Path) -> Result<Vec<String>> {
+    if !dir.exists() {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(hooks_dir)
-        .with_context(|| format!("reading {}", hooks_dir.display()))?
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
     {
         let entry = entry
-            .with_context(|| format!("listing {}", hooks_dir.display()))?;
+            .with_context(|| format!("listing {}", dir.display()))?;
         let name = entry.file_name().to_string_lossy().to_string();
         if let Some(slug) = name.strip_suffix(".json") {
             if !slug.ends_with(".remote") {

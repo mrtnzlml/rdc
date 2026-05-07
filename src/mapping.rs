@@ -9,14 +9,22 @@ use std::path::Path;
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Mapping {
     pub version: u32,
-    /// Per-kind: src_slug → tgt_slug.
     #[serde(default)]
     pub hooks: BTreeMap<String, String>,
+    #[serde(default)]
+    pub rules: BTreeMap<String, String>,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
 }
 
 impl Default for Mapping {
     fn default() -> Self {
-        Self { version: 1, hooks: BTreeMap::new() }
+        Self {
+            version: 1,
+            hooks: BTreeMap::new(),
+            rules: BTreeMap::new(),
+            labels: BTreeMap::new(),
+        }
     }
 }
 
@@ -60,6 +68,8 @@ mod tests {
         let mut m = Mapping::default();
         m.hooks.insert("validator-invoices".into(), "validator-invoices".into());
         m.hooks.insert("sftp-import".into(), "sftp-import-prod".into());
+        m.rules.insert("validation-rule".into(), "validation-rule".into());
+        m.labels.insert("priority-high".into(), "priority-high".into());
         m.save(&path).unwrap();
         let loaded = Mapping::load(&path).unwrap();
         assert_eq!(loaded, m);
