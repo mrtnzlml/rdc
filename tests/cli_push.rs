@@ -267,11 +267,14 @@ async fn push_with_no_local_edits_is_noop() {
         .args(["pull", "dev"])
         .assert().success();
 
+    // Phase-1 fast path: scan detects no changes, exits before drivers run.
+    // Stdout is empty; the "no changes" message is on stderr.
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
         .args(["push", "dev"])
         .assert().success()
-        .stdout(predicate::str::contains("0 hooks"));
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("no changes"));
 }
 
 /// Regression: after a successful push, the local file should be rewritten
@@ -436,12 +439,14 @@ async fn schema_push_skips_when_no_local_edits() {
         .args(["pull", "dev"])
         .assert().success();
 
-    // No edits — push should not call PATCH.
+    // No edits — phase-1 fast path exits before drivers run.
+    // Stdout is empty; the "no changes" message is on stderr.
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
         .args(["push", "dev"])
         .assert().success()
-        .stdout(predicate::str::contains("0 schemas"));
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("no changes"));
 }
 
 /// Schema push: when remote drifted (combined hash != base), abort that

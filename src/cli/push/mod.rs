@@ -1,6 +1,7 @@
 use crate::api::RossumClient;
 use crate::config::ProjectConfig;
 use crate::paths::Paths;
+use crate::progress::KindProgress;
 use crate::secrets::resolve_token;
 use crate::state::Lockfile;
 use anyhow::{anyhow, Context, Result};
@@ -13,9 +14,11 @@ mod inboxes;
 mod labels;
 mod queues;
 mod rules;
+pub mod scan;
 mod schemas;
 
 pub async fn run(env: &str, interactive: bool) -> Result<()> {
+    let push_started = std::time::Instant::now();
     let cwd = std::env::current_dir().context("getting current directory")?;
     let paths = Paths::for_env(&cwd, env);
 
@@ -32,6 +35,20 @@ pub async fn run(env: &str, interactive: bool) -> Result<()> {
         .context("constructing Rossum API client")?;
 
     let mut lockfile = Lockfile::load(&paths.lockfile())?;
+
+    // Phase 1: scan local files for changes.
+    let scan_progress = KindProgress::start(format!("push envs/{env}"));
+    let (scanned, changes) = scan::scan(&paths, &lockfile)?;
+    drop(scan_progress); // suppress auto ✓ line; we emit our own.
+    eprintln!("✓ push envs/{env}: {scanned} files scanned, {} changed", changes.total());
+
+    if changes.is_empty() {
+        eprintln!(
+            "✓ push envs/{env}: no changes  ({:.1}s)",
+            push_started.elapsed().as_secs_f32()
+        );
+        return Ok(());
+    }
 
     // Run drivers in a separate function so we can detect [a]bort
     // (PullAborted) and skip lockfile.save(). Mirrors the pull-side
