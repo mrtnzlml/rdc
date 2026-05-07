@@ -2,6 +2,7 @@ use super::common::{apply_pull_action, decide_pull_action, record_object, PullAc
 use crate::api::{anyhow_has_status, DataStorageClient};
 use crate::config::EnvConfig;
 use crate::model::IndexSet;
+use crate::progress::KindProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use futures::stream::{StreamExt, TryStreamExt};
@@ -18,7 +19,7 @@ use std::collections::HashSet;
 /// doesn't take 20 sequential round-trips.
 ///
 /// Returns `(collection_count, conflicts)`.
-pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str) -> Result<(usize, usize)> {
+pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str, progress: &KindProgress) -> Result<(usize, usize)> {
     let base = env_cfg.data_storage_base();
 
     let client = DataStorageClient::new(base, token.to_string())
@@ -33,6 +34,8 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str) -> Re
         }
         Err(e) => return Err(e.context("listing MDH collections")),
     };
+
+    progress.set_total(collections.len() as u64);
 
     let mut used: HashSet<String> = HashSet::new();
     let mut conflicts = 0usize;
@@ -128,6 +131,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, token: &str) -> Re
             None,
             Some(i_recorded),
         );
+        progress.tick();
     }
 
     Ok((collections.len(), conflicts))

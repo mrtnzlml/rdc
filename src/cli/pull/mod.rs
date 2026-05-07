@@ -215,8 +215,13 @@ async fn run_drivers(
     };
     let (n_email_templates, c_email_templates) = email_templates::pull(ctx).await
         .with_context(|| format!("pulling email templates for env '{env}'"))?;
-    let (n_datasets, c_datasets) = mdh::pull(ctx, env_cfg, token).await
-        .with_context(|| format!("pulling MDH datasets for env '{env}'"))?;
+    let (n_datasets, c_datasets) = {
+        let p = KindProgress::start("mdh");
+        let result = mdh::pull(ctx, env_cfg, token, &p).await
+            .with_context(|| format!("pulling MDH datasets for env '{env}'"))?;
+        p.finish();
+        result
+    };
 
     Ok(PullStats {
         n_orgs, c_orgs,
