@@ -36,6 +36,11 @@ pub enum Command {
         #[arg(long)]
         to: String,
     },
+    /// Read-only health check: token, auth, lockfile, local edits.
+    /// With no `env`, runs for every env defined in `rdc.toml`.
+    Status {
+        env: Option<String>,
+    },
 }
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
@@ -46,6 +51,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Map { src, tgt }) => crate::cli::deploy::map::run(&src, &tgt).await,
         Some(Command::Plan { from, to }) => crate::cli::deploy::plan::run(&from, &to).await,
         Some(Command::Apply { from, to }) => crate::cli::deploy::apply::run(&from, &to).await,
+        Some(Command::Status { env }) => crate::cli::status::run(env).await,
         None => {
             use clap::CommandFactory;
             Cli::command().print_help()?;
@@ -60,3 +66,4 @@ pub mod index;
 pub mod init;
 pub mod pull;
 pub mod push;
+pub mod status;
