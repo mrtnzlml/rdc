@@ -38,11 +38,14 @@ pub async fn run(env: &str) -> Result<()> {
         .context("constructing Rossum API client")?;
 
     let mut lockfile = Lockfile::load(&paths.lockfile())?;
+    let overlay = crate::overlay::Overlay::load(&paths.overlay_file())
+        .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
     let mut ctx = PullCtx {
         paths: &paths,
         client: &client,
         lockfile: &mut lockfile,
         queue_locations: std::collections::BTreeMap::new(),
+        overlay,
     };
 
     // Flat-list kinds (M7 three-way detection):

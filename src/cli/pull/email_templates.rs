@@ -1,6 +1,6 @@
 use super::common::{
-    apply_pull_action, decide_pull_action, record_object, skip_on_permission_denied,
-    PullAction, PullCtx,
+    apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
+    skip_on_permission_denied, PullAction, PullCtx,
 };
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
@@ -70,6 +70,10 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
 
         let mut proposed = serde_json::to_vec_pretty(t).context("serializing email template")?;
         proposed.push(b'\n');
+        let proposed = maybe_strip_overlay(
+            proposed,
+            ctx.overlay.as_ref().and_then(|o| o.email_template(&lockfile_key)),
+        )?;
 
         let local_path = dir.join(format!("{template_slug}.json"));
         let base_hash = ctx

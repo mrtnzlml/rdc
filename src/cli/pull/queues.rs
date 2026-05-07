@@ -1,6 +1,6 @@
 use super::common::{
-    apply_pull_action, decide_pull_action, parse_id_from_url, record_object,
-    skip_on_permission_denied, PullAction, PullCtx,
+    apply_pull_action, decide_pull_action, maybe_strip_overlay, parse_id_from_url,
+    record_object, skip_on_permission_denied, PullAction, PullCtx,
 };
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
@@ -58,6 +58,10 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<QueueCounts> {
         let queue_path = queue_dir.join("queue.json");
         let mut queue_proposed = serde_json::to_vec_pretty(q).context("serializing queue")?;
         queue_proposed.push(b'\n');
+        let queue_proposed = maybe_strip_overlay(
+            queue_proposed,
+            ctx.overlay.as_ref().and_then(|o| o.queue(&q_slug)),
+        )?;
         let queue_base = ctx
             .lockfile
             .objects
@@ -113,6 +117,12 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<QueueCounts> {
 
         let (remote_json_bytes, remote_formulas) =
             crate::snapshot::schema::serialize_schema(&schema)?;
+        // Strip overlay-managed paths from the schema JSON (M26).
+        // Formulas (extracted to formulas/<id>.py) are unaffected.
+        let remote_json_bytes = maybe_strip_overlay(
+            remote_json_bytes,
+            ctx.overlay.as_ref().and_then(|o| o.schema(&q_slug)),
+        )?;
         let remote_combined_hash =
             crate::state::schema_combined_hash(&remote_json_bytes, &remote_formulas);
 
@@ -140,8 +150,12 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<QueueCounts> {
 
         let schema_recorded = match s_action {
             PullAction::Write => {
-                crate::snapshot::schema::write_schema(&queue_dir, &schema)
-                    .with_context(|| format!("writing schema for queue '{}'", q.name))?;
+                // Use the (possibly stripped) bytes computed above instead of
+                // re-serializing the typed schema — overlay strip would be lost.
+                crate::snapshot::schema::write_schema_bytes(
+                    &queue_dir, &remote_json_bytes, &remote_formulas,
+                )
+                .with_context(|| format!("writing schema for queue '{}'", q.name))?;
                 remote_combined_hash
             }
             PullAction::KeepLocal => {
@@ -195,6 +209,10 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<QueueCounts> {
             let inbox_path = queue_dir.join("inbox.json");
             let mut inbox_proposed = serde_json::to_vec_pretty(&inbox).context("serializing inbox")?;
             inbox_proposed.push(b'\n');
+            let inbox_proposed = maybe_strip_overlay(
+                inbox_proposed,
+                ctx.overlay.as_ref().and_then(|o| o.inbox(&q_slug)),
+            )?;
             let inbox_base = ctx
                 .lockfile
                 .objects

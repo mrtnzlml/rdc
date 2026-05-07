@@ -38,6 +38,12 @@ pub struct PullCtx<'a> {
     /// and consumed by drivers for queue-nested kinds (currently
     /// email_templates). Empty until queues run.
     pub queue_locations: BTreeMap<String, (String, String)>,
+    /// Per-env overlay loaded once at pull entry. When `Some`, pull drivers
+    /// strip overlay-managed paths from the incoming remote bytes before
+    /// hashing/writing — this keeps `<env>` snapshots in their canonical
+    /// pre-overlay form so cross-env diffs and deploys are quiet (M26 /
+    /// spec §9.3). `None` when the env has no `overlay.toml`.
+    pub overlay: Option<crate::overlay::Overlay>,
 }
 
 /// Compute the content hash of an object's serialized form. The pull drivers
@@ -45,6 +51,27 @@ pub struct PullCtx<'a> {
 /// what was actually persisted.
 pub fn hash_for_lockfile(bytes: &[u8]) -> String {
     content_hash(bytes)
+}
+
+/// If `paths` is `Some` and non-empty, strip those overlay-managed dotted
+/// paths from `bytes` (parse to Value, strip, re-serialize). Otherwise
+/// return `bytes` unchanged. Used by every writable-kind pull driver to
+/// keep the snapshot in its canonical pre-overlay form (spec §9.3 / M26).
+pub fn maybe_strip_overlay(
+    bytes: Vec<u8>,
+    paths: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
+) -> Result<Vec<u8>> {
+    let Some(paths) = paths else { return Ok(bytes); };
+    if paths.is_empty() {
+        return Ok(bytes);
+    }
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes)
+        .context("parsing JSON for overlay strip")?;
+    crate::overlay::strip_paths(&mut value, paths);
+    let mut out = serde_json::to_vec_pretty(&value)
+        .context("re-serializing post overlay strip")?;
+    out.push(b'\n');
+    Ok(out)
 }
 
 /// Record an object in the lockfile under the given kind/slug.

@@ -1,7 +1,9 @@
 use crate::api::RossumClient;
+use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::snapshot::hook::{read_hook, serialize_hook, write_hook};
+use crate::snapshot::hook::{read_hook_value, serialize_hook, write_hook_code};
+use crate::snapshot::writer::write_atomic;
 use crate::state::{hook_combined_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
 
@@ -15,7 +17,10 @@ pub async fn push(
         return Ok((0, 0));
     }
 
-    // Load overlay if present (M11).
+    // Load overlay if present (M11). With M26, overlay drives both the
+    // outbound payload (apply_overrides) AND the strip applied to remote
+    // bytes for hashing — so disk-bytes (already stripped) and post-strip
+    // remote bytes can both be compared against `lockfile.content_hash`.
     let overlay = Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
@@ -36,22 +41,21 @@ pub async fn push(
             continue;
         }
 
-        let local_hook = read_hook(&hooks_dir, slug)
-            .with_context(|| format!("reading local hook '{slug}'"))?;
+        let local_json_path = hooks_dir.join(format!("{slug}.json"));
+        let local_py_path = hooks_dir.join(format!("{slug}.py"));
 
-        // Apply overlay (if any) to a JSON Value, then re-deserialize back to Hook.
-        let mut payload = serde_json::to_value(&local_hook)
-            .context("serializing local hook to value")?;
-        if let Some(ov) = &overlay {
-            if let Some(hook_overrides) = ov.hook(slug) {
-                apply_overrides(&mut payload, hook_overrides);
-            }
-        }
-        let payload_hook: crate::model::Hook = serde_json::from_value(payload.clone())
-            .with_context(|| format!("re-deserializing overlay-applied hook '{slug}'"))?;
-
-        let (post_overlay_json, post_overlay_code) = serialize_hook(&payload_hook)?;
-        let local_combined = hook_combined_hash(&post_overlay_json, &post_overlay_code);
+        // Hash the on-disk bytes directly. Pull writes the stripped form,
+        // so this hash matches `lockfile.content_hash` when the user
+        // hasn't edited anything.
+        let disk_json_bytes = std::fs::read(&local_json_path)
+            .with_context(|| format!("reading {}", local_json_path.display()))?;
+        let disk_code = if local_py_path.exists() {
+            Some(std::fs::read_to_string(&local_py_path)
+                .with_context(|| format!("reading {}", local_py_path.display()))?)
+        } else {
+            None
+        };
+        let local_combined = hook_combined_hash(&disk_json_bytes, &disk_code);
 
         let entry = lockfile.objects.get("hooks").and_then(|m| m.get(slug));
         let Some(entry) = entry else {
@@ -59,19 +63,30 @@ pub async fn push(
             skipped += 1;
             continue;
         };
-
         let Some(base) = &entry.content_hash else {
             eprintln!("warning: hooks/{slug}.json — lockfile entry has no content_hash, skipping");
             skipped += 1;
             continue;
         };
-
         if &local_combined == base {
             continue;
         }
 
         let id = entry.id;
 
+        // Read raw Value (with .py spliced in) so overlay can re-add fields
+        // stripped by pull (M26 / spec §9.3) BEFORE typed deserialize.
+        let mut payload = read_hook_value(&hooks_dir, slug)
+            .with_context(|| format!("reading local hook '{slug}'"))?;
+        let overlay_paths = overlay.as_ref().and_then(|ov| ov.hook(slug));
+        if let Some(p) = overlay_paths {
+            apply_overrides(&mut payload, p);
+        }
+        let payload_hook: crate::model::Hook = serde_json::from_value(payload)
+            .with_context(|| format!("deserializing overlay-applied hook '{slug}'"))?;
+
+        // Drift check: fetch remote, serialize, strip same overlay paths,
+        // hash. Compare to base (which was recorded post-strip on pull).
         if remote_hooks.is_none() {
             remote_hooks = Some(
                 client.list_hooks().await
@@ -84,10 +99,9 @@ pub async fn push(
             skipped += 1;
             continue;
         };
-
-        let (remote_json, remote_code) = serialize_hook(remote_hook)?;
-        let remote_combined = hook_combined_hash(&remote_json, &remote_code);
-
+        let (remote_json_full, remote_code) = serialize_hook(remote_hook)?;
+        let remote_json_stripped = maybe_strip_overlay(remote_json_full, overlay_paths)?;
+        let remote_combined = hook_combined_hash(&remote_json_stripped, &remote_code);
         if &remote_combined != base {
             eprintln!(
                 "warning: hooks/{slug}.json — remote has changed since last pull, skipping push (run `rdc pull` first)"
@@ -99,16 +113,18 @@ pub async fn push(
         let updated = client.update_hook(id, &payload_hook).await
             .with_context(|| format!("PATCH /hooks/{id}"))?;
 
-        // Write the canonical (server-authoritative) form to disk so the
-        // local file matches the lockfile hash. Without this, files written
-        // by external tooling (e.g. Python with ensure_ascii=True) leave the
-        // disk bytes diverged from the canonical form, and subsequent pulls
-        // need two iterations to settle.
-        write_hook(&hooks_dir, slug, &updated)
+        // Refresh local file with the post-strip canonical form (matches
+        // what next pull would write) and update lockfile to match.
+        let (updated_json_full, updated_code) = serialize_hook(&updated)?;
+        let updated_json_stripped = maybe_strip_overlay(updated_json_full, overlay_paths)?;
+        let updated_hash = hook_combined_hash(&updated_json_stripped, &updated_code);
+        write_atomic(&local_json_path, &updated_json_stripped)
             .with_context(|| format!("writing post-push canonical form for '{slug}'"))?;
+        if let Some(code) = &updated_code {
+            write_hook_code(&hooks_dir, slug, code)
+                .with_context(|| format!("writing hook code for '{slug}'"))?;
+        }
 
-        let (updated_json, updated_code) = serialize_hook(&updated)?;
-        let updated_hash = hook_combined_hash(&updated_json, &updated_code);
         lockfile.upsert(
             "hooks",
             slug,

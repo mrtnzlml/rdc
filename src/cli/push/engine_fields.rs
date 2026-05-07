@@ -1,12 +1,11 @@
 use crate::api::{anyhow_has_status, RossumClient};
+use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
 use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
 
-/// Push locally-edited engine fields. Flat layout under
-/// `envs/<env>/engine-fields/`. Returns `(pushed, skipped)`.
 pub async fn push(
     paths: &Paths,
     client: &RossumClient,
@@ -36,24 +35,9 @@ pub async fn push(
             continue;
         }
         let path = kind_dir.join(format!("{slug}.json"));
-        let raw = std::fs::read_to_string(&path)
+        let disk_bytes = std::fs::read(&path)
             .with_context(|| format!("reading {}", path.display()))?;
-        let local: crate::model::EngineField = serde_json::from_str(&raw)
-            .with_context(|| format!("parsing {}", path.display()))?;
-
-        let mut payload = serde_json::to_value(&local).context("serializing local engine field")?;
-        if let Some(ov) = &overlay {
-            if let Some(overrides) = ov.engine_field(slug) {
-                apply_overrides(&mut payload, overrides);
-            }
-        }
-        let payload_field: crate::model::EngineField = serde_json::from_value(payload)
-            .with_context(|| format!("re-deserializing overlay-applied engine field '{slug}'"))?;
-
-        let mut post_overlay_bytes = serde_json::to_vec_pretty(&payload_field)
-            .context("serializing engine field")?;
-        post_overlay_bytes.push(b'\n');
-        let local_combined = content_hash(&post_overlay_bytes);
+        let local_combined = content_hash(&disk_bytes);
 
         let entry = lockfile.objects.get("engine_fields").and_then(|m| m.get(slug));
         let Some(entry) = entry else {
@@ -70,6 +54,15 @@ pub async fn push(
             continue;
         }
 
+        let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        let overlay_paths = overlay.as_ref().and_then(|ov| ov.engine_field(slug));
+        if let Some(p) = overlay_paths {
+            apply_overrides(&mut payload, p);
+        }
+        let payload_field: crate::model::EngineField = serde_json::from_value(payload)
+            .with_context(|| format!("deserializing overlay-applied engine field '{slug}'"))?;
+
         let id = entry.id;
         if remote_cache.is_none() {
             remote_cache = Some(client.list_engine_fields().await
@@ -83,6 +76,7 @@ pub async fn push(
         let mut remote_bytes = serde_json::to_vec_pretty(remote_field)
             .context("serializing remote engine field")?;
         remote_bytes.push(b'\n');
+        let remote_bytes = maybe_strip_overlay(remote_bytes, overlay_paths)?;
         let remote_combined = content_hash(&remote_bytes);
         if &remote_combined != base {
             eprintln!(
@@ -109,6 +103,7 @@ pub async fn push(
         let mut updated_bytes = serde_json::to_vec_pretty(&updated)
             .context("serializing updated engine field")?;
         updated_bytes.push(b'\n');
+        let updated_bytes = maybe_strip_overlay(updated_bytes, overlay_paths)?;
         let updated_hash = content_hash(&updated_bytes);
         write_atomic(&path, &updated_bytes)
             .with_context(|| format!("writing post-push canonical form for engine field '{slug}'"))?;

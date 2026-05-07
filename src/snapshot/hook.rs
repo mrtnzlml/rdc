@@ -74,10 +74,12 @@ pub fn write_hook_code(dir: &Path, slug: &str, code: &str) -> Result<()> {
     Ok(())
 }
 
-/// Read a hook back from disk: load `<dir>/<slug>.json`, then if `<dir>/<slug>.py`
-/// exists, splice its contents back into `config.code` so the in-memory `Hook`
-/// is byte-for-byte equivalent to what was originally serialized.
-pub fn read_hook(dir: &Path, slug: &str) -> Result<Hook> {
+/// Read a hook back from disk as an untyped `Value`: load `<dir>/<slug>.json`,
+/// then if `<dir>/<slug>.py` exists, splice its contents back into
+/// `config.code`. The Value is NOT yet deserialized into `Hook` — callers
+/// who need to apply overlay overrides before typing call this directly,
+/// then `serde_json::from_value(value)?`.
+pub fn read_hook_value(dir: &Path, slug: &str) -> Result<Value> {
     let json_path = dir.join(format!("{slug}.json"));
     let raw = std::fs::read_to_string(&json_path)
         .with_context(|| format!("reading {}", json_path.display()))?;
@@ -95,6 +97,17 @@ pub fn read_hook(dir: &Path, slug: &str) -> Result<Hook> {
         }
     }
 
+    Ok(value)
+}
+
+/// Read a hook back from disk into a typed `Hook`. Splices `<slug>.py` back
+/// into `config.code` first, so the in-memory `Hook` is byte-for-byte
+/// equivalent to what was originally serialized. Fails if required typed
+/// fields are missing — overlay-stripping callers should use
+/// `read_hook_value` + apply overlay + `from_value` instead.
+pub fn read_hook(dir: &Path, slug: &str) -> Result<Hook> {
+    let value = read_hook_value(dir, slug)?;
+    let json_path = dir.join(format!("{slug}.json"));
     let hook: Hook = serde_json::from_value(value)
         .with_context(|| format!("deserializing hook from {}", json_path.display()))?;
     Ok(hook)
