@@ -65,6 +65,30 @@ async fn pull_writes_full_workspace_tree() {
         .mount(&server)
         .await;
 
+    Mock::given(method("GET"))
+        .and(path("/api/v1/rules"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("rules_list.json")))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("labels_list.json")))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/engines"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("engines_list.json")))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/engine_fields"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("engine_fields_list.json")))
+        .mount(&server)
+        .await;
+
     let project = TempDir::new().unwrap();
 
     Command::cargo_bin("rdc")
@@ -96,7 +120,11 @@ async fn pull_writes_full_workspace_tree() {
         .stdout(predicate::str::contains("3 queues"))
         .stdout(predicate::str::contains("3 schemas"))
         .stdout(predicate::str::contains("1 inbox"))
-        .stdout(predicate::str::contains("2 hooks"));
+        .stdout(predicate::str::contains("2 hooks"))
+        .stdout(predicate::str::contains("1 rule"))
+        .stdout(predicate::str::contains("2 labels"))
+        .stdout(predicate::str::contains("1 engine"))
+        .stdout(predicate::str::contains("2 engine fields"));
 
     let env_root = project.path().join("envs/dev");
 
@@ -154,6 +182,132 @@ async fn pull_writes_full_workspace_tree() {
     // Hashes are 64-char hex (SHA-256). Spot-check by counting at least one full hash.
     let hash_re = regex::Regex::new(r#""content_hash":\s*"[0-9a-f]{64}""#).unwrap();
     assert!(hash_re.is_match(&lf), "expected at least one 64-char hex content_hash in lockfile");
+
+    // M4 kinds present
+    assert!(env_root.join("rules/e-invoice-validation.json").exists());
+    assert!(env_root.join("labels/priority-high.json").exists());
+    assert!(env_root.join("labels/needs-review.json").exists());
+    assert!(env_root.join("engines/invoice-engine.json").exists());
+    assert!(env_root.join("engine-fields/invoice-id.json").exists());
+    assert!(env_root.join("engine-fields/total-amount.json").exists());
+
+    // Lockfile records new kinds
+    assert!(lf.contains("\"rules\""));
+    assert!(lf.contains("\"labels\""));
+    assert!(lf.contains("\"engines\""));
+    assert!(lf.contains("\"engine_fields\""));
+}
+
+#[tokio::test]
+async fn pull_with_workspace_filter_skips_non_matching() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("hooks_list.json")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("workspaces_list.json")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("queues_list.json")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schemas/200"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("schema_1.json")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schemas/201"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("schema_2.json")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schemas/202"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("schema_3.json")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/inboxes/300"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("inbox_1.json")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/rules"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("rules_list.json")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("labels_list.json")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/engines"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("engines_list.json")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/engine_fields"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("engine_fields_list.json")))
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args([
+            "init",
+            "--name", "test-pull",
+            "--env",
+            &format!("dev={}/api/v1:1", server.uri()),
+        ])
+        .assert()
+        .success();
+
+    // Hand-edit rdc.toml to add workspace_filter that only matches "Invoices AP".
+    let cfg_path = project.path().join("rdc.toml");
+    let cfg = std::fs::read_to_string(&cfg_path).unwrap();
+    let cfg = cfg.replace("[envs.dev]", "[envs.dev]\nworkspace_filter = \"^Invoices AP$\"");
+    std::fs::write(&cfg_path, cfg).unwrap();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert()
+        .success()
+        // Only one workspace pulled (Invoices AP); two queues belong to it.
+        .stdout(predicate::str::contains("1 workspace"))
+        .stdout(predicate::str::contains("2 queues"));
+
+    let env_root = project.path().join("envs/dev");
+    let ws_root = env_root.join("workspaces");
+    assert!(ws_root.join("invoices-ap").is_dir());
+    assert!(!ws_root.join("purchase-orders").exists(), "filtered workspace should not be pulled");
+
+    // The Purchase Orders queue (whose workspace was filtered) is skipped.
+    let lf = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    assert!(lf.contains("invoices-ap"));
+    assert!(!lf.contains("purchase-orders"), "queue from filtered workspace should not appear in lockfile");
 }
 
 #[tokio::test]
