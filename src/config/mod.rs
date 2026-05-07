@@ -21,6 +21,10 @@ pub struct EnvConfig {
     pub org_id: u64,
     #[serde(default)]
     pub workspace_filter: Option<String>,
+    /// Optional Data Storage base URL (e.g. `https://X.rossum.app/data/v1`).
+    /// When set, MDH datasets are pulled. When None, MDH is skipped silently.
+    #[serde(default)]
+    pub data_storage_base: Option<String>,
 }
 
 impl ProjectConfig {
@@ -53,6 +57,7 @@ mod tests {
                 api_base: "https://example.rossum.app/api/v1".to_string(),
                 org_id: 285704,
                 workspace_filter: None,
+                data_storage_base: None,
             },
         );
         ProjectConfig {
@@ -75,5 +80,18 @@ mod tests {
         let err = ProjectConfig::load(Path::new("/nope/rdc.toml")).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("/nope/rdc.toml"), "error should name the path: {msg}");
+    }
+
+    #[test]
+    fn round_trip_with_data_storage_base() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rdc.toml");
+        let mut cfg = example();
+        cfg.envs.get_mut("dev").unwrap().data_storage_base =
+            Some("https://example.rossum.app/data/v1".to_string());
+        cfg.save(&path).unwrap();
+        let loaded = ProjectConfig::load(&path).unwrap();
+        assert_eq!(loaded.envs["dev"].data_storage_base.as_deref(),
+                   Some("https://example.rossum.app/data/v1"));
     }
 }
