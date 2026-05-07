@@ -99,6 +99,21 @@ impl Paths {
     pub fn engine_fields_dir(&self) -> PathBuf {
         self.env_root().join("engine-fields")
     }
+
+    /// `<root>/envs/<env>/workflows/`
+    pub fn workflows_dir(&self) -> PathBuf {
+        self.env_root().join("workflows")
+    }
+
+    /// `<root>/envs/<env>/workflow-steps/`
+    pub fn workflow_steps_dir(&self) -> PathBuf {
+        self.env_root().join("workflow-steps")
+    }
+
+    /// `<root>/envs/<env>/email-templates/`
+    pub fn email_templates_dir(&self) -> PathBuf {
+        self.env_root().join("email-templates")
+    }
 }
 
 #[cfg(test)]
@@ -185,5 +200,20 @@ mod tests {
     #[test]
     fn engine_fields_dir_path() {
         assert_eq!(p().engine_fields_dir(), Path::new("/proj/envs/dev/engine-fields"));
+    }
+
+    #[test]
+    fn workflows_dir_path() {
+        assert_eq!(p().workflows_dir(), Path::new("/proj/envs/dev/workflows"));
+    }
+
+    #[test]
+    fn workflow_steps_dir_path() {
+        assert_eq!(p().workflow_steps_dir(), Path::new("/proj/envs/dev/workflow-steps"));
+    }
+
+    #[test]
+    fn email_templates_dir_path() {
+        assert_eq!(p().email_templates_dir(), Path::new("/proj/envs/dev/email-templates"));
     }
 }

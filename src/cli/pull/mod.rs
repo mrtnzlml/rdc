@@ -6,6 +6,7 @@ use crate::state::Lockfile;
 use anyhow::{anyhow, Context, Result};
 
 mod common;
+mod email_templates;
 mod engine_fields;
 mod engines;
 mod hooks;
@@ -13,6 +14,8 @@ mod labels;
 mod organization;
 mod queues;
 mod rules;
+mod workflow_steps;
+mod workflows;
 mod workspaces;
 
 pub use common::PullCtx;
@@ -52,10 +55,16 @@ pub async fn run(env: &str) -> Result<()> {
         .with_context(|| format!("pulling engines for env '{env}'"))?;
     let n_engine_fields = engine_fields::pull(&mut ctx).await
         .with_context(|| format!("pulling engine fields for env '{env}'"))?;
+    let n_workflows = workflows::pull(&mut ctx).await
+        .with_context(|| format!("pulling workflows for env '{env}'"))?;
+    let n_workflow_steps = workflow_steps::pull(&mut ctx).await
+        .with_context(|| format!("pulling workflow steps for env '{env}'"))?;
+    let n_email_templates = email_templates::pull(&mut ctx).await
+        .with_context(|| format!("pulling email templates for env '{env}'"))?;
 
     lockfile.save(&paths.lockfile())?;
     println!(
-        "Pulled {}, {}, {}, {}, {}, {}, {}, {}, {}, {} from env '{env}'",
+        "Pulled {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} from env '{env}'",
         common::pluralize(n_orgs, "organization", "organizations"),
         common::pluralize(n_workspaces, "workspace", "workspaces"),
         common::pluralize(qc.queues, "queue", "queues"),
@@ -66,6 +75,9 @@ pub async fn run(env: &str) -> Result<()> {
         common::pluralize(n_labels, "label", "labels"),
         common::pluralize(n_engines, "engine", "engines"),
         common::pluralize(n_engine_fields, "engine field", "engine fields"),
+        common::pluralize(n_workflows, "workflow", "workflows"),
+        common::pluralize(n_workflow_steps, "workflow step", "workflow steps"),
+        common::pluralize(n_email_templates, "email template", "email templates"),
     );
     Ok(())
 }
