@@ -115,7 +115,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
             crate::cli::pull::run(&env, concurrency, interactive).await
         }
-        Some(Command::Push { env }) => crate::cli::push::run(&env).await,
+        Some(Command::Push { env }) => {
+            let interactive = crate::cli::resolve::is_interactive(cli.yes);
+            crate::cli::push::run(&env, interactive).await
+        }
         Some(Command::Map { src, tgt }) => crate::cli::deploy::map::run(&src, &tgt).await,
         Some(Command::Plan { from, to }) => crate::cli::deploy::plan::run(&from, &to).await,
         Some(Command::Apply { from, to }) => crate::cli::deploy::apply::run(&from, &to).await,

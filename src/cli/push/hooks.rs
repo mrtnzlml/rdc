@@ -11,6 +11,7 @@ pub async fn push(
     paths: &Paths,
     client: &RossumClient,
     lockfile: &mut Lockfile,
+    interactive: bool,
 ) -> Result<(usize, usize)> {
     let hooks_dir = paths.hooks_dir();
     if !hooks_dir.exists() {
@@ -102,15 +103,54 @@ pub async fn push(
         let (remote_json_full, remote_code) = serialize_hook(remote_hook)?;
         let remote_json_stripped = maybe_strip_overlay(remote_json_full, overlay_paths)?;
         let remote_combined = hook_combined_hash(&remote_json_stripped, &remote_code);
+        let mut payload_to_send = payload_hook;
         if &remote_combined != base {
-            eprintln!(
-                "warning: hooks/{slug}.json — remote has changed since last pull, skipping push (run `rdc pull` first)"
-            );
-            skipped += 1;
-            continue;
+            // Drift detected. The hook is a combined-hash kind (json + py);
+            // the resolver prompt shows json bytes for the diff (most
+            // common case). On Adopt, we write both .json and .py from
+            // the remote so disk + lockfile stay aligned.
+            use crate::cli::resolve::{resolve_push_drift, PushDriftOutcome};
+            match resolve_push_drift(interactive, &local_json_path, &remote_json_stripped)? {
+                PushDriftOutcome::Patch { payload_override } => {
+                    if let Some(bytes) = payload_override {
+                        payload_to_send = serde_json::from_slice(&bytes)
+                            .with_context(|| format!("re-deserializing edited hook '{slug}'"))?;
+                    }
+                }
+                PushDriftOutcome::Adopt => {
+                    write_atomic(&local_json_path, &remote_json_stripped)
+                        .with_context(|| format!("adopting remote into {}", local_json_path.display()))?;
+                    if let Some(code) = &remote_code {
+                        write_hook_code(&hooks_dir, slug, code)
+                            .with_context(|| format!("adopting remote hook code for '{slug}'"))?;
+                    } else if local_py_path.exists() {
+                        std::fs::remove_file(&local_py_path)
+                            .with_context(|| format!("removing stale {}", local_py_path.display()))?;
+                    }
+                    lockfile.upsert(
+                        "hooks",
+                        slug,
+                        ObjectEntry {
+                            id,
+                            url: Some(remote_hook.url.clone()),
+                            modified_at: remote_hook.modified_at().map(|s| s.to_string()),
+                            content_hash: Some(remote_combined),
+                        },
+                    );
+                    skipped += 1;
+                    continue;
+                }
+                PushDriftOutcome::Skip => {
+                    eprintln!(
+                        "warning: hooks/{slug}.json — remote has changed since last pull, skipping push (run `rdc pull` first)"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            }
         }
 
-        let updated = client.update_hook(id, &payload_hook).await
+        let updated = client.update_hook(id, &payload_to_send).await
             .with_context(|| format!("PATCH /hooks/{id}"))?;
 
         // Refresh local file with the post-strip canonical form (matches
