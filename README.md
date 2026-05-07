@@ -2,7 +2,7 @@
 
 `rdc` (Rossum Deployment as Code) snapshots Rossum.ai configurations to disk for AI-assisted local development and deploys them across environments.
 
-**Status:** M8. Pull side feature-complete with three-way conflict detection across all kinds (M7 + M8) and per-env `_index.md` generation. See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full design and `docs/superpowers/plans/` for implementation plans.
+**Status:** M9. Pull side feature-complete with three-way conflict detection across all kinds (M7, M8, M9), per-env `_index.md` generation, and formula-aware schema hashes. See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full design.
 
 ## Quick start
 
@@ -39,8 +39,7 @@ ls envs/dev/
   reports the conflict count and a per-conflict warning is printed to stderr.
 
 Three-way detection covers every kind: organization, workspaces, queues,
-schemas (JSON only — formula `.py` files are always overwritten until the
-combined-hash work in M9), inboxes, hooks, rules, labels, engines, engine
+schemas (combined hash covers schema.json + every formula `.py` file), inboxes, hooks, rules, labels, engines, engine
 fields, workflows, workflow steps, email templates, and MDH collections +
 indexes.
 
