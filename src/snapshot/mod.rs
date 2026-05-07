@@ -6,6 +6,7 @@ pub mod hook;
 pub mod inbox;
 pub mod index_set;
 pub mod label;
+pub mod noise;
 pub mod organization;
 pub mod queue;
 pub mod rule;
