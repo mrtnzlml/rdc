@@ -1,15 +1,15 @@
-use super::common::{hash_for_lockfile, record_object, PullCtx};
+use super::common::{apply_pull_action, decide_pull_action, record_object, PullAction, PullCtx};
 use crate::slug::slugify_unique;
-use crate::snapshot::label::write_label;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 
-/// Pull all labels. Returns the count.
-pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<usize> {
+/// Pull all labels. Returns `(count, conflicts)`.
+pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
     let labels = ctx.client.list_labels().await.context("listing labels")?;
 
     let mut used: HashSet<String> = HashSet::new();
     let mut dir_created = false;
+    let mut conflicts = 0usize;
     for l in &labels {
         if !dir_created {
             std::fs::create_dir_all(ctx.paths.labels_dir())
@@ -19,9 +19,23 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<usize> {
         let slug = slugify_unique(&l.name, &used);
         used.insert(slug.clone());
 
-        let bytes = write_label(&ctx.paths.labels_dir(), &slug, l)
-            .with_context(|| format!("writing label '{}' to disk", l.name))?;
-        let hash = hash_for_lockfile(&bytes);
+        let mut proposed = serde_json::to_vec_pretty(l).context("serializing label")?;
+        proposed.push(b'\n');
+
+        let local_path = ctx.paths.labels_dir().join(format!("{slug}.json"));
+        let base_hash = ctx
+            .lockfile
+            .objects
+            .get("labels")
+            .and_then(|m| m.get(&slug))
+            .and_then(|e| e.content_hash.clone());
+
+        let (action, remote_hash) =
+            decide_pull_action(&local_path, base_hash.as_deref(), &proposed)?;
+        if action == PullAction::Conflict {
+            conflicts += 1;
+        }
+        let recorded_hash = apply_pull_action(action, &local_path, &proposed, remote_hash)?;
 
         record_object(
             ctx.lockfile,
@@ -30,9 +44,9 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<usize> {
             l.id,
             Some(l.url.clone()),
             l.modified_at().map(|s| s.to_string()),
-            Some(hash),
+            Some(recorded_hash),
         );
     }
 
-    Ok(labels.len())
+    Ok((labels.len(), conflicts))
 }

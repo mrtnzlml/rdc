@@ -41,6 +41,15 @@ pub fn write_hook(dir: &Path, slug: &str, hook: &Hook) -> Result<Vec<u8>> {
     Ok(json_with_newline)
 }
 
+/// Write only the hook's `.py` file (extracted from `config.code`). Used by
+/// pull drivers that compute the JSON write decision separately and only need
+/// to overwrite the code file.
+pub fn write_hook_code(dir: &Path, slug: &str, code: &str) -> Result<()> {
+    let py_path = dir.join(format!("{slug}.py"));
+    write_atomic(&py_path, code.as_bytes())?;
+    Ok(())
+}
+
 /// Read a hook back from disk: load `<dir>/<slug>.json`, then if `<dir>/<slug>.py`
 /// exists, splice its contents back into `config.code` so the in-memory `Hook`
 /// is byte-for-byte equivalent to what was originally serialized.

@@ -1,11 +1,10 @@
-use super::common::{hash_for_lockfile, record_object, PullCtx};
+use super::common::{apply_pull_action, decide_pull_action, record_object, PullAction, PullCtx};
 use crate::slug::slugify_unique;
-use crate::snapshot::engine_field::write_engine_field;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 
-/// Pull all engine fields. Returns the count.
-pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<usize> {
+/// Pull all engine fields. Returns `(count, conflicts)`.
+pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
     let fields = ctx
         .client
         .list_engine_fields()
@@ -14,6 +13,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<usize> {
 
     let mut used: HashSet<String> = HashSet::new();
     let mut dir_created = false;
+    let mut conflicts = 0usize;
     for f in &fields {
         if !dir_created {
             std::fs::create_dir_all(ctx.paths.engine_fields_dir())
@@ -23,9 +23,23 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<usize> {
         let slug = slugify_unique(&f.name, &used);
         used.insert(slug.clone());
 
-        let bytes = write_engine_field(&ctx.paths.engine_fields_dir(), &slug, f)
-            .with_context(|| format!("writing engine field '{}' to disk", f.name))?;
-        let hash = hash_for_lockfile(&bytes);
+        let mut proposed = serde_json::to_vec_pretty(f).context("serializing engine field")?;
+        proposed.push(b'\n');
+
+        let local_path = ctx.paths.engine_fields_dir().join(format!("{slug}.json"));
+        let base_hash = ctx
+            .lockfile
+            .objects
+            .get("engine_fields")
+            .and_then(|m| m.get(&slug))
+            .and_then(|x| x.content_hash.clone());
+
+        let (action, remote_hash) =
+            decide_pull_action(&local_path, base_hash.as_deref(), &proposed)?;
+        if action == PullAction::Conflict {
+            conflicts += 1;
+        }
+        let recorded_hash = apply_pull_action(action, &local_path, &proposed, remote_hash)?;
 
         record_object(
             ctx.lockfile,
@@ -34,9 +48,9 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<usize> {
             f.id,
             Some(f.url.clone()),
             f.modified_at().map(|s| s.to_string()),
-            Some(hash),
+            Some(recorded_hash),
         );
     }
 
-    Ok(fields.len())
+    Ok((fields.len(), conflicts))
 }

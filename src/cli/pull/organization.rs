@@ -1,10 +1,9 @@
-use super::common::{hash_for_lockfile, record_object, PullCtx};
-use crate::snapshot::organization::write_organization;
+use super::common::{apply_pull_action, decide_pull_action, record_object, PullAction, PullCtx};
 use anyhow::{Context, Result};
 
 /// Pull the env's organization. The org_id comes from the env's config in
-/// rdc.toml. Returns 1 on success (one organization per env).
-pub async fn pull(ctx: &mut PullCtx<'_>, org_id: u64) -> Result<usize> {
+/// rdc.toml. Returns `(count, conflicts)`.
+pub async fn pull(ctx: &mut PullCtx<'_>, org_id: u64) -> Result<(usize, usize)> {
     let org = ctx
         .client
         .get_organization(org_id)
@@ -17,22 +16,29 @@ pub async fn pull(ctx: &mut PullCtx<'_>, org_id: u64) -> Result<usize> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
 
-    let bytes = write_organization(&path, &org)
-        .with_context(|| format!("writing organization to {}", path.display()))?;
-    let hash = hash_for_lockfile(&bytes);
+    let mut proposed = serde_json::to_vec_pretty(&org).context("serializing organization")?;
+    proposed.push(b'\n');
+
+    let base_hash = ctx
+        .lockfile
+        .objects
+        .get("organization")
+        .and_then(|m| m.get("self"))
+        .and_then(|e| e.content_hash.clone());
+
+    let (action, remote_hash) = decide_pull_action(&path, base_hash.as_deref(), &proposed)?;
+    let conflicts = if action == PullAction::Conflict { 1 } else { 0 };
+    let recorded_hash = apply_pull_action(action, &path, &proposed, remote_hash)?;
 
     record_object(
         ctx.lockfile,
         "organization",
-        // Slug for the singleton org is just "self" — there's only one per env,
-        // so the slug doesn't appear in the filename. We use a fixed key in the
-        // lockfile for symmetry with multi-object kinds.
         "self",
         org.id,
         Some(org.url.clone()),
         org.modified_at().map(|s| s.to_string()),
-        Some(hash),
+        Some(recorded_hash),
     );
 
-    Ok(1)
+    Ok((1, conflicts))
 }

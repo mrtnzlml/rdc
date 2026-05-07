@@ -1,15 +1,15 @@
-use super::common::{hash_for_lockfile, record_object, PullCtx};
+use super::common::{apply_pull_action, decide_pull_action, record_object, PullAction, PullCtx};
 use crate::slug::slugify_unique;
-use crate::snapshot::workflow_step::write_workflow_step;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 
-/// Pull all workflow steps. Returns the count.
-pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<usize> {
+/// Pull all workflow steps. Returns `(count, conflicts)`.
+pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
     let steps = ctx.client.list_workflow_steps().await.context("listing workflow steps")?;
 
     let mut used: HashSet<String> = HashSet::new();
     let mut dir_created = false;
+    let mut conflicts = 0usize;
     for s in &steps {
         if !dir_created {
             std::fs::create_dir_all(ctx.paths.workflow_steps_dir())
@@ -19,9 +19,23 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<usize> {
         let slug = slugify_unique(&s.name, &used);
         used.insert(slug.clone());
 
-        let bytes = write_workflow_step(&ctx.paths.workflow_steps_dir(), &slug, s)
-            .with_context(|| format!("writing workflow step '{}' to disk", s.name))?;
-        let hash = hash_for_lockfile(&bytes);
+        let mut proposed = serde_json::to_vec_pretty(s).context("serializing workflow step")?;
+        proposed.push(b'\n');
+
+        let local_path = ctx.paths.workflow_steps_dir().join(format!("{slug}.json"));
+        let base_hash = ctx
+            .lockfile
+            .objects
+            .get("workflow_steps")
+            .and_then(|m| m.get(&slug))
+            .and_then(|x| x.content_hash.clone());
+
+        let (action, remote_hash) =
+            decide_pull_action(&local_path, base_hash.as_deref(), &proposed)?;
+        if action == PullAction::Conflict {
+            conflicts += 1;
+        }
+        let recorded_hash = apply_pull_action(action, &local_path, &proposed, remote_hash)?;
 
         record_object(
             ctx.lockfile,
@@ -30,9 +44,9 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<usize> {
             s.id,
             Some(s.url.clone()),
             s.modified_at().map(|x| x.to_string()),
-            Some(hash),
+            Some(recorded_hash),
         );
     }
 
-    Ok(steps.len())
+    Ok((steps.len(), conflicts))
 }

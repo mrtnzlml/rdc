@@ -40,30 +40,34 @@ pub async fn run(env: &str) -> Result<()> {
     let mut lockfile = Lockfile::load(&paths.lockfile())?;
     let mut ctx = PullCtx { paths: &paths, client: &client, lockfile: &mut lockfile };
 
-    let n_orgs = organization::pull(&mut ctx, env_cfg.org_id).await
+    // Flat-list kinds (M7 three-way detection):
+    let (n_orgs, c_orgs) = organization::pull(&mut ctx, env_cfg.org_id).await
         .with_context(|| format!("pulling organization for env '{env}'"))?;
     let n_workspaces = workspaces::pull(&mut ctx, env_cfg).await
         .with_context(|| format!("pulling workspaces for env '{env}'"))?;
     let qc = queues::pull(&mut ctx).await
         .with_context(|| format!("pulling queues for env '{env}'"))?;
-    let n_hooks = hooks::pull(&mut ctx).await
+    let (n_hooks, c_hooks) = hooks::pull(&mut ctx).await
         .with_context(|| format!("pulling hooks for env '{env}'"))?;
-    let n_rules = rules::pull(&mut ctx).await
+    let (n_rules, c_rules) = rules::pull(&mut ctx).await
         .with_context(|| format!("pulling rules for env '{env}'"))?;
-    let n_labels = labels::pull(&mut ctx).await
+    let (n_labels, c_labels) = labels::pull(&mut ctx).await
         .with_context(|| format!("pulling labels for env '{env}'"))?;
-    let n_engines = engines::pull(&mut ctx).await
+    let (n_engines, c_engines) = engines::pull(&mut ctx).await
         .with_context(|| format!("pulling engines for env '{env}'"))?;
-    let n_engine_fields = engine_fields::pull(&mut ctx).await
+    let (n_engine_fields, c_engine_fields) = engine_fields::pull(&mut ctx).await
         .with_context(|| format!("pulling engine fields for env '{env}'"))?;
-    let n_workflows = workflows::pull(&mut ctx).await
+    let (n_workflows, c_workflows) = workflows::pull(&mut ctx).await
         .with_context(|| format!("pulling workflows for env '{env}'"))?;
-    let n_workflow_steps = workflow_steps::pull(&mut ctx).await
+    let (n_workflow_steps, c_workflow_steps) = workflow_steps::pull(&mut ctx).await
         .with_context(|| format!("pulling workflow steps for env '{env}'"))?;
-    let n_email_templates = email_templates::pull(&mut ctx).await
+    let (n_email_templates, c_email_templates) = email_templates::pull(&mut ctx).await
         .with_context(|| format!("pulling email templates for env '{env}'"))?;
     let n_datasets = mdh::pull(&mut ctx, env_cfg, &token).await
         .with_context(|| format!("pulling MDH datasets for env '{env}'"))?;
+
+    let total_conflicts = c_orgs + c_hooks + c_rules + c_labels + c_engines
+        + c_engine_fields + c_workflows + c_workflow_steps + c_email_templates;
 
     lockfile.save(&paths.lockfile())?;
     let mut summary = format!(
@@ -84,6 +88,9 @@ pub async fn run(env: &str) -> Result<()> {
     );
     if env_cfg.data_storage_base.is_some() {
         summary.push_str(&format!(", {}", common::pluralize(n_datasets, "dataset", "datasets")));
+    }
+    if total_conflicts > 0 {
+        summary.push_str(&format!(", {}", common::pluralize(total_conflicts, "conflict", "conflicts")));
     }
     summary.push_str(&format!(" from env '{env}'"));
     println!("{summary}");
