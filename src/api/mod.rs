@@ -186,6 +186,76 @@ impl RossumClient {
         Ok(value)
     }
 
+    /// PATCH /queues/{id}. Used to push queue settings (columns, automation,
+    /// locale, etc.) back to Rossum.
+    pub async fn update_queue(&self, id: u64, queue: &crate::model::Queue)
+        -> Result<crate::model::Queue>
+    {
+        let url = format!("{}/queues/{id}", self.base_url);
+        let resp = self
+            .http
+            .patch(&url)
+            .header("Authorization", format!("token {}", self.token))
+            .json(queue)
+            .send()
+            .await
+            .with_context(|| format!("PATCH {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ApiError::Status { status: status.as_u16(), body }.into());
+        }
+        let value = resp.json::<crate::model::Queue>().await
+            .with_context(|| format!("decoding PATCH response from {url}"))?;
+        Ok(value)
+    }
+
+    /// PATCH /inboxes/{id}.
+    pub async fn update_inbox(&self, id: u64, inbox: &crate::model::Inbox)
+        -> Result<crate::model::Inbox>
+    {
+        let url = format!("{}/inboxes/{id}", self.base_url);
+        let resp = self
+            .http
+            .patch(&url)
+            .header("Authorization", format!("token {}", self.token))
+            .json(inbox)
+            .send()
+            .await
+            .with_context(|| format!("PATCH {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ApiError::Status { status: status.as_u16(), body }.into());
+        }
+        let value = resp.json::<crate::model::Inbox>().await
+            .with_context(|| format!("decoding PATCH response from {url}"))?;
+        Ok(value)
+    }
+
+    /// PATCH /email_templates/{id}.
+    pub async fn update_email_template(&self, id: u64, template: &crate::model::EmailTemplate)
+        -> Result<crate::model::EmailTemplate>
+    {
+        let url = format!("{}/email_templates/{id}", self.base_url);
+        let resp = self
+            .http
+            .patch(&url)
+            .header("Authorization", format!("token {}", self.token))
+            .json(template)
+            .send()
+            .await
+            .with_context(|| format!("PATCH {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ApiError::Status { status: status.as_u16(), body }.into());
+        }
+        let value = resp.json::<crate::model::EmailTemplate>().await
+            .with_context(|| format!("decoding PATCH response from {url}"))?;
+        Ok(value)
+    }
+
     pub async fn list_rules(&self) -> Result<Vec<crate::model::Rule>> {
         let mut url = format!("{}/rules", self.base_url);
         let mut out = Vec::new();

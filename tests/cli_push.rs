@@ -514,3 +514,256 @@ async fn schema_push_skips_when_remote_drifted() {
         .stdout(predicate::str::contains("0 schemas"))
         .stdout(predicate::str::contains("1 skipped"));
 }
+
+/// Queue push: edit `default_score_threshold`, push, expect `1 queue` in
+/// the summary and the canonical server response written back to disk.
+#[tokio::test]
+async fn queue_push_succeeds_when_threshold_edited() {
+    let server = MockServer::start().await;
+    mount_minimal_schema_setup(&server).await;
+
+    // PATCH response: server confirms the edit.
+    let patch_response = serde_json::json!({
+        "id": 100,
+        "url": "https://mock.rossum.app/api/v1/queues/100",
+        "name": "Cost Invoices",
+        "workspace": "https://mock.rossum.app/api/v1/workspaces/700852",
+        "schema": "https://mock.rossum.app/api/v1/schemas/200",
+        "default_score_threshold": 0.91,
+        "modified_at": "2026-05-08T10:00:00Z"
+    });
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/queues/100"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(patch_response))
+        .mount(&server).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert().success();
+
+    // Edit local queue's default_score_threshold by adding the field.
+    let queue_path = project.path()
+        .join("envs/dev/workspaces/invoices-ap/queues/cost-invoices/queue.json");
+    let raw = std::fs::read_to_string(&queue_path).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    v["default_score_threshold"] = serde_json::json!(0.91);
+    std::fs::write(&queue_path, format!("{}\n", serde_json::to_string_pretty(&v).unwrap())).unwrap();
+
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["push", "dev"])
+        .assert().success()
+        .stdout(predicate::str::contains("1 queue"))
+        .stdout(predicate::str::contains("0 schemas"));
+}
+
+/// Email template push: edit subject, push, expect `1 email template` in
+/// the summary. Setup uses a single workspace+queue+schema with one
+/// queue-scoped email template attached to the queue.
+#[tokio::test]
+async fn email_template_push_succeeds_when_subject_edited() {
+    let server = MockServer::start().await;
+
+    // Mount everything mount_minimal_schema_setup does EXCEPT email_templates,
+    // so we can mount that endpoint with a real (non-empty) list.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [{
+                "id": 700852,
+                "url": "https://mock.rossum.app/api/v1/workspaces/700852",
+                "name": "Invoices AP",
+                "organization": "https://mock.rossum.app/api/v1/organizations/1",
+                "queues": ["https://mock.rossum.app/api/v1/queues/100"]
+            }]
+        })))
+        .mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [{
+                "id": 100,
+                "url": "https://mock.rossum.app/api/v1/queues/100",
+                "name": "Cost Invoices",
+                "workspace": "https://mock.rossum.app/api/v1/workspaces/700852",
+                "schema": "https://mock.rossum.app/api/v1/schemas/200"
+            }]
+        })))
+        .mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schemas/200"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("schema_1.json")))
+        .mount(&server).await;
+    for ep in [
+        "/api/v1/hooks", "/api/v1/rules", "/api/v1/labels",
+        "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&server).await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/api/v1/email_templates"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [{
+                "id": 555,
+                "url": "https://mock.rossum.app/api/v1/email_templates/555",
+                "name": "Rejection Notice",
+                "subject": "Your invoice was rejected",
+                "queue": "https://mock.rossum.app/api/v1/queues/100"
+            }]
+        })))
+        .mount(&server).await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/email_templates/555"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 555,
+            "url": "https://mock.rossum.app/api/v1/email_templates/555",
+            "name": "Rejection Notice",
+            "subject": "M18 marker subject",
+            "queue": "https://mock.rossum.app/api/v1/queues/100",
+            "modified_at": "2026-05-08T10:00:00Z"
+        })))
+        .mount(&server).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert().success();
+
+    // Edit the template's subject locally.
+    let template_path = project.path()
+        .join("envs/dev/workspaces/invoices-ap/queues/cost-invoices/email-templates/rejection-notice.json");
+    assert!(template_path.exists(), "template pulled into queue dir");
+    let raw = std::fs::read_to_string(&template_path).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    v["subject"] = serde_json::json!("M18 marker subject");
+    std::fs::write(&template_path, format!("{}\n", serde_json::to_string_pretty(&v).unwrap())).unwrap();
+
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["push", "dev"])
+        .assert().success()
+        .stdout(predicate::str::contains("1 email template"));
+}
+
+/// Inbox push: edit name, push, expect `1 inbox` in the summary.
+#[tokio::test]
+async fn inbox_push_succeeds_when_edited() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [{
+                "id": 700852,
+                "url": "https://mock.rossum.app/api/v1/workspaces/700852",
+                "name": "Invoices AP",
+                "organization": "https://mock.rossum.app/api/v1/organizations/1",
+                "queues": ["https://mock.rossum.app/api/v1/queues/100"]
+            }]
+        })))
+        .mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [{
+                "id": 100,
+                "url": "https://mock.rossum.app/api/v1/queues/100",
+                "name": "Cost Invoices",
+                "workspace": "https://mock.rossum.app/api/v1/workspaces/700852",
+                "schema": "https://mock.rossum.app/api/v1/schemas/200",
+                "inbox": "https://mock.rossum.app/api/v1/inboxes/300"
+            }]
+        })))
+        .mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schemas/200"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("schema_1.json")))
+        .mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/inboxes/300"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("inbox_1.json")))
+        .mount(&server).await;
+    for ep in [
+        "/api/v1/hooks", "/api/v1/rules", "/api/v1/labels",
+        "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&server).await;
+    }
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/inboxes/300"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 300,
+            "url": "https://mock.rossum.app/api/v1/inboxes/300",
+            "name": "M18 inbox marker",
+            "email": "x@mock",
+            "queues": ["https://mock.rossum.app/api/v1/queues/100"]
+        })))
+        .mount(&server).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert().success();
+
+    let inbox_path = project.path()
+        .join("envs/dev/workspaces/invoices-ap/queues/cost-invoices/inbox.json");
+    let raw = std::fs::read_to_string(&inbox_path).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    v["name"] = serde_json::json!("M18 inbox marker");
+    std::fs::write(&inbox_path, format!("{}\n", serde_json::to_string_pretty(&v).unwrap())).unwrap();
+
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["push", "dev"])
+        .assert().success()
+        .stdout(predicate::str::contains("1 inbox"));
+}
