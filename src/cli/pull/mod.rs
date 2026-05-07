@@ -143,16 +143,36 @@ async fn run_drivers(
     env: &str,
     token: &str,
 ) -> Result<PullStats> {
-    let (n_orgs, c_orgs) = organization::pull(ctx, env_cfg.org_id).await
-        .with_context(|| format!("pulling organization for env '{env}'"))?;
-    let n_workspaces = workspaces::pull(ctx, env_cfg).await
-        .with_context(|| format!("pulling workspaces for env '{env}'"))?;
+    let (n_orgs, c_orgs) = {
+        let p = KindProgress::start("organization");
+        let result = organization::pull(ctx, env_cfg.org_id, &p).await
+            .with_context(|| format!("pulling organization for env '{env}'"))?;
+        p.finish();
+        result
+    };
+    let n_workspaces = {
+        let p = KindProgress::start("workspaces");
+        let result = workspaces::pull(ctx, env_cfg, &p).await
+            .with_context(|| format!("pulling workspaces for env '{env}'"))?;
+        p.finish();
+        result
+    };
     let qc = queues::pull(ctx).await
         .with_context(|| format!("pulling queues for env '{env}'"))?;
-    let (n_hooks, c_hooks) = hooks::pull(ctx).await
-        .with_context(|| format!("pulling hooks for env '{env}'"))?;
-    let (n_rules, c_rules) = rules::pull(ctx).await
-        .with_context(|| format!("pulling rules for env '{env}'"))?;
+    let (n_hooks, c_hooks) = {
+        let p = KindProgress::start("hooks");
+        let result = hooks::pull(ctx, &p).await
+            .with_context(|| format!("pulling hooks for env '{env}'"))?;
+        p.finish();
+        result
+    };
+    let (n_rules, c_rules) = {
+        let p = KindProgress::start("rules");
+        let result = rules::pull(ctx, &p).await
+            .with_context(|| format!("pulling rules for env '{env}'"))?;
+        p.finish();
+        result
+    };
     let (n_labels, c_labels) = {
         let p = KindProgress::start("labels");
         let result = labels::pull(ctx, &p).await
@@ -160,14 +180,34 @@ async fn run_drivers(
         p.finish();
         result
     };
-    let (n_engines, c_engines) = engines::pull(ctx).await
-        .with_context(|| format!("pulling engines for env '{env}'"))?;
-    let (n_engine_fields, c_engine_fields) = engine_fields::pull(ctx).await
-        .with_context(|| format!("pulling engine fields for env '{env}'"))?;
-    let (n_workflows, c_workflows) = workflows::pull(ctx).await
-        .with_context(|| format!("pulling workflows for env '{env}'"))?;
-    let (n_workflow_steps, c_workflow_steps) = workflow_steps::pull(ctx).await
-        .with_context(|| format!("pulling workflow steps for env '{env}'"))?;
+    let (n_engines, c_engines) = {
+        let p = KindProgress::start("engines");
+        let result = engines::pull(ctx, &p).await
+            .with_context(|| format!("pulling engines for env '{env}'"))?;
+        p.finish();
+        result
+    };
+    let (n_engine_fields, c_engine_fields) = {
+        let p = KindProgress::start("engine_fields");
+        let result = engine_fields::pull(ctx, &p).await
+            .with_context(|| format!("pulling engine fields for env '{env}'"))?;
+        p.finish();
+        result
+    };
+    let (n_workflows, c_workflows) = {
+        let p = KindProgress::start("workflows");
+        let result = workflows::pull(ctx, &p).await
+            .with_context(|| format!("pulling workflows for env '{env}'"))?;
+        p.finish();
+        result
+    };
+    let (n_workflow_steps, c_workflow_steps) = {
+        let p = KindProgress::start("workflow_steps");
+        let result = workflow_steps::pull(ctx, &p).await
+            .with_context(|| format!("pulling workflow steps for env '{env}'"))?;
+        p.finish();
+        result
+    };
     let (n_email_templates, c_email_templates) = email_templates::pull(ctx).await
         .with_context(|| format!("pulling email templates for env '{env}'"))?;
     let (n_datasets, c_datasets) = mdh::pull(ctx, env_cfg, token).await

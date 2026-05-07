@@ -1,5 +1,6 @@
 use super::common::{hash_for_lockfile, record_object, skip_on_permission_denied, PullCtx};
 use crate::config::EnvConfig;
+use crate::progress::KindProgress;
 use crate::slug::slugify_unique;
 use crate::snapshot::workspace::write_workspace;
 use anyhow::{Context, Result};
@@ -11,11 +12,12 @@ use std::collections::HashSet;
 /// When the filter is `None`, all workspaces are pulled.
 /// Each workspace is written as `envs/<env>/workspaces/<slug>/workspace.json`.
 /// Returns the number of workspaces pulled.
-pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig) -> Result<usize> {
+pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig, progress: &KindProgress) -> Result<usize> {
     let workspaces = skip_on_permission_denied(
         ctx.client.list_workspaces().await.context("listing workspaces"),
         "workspaces",
     )?;
+    progress.set_total(workspaces.len() as u64);
 
     let filter = match &env_cfg.workspace_filter {
         Some(pat) => Some(
@@ -31,6 +33,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig) -> Result<usize> {
     for ws in &workspaces {
         if let Some(re) = &filter {
             if !re.is_match(&ws.name) {
+                progress.tick();
                 continue;
             }
         }
@@ -66,6 +69,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig) -> Result<usize> {
         );
 
         count += 1;
+        progress.tick();
     }
 
     Ok(count)

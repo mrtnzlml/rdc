@@ -1,14 +1,16 @@
 use super::common::{apply_pull_action, decide_pull_action, record_object, skip_on_permission_denied, PullAction, PullCtx};
+use crate::progress::KindProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 
 /// Pull all workflows. Returns `(count, conflicts)`.
-pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
+pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<(usize, usize)> {
     let workflows = skip_on_permission_denied(
         ctx.client.list_workflows().await.context("listing workflows"),
         "workflows",
     )?;
+    progress.set_total(workflows.len() as u64);
 
     let mut used: HashSet<String> = HashSet::new();
     let mut dir_created = false;
@@ -52,6 +54,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
             w.modified_at().map(|s| s.to_string()),
             Some(recorded_hash),
         );
+        progress.tick();
     }
 
     Ok((workflows.len(), conflicts))

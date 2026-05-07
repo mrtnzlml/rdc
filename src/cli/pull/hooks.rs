@@ -2,6 +2,7 @@ use super::common::{
     apply_pull_action, maybe_strip_overlay, record_object, skip_on_permission_denied,
     PullAction, PullCtx,
 };
+use crate::progress::KindProgress;
 use crate::slug::slugify_unique;
 use crate::snapshot::hook::{serialize_hook, write_hook_code};
 use crate::state::hook_combined_hash;
@@ -9,11 +10,12 @@ use anyhow::{Context, Result};
 use std::collections::HashSet;
 
 /// Pull all hooks. Returns `(count, conflicts)`.
-pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
+pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<(usize, usize)> {
     let hooks = skip_on_permission_denied(
         ctx.client.list_hooks().await.context("listing hooks"),
         "hooks",
     )?;
+    progress.set_total(hooks.len() as u64);
 
     let mut used_slugs: HashSet<String> = HashSet::new();
     let mut dir_created = false;
@@ -161,6 +163,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
             hook.modified_at().map(|s| s.to_string()),
             Some(recorded_hash),
         );
+        progress.tick();
     }
 
     Ok((hooks.len(), conflicts))

@@ -2,16 +2,18 @@ use super::common::{
     apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
     skip_on_permission_denied, PullAction, PullCtx,
 };
+use crate::progress::KindProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 
 /// Pull all rules. Returns `(count, conflicts)`.
-pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
+pub async fn pull(ctx: &mut PullCtx<'_>, progress: &KindProgress) -> Result<(usize, usize)> {
     let rules = skip_on_permission_denied(
         ctx.client.list_rules().await.context("listing rules"),
         "rules",
     )?;
+    progress.set_total(rules.len() as u64);
 
     let mut used: HashSet<String> = HashSet::new();
     let mut dir_created = false;
@@ -59,6 +61,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
             r.modified_at().map(|s| s.to_string()),
             Some(recorded_hash),
         );
+        progress.tick();
     }
 
     Ok((rules.len(), conflicts))
