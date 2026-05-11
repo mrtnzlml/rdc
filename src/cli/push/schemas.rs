@@ -3,6 +3,7 @@ use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
 use crate::progress::OverallProgress;
+use crate::snapshot::create::strip_for_create;
 use crate::snapshot::schema::{read_schema_value, serialize_schema, write_schema_bytes};
 use crate::state::{schema_combined_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
@@ -34,13 +35,40 @@ pub async fn push(
         // queue_dir is the parent of schema.json
         let queue_dir = schema_path.parent()
             .with_context(|| format!("schema path has no parent: {}", schema_path.display()))?;
+        let overlay_paths = overlay.as_ref().and_then(|ov| ov.schema(q_slug));
 
-        let entry = lockfile.objects.get("schemas").and_then(|m| m.get(q_slug.as_str()));
-        let Some(entry) = entry else {
-            progress.println(format!("warning: schema for queue '{q_slug}' — no lockfile entry, skipping"));
-            skipped += 1;
+        // Missing lockfile entry → new schema, POST.
+        if lockfile.objects.get("schemas").and_then(|m| m.get(q_slug.as_str())).is_none() {
+            let mut payload = read_schema_value(queue_dir)
+                .with_context(|| format!("reading local schema for queue '{q_slug}' to create"))?;
+            if let Some(p) = overlay_paths {
+                apply_overrides(&mut payload, p);
+            }
+            strip_for_create(&mut payload, "schemas");
+            let created = client.create_schema(&payload, Some(progress.clone())).await
+                .with_context(|| format!("POST /schemas (creating for queue '{q_slug}')"))?;
+            let (created_json, created_formulas) = serialize_schema(&created)?;
+            let created_json = maybe_strip_overlay(created_json, overlay_paths)?;
+            let created_hash = schema_combined_hash(&created_json, &created_formulas);
+            write_schema_bytes(queue_dir, &created_json, &created_formulas)
+                .with_context(|| format!("writing post-create canonical form for schema '{q_slug}'"))?;
+            lockfile.upsert(
+                "schemas",
+                q_slug,
+                ObjectEntry {
+                    id: created.id,
+                    url: Some(created.url.clone()),
+                    modified_at: created.modified_at().map(|s| s.to_string()),
+                    content_hash: Some(created_hash),
+                },
+            );
+            progress.println(format!("created schemas/{q_slug} (id {})", created.id));
+            progress.tick(q_slug.as_str());
+            pushed += 1;
             continue;
-        };
+        }
+
+        let entry = lockfile.objects.get("schemas").and_then(|m| m.get(q_slug.as_str())).unwrap();
         let Some(base) = &entry.content_hash else {
             progress.println(format!("warning: schema for queue '{q_slug}' — lockfile entry has no content_hash, skipping"));
             skipped += 1;
@@ -52,7 +80,6 @@ pub async fn push(
         // deserialize for the PATCH body.
         let mut payload = read_schema_value(queue_dir)
             .with_context(|| format!("reading local schema for queue '{q_slug}'"))?;
-        let overlay_paths = overlay.as_ref().and_then(|ov| ov.schema(q_slug));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }

@@ -3,6 +3,7 @@ use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
 use crate::progress::OverallProgress;
+use crate::snapshot::create::strip_for_create;
 use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
@@ -26,15 +27,48 @@ pub async fn push(
         std::collections::HashMap::new();
 
     for (q_slug, queue_path) in changes {
+        let overlay_paths = overlay.as_ref().and_then(|ov| ov.queue(q_slug));
+
+        // Missing lockfile entry → new queue, POST. User must already have
+        // POSTed the referenced workspace + schema (linear push); if not,
+        // the server will reject with a clear error.
+        if lockfile.objects.get("queues").and_then(|m| m.get(q_slug.as_str())).is_none() {
+            let disk_bytes = std::fs::read(queue_path)
+                .with_context(|| format!("reading {}", queue_path.display()))?;
+            let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
+                .with_context(|| format!("parsing {}", queue_path.display()))?;
+            if let Some(p) = overlay_paths {
+                apply_overrides(&mut payload, p);
+            }
+            strip_for_create(&mut payload, "queues");
+            let created = client.create_queue(&payload, Some(progress.clone())).await
+                .with_context(|| format!("POST /queues (creating '{q_slug}')"))?;
+            let mut created_bytes = serde_json::to_vec_pretty(&created)
+                .context("serializing created queue")?;
+            created_bytes.push(b'\n');
+            let created_bytes = maybe_strip_overlay(created_bytes, overlay_paths)?;
+            let created_hash = content_hash(&created_bytes);
+            write_atomic(queue_path, &created_bytes)
+                .with_context(|| format!("writing post-create canonical form for '{q_slug}'"))?;
+            lockfile.upsert(
+                "queues",
+                q_slug,
+                ObjectEntry {
+                    id: created.id,
+                    url: Some(created.url.clone()),
+                    modified_at: created.modified_at().map(|s| s.to_string()),
+                    content_hash: Some(created_hash),
+                },
+            );
+            progress.println(format!("created queues/{q_slug} (id {})", created.id));
+            progress.tick(q_slug.as_str());
+            pushed += 1;
+            continue;
+        }
+
         let disk_bytes = std::fs::read(queue_path)
             .with_context(|| format!("reading {}", queue_path.display()))?;
-
-        let entry = lockfile.objects.get("queues").and_then(|m| m.get(q_slug.as_str()));
-        let Some(entry) = entry else {
-            progress.println(format!("warning: queue '{q_slug}' — no lockfile entry, skipping"));
-            skipped += 1;
-            continue;
-        };
+        let entry = lockfile.objects.get("queues").and_then(|m| m.get(q_slug.as_str())).unwrap();
         let Some(base) = &entry.content_hash else {
             progress.println(format!("warning: queue '{q_slug}' — lockfile entry has no content_hash, skipping"));
             skipped += 1;
@@ -44,7 +78,6 @@ pub async fn push(
 
         let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
             .with_context(|| format!("parsing {}", queue_path.display()))?;
-        let overlay_paths = overlay.as_ref().and_then(|ov| ov.queue(q_slug));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }

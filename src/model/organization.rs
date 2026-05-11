@@ -6,7 +6,9 @@ use std::collections::BTreeMap;
 /// organization per env (the one whose ID is in `rdc.toml`).
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Organization {
+    #[serde(default)]
     pub id: u64,
+    #[serde(default)]
     pub url: String,
     pub name: String,
     #[serde(flatten)]

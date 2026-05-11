@@ -6,7 +6,9 @@ use std::collections::BTreeMap;
 /// queue-to-queue transition.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct WorkflowStep {
+    #[serde(default)]
     pub id: u64,
+    #[serde(default)]
     pub url: String,
     pub name: String,
     pub workflow: String,

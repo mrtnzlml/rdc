@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 /// and nested under `envs/<env>/workspaces/<slug>/queues/<slug>/`.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Workspace {
+    #[serde(default)]
     pub id: u64,
+    #[serde(default)]
     pub url: String,
     pub name: String,
     pub organization: String,

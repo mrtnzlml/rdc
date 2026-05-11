@@ -3,6 +3,7 @@ use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
 use crate::progress::OverallProgress;
+use crate::snapshot::create::strip_for_create;
 use crate::snapshot::hook::{read_hook_value, serialize_hook, write_hook_code};
 use crate::snapshot::writer::write_atomic;
 use crate::state::{hook_combined_hash, Lockfile, ObjectEntry};
@@ -33,15 +34,46 @@ pub async fn push(
 
     for (slug, local_json_path) in changes {
         let local_py_path = hooks_dir.join(format!("{slug}.py"));
+        let overlay_paths = overlay.as_ref().and_then(|ov| ov.hook(slug));
 
-        let entry = lockfile.objects.get("hooks").and_then(|m| m.get(slug.as_str()));
-        let Some(entry) = entry else {
-            progress.println(format!(
-                "warning: hooks/{slug}.json — no lockfile entry, skipping (push only updates existing objects)"
-            ));
-            skipped += 1;
+        // Missing lockfile entry = new hook → POST. Local file becomes the
+        // create payload; server response (with id/url assigned) overwrites
+        // disk; lockfile gets a fresh entry.
+        if lockfile.objects.get("hooks").and_then(|m| m.get(slug.as_str())).is_none() {
+            let mut payload = read_hook_value(&hooks_dir, slug)
+                .with_context(|| format!("reading local hook '{slug}' for create"))?;
+            if let Some(p) = overlay_paths {
+                apply_overrides(&mut payload, p);
+            }
+            strip_for_create(&mut payload, "hooks");
+            let created = client.create_hook(&payload, Some(progress.clone())).await
+                .with_context(|| format!("POST /hooks (creating '{slug}')"))?;
+            let (created_json_full, created_code) = serialize_hook(&created)?;
+            let created_json_stripped = maybe_strip_overlay(created_json_full, overlay_paths)?;
+            let created_hash = hook_combined_hash(&created_json_stripped, &created_code);
+            write_atomic(local_json_path, &created_json_stripped)
+                .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
+            if let Some(code) = &created_code {
+                write_hook_code(&hooks_dir, slug, code)
+                    .with_context(|| format!("writing hook code for '{slug}'"))?;
+            }
+            lockfile.upsert(
+                "hooks",
+                slug,
+                ObjectEntry {
+                    id: created.id,
+                    url: Some(created.url.clone()),
+                    modified_at: created.modified_at().map(|s| s.to_string()),
+                    content_hash: Some(created_hash),
+                },
+            );
+            progress.println(format!("created hooks/{slug} (id {})", created.id));
+            progress.tick(slug.as_str());
+            pushed += 1;
             continue;
-        };
+        }
+
+        let entry = lockfile.objects.get("hooks").and_then(|m| m.get(slug.as_str())).unwrap();
         let Some(base) = &entry.content_hash else {
             progress.println(format!(
                 "warning: hooks/{slug}.json — lockfile entry has no content_hash, skipping"
@@ -57,7 +89,6 @@ pub async fn push(
         // stripped by pull (spec §9.3) BEFORE typed deserialize.
         let mut payload = read_hook_value(&hooks_dir, slug)
             .with_context(|| format!("reading local hook '{slug}'"))?;
-        let overlay_paths = overlay.as_ref().and_then(|ov| ov.hook(slug));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }

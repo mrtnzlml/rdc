@@ -301,10 +301,70 @@ Each candidate is compared against the lockfile's `content_hash`:
 - **Local edits, remote unchanged since last pull** → PATCH succeeds.
 - **Local edits AND remote drifted** → resolver opens (TTY) or skip
   + warning (non-TTY / `--yes`). See "Push drift resolver" below.
+- **No lockfile entry** → treated as a **new resource** and POSTed. See
+  "Creating new resources" below.
 
 After a successful push, the local file is rewritten with the server's
 authoritative response so the lockfile hash matches the file bytes.
 Subsequent pulls are idempotent.
+
+### Creating new resources
+
+You can create remote objects by authoring local files and pushing them.
+There is no separate `rdc create` command — push detects "local file
+exists, no lockfile entry" and POSTs.
+
+**Workflow:**
+
+1. Author the JSON. Omit `id` and `url` (the server assigns them). For a
+   new hook, write `envs/<env>/hooks/<slug>.json` with `name`, `type`,
+   `events`, `config` plus any optional fields. If the hook has code,
+   author `envs/<env>/hooks/<slug>.py` next to it — push splices it into
+   `config.code` automatically.
+
+2. Run `rdc push <env>`. Each new object is POSTed; the server's
+   response (with `id`, `url`, timestamps) is written back to disk in
+   canonical form; the lockfile is updated.
+
+**Supported kinds**: workspaces, schemas, queues, inboxes, hooks, rules,
+labels, engines, engine fields, email templates. Workflows and workflow
+steps are read-only at the API and cannot be created.
+
+**Dependency order within a single push**: workspaces → schemas →
+queues → inboxes → email templates → hooks/rules/labels/engines/engine
+fields. Cross-references between objects are URL-based, and the server
+needs the referenced URL to exist when the request lands. **`rdc push`
+does not substitute URLs across newly-created peers within a single
+push** (linear-push model — no topological URL resolution).
+
+If you're creating multiple objects with cross-references — say, a new
+queue that references a new schema — the right workflow is:
+
+1. Create the schema first (author `schema.json`, push). After the POST
+   succeeds, the server's `id` and `url` end up in your local file and
+   lockfile.
+2. Copy the schema's new `url` into the queue's `schema` field.
+3. Push again to create the queue.
+
+For independent creates (e.g. a new hook that references existing
+queues by URL), a single push is enough.
+
+**Slug uniqueness**: the file's slug must not already exist in the
+lockfile — that path is the "update existing" path. To create a similar
+object, pick a different slug.
+
+**Server-assigned fields** (`id`, `url`, `created_at`, `created_by`,
+`modified_at`, `modified_by`, `status`, plus kind-specific computed
+fields like `queues` on a workspace or `hooks` on a queue) are stripped
+from the outbound POST body. If you accidentally leave a stale `id`
+from another env in your file, it's silently dropped — the new object
+gets a fresh id.
+
+Sample stderr line on a successful create:
+
+```
+created hooks/my-new-hook (id 555)
+```
 
 ### Push drift resolver
 
