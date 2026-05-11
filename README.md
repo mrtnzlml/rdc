@@ -6,6 +6,28 @@
 disk for AI-assisted local development, lets you edit them in place, and
 deploys them across environments.
 
+## Opinionated by design
+
+`rdc` does one thing and tries to do it without surprises. There is **one**
+supported workflow:
+
+1. **Pull** an environment into a local snapshot.
+2. **Edit** the snapshot (JSON files, extracted `.py` code, formula sidecars).
+3. **Push** changes back to that environment, or **deploy** them to another
+   environment via `map` / `plan` / `apply`.
+
+That's it. No partial pulls, no per-kind filters, no per-workspace scope
+limiters. The whole environment is the unit of work; an `overlay.toml`
+captures the per-env divergences (names, runtimes, thresholds) so the
+canonical snapshot stays clean.
+
+Defaults are chosen so the tool **just works**: MDH is auto-detected from
+`api_base`, server-managed fields like `modified_at` are ignored at the
+hash layer, transient API errors retry with backoff, color and progress
+bars honor TTY detection, and `rdc push` with no edits exits silently.
+If you find yourself reaching for a flag, it's probably either not there
+on purpose, or the existing default is the one we'd recommend anyway.
+
 ## Capabilities
 
 - **Pull** every kind in scope: organization, workspaces, queues,
@@ -563,11 +585,9 @@ These flags can be passed to any subcommand:
 
 | Flag | Description |
 |------|-------------|
-| `--concurrency N` | Maximum parallel API calls inside `rdc pull`. Default 5 (spec §16). Also reads `RDC_CONCURRENCY`. |
-| `--json` | Reserved for machine-readable output (no-op today). |
+| `--concurrency N` | Maximum parallel API calls inside `rdc pull`. Default 5. Also reads `RDC_CONCURRENCY`. |
 | `--no-color` | Disable ANSI color output. Also honored via the `NO_COLOR` environment variable. |
-| `--verbose`, `--debug` | Reserved for log level (no-op today). |
-| `--yes` | Skip interactive prompts. Today only `rdc init`'s wizard is interactive, and it auto-disables on non-TTY stdin. |
+| `--yes` | Skip interactive prompts (conflict resolver, init wizard). Auto-enabled when stdin isn't a TTY. |
 
 **Concurrency.** `rdc pull` lists every kind sequentially (one
 `list_*` call per kind), but a queue tree of 25 queues otherwise

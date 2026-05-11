@@ -7,25 +7,12 @@ pub struct Cli {
     /// the `RDC_CONCURRENCY` env var).
     #[arg(long, global = true, value_name = "N")]
     pub concurrency: Option<usize>,
-    /// Emit machine-readable JSON output where applicable.
-    /// (Reserved; currently a no-op.)
-    #[arg(long, global = true)]
-    pub json: bool,
-    /// Disable ANSI color in output.
-    /// (Reserved; rdc currently emits plain text.)
+    /// Disable ANSI color in output. Also honored via `NO_COLOR`.
     #[arg(long = "no-color", global = true)]
     pub no_color: bool,
-    /// Verbose logging.
-    /// (Reserved; currently a no-op.)
-    #[arg(long, global = true)]
-    pub verbose: bool,
-    /// Debug logging.
-    /// (Reserved; currently a no-op.)
-    #[arg(long, global = true)]
-    pub debug: bool,
-    /// Skip interactive confirmations (for CI use).
-    /// (Reserved; rdc currently has no interactive confirmations beyond
-    /// `rdc init`'s wizard, which auto-disables when stdin isn't a TTY.)
+    /// Skip interactive prompts (conflict resolver, init wizard).
+    /// Conflicts fall back to the shadow-file flow; the wizard exits
+    /// with usage hints. Auto-enabled when stdin isn't a TTY.
     #[arg(long, global = true)]
     pub yes: bool,
 
