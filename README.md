@@ -70,12 +70,72 @@ on purpose, or the existing default is the one we'd recommend anyway.
 See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full
 design.
 
-## Upgrading older lockfiles
+## Upgrade
 
-This release changes how `content_hash` is computed: server-managed fields
-(`modified_at`, `modifier`) are now stripped before hashing. The first
-pull after upgrade may surface false-positive conflicts on every object
-because the lockfile was written with the old algorithm.
+Keep rdc current with one command:
+
+```sh
+rdc upgrade
+```
+
+This downloads the latest GitHub release for your platform, runs a
+sanity-check `--version` on the new binary, and swaps it in atomically.
+The previous binary is kept at `<install_dir>/rdc.bak` for one-shot
+rollback (`mv rdc.bak rdc`).
+
+`rdc upgrade --check` reports the latest available version without
+installing. `rdc upgrade --version v0.0.2` pins to a specific tag —
+useful as an emergency downgrade, but you may need to re-pull
+afterward (see "Compatibility").
+
+**Passive nudge.** Every command does a once-daily check against the
+GitHub Releases API in the background. If a newer release exists, rdc
+prints a one-line `note: rdc vX is available — run \`rdc upgrade\` to install`
+at the top of the command. The check is best-effort: network errors,
+API rate-limits, or unreachable cluster all fail silently — the nudge
+just doesn't appear. Cache lives at `$XDG_CACHE_HOME/rdc/update.json`
+(fallback `~/.cache/rdc/update.json`).
+
+**Install-location detection.** `rdc upgrade` only self-replaces when
+it's safe to do so:
+
+| Install method | `rdc upgrade` behavior |
+|---|---|
+| `install.sh` / manual binary in a writable dir | Self-replaces atomically; previous binary kept as `rdc.bak`. |
+| `cargo install --git …` | Refuses — would break cargo's bookkeeping. Prints the right `cargo install --force` invocation instead. |
+| Read-only dir (`/usr/local/bin`, system package manager, etc.) | Refuses — prints the manual download URL + commands. |
+
+**Self-replace is safe while rdc is running.** On Linux/macOS the
+kernel keeps the running binary's inode alive after its directory
+entry is replaced, so the in-flight `rdc upgrade` process completes
+normally. The swap uses a copy-aside + atomic rename pattern so
+`<install_dir>/rdc` is always a valid binary — a parallel shell tab
+running `rdc` during the upgrade never sees a missing file.
+
+## Compatibility
+
+- **Backward compat (new binary, old artifacts):** the latest rdc
+  always reads anything produced by any previous release. Lockfile
+  versions migrate forward; project config and overlay tolerate
+  missing fields via serde defaults.
+- **Forward compat (older binary, newer artifacts):** not promised.
+  But artifacts an older binary doesn't understand produce a clear
+  error pointing at `rdc upgrade`, never silent corruption. For
+  example, a downgrade-then-pull scenario where the lockfile was
+  written by a newer rdc errors with: *"lockfile … was written by a
+  newer rdc (lockfile version N, this rdc supports up to version M).
+  Run `rdc upgrade` to install a matching binary."*
+- **Downgrades.** `rdc upgrade --version <older>` is an emergency
+  escape hatch. We don't promise the older binary can still read your
+  snapshot or lockfile cleanly — you may have to delete the lockfile
+  and re-pull.
+
+### Upgrading from older lockfiles
+
+A previous release changed how `content_hash` is computed: server-managed
+fields (`modified_at`, `modifier`) are now stripped before hashing. The
+first pull on a lockfile written before that change can surface
+false-positive conflicts on every object.
 
 To clear the storm without resolving each conflict by hand:
 
@@ -83,8 +143,8 @@ To clear the storm without resolving each conflict by hand:
 rdc repair --rebuild-lock <env>
 ```
 
-Subsequent pulls will be clean. Real edits made before upgrading remain
-visible — `repair` only re-baselines the hash; it does not discard
+Subsequent pulls will be clean. Real edits made before re-baselining
+remain visible — `repair` only resets the hash; it does not discard
 local edits.
 
 ## Install

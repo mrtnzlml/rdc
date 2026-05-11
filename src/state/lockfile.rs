@@ -63,9 +63,19 @@ impl Lockfile {
                 lf.version = LOCKFILE_VERSION;
             }
             v if v == LOCKFILE_VERSION => {}
+            v if v > LOCKFILE_VERSION => {
+                anyhow::bail!(
+                    "lockfile {} was written by a newer rdc (lockfile version {}, this rdc supports up to version {}). \
+                    Run `rdc upgrade` to install a matching binary.",
+                    path.display(),
+                    v,
+                    LOCKFILE_VERSION
+                );
+            }
             v => {
                 anyhow::bail!(
-                    "lockfile {} has version {} but this rdc supports {}",
+                    "lockfile {} has unknown version {} (this rdc supports version {}). \
+                    Run `rdc repair --rebuild-lock <env>` to reconstruct it.",
                     path.display(),
                     v,
                     LOCKFILE_VERSION
