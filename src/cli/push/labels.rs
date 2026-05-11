@@ -3,6 +3,7 @@ use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
 use crate::progress::OverallProgress;
+use crate::snapshot::create::strip_for_create;
 use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
@@ -26,15 +27,46 @@ pub async fn push(
     let mut remote_labels: Option<Vec<crate::model::Label>> = None;
 
     for (slug, path) in changes {
+        let overlay_paths = overlay.as_ref().and_then(|ov| ov.label(slug));
+
+        // Missing lockfile entry → new label, POST.
+        if lockfile.objects.get("labels").and_then(|m| m.get(slug.as_str())).is_none() {
+            let disk_bytes = std::fs::read(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
+                .with_context(|| format!("parsing {}", path.display()))?;
+            if let Some(p) = overlay_paths {
+                apply_overrides(&mut payload, p);
+            }
+            strip_for_create(&mut payload, "labels");
+            let created = client.create_label(&payload, Some(progress.clone())).await
+                .with_context(|| format!("POST /labels (creating '{slug}')"))?;
+            let mut created_bytes = serde_json::to_vec_pretty(&created)
+                .context("serializing created label")?;
+            created_bytes.push(b'\n');
+            let created_bytes = maybe_strip_overlay(created_bytes, overlay_paths)?;
+            let created_hash = content_hash(&created_bytes);
+            write_atomic(path, &created_bytes)
+                .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
+            lockfile.upsert(
+                "labels",
+                slug,
+                ObjectEntry {
+                    id: created.id,
+                    url: Some(created.url.clone()),
+                    modified_at: created.modified_at().map(|s| s.to_string()),
+                    content_hash: Some(created_hash),
+                },
+            );
+            progress.println(format!("created labels/{slug} (id {})", created.id));
+            progress.tick(slug.as_str());
+            pushed += 1;
+            continue;
+        }
+
         let disk_bytes = std::fs::read(path)
             .with_context(|| format!("reading {}", path.display()))?;
-
-        let entry = lockfile.objects.get("labels").and_then(|m| m.get(slug.as_str()));
-        let Some(entry) = entry else {
-            progress.println(format!("warning: labels/{slug}.json — no lockfile entry, skipping"));
-            skipped += 1;
-            continue;
-        };
+        let entry = lockfile.objects.get("labels").and_then(|m| m.get(slug.as_str())).unwrap();
         let Some(base) = &entry.content_hash else {
             progress.println(format!("warning: labels/{slug}.json — lockfile entry has no content_hash, skipping"));
             skipped += 1;
@@ -46,7 +78,6 @@ pub async fn push(
 
         let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
             .with_context(|| format!("parsing {}", path.display()))?;
-        let overlay_paths = overlay.as_ref().and_then(|ov| ov.label(slug));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }

@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 /// queues; schema can be null for templates or unconfigured queues.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Queue {
+    #[serde(default)]
     pub id: u64,
+    #[serde(default)]
     pub url: String,
     pub name: String,
     #[serde(default)]

@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 /// on-disk path so phase-2 drivers don't re-walk.
 #[derive(Debug, Default)]
 pub struct ChangeList {
+    pub workspaces: BTreeMap<String, std::path::PathBuf>,
     pub hooks: BTreeMap<String, std::path::PathBuf>,
     pub rules: BTreeMap<String, std::path::PathBuf>,
     pub labels: BTreeMap<String, std::path::PathBuf>,
@@ -26,7 +27,8 @@ pub struct ChangeList {
 
 impl ChangeList {
     pub fn total(&self) -> usize {
-        self.hooks.len()
+        self.workspaces.len()
+            + self.hooks.len()
             + self.rules.len()
             + self.labels.len()
             + self.queues.len()
@@ -49,6 +51,7 @@ pub fn scan(paths: &Paths, lockfile: &Lockfile) -> Result<(usize, ChangeList)> {
     let mut changes = ChangeList::default();
     let mut scanned = 0;
 
+    scanned += scan_workspaces(paths, lockfile, &mut changes.workspaces)?;
     scanned += scan_hooks(paths, lockfile, &mut changes.hooks)?;
     scanned += scan_flat_kind(paths, lockfile, "rules", paths.rules_dir(), &mut changes.rules)?;
     scanned += scan_flat_kind(paths, lockfile, "labels", paths.labels_dir(), &mut changes.labels)?;
@@ -60,6 +63,42 @@ pub fn scan(paths: &Paths, lockfile: &Lockfile) -> Result<(usize, ChangeList)> {
     scanned += scan_flat_kind(paths, lockfile, "engine_fields", paths.engine_fields_dir(), &mut changes.engine_fields)?;
 
     Ok((scanned, changes))
+}
+
+fn scan_workspaces(
+    paths: &Paths,
+    lockfile: &Lockfile,
+    out: &mut BTreeMap<String, std::path::PathBuf>,
+) -> Result<usize> {
+    use crate::state::content_hash;
+    let workspaces_dir = paths.workspaces_dir();
+    if !workspaces_dir.exists() {
+        return Ok(0);
+    }
+    let mut scanned = 0;
+    for ws_entry in std::fs::read_dir(&workspaces_dir)? {
+        let ws_entry = ws_entry?;
+        if !ws_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let ws_slug = ws_entry.file_name().to_string_lossy().to_string();
+        let ws_json_path = ws_entry.path().join("workspace.json");
+        if !ws_json_path.exists() {
+            continue;
+        }
+        let bytes = std::fs::read(&ws_json_path)?;
+        let local_hash = content_hash(&bytes);
+        scanned += 1;
+        let base_hash = lockfile
+            .objects
+            .get("workspaces")
+            .and_then(|m| m.get(&ws_slug))
+            .and_then(|e| e.content_hash.as_deref());
+        if base_hash != Some(local_hash.as_str()) {
+            out.insert(ws_slug, ws_json_path);
+        }
+    }
+    Ok(scanned)
 }
 
 fn scan_hooks(

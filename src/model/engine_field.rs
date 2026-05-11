@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 /// Rossum engine field. Defines a single extractable field on an engine.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct EngineField {
+    #[serde(default)]
     pub id: u64,
+    #[serde(default)]
     pub url: String,
     pub name: String,
     pub engine: String,

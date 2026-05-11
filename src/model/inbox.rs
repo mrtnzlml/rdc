@@ -6,9 +6,12 @@ use std::collections::BTreeMap;
 /// email-ingestion endpoint.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Inbox {
+    #[serde(default)]
     pub id: u64,
+    #[serde(default)]
     pub url: String,
     pub name: String,
+    #[serde(default)]
     pub email: String,
     /// URL of the queue this inbox is attached to.
     pub queues: Vec<String>,

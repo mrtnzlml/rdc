@@ -9,9 +9,12 @@ use std::collections::BTreeMap;
 /// files (mirroring the hook code-extraction pattern).
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Schema {
+    #[serde(default)]
     pub id: u64,
+    #[serde(default)]
     pub url: String,
     pub name: String,
+    #[serde(default)]
     pub queues: Vec<String>,
     /// The schema content tree (sections, datapoints, formulas, etc.). Opaque
     /// in the model; the codec walks it.

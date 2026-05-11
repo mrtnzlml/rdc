@@ -3,6 +3,7 @@ use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
 use crate::progress::OverallProgress;
+use crate::snapshot::create::strip_for_create;
 use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
@@ -27,15 +28,46 @@ pub async fn push(
 
     // slug (lockfile_key) = "ws_slug/q_slug/template_slug"
     for (lockfile_key, template_path) in changes {
+        let overlay_paths = overlay.as_ref().and_then(|ov| ov.email_template(lockfile_key));
+
+        // Missing lockfile entry → new email template, POST.
+        if lockfile.objects.get("email_templates").and_then(|m| m.get(lockfile_key.as_str())).is_none() {
+            let disk_bytes = std::fs::read(template_path)
+                .with_context(|| format!("reading {}", template_path.display()))?;
+            let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
+                .with_context(|| format!("parsing {}", template_path.display()))?;
+            if let Some(p) = overlay_paths {
+                apply_overrides(&mut payload, p);
+            }
+            strip_for_create(&mut payload, "email_templates");
+            let created = client.create_email_template(&payload, Some(progress.clone())).await
+                .with_context(|| format!("POST /email_templates (creating '{lockfile_key}')"))?;
+            let mut created_bytes = serde_json::to_vec_pretty(&created)
+                .context("serializing created email template")?;
+            created_bytes.push(b'\n');
+            let created_bytes = maybe_strip_overlay(created_bytes, overlay_paths)?;
+            let created_hash = content_hash(&created_bytes);
+            write_atomic(template_path, &created_bytes)
+                .with_context(|| format!("writing post-create canonical form for '{lockfile_key}'"))?;
+            lockfile.upsert(
+                "email_templates",
+                lockfile_key,
+                ObjectEntry {
+                    id: created.id,
+                    url: Some(created.url.clone()),
+                    modified_at: created.modified_at().map(|s| s.to_string()),
+                    content_hash: Some(created_hash),
+                },
+            );
+            progress.println(format!("created email_templates/{lockfile_key} (id {})", created.id));
+            progress.tick(lockfile_key.as_str());
+            pushed += 1;
+            continue;
+        }
+
         let disk_bytes = std::fs::read(template_path)
             .with_context(|| format!("reading {}", template_path.display()))?;
-
-        let entry = lockfile.objects.get("email_templates").and_then(|m| m.get(lockfile_key.as_str()));
-        let Some(entry) = entry else {
-            progress.println(format!("warning: email template '{lockfile_key}' — no lockfile entry, skipping"));
-            skipped += 1;
-            continue;
-        };
+        let entry = lockfile.objects.get("email_templates").and_then(|m| m.get(lockfile_key.as_str())).unwrap();
         let Some(base) = &entry.content_hash else {
             progress.println(format!("warning: email template '{lockfile_key}' — lockfile entry has no content_hash, skipping"));
             skipped += 1;
@@ -45,7 +77,6 @@ pub async fn push(
 
         let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
             .with_context(|| format!("parsing {}", template_path.display()))?;
-        let overlay_paths = overlay.as_ref().and_then(|ov| ov.email_template(lockfile_key));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }

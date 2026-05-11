@@ -300,4 +300,69 @@ impl RossumClient {
         resp.json::<TResp>().await
             .with_context(|| format!("decoding PATCH response from {url}"))
     }
+
+    /// Generic POST `<base>/<path>` with `body` as JSON. Used by every
+    /// `create_X` method. Body is pre-stripped of server-managed fields
+    /// by the caller (`strip_for_create` in `src/snapshot/create.rs`).
+    async fn post_json<TResp>(&self, path: &str, body: &serde_json::Value, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<TResp>
+    where
+        TResp: serde::de::DeserializeOwned,
+    {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = retry::send_with_retry(
+            || self.http
+                .post(&url)
+                .header("Authorization", format!("token {}", self.token))
+                .json(body),
+            &format!("POST {url}"),
+            progress,
+        ).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ApiError::Status { status: status.as_u16(), body }.into());
+        }
+        resp.json::<TResp>().await
+            .with_context(|| format!("decoding POST response from {url}"))
+    }
+
+    pub async fn create_hook(&self, body: &serde_json::Value, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<Hook> {
+        self.post_json("/hooks", body, progress).await
+    }
+
+    pub async fn create_workspace(&self, body: &serde_json::Value, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<crate::model::Workspace> {
+        self.post_json("/workspaces", body, progress).await
+    }
+
+    pub async fn create_queue(&self, body: &serde_json::Value, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<crate::model::Queue> {
+        self.post_json("/queues", body, progress).await
+    }
+
+    pub async fn create_schema(&self, body: &serde_json::Value, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<crate::model::Schema> {
+        self.post_json("/schemas", body, progress).await
+    }
+
+    pub async fn create_inbox(&self, body: &serde_json::Value, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<crate::model::Inbox> {
+        self.post_json("/inboxes", body, progress).await
+    }
+
+    pub async fn create_label(&self, body: &serde_json::Value, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<crate::model::Label> {
+        self.post_json("/labels", body, progress).await
+    }
+
+    pub async fn create_rule(&self, body: &serde_json::Value, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<crate::model::Rule> {
+        self.post_json("/rules", body, progress).await
+    }
+
+    pub async fn create_email_template(&self, body: &serde_json::Value, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<crate::model::EmailTemplate> {
+        self.post_json("/email_templates", body, progress).await
+    }
+
+    pub async fn create_engine(&self, body: &serde_json::Value, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<crate::model::Engine> {
+        self.post_json("/engines", body, progress).await
+    }
+
+    pub async fn create_engine_field(&self, body: &serde_json::Value, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<crate::model::EngineField> {
+        self.post_json("/engine_fields", body, progress).await
+    }
 }

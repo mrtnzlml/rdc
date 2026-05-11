@@ -17,6 +17,7 @@ mod queues;
 mod rules;
 pub mod scan;
 mod schemas;
+mod workspaces;
 
 pub async fn run(env: &str, interactive: bool) -> Result<()> {
     let push_started = std::time::Instant::now();
@@ -73,7 +74,8 @@ pub async fn run(env: &str, interactive: bool) -> Result<()> {
         .with_context(|| format!("regenerating _index.md for env '{env}'"))?;
 
     let mut summary = format!(
-        "Pushed {}, {}, {}, {}, {}, {}, {}, {}, {} to env '{env}'",
+        "Pushed {}, {}, {}, {}, {}, {}, {}, {}, {}, {} to env '{env}'",
+        crate::cli::pull::common::pluralize(counts.n_workspaces, "workspace", "workspaces"),
         crate::cli::pull::common::pluralize(counts.n_hooks, "hook", "hooks"),
         crate::cli::pull::common::pluralize(counts.n_rules, "rule", "rules"),
         crate::cli::pull::common::pluralize(counts.n_labels, "label", "labels"),
@@ -84,8 +86,8 @@ pub async fn run(env: &str, interactive: bool) -> Result<()> {
         crate::cli::pull::common::pluralize(counts.n_engines, "engine", "engines"),
         crate::cli::pull::common::pluralize(counts.n_engine_fields, "engine field", "engine fields"),
     );
-    let total_skipped = counts.c_hooks + counts.c_rules + counts.c_labels + counts.c_queues
-        + counts.c_schemas + counts.c_inboxes + counts.c_email_templates
+    let total_skipped = counts.c_workspaces + counts.c_hooks + counts.c_rules + counts.c_labels
+        + counts.c_queues + counts.c_schemas + counts.c_inboxes + counts.c_email_templates
         + counts.c_engines + counts.c_engine_fields;
     if total_skipped > 0 {
         summary.push_str(&format!(", {} skipped (conflict)", total_skipped));
@@ -95,6 +97,7 @@ pub async fn run(env: &str, interactive: bool) -> Result<()> {
 }
 
 struct PushCounts {
+    n_workspaces: usize, c_workspaces: usize,
     n_hooks: usize, c_hooks: usize,
     n_rules: usize, c_rules: usize,
     n_labels: usize, c_labels: usize,
@@ -117,6 +120,7 @@ async fn run_drivers(
 ) -> Result<PushCounts> {
     // Phase 1: accumulate the bar's total denominator for all changed kinds
     // upfront so the percentage only grows monotonically during phase 2.
+    progress.inc_total(changes.workspaces.len() as u64);
     progress.inc_total(changes.hooks.len() as u64);
     progress.inc_total(changes.rules.len() as u64);
     progress.inc_total(changes.labels.len() as u64);
@@ -127,7 +131,51 @@ async fn run_drivers(
     progress.inc_total(changes.engines.len() as u64);
     progress.inc_total(changes.engine_fields.len() as u64);
 
-    // Phase 2: push each kind; drivers call progress.tick() per item.
+    // Phase 2: push each kind in dependency order. Workspaces first
+    // (queues / schemas / inboxes / email_templates all root from a
+    // workspace URL); schemas next (queues reference schema URLs); then
+    // queues; then queue-children (inboxes, email_templates); then the
+    // org-level leaves. Drivers call progress.tick() per item.
+    let (n_workspaces, c_workspaces) = if !changes.workspaces.is_empty() {
+        progress.start_phase("workspaces");
+        workspaces::push(paths, client, lockfile, interactive, &changes.workspaces, progress).await
+            .with_context(|| format!("pushing workspaces for env '{env}'"))?
+    } else {
+        (0, 0)
+    };
+
+    let (n_schemas, c_schemas) = if !changes.schemas.is_empty() {
+        progress.start_phase("schemas");
+        schemas::push(paths, client, lockfile, interactive, &changes.schemas, progress).await
+            .with_context(|| format!("pushing schemas for env '{env}'"))?
+    } else {
+        (0, 0)
+    };
+
+    let (n_queues, c_queues) = if !changes.queues.is_empty() {
+        progress.start_phase("queues");
+        queues::push(paths, client, lockfile, interactive, &changes.queues, progress).await
+            .with_context(|| format!("pushing queues for env '{env}'"))?
+    } else {
+        (0, 0)
+    };
+
+    let (n_inboxes, c_inboxes) = if !changes.inboxes.is_empty() {
+        progress.start_phase("inboxes");
+        inboxes::push(paths, client, lockfile, interactive, &changes.inboxes, progress).await
+            .with_context(|| format!("pushing inboxes for env '{env}'"))?
+    } else {
+        (0, 0)
+    };
+
+    let (n_email_templates, c_email_templates) = if !changes.email_templates.is_empty() {
+        progress.start_phase("email_templates");
+        email_templates::push(paths, client, lockfile, interactive, &changes.email_templates, progress).await
+            .with_context(|| format!("pushing email templates for env '{env}'"))?
+    } else {
+        (0, 0)
+    };
+
     let (n_hooks, c_hooks) = if !changes.hooks.is_empty() {
         progress.start_phase("hooks");
         hooks::push(paths, client, lockfile, interactive, &changes.hooks, progress).await
@@ -152,38 +200,6 @@ async fn run_drivers(
         (0, 0)
     };
 
-    let (n_queues, c_queues) = if !changes.queues.is_empty() {
-        progress.start_phase("queues");
-        queues::push(paths, client, lockfile, interactive, &changes.queues, progress).await
-            .with_context(|| format!("pushing queues for env '{env}'"))?
-    } else {
-        (0, 0)
-    };
-
-    let (n_schemas, c_schemas) = if !changes.schemas.is_empty() {
-        progress.start_phase("schemas");
-        schemas::push(paths, client, lockfile, interactive, &changes.schemas, progress).await
-            .with_context(|| format!("pushing schemas for env '{env}'"))?
-    } else {
-        (0, 0)
-    };
-
-    let (n_inboxes, c_inboxes) = if !changes.inboxes.is_empty() {
-        progress.start_phase("inboxes");
-        inboxes::push(paths, client, lockfile, interactive, &changes.inboxes, progress).await
-            .with_context(|| format!("pushing inboxes for env '{env}'"))?
-    } else {
-        (0, 0)
-    };
-
-    let (n_email_templates, c_email_templates) = if !changes.email_templates.is_empty() {
-        progress.start_phase("email_templates");
-        email_templates::push(paths, client, lockfile, interactive, &changes.email_templates, progress).await
-            .with_context(|| format!("pushing email templates for env '{env}'"))?
-    } else {
-        (0, 0)
-    };
-
     let (n_engines, c_engines) = if !changes.engines.is_empty() {
         progress.start_phase("engines");
         engines::push(paths, client, lockfile, interactive, &changes.engines, progress).await
@@ -201,6 +217,7 @@ async fn run_drivers(
     };
 
     Ok(PushCounts {
+        n_workspaces, c_workspaces,
         n_hooks, c_hooks,
         n_rules, c_rules,
         n_labels, c_labels,

@@ -119,7 +119,7 @@ async fn push_succeeds_when_local_edited_and_remote_unchanged() {
         .current_dir(project.path())
         .args(["push", "dev"])
         .assert().success()
-        .stdout(predicate::str::contains("Pushed 1 hook"));
+        .stdout(predicate::str::contains("1 hook"));
 }
 
 #[tokio::test]
@@ -240,7 +240,7 @@ version = 1
         .current_dir(project.path())
         .args(["push", "dev"])
         .assert().success()
-        .stdout(predicate::str::contains("Pushed 1 hook"));
+        .stdout(predicate::str::contains("1 hook"));
 
     let body = captured.lock().unwrap().clone().expect("PATCH body should be captured");
     assert_eq!(body["name"], serde_json::Value::String("Validator (DEV-OVERLAY)".into()));
@@ -340,7 +340,7 @@ async fn push_rewrites_local_file_with_canonical_form() {
         .current_dir(project.path())
         .args(["push", "dev"])
         .assert().success()
-        .stdout(predicate::str::contains("Pushed 1 hook"));
+        .stdout(predicate::str::contains("1 hook"));
 
     let post_push = std::fs::read(&json_path).unwrap();
     assert!(!post_push.windows(6).any(|w| w == b"\\u2014"),
@@ -938,4 +938,99 @@ async fn push_no_drift_when_only_modified_at_differs() {
         stdout.contains("1 label"),
         "expected one label patched in summary. stdout={stdout}\nstderr={stderr}"
     );
+}
+
+/// User-authored new hook file with no lockfile entry → push detects as
+/// create, POSTs to /hooks, writes the canonical response back to disk,
+/// and upserts the lockfile entry.
+#[tokio::test]
+async fn push_creates_new_hook_with_no_lockfile_entry() {
+    let server = MockServer::start().await;
+    mount_get_only_hooks_org(&server, empty_list()).await;
+
+    // Mock the POST /hooks endpoint. Returns the user's body plus
+    // server-assigned id, url, and timestamps.
+    Mock::given(method("POST"))
+        .and(path("/api/v1/hooks"))
+        .and(header("authorization", "token TEST_TOKEN"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": 555,
+            "url": format!("{}/api/v1/hooks/555", server.uri()),
+            "name": "new-hook",
+            "type": "function",
+            "events": ["annotation_content.initialize"],
+            "queues": [],
+            "active": true,
+            "config": {
+                "runtime": "python3.12",
+                "code": "def rossum_hook_request_handler(payload):\n    return payload\n"
+            },
+            "created_at": "2026-05-11T10:00:00Z",
+            "modified_at": "2026-05-11T10:00:00Z"
+        })))
+        .mount(&server).await;
+
+    let project = TempDir::new().unwrap();
+
+    // Scaffold a minimal project.
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--name", "test", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+
+    // Pull once to set up the empty lockfile.
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert().success();
+
+    // Author a NEW hook locally: .json without id/url, plus a .py sidecar.
+    let hooks_dir = project.path().join("envs/dev/hooks");
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+    std::fs::write(
+        hooks_dir.join("new-hook.json"),
+        r#"{
+  "name": "new-hook",
+  "type": "function",
+  "events": ["annotation_content.initialize"],
+  "queues": [],
+  "active": true,
+  "config": {"runtime": "python3.12"}
+}"#,
+    ).unwrap();
+    std::fs::write(
+        hooks_dir.join("new-hook.py"),
+        "def rossum_hook_request_handler(payload):\n    return payload\n",
+    ).unwrap();
+
+    let out = Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["push", "dev"])
+        .output().unwrap();
+
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stderr.contains("created hooks/new-hook"),
+        "expected 'created hooks/new-hook' in stderr; got:\nstderr={stderr}\nstdout={stdout}"
+    );
+    assert!(
+        stdout.contains("1 hook"),
+        "summary should show 1 hook pushed. stdout={stdout}"
+    );
+
+    // Disk file should now contain the server's response (with id + url).
+    let on_disk = std::fs::read_to_string(hooks_dir.join("new-hook.json")).unwrap();
+    assert!(on_disk.contains("\"id\""), "post-create file should contain server's id; got:\n{on_disk}");
+    assert!(on_disk.contains("555"), "post-create file should contain the assigned id 555");
+
+    // Lockfile should have the new entry.
+    let lf = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    assert!(lf.contains("\"new-hook\""), "lockfile should have new-hook entry; got:\n{lf}");
+    assert!(lf.contains("\"id\": 555"), "lockfile should record assigned id 555");
 }

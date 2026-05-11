@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 /// Rossum label. Categorizes annotations within an organization.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Label {
+    #[serde(default)]
     pub id: u64,
+    #[serde(default)]
     pub url: String,
     pub name: String,
     pub organization: String,
