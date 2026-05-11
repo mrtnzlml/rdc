@@ -2,18 +2,27 @@ use super::common::{
     apply_pull_action, maybe_strip_overlay, record_object, skip_on_permission_denied,
     PullAction, PullCtx,
 };
+use crate::model::Hook;
+use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use crate::snapshot::hook::{serialize_hook, write_hook_code};
 use crate::state::hook_combined_hash;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
+use std::sync::Arc;
 
-/// Pull all hooks. Returns `(count, conflicts)`.
-pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
-    let hooks = skip_on_permission_denied(
-        ctx.client.list_hooks().await.context("listing hooks"),
+/// Phase 1: list all hooks from the API.
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<Vec<Hook>> {
+    skip_on_permission_denied(
+        ctx.client.list_hooks(Some(progress.clone())).await.context("listing hooks"),
         "hooks",
-    )?;
+        progress,
+    )
+}
+
+/// Phase 2: write listed hooks to disk. Returns `(count, conflicts)`.
+pub async fn process(ctx: &mut PullCtx<'_>, hooks: Vec<Hook>, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
+    progress.start_phase("hooks");
 
     let mut used_slugs: HashSet<String> = HashSet::new();
     let mut dir_created = false;
@@ -86,7 +95,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
             PullAction::Write => {
                 // The `interactive` flag is irrelevant on Write (no resolver
                 // path); pass `ctx.interactive` for consistency.
-                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone(), ctx.interactive)?;
+                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone(), ctx.interactive, progress)?;
                 if let Some(code) = &proposed_code {
                     write_hook_code(&ctx.paths.hooks_dir(), &slug, code)
                         .with_context(|| format!("writing hook code for '{}'", hook.name))?;
@@ -99,6 +108,10 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
             PullAction::KeepLocal => {
                 let local_json = pre_local_json.as_ref().unwrap();
                 hook_combined_hash(local_json, &pre_local_code)
+            }
+            PullAction::NoChange => {
+                // Combined hash is already equal — no file writes needed.
+                remote_combined_hash
             }
             PullAction::Conflict => {
                 // Combined-hash conflict (spec §8.3). When both sides
@@ -157,6 +170,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
             hook.modified_at().map(|s| s.to_string()),
             Some(recorded_hash),
         );
+        progress.tick(&hook.name);
     }
 
     Ok((hooks.len(), conflicts))

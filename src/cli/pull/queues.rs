@@ -12,10 +12,12 @@ use super::common::{
     record_object, skip_on_permission_denied, PullAction, PullCtx,
 };
 use crate::model::{Inbox, Queue, Schema};
+use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use futures::stream::{StreamExt, TryStreamExt};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Counts of objects pulled by the queues driver.
 pub struct QueueCounts {
@@ -35,25 +37,30 @@ struct QueueWork<'a> {
     inbox_id: Option<u64>,
 }
 
-pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<QueueCounts> {
-    let queues = skip_on_permission_denied(
-        ctx.client.list_queues().await.context("listing queues"),
+/// Phase 1: list all queues from the API.
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<Vec<Queue>> {
+    skip_on_permission_denied(
+        ctx.client.list_queues(Some(progress.clone())).await.context("listing queues"),
         "queues",
-    )?;
+        progress,
+    )
+}
+
+/// Phase 2: process listed queues — filter, slug, write queue.json + schema +
+/// inbox. Also populates `ctx.queue_locations` for email_templates.
+pub async fn process(ctx: &mut PullCtx<'_>, queues: Vec<Queue>, progress: &Arc<OverallProgress>) -> Result<QueueCounts> {
+    progress.start_phase("queues");
 
     let mut per_ws_used_slugs: HashMap<String, HashSet<String>> = HashMap::new();
     let mut counts = QueueCounts { queues: 0, schemas: 0, inboxes: 0, conflicts: 0 };
 
-    // === Phase 1: filter, slug, queue.json write, build work list ===
+    // === Sub-phase A: filter, slug, queue.json write, build work list ===
     let mut work: Vec<QueueWork> = Vec::new();
     for q in &queues {
         let ws_url = match &q.workspace {
             Some(u) => u,
             None => {
-                eprintln!(
-                    "warning: skipping queue '{}' (id {}) — no workspace (orphan/hidden)",
-                    q.name, q.id
-                );
+                progress.skipped_orphan();
                 continue;
             }
         };
@@ -94,7 +101,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<QueueCounts> {
         if q_action == PullAction::Conflict {
             counts.conflicts += 1;
         }
-        let q_recorded = apply_pull_action(q_action, &queue_path, &queue_proposed, q_remote_hash, ctx.interactive)?;
+        let q_recorded = apply_pull_action(q_action, &queue_path, &queue_proposed, q_remote_hash, ctx.interactive, progress)?;
         record_object(
             ctx.lockfile,
             "queues",
@@ -112,10 +119,10 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<QueueCounts> {
             Some(url) => Some(parse_id_from_url(url)
                 .with_context(|| format!("parsing schema URL '{}' for queue '{}'", url, q.name))?),
             None => {
-                eprintln!(
+                progress.println(format!(
                     "warning: queue '{}' (id {}) has no schema — skipping schema + inbox",
-                    q.name, q.id
-                );
+                    q.name, q.id,
+                ));
                 None
             }
         };
@@ -128,24 +135,28 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<QueueCounts> {
         work.push(QueueWork { q, q_slug, queue_dir, schema_id, inbox_id });
     }
 
-    // === Phase 2: concurrent schema + inbox fetches ===
+    // === Sub-phase B: concurrent schema + inbox fetches ===
     // Per spec §16 #4 + §7.2: bounded by ctx.concurrency.
     let client = ctx.client;
+    let progress_inner = progress.clone();
     let fetched_vec: Vec<(u64, Option<Schema>, Option<Inbox>)> = futures::stream::iter(
         work.iter().map(|w| (w.q.id, w.q.name.clone(), w.schema_id, w.inbox_id))
     )
-    .map(|(qid, qname, sid_opt, iid_opt)| async move {
-        let schema = match sid_opt {
-            Some(sid) => Some(client.get_schema(sid).await
-                .with_context(|| format!("fetching schema {sid} for queue '{qname}'"))?),
-            None => None,
-        };
-        let inbox = match iid_opt {
-            Some(iid) => Some(client.get_inbox(iid).await
-                .with_context(|| format!("fetching inbox {iid} for queue '{qname}'"))?),
-            None => None,
-        };
-        Ok::<_, anyhow::Error>((qid, schema, inbox))
+    .map(|(qid, qname, sid_opt, iid_opt)| {
+        let p = progress_inner.clone();
+        async move {
+            let schema = match sid_opt {
+                Some(sid) => Some(client.get_schema(sid, Some(p.clone())).await
+                    .with_context(|| format!("fetching schema {sid} for queue '{qname}'"))?),
+                None => None,
+            };
+            let inbox = match iid_opt {
+                Some(iid) => Some(client.get_inbox(iid, Some(p.clone())).await
+                    .with_context(|| format!("fetching inbox {iid} for queue '{qname}'"))?),
+                None => None,
+            };
+            Ok::<_, anyhow::Error>((qid, schema, inbox))
+        }
     })
     .buffer_unordered(ctx.concurrency)
     .try_collect()
@@ -153,16 +164,17 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<QueueCounts> {
     let fetched: HashMap<u64, (Option<Schema>, Option<Inbox>)> =
         fetched_vec.into_iter().map(|(qid, s, i)| (qid, (s, i))).collect();
 
-    // === Phase 3: schema + inbox write decisions (sequential, mutates lockfile) ===
+    // === Sub-phase C: schema + inbox write decisions (sequential, mutates lockfile) ===
     for w in &work {
         let Some((schema_opt, inbox_opt)) = fetched.get(&w.q.id) else { continue };
 
         if let Some(schema) = schema_opt {
-            write_schema_for_queue(ctx, &mut counts, w, schema)?;
+            write_schema_for_queue(ctx, &mut counts, w, schema, progress)?;
         }
         if let Some(inbox) = inbox_opt {
-            write_inbox_for_queue(ctx, &mut counts, w, inbox)?;
+            write_inbox_for_queue(ctx, &mut counts, w, inbox, progress)?;
         }
+        progress.tick(&w.q.name);
     }
 
     Ok(counts)
@@ -173,6 +185,7 @@ fn write_schema_for_queue(
     counts: &mut QueueCounts,
     w: &QueueWork<'_>,
     schema: &Schema,
+    progress: &Arc<OverallProgress>,
 ) -> Result<()> {
     let queue_dir = &w.queue_dir;
     let schema_path = queue_dir.join("schema.json");
@@ -225,6 +238,10 @@ fn write_schema_for_queue(
         PullAction::KeepLocal => {
             let local_json = pre_local_json.as_ref().unwrap();
             crate::state::schema_combined_hash(local_json, &pre_local_formulas)
+        }
+        PullAction::NoChange => {
+            // Combined hash is already equal — no file writes needed.
+            remote_combined_hash
         }
         PullAction::Conflict => {
             counts.conflicts += 1;
@@ -281,12 +298,12 @@ fn write_schema_for_queue(
                         crate::snapshot::writer::write_atomic(&p, bytes)?;
                     }
                 }
-                eprintln!(
+                progress.println(format!(
                     "warning: {} conflict — local preserved, remote at {} (formulas at {})",
                     schema_path.display(),
                     queue_dir.join("schema.json.remote").display(),
-                    queue_dir.join("formulas.remote").display()
-                );
+                    queue_dir.join("formulas.remote").display(),
+                ));
                 crate::state::schema_combined_hash(local_json, &pre_local_formulas)
             }
         }
@@ -309,6 +326,7 @@ fn write_inbox_for_queue(
     counts: &mut QueueCounts,
     w: &QueueWork<'_>,
     inbox: &Inbox,
+    progress: &Arc<OverallProgress>,
 ) -> Result<()> {
     let inbox_path = w.queue_dir.join("inbox.json");
     let mut inbox_proposed = serde_json::to_vec_pretty(inbox).context("serializing inbox")?;
@@ -328,7 +346,7 @@ fn write_inbox_for_queue(
     if i_action == PullAction::Conflict {
         counts.conflicts += 1;
     }
-    let i_recorded = apply_pull_action(i_action, &inbox_path, &inbox_proposed, i_remote_hash, ctx.interactive)?;
+    let i_recorded = apply_pull_action(i_action, &inbox_path, &inbox_proposed, i_remote_hash, ctx.interactive, progress)?;
     record_object(
         ctx.lockfile,
         "inboxes",

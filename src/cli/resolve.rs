@@ -79,41 +79,63 @@ fn read_local(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("reading {}", path.display()))
 }
 
-/// Prompt the user to resolve a conflict on `local_path` between the
-/// current local bytes and proposed `remote_bytes`. Caller passes
-/// `(index, total)` for the `[N/M]` header.
-///
-/// Reads from stdin via `BufRead` so tests can supply a `Cursor`. The
-/// production caller wraps `std::io::stdin().lock()`.
+/// Top-level entry point. Auto-detects color mode from environment and TTY.
+/// Production callers use this; tests use `prompt_resolve_with_color` to
+/// pin the mode.
 pub fn prompt_resolve<R: BufRead, W: Write>(
+    input: R,
+    output: W,
+    index: usize,
+    total: usize,
+    local_path: &Path,
+    remote_bytes: &[u8],
+) -> Result<Resolution> {
+    let mode = detect_color_mode(false);
+    prompt_resolve_with_color(input, output, index, total, local_path, remote_bytes, mode)
+}
+
+/// Color-aware core. Tests pin the mode here; production goes through
+/// `prompt_resolve` which auto-detects.
+pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
     mut input: R,
     mut output: W,
     index: usize,
     total: usize,
     local_path: &Path,
     remote_bytes: &[u8],
+    mode: ColorMode,
 ) -> Result<Resolution> {
     let local_bytes = read_local(local_path)?;
 
-    writeln!(output, "")?;
-    writeln!(output, "[{index}/{total}]  {} — conflict", local_path.display())?;
-    writeln!(output, "")?;
+    // Strip noise fields before diff display so the user only sees real
+    // changes. modified_at server-churn must not appear in the resolver.
+    let local_canonical = crate::snapshot::noise::canonicalize_for_hash(&local_bytes);
+    let remote_canonical = crate::snapshot::noise::canonicalize_for_hash(remote_bytes);
 
-    let diff = unified_diff("local", &local_bytes, "remote", remote_bytes);
-    if diff.is_empty() {
-        // Defensive: caller already determined a conflict, but if local
-        // and remote are byte-identical we just keep local.
+    if local_canonical == remote_canonical {
         return Ok(Resolution::KeepLocal);
     }
-    write!(output, "{diff}")?;
+
+    writeln!(output, "")?;
+    let header = format!("[{index}/{total}]  {} — conflict", local_path.display());
+    writeln!(output, "{}", colorize_header(&header, mode))?;
+    writeln!(output, "")?;
+
+    let diff = unified_diff("local", &local_canonical, "remote", &remote_canonical);
+    if diff.is_empty() {
+        return Ok(Resolution::KeepLocal);
+    }
+    for line in diff.lines() {
+        writeln!(output, "{}", colorize_diff_line(line, mode))?;
+    }
     writeln!(output, "")?;
 
     loop {
-        write!(output, "[k]eep local  [r]emote  [e]dit  [s]kip (shadow file)  [a]bort > ")?;
+        let prompt_text = "[k]eep local  [r]emote  [e]dit  [s]kip (shadow file)  [a]bort > ";
+        write!(output, "{}", colorize_prompt(prompt_text, mode))?;
         output.flush().ok();
         let mut line = String::new();
         if input.read_line(&mut line)? == 0 {
-            // EOF — treat as skip (preserve legacy behavior).
             return Ok(Resolution::Skip);
         }
         match line.trim().chars().next() {
@@ -341,6 +363,94 @@ pub fn resolve_push_drift(
 #[error("aborted by user at conflict resolver")]
 pub struct PullAborted;
 
+/// Whether to emit ANSI color codes in resolver output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorMode {
+    Plain,
+    Color,
+}
+
+/// Decide the color mode at runtime. `--no-color` flag has highest priority,
+/// then NO_COLOR env var, then stderr TTY detection.
+pub fn detect_color_mode(no_color_flag: bool) -> ColorMode {
+    if no_color_flag {
+        return ColorMode::Plain;
+    }
+    if std::env::var_os("NO_COLOR").is_some() {
+        return ColorMode::Plain;
+    }
+    if std::io::stderr().is_terminal() {
+        ColorMode::Color
+    } else {
+        ColorMode::Plain
+    }
+}
+
+/// Apply color to a single line of unified-diff output. Returns `line`
+/// unchanged in [`ColorMode::Plain`].
+pub fn colorize_diff_line(line: &str, mode: ColorMode) -> String {
+    if mode == ColorMode::Plain {
+        return line.to_string();
+    }
+    let prefix = if line.starts_with("--- ") {
+        "\x1b[91m" // bright red
+    } else if line.starts_with("+++ ") {
+        "\x1b[92m" // bright green
+    } else if line.starts_with("@@") {
+        "\x1b[36m" // cyan
+    } else if line.starts_with('-') {
+        "\x1b[91m" // bright red
+    } else if line.starts_with('+') {
+        "\x1b[92m" // bright green
+    } else {
+        return line.to_string();
+    };
+    format!("{prefix}{line}\x1b[0m")
+}
+
+/// Colorize the conflict header line. Bold yellow.
+pub fn colorize_header(text: &str, mode: ColorMode) -> String {
+    if mode == ColorMode::Plain {
+        return text.to_string();
+    }
+    format!("\x1b[1;93m{text}\x1b[0m")
+}
+
+/// Colorize the action-letter prompt line. Bracketed single-letter tokens
+/// like `[k]` are wrapped in bold cyan; the rest of the prompt is unchanged.
+pub fn colorize_prompt(text: &str, mode: ColorMode) -> String {
+    if mode == ColorMode::Plain {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '[' {
+            if let Some(&letter) = chars.peek() {
+                if letter.is_ascii_alphabetic() {
+                    chars.next(); // consume letter
+                    if matches!(chars.peek(), Some(']')) {
+                        chars.next(); // consume ]
+                        out.push_str("[\x1b[1;96m");
+                        out.push(letter);
+                        out.push_str("\x1b[0m]");
+                        continue;
+                    } else {
+                        // Not a single-letter bracketed token — emit as-is.
+                        out.push('[');
+                        out.push(letter);
+                        continue;
+                    }
+                }
+            }
+            out.push(c);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,5 +610,156 @@ mod tests {
         std::fs::write(&path, b"local\n").unwrap();
         let r = resolve_push_drift(false, &path, b"remote\n").unwrap();
         assert!(matches!(r, PushDriftOutcome::Skip));
+    }
+
+    #[test]
+    fn prompt_short_circuits_when_only_noise_differs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        std::fs::write(&path, b"{\"name\":\"x\",\"modified_at\":\"t1\"}").unwrap();
+
+        // Empty input — function must not block on read_line.
+        let input = Cursor::new(b"");
+        let mut output: Vec<u8> = Vec::new();
+        let r = prompt_resolve(
+            input,
+            &mut output,
+            1,
+            1,
+            &path,
+            b"{\"name\":\"x\",\"modified_at\":\"t2\"}",
+        )
+        .unwrap();
+        assert!(matches!(r, Resolution::KeepLocal));
+        // No prompt was rendered (short-circuit).
+        let s = String::from_utf8(output).unwrap();
+        assert!(!s.contains("[k]eep"), "should not have prompted: {s}");
+    }
+
+    #[test]
+    fn colorize_plain_mode_returns_unchanged() {
+        let line = "-  \"name\": \"old\"";
+        assert_eq!(colorize_diff_line(line, ColorMode::Plain), line.to_string());
+    }
+
+    #[test]
+    fn colorize_color_mode_renders_minus_red() {
+        let line = "-  \"name\": \"old\"";
+        let out = colorize_diff_line(line, ColorMode::Color);
+        // Bright-red SGR = \x1b[91m, reset = \x1b[0m.
+        assert!(out.contains("\x1b[91m"), "expected bright red prefix in: {out:?}");
+        assert!(out.ends_with("\x1b[0m"), "expected reset suffix in: {out:?}");
+    }
+
+    #[test]
+    fn colorize_color_mode_renders_plus_green() {
+        let line = "+  \"name\": \"new\"";
+        let out = colorize_diff_line(line, ColorMode::Color);
+        assert!(out.contains("\x1b[92m"), "expected bright green prefix in: {out:?}");
+    }
+
+    #[test]
+    fn colorize_color_mode_leaves_context_lines_alone() {
+        let line = "   \"unchanged\": true";
+        assert_eq!(
+            colorize_diff_line(line, ColorMode::Color),
+            line.to_string()
+        );
+    }
+
+    #[test]
+    fn colorize_color_mode_hunk_header_is_cyan() {
+        let line = "@@ -1,3 +1,3 @@";
+        let out = colorize_diff_line(line, ColorMode::Color);
+        assert!(out.contains("\x1b[36m"), "expected cyan in: {out:?}");
+    }
+
+    #[test]
+    fn colorize_file_headers_are_red_and_green() {
+        let minus_hdr = colorize_diff_line("--- local", ColorMode::Color);
+        let plus_hdr = colorize_diff_line("+++ remote", ColorMode::Color);
+        assert!(minus_hdr.contains("\x1b[91m"), "got: {minus_hdr:?}");
+        assert!(plus_hdr.contains("\x1b[92m"), "got: {plus_hdr:?}");
+    }
+
+    #[test]
+    fn detect_color_mode_no_color_env_returns_plain() {
+        let prev = std::env::var("NO_COLOR").ok();
+        std::env::set_var("NO_COLOR", "1");
+        assert!(matches!(detect_color_mode(false), ColorMode::Plain));
+        match prev {
+            Some(v) => std::env::set_var("NO_COLOR", v),
+            None => std::env::remove_var("NO_COLOR"),
+        }
+    }
+
+    #[test]
+    fn detect_color_mode_no_color_flag_returns_plain() {
+        let prev = std::env::var("NO_COLOR").ok();
+        std::env::remove_var("NO_COLOR");
+        assert!(matches!(detect_color_mode(true), ColorMode::Plain));
+        if let Some(v) = prev {
+            std::env::set_var("NO_COLOR", v);
+        }
+    }
+
+    #[test]
+    fn colorize_prompt_wraps_bracketed_letters() {
+        let s = colorize_prompt("[k]eep local  [r]emote", ColorMode::Color);
+        // Expect both letters wrapped in bold-cyan SGR.
+        assert!(s.matches("\x1b[1;96m").count() == 2, "got: {s:?}");
+    }
+
+    #[test]
+    fn colorize_prompt_plain_returns_unchanged() {
+        let s = colorize_prompt("[k]eep local", ColorMode::Plain);
+        assert_eq!(s, "[k]eep local");
+    }
+
+    #[test]
+    fn prompt_emits_color_codes_when_color_mode() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        std::fs::write(&path, b"{\"name\":\"old\"}").unwrap();
+
+        let input = Cursor::new(b"k\n");
+        let mut output: Vec<u8> = Vec::new();
+        prompt_resolve_with_color(
+            input,
+            &mut output,
+            1,
+            1,
+            &path,
+            b"{\"name\":\"new\"}",
+            ColorMode::Color,
+        )
+        .unwrap();
+        let s = String::from_utf8(output).unwrap();
+        // Header bold yellow, action letters bold cyan, diff lines red/green.
+        assert!(s.contains("\x1b[1;93m"), "no header color: {s:?}");
+        assert!(s.contains("\x1b[91m") || s.contains("\x1b[92m"), "no diff color: {s:?}");
+        assert!(s.contains("\x1b[1;96m"), "no prompt color: {s:?}");
+    }
+
+    #[test]
+    fn prompt_plain_mode_emits_no_color_codes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        std::fs::write(&path, b"{\"name\":\"old\"}").unwrap();
+
+        let input = Cursor::new(b"k\n");
+        let mut output: Vec<u8> = Vec::new();
+        prompt_resolve_with_color(
+            input,
+            &mut output,
+            1,
+            1,
+            &path,
+            b"{\"name\":\"new\"}",
+            ColorMode::Plain,
+        )
+        .unwrap();
+        let s = String::from_utf8(output).unwrap();
+        assert!(!s.contains("\x1b["), "expected no SGR codes: {s:?}");
     }
 }

@@ -1,14 +1,20 @@
 use crate::api::{ApiError, RossumClient};
 use crate::paths::Paths;
+use crate::progress::OverallProgress;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
 use anyhow::{anyhow, Context, Result};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 /// If `result` is a 403 permission_denied from the Rossum API, log a warning
 /// and return an empty list — the kind is unavailable to this token, but
 /// other kinds should still pull. Otherwise propagate the error unchanged.
-pub fn skip_on_permission_denied<T>(result: Result<Vec<T>>, kind: &str) -> Result<Vec<T>> {
+pub fn skip_on_permission_denied<T>(
+    result: Result<Vec<T>>,
+    kind: &str,
+    progress: &Arc<OverallProgress>,
+) -> Result<Vec<T>> {
     match result {
         Ok(v) => Ok(v),
         Err(e) => {
@@ -18,9 +24,7 @@ pub fn skip_on_permission_denied<T>(result: Result<Vec<T>>, kind: &str) -> Resul
                     .unwrap_or(false)
             });
             if is_403 {
-                eprintln!(
-                    "warning: skipping {kind} — token lacks permission (403)"
-                );
+                progress.println(format!("warning: skipping {kind} — token lacks permission (403)"));
                 Ok(Vec::new())
             } else {
                 Err(e)
@@ -133,6 +137,10 @@ pub enum PullAction {
     KeepLocal,
     /// Both local and remote have diverged from base — real conflict.
     Conflict,
+    /// Local and remote canonicalize to the same bytes (only noise fields
+    /// like `modified_at` differ). Skip the write to preserve on-disk
+    /// byte-stability across re-pulls.
+    NoChange,
 }
 
 /// Decide what to do on pull for a single object.
@@ -162,6 +170,12 @@ pub fn decide_pull_action(
         .with_context(|| format!("reading {}", local_path.display()))?;
     let local_hash = content_hash(&local_bytes);
 
+    // Short-circuit: canonicalized local == canonicalized remote means
+    // any difference is noise (modified_at etc.). Don't rewrite the file.
+    if local_hash == remote_hash {
+        return Ok((PullAction::NoChange, remote_hash));
+    }
+
     let local_matches_base = local_hash == base;
     let remote_matches_base = remote_hash == base;
 
@@ -189,6 +203,7 @@ pub fn apply_pull_action(
     remote_bytes: &[u8],
     remote_hash: String,
     interactive: bool,
+    progress: &Arc<OverallProgress>,
 ) -> Result<String> {
     use crate::snapshot::writer::write_atomic;
     match action {
@@ -201,11 +216,16 @@ pub fn apply_pull_action(
                 .with_context(|| format!("reading {}", local_path.display()))?;
             Ok(content_hash(&local_bytes))
         }
+        PullAction::NoChange => {
+            // Local and remote canonicalize equal — preserve disk bytes.
+            // Hash is identical to remote_hash by construction.
+            Ok(remote_hash)
+        }
         PullAction::Conflict => {
             if interactive {
-                resolve_conflict_interactive(local_path, remote_bytes, &remote_hash)
+                resolve_conflict_interactive(local_path, remote_bytes, &remote_hash, progress)
             } else {
-                shadow_file_conflict(local_path, remote_bytes)
+                shadow_file_conflict(local_path, remote_bytes, progress)
             }
         }
     }
@@ -215,7 +235,11 @@ pub fn apply_pull_action(
 /// `<file>.remote`, keep local on disk, return the local hash. Used when
 /// `interactive == false` (CI/non-TTY/--yes) and as a fallback from the
 /// resolver when the user picks `[s]kip`.
-fn shadow_file_conflict(local_path: &Path, remote_bytes: &[u8]) -> Result<String> {
+fn shadow_file_conflict(
+    local_path: &Path,
+    remote_bytes: &[u8],
+    progress: &Arc<OverallProgress>,
+) -> Result<String> {
     use crate::snapshot::writer::write_atomic;
     let mut conflict_path = local_path.to_path_buf();
     let new_name = match conflict_path.file_name().and_then(|s| s.to_str()) {
@@ -224,11 +248,11 @@ fn shadow_file_conflict(local_path: &Path, remote_bytes: &[u8]) -> Result<String
     };
     conflict_path.set_file_name(new_name);
     write_atomic(&conflict_path, remote_bytes)?;
-    eprintln!(
+    progress.println(format!(
         "warning: {} conflict — local preserved, remote at {}",
         local_path.display(),
-        conflict_path.display()
-    );
+        conflict_path.display(),
+    ));
     let local_bytes = std::fs::read(local_path)
         .with_context(|| format!("reading {}", local_path.display()))?;
     Ok(content_hash(&local_bytes))
@@ -242,6 +266,7 @@ fn resolve_conflict_interactive(
     local_path: &Path,
     remote_bytes: &[u8],
     remote_hash: &str,
+    progress: &Arc<OverallProgress>,
 ) -> Result<String> {
     use crate::cli::resolve::{prompt_resolve, PullAborted, Resolution};
     use crate::snapshot::writer::write_atomic;
@@ -256,6 +281,7 @@ fn resolve_conflict_interactive(
         local_path,
         remote_bytes,
     )?;
+
     match resolution {
         Resolution::KeepLocal => {
             let local_bytes = std::fs::read(local_path)
@@ -270,7 +296,7 @@ fn resolve_conflict_interactive(
             write_atomic(local_path, &edited)?;
             Ok(content_hash(&edited))
         }
-        Resolution::Skip => shadow_file_conflict(local_path, remote_bytes),
+        Resolution::Skip => shadow_file_conflict(local_path, remote_bytes, progress),
         Resolution::Abort => Err(anyhow::Error::new(PullAborted)),
     }
 }
@@ -361,7 +387,9 @@ mod tests {
     fn apply_write_creates_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
-        let h = apply_pull_action(PullAction::Write, &path, b"hello", "h".repeat(64), false).unwrap();
+        let p = crate::progress::OverallProgress::start("test");
+        let h = apply_pull_action(PullAction::Write, &path, b"hello", "h".repeat(64), false, &p).unwrap();
+        p.finish();
         assert_eq!(h, "h".repeat(64));
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
     }
@@ -372,7 +400,9 @@ mod tests {
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"local").unwrap();
         // interactive=false → legacy shadow-file behavior.
-        let _ = apply_pull_action(PullAction::Conflict, &path, b"remote", "h".repeat(64), false).unwrap();
+        let p = crate::progress::OverallProgress::start("test");
+        let _ = apply_pull_action(PullAction::Conflict, &path, b"remote", "h".repeat(64), false, &p).unwrap();
+        p.finish();
         assert_eq!(std::fs::read(&path).unwrap(), b"local");
         assert_eq!(std::fs::read(dir.path().join("x.json.remote")).unwrap(), b"remote");
     }
@@ -383,7 +413,9 @@ mod tests {
             status: 403,
             body: "permission_denied".into()
         }));
-        let out = skip_on_permission_denied(err, "engines").unwrap();
+        let p = crate::progress::OverallProgress::start("test");
+        let out = skip_on_permission_denied(err, "engines", &p).unwrap();
+        p.finish();
         assert!(out.is_empty());
     }
 
@@ -393,13 +425,52 @@ mod tests {
             status: 500,
             body: "boom".into()
         }));
-        assert!(skip_on_permission_denied(err, "engines").is_err());
+        let p = crate::progress::OverallProgress::start("test");
+        assert!(skip_on_permission_denied(err, "engines", &p).is_err());
     }
 
     #[test]
     fn skip_on_permission_denied_passes_through_ok() {
         let v: Result<Vec<u32>> = Ok(vec![1, 2, 3]);
-        let out = skip_on_permission_denied(v, "engines").unwrap();
+        let p = crate::progress::OverallProgress::start("test");
+        let out = skip_on_permission_denied(v, "engines", &p).unwrap();
+        p.finish();
         assert_eq!(out, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn decide_returns_nochange_when_canonical_local_equals_canonical_remote() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        // Local has modified_at = t1
+        std::fs::write(&path, b"{\"name\":\"x\",\"modified_at\":\"t1\"}").unwrap();
+        // Remote has modified_at = t2 (newer); same other content
+        let remote = b"{\"name\":\"x\",\"modified_at\":\"t2\"}";
+        // Base hash matches both (canonical strips modified_at)
+        let base = content_hash(remote);
+        let (action, _hash) = decide_pull_action(&path, Some(&base), remote).unwrap();
+        assert_eq!(action, PullAction::NoChange);
+    }
+
+    #[test]
+    fn apply_nochange_does_not_modify_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        std::fs::write(&path, b"original").unwrap();
+        let original_bytes = std::fs::read(&path).unwrap();
+        let p = crate::progress::OverallProgress::start("test");
+        let h = apply_pull_action(
+            PullAction::NoChange,
+            &path,
+            b"different remote bytes",
+            "h".repeat(64),
+            false,
+            &p,
+        )
+        .unwrap();
+        p.finish();
+        assert_eq!(h, "h".repeat(64));
+        // Local file unchanged byte-for-byte.
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
     }
 }

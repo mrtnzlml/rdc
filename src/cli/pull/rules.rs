@@ -2,16 +2,25 @@ use super::common::{
     apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
     skip_on_permission_denied, PullAction, PullCtx,
 };
+use crate::model::Rule;
+use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
+use std::sync::Arc;
 
-/// Pull all rules. Returns `(count, conflicts)`.
-pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
-    let rules = skip_on_permission_denied(
-        ctx.client.list_rules().await.context("listing rules"),
+/// Phase 1: list all rules from the API.
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<Vec<Rule>> {
+    skip_on_permission_denied(
+        ctx.client.list_rules(Some(progress.clone())).await.context("listing rules"),
         "rules",
-    )?;
+        progress,
+    )
+}
+
+/// Phase 2: write listed rules to disk. Returns `(count, conflicts)`.
+pub async fn process(ctx: &mut PullCtx<'_>, rules: Vec<Rule>, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
+    progress.start_phase("rules");
 
     let mut used: HashSet<String> = HashSet::new();
     let mut dir_created = false;
@@ -48,7 +57,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
         if action == PullAction::Conflict {
             conflicts += 1;
         }
-        let recorded_hash = apply_pull_action(action, &local_path, &proposed, remote_hash, ctx.interactive)?;
+        let recorded_hash = apply_pull_action(action, &local_path, &proposed, remote_hash, ctx.interactive, progress)?;
 
         record_object(
             ctx.lockfile,
@@ -59,6 +68,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
             r.modified_at().map(|s| s.to_string()),
             Some(recorded_hash),
         );
+        progress.tick(&r.name);
     }
 
     Ok((rules.len(), conflicts))

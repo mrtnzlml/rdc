@@ -39,11 +39,11 @@ impl RossumClient {
         Ok(Self { base_url, token, http })
     }
 
-    pub async fn list_hooks(&self) -> Result<Vec<Hook>> {
+    pub async fn list_hooks(&self, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<Vec<Hook>> {
         let mut url = format!("{}/hooks", self.base_url);
         let mut out = Vec::new();
         loop {
-            let page: Page<Hook> = self.get_json(&url).await?;
+            let page: Page<Hook> = self.get_json(&url, progress.clone()).await?;
             out.extend(page.results);
             match page.pagination.next {
                 Some(next) => url = next,
@@ -53,39 +53,39 @@ impl RossumClient {
         Ok(out)
     }
 
-    pub async fn update_rule(&self, id: u64, rule: &crate::model::Rule)
+    pub async fn update_rule(&self, id: u64, rule: &crate::model::Rule, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>)
         -> Result<crate::model::Rule>
     {
-        self.patch_json(&format!("/rules/{id}"), rule).await
+        self.patch_json(&format!("/rules/{id}"), rule, progress).await
     }
 
-    pub async fn update_label(&self, id: u64, label: &crate::model::Label)
+    pub async fn update_label(&self, id: u64, label: &crate::model::Label, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>)
         -> Result<crate::model::Label>
     {
-        self.patch_json(&format!("/labels/{id}"), label).await
+        self.patch_json(&format!("/labels/{id}"), label, progress).await
     }
 
     /// PATCH /hooks/{id}. Returns the server's authoritative response.
-    pub async fn update_hook(&self, id: u64, hook: &Hook) -> Result<Hook> {
-        self.patch_json(&format!("/hooks/{id}"), hook).await
+    pub async fn update_hook(&self, id: u64, hook: &Hook, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<Hook> {
+        self.patch_json(&format!("/hooks/{id}"), hook, progress).await
     }
 
-    pub async fn get_organization(&self, id: u64) -> Result<crate::model::Organization> {
+    pub async fn get_organization(&self, id: u64, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<crate::model::Organization> {
         let url = format!("{}/organizations/{id}", self.base_url);
-        self.get_json(&url).await
+        self.get_json(&url, progress).await
     }
 
     /// GET /hooks/{id}. Used by `rdc diff` for single-hook fetch.
-    pub async fn get_hook(&self, id: u64) -> Result<Hook> {
+    pub async fn get_hook(&self, id: u64, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<Hook> {
         let url = format!("{}/hooks/{id}", self.base_url);
-        self.get_json(&url).await
+        self.get_json(&url, progress).await
     }
 
-    pub async fn list_workspaces(&self) -> Result<Vec<crate::model::Workspace>> {
+    pub async fn list_workspaces(&self, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<Vec<crate::model::Workspace>> {
         let mut url = format!("{}/workspaces", self.base_url);
         let mut out = Vec::new();
         loop {
-            let page: Page<crate::model::Workspace> = self.get_json(&url).await?;
+            let page: Page<crate::model::Workspace> = self.get_json(&url, progress.clone()).await?;
             out.extend(page.results);
             match page.pagination.next {
                 Some(next) => url = next,
@@ -95,11 +95,11 @@ impl RossumClient {
         Ok(out)
     }
 
-    pub async fn list_queues(&self) -> Result<Vec<crate::model::Queue>> {
+    pub async fn list_queues(&self, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<Vec<crate::model::Queue>> {
         let mut url = format!("{}/queues", self.base_url);
         let mut out = Vec::new();
         loop {
-            let page: Page<crate::model::Queue> = self.get_json(&url).await?;
+            let page: Page<crate::model::Queue> = self.get_json(&url, progress.clone()).await?;
             out.extend(page.results);
             match page.pagination.next {
                 Some(next) => url = next,
@@ -109,57 +109,57 @@ impl RossumClient {
         Ok(out)
     }
 
-    pub async fn get_inbox(&self, id: u64) -> Result<crate::model::Inbox> {
+    pub async fn get_inbox(&self, id: u64, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<crate::model::Inbox> {
         let url = format!("{}/inboxes/{id}", self.base_url);
-        self.get_json(&url).await
+        self.get_json(&url, progress).await
     }
 
-    pub async fn get_schema(&self, id: u64) -> Result<crate::model::Schema> {
+    pub async fn get_schema(&self, id: u64, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<crate::model::Schema> {
         let url = format!("{}/schemas/{id}", self.base_url);
-        self.get_json(&url).await
+        self.get_json(&url, progress).await
     }
 
-    pub async fn update_schema(&self, id: u64, schema: &crate::model::Schema)
+    pub async fn update_schema(&self, id: u64, schema: &crate::model::Schema, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>)
         -> Result<crate::model::Schema>
     {
-        self.patch_json(&format!("/schemas/{id}"), schema).await
+        self.patch_json(&format!("/schemas/{id}"), schema, progress).await
     }
 
-    pub async fn update_queue(&self, id: u64, queue: &crate::model::Queue)
+    pub async fn update_queue(&self, id: u64, queue: &crate::model::Queue, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>)
         -> Result<crate::model::Queue>
     {
-        self.patch_json(&format!("/queues/{id}"), queue).await
+        self.patch_json(&format!("/queues/{id}"), queue, progress).await
     }
 
-    pub async fn update_inbox(&self, id: u64, inbox: &crate::model::Inbox)
+    pub async fn update_inbox(&self, id: u64, inbox: &crate::model::Inbox, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>)
         -> Result<crate::model::Inbox>
     {
-        self.patch_json(&format!("/inboxes/{id}"), inbox).await
+        self.patch_json(&format!("/inboxes/{id}"), inbox, progress).await
     }
 
-    pub async fn update_email_template(&self, id: u64, t: &crate::model::EmailTemplate)
+    pub async fn update_email_template(&self, id: u64, t: &crate::model::EmailTemplate, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>)
         -> Result<crate::model::EmailTemplate>
     {
-        self.patch_json(&format!("/email_templates/{id}"), t).await
+        self.patch_json(&format!("/email_templates/{id}"), t, progress).await
     }
 
-    pub async fn update_engine(&self, id: u64, engine: &crate::model::Engine)
+    pub async fn update_engine(&self, id: u64, engine: &crate::model::Engine, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>)
         -> Result<crate::model::Engine>
     {
-        self.patch_json(&format!("/engines/{id}"), engine).await
+        self.patch_json(&format!("/engines/{id}"), engine, progress).await
     }
 
-    pub async fn update_engine_field(&self, id: u64, field: &crate::model::EngineField)
+    pub async fn update_engine_field(&self, id: u64, field: &crate::model::EngineField, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>)
         -> Result<crate::model::EngineField>
     {
-        self.patch_json(&format!("/engine_fields/{id}"), field).await
+        self.patch_json(&format!("/engine_fields/{id}"), field, progress).await
     }
 
-    pub async fn list_rules(&self) -> Result<Vec<crate::model::Rule>> {
+    pub async fn list_rules(&self, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<Vec<crate::model::Rule>> {
         let mut url = format!("{}/rules", self.base_url);
         let mut out = Vec::new();
         loop {
-            let page: Page<crate::model::Rule> = self.get_json(&url).await?;
+            let page: Page<crate::model::Rule> = self.get_json(&url, progress.clone()).await?;
             out.extend(page.results);
             match page.pagination.next {
                 Some(next) => url = next,
@@ -169,11 +169,11 @@ impl RossumClient {
         Ok(out)
     }
 
-    pub async fn list_labels(&self) -> Result<Vec<crate::model::Label>> {
+    pub async fn list_labels(&self, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<Vec<crate::model::Label>> {
         let mut url = format!("{}/labels", self.base_url);
         let mut out = Vec::new();
         loop {
-            let page: Page<crate::model::Label> = self.get_json(&url).await?;
+            let page: Page<crate::model::Label> = self.get_json(&url, progress.clone()).await?;
             out.extend(page.results);
             match page.pagination.next {
                 Some(next) => url = next,
@@ -183,11 +183,11 @@ impl RossumClient {
         Ok(out)
     }
 
-    pub async fn list_engines(&self) -> Result<Vec<crate::model::Engine>> {
+    pub async fn list_engines(&self, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<Vec<crate::model::Engine>> {
         let mut url = format!("{}/engines", self.base_url);
         let mut out = Vec::new();
         loop {
-            let page: Page<crate::model::Engine> = self.get_json(&url).await?;
+            let page: Page<crate::model::Engine> = self.get_json(&url, progress.clone()).await?;
             out.extend(page.results);
             match page.pagination.next {
                 Some(next) => url = next,
@@ -197,11 +197,11 @@ impl RossumClient {
         Ok(out)
     }
 
-    pub async fn list_engine_fields(&self) -> Result<Vec<crate::model::EngineField>> {
+    pub async fn list_engine_fields(&self, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<Vec<crate::model::EngineField>> {
         let mut url = format!("{}/engine_fields", self.base_url);
         let mut out = Vec::new();
         loop {
-            let page: Page<crate::model::EngineField> = self.get_json(&url).await?;
+            let page: Page<crate::model::EngineField> = self.get_json(&url, progress.clone()).await?;
             out.extend(page.results);
             match page.pagination.next {
                 Some(next) => url = next,
@@ -211,11 +211,11 @@ impl RossumClient {
         Ok(out)
     }
 
-    pub async fn list_workflows(&self) -> Result<Vec<crate::model::Workflow>> {
+    pub async fn list_workflows(&self, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<Vec<crate::model::Workflow>> {
         let mut url = format!("{}/workflows", self.base_url);
         let mut out = Vec::new();
         loop {
-            let page: Page<crate::model::Workflow> = self.get_json(&url).await?;
+            let page: Page<crate::model::Workflow> = self.get_json(&url, progress.clone()).await?;
             out.extend(page.results);
             match page.pagination.next {
                 Some(next) => url = next,
@@ -225,11 +225,11 @@ impl RossumClient {
         Ok(out)
     }
 
-    pub async fn list_workflow_steps(&self) -> Result<Vec<crate::model::WorkflowStep>> {
+    pub async fn list_workflow_steps(&self, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<Vec<crate::model::WorkflowStep>> {
         let mut url = format!("{}/workflow_steps", self.base_url);
         let mut out = Vec::new();
         loop {
-            let page: Page<crate::model::WorkflowStep> = self.get_json(&url).await?;
+            let page: Page<crate::model::WorkflowStep> = self.get_json(&url, progress.clone()).await?;
             out.extend(page.results);
             match page.pagination.next {
                 Some(next) => url = next,
@@ -239,11 +239,11 @@ impl RossumClient {
         Ok(out)
     }
 
-    pub async fn list_email_templates(&self) -> Result<Vec<crate::model::EmailTemplate>> {
+    pub async fn list_email_templates(&self, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<Vec<crate::model::EmailTemplate>> {
         let mut url = format!("{}/email_templates", self.base_url);
         let mut out = Vec::new();
         loop {
-            let page: Page<crate::model::EmailTemplate> = self.get_json(&url).await?;
+            let page: Page<crate::model::EmailTemplate> = self.get_json(&url, progress.clone()).await?;
             out.extend(page.results);
             match page.pagination.next {
                 Some(next) => url = next,
@@ -253,10 +253,11 @@ impl RossumClient {
         Ok(out)
     }
 
-    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<T> {
         let resp = retry::send_with_retry(
             || self.http.get(url).header("Authorization", format!("token {}", self.token)),
             &format!("GET {url}"),
+            progress,
         ).await?;
 
         let status = resp.status();
@@ -277,7 +278,7 @@ impl RossumClient {
 
     /// Generic PATCH `<base>/<path>` with `body` as JSON. Used by every
     /// `update_X` method. Centralises 429 retry/backoff via `retry::send_with_retry`.
-    async fn patch_json<TBody, TResp>(&self, path: &str, body: &TBody) -> Result<TResp>
+    async fn patch_json<TBody, TResp>(&self, path: &str, body: &TBody, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<TResp>
     where
         TBody: serde::Serialize,
         TResp: serde::de::DeserializeOwned,
@@ -289,6 +290,7 @@ impl RossumClient {
                 .header("Authorization", format!("token {}", self.token))
                 .json(body),
             &format!("PATCH {url}"),
+            progress,
         ).await?;
         let status = resp.status();
         if !status.is_success() {

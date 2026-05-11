@@ -62,7 +62,7 @@ pub async fn run(env_filter: Option<String>) -> Result<()> {
                         continue;
                     }
                 };
-                match client.get_organization(env_cfg.org_id).await {
+                match client.get_organization(env_cfg.org_id, None).await {
                     Ok(org) => println!("  auth:     ok (org '{}', id {})", org.name, org.id),
                     Err(e) => println!("  auth:     failed ({})", first_line(&format!("{e:#}"))),
                 }

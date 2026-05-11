@@ -1,21 +1,29 @@
 use super::common::{hash_for_lockfile, record_object, skip_on_permission_denied, PullCtx};
 use crate::config::EnvConfig;
+use crate::model::Workspace;
+use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use crate::snapshot::workspace::write_workspace;
 use anyhow::{Context, Result};
 use regex::Regex;
 use std::collections::HashSet;
+use std::sync::Arc;
 
-/// Pull workspaces from the env's remote that match the configured
-/// `workspace_filter` (an optional regex applied to `workspace.name`).
-/// When the filter is `None`, all workspaces are pulled.
-/// Each workspace is written as `envs/<env>/workspaces/<slug>/workspace.json`.
-/// Returns the number of workspaces pulled.
-pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig) -> Result<usize> {
-    let workspaces = skip_on_permission_denied(
-        ctx.client.list_workspaces().await.context("listing workspaces"),
+/// Phase 1: list all workspaces from the API.
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<Vec<Workspace>> {
+    skip_on_permission_denied(
+        ctx.client.list_workspaces(Some(progress.clone())).await.context("listing workspaces"),
         "workspaces",
-    )?;
+        progress,
+    )
+}
+
+/// Phase 2: filter and write listed workspaces to disk.
+/// When the env's `workspace_filter` is set, only matching workspaces are
+/// written; all others are ticked (counted) but not written.
+/// Returns the number of workspaces written.
+pub async fn process(ctx: &mut PullCtx<'_>, workspaces: Vec<Workspace>, env_cfg: &EnvConfig, progress: &Arc<OverallProgress>) -> Result<usize> {
+    progress.start_phase("workspaces");
 
     let filter = match &env_cfg.workspace_filter {
         Some(pat) => Some(
@@ -31,6 +39,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig) -> Result<usize> {
     for ws in &workspaces {
         if let Some(re) = &filter {
             if !re.is_match(&ws.name) {
+                progress.tick(&ws.name);
                 continue;
             }
         }
@@ -66,6 +75,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>, env_cfg: &EnvConfig) -> Result<usize> {
         );
 
         count += 1;
+        progress.tick(&ws.name);
     }
 
     Ok(count)

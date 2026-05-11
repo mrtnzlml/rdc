@@ -1217,6 +1217,132 @@ version = 1
     assert_eq!(v["url"], serde_json::json!("https://mock.rossum.app/api/v1/hooks/1"));
 }
 
+#[tokio::test]
+async fn pull_no_conflict_when_only_modified_at_differs() {
+    // Proves the noise-field suppression stack (Tasks 1-5): a re-pull where
+    // only `modified_at` changed must not emit a conflict and must leave the
+    // on-disk file byte-identical to the first pull (NoChange path).
+
+    let server = MockServer::start().await;
+
+    // Organization endpoint required for bootstrap.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // All non-label endpoints return empty results for both pulls.
+    let empty = serde_json::json!({ "pagination": { "next": null }, "results": [] });
+    for ep in [
+        "/api/v1/hooks", "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/rules", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty.clone()))
+            .mount(&server)
+            .await;
+    }
+
+    // First pull: label with initial modified_at.
+    let initial = serde_json::json!({
+        "pagination": { "next": null },
+        "results": [{
+            "id": 1,
+            "url": format!("{}/api/v1/labels/1", server.uri()),
+            "name": "audit-hold",
+            "organization": format!("{}/api/v1/organizations/1", server.uri()),
+            "modified_at": "2026-01-01T00:00:00Z"
+        }]
+    });
+    let _g = Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&initial))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert()
+        .success();
+
+    // Confirm first pull wrote the label file.
+    let label_path = project.path().join("envs/dev/labels/audit-hold.json");
+    assert!(label_path.exists(), "label file should exist after first pull");
+    let first_pull_content = std::fs::read_to_string(&label_path).unwrap();
+    assert!(
+        first_pull_content.contains("2026-01-01T00:00:00Z"),
+        "first pull content should have initial modified_at"
+    );
+
+    // Drop scoped mock — now the second pull sees a bumped modified_at.
+    drop(_g);
+
+    let bumped = serde_json::json!({
+        "pagination": { "next": null },
+        "results": [{
+            "id": 1,
+            "url": format!("{}/api/v1/labels/1", server.uri()),
+            "name": "audit-hold",
+            "organization": format!("{}/api/v1/organizations/1", server.uri()),
+            "modified_at": "2026-12-31T23:59:59Z"
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&bumped))
+        .mount(&server)
+        .await;
+
+    let out = Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "second pull should succeed. stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stderr.contains("conflict") && !stdout.contains("conflict"),
+        "expected no conflict on modified_at-only re-pull. stdout={stdout}\nstderr={stderr}"
+    );
+
+    // Disk-stability invariant: the local file retains first-pull bytes
+    // (NoChange path skips the write).
+    let on_disk = std::fs::read_to_string(&label_path).unwrap();
+    assert!(
+        on_disk.contains("2026-01-01T00:00:00Z"),
+        "on-disk file should retain first-pull modified_at (NoChange path). found: {on_disk}"
+    );
+}
+
 /// Round-trip — after overlay strip on pull, push re-applies the
 /// overlay so the PATCH body has the env-specific value. Verifies that
 /// `read_hook_value` + apply-overlay-then-deserialize handles a file
@@ -1298,5 +1424,85 @@ version = 1
         body["name"],
         serde_json::Value::String("Validator (PROD)".into()),
         "overlay re-applies name on push: {body}",
+    );
+}
+
+#[tokio::test]
+async fn pull_with_orphan_queue_surfaces_count_in_done_line() {
+    let server = MockServer::start().await;
+
+    // Organization endpoint required for bootstrap.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // All non-queue endpoints return empty results.
+    let empty = serde_json::json!({ "pagination": { "next": null }, "results": [] });
+    for ep in [
+        "/api/v1/hooks", "/api/v1/workspaces",
+        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty.clone()))
+            .mount(&server)
+            .await;
+    }
+
+    // One queue with workspace: null (orphan — no parent workspace known).
+    let queues_resp = serde_json::json!({
+        "pagination": { "next": null },
+        "results": [{
+            "id": 7,
+            "url": format!("{}/api/v1/queues/7", server.uri()),
+            "name": "orphan-q",
+            "workspace": null,
+            "schema": null
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&queues_resp))
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let out = Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "pull should succeed. stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // With the single-bar design, orphan counts accumulate globally and
+    // appear in the final pull summary line (stdout) rather than per-phase
+    // stderr lines.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("orphans skipped"),
+        "expected orphans-skipped count in pull summary. stdout was: {stdout}"
     );
 }

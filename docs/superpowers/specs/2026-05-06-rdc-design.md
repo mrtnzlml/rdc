@@ -376,7 +376,7 @@ Mapping is slug-to-slug, not ID-to-ID — slugs are stable across re-pulls; IDs 
 | Engine fields | `envs/<env>/engine-fields/<slug>.json` |
 | Workflows | `envs/<env>/workflows/<slug>.json` |
 | Workflow steps | `envs/<env>/workflow-steps/<slug>.json` |
-| Email templates | `envs/<env>/workspaces/<ws-slug>/queues/<q-slug>/email-templates/<slug>.json` (queue-scoped, M16) |
+| Email templates | `envs/<env>/workspaces/<ws-slug>/queues/<q-slug>/email-templates/<slug>.json` (queue-scoped) |
 | MDH dataset metadata | `envs/<env>/mdh/<dataset>/collection.json` |
 | MDH indexes (regular + Atlas Search) | `envs/<env>/mdh/<dataset>/indexes.json` |
 

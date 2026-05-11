@@ -2,13 +2,28 @@ use super::common::{
     apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
     skip_on_permission_denied, PullAction, PullCtx,
 };
+use crate::model::EmailTemplate;
+use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-/// Pull all email templates. Templates are queue-scoped in the live API
-/// (each carries a `queue` URL), so the snapshot nests them under the
-/// owning queue:
+/// Phase 1: list all email templates from the API.
+/// Note: the orphan-skipping logic (templates without a known queue_location)
+/// lives in `process`, where ctx.queue_locations is fully populated.
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<Vec<EmailTemplate>> {
+    skip_on_permission_denied(
+        ctx.client.list_email_templates(Some(progress.clone())).await.context("listing email templates"),
+        "email_templates",
+        progress,
+    )
+}
+
+/// Phase 2: write listed email templates to disk.
+///
+/// Templates are queue-scoped in the live API (each carries a `queue` URL),
+/// so the snapshot nests them under the owning queue:
 ///
 /// ```text
 /// envs/<env>/workspaces/<ws>/queues/<q>/email-templates/<slug>.json
@@ -18,12 +33,12 @@ use std::collections::{HashMap, HashSet};
 /// per-template slugs don't collide across queues (most queues carry the
 /// same five built-in templates).
 ///
+/// ctx.queue_locations must already be populated by queues::process before
+/// this is called.
+///
 /// Returns `(count, conflicts)`.
-pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
-    let templates = skip_on_permission_denied(
-        ctx.client.list_email_templates().await.context("listing email templates"),
-        "email_templates",
-    )?;
+pub async fn process(ctx: &mut PullCtx<'_>, templates: Vec<EmailTemplate>, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
+    progress.start_phase("email_templates");
 
     let mut per_queue_used_slugs: HashMap<(String, String), HashSet<String>> = HashMap::new();
     let mut count = 0usize;
@@ -33,19 +48,13 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
         let queue_url = match &t.queue {
             Some(u) => u,
             None => {
-                eprintln!(
-                    "warning: skipping email template '{}' (id {}) — no queue (org-wide template not supported by snapshot layout)",
-                    t.name, t.id
-                );
+                progress.skipped_orphan();
                 continue;
             }
         };
 
         let Some((ws_slug, q_slug)) = ctx.queue_locations.get(queue_url).cloned() else {
-            eprintln!(
-                "warning: skipping email template '{}' (id {}) — queue {} not in snapshot (orphan/filtered)",
-                t.name, t.id, queue_url
-            );
+            progress.skipped_orphan();
             continue;
         };
 
@@ -88,7 +97,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
         if action == PullAction::Conflict {
             conflicts += 1;
         }
-        let recorded_hash = apply_pull_action(action, &local_path, &proposed, remote_hash, ctx.interactive)?;
+        let recorded_hash = apply_pull_action(action, &local_path, &proposed, remote_hash, ctx.interactive, progress)?;
 
         record_object(
             ctx.lockfile,
@@ -100,6 +109,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
             Some(recorded_hash),
         );
         count += 1;
+        progress.tick(&t.name);
     }
 
     Ok((count, conflicts))

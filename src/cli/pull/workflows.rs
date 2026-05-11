@@ -1,14 +1,23 @@
 use super::common::{apply_pull_action, decide_pull_action, record_object, skip_on_permission_denied, PullAction, PullCtx};
+use crate::model::Workflow;
+use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
+use std::sync::Arc;
 
-/// Pull all workflows. Returns `(count, conflicts)`.
-pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
-    let workflows = skip_on_permission_denied(
-        ctx.client.list_workflows().await.context("listing workflows"),
+/// Phase 1: list all workflows from the API.
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<Vec<Workflow>> {
+    skip_on_permission_denied(
+        ctx.client.list_workflows(Some(progress.clone())).await.context("listing workflows"),
         "workflows",
-    )?;
+        progress,
+    )
+}
+
+/// Phase 2: write listed workflows to disk. Returns `(count, conflicts)`.
+pub async fn process(ctx: &mut PullCtx<'_>, workflows: Vec<Workflow>, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
+    progress.start_phase("workflows");
 
     let mut used: HashSet<String> = HashSet::new();
     let mut dir_created = false;
@@ -41,7 +50,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
         if action == PullAction::Conflict {
             conflicts += 1;
         }
-        let recorded_hash = apply_pull_action(action, &local_path, &proposed, remote_hash, ctx.interactive)?;
+        let recorded_hash = apply_pull_action(action, &local_path, &proposed, remote_hash, ctx.interactive, progress)?;
 
         record_object(
             ctx.lockfile,
@@ -52,6 +61,7 @@ pub async fn pull(ctx: &mut PullCtx<'_>) -> Result<(usize, usize)> {
             w.modified_at().map(|s| s.to_string()),
             Some(recorded_hash),
         );
+        progress.tick(&w.name);
     }
 
     Ok((workflows.len(), conflicts))

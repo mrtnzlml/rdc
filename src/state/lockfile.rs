@@ -137,10 +137,13 @@ impl Lockfile {
     }
 }
 
-/// Compute a stable SHA-256 over canonical JSON bytes. Hex-encoded.
+/// Compute a stable SHA-256 over canonical JSON bytes (with noise fields
+/// stripped). Falls back to raw-byte SHA-256 for inputs that aren't valid
+/// JSON. Hex-encoded output.
 pub fn content_hash(bytes: &[u8]) -> String {
+    let canonical = crate::snapshot::noise::canonicalize_for_hash(bytes);
     let mut hasher = Sha256::new();
-    hasher.update(bytes);
+    hasher.update(&canonical);
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(64);
     for b in digest {
@@ -165,8 +168,9 @@ pub fn content_hash(bytes: &[u8]) -> String {
 /// )
 /// ```
 pub fn schema_combined_hash(json_bytes: &[u8], formulas: &[(String, Vec<u8>)]) -> String {
+    let canonical = crate::snapshot::noise::canonicalize_for_hash(json_bytes);
     let mut hasher = Sha256::new();
-    hasher.update(json_bytes);
+    hasher.update(&canonical);
     for (field_id, bytes) in formulas {
         hasher.update([0u8]);
         let path = format!("formulas/{field_id}.py");
@@ -193,8 +197,9 @@ pub fn schema_combined_hash(json_bytes: &[u8], formulas: &[(String, Vec<u8>)]) -
 /// )
 /// ```
 pub fn hook_combined_hash(json_bytes: &[u8], code: &Option<String>) -> String {
+    let canonical = crate::snapshot::noise::canonicalize_for_hash(json_bytes);
     let mut hasher = Sha256::new();
-    hasher.update(json_bytes);
+    hasher.update(&canonical);
     if let Some(code) = code {
         hasher.update([0u8]);
         hasher.update(b"code");
@@ -359,6 +364,47 @@ mod tests {
         let h1 = hook_combined_hash(json, &Some("v1".to_string()));
         let h2 = hook_combined_hash(json, &Some("v2".to_string()));
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn content_hash_equal_when_only_modified_at_differs() {
+        let a = b"{\"name\":\"x\",\"modified_at\":\"2026-01-01\"}";
+        let b = b"{\"name\":\"x\",\"modified_at\":\"2026-12-31\"}";
+        assert_eq!(content_hash(a), content_hash(b));
+    }
+
+    #[test]
+    fn content_hash_differs_on_real_change() {
+        let a = b"{\"name\":\"x\",\"modified_at\":\"t\"}";
+        let b = b"{\"name\":\"y\",\"modified_at\":\"t\"}";
+        assert_ne!(content_hash(a), content_hash(b));
+    }
+
+    #[test]
+    fn content_hash_falls_back_for_non_json_bytes() {
+        let h1 = content_hash(b"hello world");
+        let h2 = content_hash(b"hello world");
+        assert_eq!(h1, h2);
+        assert_ne!(content_hash(b"hello world"), content_hash(b"goodbye"));
+    }
+
+    #[test]
+    fn hook_combined_hash_strips_modified_at_in_json_portion() {
+        let a = b"{\"name\":\"h\",\"modified_at\":\"t1\"}";
+        let b = b"{\"name\":\"h\",\"modified_at\":\"t2\"}";
+        let code = Some("def x(): pass".to_string());
+        assert_eq!(hook_combined_hash(a, &code), hook_combined_hash(b, &code));
+    }
+
+    #[test]
+    fn schema_combined_hash_strips_modified_at_in_json_portion() {
+        let a = b"{\"name\":\"s\",\"modified_at\":\"t1\"}";
+        let b = b"{\"name\":\"s\",\"modified_at\":\"t2\"}";
+        let formulas = vec![("42".to_string(), b"return 1\n".to_vec())];
+        assert_eq!(
+            schema_combined_hash(a, &formulas),
+            schema_combined_hash(b, &formulas)
+        );
     }
 
     #[test]
