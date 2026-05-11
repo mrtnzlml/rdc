@@ -49,7 +49,7 @@ struct PullStats {
     c_orgs: usize,
 }
 
-pub async fn run(env: &str, concurrency: usize, interactive: bool) -> Result<()> {
+pub async fn run(env: &str, interactive: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let paths = Paths::for_env(&cwd, env);
 
@@ -84,7 +84,6 @@ pub async fn run(env: &str, concurrency: usize, interactive: bool) -> Result<()>
             lockfile: &mut lockfile,
             queue_locations: std::collections::BTreeMap::new(),
             overlay,
-            concurrency,
             interactive,
         };
         run_drivers(&mut ctx, env_cfg, env, &token, &progress).await

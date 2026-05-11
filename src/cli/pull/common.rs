@@ -48,10 +48,6 @@ pub struct PullCtx<'a> {
     /// pre-overlay form so cross-env diffs and deploys are quiet (spec
     /// §9.3). `None` when the env has no `overlay.toml`.
     pub overlay: Option<crate::overlay::Overlay>,
-    /// Maximum parallel API calls used by drivers that fan out per-object
-    /// fetches (queues, mdh). Default 5 per spec §16; overridable via
-    /// `--concurrency` flag or `RDC_CONCURRENCY` env var.
-    pub concurrency: usize,
     /// When true, conflicts trigger an interactive [k]/[r]/[e]/[s]/[a]
     /// prompt (spec §8.3). False on non-TTY or when `--yes` was passed —
     /// in that case `apply_pull_action` falls back to the legacy
@@ -59,6 +55,12 @@ pub struct PullCtx<'a> {
     /// it to `apply_pull_action`.
     pub interactive: bool,
 }
+
+/// Bound for the per-item async fan-out in drivers that pipeline sub-fetches
+/// (queues fetching schema + inbox, mdh fetching indexes + search-indexes).
+/// Empirically saturates upstream — going higher doesn't help because
+/// `list_*` calls remain serial.
+pub const PULL_FANOUT: usize = 5;
 
 /// Compute the content hash of an object's serialized form. The pull drivers
 /// hash the JSON bytes they're about to write to disk so the lockfile records
