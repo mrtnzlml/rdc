@@ -60,8 +60,9 @@ on purpose, or the existing default is the one we'd recommend anyway.
   `rdc diff` shows unified diffs (local vs remote, or two snapshots);
   `rdc auth` sets/refreshes tokens; `rdc repair --rebuild-lock`
   recovers a corrupted lockfile.
-- **Distribution.** Single static binary via `curl | sh` (pre-built
-  for darwin x86_64/aarch64 + linux x86_64) or `cargo install`.
+- **Distribution.** Single binary via `curl | sh` (pre-built for
+  darwin x86_64/aarch64, linux x86_64, and windows x86_64) or `cargo
+  install`.
 - **AI-friendly snapshot.** `_index.md` includes a per-kind inventory
   plus a cross-references section that resolves `hook → queues`,
   `rule → queues`, and `email_template → queue` so AI agents can
@@ -94,16 +95,17 @@ prints a one-line `note: rdc vX is available — run \`rdc upgrade\` to install`
 at the top of the command. The check is best-effort: network errors,
 API rate-limits, or unreachable cluster all fail silently — the nudge
 just doesn't appear. Cache lives at `$XDG_CACHE_HOME/rdc/update.json`
-(fallback `~/.cache/rdc/update.json`).
+(fallback `~/.cache/rdc/update.json`) on Unix, or
+`%LOCALAPPDATA%\rdc\update.json` on Windows.
 
 **Install-location detection.** `rdc upgrade` only self-replaces when
 it's safe to do so:
 
 | Install method | `rdc upgrade` behavior |
 |---|---|
-| `install.sh` / manual binary in a writable dir | Self-replaces atomically; previous binary kept as `rdc.bak`. |
+| `install.sh` / manual binary in a writable dir | Self-replaces atomically; previous binary kept as `rdc.bak` (or `rdc.bak.exe` on Windows). |
 | `cargo install --git …` | Refuses — would break cargo's bookkeeping. Prints the right `cargo install --force` invocation instead. |
-| Read-only dir (`/usr/local/bin`, system package manager, etc.) | Refuses — prints the manual download URL + commands. |
+| Read-only dir (`/usr/local/bin`, system package manager, `C:\Program Files`, etc.) | Refuses — prints the manual download URL + commands. |
 
 **Self-replace is safe while rdc is running.** On Linux/macOS the
 kernel keeps the running binary's inode alive after its directory
@@ -111,6 +113,13 @@ entry is replaced, so the in-flight `rdc upgrade` process completes
 normally. The swap uses a copy-aside + atomic rename pattern so
 `<install_dir>/rdc` is always a valid binary — a parallel shell tab
 running `rdc` during the upgrade never sees a missing file.
+
+On Windows the OS allows renaming (but not overwriting or deleting) a
+running `.exe`, so the swap renames the current `rdc.exe` aside to
+`rdc.bak.exe` and places the new binary at the original path. The
+in-flight upgrade completes from the renamed file; new invocations
+pick up the new binary. If the placement step fails the rename is
+rolled back so the user never ends up without a working `rdc`.
 
 ## Compatibility
 
@@ -173,6 +182,18 @@ To install a specific version:
 curl -fsSL https://raw.githubusercontent.com/mrtnzlml/rossum-deployment-manager-experiment/main/install.sh | sh -s -- v0.0.1
 ```
 
+Windows (PowerShell):
+
+```powershell
+# Adjust $dest if you prefer somewhere other than %USERPROFILE%\.rdc\bin.
+$dest = "$env:USERPROFILE\.rdc\bin"
+New-Item -ItemType Directory -Force -Path $dest | Out-Null
+Invoke-WebRequest -Uri "https://github.com/mrtnzlml/rossum-deployment-manager-experiment/releases/latest/download/rdc-x86_64-pc-windows-msvc.tar.gz" -OutFile "$env:TEMP\rdc.tar.gz"
+tar -xzf "$env:TEMP\rdc.tar.gz" -C $dest
+# Add $dest to your PATH (one-time):
+[Environment]::SetEnvironmentVariable("Path", "$env:Path;$dest", "User")
+```
+
 Or build from source with Rust:
 
 ```sh
@@ -182,8 +203,8 @@ cargo install --path .
 ```
 
 **Supported pre-built platforms:** macOS (Intel + Apple Silicon),
-Linux x86_64. For Linux aarch64, Windows, or other platforms, build
-from source.
+Linux x86_64, Windows x86_64. For Linux aarch64, Windows aarch64, or
+other platforms, build from source.
 
 ## Quick start
 

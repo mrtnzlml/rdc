@@ -144,32 +144,43 @@ pub fn classify_install() -> Result<InstallLocation> {
 }
 
 fn is_under_cargo_bin(path: &Path) -> bool {
-    // CARGO_HOME first, then fall back to ~/.cargo.
+    // CARGO_HOME first, then fall back to <home>/.cargo. `home_dir`
+    // honours HOME on Unix and USERPROFILE on Windows.
     let cargo_home = std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| {
-                let mut p = PathBuf::from(h);
-                p.push(".cargo");
-                p
-            })
-        });
+        .or_else(|| home_dir().map(|h| h.join(".cargo")));
     let Some(cargo_home) = cargo_home else { return false };
-    let cargo_bin = cargo_home.join("bin");
-    path.starts_with(&cargo_bin)
+    path.starts_with(cargo_home.join("bin"))
+}
+
+/// User home directory: `$HOME` on Unix, `%USERPROFILE%` on Windows
+/// (falls back to `$HOME` first on both — some Windows shells set it).
+fn home_dir() -> Option<PathBuf> {
+    if let Some(h) = std::env::var_os("HOME") {
+        return Some(PathBuf::from(h));
+    }
+    #[cfg(windows)]
+    {
+        if let Some(h) = std::env::var_os("USERPROFILE") {
+            return Some(PathBuf::from(h));
+        }
+    }
+    None
 }
 
 fn is_writable_in_place(path: &Path) -> bool {
     // The check that actually matters is "can we replace this file?" —
     // which on Unix means "can we write into its parent directory?"
     // because rename(parent/tmp, parent/exe) requires the parent
-    // writable, not the file itself.
+    // writable, not the file itself. We probe by creating and deleting
+    // a tiny test file. This is more reliable than reading permission
+    // bits, especially on Windows where `C:\Program Files` is not
+    // marked read-only but requires admin to write to.
     let Some(parent) = path.parent() else { return false };
-    let meta = match std::fs::metadata(parent) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-    !meta.permissions().readonly()
+    let probe = parent.join(format!(".rdc.write_test.{}", std::process::id()));
+    let ok = std::fs::write(&probe, b"").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    ok
 }
 
 /// Asset name for the current platform, matching what the release
@@ -178,6 +189,7 @@ pub fn platform_asset_name() -> Result<String> {
     let os = match std::env::consts::OS {
         "macos" => "apple-darwin",
         "linux" => "unknown-linux-gnu",
+        "windows" => "pc-windows-msvc",
         other => anyhow::bail!("unsupported OS '{other}' — build from source instead"),
     };
     let arch = match std::env::consts::ARCH {
@@ -188,7 +200,20 @@ pub fn platform_asset_name() -> Result<String> {
     if os == "unknown-linux-gnu" && arch == "aarch64" {
         anyhow::bail!("linux aarch64 isn't pre-built; build from source instead");
     }
+    if os == "pc-windows-msvc" && arch == "aarch64" {
+        anyhow::bail!("windows aarch64 isn't pre-built; build from source instead");
+    }
     Ok(format!("rdc-{arch}-{os}.tar.gz"))
+}
+
+/// Filename of the rdc binary on the current platform.
+fn binary_filename() -> &'static str {
+    if cfg!(windows) { "rdc.exe" } else { "rdc" }
+}
+
+/// Filename of the rollback copy left next to the installed binary.
+fn backup_filename() -> &'static str {
+    if cfg!(windows) { "rdc.bak.exe" } else { "rdc.bak" }
 }
 
 /// Minimal subset of the GitHub Releases JSON.
@@ -232,19 +257,20 @@ fn asset_download_url(version: &Version, asset: &str) -> String {
     format!("https://github.com/{REPO}/releases/download/v{version}/{asset}")
 }
 
-/// Cache file location: `$XDG_CACHE_HOME/rdc/update.json` if set,
-/// `$HOME/.cache/rdc/update.json` otherwise. Returns None if we can't
-/// figure out a home directory.
+/// Cache file location. On Unix: `$XDG_CACHE_HOME/rdc/update.json`,
+/// falling back to `$HOME/.cache/rdc/update.json`. On Windows:
+/// `%LOCALAPPDATA%\rdc\update.json`, falling back to
+/// `%USERPROFILE%\AppData\Local\rdc\update.json`. Returns None if we
+/// can't locate a usable base directory.
 fn cache_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|h| h.join("AppData").join("Local")))?;
+    #[cfg(not(windows))]
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| {
-                let mut p = PathBuf::from(h);
-                p.push(".cache");
-                p
-            })
-        })?;
+        .or_else(|| home_dir().map(|h| h.join(".cache")))?;
     Some(base.join("rdc").join("update.json"))
 }
 
@@ -368,14 +394,26 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
         }
         InstallLocation::Unknown(path) => {
             let asset = platform_asset_name().unwrap_or_else(|_| "<your-platform>.tar.gz".into());
+            let url = asset_download_url(&latest, &asset);
+            let bin = binary_filename();
+            #[cfg(windows)]
+            eprintln!(
+                "rdc binary at {} is not in a writable directory.\n\
+                 To upgrade manually (PowerShell):\n\n  \
+                 Invoke-WebRequest -Uri \"{url}\" -OutFile \"$env:TEMP\\{asset}\"\n  \
+                 tar -xzf \"$env:TEMP\\{asset}\" -C \"$env:TEMP\"\n  \
+                 Move-Item -Force \"$env:TEMP\\{bin}\" \"{}\"\n",
+                path.display(),
+                path.display(),
+            );
+            #[cfg(not(windows))]
             eprintln!(
                 "rdc binary at {} is not in a writable directory.\n\
                  To upgrade manually:\n\n  \
-                 curl -fsSL {} -o /tmp/{asset}\n  \
+                 curl -fsSL {url} -o /tmp/{asset}\n  \
                  tar xzf /tmp/{asset} -C /tmp\n  \
-                 mv /tmp/rdc {}\n",
+                 mv /tmp/{bin} {}\n",
                 path.display(),
-                asset_download_url(&latest, &asset),
                 path.display(),
             );
             anyhow::bail!("install location not writable");
@@ -402,9 +440,12 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
     extract_rdc_binary(bytes.as_ref(), tmp.path())
         .context("extracting rdc from tarball")?;
 
-    let staged = tmp.path().join("rdc");
+    let staged = tmp.path().join(binary_filename());
     if !staged.exists() {
-        anyhow::bail!("tarball did not contain an 'rdc' binary at the root");
+        anyhow::bail!(
+            "tarball did not contain a '{}' binary at the root",
+            binary_filename()
+        );
     }
 
     // Pre-flight: run the staged binary's --version and confirm it
@@ -434,27 +475,38 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
         );
     }
 
-    // Self-replace pattern (Unix-only; Windows isn't a supported target):
+    // Self-replace pattern. Two cases:
     //
-    // The atomic rename(staged, target) below is correct only when both
-    // paths are on the same filesystem. The staged binary lives under
+    // Unix: rename(staged, target) is atomic only when both paths sit
+    // on the same filesystem. The staged binary lives under
     // tempfile::tempdir() which is often /tmp — a different fs from the
     // install dir. So we first COPY the staged binary into a sibling of
     // target (same dir → same fs), then atomically rename it over
     // target. The kernel keeps the old binary's inode alive for the
     // running process, so this self-update completes without breaking
-    // the in-flight upgrade.
+    // the in-flight upgrade. We use COPY (not rename) for the backup so
+    // target_path is never absent from the directory — a parallel shell
+    // that runs `rdc` during the upgrade always sees a valid binary.
     //
-    // We also use COPY (not rename) for the backup so target_path is
-    // never absent from the directory — a parallel shell that runs
-    // `rdc` during the upgrade always sees a valid binary, either the
-    // old one (before swap) or the new one (after).
+    // Windows: a running .exe cannot be overwritten or deleted, but it
+    // CAN be renamed. So we stage into a sibling, rename target →
+    // backup (which the OS allows even though target is the running
+    // process), then rename staging → target. If the second rename
+    // fails we restore the backup. The running rdc keeps executing
+    // because Windows tracks the open handle by id, not path.
     let target_dir = target_path.parent().ok_or_else(|| {
         anyhow!("target path {} has no parent directory", target_path.display())
     })?;
 
-    // 1. Stage the new binary in the target's directory.
-    let staging_path = target_dir.join(format!(".rdc.new.{}", std::process::id()));
+    // 1. Stage the new binary in the target's directory. Windows needs
+    //    the `.exe` extension on the staging path so the pre-flight
+    //    Command::new()/rename behave correctly.
+    let staging_name = if cfg!(windows) {
+        format!(".rdc.new.{}.exe", std::process::id())
+    } else {
+        format!(".rdc.new.{}", std::process::id())
+    };
+    let staging_path = target_dir.join(staging_name);
     std::fs::copy(&staged, &staging_path).with_context(|| {
         format!(
             "staging new binary at {} (from {})",
@@ -474,34 +526,61 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
             .with_context(|| format!("chmod {}", staging_path.display()))?;
     }
 
-    // 2. Copy the current binary aside as a backup BEFORE the swap.
-    //    Target stays in place — this is just a sibling duplicate.
-    let backup_path = target_path.with_file_name("rdc.bak");
+    let backup_path = target_path.with_file_name(backup_filename());
     let _ = std::fs::remove_file(&backup_path); // overwrite previous backup
-    if let Err(e) = std::fs::copy(&target_path, &backup_path) {
-        let _ = std::fs::remove_file(&staging_path);
-        return Err(anyhow::Error::new(e)).with_context(|| {
-            format!(
-                "backing up {} to {}",
-                target_path.display(),
-                backup_path.display()
-            )
-        });
+
+    #[cfg(not(windows))]
+    {
+        // Unix path: copy aside, then atomic rename.
+        if let Err(e) = std::fs::copy(&target_path, &backup_path) {
+            let _ = std::fs::remove_file(&staging_path);
+            return Err(anyhow::Error::new(e)).with_context(|| {
+                format!(
+                    "backing up {} to {}",
+                    target_path.display(),
+                    backup_path.display()
+                )
+            });
+        }
+        if let Err(e) = std::fs::rename(&staging_path, &target_path) {
+            let _ = std::fs::remove_file(&staging_path);
+            // The backup is still good; target_path is still the old binary.
+            return Err(anyhow::Error::new(e)).with_context(|| {
+                format!(
+                    "swapping in new binary at {} (target unchanged; backup at {})",
+                    target_path.display(),
+                    backup_path.display()
+                )
+            });
+        }
     }
 
-    // 3. Atomic swap: rename(staging, target) replaces target's
-    //    directory entry. Old inode stays alive for the running rdc;
-    //    every subsequent `rdc` invocation gets the new binary.
-    if let Err(e) = std::fs::rename(&staging_path, &target_path) {
-        let _ = std::fs::remove_file(&staging_path);
-        // The backup is still good; target_path is still the old binary.
-        return Err(anyhow::Error::new(e)).with_context(|| {
-            format!(
-                "swapping in new binary at {} (target unchanged; backup at {})",
-                target_path.display(),
-                backup_path.display()
-            )
-        });
+    #[cfg(windows)]
+    {
+        // Windows path: rename aside (allowed for a running .exe), then
+        // place the staged binary at the original path. Roll back on
+        // failure so the user never ends up without a working `rdc`.
+        if let Err(e) = std::fs::rename(&target_path, &backup_path) {
+            let _ = std::fs::remove_file(&staging_path);
+            return Err(anyhow::Error::new(e)).with_context(|| {
+                format!(
+                    "renaming current binary {} → {} (no changes applied)",
+                    target_path.display(),
+                    backup_path.display()
+                )
+            });
+        }
+        if let Err(e) = std::fs::rename(&staging_path, &target_path) {
+            // Rollback: put the original back where it was.
+            let _ = std::fs::rename(&backup_path, &target_path);
+            let _ = std::fs::remove_file(&staging_path);
+            return Err(anyhow::Error::new(e)).with_context(|| {
+                format!(
+                    "placing new binary at {} (rolled back to previous)",
+                    target_path.display(),
+                )
+            });
+        }
     }
 
     // Refresh the nudge cache so we don't keep telling the user about
@@ -518,13 +597,15 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
     Ok(())
 }
 
-/// Walk a `.tar.gz` byte slice and extract `rdc` to `dest_dir`.
+/// Walk a `.tar.gz` byte slice and extract the rdc binary to `dest_dir`.
 /// The tarball produced by `.github/workflows/release.yaml` has the
-/// binary at the root; we accept any entry named `rdc` regardless of
-/// path prefix for robustness.
+/// binary at the root; we accept any entry whose file name matches
+/// the platform-appropriate binary (`rdc` on Unix, `rdc.exe` on
+/// Windows) regardless of path prefix.
 fn extract_rdc_binary(gz_bytes: &[u8], dest_dir: &Path) -> Result<()> {
     let gz = flate2::read::GzDecoder::new(gz_bytes);
     let mut archive = tar::Archive::new(gz);
+    let expected = binary_filename();
     for entry in archive.entries().context("reading tarball entries")? {
         let mut entry = entry.context("reading tarball entry")?;
         let entry_path = entry.path().context("reading tarball entry path")?.into_owned();
@@ -532,15 +613,15 @@ fn extract_rdc_binary(gz_bytes: &[u8], dest_dir: &Path) -> Result<()> {
             Some(n) => n.to_owned(),
             None => continue,
         };
-        if file_name == "rdc" {
-            let dest = dest_dir.join("rdc");
+        if file_name == expected {
+            let dest = dest_dir.join(expected);
             entry
                 .unpack(&dest)
-                .with_context(|| format!("unpacking rdc to {}", dest.display()))?;
+                .with_context(|| format!("unpacking {expected} to {}", dest.display()))?;
             return Ok(());
         }
     }
-    anyhow::bail!("no 'rdc' binary inside tarball")
+    anyhow::bail!("no '{expected}' binary inside tarball")
 }
 
 #[cfg(test)]
@@ -598,10 +679,32 @@ mod tests {
 
     #[test]
     fn cargo_bin_detection_matches_expected_prefix() {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        let home = home_dir().expect("test requires HOME or USERPROFILE");
         let p = home.join(".cargo").join("bin").join("rdc");
         assert!(is_under_cargo_bin(&p));
         let p2 = home.join(".local").join("bin").join("rdc");
         assert!(!is_under_cargo_bin(&p2));
+    }
+
+    #[test]
+    fn binary_filename_matches_platform() {
+        if cfg!(windows) {
+            assert_eq!(binary_filename(), "rdc.exe");
+            assert_eq!(backup_filename(), "rdc.bak.exe");
+        } else {
+            assert_eq!(binary_filename(), "rdc");
+            assert_eq!(backup_filename(), "rdc.bak");
+        }
+    }
+
+    #[test]
+    fn platform_asset_name_windows_format() {
+        // Just check the format hasn't regressed for current platform.
+        if let Ok(name) = platform_asset_name() {
+            assert!(name.ends_with(".tar.gz"));
+            if cfg!(target_os = "windows") {
+                assert!(name.contains("pc-windows-msvc"));
+            }
+        }
     }
 }

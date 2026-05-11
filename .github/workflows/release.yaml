@@ -22,6 +22,8 @@ jobs:
             os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -46,7 +48,10 @@ jobs:
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../rdc-${{ matrix.target }}.tar.gz rdc
+          # Pick `rdc.exe` on Windows, `rdc` otherwise.
+          binary=rdc
+          [ -f rdc.exe ] && binary=rdc.exe
+          tar czf ../../../rdc-${{ matrix.target }}.tar.gz "$binary"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
