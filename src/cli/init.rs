@@ -31,6 +31,7 @@ pub async fn run(name: Option<String>, env_specs: Vec<String>) -> Result<()> {
     cfg.save(&cfg_path)?;
 
     write_gitignore(&cwd)?;
+    write_claude_md(&cwd)?;
     std::fs::create_dir_all(cwd.join("secrets"))
         .with_context(|| format!("creating {}", cwd.join("secrets").display()))?;
     for env in envs.keys() {
@@ -162,3 +163,130 @@ fn write_gitignore(root: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+/// Write an agent guide at `<root>/CLAUDE.md`. Unlike `_index.md`, this
+/// is a once-only file — `rdc init` creates it, but pull/push never
+/// overwrite it. Existing files (e.g. when re-running init on an
+/// already-bootstrapped repo, or when the user has hand-edited the
+/// guide) are left untouched.
+fn write_claude_md(root: &Path) -> Result<()> {
+    let path = root.join("CLAUDE.md");
+    if path.exists() {
+        return Ok(());
+    }
+    write_atomic(&path, CLAUDE_MD_TEMPLATE.as_bytes())?;
+    Ok(())
+}
+
+const CLAUDE_MD_TEMPLATE: &str = r#"# Agent guide
+
+This project is managed with **rdc** (Rossum Deployment as Code). It
+snapshots a Rossum.ai tenant's configuration (hooks, queues, schemas,
+…) as plain files so they can be reviewed, edited, and deployed like
+code.
+
+## Where to look first
+
+- **`envs/<env>/_index.md`** — inventory of every object in `<env>`
+  with its on-disk path, human name, type-specific signals, and the
+  related objects it points at (or that point at it). Start here when
+  you need to find something or understand the shape of an env.
+  Regenerated on every `rdc pull` / `rdc push` — never hand-edit.
+- **`rdc.toml`** — project name and per-env API base URL + org id.
+
+## Repo layout
+
+```
+rdc.toml                                  project + env definitions
+secrets/<env>.secrets.json                API tokens (gitignored)
+envs/<env>/
+  _index.md                               auto-regenerated; do not edit
+  organization.json
+  overlay.toml                            optional per-env field overrides
+  workspaces/<ws>/
+    workspace.json
+    queues/<q>/
+      queue.json
+      schema.json
+      formulas/<field_id>.py              extracted from schema content
+      inbox.json
+      email-templates/<slug>.json
+  hooks/<slug>.json                       + sibling <slug>.py for function hooks
+  rules/<slug>.json
+  labels/<slug>.json
+  engines/<slug>.json
+  engine-fields/<slug>.json
+  workflows/<slug>.json
+  workflow-steps/<slug>.json
+  mdh/<dataset>/                          Master Data Hub (if enabled)
+.rdc/
+  state/<env>.lock.json                   slug↔id + base hashes; never edit
+  map/<src>→<tgt>.toml                    cross-env slug mappings
+```
+
+## Editing recipes
+
+| To change… | Edit | Then run |
+|---|---|---|
+| Hook code | `envs/<env>/hooks/<slug>.py` | `rdc push <env>` |
+| Hook config (events, queues, name) | `envs/<env>/hooks/<slug>.json` | `rdc push <env>` |
+| Schema fields | `envs/<env>/workspaces/<ws>/queues/<q>/schema.json` | `rdc push <env>` |
+| A formula | `envs/<env>/workspaces/<ws>/queues/<q>/formulas/<field>.py` | `rdc push <env>` |
+| Queue settings | `envs/<env>/workspaces/<ws>/queues/<q>/queue.json` | `rdc push <env>` |
+| Rule logic | `envs/<env>/rules/<slug>.json` | `rdc push <env>` |
+| Label name / colour | `envs/<env>/labels/<slug>.json` | `rdc push <env>` |
+| Email template | `envs/<env>/workspaces/<ws>/queues/<q>/email-templates/<slug>.json` | `rdc push <env>` |
+| Per-env override only | `envs/<env>/overlay.toml` | `rdc push <env>` |
+
+## Adding a new object
+
+Create the JSON (and `.py` if the kind has executable code) under the
+right directory. `rdc push <env>` detects files with no lockfile entry,
+POSTs them, and writes the server-assigned `id` / `url` back into the
+local file. Cross-references must use URLs already known to the
+lockfile (e.g. a new hook's `queues` field must point at queues that
+already exist on the remote).
+
+## Common commands
+
+- `rdc pull <env>` — fetch remote into local snapshot
+- `rdc push <env>` — push local edits back; creates new objects too
+- `rdc diff <env>` — local-vs-remote diff (no writes)
+- `rdc diff <a> <b>` — diff two local snapshots
+- `rdc status [<env>]` — auth + lockfile health
+- `rdc map <env>` — realign stale slugs after a remote rename
+- `rdc map <src> <tgt>` — auto-match for cross-env deploys
+- `rdc plan --from <src> --to <tgt>` — preview a deploy
+- `rdc apply --from <src> --to <tgt>` — execute a deploy
+- `rdc repair --rebuild-lock <env>` — recover a corrupted lockfile
+
+## Conflicts & drift
+
+A three-way merge (local · base · remote) runs on every pull. When
+both sides have diverged, `rdc pull` prompts an inline resolver:
+`[k]eep local · [r]emote · [e]dit · [s]kip · [a]bort`. In non-TTY
+(CI / `--yes`) mode, conflicts produce a `<file>.remote` shadow and
+keep the local on disk.
+
+`rdc push` runs the same drift check before each PATCH. The prompt is
+`[k]` (force-push), `[r]` (adopt remote), `[s]` (skip), `[a]` (abort).
+
+## Cross-env deploys (e.g. dev → prod)
+
+1. `rdc pull dev` and `rdc pull prod` so both lockfiles are populated.
+2. `rdc map dev prod` — auto-matches by slug, writes
+   `.rdc/map/dev→prod.toml`.
+3. Hand-edit the mapping for renames or skips.
+4. `rdc plan --from dev --to prod` — shows what will change without
+   PATCHing.
+5. `rdc apply --from dev --to prod` — executes. Per-env values stay in
+   each env's `overlay.toml`.
+
+## What NOT to edit
+
+- `_index.md` (auto-regenerated by every pull/push)
+- `.rdc/state/<env>.lock.json` (slug↔id and base hashes; rdc owns this)
+- `*.remote` files (shadow files from conflict resolution; either
+  consume the changes or delete the file)
+- Contents of `secrets/` (gitignored API tokens)
+"#;

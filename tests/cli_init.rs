@@ -30,6 +30,36 @@ fn init_creates_expected_files() {
     let gitignore = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
     assert!(gitignore.contains("/secrets"));
     assert!(gitignore.contains("/.rdc/cache"));
+
+    // CLAUDE.md agent guide is created at project root.
+    let claude_md = dir.path().join("CLAUDE.md");
+    assert!(claude_md.exists(), "CLAUDE.md should be created on init");
+    let body = std::fs::read_to_string(&claude_md).unwrap();
+    assert!(body.contains("# Agent guide"));
+    assert!(body.contains("`envs/<env>/_index.md`"));
+    assert!(body.contains("rdc push"));
+    assert!(body.contains("Conflicts & drift"));
+}
+
+#[test]
+fn init_does_not_clobber_existing_claude_md() {
+    let dir = TempDir::new().unwrap();
+    let user_content = "# My own notes\n\nKeep this!\n";
+    std::fs::write(dir.path().join("CLAUDE.md"), user_content).unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--name", "demo",
+            "--env", "dev=https://example.rossum.app/api/v1:285704",
+        ])
+        .assert()
+        .success();
+
+    let after = std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
+    assert_eq!(after, user_content, "init must not overwrite a pre-existing CLAUDE.md");
 }
 
 #[test]
