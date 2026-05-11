@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -10,10 +10,15 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating parent dir {}", parent.display()))?;
     }
-    let tmp = path.with_extension(format!(
-        "{}.tmp",
-        path.extension().and_then(|s| s.to_str()).unwrap_or("")
-    ));
+    // Sibling temp file: append ".tmp" to the full file name (not the
+    // extension). Works for "foo.json" → "foo.json.tmp" and for an
+    // extensionless "foo" → "foo.tmp".
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("path {} has no file name", path.display()))?;
+    let mut tmp_name = file_name.to_owned();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
     {
         let mut f = fs::File::create(&tmp)
             .with_context(|| format!("creating temp file {}", tmp.display()))?;
@@ -59,5 +64,18 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(entries, vec!["y.txt"]);
+    }
+
+    #[test]
+    fn extensionless_path_writes_cleanly() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rdc");
+        write_atomic(&path, b"binary-like").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"binary-like");
+        let entries: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(entries, vec!["rdc"]);
     }
 }

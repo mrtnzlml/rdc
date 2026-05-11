@@ -370,16 +370,36 @@ pub enum ColorMode {
     Color,
 }
 
+/// Process-wide override for the `--no-color` CLI flag. Set once at
+/// `rdc` startup by `cli::run`; read by `detect_color_mode`. Using an
+/// atomic instead of threading the flag through every PullCtx /
+/// PushDriftOutcome / Apply call site — the flag is set exactly once
+/// and never changes during a run.
+static NO_COLOR_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record the `--no-color` flag value from the CLI parser.
+pub fn set_no_color_flag(no_color: bool) {
+    NO_COLOR_FLAG.store(no_color, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Decide the color mode at runtime. `--no-color` flag has highest priority,
 /// then NO_COLOR env var, then stderr TTY detection.
 pub fn detect_color_mode(no_color_flag: bool) -> ColorMode {
-    if no_color_flag {
+    decide_color_mode(
+        no_color_flag || NO_COLOR_FLAG.load(std::sync::atomic::Ordering::Relaxed),
+        std::env::var_os("NO_COLOR").is_some(),
+        std::io::stderr().is_terminal(),
+    )
+}
+
+/// Pure form for testing: returns the color mode given the three inputs
+/// directly. The wrapping `detect_color_mode` plumbs in the live env +
+/// TTY readings.
+fn decide_color_mode(no_color: bool, no_color_env: bool, is_tty: bool) -> ColorMode {
+    if no_color || no_color_env {
         return ColorMode::Plain;
     }
-    if std::env::var_os("NO_COLOR").is_some() {
-        return ColorMode::Plain;
-    }
-    if std::io::stderr().is_terminal() {
+    if is_tty {
         ColorMode::Color
     } else {
         ColorMode::Plain
@@ -683,24 +703,25 @@ mod tests {
     }
 
     #[test]
-    fn detect_color_mode_no_color_env_returns_plain() {
-        let prev = std::env::var("NO_COLOR").ok();
-        std::env::set_var("NO_COLOR", "1");
-        assert!(matches!(detect_color_mode(false), ColorMode::Plain));
-        match prev {
-            Some(v) => std::env::set_var("NO_COLOR", v),
-            None => std::env::remove_var("NO_COLOR"),
-        }
+    fn decide_color_mode_no_color_env_returns_plain() {
+        assert!(matches!(decide_color_mode(false, true, true), ColorMode::Plain));
+        assert!(matches!(decide_color_mode(false, true, false), ColorMode::Plain));
     }
 
     #[test]
-    fn detect_color_mode_no_color_flag_returns_plain() {
-        let prev = std::env::var("NO_COLOR").ok();
-        std::env::remove_var("NO_COLOR");
-        assert!(matches!(detect_color_mode(true), ColorMode::Plain));
-        if let Some(v) = prev {
-            std::env::set_var("NO_COLOR", v);
-        }
+    fn decide_color_mode_no_color_flag_returns_plain() {
+        assert!(matches!(decide_color_mode(true, false, true), ColorMode::Plain));
+        assert!(matches!(decide_color_mode(true, false, false), ColorMode::Plain));
+    }
+
+    #[test]
+    fn decide_color_mode_tty_with_no_overrides_returns_color() {
+        assert!(matches!(decide_color_mode(false, false, true), ColorMode::Color));
+    }
+
+    #[test]
+    fn decide_color_mode_no_tty_returns_plain() {
+        assert!(matches!(decide_color_mode(false, false, false), ColorMode::Plain));
     }
 
     #[test]

@@ -154,10 +154,15 @@ pub fn content_hash(bytes: &[u8]) -> String {
     let canonical = crate::snapshot::noise::canonicalize_for_hash(bytes);
     let mut hasher = Sha256::new();
     hasher.update(&canonical);
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(64);
+    to_hex(&hasher.finalize())
+}
+
+/// Hex-encode a digest as a 64-char lowercase string. Used by every
+/// `*_hash` function to format its SHA-256 output.
+fn to_hex(digest: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut hex = String::with_capacity(digest.len() * 2);
     for b in digest {
-        use std::fmt::Write;
         write!(&mut hex, "{:02x}", b).expect("writing to String cannot fail");
     }
     hex
@@ -188,13 +193,7 @@ pub fn schema_combined_hash(json_bytes: &[u8], formulas: &[(String, Vec<u8>)]) -
         hasher.update([0u8]);
         hasher.update(bytes);
     }
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(64);
-    for b in digest {
-        use std::fmt::Write;
-        write!(&mut hex, "{:02x}", b).expect("writing to String cannot fail");
-    }
-    hex
+    to_hex(&hasher.finalize())
 }
 
 /// Compute the combined hash for a hook: the post-extraction `<slug>.json`
@@ -222,13 +221,7 @@ pub fn hook_combined_hash(json_bytes: &[u8], code: &Option<String>) -> String {
         hasher.update([0u8]);
         hasher.update(code.as_bytes());
     }
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(64);
-    for b in digest {
-        use std::fmt::Write;
-        write!(&mut hex, "{:02x}", b).expect("writing to String cannot fail");
-    }
-    hex
+    to_hex(&hasher.finalize())
 }
 
 #[cfg(test)]

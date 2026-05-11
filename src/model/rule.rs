@@ -18,7 +18,7 @@ pub struct Rule {
 
 impl Rule {
     pub fn modified_at(&self) -> Option<&str> {
-        self.extra.get("modified_at").and_then(|v| v.as_str())
+        crate::model::modified_at(&self.extra)
     }
 }
 

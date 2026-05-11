@@ -23,6 +23,7 @@
 //!   `.send()`. Reqwest's own connect retry is not exposed; if needed in
 //!   the future, layer it on the `build()` closure side.
 
+use crate::progress::ProgressHandle;
 use anyhow::{Context, Result};
 use reqwest::{Response, StatusCode};
 use std::time::Duration;
@@ -40,34 +41,37 @@ const MAX_SLEEP_SECS: u64 = 60;
 pub async fn send_with_retry(
     mut build: impl FnMut() -> reqwest::RequestBuilder,
     desc: &str,
-    progress: Option<std::sync::Arc<crate::progress::OverallProgress>>,
+    progress: ProgressHandle,
 ) -> Result<Response> {
-    for attempt in 0..MAX_ATTEMPTS {
+    // Retries up to MAX_ATTEMPTS - 1 times; the final pass falls through
+    // to the post-loop send so the function always returns from one
+    // explicit `send()` call.
+    for attempt in 0..MAX_ATTEMPTS - 1 {
         let resp = build()
             .send()
             .await
             .with_context(|| format!("{desc} (attempt {})", attempt + 1))?;
-        if let Some(reason) = retriable_reason(resp.status()) {
-            if attempt < MAX_ATTEMPTS - 1 {
-                let wait = retry_after(&resp).unwrap_or_else(|| backoff(attempt));
-                let msg = format!(
-                    "{reason} ({}) on {desc}; retrying in {}s (attempt {}/{})",
-                    resp.status().as_u16(),
-                    wait.as_secs(),
-                    attempt + 1,
-                    MAX_ATTEMPTS,
-                );
-                match &progress {
-                    Some(p) => p.println(&msg),
-                    None => eprintln!("{msg}"),
-                }
-                tokio::time::sleep(wait).await;
-                continue;
-            }
+        let Some(reason) = retriable_reason(resp.status()) else {
+            return Ok(resp);
+        };
+        let wait = retry_after(&resp).unwrap_or_else(|| backoff(attempt));
+        let msg = format!(
+            "{reason} ({}) on {desc}; retrying in {}s (attempt {}/{})",
+            resp.status().as_u16(),
+            wait.as_secs(),
+            attempt + 1,
+            MAX_ATTEMPTS,
+        );
+        match &progress {
+            Some(p) => p.println(&msg),
+            None => eprintln!("{msg}"),
         }
-        return Ok(resp);
+        tokio::time::sleep(wait).await;
     }
-    unreachable!("loop exits via return on the last attempt")
+    build()
+        .send()
+        .await
+        .with_context(|| format!("{desc} (attempt {})", MAX_ATTEMPTS))
 }
 
 /// Returns the human-readable reason a status is retriable, or None if not.

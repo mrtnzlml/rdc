@@ -10,8 +10,19 @@ use std::path::Path;
 ///
 /// Returns an actionable error if neither source is present.
 pub fn resolve_token(project_root: &Path, env: &str) -> Result<String> {
+    resolve_token_from(project_root, env, |k| std::env::var(k).ok())
+}
+
+/// Inner form with an injectable env-getter. Lets tests cover the env-var
+/// branch without mutating the process-wide environment, which is unsound
+/// to do concurrently with other tests reading env vars.
+fn resolve_token_from<F: Fn(&str) -> Option<String>>(
+    project_root: &Path,
+    env: &str,
+    get_env: F,
+) -> Result<String> {
     let env_var = format!("RDC_TOKEN_{}", env.to_uppercase());
-    if let Ok(t) = std::env::var(&env_var) {
+    if let Some(t) = get_env(&env_var) {
         if !t.is_empty() {
             return Ok(t);
         }
@@ -50,12 +61,17 @@ mod tests {
     #[test]
     fn env_var_wins() {
         let dir = TempDir::new().unwrap();
-        // SAFETY: env vars are process-global; tests run in parallel by default
-        // but each uses a unique env name to avoid collisions.
-        std::env::set_var("RDC_TOKEN_UNITTEST_A", "from-env");
-        let token = resolve_token(dir.path(), "unittest_a").unwrap();
+        std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        std::fs::write(
+            dir.path().join("secrets/dev.secrets.json"),
+            r#"{"api_token":"from-file"}"#,
+        )
+        .unwrap();
+        let token = resolve_token_from(dir.path(), "dev", |k| {
+            (k == "RDC_TOKEN_DEV").then(|| "from-env".to_string())
+        })
+        .unwrap();
         assert_eq!(token, "from-env");
-        std::env::remove_var("RDC_TOKEN_UNITTEST_A");
     }
 
     #[test]
@@ -63,18 +79,31 @@ mod tests {
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
         std::fs::write(
-            dir.path().join("secrets/unittest_b.secrets.json"),
+            dir.path().join("secrets/dev.secrets.json"),
             r#"{"api_token":"from-file"}"#,
         )
         .unwrap();
-        let token = resolve_token(dir.path(), "unittest_b").unwrap();
+        let token = resolve_token_from(dir.path(), "dev", |_| None).unwrap();
+        assert_eq!(token, "from-file");
+    }
+
+    #[test]
+    fn env_var_with_empty_value_falls_through_to_file() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        std::fs::write(
+            dir.path().join("secrets/dev.secrets.json"),
+            r#"{"api_token":"from-file"}"#,
+        )
+        .unwrap();
+        let token = resolve_token_from(dir.path(), "dev", |_| Some(String::new())).unwrap();
         assert_eq!(token, "from-file");
     }
 
     #[test]
     fn missing_token_errors_with_actionable_message() {
         let dir = TempDir::new().unwrap();
-        let err = resolve_token(dir.path(), "unittest_c").unwrap_err();
+        let err = resolve_token_from(dir.path(), "unittest_c", |_| None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("RDC_TOKEN_UNITTEST_C"), "should mention env var: {msg}");
         assert!(msg.contains("secrets/unittest_c.secrets.json"), "should mention file path: {msg}");

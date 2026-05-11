@@ -71,13 +71,6 @@ pub fn tgt_in_sync(
     Ok(base.map(|b| b == remote_hash).unwrap_or(true))
 }
 
-/// Idempotency: payload bytes vs current remote bytes (full forms,
-/// without overlay strip — both have overlay-applied values for an
-/// unchanged tgt). Returns `true` when a PATCH would be a no-op.
-pub fn payload_matches_remote(payload_bytes: &[u8], remote_bytes: &[u8]) -> bool {
-    payload_bytes == remote_bytes
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -107,6 +107,8 @@ pub enum Command {
 }
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
+    crate::cli::resolve::set_no_color_flag(cli.no_color);
+
     // Once-daily passive nudge. Skipped for the upgrade command since
     // it computes the same answer fresh. Refresh runs first (tight 2s
     // timeout, silent on failure) so the cache is up-to-date by the

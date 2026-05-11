@@ -62,13 +62,6 @@ pub struct PullCtx<'a> {
 /// `list_*` calls remain serial.
 pub const PULL_FANOUT: usize = 5;
 
-/// Compute the content hash of an object's serialized form. The pull drivers
-/// hash the JSON bytes they're about to write to disk so the lockfile records
-/// what was actually persisted.
-pub fn hash_for_lockfile(bytes: &[u8]) -> String {
-    content_hash(bytes)
-}
-
 /// If `paths` is `Some` and non-empty, strip those overlay-managed dotted
 /// paths from `bytes` (parse to Value, strip, re-serialize). Otherwise
 /// return `bytes` unchanged. Used by every writable-kind pull driver to
@@ -178,12 +171,13 @@ pub fn decide_pull_action(
         return Ok((PullAction::NoChange, remote_hash));
     }
 
+    // local_hash == remote_hash is already handled above as NoChange, so
+    // we only need to branch on which side diverged from the base.
     let local_matches_base = local_hash == base;
     let remote_matches_base = remote_hash == base;
 
     let action = match (local_matches_base, remote_matches_base) {
-        (true, true) => PullAction::Write,
-        (true, false) => PullAction::Write,
+        (true, _) => PullAction::Write,
         (false, true) => PullAction::KeepLocal,
         (false, false) => PullAction::Conflict,
     };

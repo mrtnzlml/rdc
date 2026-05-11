@@ -11,6 +11,11 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+/// Optional reference to the run-wide progress bar. `None` when no bar
+/// is active (e.g. `rdc auth`, `rdc diff`). Cheap to clone; just bumps
+/// an `Arc` refcount.
+pub type ProgressHandle = Option<Arc<OverallProgress>>;
+
 /// Cheaply cloneable handle to the run-wide progress UX. Wrap your only
 /// instance in `Arc<OverallProgress>` and clone it everywhere — concurrent
 /// closures included.
@@ -20,8 +25,6 @@ pub struct OverallProgress {
 
 enum Inner {
     Bar {
-        title: String,
-        started: Instant,
         bar: indicatif::ProgressBar,
         current_phase: Option<String>,
         phase_started: Option<Instant>,
@@ -30,8 +33,6 @@ enum Inner {
         finished: bool,
     },
     Log {
-        title: String,
-        started: Instant,
         current_phase: Option<String>,
         phase_started: Option<Instant>,
         phase_count: AtomicU64,
@@ -48,7 +49,7 @@ impl OverallProgress {
         let title: String = title.into();
         let inner = if std::io::stderr().is_terminal() {
             let bar = indicatif::ProgressBar::new(0);
-            bar.set_prefix(title.clone());
+            bar.set_prefix(title);
             bar.set_style(
                 indicatif::ProgressStyle::with_template(
                     "{spinner} {prefix}  [{wide_bar}] {pos}/{len}  ETA {eta}\n  ↳ {msg}",
@@ -58,8 +59,6 @@ impl OverallProgress {
             bar.set_message("discovering items…");
             bar.enable_steady_tick(std::time::Duration::from_millis(100));
             Inner::Bar {
-                title,
-                started: Instant::now(),
                 bar,
                 current_phase: None,
                 phase_started: None,
@@ -70,8 +69,6 @@ impl OverallProgress {
         } else {
             eprintln!("→ {title}: discovering items…");
             Inner::Log {
-                title,
-                started: Instant::now(),
                 current_phase: None,
                 phase_started: None,
                 phase_count: AtomicU64::new(0),

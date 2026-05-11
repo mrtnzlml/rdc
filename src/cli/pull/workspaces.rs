@@ -1,8 +1,9 @@
-use super::common::{hash_for_lockfile, record_object, skip_on_permission_denied, PullCtx};
+use super::common::{record_object, skip_on_permission_denied, PullCtx};
 use crate::model::Workspace;
 use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use crate::snapshot::workspace::write_workspace;
+use crate::state::content_hash;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -42,7 +43,7 @@ pub async fn process(ctx: &mut PullCtx<'_>, workspaces: Vec<Workspace>, progress
 
         let bytes = write_workspace(&ws_dir, ws)
             .with_context(|| format!("writing workspace '{}' to disk", ws.name))?;
-        let hash = hash_for_lockfile(&bytes);
+        let hash = content_hash(&bytes);
 
         record_object(
             ctx.lockfile,

@@ -9,42 +9,22 @@ use std::path::Path;
 /// stripped from the JSON to avoid duplication; the `.py` file becomes the
 /// source of truth.
 ///
-/// Returns the JSON path written.
+/// Returns the JSON bytes written (post-extraction, with trailing newline).
 pub fn write_hook(dir: &Path, slug: &str, hook: &Hook) -> Result<Vec<u8>> {
-    let mut json_value = serde_json::to_value(hook)
-        .context("serializing hook to value")?;
-
-    // Extract `config.code` into a sibling .py file.
-    let code = json_value
-        .get_mut("config")
-        .and_then(|c| c.as_object_mut())
-        .and_then(|m| m.remove("code"))
-        .and_then(|v| match v {
-            Value::String(s) => Some(s),
-            _ => None,
-        });
-
-    let json_path = dir.join(format!("{slug}.json"));
-    let json_bytes = serde_json::to_vec_pretty(&json_value)
-        .context("serializing hook json")?;
-    let mut json_with_newline = json_bytes;
-    json_with_newline.push(b'\n');
-    write_atomic(&json_path, &json_with_newline)?;
-
+    let (json_bytes, code) = serialize_hook(hook)?;
+    write_atomic(&dir.join(format!("{slug}.json")), &json_bytes)?;
     if let Some(code) = code {
-        let py_path = dir.join(format!("{slug}.py"));
         // Write code bytes exactly as received. Preserves byte-exact round-trip
         // through the codec (read_hook returns Hook with identical config.code).
-        write_atomic(&py_path, code.as_bytes())?;
+        write_atomic(&dir.join(format!("{slug}.py")), code.as_bytes())?;
     }
-
-    Ok(json_with_newline)
+    Ok(json_bytes)
 }
 
 /// Serialize a hook to its on-disk byte form WITHOUT writing. Returns the JSON
-/// bytes (post-extraction) and the optional extracted code string. Used by
-/// pull/push drivers to compute `hook_combined_hash` before deciding whether
-/// to write or send.
+/// bytes (post-extraction, with trailing newline) and the optional extracted
+/// code string. Used by pull/push drivers to compute `hook_combined_hash`
+/// before deciding whether to write or send.
 pub fn serialize_hook(hook: &Hook) -> Result<(Vec<u8>, Option<String>)> {
     let mut json_value = serde_json::to_value(hook)
         .context("serializing hook to value")?;
@@ -58,9 +38,8 @@ pub fn serialize_hook(hook: &Hook) -> Result<(Vec<u8>, Option<String>)> {
             _ => None,
         });
 
-    let bytes = serde_json::to_vec_pretty(&json_value)
+    let mut bytes = serde_json::to_vec_pretty(&json_value)
         .context("serializing hook json")?;
-    let mut bytes = bytes;
     bytes.push(b'\n');
     Ok((bytes, code))
 }

@@ -1,5 +1,5 @@
 use crate::api::{anyhow_has_status, RossumClient};
-use crate::cli::deploy::common::{payload_matches_remote, rewrite_urls, tgt_in_sync};
+use crate::cli::deploy::common::{rewrite_urls, tgt_in_sync};
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::config::ProjectConfig;
 use crate::mapping::Mapping;
@@ -124,7 +124,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             skipped += 1;
             continue;
         }
-        if payload_matches_remote(&payload_bytes, &remote_bytes) {
+        if payload_bytes == remote_bytes {
             continue;
         }
         tgt_client.update_rule(tgt_id, &payload_rule, None).await
@@ -172,7 +172,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             skipped += 1;
             continue;
         }
-        if payload_matches_remote(&payload_bytes, &remote_bytes) {
+        if payload_bytes == remote_bytes {
             continue;
         }
         tgt_client.update_label(tgt_id, &payload_label, None).await
@@ -225,7 +225,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             skipped += 1;
             continue;
         }
-        if payload_matches_remote(&payload_bytes, &remote_bytes) {
+        if payload_bytes == remote_bytes {
             continue;
         }
         tgt_client.update_queue(tgt_id, &payload_queue, None).await
@@ -316,7 +316,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             skipped += 1;
             continue;
         }
-        if payload_matches_remote(&payload_bytes, &remote_bytes) {
+        if payload_bytes == remote_bytes {
             continue;
         }
         tgt_client.update_inbox(tgt_id, &payload_inbox, None).await
@@ -367,7 +367,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             skipped += 1;
             continue;
         }
-        if payload_matches_remote(&payload_bytes, &remote_bytes) {
+        if payload_bytes == remote_bytes {
             continue;
         }
         tgt_client.update_email_template(tgt_id, &payload_template, None).await
@@ -411,7 +411,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             skipped += 1;
             continue;
         }
-        if payload_matches_remote(&payload_bytes, &remote_bytes) {
+        if payload_bytes == remote_bytes {
             continue;
         }
         match tgt_client.update_engine(tgt_id, &payload_engine, None).await
@@ -463,7 +463,7 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             skipped += 1;
             continue;
         }
-        if payload_matches_remote(&payload_bytes, &remote_bytes) {
+        if payload_bytes == remote_bytes {
             continue;
         }
         match tgt_client.update_engine_field(tgt_id, &payload_field, None).await

@@ -9,35 +9,8 @@ use std::path::Path;
 /// Returns the post-extraction JSON bytes (used for content_hash via
 /// `crate::state::schema_combined_hash` together with the formula bytes).
 pub fn write_schema(queue_dir: &Path, schema: &Schema) -> Result<Vec<u8>> {
-    let mut value = serde_json::to_value(schema)
-        .context("serializing schema to value")?;
-
-    // Walk the content tree, extracting formula strings.
-    let mut formulas: Vec<(String, String)> = Vec::new();
-    if let Some(content) = value.get_mut("content").and_then(|c| c.as_array_mut()) {
-        for node in content.iter_mut() {
-            extract_formulas(node, &mut formulas);
-        }
-    }
-
-    let json_path = queue_dir.join("schema.json");
-    let bytes = serde_json::to_vec_pretty(&value)
-        .context("serializing schema json")?;
-    let mut bytes = bytes;
-    bytes.push(b'\n');
-    write_atomic(&json_path, &bytes)?;
-
-    if !formulas.is_empty() {
-        let formulas_dir = queue_dir.join("formulas");
-        std::fs::create_dir_all(&formulas_dir)
-            .with_context(|| format!("creating {}", formulas_dir.display()))?;
-        for (field_id, formula) in formulas {
-            let py_path = formulas_dir.join(format!("{field_id}.py"));
-            // Byte-exact: write the formula text as-is, no trailing-newline padding.
-            write_atomic(&py_path, formula.as_bytes())?;
-        }
-    }
-
+    let (bytes, formulas) = serialize_schema(schema)?;
+    write_schema_bytes(queue_dir, &bytes, &formulas)?;
     Ok(bytes)
 }
 

@@ -121,45 +121,27 @@ pub fn detect(paths: &Paths, lockfile: &Lockfile) -> Vec<PendingRename> {
         }
     }
 
-    detect_flat_kind(paths, lockfile, "hooks", "json", "hooks", &mut out, |o, n| {
+    detect_flat_kind(lockfile, "hooks", paths.hooks_dir(), &mut out, |o, n| {
         PendingRename::Hook { old: o, new: n }
     });
-    detect_flat_kind(paths, lockfile, "rules", "json", "rules", &mut out, |o, n| {
+    detect_flat_kind(lockfile, "rules", paths.rules_dir(), &mut out, |o, n| {
         PendingRename::Rule { old: o, new: n }
     });
-    detect_flat_kind(paths, lockfile, "labels", "json", "labels", &mut out, |o, n| {
+    detect_flat_kind(lockfile, "labels", paths.labels_dir(), &mut out, |o, n| {
         PendingRename::Label { old: o, new: n }
     });
-    detect_flat_kind(paths, lockfile, "engines", "json", "engines", &mut out, |o, n| {
+    detect_flat_kind(lockfile, "engines", paths.engines_dir(), &mut out, |o, n| {
         PendingRename::Engine { old: o, new: n }
     });
-    detect_flat_kind(
-        paths,
-        lockfile,
-        "engine_fields",
-        "json",
-        "engine_fields",
-        &mut out,
-        |o, n| PendingRename::EngineField { old: o, new: n },
-    );
-    detect_flat_kind(
-        paths,
-        lockfile,
-        "workflows",
-        "json",
-        "workflows",
-        &mut out,
-        |o, n| PendingRename::Workflow { old: o, new: n },
-    );
-    detect_flat_kind(
-        paths,
-        lockfile,
-        "workflow_steps",
-        "json",
-        "workflow_steps",
-        &mut out,
-        |o, n| PendingRename::WorkflowStep { old: o, new: n },
-    );
+    detect_flat_kind(lockfile, "engine_fields", paths.engine_fields_dir(), &mut out, |o, n| {
+        PendingRename::EngineField { old: o, new: n }
+    });
+    detect_flat_kind(lockfile, "workflows", paths.workflows_dir(), &mut out, |o, n| {
+        PendingRename::Workflow { old: o, new: n }
+    });
+    detect_flat_kind(lockfile, "workflow_steps", paths.workflow_steps_dir(), &mut out, |o, n| {
+        PendingRename::WorkflowStep { old: o, new: n }
+    });
 
     if let Some(t_map) = lockfile.objects.get("email_templates") {
         for compound in t_map.keys() {
@@ -188,36 +170,20 @@ pub fn detect(paths: &Paths, lockfile: &Lockfile) -> Vec<PendingRename> {
 }
 
 fn detect_flat_kind(
-    paths: &Paths,
     lockfile: &Lockfile,
     kind: &str,
-    extension: &str,
-    dir_kind: &str,
+    dir: std::path::PathBuf,
     out: &mut Vec<PendingRename>,
     make: impl Fn(String, String) -> PendingRename,
 ) {
     let Some(by_slug) = lockfile.objects.get(kind) else { return };
-    let dir = flat_kind_dir(paths, dir_kind);
     for slug in by_slug.keys() {
-        let file = dir.join(format!("{slug}.{extension}"));
+        let file = dir.join(format!("{slug}.json"));
         let Some(name) = read_name(&file) else { continue };
         let proposed = slugify(&name);
         if proposed != *slug && !by_slug.contains_key(&proposed) {
             out.push(make(slug.clone(), proposed));
         }
-    }
-}
-
-fn flat_kind_dir(paths: &Paths, kind: &str) -> std::path::PathBuf {
-    match kind {
-        "hooks" => paths.hooks_dir(),
-        "rules" => paths.rules_dir(),
-        "labels" => paths.labels_dir(),
-        "engines" => paths.engines_dir(),
-        "engine_fields" => paths.engine_fields_dir(),
-        "workflows" => paths.workflows_dir(),
-        "workflow_steps" => paths.workflow_steps_dir(),
-        _ => panic!("unknown flat kind '{kind}'"),
     }
 }
 
