@@ -216,7 +216,7 @@ async fn run_drivers(
     let (n_orgs, c_orgs) = organization::process(ctx, org_listed, progress).await
         .with_context(|| format!("pulling organization for env '{env}'"))?;
 
-    let n_workspaces = workspaces::process(ctx, workspaces_listed, env_cfg, progress).await
+    let n_workspaces = workspaces::process(ctx, workspaces_listed, progress).await
         .with_context(|| format!("pulling workspaces for env '{env}'"))?;
 
     let qc = queues::process(ctx, queues_listed, progress).await

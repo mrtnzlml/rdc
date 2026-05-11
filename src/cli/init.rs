@@ -138,7 +138,6 @@ fn parse_env_spec(spec: &str) -> Result<(String, EnvConfig)> {
         EnvConfig {
             api_base: api_base.to_string(),
             org_id,
-            workspace_filter: None,
         },
     ))
 }
