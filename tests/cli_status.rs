@@ -39,7 +39,7 @@ async fn status_reports_auth_ok_and_no_edits_after_pull() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -69,7 +69,7 @@ async fn status_reports_missing_token() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
     // intentionally no secrets file written.
 
@@ -90,7 +90,7 @@ async fn status_reports_missing_lockfile() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -141,7 +141,7 @@ async fn status_detects_local_edits() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server2.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server2.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),

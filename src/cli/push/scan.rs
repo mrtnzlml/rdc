@@ -59,10 +59,98 @@ pub fn scan(paths: &Paths, lockfile: &Lockfile) -> Result<(usize, ChangeList)> {
     scanned += scan_schemas(paths, lockfile, &mut changes.schemas)?;
     scanned += scan_queue_nested_json(paths, lockfile, "inboxes", "inbox.json", &mut changes.inboxes)?;
     scanned += scan_email_templates(paths, lockfile, &mut changes.email_templates)?;
-    scanned += scan_flat_kind(paths, lockfile, "engines", paths.engines_dir(), &mut changes.engines)?;
-    scanned += scan_flat_kind(paths, lockfile, "engine_fields", paths.engine_fields_dir(), &mut changes.engine_fields)?;
+    scanned += scan_engines(paths, lockfile, &mut changes.engines)?;
+    scanned += scan_engine_fields(paths, lockfile, &mut changes.engine_fields)?;
 
     Ok((scanned, changes))
+}
+
+/// Walk `engines/<slug>/engine.json` files. Mirrors `scan_workspaces`
+/// since engines and workspaces share the dir-with-named-json shape.
+fn scan_engines(
+    paths: &Paths,
+    lockfile: &Lockfile,
+    out: &mut BTreeMap<String, std::path::PathBuf>,
+) -> Result<usize> {
+    use crate::state::content_hash;
+    let engines_dir = paths.engines_dir();
+    if !engines_dir.exists() {
+        return Ok(0);
+    }
+    let mut scanned = 0;
+    for e_entry in std::fs::read_dir(&engines_dir)? {
+        let e_entry = e_entry?;
+        if !e_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let e_slug = e_entry.file_name().to_string_lossy().to_string();
+        let e_json_path = e_entry.path().join("engine.json");
+        if !e_json_path.exists() {
+            continue;
+        }
+        let bytes = std::fs::read(&e_json_path)?;
+        let local_hash = content_hash(&bytes);
+        scanned += 1;
+        let base_hash = lockfile
+            .objects
+            .get("engines")
+            .and_then(|m| m.get(&e_slug))
+            .and_then(|x| x.content_hash.as_deref());
+        if base_hash != Some(local_hash.as_str()) {
+            out.insert(e_slug, e_json_path);
+        }
+    }
+    Ok(scanned)
+}
+
+/// Walk `engines/<engine>/fields/<field>.json` files. Each field nests
+/// under exactly one engine; the engine slug is just for path
+/// resolution — the lockfile keys fields by field slug alone.
+fn scan_engine_fields(
+    paths: &Paths,
+    lockfile: &Lockfile,
+    out: &mut BTreeMap<String, std::path::PathBuf>,
+) -> Result<usize> {
+    use crate::state::content_hash;
+    let engines_dir = paths.engines_dir();
+    if !engines_dir.exists() {
+        return Ok(0);
+    }
+    let mut scanned = 0;
+    for e_entry in std::fs::read_dir(&engines_dir)? {
+        let e_entry = e_entry?;
+        if !e_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let e_slug = e_entry.file_name().to_string_lossy().to_string();
+        let fields_dir = paths.engine_fields_dir(&e_slug);
+        if !fields_dir.exists() {
+            continue;
+        }
+        for f_entry in std::fs::read_dir(&fields_dir)? {
+            let f_entry = f_entry?;
+            let f_path = f_entry.path();
+            if f_path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(f_slug) = f_path.file_stem().and_then(|s| s.to_str()) else { continue };
+            if f_slug.ends_with(".remote") {
+                continue;
+            }
+            let bytes = std::fs::read(&f_path)?;
+            let local_hash = content_hash(&bytes);
+            scanned += 1;
+            let base_hash = lockfile
+                .objects
+                .get("engine_fields")
+                .and_then(|m| m.get(f_slug))
+                .and_then(|x| x.content_hash.as_deref());
+            if base_hash != Some(local_hash.as_str()) {
+                out.insert(f_slug.to_string(), f_path);
+            }
+        }
+    }
+    Ok(scanned)
 }
 
 fn scan_workspaces(

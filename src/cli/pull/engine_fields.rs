@@ -18,24 +18,35 @@ pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<
     )
 }
 
-/// Phase 2: write listed engine fields to disk. Returns `(count, conflicts)`.
+/// Phase 2: write listed engine fields to disk. Each field nests under
+/// its parent engine at `engines/<engine_slug>/fields/<field_slug>.json`.
+/// Orphan fields (no engine in the lockfile) are skipped with a warning
+/// — same pattern as orphan queues.
 pub async fn process(ctx: &mut PullCtx<'_>, fields: Vec<EngineField>, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
     progress.start_phase("engine_fields");
 
     let mut used: HashSet<String> = HashSet::new();
-    let mut dir_created = false;
     let mut conflicts = 0usize;
+    let mut written = 0usize;
     for f in &fields {
-        if !dir_created {
-            std::fs::create_dir_all(ctx.paths.engine_fields_dir())
-                .with_context(|| format!("creating {}", ctx.paths.engine_fields_dir().display()))?;
-            dir_created = true;
-        }
+        let Some(engine_slug) = ctx.lockfile.slug_for_url("engines", &f.engine).map(|s| s.to_string()) else {
+            progress.skipped_orphan();
+            progress.println(format!(
+                "warning: engine field '{}' (id {}) has unknown engine URL '{}'; skipping",
+                f.name, f.id, f.engine
+            ));
+            continue;
+        };
+
         let slug = match ctx.lockfile.slug_for_id("engine_fields", f.id) {
             Some(existing) => existing.to_string(),
             None => slugify_unique(&f.name, &used),
         };
         used.insert(slug.clone());
+
+        let fields_dir = ctx.paths.engine_fields_dir(&engine_slug);
+        std::fs::create_dir_all(&fields_dir)
+            .with_context(|| format!("creating {}", fields_dir.display()))?;
 
         let mut proposed = serde_json::to_vec_pretty(f).context("serializing engine field")?;
         proposed.push(b'\n');
@@ -44,7 +55,7 @@ pub async fn process(ctx: &mut PullCtx<'_>, fields: Vec<EngineField>, progress: 
             ctx.overlay.as_ref().and_then(|o| o.engine_field(&slug)),
         )?;
 
-        let local_path = ctx.paths.engine_fields_dir().join(format!("{slug}.json"));
+        let local_path = fields_dir.join(format!("{slug}.json"));
         let base_hash = ctx
             .lockfile
             .objects
@@ -69,7 +80,8 @@ pub async fn process(ctx: &mut PullCtx<'_>, fields: Vec<EngineField>, progress: 
             Some(recorded_hash),
         );
         progress.tick(&f.name);
+        written += 1;
     }
 
-    Ok((fields.len(), conflicts))
+    Ok((written, conflicts))
 }

@@ -23,19 +23,19 @@ pub async fn process(ctx: &mut PullCtx<'_>, engines: Vec<Engine>, progress: &Arc
     progress.start_phase("engines");
 
     let mut used: HashSet<String> = HashSet::new();
-    let mut dir_created = false;
     let mut conflicts = 0usize;
     for e in &engines {
-        if !dir_created {
-            std::fs::create_dir_all(ctx.paths.engines_dir())
-                .with_context(|| format!("creating {}", ctx.paths.engines_dir().display()))?;
-            dir_created = true;
-        }
         let slug = match ctx.lockfile.slug_for_id("engines", e.id) {
             Some(existing) => existing.to_string(),
             None => slugify_unique(&e.name, &used),
         };
         used.insert(slug.clone());
+
+        // Each engine owns a directory: `engines/<slug>/`. The engine's
+        // JSON lives at `engine.json` inside it, alongside `fields/`.
+        let engine_dir = ctx.paths.engine_dir(&slug);
+        std::fs::create_dir_all(&engine_dir)
+            .with_context(|| format!("creating {}", engine_dir.display()))?;
 
         let mut proposed = serde_json::to_vec_pretty(e).context("serializing engine")?;
         proposed.push(b'\n');
@@ -44,7 +44,7 @@ pub async fn process(ctx: &mut PullCtx<'_>, engines: Vec<Engine>, progress: &Arc
             ctx.overlay.as_ref().and_then(|o| o.engine(&slug)),
         )?;
 
-        let local_path = ctx.paths.engines_dir().join(format!("{slug}.json"));
+        let local_path = engine_dir.join("engine.json");
         let base_hash = ctx
             .lockfile
             .objects

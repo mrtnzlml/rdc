@@ -114,7 +114,6 @@ async fn pull_writes_full_workspace_tree() {
         .current_dir(project.path())
         .args([
             "init",
-            "--name", "test-pull",
             "--env",
             &format!("dev={}/api/v1:1", server.uri()),
         ])
@@ -220,9 +219,11 @@ async fn pull_writes_full_workspace_tree() {
     assert!(env_root.join("rules/e-invoice-validation.json").exists());
     assert!(env_root.join("labels/priority-high.json").exists());
     assert!(env_root.join("labels/needs-review.json").exists());
-    assert!(env_root.join("engines/invoice-engine.json").exists());
-    assert!(env_root.join("engine-fields/invoice-id.json").exists());
-    assert!(env_root.join("engine-fields/total-amount.json").exists());
+    // Engines own a directory (engine.json + fields/). Engine fields
+    // nest under their parent engine to mirror API 1:N ownership.
+    assert!(env_root.join("engines/invoice-engine/engine.json").exists());
+    assert!(env_root.join("engines/invoice-engine/fields/invoice-id.json").exists());
+    assert!(env_root.join("engines/invoice-engine/fields/total-amount.json").exists());
 
     // Lockfile records the kinds.
     assert!(lf.contains("\"rules\""));
@@ -230,10 +231,10 @@ async fn pull_writes_full_workspace_tree() {
     assert!(lf.contains("\"engines\""));
     assert!(lf.contains("\"engine_fields\""));
 
-    // Workflow kinds.
-    assert!(env_root.join("workflows/ap-approval-flow.json").exists());
-    assert!(env_root.join("workflow-steps/manager-approval.json").exists());
-    assert!(env_root.join("workflow-steps/finance-approval.json").exists());
+    // Workflow kinds (same nested pattern as engines).
+    assert!(env_root.join("workflows/ap-approval-flow/workflow.json").exists());
+    assert!(env_root.join("workflows/ap-approval-flow/steps/manager-approval.json").exists());
+    assert!(env_root.join("workflows/ap-approval-flow/steps/finance-approval.json").exists());
     // Email templates nest under their queue (the live API associates
     // each template with exactly one queue).
     assert!(env_root
@@ -306,7 +307,6 @@ async fn pull_mdh_when_endpoints_present() {
         .current_dir(project.path())
         .args([
             "init",
-            "--name", "test-pull",
             "--env",
             &format!("dev={}/api/v1:1", server.uri()),
         ])
@@ -383,7 +383,6 @@ async fn pull_skips_mdh_when_endpoint_returns_404() {
         .current_dir(project.path())
         .args([
             "init",
-            "--name", "test-pull",
             "--env",
             &format!("dev={}/api/v1:1", server.uri()),
         ])
@@ -436,7 +435,7 @@ async fn re_pull_with_no_changes_is_idempotent() {
     Command::cargo_bin("rdc")
         .unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert()
         .success();
 
@@ -500,7 +499,7 @@ async fn re_pull_preserves_local_edits_when_remote_unchanged() {
     Command::cargo_bin("rdc")
         .unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert()
         .success();
 
@@ -605,7 +604,7 @@ async fn re_pull_emits_remote_file_on_real_conflict() {
     Command::cargo_bin("rdc")
         .unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server1.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server1.uri())])
         .assert()
         .success();
 
@@ -746,7 +745,7 @@ async fn re_pull_emits_remote_file_on_queue_conflict() {
     Command::cargo_bin("rdc")
         .unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server1.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server1.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -828,7 +827,7 @@ async fn re_pull_preserves_local_formula_edit_when_remote_unchanged() {
     Command::cargo_bin("rdc")
         .unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -933,7 +932,7 @@ async fn re_pull_emits_remote_files_on_formula_conflict() {
     Command::cargo_bin("rdc")
         .unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server1.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server1.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -976,7 +975,6 @@ async fn pull_with_missing_token_fails_with_helpful_error() {
         .current_dir(project.path())
         .args([
             "init",
-            "--name", "x",
             "--env", "dev=https://nope.invalid/api/v1:1",
         ])
         .assert()
@@ -999,7 +997,6 @@ async fn pull_with_unknown_env_fails() {
         .current_dir(project.path())
         .args([
             "init",
-            "--name", "x",
             "--env", "dev=https://nope.invalid/api/v1:1",
         ])
         .assert()
@@ -1045,7 +1042,7 @@ async fn pull_strips_overlay_paths_from_snapshot() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -1133,7 +1130,7 @@ async fn pull_no_conflict_when_only_modified_at_differs() {
     Command::cargo_bin("rdc")
         .unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert()
         .success();
 
@@ -1251,7 +1248,7 @@ async fn push_succeeds_after_overlay_strip_on_pull() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -1338,7 +1335,7 @@ async fn pull_with_orphan_queue_surfaces_count_in_done_line() {
     Command::cargo_bin("rdc")
         .unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert()
         .success();
 

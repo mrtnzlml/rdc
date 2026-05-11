@@ -59,7 +59,7 @@ async fn diff_local_remote_no_changes() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -85,7 +85,7 @@ async fn diff_local_remote_shows_edit_in_unified_format() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -121,8 +121,7 @@ async fn diff_snapshot_vs_snapshot_no_api_calls() {
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
         .args([
-            "init", "--name", "x",
-            "--env", &format!("a={}/api/v1:1", server_a.uri()),
+            "init", "--env", &format!("a={}/api/v1:1", server_a.uri()),
             "--env", &format!("b={}/api/v1:1", server_b.uri()),
         ])
         .assert().success();

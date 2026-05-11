@@ -15,29 +15,39 @@ pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<
     )
 }
 
-/// Phase 2: write listed workflow steps to disk. Returns `(count, conflicts)`.
+/// Phase 2: write listed workflow steps to disk. Each step nests under
+/// its parent workflow at `workflows/<workflow_slug>/steps/<step_slug>.json`.
+/// Orphan steps (no workflow in the lockfile) are skipped with a warning.
 pub async fn process(ctx: &mut PullCtx<'_>, steps: Vec<WorkflowStep>, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
     progress.start_phase("workflow_steps");
 
     let mut used: HashSet<String> = HashSet::new();
-    let mut dir_created = false;
     let mut conflicts = 0usize;
+    let mut written = 0usize;
     for s in &steps {
-        if !dir_created {
-            std::fs::create_dir_all(ctx.paths.workflow_steps_dir())
-                .with_context(|| format!("creating {}", ctx.paths.workflow_steps_dir().display()))?;
-            dir_created = true;
-        }
+        let Some(workflow_slug) = ctx.lockfile.slug_for_url("workflows", &s.workflow).map(|x| x.to_string()) else {
+            progress.skipped_orphan();
+            progress.println(format!(
+                "warning: workflow step '{}' (id {}) has unknown workflow URL '{}'; skipping",
+                s.name, s.id, s.workflow
+            ));
+            continue;
+        };
+
         let slug = match ctx.lockfile.slug_for_id("workflow_steps", s.id) {
             Some(existing) => existing.to_string(),
             None => slugify_unique(&s.name, &used),
         };
         used.insert(slug.clone());
 
+        let steps_dir = ctx.paths.workflow_steps_dir(&workflow_slug);
+        std::fs::create_dir_all(&steps_dir)
+            .with_context(|| format!("creating {}", steps_dir.display()))?;
+
         let mut proposed = serde_json::to_vec_pretty(s).context("serializing workflow step")?;
         proposed.push(b'\n');
 
-        let local_path = ctx.paths.workflow_steps_dir().join(format!("{slug}.json"));
+        let local_path = steps_dir.join(format!("{slug}.json"));
         let base_hash = ctx
             .lockfile
             .objects
@@ -62,7 +72,8 @@ pub async fn process(ctx: &mut PullCtx<'_>, steps: Vec<WorkflowStep>, progress: 
             Some(recorded_hash),
         );
         progress.tick(&s.name);
+        written += 1;
     }
 
-    Ok((steps.len(), conflicts))
+    Ok((written, conflicts))
 }

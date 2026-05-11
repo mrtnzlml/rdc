@@ -154,10 +154,8 @@ fn local_edits(paths: &Paths, lockfile: &Lockfile) -> Result<Vec<(String, String
     // (struct-order typed fields, BTreeMap-sorted extra).
     flat_kind_edits::<crate::model::Rule>(&paths.rules_dir(), "rules", lockfile, &mut out)?;
     flat_kind_edits::<crate::model::Label>(&paths.labels_dir(), "labels", lockfile, &mut out)?;
-    flat_kind_edits::<crate::model::Engine>(&paths.engines_dir(), "engines", lockfile, &mut out)?;
-    flat_kind_edits::<crate::model::EngineField>(
-        &paths.engine_fields_dir(), "engine_fields", lockfile, &mut out,
-    )?;
+    engines_edits(paths, lockfile, &mut out)?;
+    engine_fields_edits(paths, lockfile, &mut out)?;
     // Workflows + workflow_steps are pull-only (Rossum API read-only); we
     // intentionally skip them in edit detection.
 
@@ -295,6 +293,75 @@ where
         let h = content_hash(&bytes);
         if differs(kind, slug, lockfile, &h) {
             out.push((kind.into(), slug.into()));
+        }
+    }
+    Ok(())
+}
+
+/// Walk `engines/<slug>/engine.json` files and surface any whose
+/// content_hash differs from the lockfile.
+fn engines_edits(
+    paths: &crate::paths::Paths,
+    lockfile: &Lockfile,
+    out: &mut Vec<(String, String)>,
+) -> Result<()> {
+    let engines_dir = paths.engines_dir();
+    if !engines_dir.exists() {
+        return Ok(());
+    }
+    for e_entry in std::fs::read_dir(&engines_dir)? {
+        let e_entry = e_entry?;
+        if !e_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let e_slug = e_entry.file_name().to_string_lossy().to_string();
+        let e_json_path = e_entry.path().join("engine.json");
+        if !e_json_path.exists() {
+            continue;
+        }
+        let bytes = read_pretty_canonical_bytes::<crate::model::Engine>(&e_json_path)?;
+        let h = content_hash(&bytes);
+        if differs("engines", &e_slug, lockfile, &h) {
+            out.push(("engines".into(), e_slug));
+        }
+    }
+    Ok(())
+}
+
+/// Walk `engines/<engine>/fields/<field>.json` files. Each field's
+/// lockfile key is the field slug alone (not compound).
+fn engine_fields_edits(
+    paths: &crate::paths::Paths,
+    lockfile: &Lockfile,
+    out: &mut Vec<(String, String)>,
+) -> Result<()> {
+    let engines_dir = paths.engines_dir();
+    if !engines_dir.exists() {
+        return Ok(());
+    }
+    for e_entry in std::fs::read_dir(&engines_dir)? {
+        let e_entry = e_entry?;
+        if !e_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let e_slug = e_entry.file_name().to_string_lossy().to_string();
+        let fields_dir = paths.engine_fields_dir(&e_slug);
+        if !fields_dir.exists() {
+            continue;
+        }
+        for f_entry in std::fs::read_dir(&fields_dir)? {
+            let f_entry = f_entry?;
+            let name = f_entry.file_name().to_string_lossy().to_string();
+            let Some(f_slug) = name.strip_suffix(".json") else { continue };
+            if f_slug.ends_with(".remote") {
+                continue;
+            }
+            let path = fields_dir.join(format!("{f_slug}.json"));
+            let bytes = read_pretty_canonical_bytes::<crate::model::EngineField>(&path)?;
+            let h = content_hash(&bytes);
+            if differs("engine_fields", f_slug, lockfile, &h) {
+                out.push(("engine_fields".into(), f_slug.into()));
+            }
         }
     }
     Ok(())

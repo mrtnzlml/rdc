@@ -73,10 +73,14 @@ impl PendingRename {
     }
 }
 
-/// Sort key so workspaces apply before queues, queues before leaves.
+/// Sort key so cascade-parent renames apply before their children:
+/// workspaces and engines and workflows (each owns a subtree on disk)
+/// before queues, queues before leaf objects.
 fn priority(p: &PendingRename) -> u8 {
     match p {
         PendingRename::Workspace { .. } => 0,
+        PendingRename::Engine { .. } => 0,
+        PendingRename::Workflow { .. } => 0,
         PendingRename::Queue { .. } => 1,
         _ => 2,
     }
@@ -130,18 +134,10 @@ pub fn detect(paths: &Paths, lockfile: &Lockfile) -> Vec<PendingRename> {
     detect_flat_kind(lockfile, "labels", paths.labels_dir(), &mut out, |o, n| {
         PendingRename::Label { old: o, new: n }
     });
-    detect_flat_kind(lockfile, "engines", paths.engines_dir(), &mut out, |o, n| {
-        PendingRename::Engine { old: o, new: n }
-    });
-    detect_flat_kind(lockfile, "engine_fields", paths.engine_fields_dir(), &mut out, |o, n| {
-        PendingRename::EngineField { old: o, new: n }
-    });
-    detect_flat_kind(lockfile, "workflows", paths.workflows_dir(), &mut out, |o, n| {
-        PendingRename::Workflow { old: o, new: n }
-    });
-    detect_flat_kind(lockfile, "workflow_steps", paths.workflow_steps_dir(), &mut out, |o, n| {
-        PendingRename::WorkflowStep { old: o, new: n }
-    });
+    detect_engines(paths, lockfile, &mut out);
+    detect_engine_fields(paths, lockfile, &mut out);
+    detect_workflows(paths, lockfile, &mut out);
+    detect_workflow_steps(paths, lockfile, &mut out);
 
     if let Some(t_map) = lockfile.objects.get("email_templates") {
         for compound in t_map.keys() {
@@ -193,6 +189,109 @@ fn read_name(path: &std::path::Path) -> Option<String> {
     let raw = std::fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())
+}
+
+/// Detect stale engine slugs: read `engines/<slug>/engine.json` and
+/// propose a rename if the JSON's `name` slugifies to something
+/// different than `<slug>`. Engines own a directory on disk, so a
+/// rename moves the whole subtree (engine.json + fields/).
+fn detect_engines(paths: &Paths, lockfile: &Lockfile, out: &mut Vec<PendingRename>) {
+    let Some(by_slug) = lockfile.objects.get("engines") else { return };
+    for slug in by_slug.keys() {
+        let file = paths.engine_dir(slug).join("engine.json");
+        let Some(name) = read_name(&file) else { continue };
+        let proposed = slugify(&name);
+        if proposed != *slug && !by_slug.contains_key(&proposed) {
+            out.push(PendingRename::Engine {
+                old: slug.clone(),
+                new: proposed,
+            });
+        }
+    }
+}
+
+/// Detect stale engine-field slugs. Each field nests under exactly one
+/// engine; we find that engine by walking and matching.
+fn detect_engine_fields(paths: &Paths, lockfile: &Lockfile, out: &mut Vec<PendingRename>) {
+    let Some(by_slug) = lockfile.objects.get("engine_fields") else { return };
+    for slug in by_slug.keys() {
+        // Walk every engine until we find the field.
+        let Some(file) = locate_engine_field_file(paths, slug) else { continue };
+        let Some(name) = read_name(&file) else { continue };
+        let proposed = slugify(&name);
+        if proposed != *slug && !by_slug.contains_key(&proposed) {
+            out.push(PendingRename::EngineField {
+                old: slug.clone(),
+                new: proposed,
+            });
+        }
+    }
+}
+
+/// Detect stale workflow slugs. Same pattern as engines.
+fn detect_workflows(paths: &Paths, lockfile: &Lockfile, out: &mut Vec<PendingRename>) {
+    let Some(by_slug) = lockfile.objects.get("workflows") else { return };
+    for slug in by_slug.keys() {
+        let file = paths.workflow_dir(slug).join("workflow.json");
+        let Some(name) = read_name(&file) else { continue };
+        let proposed = slugify(&name);
+        if proposed != *slug && !by_slug.contains_key(&proposed) {
+            out.push(PendingRename::Workflow {
+                old: slug.clone(),
+                new: proposed,
+            });
+        }
+    }
+}
+
+/// Detect stale workflow-step slugs. Same pattern as engine_fields.
+fn detect_workflow_steps(paths: &Paths, lockfile: &Lockfile, out: &mut Vec<PendingRename>) {
+    let Some(by_slug) = lockfile.objects.get("workflow_steps") else { return };
+    for slug in by_slug.keys() {
+        let Some(file) = locate_workflow_step_file(paths, slug) else { continue };
+        let Some(name) = read_name(&file) else { continue };
+        let proposed = slugify(&name);
+        if proposed != *slug && !by_slug.contains_key(&proposed) {
+            out.push(PendingRename::WorkflowStep {
+                old: slug.clone(),
+                new: proposed,
+            });
+        }
+    }
+}
+
+/// Walk `engines/*/fields/<slug>.json` and return the first match.
+fn locate_engine_field_file(paths: &Paths, slug: &str) -> Option<std::path::PathBuf> {
+    let engines_dir = paths.engines_dir();
+    let entries = std::fs::read_dir(&engines_dir).ok()?;
+    for e_entry in entries.flatten() {
+        if !e_entry.file_type().ok()?.is_dir() {
+            continue;
+        }
+        let e_slug = e_entry.file_name().to_string_lossy().to_string();
+        let p = paths.engine_fields_dir(&e_slug).join(format!("{slug}.json"));
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Walk `workflows/*/steps/<slug>.json` and return the first match.
+fn locate_workflow_step_file(paths: &Paths, slug: &str) -> Option<std::path::PathBuf> {
+    let workflows_dir = paths.workflows_dir();
+    let entries = std::fs::read_dir(&workflows_dir).ok()?;
+    for w_entry in entries.flatten() {
+        if !w_entry.file_type().ok()?.is_dir() {
+            continue;
+        }
+        let w_slug = w_entry.file_name().to_string_lossy().to_string();
+        let p = paths.workflow_steps_dir(&w_slug).join(format!("{slug}.json"));
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// Locate the queue dir for a given q_slug by reading the queue.json's
@@ -370,22 +469,36 @@ fn apply_one(
             collect_orphans(paths, "labels", old, &mut orphans);
         }
         PendingRename::Engine { old, new } => {
-            move_file(&paths.engines_dir().join(format!("{old}.json")), &paths.engines_dir().join(format!("{new}.json")))?;
+            // Engines own a dir (engine.json + fields/); a rename moves
+            // the whole subtree. Engine-field slugs are unchanged.
+            move_dir(&paths.engine_dir(old), &paths.engine_dir(new))?;
             rename_lockfile_key(lockfile, "engines", old, new);
             collect_orphans(paths, "engines", old, &mut orphans);
         }
         PendingRename::EngineField { old, new } => {
-            move_file(&paths.engine_fields_dir().join(format!("{old}.json")), &paths.engine_fields_dir().join(format!("{new}.json")))?;
+            // Find the field under whatever engine currently owns it,
+            // then rename in place inside that engine's fields/ dir.
+            if let Some(old_path) = locate_engine_field_file(paths, old) {
+                if let Some(parent) = old_path.parent() {
+                    move_file(&old_path, &parent.join(format!("{new}.json")))?;
+                }
+            }
             rename_lockfile_key(lockfile, "engine_fields", old, new);
             collect_orphans(paths, "engine_fields", old, &mut orphans);
         }
         PendingRename::Workflow { old, new } => {
-            move_file(&paths.workflows_dir().join(format!("{old}.json")), &paths.workflows_dir().join(format!("{new}.json")))?;
+            // Workflows own a dir (workflow.json + steps/); same shape
+            // as engines.
+            move_dir(&paths.workflow_dir(old), &paths.workflow_dir(new))?;
             rename_lockfile_key(lockfile, "workflows", old, new);
             collect_orphans(paths, "workflows", old, &mut orphans);
         }
         PendingRename::WorkflowStep { old, new } => {
-            move_file(&paths.workflow_steps_dir().join(format!("{old}.json")), &paths.workflow_steps_dir().join(format!("{new}.json")))?;
+            if let Some(old_path) = locate_workflow_step_file(paths, old) {
+                if let Some(parent) = old_path.parent() {
+                    move_file(&old_path, &parent.join(format!("{new}.json")))?;
+                }
+            }
             rename_lockfile_key(lockfile, "workflow_steps", old, new);
         }
         PendingRename::EmailTemplate { ws, q, old, new } => {

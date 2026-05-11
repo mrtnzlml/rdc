@@ -10,7 +10,6 @@ fn init_creates_expected_files() {
         .current_dir(dir.path())
         .args([
             "init",
-            "--name", "demo",
             "--env", "dev=https://example.rossum.app/api/v1:285704",
         ])
         .assert()
@@ -23,7 +22,8 @@ fn init_creates_expected_files() {
     assert!(dir.path().join("secrets").is_dir());
 
     let cfg = std::fs::read_to_string(dir.path().join("rdc.toml")).unwrap();
-    assert!(cfg.contains("name = \"demo\""));
+    // No [project] section any more — the config is just envs.
+    assert!(!cfg.contains("[project]"));
     assert!(cfg.contains("[envs.dev]"));
     assert!(cfg.contains("api_base = \"https://example.rossum.app/api/v1\""));
 
@@ -52,7 +52,6 @@ fn init_does_not_clobber_existing_claude_md() {
         .current_dir(dir.path())
         .args([
             "init",
-            "--name", "demo",
             "--env", "dev=https://example.rossum.app/api/v1:285704",
         ])
         .assert()
@@ -63,21 +62,98 @@ fn init_does_not_clobber_existing_claude_md() {
 }
 
 #[test]
-fn init_refuses_to_clobber_existing_project() {
+fn init_adds_new_env_to_existing_project() {
     let dir = TempDir::new().unwrap();
-    std::fs::write(dir.path().join("rdc.toml"), "stub").unwrap();
-
+    // Bootstrap.
     Command::cargo_bin("rdc")
         .unwrap()
         .current_dir(dir.path())
         .args([
             "init",
-            "--name", "demo",
             "--env", "dev=https://example.rossum.app/api/v1:285704",
         ])
         .assert()
+        .success();
+
+    // Re-run init to add a second env. Should succeed.
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--env", "prod=https://example.rossum.app/api/v1:285705",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Added env(s)"))
+        .stdout(predicate::str::contains("prod"))
+        .stdout(predicate::str::contains("rdc auth prod"))
+        .stdout(predicate::str::contains("rdc pull prod"));
+
+    // Config now has both envs.
+    let cfg = std::fs::read_to_string(dir.path().join("rdc.toml")).unwrap();
+    assert!(cfg.contains("[envs.dev]"));
+    assert!(cfg.contains("[envs.prod]"));
+    assert!(cfg.contains("285705"));
+
+    // Both env dirs scaffolded.
+    assert!(dir.path().join("envs/dev").is_dir());
+    assert!(dir.path().join("envs/prod").is_dir());
+    assert!(dir.path().join("envs/prod/hooks").is_dir());
+}
+
+#[test]
+fn init_on_existing_project_rejects_duplicate_env() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--env", "dev=https://example.rossum.app/api/v1:285704",
+        ])
+        .assert()
+        .success();
+
+    // Re-running with the same env name should fail clearly.
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--env", "dev=https://different.rossum.app/api/v1:999",
+        ])
+        .assert()
         .failure()
-        .stderr(predicate::str::contains("already initialized"));
+        .stderr(predicate::str::contains("env 'dev' already exists"));
+
+    // Config preserved — no partial mutation.
+    let cfg = std::fs::read_to_string(dir.path().join("rdc.toml")).unwrap();
+    assert!(cfg.contains("285704"), "original env config must be preserved");
+    assert!(!cfg.contains("999"), "rejected env must not appear");
+}
+
+#[test]
+fn init_on_existing_project_without_env_in_ci_errors_with_hint() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--env", "dev=https://example.rossum.app/api/v1:285704",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("extending existing project"))
+        .stderr(predicate::str::contains("at least one --env is required"));
 }
 
 /// In CI / piped contexts, stdin is not a TTY. `rdc init` with no flags
@@ -89,12 +165,9 @@ fn init_without_flags_in_ci_errors_with_usage_hint() {
         .unwrap()
         .current_dir(dir.path())
         .args(["init"])
-        // assert_cmd's runner inherits the parent's stdin; in `cargo test`
-        // that's the test runner's stdin, which is not a TTY. So
-        // `is_terminal()` returns false and we should get the usage error.
         .assert()
         .failure()
-        .stderr(predicate::str::contains("--name and at least one --env are required"));
+        .stderr(predicate::str::contains("at least one --env is required"));
     assert!(!dir.path().join("rdc.toml").exists(), "no project should be scaffolded on error");
 }
 
@@ -108,7 +181,6 @@ fn init_prints_next_steps() {
         .current_dir(dir.path())
         .args([
             "init",
-            "--name", "demo",
             "--env", "dev=https://example.rossum.app/api/v1:285704",
         ])
         .assert()
@@ -116,4 +188,38 @@ fn init_prints_next_steps() {
         .stdout(predicate::str::contains("Next steps:"))
         .stdout(predicate::str::contains("rdc auth dev"))
         .stdout(predicate::str::contains("rdc pull dev"));
+}
+
+/// A pre-existing rdc.toml that still has the legacy `[project]` section
+/// must still load — serde ignores unknown fields. Init in extend mode
+/// then drops the section when it re-saves the config.
+#[test]
+fn init_strips_legacy_project_section_on_extend() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("rdc.toml"),
+        r#"[project]
+name = "legacy"
+
+[envs.dev]
+api_base = "https://example.rossum.app/api/v1"
+org_id = 285704
+"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--env", "prod=https://example.rossum.app/api/v1:285705",
+        ])
+        .assert()
+        .success();
+
+    let cfg = std::fs::read_to_string(dir.path().join("rdc.toml")).unwrap();
+    assert!(!cfg.contains("[project]"), "legacy [project] section should be stripped on re-save");
+    assert!(cfg.contains("[envs.dev]"), "existing env must be preserved");
+    assert!(cfg.contains("[envs.prod]"), "new env must be added");
 }

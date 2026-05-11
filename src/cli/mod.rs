@@ -18,12 +18,10 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Bootstrap a new rdc project in the current directory.
-    /// Both `--name` and `--env` are optional; when omitted, prompts
-    /// interactively (if stdin is a TTY).
+    /// Bootstrap an rdc project in the current directory, or add a new
+    /// environment to an existing one. `--env` may be repeated; when
+    /// omitted, prompts interactively (if stdin is a TTY).
     Init {
-        #[arg(long)]
-        name: Option<String>,
         #[arg(long = "env", value_name = "ENV_SPEC")]
         envs: Vec<String>,
     },
@@ -119,7 +117,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     match cli.command {
-        Some(Command::Init { name, envs }) => crate::cli::init::run(name, envs).await,
+        Some(Command::Init { envs }) => crate::cli::init::run(envs).await,
         Some(Command::Pull { env }) => {
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
             crate::cli::pull::run(&env, interactive).await

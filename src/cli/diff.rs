@@ -114,22 +114,8 @@ async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) -> Res
                 .ok_or_else(|| anyhow!("label id {id} not found on remote"))
         }),
     ).await?;
-    diff_flat_remote::<crate::model::Engine>(
-        &paths.engines_dir(), "engines", &lockfile, &client, &mut diffs_printed,
-        |c, id| Box::pin(async move {
-            let list = c.list_engines(None).await?;
-            list.into_iter().find(|e| e.id == id)
-                .ok_or_else(|| anyhow!("engine id {id} not found on remote"))
-        }),
-    ).await?;
-    diff_flat_remote::<crate::model::EngineField>(
-        &paths.engine_fields_dir(), "engine_fields", &lockfile, &client, &mut diffs_printed,
-        |c, id| Box::pin(async move {
-            let list = c.list_engine_fields(None).await?;
-            list.into_iter().find(|f| f.id == id)
-                .ok_or_else(|| anyhow!("engine field id {id} not found on remote"))
-        }),
-    ).await?;
+    diff_engines(&paths, &lockfile, &client, &mut diffs_printed).await?;
+    diff_engine_fields(&paths, &lockfile, &client, &mut diffs_printed).await?;
 
     // Queue-nested kinds.
     if paths.workspaces_dir().exists() {
@@ -388,9 +374,98 @@ fn diff_formulas(
     }
 }
 
-/// Generic helper for flat-list kinds (rules / labels / engines /
-/// engine_fields). Reads each `<kind>/<slug>.json`, fetches the matching
-/// remote via the supplied future, and prints unified diff if they differ.
+/// Walk `engines/<slug>/engine.json` files and diff each against the
+/// fetched remote engine.
+async fn diff_engines(
+    paths: &Paths,
+    lockfile: &Lockfile,
+    client: &RossumClient,
+    counter: &mut usize,
+) -> Result<()> {
+    let engines_dir = paths.engines_dir();
+    if !engines_dir.exists() {
+        return Ok(());
+    }
+    for e_entry in std::fs::read_dir(&engines_dir)? {
+        let e_entry = e_entry?;
+        if !e_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let e_slug = e_entry.file_name().to_string_lossy().to_string();
+        let path = e_entry.path().join("engine.json");
+        if !path.exists() {
+            continue;
+        }
+        let local: crate::model::Engine = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        let local_canon = canonical_json_for_diff(&local)?;
+        let Some(id) = lookup_id(lockfile, "engines", &e_slug) else { continue };
+        let list = client.list_engines(None).await?;
+        let remote = match list.into_iter().find(|e| e.id == id) {
+            Some(r) => r,
+            None => continue,
+        };
+        let remote_canon = canonical_json_for_diff(&remote)?;
+        print_unified(
+            &format!("engines/{e_slug}/engine.json (local)"),
+            &format!("engines/{e_slug}/engine.json (remote)"),
+            &local_canon, &remote_canon, counter,
+        );
+    }
+    Ok(())
+}
+
+/// Walk `engines/<engine>/fields/<slug>.json` files and diff each
+/// against the fetched remote engine field.
+async fn diff_engine_fields(
+    paths: &Paths,
+    lockfile: &Lockfile,
+    client: &RossumClient,
+    counter: &mut usize,
+) -> Result<()> {
+    let engines_dir = paths.engines_dir();
+    if !engines_dir.exists() {
+        return Ok(());
+    }
+    let mut remote_cache: Option<Vec<crate::model::EngineField>> = None;
+    for e_entry in std::fs::read_dir(&engines_dir)? {
+        let e_entry = e_entry?;
+        if !e_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let e_slug = e_entry.file_name().to_string_lossy().to_string();
+        let fields_dir = paths.engine_fields_dir(&e_slug);
+        if !fields_dir.exists() {
+            continue;
+        }
+        for f_entry in std::fs::read_dir(&fields_dir)? {
+            let f_entry = f_entry?;
+            let name = f_entry.file_name().to_string_lossy().to_string();
+            let Some(f_slug) = name.strip_suffix(".json") else { continue };
+            if f_slug.ends_with(".remote") {
+                continue;
+            }
+            let path = fields_dir.join(format!("{f_slug}.json"));
+            let local: crate::model::EngineField = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+            let local_canon = canonical_json_for_diff(&local)?;
+            let Some(id) = lookup_id(lockfile, "engine_fields", f_slug) else { continue };
+            if remote_cache.is_none() {
+                remote_cache = Some(client.list_engine_fields(None).await?);
+            }
+            let Some(remote) = remote_cache.as_ref().unwrap().iter().find(|f| f.id == id) else { continue };
+            let remote_canon = canonical_json_for_diff(remote)?;
+            print_unified(
+                &format!("engines/{e_slug}/fields/{f_slug}.json (local)"),
+                &format!("engines/{e_slug}/fields/{f_slug}.json (remote)"),
+                &local_canon, &remote_canon, counter,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Generic helper for flat-list kinds (rules / labels). Reads each
+/// `<kind>/<slug>.json`, fetches the matching remote via the supplied
+/// future, and prints unified diff if they differ.
 async fn diff_flat_remote<T>(
     dir: &Path,
     kind: &str,

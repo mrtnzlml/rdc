@@ -213,12 +213,13 @@ mkdir my-rossum-project && cd my-rossum-project
 
 # Bootstrap. Two modes:
 #   1. Non-interactive (CI-friendly):
-rdc init --name my-project \
-  --env dev=https://YOUR-ORG.rossum.app/api/v1:YOUR_ORG_ID
+rdc init --env dev=https://YOUR-ORG.rossum.app/api/v1:YOUR_ORG_ID
 #   2. Interactive wizard (when run from a terminal with no flags):
 rdc init
-# → prompts for project name, then loops over env name + api_base + org_id
-# → blank env name finishes the loop
+# → loops over env name + api_base + org_id; blank env name finishes
+#
+# Re-running `rdc init` in an existing project adds a new environment
+# rather than failing. Existing envs are preserved.
 
 # After init, set the API token (one of these):
 rdc auth dev --token YOUR_TOKEN          # validates + writes secrets/dev.secrets.json (mode 0600)
@@ -274,9 +275,13 @@ envs/dev/
 ├── rules/
 ├── labels/
 ├── engines/
-├── engine-fields/
+│   └── <engine-slug>/
+│       ├── engine.json
+│       └── fields/<field-slug>.json    (engine fields nest under their engine)
 ├── workflows/
-├── workflow-steps/
+│   └── <workflow-slug>/
+│       ├── workflow.json
+│       └── steps/<step-slug>.json      (workflow steps nest under their workflow)
 └── mdh/                         (only when the cluster has MDH)
     └── <dataset-slug>/
         ├── collection.json

@@ -36,7 +36,7 @@ async fn repair_requires_rebuild_lock_flag() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", "dev=https://x/api/v1:1"])
+        .args(["init", "--env", "dev=https://x/api/v1:1"])
         .assert().success();
 
     Command::cargo_bin("rdc").unwrap()
@@ -54,7 +54,7 @@ async fn repair_backs_up_lockfile_and_repulls() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -94,7 +94,7 @@ async fn repair_works_when_lockfile_is_missing() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),

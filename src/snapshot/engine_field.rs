@@ -3,7 +3,9 @@ use crate::snapshot::writer::write_atomic;
 use anyhow::{Context, Result};
 use std::path::Path;
 
-/// Write an engine field as `<dir>/<slug>.json`. Returns the bytes written.
+/// Write an engine field as `<fields_dir>/<slug>.json`. `fields_dir` is
+/// expected to be `engines/<engine_slug>/fields/`. Returns the bytes
+/// written.
 pub fn write_engine_field(dir: &Path, slug: &str, f: &EngineField) -> Result<Vec<u8>> {
     let path = dir.join(format!("{slug}.json"));
     let bytes = serde_json::to_vec_pretty(f)

@@ -20,24 +20,25 @@ pub async fn process(ctx: &mut PullCtx<'_>, workflows: Vec<Workflow>, progress: 
     progress.start_phase("workflows");
 
     let mut used: HashSet<String> = HashSet::new();
-    let mut dir_created = false;
     let mut conflicts = 0usize;
     for w in &workflows {
-        if !dir_created {
-            std::fs::create_dir_all(ctx.paths.workflows_dir())
-                .with_context(|| format!("creating {}", ctx.paths.workflows_dir().display()))?;
-            dir_created = true;
-        }
         let slug = match ctx.lockfile.slug_for_id("workflows", w.id) {
             Some(existing) => existing.to_string(),
             None => slugify_unique(&w.name, &used),
         };
         used.insert(slug.clone());
 
+        // Each workflow owns a directory: `workflows/<slug>/`. The
+        // workflow's JSON lives at `workflow.json` inside it, alongside
+        // `steps/`.
+        let workflow_dir = ctx.paths.workflow_dir(&slug);
+        std::fs::create_dir_all(&workflow_dir)
+            .with_context(|| format!("creating {}", workflow_dir.display()))?;
+
         let mut proposed = serde_json::to_vec_pretty(w).context("serializing workflow")?;
         proposed.push(b'\n');
 
-        let local_path = ctx.paths.workflows_dir().join(format!("{slug}.json"));
+        let local_path = workflow_dir.join("workflow.json");
         let base_hash = ctx
             .lockfile
             .objects

@@ -98,7 +98,7 @@ async fn push_succeeds_when_local_edited_and_remote_unchanged() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -157,7 +157,7 @@ async fn push_skips_when_remote_has_drifted() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server1.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server1.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -208,7 +208,7 @@ async fn push_applies_overlay_values_to_outbound_patch() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -255,7 +255,7 @@ async fn push_with_no_local_edits_is_noop() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -306,7 +306,7 @@ async fn push_rewrites_local_file_with_canonical_form() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -390,7 +390,7 @@ async fn schema_push_succeeds_when_formula_edited() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -428,7 +428,7 @@ async fn schema_push_skips_when_no_local_edits() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -492,7 +492,7 @@ async fn schema_push_skips_when_remote_drifted() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server1.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server1.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -548,7 +548,7 @@ async fn queue_push_succeeds_when_threshold_edited() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -656,7 +656,7 @@ async fn email_template_push_succeeds_when_subject_edited() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -751,7 +751,7 @@ async fn inbox_push_succeeds_when_edited() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -786,7 +786,7 @@ async fn push_with_no_changes_prints_no_bars() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -867,7 +867,7 @@ async fn push_no_drift_when_only_modified_at_differs() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
@@ -975,7 +975,7 @@ async fn push_creates_new_hook_with_no_lockfile_entry() {
     // Scaffold a minimal project.
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "test", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),

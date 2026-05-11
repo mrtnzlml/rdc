@@ -430,10 +430,16 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
     // Engine fields ----------------------------------------------------
     for (src_slug, tgt_slug) in &mapping.engine_fields {
         let Some(tgt_id) = lookup_tgt_id(&tgt_lockfile, "engine_fields", tgt_slug, &mut skipped) else { continue };
-        let path = src_paths.engine_fields_dir().join(format!("{src_slug}.json"));
+        let Some(path) = locate_engine_field_path(&src_paths, src_slug) else {
+            eprintln!(
+                "warning: cannot locate src engine field '{src_slug}' under any engine dir; skipping"
+            );
+            skipped += 1;
+            continue;
+        };
         let raw = match std::fs::read_to_string(&path) {
             Ok(r) => r,
-            Err(e) => { eprintln!("warning: cannot read src engine-fields/{src_slug}: {e:#}"); skipped += 1; continue; }
+            Err(e) => { eprintln!("warning: cannot read src engine field '{src_slug}': {e:#}"); skipped += 1; continue; }
         };
         let mut payload: Value = match serde_json::from_str(&raw) {
             Ok(v) => v,
@@ -543,6 +549,25 @@ fn locate_queue_dir(paths: &Paths, q_slug: &str) -> Option<PathBuf> {
         }
         let ws_slug = ws_entry.file_name().to_string_lossy().to_string();
         let candidate = paths.queue_dir(&ws_slug, q_slug);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Locate an engine field's on-disk path by walking
+/// `engines/*/fields/<field_slug>.json`. Returns the first match
+/// (engine_fields slugs are globally unique).
+fn locate_engine_field_path(paths: &Paths, field_slug: &str) -> Option<PathBuf> {
+    let engines_dir = paths.engines_dir();
+    let entries = std::fs::read_dir(&engines_dir).ok()?;
+    for e_entry in entries.flatten() {
+        if !e_entry.file_type().ok()?.is_dir() {
+            continue;
+        }
+        let e_slug = e_entry.file_name().to_string_lossy().to_string();
+        let candidate = paths.engine_fields_dir(&e_slug).join(format!("{field_slug}.json"));
         if candidate.exists() {
             return Some(candidate);
         }

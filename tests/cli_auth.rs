@@ -22,7 +22,7 @@ async fn auth_writes_validated_token_to_secrets_file() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
 
     Command::cargo_bin("rdc").unwrap()
@@ -60,7 +60,7 @@ async fn auth_rejects_bad_token_and_does_not_write() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
 
     Command::cargo_bin("rdc").unwrap()
@@ -79,7 +79,7 @@ async fn auth_unknown_env_errors_clearly() {
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--name", "x", "--env", "dev=https://x/api/v1:1"])
+        .args(["init", "--env", "dev=https://x/api/v1:1"])
         .assert().success();
 
     Command::cargo_bin("rdc").unwrap()

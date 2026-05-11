@@ -103,7 +103,6 @@ async fn map_plan_apply_full_flow() {
         .current_dir(project.path())
         .args([
             "init",
-            "--name", "x",
             "--env", &format!("test={}/api/v1:1", test_server.uri()),
             "--env", &format!("prod={}/api/v1:1", prod_server.uri()),
         ])
@@ -255,8 +254,7 @@ async fn deploy_queue_and_schema() {
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
         .args([
-            "init", "--name", "x",
-            "--env", &format!("test={}/api/v1:1", test_server.uri()),
+            "init", "--env", &format!("test={}/api/v1:1", test_server.uri()),
             "--env", &format!("prod={}/api/v1:1", prod_server.uri()),
         ])
         .assert().success();

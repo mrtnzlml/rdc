@@ -110,9 +110,18 @@ impl Paths {
         self.env_root().join("engines")
     }
 
-    /// `<root>/envs/<env>/engine-fields/`
-    pub fn engine_fields_dir(&self) -> PathBuf {
-        self.env_root().join("engine-fields")
+    /// `<root>/envs/<env>/engines/<engine_slug>/`. Mirrors the
+    /// workspace-as-directory pattern: the engine's own JSON lives at
+    /// `engine.json` inside this dir, alongside a `fields/` subdir for
+    /// the engine fields it owns.
+    pub fn engine_dir(&self, engine_slug: &str) -> PathBuf {
+        self.engines_dir().join(engine_slug)
+    }
+
+    /// `<root>/envs/<env>/engines/<engine_slug>/fields/`. One file per
+    /// engine field; each engine field belongs to exactly one engine.
+    pub fn engine_fields_dir(&self, engine_slug: &str) -> PathBuf {
+        self.engine_dir(engine_slug).join("fields")
     }
 
     /// `<root>/envs/<env>/workflows/`
@@ -120,9 +129,18 @@ impl Paths {
         self.env_root().join("workflows")
     }
 
-    /// `<root>/envs/<env>/workflow-steps/`
-    pub fn workflow_steps_dir(&self) -> PathBuf {
-        self.env_root().join("workflow-steps")
+    /// `<root>/envs/<env>/workflows/<workflow_slug>/`. Same dir-with-
+    /// named-json pattern as workspaces and engines: the workflow's
+    /// own JSON lives at `workflow.json` inside this dir, alongside a
+    /// `steps/` subdir for the workflow steps it owns.
+    pub fn workflow_dir(&self, workflow_slug: &str) -> PathBuf {
+        self.workflows_dir().join(workflow_slug)
+    }
+
+    /// `<root>/envs/<env>/workflows/<workflow_slug>/steps/`. One file
+    /// per workflow step; each step belongs to exactly one workflow.
+    pub fn workflow_steps_dir(&self, workflow_slug: &str) -> PathBuf {
+        self.workflow_dir(workflow_slug).join("steps")
     }
 
     /// `<root>/envs/<env>/workspaces/<ws_slug>/queues/<queue_slug>/email-templates/`.
@@ -243,8 +261,16 @@ mod tests {
     }
 
     #[test]
+    fn engine_dir_path() {
+        assert_eq!(p().engine_dir("invoice"), Path::new("/proj/envs/dev/engines/invoice"));
+    }
+
+    #[test]
     fn engine_fields_dir_path() {
-        assert_eq!(p().engine_fields_dir(), Path::new("/proj/envs/dev/engine-fields"));
+        assert_eq!(
+            p().engine_fields_dir("invoice"),
+            Path::new("/proj/envs/dev/engines/invoice/fields")
+        );
     }
 
     #[test]
@@ -253,8 +279,19 @@ mod tests {
     }
 
     #[test]
+    fn workflow_dir_path() {
+        assert_eq!(
+            p().workflow_dir("ap-flow"),
+            Path::new("/proj/envs/dev/workflows/ap-flow")
+        );
+    }
+
+    #[test]
     fn workflow_steps_dir_path() {
-        assert_eq!(p().workflow_steps_dir(), Path::new("/proj/envs/dev/workflow-steps"));
+        assert_eq!(
+            p().workflow_steps_dir("ap-flow"),
+            Path::new("/proj/envs/dev/workflows/ap-flow/steps")
+        );
     }
 
     #[test]

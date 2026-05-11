@@ -67,7 +67,10 @@ pub async fn push(
             .with_context(|| format!("reading {}", path.display()))?;
         let entry = lockfile.objects.get("engine_fields").and_then(|m| m.get(slug.as_str())).unwrap();
         let Some(base) = &entry.content_hash else {
-            progress.println(format!("warning: engine-fields/{slug}.json — lockfile has no content_hash, skipping"));
+            progress.println(format!(
+                "warning: {} — lockfile has no content_hash, skipping",
+                path.display()
+            ));
             skipped += 1;
             continue;
         };
@@ -87,7 +90,10 @@ pub async fn push(
                 .context("listing engine fields to verify no drift before push")?);
         }
         let Some(remote_field) = remote_cache.as_ref().unwrap().iter().find(|f| f.id == id) else {
-            progress.println(format!("warning: engine-fields/{slug}.json — id {id} not found on remote, skipping"));
+            progress.println(format!(
+                "warning: {} — id {id} not found on remote, skipping",
+                path.display()
+            ));
             skipped += 1;
             continue;
         };
@@ -124,7 +130,8 @@ pub async fn push(
                 }
                 PushDriftOutcome::Skip => {
                     progress.println(format!(
-                        "warning: engine-fields/{slug}.json — remote has changed since last pull, skipping push (run `rdc pull` first)"
+                        "warning: {} — remote has changed since last pull, skipping push (run `rdc pull` first)",
+                        path.display()
                     ));
                     skipped += 1;
                     continue;

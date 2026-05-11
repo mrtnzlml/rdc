@@ -1,40 +1,54 @@
-use crate::config::{EnvConfig, ProjectConfig, ProjectMeta};
+use crate::config::{EnvConfig, ProjectConfig};
 use crate::paths::Paths;
 use crate::snapshot::writer::write_atomic;
 use anyhow::{anyhow, Context, Result};
-use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 
-pub async fn run(name: Option<String>, env_specs: Vec<String>) -> Result<()> {
+/// Whether `rdc init` is bootstrapping a new project or extending an
+/// existing one by adding new env(s).
+enum InitMode {
+    New,
+    Extend,
+}
+
+pub async fn run(env_specs: Vec<String>) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let cfg_path = cwd.join("rdc.toml");
-    if cfg_path.exists() {
-        return Err(anyhow!(
-            "directory is already initialized as an rdc project (rdc.toml exists at {})",
-            cfg_path.display()
-        ));
-    }
 
-    let (name, env_specs) = resolve_name_and_envs(name, env_specs)?;
+    let (mut cfg, mode) = if cfg_path.exists() {
+        let existing = ProjectConfig::load(&cfg_path).with_context(|| {
+            format!("loading existing project config from {}", cfg_path.display())
+        })?;
+        (existing, InitMode::Extend)
+    } else {
+        (ProjectConfig::default(), InitMode::New)
+    };
 
-    let mut envs = BTreeMap::new();
+    // Get env specs (interactive when none provided + TTY available).
+    let env_specs = resolve_env_specs(env_specs, &cfg, &mode)?;
+
+    let mut new_env_names: Vec<String> = Vec::new();
     for spec in &env_specs {
         let (env_name, env_cfg) = parse_env_spec(spec)?;
-        envs.insert(env_name, env_cfg);
+        if cfg.envs.contains_key(&env_name) {
+            return Err(anyhow!(
+                "env '{env_name}' already exists in this project; \
+                 to update it, edit {} directly",
+                cfg_path.display()
+            ));
+        }
+        cfg.envs.insert(env_name.clone(), env_cfg);
+        new_env_names.push(env_name);
     }
 
-    let cfg = ProjectConfig {
-        project: ProjectMeta { name: name.clone() },
-        envs: envs.clone(),
-    };
     cfg.save(&cfg_path)?;
 
     write_gitignore(&cwd)?;
     write_claude_md(&cwd)?;
     std::fs::create_dir_all(cwd.join("secrets"))
         .with_context(|| format!("creating {}", cwd.join("secrets").display()))?;
-    for env in envs.keys() {
+    for env in &new_env_names {
         let paths = Paths::for_env(&cwd, env);
         std::fs::create_dir_all(paths.env_root())
             .with_context(|| format!("creating {}", paths.env_root().display()))?;
@@ -42,76 +56,107 @@ pub async fn run(name: Option<String>, env_specs: Vec<String>) -> Result<()> {
             .with_context(|| format!("creating {}", paths.hooks_dir().display()))?;
     }
 
-    let env_list = envs.keys().cloned().collect::<Vec<_>>().join(", ");
-    println!("Initialized rdc project '{name}' with envs: {env_list}");
+    let env_list = new_env_names.join(", ");
+    match mode {
+        InitMode::New => {
+            println!("Initialized rdc project with envs: {env_list}");
+        }
+        InitMode::Extend => {
+            println!("Added env(s): {env_list}");
+        }
+    }
     println!();
     println!("Next steps:");
-    for env in envs.keys() {
+    for env in &new_env_names {
         let upper = env.to_uppercase();
         println!("  • Set the API token for env '{env}':");
         println!("      rdc auth {env} --token <token>     # validates + writes secrets/{env}.secrets.json");
         println!("      # or: export RDC_TOKEN_{upper}=<token>");
     }
-    for env in envs.keys() {
+    for env in &new_env_names {
         println!("  • Pull a snapshot:  rdc pull {env}");
     }
     Ok(())
 }
 
-/// If both `name` and at least one env spec are provided, use them as-is.
-/// Otherwise prompt interactively (TTY only). Without a TTY, fail with a
-/// usage hint so CI gets a clear error rather than blocking on stdin.
-fn resolve_name_and_envs(
-    name: Option<String>,
+/// Resolve the list of env specs to use. When `env_specs` is empty,
+/// prompts interactively (TTY-only). The prompt copy differs by mode
+/// so users adding to an existing project see context about what's
+/// already defined.
+fn resolve_env_specs(
     env_specs: Vec<String>,
-) -> Result<(String, Vec<String>)> {
-    if let (Some(n), false) = (&name, env_specs.is_empty()) {
-        return Ok((n.clone(), env_specs));
+    cfg: &ProjectConfig,
+    mode: &InitMode,
+) -> Result<Vec<String>> {
+    if !env_specs.is_empty() {
+        return Ok(env_specs);
     }
     if !std::io::stdin().is_terminal() {
-        return Err(anyhow!(
-            "rdc init: --name and at least one --env are required when stdin is not a TTY. \
-Example: rdc init --name myproj --env dev=https://api.elis.rossum.ai/v1:123456"
-        ));
+        let example = "rdc init --env dev=https://api.elis.rossum.ai/v1:123456";
+        let msg = match mode {
+            InitMode::New => format!(
+                "rdc init: at least one --env is required when stdin is not a TTY. \
+                 Example: {example}"
+            ),
+            InitMode::Extend => format!(
+                "rdc init: at least one --env is required when stdin is not a TTY \
+                 (extending existing project). Example: {example}"
+            ),
+        };
+        return Err(anyhow!(msg));
     }
-    let name = match name {
-        Some(n) => n,
-        None => {
-            let n = prompt("Project name: ")?;
-            if n.is_empty() {
-                return Err(anyhow!("project name cannot be empty"));
-            }
-            n
+
+    println!();
+    match mode {
+        InitMode::New => {
+            println!(
+                "Define one or more environments. Press Enter on the env name to finish."
+            );
         }
-    };
-    let mut env_specs = env_specs;
+        InitMode::Extend => {
+            let existing = if cfg.envs.is_empty() {
+                "(none)".to_string()
+            } else {
+                cfg.envs.keys().cloned().collect::<Vec<_>>().join(", ")
+            };
+            println!("Adding env(s) to existing project. Existing envs: {existing}.");
+            println!(
+                "Define one or more new environments. Press Enter on the env name to finish."
+            );
+        }
+    }
+
+    let mut env_specs: Vec<String> = Vec::new();
+    loop {
+        let env_name = prompt("\n  env name: ")?;
+        if env_name.is_empty() {
+            break;
+        }
+        if cfg.envs.contains_key(&env_name) {
+            return Err(anyhow!(
+                "env '{env_name}' already exists in this project; \
+                 to update it, edit rdc.toml directly"
+            ));
+        }
+        let api_base = prompt("  api_base (e.g. https://api.elis.rossum.ai/v1): ")?;
+        if api_base.is_empty() {
+            return Err(anyhow!("api_base cannot be empty for env '{env_name}'"));
+        }
+        let org_id = prompt("  org_id: ")?;
+        if org_id.is_empty() {
+            return Err(anyhow!("org_id cannot be empty for env '{env_name}'"));
+        }
+        // Light validation: ensure it parses as u64 here too so we
+        // surface the error before scaffolding starts.
+        org_id
+            .parse::<u64>()
+            .with_context(|| format!("org_id '{org_id}' must be a positive integer"))?;
+        env_specs.push(format!("{env_name}={api_base}:{org_id}"));
+    }
     if env_specs.is_empty() {
-        println!();
-        println!("Define one or more environments. Press Enter on the env name to finish.");
-        loop {
-            let env_name = prompt("\n  env name: ")?;
-            if env_name.is_empty() {
-                break;
-            }
-            let api_base = prompt("  api_base (e.g. https://api.elis.rossum.ai/v1): ")?;
-            if api_base.is_empty() {
-                return Err(anyhow!("api_base cannot be empty for env '{env_name}'"));
-            }
-            let org_id = prompt("  org_id: ")?;
-            if org_id.is_empty() {
-                return Err(anyhow!("org_id cannot be empty for env '{env_name}'"));
-            }
-            // Light validation: ensure it parses as u64 here too so we
-            // surface the error before scaffolding starts.
-            org_id.parse::<u64>()
-                .with_context(|| format!("org_id '{org_id}' must be a positive integer"))?;
-            env_specs.push(format!("{env_name}={api_base}:{org_id}"));
-        }
-        if env_specs.is_empty() {
-            return Err(anyhow!("at least one env is required"));
-        }
+        return Err(anyhow!("at least one env is required"));
     }
-    Ok((name, env_specs))
+    Ok(env_specs)
 }
 
 fn prompt(msg: &str) -> Result<String> {
@@ -214,10 +259,12 @@ envs/<env>/
   hooks/<slug>.json                       + sibling <slug>.py for function hooks
   rules/<slug>.json
   labels/<slug>.json
-  engines/<slug>.json
-  engine-fields/<slug>.json
-  workflows/<slug>.json
-  workflow-steps/<slug>.json
+  engines/<engine_slug>/
+    engine.json
+    fields/<field_slug>.json                each engine field nests under its engine
+  workflows/<workflow_slug>/
+    workflow.json
+    steps/<step_slug>.json                  each step nests under its workflow
   mdh/<dataset>/                          Master Data Hub (if enabled)
 .rdc/
   state/<env>.lock.json                   slug↔id + base hashes; never edit
@@ -289,4 +336,17 @@ keep the local on disk.
 - `*.remote` files (shadow files from conflict resolution; either
   consume the changes or delete the file)
 - Contents of `secrets/` (gitignored API tokens)
+
+## Known limitations
+
+- **One schema per queue, one inbox per queue.** The Rossum API
+  technically allows a single schema or inbox to be referenced by many
+  queues (`schema.queues` / `inbox.queues` are arrays). rdc's on-disk
+  layout assumes each queue owns its own schema and inbox — the files
+  live at `workspaces/<ws>/queues/<q>/schema.json` and `inbox.json`.
+  If a tenant shares a schema or inbox across queues, rdc will write
+  duplicate copies (one per consuming queue) and the lockfile will
+  carry an entry per queue slug pointing at the same remote id. Push
+  to that shared resource works (id is the truth), but cross-env
+  deploys via `rdc apply` may surface confusing diffs.
 "#;

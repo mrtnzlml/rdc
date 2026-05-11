@@ -63,16 +63,8 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
 
     // Other org-wide flat kinds. Workflows + workflow_steps excluded —
     // Rossum's workflow API is read-only.
-    total_count += plan_flat_kind(
-        "engines", &mapping.engines,
-        &src_paths.engines_dir(),
-        &tgt_lockfile, tgt, &mut total_warnings,
-    );
-    total_count += plan_flat_kind(
-        "engine_fields", &mapping.engine_fields,
-        &src_paths.engine_fields_dir(),
-        &tgt_lockfile, tgt, &mut total_warnings,
-    );
+    total_count += plan_engines(&mapping.engines, &src_paths, &tgt_lockfile, tgt, &mut total_warnings);
+    total_count += plan_engine_fields(&mapping.engine_fields, &src_paths, &tgt_lockfile, tgt, &mut total_warnings);
 
     if total_count == 0 && total_warnings == 0 {
         println!("  (no mapped objects)");
@@ -105,6 +97,75 @@ fn plan_flat_kind(
         count += 1;
     }
     count
+}
+
+fn plan_engines(
+    pairs: &BTreeMap<String, String>,
+    src_paths: &Paths,
+    tgt_lockfile: &Lockfile,
+    tgt: &str,
+    warnings: &mut usize,
+) -> usize {
+    let mut count = 0;
+    for (src_slug, tgt_slug) in pairs {
+        let src_path = src_paths.engine_dir(src_slug).join("engine.json");
+        if !src_path.exists() {
+            eprintln!("warning: src engines/{src_slug}/engine.json missing — skipping in plan");
+            *warnings += 1;
+            continue;
+        }
+        let Some(tgt_id) = tgt_lockfile_id(tgt_lockfile, "engines", tgt_slug) else {
+            eprintln!("warning: tgt lockfile has no entry for engines/{tgt_slug} — run `rdc pull {tgt}` first");
+            *warnings += 1;
+            continue;
+        };
+        println!("  ~ engines/{src_slug}  →  {tgt}/{tgt_slug} (id {tgt_id})");
+        count += 1;
+    }
+    count
+}
+
+fn plan_engine_fields(
+    pairs: &BTreeMap<String, String>,
+    src_paths: &Paths,
+    tgt_lockfile: &Lockfile,
+    tgt: &str,
+    warnings: &mut usize,
+) -> usize {
+    let mut count = 0;
+    for (src_slug, tgt_slug) in pairs {
+        let Some(src_path) = locate_engine_field(src_paths, src_slug) else {
+            eprintln!("warning: src engine field '{src_slug}' missing under any engine — skipping in plan");
+            *warnings += 1;
+            continue;
+        };
+        let _ = src_path; // existence already verified by locate
+        let Some(tgt_id) = tgt_lockfile_id(tgt_lockfile, "engine_fields", tgt_slug) else {
+            eprintln!("warning: tgt lockfile has no entry for engine_fields/{tgt_slug} — run `rdc pull {tgt}` first");
+            *warnings += 1;
+            continue;
+        };
+        println!("  ~ engine_fields/{src_slug}  →  {tgt}/{tgt_slug} (id {tgt_id})");
+        count += 1;
+    }
+    count
+}
+
+/// Walk `engines/*/fields/<slug>.json` and return the first match.
+fn locate_engine_field(paths: &Paths, slug: &str) -> Option<PathBuf> {
+    let engines_dir = paths.engines_dir();
+    let entries = std::fs::read_dir(&engines_dir).ok()?;
+    for e_entry in entries.flatten() {
+        if !e_entry.file_type().ok()?.is_dir() {
+            continue;
+        }
+        let e_slug = e_entry.file_name().to_string_lossy().to_string();
+        let p = paths.engine_fields_dir(&e_slug).join(format!("{slug}.json"));
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 fn plan_queue_nested(

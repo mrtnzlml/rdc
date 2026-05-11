@@ -3,16 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Default)]
 pub struct ProjectConfig {
-    pub project: ProjectMeta,
     #[serde(default)]
     pub envs: BTreeMap<String, EnvConfig>,
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
-pub struct ProjectMeta {
-    pub name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
@@ -94,10 +88,30 @@ mod tests {
                 org_id: 285704,
             },
         );
-        ProjectConfig {
-            project: ProjectMeta { name: "demo".to_string() },
-            envs,
-        }
+        ProjectConfig { envs }
+    }
+
+    /// Older `rdc.toml` files written before the `[project]` section was
+    /// removed must still load — serde ignores unknown fields by default,
+    /// and `envs` is what we care about.
+    #[test]
+    fn load_ignores_legacy_project_section() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rdc.toml");
+        std::fs::write(
+            &path,
+            r#"[project]
+name = "legacy"
+
+[envs.dev]
+api_base = "https://example.rossum.app/api/v1"
+org_id = 285704
+"#,
+        )
+        .unwrap();
+        let cfg = ProjectConfig::load(&path).unwrap();
+        assert!(cfg.envs.contains_key("dev"));
+        assert_eq!(cfg.envs["dev"].org_id, 285704);
     }
 
     #[test]

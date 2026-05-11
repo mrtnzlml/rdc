@@ -36,8 +36,8 @@ pub async fn run(src: &str, tgt: &str, check: bool) -> Result<()> {
     // intentionally excluded — Rossum's workflow API is read-only via PATCH
     // on every plan we've checked (OPTIONS returns "GET, HEAD, OPTIONS"),
     // so push/deploy can never succeed.
-    let eng_new = match_kind(&mut mapping.engines, &src_paths.engines_dir(), &tgt_paths.engines_dir())?;
-    let ef_new = match_kind(&mut mapping.engine_fields, &src_paths.engine_fields_dir(), &tgt_paths.engine_fields_dir())?;
+    let eng_new = match_engines(&mut mapping.engines, &src_paths, &tgt_paths)?;
+    let ef_new = match_engine_fields(&mut mapping.engine_fields, &src_paths, &tgt_paths)?;
 
     let any_total = mapping.hooks.len()
         + mapping.rules.len()
@@ -114,6 +114,104 @@ fn list_flat_slugs(dir: &Path) -> Result<Vec<String>> {
     }
     out.sort();
     Ok(out)
+}
+
+/// List engine slugs from `engines/<slug>/engine.json` layout.
+fn list_engine_slugs(paths: &Paths) -> Result<Vec<String>> {
+    let engines_dir = paths.engines_dir();
+    if !engines_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&engines_dir)
+        .with_context(|| format!("reading {}", engines_dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("listing {}", engines_dir.display()))?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let slug = entry.file_name().to_string_lossy().to_string();
+        // Only count engines that have their JSON on disk.
+        if entry.path().join("engine.json").exists() {
+            out.push(slug);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// List engine-field slugs across every engine. Slugs are globally
+/// unique so the parent-engine slug doesn't appear in the result.
+fn list_engine_field_slugs(paths: &Paths) -> Result<Vec<String>> {
+    let engines_dir = paths.engines_dir();
+    if !engines_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for e_entry in std::fs::read_dir(&engines_dir)? {
+        let e_entry = e_entry?;
+        if !e_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let e_slug = e_entry.file_name().to_string_lossy().to_string();
+        let fields_dir = paths.engine_fields_dir(&e_slug);
+        if !fields_dir.exists() {
+            continue;
+        }
+        for f_entry in std::fs::read_dir(&fields_dir)? {
+            let f_entry = f_entry?;
+            let name = f_entry.file_name().to_string_lossy().to_string();
+            if let Some(slug) = name.strip_suffix(".json") {
+                if !slug.ends_with(".remote") {
+                    out.push(slug.to_string());
+                }
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Auto-match engine slugs by directory name.
+fn match_engines(
+    existing: &mut BTreeMap<String, String>,
+    src_paths: &Paths,
+    tgt_paths: &Paths,
+) -> Result<usize> {
+    let src_slugs = list_engine_slugs(src_paths)?;
+    let tgt_slugs: std::collections::HashSet<_> = list_engine_slugs(tgt_paths)?.into_iter().collect();
+    let mut added = 0;
+    for src_slug in &src_slugs {
+        if existing.contains_key(src_slug) {
+            continue;
+        }
+        if tgt_slugs.contains(src_slug) {
+            existing.insert(src_slug.clone(), src_slug.clone());
+            added += 1;
+        }
+    }
+    Ok(added)
+}
+
+/// Auto-match engine-field slugs across all engines.
+fn match_engine_fields(
+    existing: &mut BTreeMap<String, String>,
+    src_paths: &Paths,
+    tgt_paths: &Paths,
+) -> Result<usize> {
+    let src_slugs = list_engine_field_slugs(src_paths)?;
+    let tgt_slugs: std::collections::HashSet<_> = list_engine_field_slugs(tgt_paths)?.into_iter().collect();
+    let mut added = 0;
+    for src_slug in &src_slugs {
+        if existing.contains_key(src_slug) {
+            continue;
+        }
+        if tgt_slugs.contains(src_slug) {
+            existing.insert(src_slug.clone(), src_slug.clone());
+            added += 1;
+        }
+    }
+    Ok(added)
 }
 
 /// Auto-match queue slugs by directory name. The lockfile keys queues by

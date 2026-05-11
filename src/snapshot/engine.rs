@@ -3,19 +3,20 @@ use crate::snapshot::writer::write_atomic;
 use anyhow::{Context, Result};
 use std::path::Path;
 
-/// Write an engine as `<dir>/<slug>.json`. Returns the bytes written.
-pub fn write_engine(dir: &Path, slug: &str, e: &Engine) -> Result<Vec<u8>> {
-    let path = dir.join(format!("{slug}.json"));
-    let bytes = serde_json::to_vec_pretty(e)
-        .context("serializing engine")?;
-    let mut bytes = bytes;
+/// Write an engine as `<engine_dir>/engine.json`. The engine dir is
+/// expected to be `engines/<slug>/`; the engine's own JSON sits beside
+/// the `fields/` subdir that contains its engine fields. Mirrors the
+/// `workspaces/<ws>/workspace.json` pattern.
+pub fn write_engine(engine_dir: &Path, e: &Engine) -> Result<Vec<u8>> {
+    let path = engine_dir.join("engine.json");
+    let mut bytes = serde_json::to_vec_pretty(e).context("serializing engine")?;
     bytes.push(b'\n');
     write_atomic(&path, &bytes)?;
     Ok(bytes)
 }
 
-pub fn read_engine(dir: &Path, slug: &str) -> Result<Engine> {
-    let path = dir.join(format!("{slug}.json"));
+pub fn read_engine(engine_dir: &Path) -> Result<Engine> {
+    let path = engine_dir.join("engine.json");
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&raw)
@@ -40,9 +41,11 @@ mod tests {
     #[test]
     fn round_trip() {
         let dir = TempDir::new().unwrap();
+        let engine_dir = dir.path().join("e");
+        std::fs::create_dir_all(&engine_dir).unwrap();
         let original = sample();
-        write_engine(dir.path(), "e", &original).unwrap();
-        let read = read_engine(dir.path(), "e").unwrap();
+        write_engine(&engine_dir, &original).unwrap();
+        let read = read_engine(&engine_dir).unwrap();
         assert_eq!(original, read);
     }
 }
