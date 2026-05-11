@@ -76,9 +76,30 @@ pub enum Command {
         #[arg(long = "rebuild-lock")]
         rebuild_lock: bool,
     },
+    /// Download and install the latest rdc release in place. Replaces
+    /// the running binary atomically; keeps the previous binary as
+    /// `<install_dir>/rdc.bak` for one-shot rollback.
+    Upgrade {
+        /// Pin to a specific version instead of the latest (emergency
+        /// downgrade; you may need to re-pull afterward).
+        #[arg(long)]
+        version: Option<String>,
+        /// Only check for a newer version; don't install.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
+    // Once-daily passive nudge. Skipped for the upgrade command since
+    // it computes the same answer fresh. Refresh runs first (tight 2s
+    // timeout, silent on failure) so the cache is up-to-date by the
+    // time we decide whether to print.
+    if !matches!(cli.command, Some(Command::Upgrade { .. })) {
+        crate::upgrade::refresh_cache_if_stale().await;
+        crate::upgrade::emit_nudge_if_available();
+    }
+
     match cli.command {
         Some(Command::Init { name, envs }) => crate::cli::init::run(name, envs).await,
         Some(Command::Pull { env }) => {
@@ -97,6 +118,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Auth { env, token }) => crate::cli::auth::run(&env, token).await,
         Some(Command::Repair { env, rebuild_lock }) => {
             crate::cli::repair::run(&env, rebuild_lock).await
+        }
+        Some(Command::Upgrade { version, check }) => {
+            let target = match version {
+                Some(v) => Some(crate::upgrade::Version::parse(&v)?),
+                None => None,
+            };
+            crate::upgrade::run_upgrade(target, check).await
         }
         None => {
             use clap::CommandFactory;

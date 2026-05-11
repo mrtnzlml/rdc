@@ -10,3 +10,4 @@ pub mod secrets;
 pub mod slug;
 pub mod snapshot;
 pub mod state;
+pub mod upgrade;
