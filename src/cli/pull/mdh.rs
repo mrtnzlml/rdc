@@ -98,7 +98,7 @@ pub async fn process(ctx: &mut PullCtx<'_>, listed: MdhListed, progress: &Arc<Ov
     }
 
     // === Sub-phase B: concurrent index fetches per collection (regular +
-    //            search). Bounded by ctx.concurrency.
+    //            search). Bounded fan-out (see common::PULL_FANOUT).
     let client_ref = &client;
     let progress_inner = progress.clone();
     let fetched: Vec<(String, IndexSet)> = futures::stream::iter(
@@ -114,7 +114,7 @@ pub async fn process(ctx: &mut PullCtx<'_>, listed: MdhListed, progress: &Arc<Ov
             Ok::<_, anyhow::Error>((slug, IndexSet { regular, search }))
         }
     })
-    .buffer_unordered(ctx.concurrency)
+    .buffer_unordered(crate::cli::pull::common::PULL_FANOUT)
     .try_collect()
     .await?;
     let by_slug: std::collections::HashMap<String, IndexSet> = fetched.into_iter().collect();

@@ -36,8 +36,7 @@ on purpose, or the existing default is the one we'd recommend anyway.
   engine fields, workflows, workflow steps, email templates, and MDH
   collections + indexes. The Data Storage URL is derived from
   `api_base` — no extra config. Per-queue sub-fetches (schema +
-  inbox) and per-MDH-collection index fetches are pipelined via a
-  bounded `--concurrency` (spec §7.2 / §16, default 5).
+  inbox) and per-MDH-collection index fetches are pipelined.
 - **Push** locally-edited objects back to the API for hooks, rules,
   labels, queues, schemas (formula round-trip), inboxes, email
   templates, engines, and engine fields. Workflows and workflow
@@ -585,22 +584,8 @@ These flags can be passed to any subcommand:
 
 | Flag | Description |
 |------|-------------|
-| `--concurrency N` | Maximum parallel API calls inside `rdc pull`. Default 5. Also reads `RDC_CONCURRENCY`. |
 | `--no-color` | Disable ANSI color output. Also honored via the `NO_COLOR` environment variable. |
 | `--yes` | Skip interactive prompts (conflict resolver, init wizard). Auto-enabled when stdin isn't a TTY. |
-
-**Concurrency.** `rdc pull` lists every kind sequentially (one
-`list_*` call per kind), but a queue tree of 25 queues otherwise
-needs 50 sequential round-trips for schema + inbox, and a 10-MDH
-deploy needs 20 sequential round-trips for regular + search
-indexes. With `--concurrency N`, the per-queue and per-collection
-sub-fetches are pipelined `N` at a time. Beyond ~5 the gains
-flatten because the upstream `list_*` calls remain serial.
-
-```sh
-rdc --concurrency 10 pull dev
-RDC_CONCURRENCY=10 rdc pull dev   # equivalent
-```
 
 **Transient-error handling.** Every Rossum and Data Storage HTTP
 call retries automatically on:

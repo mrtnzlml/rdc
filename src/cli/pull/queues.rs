@@ -136,7 +136,7 @@ pub async fn process(ctx: &mut PullCtx<'_>, queues: Vec<Queue>, progress: &Arc<O
     }
 
     // === Sub-phase B: concurrent schema + inbox fetches ===
-    // Per spec §16 #4 + §7.2: bounded by ctx.concurrency.
+    // Bounded fan-out (see common::PULL_FANOUT).
     let client = ctx.client;
     let progress_inner = progress.clone();
     let fetched_vec: Vec<(u64, Option<Schema>, Option<Inbox>)> = futures::stream::iter(
@@ -158,7 +158,7 @@ pub async fn process(ctx: &mut PullCtx<'_>, queues: Vec<Queue>, progress: &Arc<O
             Ok::<_, anyhow::Error>((qid, schema, inbox))
         }
     })
-    .buffer_unordered(ctx.concurrency)
+    .buffer_unordered(crate::cli::pull::common::PULL_FANOUT)
     .try_collect()
     .await?;
     let fetched: HashMap<u64, (Option<Schema>, Option<Inbox>)> =

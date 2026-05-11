@@ -3,10 +3,6 @@ use clap::{Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(name = "rdc", version, about = "Rossum Deployment as Code")]
 pub struct Cli {
-    /// Maximum parallel API calls during pull (default 5; also respects
-    /// the `RDC_CONCURRENCY` env var).
-    #[arg(long, global = true, value_name = "N")]
-    pub concurrency: Option<usize>,
     /// Disable ANSI color in output. Also honored via `NO_COLOR`.
     #[arg(long = "no-color", global = true)]
     pub no_color: bool,
@@ -18,18 +14,6 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Option<Command>,
-}
-
-/// Resolve the effective concurrency for this invocation.
-///
-/// Priority order: `--concurrency` flag, then `RDC_CONCURRENCY` env var,
-/// then the spec §16 default of 5. Used by the pull driver to bound the
-/// number of in-flight HTTP requests.
-pub fn resolve_concurrency(flag: Option<usize>) -> usize {
-    flag
-        .or_else(|| std::env::var("RDC_CONCURRENCY").ok().and_then(|s| s.parse().ok()))
-        .unwrap_or(5)
-        .max(1)
 }
 
 #[derive(Debug, Subcommand)]
@@ -98,9 +82,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Some(Command::Init { name, envs }) => crate::cli::init::run(name, envs).await,
         Some(Command::Pull { env }) => {
-            let concurrency = resolve_concurrency(cli.concurrency);
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
-            crate::cli::pull::run(&env, concurrency, interactive).await
+            crate::cli::pull::run(&env, interactive).await
         }
         Some(Command::Push { env }) => {
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
