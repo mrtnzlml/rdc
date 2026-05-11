@@ -132,12 +132,15 @@ running `rdc` during the upgrade never sees a missing file.
 
 ### Upgrading from older lockfiles
 
-A previous release changed how `content_hash` is computed: server-managed
-fields (`modified_at`, `modifier`) are now stripped before hashing. The
-first pull on a lockfile written before that change can surface
-false-positive conflicts on every object.
+Most rdc upgrades don't touch how `content_hash` is computed and need
+no special handling. The rare exception is a release that changes the
+hash inputs themselves — for example, stripping a new server-managed
+field before hashing. The first pull on a lockfile written before such
+a change can surface false-positive conflicts on every object, because
+old hashes don't match newly-computed ones.
 
-To clear the storm without resolving each conflict by hand:
+When that happens, clear the storm without resolving each conflict by
+hand:
 
 ```sh
 rdc repair --rebuild-lock <env>
@@ -146,6 +149,11 @@ rdc repair --rebuild-lock <env>
 Subsequent pulls will be clean. Real edits made before re-baselining
 remain visible — `repair` only resets the hash; it does not discard
 local edits.
+
+Hash-input changes are treated as semver-breaking events: they happen
+rarely, and the release notes will say so explicitly when they do. This
+keeps the day-to-day upgrade path quiet, with `repair --rebuild-lock`
+reserved as the one-shot recovery whenever a release notes flags it.
 
 ## Install
 
