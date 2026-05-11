@@ -101,6 +101,22 @@ pub async fn run(env_filter: Option<String>) -> Result<()> {
                 println!("            {kind}/{slug}");
             }
         }
+
+        // Pending renames: stale local slugs vs current JSON name fields.
+        // Surfaced here so it's discoverable outside of pull-summary
+        // scrollback. Run `rdc map <env>` to apply.
+        let pending = crate::cli::deploy::realign::detect(&paths, &lockfile);
+        if pending.is_empty() {
+            println!("  renames:  none");
+        } else {
+            println!(
+                "  renames:  {} pending (run `rdc map {env}` to apply):",
+                pending.len()
+            );
+            for p in &pending {
+                println!("            {}", p.describe());
+            }
+        }
     }
 
     Ok(())

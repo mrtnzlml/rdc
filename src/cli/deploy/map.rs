@@ -5,7 +5,7 @@ use anyhow::{anyhow, Context, Result};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-pub async fn run(src: &str, tgt: &str) -> Result<()> {
+pub async fn run(src: &str, tgt: &str, check: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let src_paths = Paths::for_env(&cwd, src);
     let tgt_paths = Paths::for_env(&cwd, tgt);
@@ -48,6 +48,17 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         + mapping.email_templates.len()
         + mapping.engines.len()
         + mapping.engine_fields.len();
+    if check {
+        println!(
+            "Would auto-match {h_new} new hooks, {r_new} new rules, {l_new} new labels, \
+{q_new} new queues, {s_new} new schemas, {i_new} new inboxes, \
+{e_new} new email templates, {eng_new} new engines, {ef_new} new engine fields \
+by slug. Would write {}.",
+            mapping_path.display()
+        );
+        return Ok(());
+    }
+
     if any_total > 0 {
         std::fs::create_dir_all(src_paths.mapping_dir())
             .with_context(|| format!("creating {}", src_paths.mapping_dir().display()))?;
