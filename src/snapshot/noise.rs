@@ -39,11 +39,45 @@ pub fn strip_noise_fields(value: &mut serde_json::Value) {
 /// unchanged if parsing fails (e.g., non-JSON inputs from tests or
 /// raw formula bytes used inside combined hashes).
 pub fn canonicalize_for_hash(bytes: &[u8]) -> Vec<u8> {
+    canonicalize_with_extra_strips(bytes, &[])
+}
+
+/// Same as `canonicalize_for_hash` but also strips additional keys
+/// (recursively) that the caller knows are server-managed for the
+/// specific kind being hashed. Used by `hook_combined_hash` to strip
+/// `status` — Rossum's hook deployment cycles `status` from
+/// `"pending"` → `"ready"` asynchronously after POST, so a hook
+/// created at T0 and re-read at T0+a-few-seconds otherwise produces
+/// different hashes and triggers spurious drift on the very next
+/// push.
+pub fn canonicalize_with_extra_strips(bytes: &[u8], extra: &[&str]) -> Vec<u8> {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
         return bytes.to_vec();
     };
     strip_noise_fields(&mut value);
+    if !extra.is_empty() {
+        strip_field_recursive(&mut value, extra);
+    }
     serde_json::to_vec(&value).unwrap_or_else(|_| bytes.to_vec())
+}
+
+fn strip_field_recursive(value: &mut serde_json::Value, fields: &[&str]) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for f in fields {
+                map.remove(*f);
+            }
+            for (_, child) in map.iter_mut() {
+                strip_field_recursive(child, fields);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                strip_field_recursive(item, fields);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]

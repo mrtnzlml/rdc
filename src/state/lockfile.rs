@@ -207,7 +207,13 @@ pub fn schema_combined_hash(json_bytes: &[u8], formulas: &[(String, Vec<u8>)]) -
 /// )
 /// ```
 pub fn hook_combined_hash(json_bytes: &[u8], code: &Option<String>) -> String {
-    let canonical = crate::snapshot::noise::canonicalize_for_hash(json_bytes);
+    // `status` is server-managed for hooks (pending → ready transition
+    // happens asynchronously after a POST). Strip it from the hash so
+    // a hook created at T0 doesn't show drift at T0+a-few-seconds.
+    let canonical = crate::snapshot::noise::canonicalize_with_extra_strips(
+        json_bytes,
+        &["status"],
+    );
     let mut hasher = Sha256::new();
     hasher.update(&canonical);
     if let Some(code) = code {

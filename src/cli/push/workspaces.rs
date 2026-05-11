@@ -1,7 +1,7 @@
-//! Push workspaces. Supports both PATCH (existing workspace edited) and
-//! POST (new workspace). Workspaces sit at the top of the dependency tree
-//! — queues, schemas, inboxes, email_templates all root from a workspace
-//! by URL — so this driver runs first in the phase-2 dispatch.
+//! Push workspaces. Handles both CREATE (POST) and UPDATE (PATCH).
+//! Workspaces sit at the top of the dependency tree — queues, schemas,
+//! inboxes, email_templates all root from a workspace by URL — so this
+//! driver runs first in the phase-2 dispatch.
 
 use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
@@ -30,14 +30,14 @@ pub async fn push(
     let mut skipped = 0usize;
 
     for (ws_slug, ws_path) in changes {
-        // Overlay for workspaces lives under [hooks.<slug>]-style sections;
-        // workspaces don't have a typed overlay accessor today, so the
-        // payload is sent as-is (no overlay merge). This keeps the create
-        // path simple. Adding an overlay accessor is a follow-up if needed.
+        // Workspaces don't have a typed overlay accessor in `Overlay`
+        // today (no `[workspaces.<slug>]` section). If users start
+        // needing one — e.g. per-env `autopilot` differences — that's a
+        // future Overlay extension; for now the payload is sent as-is.
         let overlay_paths: Option<&BTreeMap<String, serde_json::Value>> = None;
         let _ = overlay;
 
-        // Missing lockfile entry → new workspace, POST.
+        // CREATE — no lockfile entry yet.
         if lockfile.objects.get("workspaces").and_then(|m| m.get(ws_slug.as_str())).is_none() {
             let disk_bytes = std::fs::read(ws_path)
                 .with_context(|| format!("reading {}", ws_path.display()))?;
@@ -72,15 +72,89 @@ pub async fn push(
             continue;
         }
 
-        // Workspaces have no PATCH driver today. Local edits on existing
-        // workspaces aren't pushed (would need an update_workspace method
-        // + drift detection). Surface a clear message rather than a
-        // silent skip so users know an edit they made won't propagate.
-        progress.println(format!(
-            "warning: workspaces/{ws_slug} has local edits but workspace push is create-only — re-run `rdc pull` to revert, or PATCH manually via the API"
-        ));
-        skipped += 1;
-        let _ = interactive;
+        // UPDATE — existing workspace, PATCH the diff with drift detection.
+        let entry = lockfile.objects.get("workspaces").and_then(|m| m.get(ws_slug.as_str())).unwrap();
+        let Some(base) = &entry.content_hash else {
+            progress.println(format!("warning: workspaces/{ws_slug} — lockfile entry has no content_hash, skipping"));
+            skipped += 1;
+            continue;
+        };
+        let base = base.clone();
+        let id = entry.id;
+
+        let disk_bytes = std::fs::read(ws_path)
+            .with_context(|| format!("reading {}", ws_path.display()))?;
+        let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
+            .with_context(|| format!("parsing {}", ws_path.display()))?;
+        if let Some(p) = overlay_paths {
+            apply_overrides(&mut payload, p);
+        }
+        let payload_workspace: crate::model::Workspace = serde_json::from_value(payload)
+            .with_context(|| format!("deserializing overlay-applied workspace '{ws_slug}'"))?;
+
+        // Drift check.
+        let remote_workspace = client.get_workspace(id, Some(progress.clone())).await
+            .with_context(|| format!("fetching workspace {id} to verify drift before push"))?;
+        let mut remote_bytes = serde_json::to_vec_pretty(&remote_workspace)
+            .context("serializing remote workspace")?;
+        remote_bytes.push(b'\n');
+        let remote_bytes = maybe_strip_overlay(remote_bytes, overlay_paths)?;
+        let remote_combined = content_hash(&remote_bytes);
+        let mut payload_to_send = payload_workspace;
+        if &remote_combined != &base {
+            use crate::cli::resolve::{resolve_push_drift, PushDriftOutcome};
+            match resolve_push_drift(interactive, ws_path, &remote_bytes)? {
+                PushDriftOutcome::Patch { payload_override } => {
+                    if let Some(bytes) = payload_override {
+                        payload_to_send = serde_json::from_slice(&bytes)
+                            .with_context(|| format!("re-deserializing edited workspace '{ws_slug}'"))?;
+                    }
+                }
+                PushDriftOutcome::Adopt => {
+                    write_atomic(ws_path, &remote_bytes)
+                        .with_context(|| format!("adopting remote into {}", ws_path.display()))?;
+                    lockfile.upsert(
+                        "workspaces",
+                        ws_slug,
+                        ObjectEntry {
+                            id,
+                            url: Some(remote_workspace.url.clone()),
+                            modified_at: remote_workspace.modified_at().map(|s| s.to_string()),
+                            content_hash: Some(remote_combined),
+                        },
+                    );
+                    skipped += 1;
+                    continue;
+                }
+                PushDriftOutcome::Skip => {
+                    progress.println(format!("warning: workspaces/{ws_slug} — remote has changed since last pull, skipping"));
+                    skipped += 1;
+                    continue;
+                }
+            }
+        }
+
+        let updated = client.update_workspace(id, &payload_to_send, Some(progress.clone())).await
+            .with_context(|| format!("PATCH /workspaces/{id}"))?;
+        let mut updated_bytes = serde_json::to_vec_pretty(&updated)
+            .context("serializing updated workspace")?;
+        updated_bytes.push(b'\n');
+        let updated_bytes = maybe_strip_overlay(updated_bytes, overlay_paths)?;
+        let updated_hash = content_hash(&updated_bytes);
+        write_atomic(ws_path, &updated_bytes)
+            .with_context(|| format!("writing post-push canonical form for '{ws_slug}'"))?;
+        lockfile.upsert(
+            "workspaces",
+            ws_slug,
+            ObjectEntry {
+                id: updated.id,
+                url: Some(updated.url.clone()),
+                modified_at: updated.modified_at().map(|s| s.to_string()),
+                content_hash: Some(updated_hash),
+            },
+        );
+        progress.tick(ws_slug.as_str());
+        pushed += 1;
     }
 
     Ok((pushed, skipped))

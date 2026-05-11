@@ -334,6 +334,15 @@ impl RossumClient {
         self.post_json("/workspaces", body, progress).await
     }
 
+    pub async fn update_workspace(&self, id: u64, workspace: &crate::model::Workspace, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<crate::model::Workspace> {
+        self.patch_json(&format!("/workspaces/{id}"), workspace, progress).await
+    }
+
+    pub async fn get_workspace(&self, id: u64, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<crate::model::Workspace> {
+        let url = format!("{}/workspaces/{id}", self.base_url);
+        self.get_json(&url, progress).await
+    }
+
     pub async fn create_queue(&self, body: &serde_json::Value, progress: Option<std::sync::Arc<crate::progress::OverallProgress>>) -> Result<crate::model::Queue> {
         self.post_json("/queues", body, progress).await
     }
