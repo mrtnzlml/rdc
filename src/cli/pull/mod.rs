@@ -141,6 +141,16 @@ pub async fn run(env: &str, interactive: bool) -> Result<()> {
     }
     summary.push_str(&format!(" from env '{env}'"));
     println!("{summary}");
+
+    // Stale slugs surface here: detected, never auto-applied. The user
+    // runs `rdc map <env>` when ready to commit the file moves.
+    let pending = crate::cli::deploy::realign::detect(&paths, &lockfile);
+    if !pending.is_empty() {
+        eprintln!(
+            "note: {} resource(s) have been renamed on remote — run `rdc map {env}` to apply",
+            pending.len()
+        );
+    }
     Ok(())
 }
 

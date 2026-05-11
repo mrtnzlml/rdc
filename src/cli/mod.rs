@@ -31,8 +31,24 @@ pub enum Command {
     Pull { env: String },
     /// Push locally-edited hooks back to the Rossum environment.
     Push { env: String },
-    /// Auto-match hooks by slug between two envs and write the mapping file.
-    Map { src: String, tgt: String },
+    /// Align slugs.
+    ///
+    /// * `rdc map <env>` — within-env: rename any local slug that no
+    ///   longer matches its current JSON `name` field. Pull never moves
+    ///   files; this is the explicit user-driven action that brings
+    ///   stale slugs into alignment. Cascade-aware (queue and workspace
+    ///   renames move the whole subtree).
+    ///
+    /// * `rdc map <src> <tgt>` — cross-env: auto-match by slug and
+    ///   write the mapping file used by `rdc plan` / `rdc apply`.
+    Map {
+        src: String,
+        tgt: Option<String>,
+        /// Print pending renames (within-env) or proposed matches
+        /// (cross-env) without writing anything.
+        #[arg(long)]
+        check: bool,
+    },
     /// Show what `rdc apply --from <src> --to <tgt>` would do.
     Plan {
         #[arg(long)]
@@ -110,7 +126,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
             crate::cli::push::run(&env, interactive).await
         }
-        Some(Command::Map { src, tgt }) => crate::cli::deploy::map::run(&src, &tgt).await,
+        Some(Command::Map { src, tgt, check }) => match tgt {
+            Some(tgt) => crate::cli::deploy::map::run(&src, &tgt, check).await,
+            None => crate::cli::deploy::realign::run_within_env(&src, check, cli.yes).await,
+        },
         Some(Command::Plan { from, to }) => crate::cli::deploy::plan::run(&from, &to).await,
         Some(Command::Apply { from, to }) => crate::cli::deploy::apply::run(&from, &to).await,
         Some(Command::Status { env }) => crate::cli::status::run(env).await,

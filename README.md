@@ -563,14 +563,62 @@ re-applies them on the way out; pull strips them on the way in.
   drift check surfaces as "remote has changed". Run `rdc pull` once
   more after editing the overlay to re-baseline.
 
-## Deploy — copy from one env to another
+## Map — align slugs
+
+`rdc map` has two modes; the verb is the same ("align slugs"), the
+scope is set by how many envs you name:
+
+### `rdc map <env>` — within-env
+
+Slugs in the snapshot are sticky to the Rossum object ID: once a hook
+has `validator-invoices` as its slug, that slug stays there even if
+the hook is later renamed on the remote. This is intentional — cross-
+references stay valid, pull stays idempotent, file paths don't churn.
+
+The trade-off is cosmetic staleness: `hooks/validator-invoices.json`
+whose JSON says `"name": "Validator Invoices v2"`.
+
+`rdc map <env>` is the explicit user-driven action that brings stale
+slugs into alignment. **Pull never moves files** — it stays clean for
+review. When you're ready to commit the renames in a single, easy-to-
+review diff, run:
+
+```sh
+rdc map dev               # interactive: y/N per rename
+rdc map dev --yes         # apply all without prompting
+rdc map dev --check       # list pending without modifying anything
+```
+
+The command is **cascade-aware**:
+
+- Renaming a workspace moves the entire `workspaces/<old>/` directory
+  to `<new>/` (one OS call, all children come along) and rewrites the
+  leading segment of every `email_templates` compound key in the
+  lockfile.
+- Renaming a queue moves the queue directory (schema.json, inbox.json,
+  formulas/, email-templates/ all move with it) and rewrites the
+  `queues`, `schemas`, `inboxes` lockfile entries plus the middle
+  segment of every `email_templates` compound key under that queue.
+- Renaming a hook moves both `<slug>.json` and `<slug>.py`.
+- Renaming refuses (and warns) when the new slug would collide with
+  another existing slug.
+
+Pull surfaces pending renames at the end of its summary; `rdc status`
+lists each pending rename per env.
+
+If `overlay.toml` or `.rdc/map/*.toml` reference an old slug, the
+command **warns but does not modify** those files — they're user-
+authored configs.
+
+### `rdc map <src> <tgt>` — cross-env
 
 When you've validated changes in a TEST env and want to ship them to
 PROD, use the deploy commands.
 
 `rdc map <src> <tgt>` — auto-match objects by slug between two envs
 and write `.rdc/map/<src>→<tgt>.toml`. Re-runnable; existing entries
-are preserved, new auto-matches are added.
+are preserved, new auto-matches are added. `--check` dry-runs without
+writing.
 
 `rdc plan --from <src> --to <tgt>` — read-only. Print what
 `rdc apply` would do.
