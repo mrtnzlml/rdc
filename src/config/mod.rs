@@ -19,8 +19,6 @@ pub struct ProjectMeta {
 pub struct EnvConfig {
     pub api_base: String,
     pub org_id: u64,
-    #[serde(default)]
-    pub workspace_filter: Option<String>,
 }
 
 impl EnvConfig {
@@ -94,7 +92,6 @@ mod tests {
             EnvConfig {
                 api_base: "https://example.rossum.app/api/v1".to_string(),
                 org_id: 285704,
-                workspace_filter: None,
             },
         );
         ProjectConfig {
@@ -168,7 +165,6 @@ mod tests {
         let cfg = EnvConfig {
             api_base: "https://api.elis.rossum.ai/v1".into(),
             org_id: 1,
-            workspace_filter: None,
         };
         assert_eq!(cfg.data_storage_base(), "https://elis.rossum.ai/svc/data-storage/api");
     }
