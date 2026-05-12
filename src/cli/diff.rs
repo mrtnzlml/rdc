@@ -96,16 +96,9 @@ async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) -> Res
         }
     }
 
+    // Rules: combined-form (.json + optional .py for trigger_condition).
+    diff_rules(&paths, &lockfile, &client, &mut diffs_printed).await?;
     // Flat kinds with simple typed JSON.
-    diff_flat_remote::<crate::model::Rule>(
-        &paths.rules_dir(), "rules", &lockfile, &client, &mut diffs_printed,
-        |c, id| Box::pin(async move {
-            // Fetch via list (no get_rule single endpoint exposed).
-            let list = c.list_rules(None).await?;
-            list.into_iter().find(|r| r.id == id)
-                .ok_or_else(|| anyhow!("rule id {id} not found on remote"))
-        }),
-    ).await?;
     diff_flat_remote::<crate::model::Label>(
         &paths.labels_dir(), "labels", &lockfile, &client, &mut diffs_printed,
         |c, id| Box::pin(async move {
@@ -372,6 +365,67 @@ fn diff_formulas(
             );
         }
     }
+}
+
+/// Walk `rules/<slug>.json` files and diff each against the fetched
+/// remote rule. When the local or remote has a `trigger_condition`,
+/// emit a second diff for the `.py` side too. Mirrors the hooks block.
+async fn diff_rules(
+    paths: &Paths,
+    lockfile: &Lockfile,
+    client: &RossumClient,
+    counter: &mut usize,
+) -> Result<()> {
+    use crate::snapshot::rule::{read_rule, serialize_rule};
+    let dir = paths.rules_dir();
+    if !dir.exists() {
+        return Ok(());
+    }
+    let mut remote_cache: Option<Vec<crate::model::Rule>> = None;
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(slug) = name.strip_suffix(".json") else { continue };
+        if slug.ends_with(".remote") {
+            continue;
+        }
+        let local = match read_rule(&dir, slug) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let (local_json, local_code) = serialize_rule(&local)?;
+
+        let id = match lookup_id(lockfile, "rules", slug) {
+            Some(i) => i,
+            None => continue,
+        };
+        if remote_cache.is_none() {
+            remote_cache = Some(client.list_rules(None).await?);
+        }
+        let Some(remote) = remote_cache.as_ref().unwrap().iter().find(|r| r.id == id).cloned() else {
+            continue;
+        };
+        let (remote_json, remote_code) = serialize_rule(&remote)?;
+
+        let lj = String::from_utf8_lossy(&local_json);
+        let rj = String::from_utf8_lossy(&remote_json);
+        print_unified(
+            &format!("rules/{slug}.json (local)"),
+            &format!("rules/{slug}.json (remote)"),
+            &lj, &rj, counter,
+        );
+
+        let lc = local_code.unwrap_or_default();
+        let rc = remote_code.unwrap_or_default();
+        if lc != rc {
+            print_unified(
+                &format!("rules/{slug}.py (local)"),
+                &format!("rules/{slug}.py (remote)"),
+                &lc, &rc, counter,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Walk `engines/<slug>/engine.json` files and diff each against the

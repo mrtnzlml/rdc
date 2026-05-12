@@ -4,8 +4,9 @@ use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
 use crate::progress::OverallProgress;
 use crate::snapshot::create::strip_for_create;
+use crate::snapshot::rule::{read_rule_value, serialize_rule, write_rule_code};
 use crate::snapshot::writer::write_atomic;
-use crate::state::{content_hash, Lockfile, ObjectEntry};
+use crate::state::{rule_combined_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -21,33 +22,35 @@ pub async fn push(
     let overlay = Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
+    let rules_dir = paths.rules_dir();
     let mut pushed = 0usize;
     let mut skipped = 0usize;
 
     let mut remote_rules: Option<Vec<crate::model::Rule>> = None;
 
-    for (slug, path) in changes {
+    for (slug, local_json_path) in changes {
+        let local_py_path = rules_dir.join(format!("{slug}.py"));
         let overlay_paths = overlay.as_ref().and_then(|ov| ov.rule(slug));
 
-        // Missing lockfile entry → new rule, POST.
+        // CREATE — no lockfile entry yet.
         if lockfile.objects.get("rules").and_then(|m| m.get(slug.as_str())).is_none() {
-            let disk_bytes = std::fs::read(path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
-                .with_context(|| format!("parsing {}", path.display()))?;
+            let mut payload = read_rule_value(&rules_dir, slug)
+                .with_context(|| format!("reading local rule '{slug}' for create"))?;
             if let Some(p) = overlay_paths {
                 apply_overrides(&mut payload, p);
             }
             strip_for_create(&mut payload, "rules");
             let created = client.create_rule(&payload, Some(progress.clone())).await
                 .with_context(|| format!("POST /rules (creating '{slug}')"))?;
-            let mut created_bytes = serde_json::to_vec_pretty(&created)
-                .context("serializing created rule")?;
-            created_bytes.push(b'\n');
-            let created_bytes = maybe_strip_overlay(created_bytes, overlay_paths)?;
-            let created_hash = content_hash(&created_bytes);
-            write_atomic(path, &created_bytes)
+            let (created_json_full, created_code) = serialize_rule(&created)?;
+            let created_json_stripped = maybe_strip_overlay(created_json_full, overlay_paths)?;
+            let created_hash = rule_combined_hash(&created_json_stripped, &created_code);
+            write_atomic(local_json_path, &created_json_stripped)
                 .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
+            if let Some(code) = &created_code {
+                write_rule_code(&rules_dir, slug, code)
+                    .with_context(|| format!("writing rule code for '{slug}'"))?;
+            }
             lockfile.upsert(
                 "rules",
                 slug,
@@ -64,47 +67,48 @@ pub async fn push(
             continue;
         }
 
-        // Read raw Value, apply overlay, then deserialize for the PATCH body.
-        let disk_bytes = std::fs::read(path)
-            .with_context(|| format!("reading {}", path.display()))?;
-
+        // UPDATE — read JSON+.py, splice, drift-check, PATCH.
         let entry = lockfile.objects.get("rules").and_then(|m| m.get(slug.as_str())).unwrap();
         let Some(base) = &entry.content_hash else {
-            progress.println(format!("warning: rules/{slug}.json — lockfile entry has no content_hash, skipping"));
+            progress.println(format!(
+                "warning: {} — lockfile entry has no content_hash, skipping",
+                local_json_path.display()
+            ));
             skipped += 1;
             continue;
         };
         let base = base.clone();
-
         let id = entry.id;
 
-        let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
-            .with_context(|| format!("parsing {}", path.display()))?;
+        let mut payload = read_rule_value(&rules_dir, slug)
+            .with_context(|| format!("reading local rule '{slug}'"))?;
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }
         let payload_rule: crate::model::Rule = serde_json::from_value(payload)
             .with_context(|| format!("deserializing overlay-applied rule '{slug}'"))?;
 
+        // Drift check.
         if remote_rules.is_none() {
             remote_rules = Some(client.list_rules(Some(progress.clone())).await
                 .context("listing rules to verify no drift before push")?);
         }
         let remote_list = remote_rules.as_ref().unwrap();
         let Some(remote_rule) = remote_list.iter().find(|r| r.id == id) else {
-            progress.println(format!("warning: rules/{slug}.json — id {id} not found on remote, skipping"));
+            progress.println(format!(
+                "warning: {} — id {id} not found on remote, skipping",
+                local_json_path.display()
+            ));
             skipped += 1;
             continue;
         };
-        let mut remote_bytes = serde_json::to_vec_pretty(remote_rule)
-            .context("serializing remote rule")?;
-        remote_bytes.push(b'\n');
-        let remote_bytes = maybe_strip_overlay(remote_bytes, overlay_paths)?;
-        let remote_combined = content_hash(&remote_bytes);
+        let (remote_json_full, remote_code) = serialize_rule(remote_rule)?;
+        let remote_json_stripped = maybe_strip_overlay(remote_json_full, overlay_paths)?;
+        let remote_combined = rule_combined_hash(&remote_json_stripped, &remote_code);
         let mut payload_to_send = payload_rule;
         if &remote_combined != &base {
             use crate::cli::resolve::{resolve_push_drift, PushDriftOutcome};
-            match resolve_push_drift(interactive, path, &remote_bytes)? {
+            match resolve_push_drift(interactive, local_json_path, &remote_json_stripped)? {
                 PushDriftOutcome::Patch { payload_override } => {
                     if let Some(bytes) = payload_override {
                         payload_to_send = serde_json::from_slice(&bytes)
@@ -112,8 +116,15 @@ pub async fn push(
                     }
                 }
                 PushDriftOutcome::Adopt => {
-                    write_atomic(path, &remote_bytes)
-                        .with_context(|| format!("adopting remote into {}", path.display()))?;
+                    write_atomic(local_json_path, &remote_json_stripped)
+                        .with_context(|| format!("adopting remote into {}", local_json_path.display()))?;
+                    if let Some(code) = &remote_code {
+                        write_rule_code(&rules_dir, slug, code)
+                            .with_context(|| format!("adopting remote rule code for '{slug}'"))?;
+                    } else if local_py_path.exists() {
+                        std::fs::remove_file(&local_py_path)
+                            .with_context(|| format!("removing stale {}", local_py_path.display()))?;
+                    }
                     lockfile.upsert(
                         "rules",
                         slug,
@@ -128,7 +139,10 @@ pub async fn push(
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    progress.println(format!("warning: rules/{slug}.json — remote has changed since last pull, skipping push"));
+                    progress.println(format!(
+                        "warning: {} — remote has changed since last pull, skipping push (run `rdc pull` first)",
+                        local_json_path.display()
+                    ));
                     skipped += 1;
                     continue;
                 }
@@ -138,14 +152,20 @@ pub async fn push(
         let updated = client.update_rule(id, &payload_to_send, Some(progress.clone())).await
             .with_context(|| format!("PATCH /rules/{id}"))?;
 
-        let mut updated_bytes = serde_json::to_vec_pretty(&updated)
-            .context("serializing updated rule")?;
-        updated_bytes.push(b'\n');
-        let updated_bytes = maybe_strip_overlay(updated_bytes, overlay_paths)?;
-        let updated_hash = content_hash(&updated_bytes);
-
-        write_atomic(path, &updated_bytes)
+        // Refresh local file with the post-strip canonical form.
+        let (updated_json_full, updated_code) = serialize_rule(&updated)?;
+        let updated_json_stripped = maybe_strip_overlay(updated_json_full, overlay_paths)?;
+        let updated_hash = rule_combined_hash(&updated_json_stripped, &updated_code);
+        write_atomic(local_json_path, &updated_json_stripped)
             .with_context(|| format!("writing post-push canonical form for '{slug}'"))?;
+        if let Some(code) = &updated_code {
+            write_rule_code(&rules_dir, slug, code)
+                .with_context(|| format!("writing rule code for '{slug}'"))?;
+        } else if local_py_path.exists() {
+            // Server dropped the trigger_condition; remove the stale .py.
+            std::fs::remove_file(&local_py_path)
+                .with_context(|| format!("removing stale {}", local_py_path.display()))?;
+        }
 
         lockfile.upsert(
             "rules",

@@ -152,7 +152,7 @@ fn local_edits(paths: &Paths, lockfile: &Lockfile) -> Result<Vec<(String, String
     // Flat-list kinds with plain content_hash. Each goes through typed
     // deserialize+serialize so the canonical bytes match what pull wrote
     // (struct-order typed fields, BTreeMap-sorted extra).
-    flat_kind_edits::<crate::model::Rule>(&paths.rules_dir(), "rules", lockfile, &mut out)?;
+    rules_edits(paths, lockfile, &mut out)?;
     flat_kind_edits::<crate::model::Label>(&paths.labels_dir(), "labels", lockfile, &mut out)?;
     engines_edits(paths, lockfile, &mut out)?;
     engine_fields_edits(paths, lockfile, &mut out)?;
@@ -293,6 +293,38 @@ where
         let h = content_hash(&bytes);
         if differs(kind, slug, lockfile, &h) {
             out.push((kind.into(), slug.into()));
+        }
+    }
+    Ok(())
+}
+
+/// Walk `rules/<slug>.json` files and surface any whose combined
+/// hash (JSON + extracted trigger_condition .py) differs from the
+/// lockfile. Mirrors hook edit detection.
+fn rules_edits(
+    paths: &crate::paths::Paths,
+    lockfile: &Lockfile,
+    out: &mut Vec<(String, String)>,
+) -> Result<()> {
+    use crate::state::rule_combined_hash;
+    let dir = paths.rules_dir();
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(slug) = name.strip_suffix(".json") else { continue };
+        if slug.ends_with(".remote") {
+            continue;
+        }
+        // Re-read via splice + typed-canonical so the bytes match what
+        // pull would write next.
+        let rule = crate::snapshot::rule::read_rule(&dir, slug)?;
+        let (json_bytes, code) = crate::snapshot::rule::serialize_rule(&rule)?;
+        let h = rule_combined_hash(&json_bytes, &code);
+        if differs("rules", slug, lockfile, &h) {
+            out.push(("rules".into(), slug.into()));
         }
     }
     Ok(())

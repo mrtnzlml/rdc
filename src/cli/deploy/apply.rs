@@ -85,17 +85,15 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
     }
 
     // Rules ------------------------------------------------------------
+    // Rules are a combined-hash kind (json + trigger_condition .py),
+    // so the drift check and idempotency check both consider the
+    // extracted code, not just the JSON bytes.
     let mut remote_rules_cache: Option<Vec<crate::model::Rule>> = None;
     for (src_slug, tgt_slug) in &mapping.rules {
         let Some(tgt_id) = lookup_tgt_id(&tgt_lockfile, "rules", tgt_slug, &mut skipped) else { continue };
-        let path = src_paths.rules_dir().join(format!("{src_slug}.json"));
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(r) => r,
-            Err(e) => { eprintln!("warning: cannot read src rules/{src_slug}: {e:#}"); skipped += 1; continue; }
-        };
-        let mut payload: Value = match serde_json::from_str(&raw) {
+        let mut payload = match crate::snapshot::rule::read_rule_value(&src_paths.rules_dir(), src_slug) {
             Ok(v) => v,
-            Err(e) => { eprintln!("warning: parsing rules/{src_slug}: {e:#}"); skipped += 1; continue; }
+            Err(e) => { eprintln!("warning: cannot read src rules/{src_slug}: {e:#}"); skipped += 1; continue; }
         };
         rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping);
         let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.rule(tgt_slug));
@@ -106,8 +104,8 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             Ok(v) => v,
             Err(e) => { eprintln!("warning: rules/{src_slug} → {tgt_slug}: payload not a valid Rule ({e:#}); skipping"); skipped += 1; continue; }
         };
-        let mut payload_bytes = serde_json::to_vec_pretty(&payload_rule).context("serializing payload rule")?;
-        payload_bytes.push(b'\n');
+        let (payload_json_full, payload_code) = crate::snapshot::rule::serialize_rule(&payload_rule)?;
+
         if remote_rules_cache.is_none() {
             remote_rules_cache = Some(tgt_client.list_rules(None).await.context("listing tgt rules for drift check")?);
         }
@@ -117,14 +115,20 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             skipped += 1;
             continue;
         };
-        let mut remote_bytes = serde_json::to_vec_pretty(remote).context("serializing remote rule")?;
-        remote_bytes.push(b'\n');
-        if !tgt_in_sync(remote_bytes.clone(), overlay_paths, &tgt_lockfile, "rules", tgt_slug)? {
+        let (remote_json_full, remote_code) = crate::snapshot::rule::serialize_rule(remote)?;
+        let in_sync = {
+            let stripped = maybe_strip_overlay(remote_json_full.clone(), overlay_paths)?;
+            let h = crate::state::rule_combined_hash(&stripped, &remote_code);
+            let base = tgt_lockfile.objects.get("rules").and_then(|m| m.get(tgt_slug)).and_then(|e| e.content_hash.as_deref());
+            base.map(|b| b == h).unwrap_or(true)
+        };
+        if !in_sync {
             eprintln!("warning: tgt rules/{tgt_slug} has drifted from tgt lockfile (run `rdc pull {tgt}` first); skipping");
             skipped += 1;
             continue;
         }
-        if payload_bytes == remote_bytes {
+        // Idempotency: both JSON and code must match.
+        if payload_json_full == remote_json_full && payload_code == remote_code {
             continue;
         }
         tgt_client.update_rule(tgt_id, &payload_rule, None).await

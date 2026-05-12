@@ -224,6 +224,33 @@ pub fn hook_combined_hash(json_bytes: &[u8], code: &Option<String>) -> String {
     to_hex(&hasher.finalize())
 }
 
+/// Compute the combined hash for a rule: the post-extraction
+/// `<slug>.json` bytes plus the extracted `trigger_condition` (when
+/// present).
+///
+/// ```text
+/// SHA-256(
+///     json_bytes
+///     [|| 0x00 || "trigger_condition" || 0x00 || code_bytes]
+/// )
+/// ```
+///
+/// The separator includes the field name (not just `"code"`) so a
+/// future rule field that also carries Python wouldn't silently
+/// collide.
+pub fn rule_combined_hash(json_bytes: &[u8], code: &Option<String>) -> String {
+    let canonical = crate::snapshot::noise::canonicalize_for_hash(json_bytes);
+    let mut hasher = Sha256::new();
+    hasher.update(&canonical);
+    if let Some(code) = code {
+        hasher.update([0u8]);
+        hasher.update(b"trigger_condition");
+        hasher.update([0u8]);
+        hasher.update(code.as_bytes());
+    }
+    to_hex(&hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,6 +430,50 @@ mod tests {
         let b = b"{\"name\":\"h\",\"modified_at\":\"t2\"}";
         let code = Some("def x(): pass".to_string());
         assert_eq!(hook_combined_hash(a, &code), hook_combined_hash(b, &code));
+    }
+
+    #[test]
+    fn rule_combined_hash_no_code() {
+        let h1 = rule_combined_hash(b"{}", &None);
+        let h2 = rule_combined_hash(b"{}", &None);
+        assert_eq!(h1, h2);
+        assert_eq!(h1, content_hash(b"{}"));
+    }
+
+    #[test]
+    fn rule_combined_hash_with_code_differs_from_no_code() {
+        let h_no = rule_combined_hash(b"{}", &None);
+        let h_with = rule_combined_hash(b"{}", &Some("x > 0".to_string()));
+        assert_ne!(h_no, h_with);
+    }
+
+    #[test]
+    fn rule_combined_hash_changes_when_code_changes() {
+        let json = b"{}";
+        let h1 = rule_combined_hash(json, &Some("x > 0".to_string()));
+        let h2 = rule_combined_hash(json, &Some("y < 10".to_string()));
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn rule_combined_hash_strips_modified_at_in_json_portion() {
+        let a = b"{\"name\":\"r\",\"modified_at\":\"t1\"}";
+        let b = b"{\"name\":\"r\",\"modified_at\":\"t2\"}";
+        let code = Some("x > 0".to_string());
+        assert_eq!(rule_combined_hash(a, &code), rule_combined_hash(b, &code));
+    }
+
+    /// rule_combined_hash and hook_combined_hash must NOT collide when
+    /// given the same json + code bytes, because the field-name
+    /// separator differs (`code` vs `trigger_condition`).
+    #[test]
+    fn rule_and_hook_combined_hashes_do_not_collide() {
+        let json = b"{}";
+        let code = Some("x > 0".to_string());
+        // hook_combined_hash also strips `status`; the JSON has no
+        // status so canonicalize_with_extra_strips reduces to the same
+        // canonicalize_for_hash input on this minimal payload.
+        assert_ne!(rule_combined_hash(json, &code), hook_combined_hash(json, &code));
     }
 
     #[test]

@@ -6,6 +6,7 @@
       "url": "https://mock.rossum.app/api/v1/rules/2597",
       "name": "E-invoice Validation",
       "queues": ["https://mock.rossum.app/api/v1/queues/100"],
+      "trigger_condition": "annotation_content.total > 1000\n",
       "modified_at": "2026-04-15T08:00:00Z"
     }
   ]

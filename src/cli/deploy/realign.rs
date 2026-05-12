@@ -459,7 +459,13 @@ fn apply_one(
             collect_orphans(paths, "hooks", old, &mut orphans);
         }
         PendingRename::Rule { old, new } => {
+            // Rules are a combined-form kind (json + optional
+            // trigger_condition .py). Move both files when present.
             move_file(&paths.rules_dir().join(format!("{old}.json")), &paths.rules_dir().join(format!("{new}.json")))?;
+            move_optional(
+                &paths.rules_dir().join(format!("{old}.py")),
+                &paths.rules_dir().join(format!("{new}.py")),
+            )?;
             rename_lockfile_key(lockfile, "rules", old, new);
             collect_orphans(paths, "rules", old, &mut orphans);
         }

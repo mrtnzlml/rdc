@@ -217,6 +217,16 @@ async fn pull_writes_full_workspace_tree() {
 
     // Org-level kinds.
     assert!(env_root.join("rules/e-invoice-validation.json").exists());
+    // trigger_condition is a Python expression, extracted to a sibling
+    // .py file and stripped from the JSON.
+    assert!(env_root.join("rules/e-invoice-validation.py").exists(),
+        "rules/<slug>.py should be created when the rule has trigger_condition");
+    let rule_json = std::fs::read_to_string(env_root.join("rules/e-invoice-validation.json")).unwrap();
+    assert!(!rule_json.contains("trigger_condition"),
+        "trigger_condition should be extracted from JSON; got: {rule_json}");
+    let rule_py = std::fs::read_to_string(env_root.join("rules/e-invoice-validation.py")).unwrap();
+    assert_eq!(rule_py, "annotation_content.total > 1000\n",
+        "rule .py should contain the trigger_condition bytes exactly");
     assert!(env_root.join("labels/priority-high.json").exists());
     assert!(env_root.join("labels/needs-review.json").exists());
     // Engines own a directory (engine.json + fields/). Engine fields

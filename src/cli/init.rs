@@ -257,7 +257,7 @@ envs/<env>/
       inbox.json
       email-templates/<slug>.json
   hooks/<slug>.json                       + sibling <slug>.py for function hooks
-  rules/<slug>.json
+  rules/<slug>.json                       + sibling <slug>.py for trigger_condition
   labels/<slug>.json
   engines/<engine_slug>/
     engine.json
@@ -280,7 +280,8 @@ envs/<env>/
 | Schema fields | `envs/<env>/workspaces/<ws>/queues/<q>/schema.json` | `rdc push <env>` |
 | A formula | `envs/<env>/workspaces/<ws>/queues/<q>/formulas/<field>.py` | `rdc push <env>` |
 | Queue settings | `envs/<env>/workspaces/<ws>/queues/<q>/queue.json` | `rdc push <env>` |
-| Rule logic | `envs/<env>/rules/<slug>.json` | `rdc push <env>` |
+| Rule's trigger condition (Python) | `envs/<env>/rules/<slug>.py` | `rdc push <env>` |
+| Rule config (name, queues) | `envs/<env>/rules/<slug>.json` | `rdc push <env>` |
 | Label name / colour | `envs/<env>/labels/<slug>.json` | `rdc push <env>` |
 | Email template | `envs/<env>/workspaces/<ws>/queues/<q>/email-templates/<slug>.json` | `rdc push <env>` |
 | Per-env override only | `envs/<env>/overlay.toml` | `rdc push <env>` |

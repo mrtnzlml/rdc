@@ -53,7 +53,7 @@ pub fn scan(paths: &Paths, lockfile: &Lockfile) -> Result<(usize, ChangeList)> {
 
     scanned += scan_workspaces(paths, lockfile, &mut changes.workspaces)?;
     scanned += scan_hooks(paths, lockfile, &mut changes.hooks)?;
-    scanned += scan_flat_kind(paths, lockfile, "rules", paths.rules_dir(), &mut changes.rules)?;
+    scanned += scan_rules(paths, lockfile, &mut changes.rules)?;
     scanned += scan_flat_kind(paths, lockfile, "labels", paths.labels_dir(), &mut changes.labels)?;
     scanned += scan_queue_nested_json(paths, lockfile, "queues", "queue.json", &mut changes.queues)?;
     scanned += scan_schemas(paths, lockfile, &mut changes.schemas)?;
@@ -148,6 +148,51 @@ fn scan_engine_fields(
             if base_hash != Some(local_hash.as_str()) {
                 out.insert(f_slug.to_string(), f_path);
             }
+        }
+    }
+    Ok(scanned)
+}
+
+/// Walk `rules/<slug>.json` files. Each rule may have a sibling
+/// `<slug>.py` carrying the extracted `trigger_condition`; the
+/// combined hash covers both. Mirrors `scan_hooks`.
+fn scan_rules(
+    paths: &Paths,
+    lockfile: &Lockfile,
+    out: &mut BTreeMap<String, std::path::PathBuf>,
+) -> Result<usize> {
+    use crate::state::rule_combined_hash;
+    let dir = paths.rules_dir();
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut scanned = 0;
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(slug) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        if slug.ends_with(".remote") {
+            continue;
+        }
+        let json_bytes = std::fs::read(&path)?;
+        let py_path = path.with_extension("py");
+        let code = if py_path.exists() {
+            Some(std::fs::read_to_string(&py_path)?)
+        } else {
+            None
+        };
+        let local_hash = rule_combined_hash(&json_bytes, &code);
+        scanned += 1;
+        let base_hash = lockfile
+            .objects
+            .get("rules")
+            .and_then(|m| m.get(slug))
+            .and_then(|e| e.content_hash.as_deref());
+        if base_hash != Some(local_hash.as_str()) {
+            out.insert(slug.to_string(), path);
         }
     }
     Ok(scanned)

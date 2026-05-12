@@ -475,10 +475,15 @@ fn emit_rules(md: &mut String, ctx: &IndexCtx<'_>) {
     md.push_str("## rules\n\n");
     for (slug, entry) in entries.iter() {
         let path = ctx.paths.rules_dir().join(format!("{slug}.json"));
+        let py_path = ctx.paths.rules_dir().join(format!("{slug}.py"));
         let v = read_json(&path);
         write_header(md, slug, entry.id);
         write_name(md, v.as_ref());
-        md.push_str(&format!("  - path: rules/{slug}.json\n"));
+        if py_path.exists() {
+            md.push_str(&format!("  - path: rules/{slug}.json (+ rules/{slug}.py)\n"));
+        } else {
+            md.push_str(&format!("  - path: rules/{slug}.json\n"));
+        }
         if let Some(v) = v.as_ref() {
             let qs = urls_to_slugs(v, "queues", "queues", ctx.lockfile);
             if !qs.is_empty() {
