@@ -5,6 +5,7 @@
 //!   - Interactive `token_owner` picker (later tasks).
 
 use anyhow::{anyhow, Result};
+use crate::model::Hook;
 use crate::overlay::Overlay;
 use serde_json::Value;
 
@@ -20,6 +21,13 @@ pub fn effective_token_owner<'a>(overlay: Option<&'a Overlay>, slug: &str) -> Op
         return Some(per_hook);
     }
     overlay.defaults.store_extension_token_owner.as_deref()
+}
+
+/// Find a remote hook matching `(name, hook_template)`. Used after a
+/// previously-failed two-call create to adopt the partial install instead
+/// of POSTing again.
+pub fn find_orphan<'a>(hooks: &'a [Hook], name: &str, template_url: &str) -> Option<&'a Hook> {
+    hooks.iter().find(|h| h.name == name && h.hook_template() == Some(template_url))
 }
 
 /// Extract `{name, hook_template, events, queues, token_owner}` from a
@@ -122,5 +130,27 @@ mod tests {
             "name": "X", "events": [], "queues": [], "token_owner": "u"
         });
         assert!(build_install_body(&no_template).is_err());
+    }
+
+    #[test]
+    fn find_orphan_matches_by_name_and_template() {
+        use crate::model::Hook;
+        let hooks: Vec<Hook> = vec![
+            serde_json::from_value(serde_json::json!({
+                "id": 100, "url": "u100", "name": "Master Data Hub", "type": "webhook",
+                "extension_source": "rossum_store",
+                "hook_template": "https://elis/api/v1/hook_templates/39"
+            })).unwrap(),
+            serde_json::from_value(serde_json::json!({
+                "id": 101, "url": "u101", "name": "Master Data Hub", "type": "webhook",
+                "extension_source": "rossum_store",
+                "hook_template": "https://elis/api/v1/hook_templates/27"
+            })).unwrap(),
+        ];
+        let orphan = find_orphan(&hooks, "Master Data Hub", "https://elis/api/v1/hook_templates/39");
+        assert_eq!(orphan.map(|h| h.id), Some(100));
+
+        let none = find_orphan(&hooks, "No Such Hook", "https://elis/api/v1/hook_templates/39");
+        assert!(none.is_none());
     }
 }
