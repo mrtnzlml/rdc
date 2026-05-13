@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::fs;
 use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -162,4 +163,75 @@ async fn status_detects_local_edits() {
         .args(["status", "dev"])
         .assert().success()
         .stdout(predicate::str::contains("hooks/validator-invoices"));
+}
+
+#[tokio::test]
+async fn status_shows_store_extension_count() {
+    let server = MockServer::start().await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("test={}/api/v1:1", server.uri())])
+        .assert().success();
+    fs::write(
+        project.path().join("secrets/test.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+
+    // Mount only the auth endpoint; status only needs it to report "auth ok".
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server).await;
+
+    // Write a minimal v2 lockfile with two hook entries.
+    let state_dir = project.path().join(".rdc/state");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("test.lock.json"),
+        serde_json::json!({
+            "version": 2,
+            "objects": {
+                "hooks": {
+                    "regular-hook": { "id": 1, "url": "https://mock/api/v1/hooks/1" },
+                    "store-hook": { "id": 2, "url": "https://mock/api/v1/hooks/2" }
+                }
+            }
+        })
+        .to_string(),
+    ).unwrap();
+
+    // Write the hooks snapshot files: one regular, one store extension.
+    let hooks_dir = project.path().join("envs/test/hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    fs::write(
+        hooks_dir.join("regular-hook.json"),
+        serde_json::json!({
+            "id": 1,
+            "url": "https://mock/api/v1/hooks/1",
+            "name": "Regular Hook",
+            "type": "function",
+            "extension_source": "custom"
+        })
+        .to_string(),
+    ).unwrap();
+    fs::write(
+        hooks_dir.join("store-hook.json"),
+        serde_json::json!({
+            "id": 2,
+            "url": "https://mock/api/v1/hooks/2",
+            "name": "Store Hook",
+            "type": "webhook",
+            "extension_source": "rossum_store",
+            "hook_template": "https://mock/api/v1/hook_templates/10"
+        })
+        .to_string(),
+    ).unwrap();
+
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["status", "test"])
+        .assert().success()
+        .stdout(predicate::str::contains("(1 store extension)"));
 }

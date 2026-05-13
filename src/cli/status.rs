@@ -82,8 +82,17 @@ pub async fn run(env_filter: Option<String>) -> Result<()> {
             }
         };
         let total_objects: usize = lockfile.objects.values().map(|m| m.len()).sum();
+        let store_ext_count = count_store_extensions(&paths.hooks_dir());
+        let store_ext_suffix = if store_ext_count > 0 {
+            format!(
+                "  ({store_ext_count} store extension{})",
+                if store_ext_count != 1 { "s" } else { "" }
+            )
+        } else {
+            String::new()
+        };
         println!(
-            "  lockfile: v{}, {total_objects} objects across {} kinds",
+            "  lockfile: v{}, {total_objects} objects across {} kinds{store_ext_suffix}",
             lockfile.version,
             lockfile.objects.len()
         );
@@ -427,6 +436,31 @@ fn engine_fields_edits(
         }
     }
     Ok(())
+}
+
+fn count_store_extensions(hooks_dir: &Path) -> usize {
+    if !hooks_dir.exists() {
+        return 0;
+    }
+    let mut n = 0;
+    if let Ok(entries) = std::fs::read_dir(hooks_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(s) = std::fs::read_to_string(&path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                    if v.get("extension_source").and_then(|x| x.as_str())
+                        == Some("rossum_store")
+                    {
+                        n += 1;
+                    }
+                }
+            }
+        }
+    }
+    n
 }
 
 fn first_line(s: &str) -> &str {
