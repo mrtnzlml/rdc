@@ -34,7 +34,7 @@ fn mdh_snapshot_body(api_base: &str) -> serde_json::Value {
 
 /// Same shape as `mdh_snapshot_body` but representing what the server returns
 /// immediately after `POST /hooks/create` — template defaults (un-customised
-/// `settings`), plus id/url assigned. Used by Task 20's test extension.
+/// `settings`), plus id/url assigned.
 #[allow(dead_code)]
 fn mdh_installed_body(api_base: &str, id: u64) -> serde_json::Value {
     let mut body = mdh_snapshot_body(api_base);
@@ -563,10 +563,12 @@ async fn deploy_bootstraps_empty_target_with_url_rewriting() {
     );
 }
 
-/// Task 19: Deploy pre-pass resolves template URLs and reads token_owner from
-/// the tgt overlay (non-interactive path). After `rdc deploy test prod --yes`
-/// the `.rdc/map/test→prod.toml` must contain a `[hook_templates]` section
-/// with the src→tgt template URL pair built by `plan_store_extension_bootstrap`.
+/// Deploy pre-pass resolves cross-cluster template URLs and reads token_owner
+/// from the tgt overlay (non-interactive path). After `rdc deploy test prod
+/// --yes`, the `.rdc/map/test→prod.toml` must contain a `[hook_templates]`
+/// section with the src→tgt template URL pair, and the tgt lockfile must
+/// record the new hook id (proving both the pre-pass and the two-call install
+/// + PATCH path ran).
 #[tokio::test]
 async fn deploy_resolves_templates_and_prompts_for_token_owner() {
     let test_server = MockServer::start().await;
@@ -747,9 +749,9 @@ async fn deploy_resolves_templates_and_prompts_for_token_owner() {
         "tgt template id 41 missing from map file:\n{raw}"
     );
 
-    // Task 20: After deploy the tgt lockfile must record the hook with a
-    // positive id (proving the two-call install + PATCH path ran, not just
-    // the pre-pass template resolution).
+    // The tgt lockfile must record the new hook id (proving the two-call
+    // install + PATCH path actually ran, not just the pre-pass template
+    // resolution).
     let lf_path = project.path().join(".rdc/state/prod.lock.json");
     let lf_raw = std::fs::read_to_string(&lf_path).expect("tgt lockfile should exist");
     let lf: serde_json::Value = serde_json::from_str(&lf_raw).expect("lockfile must be valid JSON");

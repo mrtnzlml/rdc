@@ -106,11 +106,10 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
     let tgt_overlay = Overlay::load(&tgt_paths.overlay_file())
         .with_context(|| format!("loading tgt overlay from {}", tgt_paths.overlay_file().display()))?;
 
-    // 0a. Store-extension pre-pass: resolve cross-cluster template URLs and
-    // prompt for any missing token_owner values. This runs before any writes
-    // so failures abort cleanly. Produces a StorePlan list consumed by
-    // create_hook in Task 20; for now it's stored as a local variable.
-    // store_plans threaded into create_hook in Task 20.
+    // Store-extension pre-pass: resolve cross-cluster template URLs and
+    // prompt for any missing token_owner values. Runs before any writes so
+    // failures abort cleanly. The resulting plans feed the bootstrap loop
+    // below, which routes store extensions through `/hooks/create` + PATCH.
     let store_plans = crate::cli::deploy::store_extensions::plan_store_extension_bootstrap(
         &src_paths,
         &tgt_paths,
