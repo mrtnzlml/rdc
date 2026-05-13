@@ -14,12 +14,11 @@ name = "rdc"
 path = "src/lib.rs"
 
 [dependencies]
-anstyle = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-clap-cargo = { version = "0.16", default-features = false, features = ["clap"] }
+clap-cargo = { version = "0.18", default-features = false, features = ["clap"] }
 flate2 = "1"
-futures = "0.3"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 indicatif = "0.18"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 serde = { version = "1", features = ["derive"] }
@@ -29,7 +28,7 @@ similar = "3"
 tar = "0.4"
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 toml = "1"
 
 [dev-dependencies]
@@ -38,6 +37,5 @@ http = "1"
 predicates = "3"
 pretty_assertions = "1"
 regex = "1"
-tempfile = "3"
 wiremock = "0.6"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "test-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
