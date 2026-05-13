@@ -1444,3 +1444,108 @@ async fn push_installs_store_extension_via_two_call_flow() {
         "lockfile should record id 999; lockfile:\n{lf_raw}"
     );
 }
+
+/// When a prior push died between POST /hooks/create and PATCH /hooks/{id},
+/// the hook is already installed (orphan) but has no lockfile entry.  The next
+/// push must detect the orphan via (name, hook_template) match and go directly
+/// to PATCH without calling POST /hooks/create again.
+#[tokio::test]
+async fn push_adopts_orphan_store_extension_skips_install() {
+    let server = MockServer::start().await;
+    let api_base = format!("{}/api/v1", server.uri());
+
+    // Mount the bare-minimum endpoints for pull (org + all-empty kinds).
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server).await;
+    for ep in [
+        "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&server).await;
+    }
+
+    // 1. Orphan check — hook list contains the already-installed orphan (id 555).
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [mdh_installed_body(&api_base, 555)]
+        })))
+        .mount(&server).await;
+
+    // 2. POST /hooks/create must NOT be called; fail the test if it is.
+    Mock::given(method("POST"))
+        .and(path("/api/v1/hooks/create"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server).await;
+
+    // 3. PATCH /hooks/555 — adopt + reconcile; echo back the full snapshot body.
+    let after_patch = {
+        let mut b = mdh_snapshot_body(&api_base);
+        b["id"] = serde_json::Value::from(555u64);
+        b["url"] = serde_json::Value::from(format!("{api_base}/hooks/555"));
+        b
+    };
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/hooks/555"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&after_patch))
+        .expect(1)
+        .mount(&server).await;
+
+    let project = TempDir::new().unwrap();
+
+    // Bootstrap: init + token.
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("test={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/test.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+
+    // Pull with an empty hooks list to establish the lockfile (no hooks entry).
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "test"])
+        .assert().success();
+
+    // Write the MDH snapshot file — no lockfile entry for it exists.
+    let hooks_dir = project.path().join("envs/test/hooks");
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+    std::fs::write(
+        hooks_dir.join("master-data-hub.json"),
+        serde_json::to_string_pretty(&mdh_snapshot_body(&api_base)).unwrap(),
+    ).unwrap();
+
+    // Push — must skip install and go straight to PATCH /hooks/555.
+    let out = Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["push", "test", "--yes"])
+        .output().unwrap();
+
+    assert!(
+        out.status.success(),
+        "push should succeed.\nstderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout),
+    );
+
+    // Lockfile must record the orphan's id (555), not a freshly-created one.
+    let lf_raw = std::fs::read_to_string(
+        project.path().join(".rdc/state/test.lock.json")
+    ).unwrap();
+    let lf: serde_json::Value = serde_json::from_str(&lf_raw).unwrap();
+    assert_eq!(
+        lf["objects"]["hooks"]["master-data-hub"]["id"],
+        serde_json::Value::from(555u64),
+        "lockfile should record orphan id 555; lockfile:\n{lf_raw}"
+    );
+}
