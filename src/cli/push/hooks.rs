@@ -40,14 +40,74 @@ pub async fn push(
         // create payload; server response (with id/url assigned) overwrites
         // disk; lockfile gets a fresh entry.
         if lockfile.objects.get("hooks").and_then(|m| m.get(slug.as_str())).is_none() {
+            // Read + overlay-apply once; reused by both paths.
             let mut payload = read_hook_value(&hooks_dir, slug)
                 .with_context(|| format!("reading local hook '{slug}' for create"))?;
             if let Some(p) = overlay_paths {
                 apply_overrides(&mut payload, p);
             }
-            strip_for_create(&mut payload, "hooks");
-            let created = client.create_hook(&payload, Some(progress.clone())).await
-                .with_context(|| format!("POST /hooks (creating '{slug}')"))?;
+
+            // Anomaly guard, then dispatch on extension type.
+            let typed: crate::model::Hook = serde_json::from_value(payload.clone())
+                .with_context(|| format!("deserializing hook '{slug}' for create"))?;
+            crate::cli::deploy::store_extensions::check_store_extension_anomaly(&typed, slug)?;
+
+            let created = if typed.is_store_extension() {
+                // Two-call create: orphan check → POST /hooks/create → PATCH.
+                if remote_hooks.is_none() {
+                    remote_hooks = Some(
+                        client.list_hooks(Some(progress.clone())).await
+                            .context("listing hooks for store-extension orphan check")?,
+                    );
+                }
+                let remote = remote_hooks.as_ref().unwrap();
+                let template_url = typed.hook_template().unwrap(); // anomaly guard ensures Some
+                let installed_id = match crate::cli::deploy::store_extensions::find_orphan(
+                    remote, &typed.name, template_url,
+                ) {
+                    Some(orphan) => {
+                        progress.println(format!(
+                            "adopting orphan store-extension hooks/{slug} (id {})",
+                            orphan.id
+                        ));
+                        orphan.id
+                    }
+                    None => {
+                        let install_body =
+                            crate::cli::deploy::store_extensions::build_install_body(&payload)?;
+                        let installed = client
+                            .create_hook_via_install(&install_body, Some(progress.clone()))
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "POST /hooks/create (installing store extension '{slug}')"
+                                )
+                            })?;
+                        progress.println(format!(
+                            "installed store extension hooks/{slug} (id {})",
+                            installed.id
+                        ));
+                        installed.id
+                    }
+                };
+                client
+                    .update_hook(installed_id, &typed, Some(progress.clone()))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "PATCH /hooks/{installed_id} (reconciling store extension '{slug}')"
+                        )
+                    })?
+            } else {
+                // Regular hook: strip server-only fields, then POST.
+                strip_for_create(&mut payload, "hooks");
+                client
+                    .create_hook(&payload, Some(progress.clone()))
+                    .await
+                    .with_context(|| format!("POST /hooks (creating '{slug}')"))?
+            };
+
+            // Disk + lockfile write — same for both paths.
             let (created_json_full, created_code) = serialize_hook(&created)?;
             let created_json_stripped = maybe_strip_overlay(created_json_full, overlay_paths)?;
             let created_hash = hook_combined_hash(&created_json_stripped, &created_code);

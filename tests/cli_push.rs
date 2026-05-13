@@ -13,6 +13,44 @@ fn empty_list() -> serde_json::Value {
     serde_json::json!({ "pagination": { "next": null }, "results": [] })
 }
 
+/// Snapshot body for a Master Data Hub store extension.
+/// `api_base` is the full API base URL (e.g. `http://127.0.0.1:PORT/api/v1`).
+fn mdh_snapshot_body(api_base: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": "Master Data Hub",
+        "type": "webhook",
+        "events": ["annotation_content.initialize", "annotation_content.started", "annotation_content.updated"],
+        "queues": [],
+        "active": true,
+        "run_after": [],
+        "metadata": {},
+        "config": { "private": true, "timeout_s": 60, "payload_logging_enabled": false },
+        "settings": { "configurations": [{"name": "customised"}] },
+        "sideload": ["schemas"],
+        "settings_schema": null,
+        "secrets_schema": { "type": "object", "additionalProperties": {"type": "string"} },
+        "description": "Enhance the extracted data with details from your master records.",
+        "guide": "<div>...</div>",
+        "read_more_url": "https://docs.rossum.ai/mdh",
+        "extension_image_url": "https://example.com/mdh.png",
+        "token_lifetime_s": 7200,
+        "token_owner": format!("{api_base}/users/938493"),
+        "extension_source": "rossum_store",
+        "hook_template": format!("{api_base}/hook_templates/39")
+    })
+}
+
+/// Same shape as `mdh_snapshot_body` but representing what the server returns
+/// immediately after `POST /hooks/create` — template defaults (un-customised
+/// `settings`), plus id/url assigned.
+fn mdh_installed_body(api_base: &str, id: u64) -> serde_json::Value {
+    let mut body = mdh_snapshot_body(api_base);
+    body["id"] = serde_json::Value::from(id);
+    body["url"] = serde_json::Value::from(format!("{api_base}/hooks/{id}"));
+    body["settings"] = serde_json::json!({"configurations": []}); // template default, NOT customised
+    body
+}
+
 async fn mount_get_only_hooks_org(server: &MockServer, hooks_payload: serde_json::Value) {
     Mock::given(method("GET"))
         .and(path("/api/v1/organizations/1"))
@@ -1292,5 +1330,117 @@ async fn push_dry_run_lists_tombstones_without_calling_delete() {
     assert!(
         !*delete_attempted.lock().unwrap(),
         "dry-run must not issue any DELETE"
+    );
+}
+
+// ============================================================
+// Store extensions — two-call create flow
+// ============================================================
+
+/// A store extension (e.g. Master Data Hub) whose snapshot is present but has
+/// no lockfile entry must go through the two-call install path:
+///   1. GET /hooks — orphan check (empty list here).
+///   2. POST /hooks/create — installs from the template, returns id.
+///   3. PATCH /hooks/{id} — reconciles any customisations from the snapshot.
+/// After success the lockfile entry must record the assigned id.
+#[tokio::test]
+async fn push_installs_store_extension_via_two_call_flow() {
+    let server = MockServer::start().await;
+    let api_base = format!("{}/api/v1", server.uri());
+
+    // Mount the bare-minimum endpoints for pull (org + all-empty kinds).
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server).await;
+    for ep in [
+        "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&server).await;
+    }
+
+    // 1. Orphan check — empty hook list (also used by initial pull).
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": []
+        })))
+        .mount(&server).await;
+
+    // 2. POST /hooks/create — returns the installed body with id 999.
+    Mock::given(method("POST"))
+        .and(path("/api/v1/hooks/create"))
+        .respond_with(ResponseTemplate::new(201)
+            .set_body_json(mdh_installed_body(&api_base, 999)))
+        .expect(1)
+        .mount(&server).await;
+
+    // 3. PATCH /hooks/999 — reconcile customisations; echo back the full snapshot body.
+    let after_patch = {
+        let mut b = mdh_snapshot_body(&api_base);
+        b["id"] = serde_json::Value::from(999u64);
+        b["url"] = serde_json::Value::from(format!("{api_base}/hooks/999"));
+        b
+    };
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/hooks/999"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&after_patch))
+        .expect(1)
+        .mount(&server).await;
+
+    let project = TempDir::new().unwrap();
+
+    // Bootstrap: init + token.
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("test={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/test.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+
+    // Pull with an empty hooks list to establish the lockfile (no hooks entry).
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "test"])
+        .assert().success();
+
+    // Write the MDH snapshot file — no lockfile entry for it exists.
+    let hooks_dir = project.path().join("envs/test/hooks");
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+    std::fs::write(
+        hooks_dir.join("master-data-hub.json"),
+        serde_json::to_string_pretty(&mdh_snapshot_body(&api_base)).unwrap(),
+    ).unwrap();
+
+    // Push — should exercise all three mock endpoints.
+    let out = Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["push", "test", "--yes"])
+        .output().unwrap();
+
+    assert!(
+        out.status.success(),
+        "push should succeed.\nstderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout),
+    );
+
+    // Lockfile must have the new entry with id 999.
+    let lf_raw = std::fs::read_to_string(
+        project.path().join(".rdc/state/test.lock.json")
+    ).unwrap();
+    let lf: serde_json::Value = serde_json::from_str(&lf_raw).unwrap();
+    assert_eq!(
+        lf["objects"]["hooks"]["master-data-hub"]["id"],
+        serde_json::Value::from(999u64),
+        "lockfile should record id 999; lockfile:\n{lf_raw}"
     );
 }

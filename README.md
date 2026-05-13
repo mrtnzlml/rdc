@@ -213,6 +213,15 @@ The server's response (with `id`, `url`, timestamps) is written back to disk in 
 
 Supported kinds for create: workspaces, schemas, queues, inboxes, hooks, rules, labels, engines, engine fields, email templates. Workflows and workflow steps are read-only at the Rossum API.
 
+### Store extensions
+
+Extensions installed via the Rossum store (Master Data Hub, Email
+Notifications, …) live under `hooks/` like any other hook, identified
+by `"extension_source": "rossum_store"` in the JSON. `rdc push` knows
+to use the dedicated install endpoint when creating one on a fresh
+environment, then PATCHes any customisations from the snapshot. Update
+and delete behave identically to regular hooks.
+
 ### Delete an object
 
 Removing the local file (and committing that removal to your repo) is the declarative way to say "delete this from remote." The lockfile entry remains, which is rdc's signal that the object *was* tracked and is now meant to be gone. `rdc push <env>` discovers these tombstones in its scan phase and, after confirmation, issues `DELETE /<kind>/<id>` for each in reverse dependency order.
