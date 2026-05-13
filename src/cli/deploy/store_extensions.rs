@@ -5,6 +5,7 @@
 //!   - Interactive `token_owner` picker.
 //!   - Bootstrap pre-pass: resolves template URLs + prompts for token_owner.
 
+// Re-exported so deploy callers can import the picker from one place.
 pub use crate::cli::resolve::{prompt_token_owner, render_token_owner_picker};
 
 use anyhow::{anyhow, Context, Result};
@@ -15,7 +16,7 @@ use crate::overlay::{write_store_extension_token_owner, Overlay};
 use crate::progress::ProgressHandle;
 use crate::state::Lockfile;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// One bootstrap entry per store extension to be created.
@@ -84,7 +85,7 @@ pub async fn plan_store_extension_bootstrap(
     }
 
     // 2. Resolve template URLs. List on cache miss only.
-    let src_urls: std::collections::BTreeSet<String> = needed.iter()
+    let src_urls: BTreeSet<String> = needed.iter()
         .filter_map(|(_, h)| h.hook_template().map(|s| s.to_string()))
         .collect();
     let uncached: Vec<&str> = src_urls.iter()
@@ -115,7 +116,7 @@ pub async fn plan_store_extension_bootstrap(
     let mut plans = Vec::new();
     for (tgt_slug, hook) in &needed {
         let src_slug = tgt_slug.clone(); // same-slug default; rename via mapping handled at step 1
-        let src_template_url = hook.hook_template().unwrap().to_string();
+        let src_template_url = hook.hook_template().expect("check_store_extension_anomaly guarantees hook_template is Some for store extensions").to_string();
         let tgt_template_url = mapping.hook_templates.get(&src_template_url)
             .ok_or_else(|| anyhow!("internal: template URL '{src_template_url}' missing from mapping after resolve"))?
             .clone();
@@ -140,7 +141,7 @@ pub async fn plan_store_extension_bootstrap(
                     tgt_users = Some(tgt_client.list_users(progress.clone()).await
                         .context("listing tgt users for token_owner picker")?);
                 }
-                let users = tgt_users.as_ref().unwrap();
+                let users = tgt_users.as_ref().expect("tgt_users was just populated above");
                 let (chosen, apply_all) = match prompt_token_owner(tgt_slug, tgt_env_label, users, self_user_id)? {
                     Some(pair) => pair,
                     None => return Err(anyhow!("deploy aborted at token_owner picker")),

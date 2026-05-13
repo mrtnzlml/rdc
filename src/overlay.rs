@@ -13,6 +13,8 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+pub const OVERLAY_VERSION: u32 = 1;
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Default)]
 pub struct Defaults {
     /// Fallback `token_owner` URL applied to every store extension that
@@ -106,6 +108,24 @@ impl Overlay {
     }
 }
 
+impl Default for Overlay {
+    fn default() -> Self {
+        Self {
+            version: OVERLAY_VERSION,
+            defaults: Defaults::default(),
+            hooks: BTreeMap::new(),
+            rules: BTreeMap::new(),
+            labels: BTreeMap::new(),
+            schemas: BTreeMap::new(),
+            queues: BTreeMap::new(),
+            inboxes: BTreeMap::new(),
+            email_templates: BTreeMap::new(),
+            engines: BTreeMap::new(),
+            engine_fields: BTreeMap::new(),
+        }
+    }
+}
+
 /// Idempotent write: load the overlay file (or create an empty one),
 /// patch in the `token_owner` (per-hook if `slug` is `Some`, otherwise
 /// into `[defaults] store_extension_token_owner`), atomically rewrite
@@ -115,19 +135,7 @@ pub fn write_store_extension_token_owner(
     slug: Option<&str>,
     user_url: &str,
 ) -> Result<()> {
-    let mut overlay = Overlay::load(path)?.unwrap_or(Overlay {
-        version: 1,
-        hooks: BTreeMap::new(),
-        rules: BTreeMap::new(),
-        labels: BTreeMap::new(),
-        schemas: BTreeMap::new(),
-        queues: BTreeMap::new(),
-        inboxes: BTreeMap::new(),
-        email_templates: BTreeMap::new(),
-        engines: BTreeMap::new(),
-        engine_fields: BTreeMap::new(),
-        defaults: Defaults::default(),
-    });
+    let mut overlay = Overlay::load(path)?.unwrap_or_default();
     match slug {
         Some(s) => {
             let entry = overlay.hooks.entry(s.to_string()).or_insert_with(BTreeMap::new);
@@ -191,7 +199,7 @@ fn set_at_path(value: &mut Value, path: &str, new_value: Value) {
         if !current.is_object() {
             *current = Value::Object(Default::default());
         }
-        let obj = current.as_object_mut().expect("just made object");
+        let obj = current.as_object_mut().expect("set_at_path just initialized current as Value::Object");
         let entry = obj.entry((*segment).to_string()).or_insert(Value::Object(Default::default()));
         if !entry.is_object() {
             *entry = Value::Object(Default::default());
@@ -201,7 +209,7 @@ fn set_at_path(value: &mut Value, path: &str, new_value: Value) {
     if !current.is_object() {
         *current = Value::Object(Default::default());
     }
-    let obj = current.as_object_mut().expect("just made object");
+    let obj = current.as_object_mut().expect("set_at_path just initialized current as Value::Object");
     obj.insert(segments.last().unwrap().to_string(), new_value);
 }
 

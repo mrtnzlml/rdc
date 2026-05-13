@@ -60,8 +60,8 @@ pub async fn push(
                             .context("listing hooks for store-extension orphan check")?,
                     );
                 }
-                let remote = remote_hooks.as_ref().unwrap();
-                let template_url = typed.hook_template().unwrap(); // anomaly guard ensures Some
+                let remote = remote_hooks.as_ref().expect("remote_hooks was just populated above");
+                let template_url = typed.hook_template().expect("check_store_extension_anomaly guarantees hook_template is Some for store extensions");
                 let installed_id = match crate::cli::deploy::store_extensions::find_orphan(
                     remote, &typed.name, template_url,
                 ) {
@@ -163,7 +163,7 @@ pub async fn push(
                     .context("listing hooks to verify no drift before push")?,
             );
         }
-        let remote_list = remote_hooks.as_ref().unwrap();
+        let remote_list = remote_hooks.as_ref().expect("remote_hooks was just populated above");
         let Some(remote_hook) = remote_list.iter().find(|h| h.id == id) else {
             progress.println(format!(
                 "warning: hooks/{slug}.json — id {id} not found on remote, skipping"
@@ -175,7 +175,7 @@ pub async fn push(
         let remote_json_stripped = maybe_strip_overlay(remote_json_full, overlay_paths)?;
         let remote_combined = hook_combined_hash(&remote_json_stripped, &remote_code);
         let mut payload_to_send = payload_hook;
-        if &remote_combined != &base {
+        if remote_combined != base {
             // Drift detected. The hook is a combined-hash kind (json + py);
             // the resolver prompt shows json bytes for the diff (most
             // common case). On Adopt, we write both .json and .py from

@@ -26,6 +26,7 @@
 
 use crate::api::RossumClient;
 use crate::cli::deploy::common::rewrite_urls;
+use crate::cli::deploy::store_extensions::{build_install_body, find_orphan, StorePlan};
 use crate::mapping::Mapping;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
@@ -73,6 +74,18 @@ fn shape_create_body(
     payload
 }
 
+/// Thin wrapper for callers that have no explicit URL substitutions to pass.
+fn shape_create_body_no_subs(
+    raw: Value,
+    kind: &str,
+    overlay_paths: Option<&std::collections::BTreeMap<String, Value>>,
+    src_lockfile: &Lockfile,
+    tgt_lockfile: &Lockfile,
+    mapping: &Mapping,
+) -> Value {
+    shape_create_body(raw, kind, overlay_paths, src_lockfile, tgt_lockfile, mapping, &std::collections::BTreeMap::new())
+}
+
 pub async fn create_workspace(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
     let path = ctx.src_paths.workspace_dir(slug).join("workspace.json");
     let raw: Value = serde_json::from_slice(
@@ -81,7 +94,7 @@ pub async fn create_workspace(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()>
     .with_context(|| format!("parsing {}", path.display()))?;
     // Workspaces aren't a section in the overlay schema today, so no
     // per-workspace overrides apply on create.
-    let body = shape_create_body(raw, "workspaces", None, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping, &std::collections::BTreeMap::new());
+    let body = shape_create_body_no_subs(raw, "workspaces", None, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping);
     let created = ctx
         .tgt_client
         .create_workspace(&body, None)
@@ -113,7 +126,7 @@ pub async fn create_schema(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<
     let mut payload = read_schema_value(&src_queue_dir)
         .with_context(|| format!("reading src schema '{queue_slug}'"))?;
     let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.schema(queue_slug));
-    payload = shape_create_body(payload, "schemas", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping, &std::collections::BTreeMap::new());
+    payload = shape_create_body_no_subs(payload, "schemas", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping);
     let created = ctx
         .tgt_client
         .create_schema(&payload, None)
@@ -126,7 +139,7 @@ pub async fn create_schema(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<
         .parent()
         .and_then(|p| p.parent())
         .and_then(|p| p.file_name())
-        .map(|s| s.to_string_lossy().to_string())
+        .map(|s| s.to_string_lossy().into_owned())
         .context("locating src ws slug for schema")?;
     let tgt_queue_dir = ctx.tgt_paths.queue_dir(&ws_slug, queue_slug);
     std::fs::create_dir_all(&tgt_queue_dir)
@@ -158,7 +171,7 @@ pub async fn create_queue(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
     )
     .with_context(|| format!("parsing {}", queue_path.display()))?;
     let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.queue(queue_slug));
-    let body = shape_create_body(raw, "queues", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping, &std::collections::BTreeMap::new());
+    let body = shape_create_body_no_subs(raw, "queues", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping);
     let created = ctx
         .tgt_client
         .create_queue(&body, None)
@@ -168,7 +181,7 @@ pub async fn create_queue(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
         .parent()
         .and_then(|p| p.parent())
         .and_then(|p| p.file_name())
-        .map(|s| s.to_string_lossy().to_string())
+        .map(|s| s.to_string_lossy().into_owned())
         .context("locating src ws slug for queue")?;
     let tgt_queue_dir = ctx.tgt_paths.queue_dir(&ws_slug, queue_slug);
     std::fs::create_dir_all(&tgt_queue_dir)
@@ -247,7 +260,7 @@ pub async fn create_inbox(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
     )
     .with_context(|| format!("parsing {}", inbox_path.display()))?;
     let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.inbox(queue_slug));
-    let body = shape_create_body(raw, "inboxes", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping, &std::collections::BTreeMap::new());
+    let body = shape_create_body_no_subs(raw, "inboxes", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping);
     let created = ctx
         .tgt_client
         .create_inbox(&body, None)
@@ -257,7 +270,7 @@ pub async fn create_inbox(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
         .parent()
         .and_then(|p| p.parent())
         .and_then(|p| p.file_name())
-        .map(|s| s.to_string_lossy().to_string())
+        .map(|s| s.to_string_lossy().into_owned())
         .context("locating src ws slug for inbox")?;
     let tgt_inbox = ctx.tgt_paths.queue_dir(&ws_slug, queue_slug).join("inbox.json");
     let mut bytes = serde_json::to_vec_pretty(&created).context("serializing created inbox")?;
@@ -280,7 +293,7 @@ pub async fn create_inbox(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
 pub async fn create_hook(
     ctx: &mut CreateCtx<'_>,
     slug: &str,
-    store_plan: Option<&crate::cli::deploy::store_extensions::StorePlan>,
+    store_plan: Option<&StorePlan>,
     remote_hooks_cache: &mut Option<Vec<crate::model::Hook>>,
 ) -> Result<()> {
     let payload = read_hook_value(&ctx.src_paths.hooks_dir(), slug)
@@ -318,9 +331,9 @@ pub async fn create_hook(
                     .context("listing tgt hooks for store-extension orphan check")?,
             );
         }
-        let remote = remote_hooks_cache.as_ref().unwrap();
+        let remote = remote_hooks_cache.as_ref().expect("remote_hooks_cache was just populated above");
         let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let installed_id = match crate::cli::deploy::store_extensions::find_orphan(
+        let installed_id = match find_orphan(
             remote,
             &name,
             &plan.tgt_template_url,
@@ -334,7 +347,7 @@ pub async fn create_hook(
             }
             None => {
                 let install_body =
-                    crate::cli::deploy::store_extensions::build_install_body(&body)?;
+                    build_install_body(&body)?;
                 let installed = ctx
                     .tgt_client
                     .create_hook_via_install(&install_body, None)
@@ -403,7 +416,7 @@ pub async fn create_rule(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
     let payload = read_rule_value(&ctx.src_paths.rules_dir(), slug)
         .with_context(|| format!("reading src rule '{slug}'"))?;
     let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.rule(slug));
-    let body = shape_create_body(payload, "rules", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping, &std::collections::BTreeMap::new());
+    let body = shape_create_body_no_subs(payload, "rules", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping);
     let created = ctx
         .tgt_client
         .create_rule(&body, None)
@@ -436,7 +449,7 @@ pub async fn create_label(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
     )
     .with_context(|| format!("parsing {}", path.display()))?;
     let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.label(slug));
-    let body = shape_create_body(raw, "labels", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping, &std::collections::BTreeMap::new());
+    let body = shape_create_body_no_subs(raw, "labels", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping);
     let created = ctx
         .tgt_client
         .create_label(&body, None)

@@ -404,7 +404,7 @@ fn list_workspace_slugs(paths: &Paths) -> Result<Vec<String>> {
         if !entry.file_type()?.is_dir() {
             continue;
         }
-        let slug = entry.file_name().to_string_lossy().to_string();
+        let slug = entry.file_name().to_string_lossy().into_owned();
         if entry.path().join("workspace.json").exists() {
             out.push(slug);
         }
@@ -440,7 +440,7 @@ fn list_queue_nested(paths: &Paths, kind: &str) -> Result<Vec<String>> {
                 continue;
             }
             if q_entry.path().join(file_name).exists() {
-                out.push(q_entry.file_name().to_string_lossy().to_string());
+                out.push(q_entry.file_name().to_string_lossy().into_owned());
             }
         }
     }
@@ -459,7 +459,7 @@ fn list_email_template_keys(paths: &Paths) -> Result<Vec<String>> {
         if !ws_entry.file_type()?.is_dir() {
             continue;
         }
-        let ws_slug = ws_entry.file_name().to_string_lossy().to_string();
+        let ws_slug = ws_entry.file_name().to_string_lossy().into_owned();
         let queues_dir = ws_entry.path().join("queues");
         if !queues_dir.exists() {
             continue;
@@ -469,14 +469,14 @@ fn list_email_template_keys(paths: &Paths) -> Result<Vec<String>> {
             if !q_entry.file_type()?.is_dir() {
                 continue;
             }
-            let q_slug = q_entry.file_name().to_string_lossy().to_string();
+            let q_slug = q_entry.file_name().to_string_lossy().into_owned();
             let et_dir = q_entry.path().join("email-templates");
             if !et_dir.exists() {
                 continue;
             }
             for f in std::fs::read_dir(&et_dir)? {
                 let f = f?;
-                let name = f.file_name().to_string_lossy().to_string();
+                let name = f.file_name().to_string_lossy().into_owned();
                 if let Some(stem) = name.strip_suffix(".json") {
                     if !stem.ends_with(".remote") {
                         out.push(format!("{ws_slug}/{q_slug}/{stem}"));
@@ -502,7 +502,7 @@ fn list_flat_kind(paths: &Paths, kind: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
+        let name = entry.file_name().to_string_lossy().into_owned();
         if let Some(stem) = name.strip_suffix(".json") {
             if !stem.ends_with(".remote") {
                 out.push(stem.to_string());
@@ -525,7 +525,7 @@ fn list_engine_slugs(paths: &Paths) -> Result<Vec<String>> {
             continue;
         }
         if entry.path().join("engine.json").exists() {
-            out.push(entry.file_name().to_string_lossy().to_string());
+            out.push(entry.file_name().to_string_lossy().into_owned());
         }
     }
     out.sort();
@@ -543,14 +543,14 @@ fn list_engine_field_slugs(paths: &Paths) -> Result<Vec<String>> {
         if !e_entry.file_type()?.is_dir() {
             continue;
         }
-        let e_slug = e_entry.file_name().to_string_lossy().to_string();
+        let e_slug = e_entry.file_name().to_string_lossy().into_owned();
         let fields_dir = paths.engine_fields_dir(&e_slug);
         if !fields_dir.exists() {
             continue;
         }
         for f_entry in std::fs::read_dir(&fields_dir)? {
             let f_entry = f_entry?;
-            let name = f_entry.file_name().to_string_lossy().to_string();
+            let name = f_entry.file_name().to_string_lossy().into_owned();
             if let Some(stem) = name.strip_suffix(".json") {
                 if !stem.ends_with(".remote") {
                     out.push(stem.to_string());

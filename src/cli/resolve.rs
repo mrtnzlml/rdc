@@ -26,6 +26,7 @@
 
 use anyhow::{Context, Result};
 use similar::TextDiff;
+use std::fmt::Write as FmtWrite;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 use std::process::Command;
@@ -60,12 +61,12 @@ pub fn unified_diff(label_a: &str, a: &[u8], label_b: &str, b: &[u8]) -> String 
     let b_str = String::from_utf8_lossy(b);
     let diff = TextDiff::from_lines(a_str.as_ref(), b_str.as_ref());
     let mut out = String::new();
-    out.push_str(&format!("--- {label_a}\n"));
-    out.push_str(&format!("+++ {label_b}\n"));
+    write!(out, "--- {label_a}\n").expect("writing to String never fails");
+    write!(out, "+++ {label_b}\n").expect("writing to String never fails");
     let mut any = false;
     for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
         any = true;
-        out.push_str(&format!("{hunk}"));
+        write!(out, "{hunk}").expect("writing to String never fails");
     }
     if !any {
         return String::new();
@@ -116,10 +117,10 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
         return Ok(Resolution::KeepLocal);
     }
 
-    writeln!(output, "")?;
+    writeln!(output)?;
     let header = format!("[{index}/{total}]  {} — conflict", local_path.display());
     writeln!(output, "{}", colorize_header(&header, mode))?;
-    writeln!(output, "")?;
+    writeln!(output)?;
 
     let diff = unified_diff("local", &local_canonical, "remote", &remote_canonical);
     if diff.is_empty() {
@@ -128,7 +129,7 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
     for line in diff.lines() {
         writeln!(output, "{}", colorize_diff_line(line, mode))?;
     }
-    writeln!(output, "")?;
+    writeln!(output)?;
 
     loop {
         let prompt_text = "[k]eep local  [r]emote  [e]dit  [s]kip (shadow file)  [a]bort > ";
@@ -356,6 +357,16 @@ pub fn resolve_push_drift(
     }
 }
 
+fn sort_users_for_picker(users: &[crate::model::User]) -> Vec<&crate::model::User> {
+    let mut v: Vec<&crate::model::User> = users.iter().collect();
+    v.sort_by_key(|u| {
+        if u.is_system_user() { 0u8 }
+        else if u.is_admin() { 1 }
+        else { 2 }
+    });
+    v
+}
+
 /// Render the token_owner picker prompt as a string. Pure function for
 /// testability; the interactive variant `prompt_token_owner` wraps this
 /// with stdin/stdout.
@@ -365,13 +376,10 @@ pub fn render_token_owner_picker(
     users: &[crate::model::User],
     self_user_id: Option<u64>,
 ) -> String {
-    let mut sorted: Vec<&crate::model::User> = users.iter().collect();
-    sorted.sort_by_key(|u| {
-        if u.is_system_user() { 0 } else if u.is_admin() { 1 } else { 2 }
-    });
+    let sorted = sort_users_for_picker(users);
     let mut out = String::new();
-    out.push_str(&format!("Pick the token_owner for store extension '{slug}' on {tgt_env}\n"));
-    out.push_str("(used as the API service account for the extension's calls; usually a system user):\n\n");
+    write!(out, "Pick the token_owner for store extension '{slug}' on {tgt_env}\n").expect("writing to String never fails");
+    write!(out, "(used as the API service account for the extension's calls; usually a system user):\n\n").expect("writing to String never fails");
     for (i, u) in sorted.iter().enumerate() {
         let mut tags = Vec::new();
         if u.is_admin() { tags.push("admin"); }
@@ -383,11 +391,11 @@ pub fn render_token_owner_picker(
         } else {
             format!("{} {}", u.first_name, u.last_name).trim().to_string()
         };
-        out.push_str(&format!("  [{}] {display}   {tags}\n", i + 1));
-        out.push_str(&format!("      {}\n", u.url));
+        write!(out, "  [{}] {display}   {tags}\n", i + 1).expect("writing to String never fails");
+        write!(out, "      {}\n", u.url).expect("writing to String never fails");
     }
-    out.push_str("  [a] abort the deploy\n\n");
-    out.push_str("[1] > ");
+    write!(out, "  [a] abort the deploy\n\n").expect("writing to String never fails");
+    write!(out, "[1] > ").expect("writing to String never fails");
     out
 }
 
@@ -413,10 +421,7 @@ pub fn prompt_token_owner(
     } else {
         pick.parse().map_err(|_| anyhow::anyhow!("expected a number or 'a', got '{pick}'"))?
     };
-    let mut sorted: Vec<&crate::model::User> = users.iter().collect();
-    sorted.sort_by_key(|u| {
-        if u.is_system_user() { 0 } else if u.is_admin() { 1 } else { 2 }
-    });
+    let sorted = sort_users_for_picker(users);
     let chosen = sorted.get(n - 1).ok_or_else(|| anyhow::anyhow!("'{n}' is out of range"))?;
     print!("\nApply this choice to all remaining store extensions in this deploy? [y/N] ");
     io::stdout().flush().ok();
