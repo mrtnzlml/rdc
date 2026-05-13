@@ -143,7 +143,7 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
     let plan = compute_plan(&src_paths, &tgt_paths, &src_lockfile, &tgt_lockfile, &mapping, mirror)?;
 
     // 2. Display plan
-    print_plan(src, tgt, &plan, mirror, dry_run);
+    print_plan(src, tgt, &plan, mirror, dry_run, &store_plans);
 
     // 3. Confirm (TTY only) — skip the prompt when nothing destructive is
     // planned OR when dry-run is set (no writes will happen). An
@@ -564,7 +564,14 @@ fn list_engine_field_slugs(paths: &Paths) -> Result<Vec<String>> {
 
 // ----- plan display + confirmation ------------------------------------
 
-fn print_plan(src: &str, tgt: &str, plan: &PlanCounts, mirror: bool, dry_run: bool) {
+fn print_plan(
+    src: &str,
+    tgt: &str,
+    plan: &PlanCounts,
+    mirror: bool,
+    dry_run: bool,
+    store_plans: &[crate::cli::deploy::store_extensions::StorePlan],
+) {
     let suffix = if dry_run { "  (dry run — no remote changes)" } else { "" };
     println!("Plan: {src} → {tgt}{suffix}");
     if plan.create_total() == 0 {
@@ -575,6 +582,33 @@ fn print_plan(src: &str, tgt: &str, plan: &PlanCounts, mirror: bool, dry_run: bo
             .filter_map(|k| plan.creates.get(k).map(|v| format!("{} {}", v.len(), k)))
             .collect();
         println!("  + create:  {}", parts.join(", "));
+
+        // Surface store-extension subset when any of the hooks-to-create are
+        // store extensions. Print a sub-line showing count, operation shape,
+        // and a per-hook detail line with slug → template name + id.
+        if !store_plans.is_empty() {
+            let n = store_plans.len();
+            let hooks_to_create = plan.creates.get("hooks").map(|v| v.len()).unwrap_or(0);
+            if hooks_to_create > 0 && hooks_to_create >= n {
+                println!(
+                    "             ↳ {} of the {} hooks are store extensions (POST /hooks/create + PATCH each):",
+                    n, hooks_to_create
+                );
+            } else {
+                let ext_word = if n == 1 { "store extension" } else { "store extensions" };
+                println!(
+                    "             ↳ {} {} will be installed (POST /hooks/create + PATCH each):",
+                    n, ext_word
+                );
+            }
+            for sp in store_plans {
+                let tgt_id = sp.tgt_template_url.rsplit('/').next().unwrap_or("?");
+                println!(
+                    "                 {} → template '{}' on {} (id {})",
+                    sp.src_slug, sp.tgt_template_name, tgt, tgt_id
+                );
+            }
+        }
     }
 
     // Updates are computed lazily by the apply sub-step. We surface that

@@ -1042,3 +1042,163 @@ async fn deploy_resolves_templates_and_prompts_for_token_owner() {
         .expect("hooks.master-data-hub.id must be an integer in tgt lockfile");
     assert!(hook_id > 0, "hook id in tgt lockfile must be positive, got {hook_id}");
 }
+
+/// `rdc deploy test prod --dry-run` with a store extension in src must print
+/// the store-extension sub-line in the plan summary, naming the slug and the
+/// template on the target cluster. No writes should reach the tgt server.
+#[tokio::test]
+async fn deploy_plan_lists_store_extensions_in_dry_run() {
+    let test_server = MockServer::start().await;
+    let prod_server = MockServer::start().await;
+    let src_api = format!("{}/api/v1", test_server.uri());
+    let tgt_api = format!("{}/api/v1", prod_server.uri());
+
+    // ── Src (test) pull mocks ────────────────────────────────────────────────
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&test_server).await;
+    let mdh_src = {
+        let mut b = mdh_snapshot_body(&src_api);
+        b["id"] = serde_json::Value::from(999u64);
+        b["url"] = serde_json::Value::String(format!("{src_api}/hooks/999"));
+        b
+    };
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": {"next": null},
+            "results": [mdh_src.clone()]
+        })))
+        .mount(&test_server).await;
+    for ep in [
+        "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&test_server).await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hook_templates"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": {"next": null},
+            "results": [
+                {"url": format!("{src_api}/hook_templates/39"),
+                 "name": "Master Data Hub", "type": "webhook",
+                 "extension_source": "rossum_store", "install_action": "copy"}
+            ]
+        })))
+        .mount(&test_server).await;
+
+    // ── Tgt (prod) pull mocks ────────────────────────────────────────────────
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&prod_server).await;
+    for ep in [
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/hooks",
+        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&prod_server).await;
+    }
+    // tgt /hook_templates — id 41 (different from src's 39)
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hook_templates"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": {"next": null},
+            "results": [
+                {"url": format!("{tgt_api}/hook_templates/41"),
+                 "name": "Master Data Hub", "type": "webhook",
+                 "extension_source": "rossum_store", "install_action": "copy"}
+            ]
+        })))
+        .mount(&prod_server).await;
+
+    // ── Project bootstrap ────────────────────────────────────────────────────
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args([
+            "init",
+            "--env", &format!("test={src_api}:1"),
+            "--env", &format!("prod={tgt_api}:1"),
+        ])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/test.secrets.json"),
+        r#"{"api_token":"TKN_TEST"}"#,
+    ).unwrap();
+    std::fs::write(
+        project.path().join("secrets/prod.secrets.json"),
+        r#"{"api_token":"TKN_PROD"}"#,
+    ).unwrap();
+
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "test"])
+        .assert().success();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "prod"])
+        .assert().success();
+
+    // Pre-populate the tgt overlay with the system user URL so the pre-pass
+    // resolves token_owner without hanging on stdin.
+    let prod_overlay_path = project.path().join("envs/prod/overlay.toml");
+    std::fs::create_dir_all(prod_overlay_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &prod_overlay_path,
+        format!(
+            "version = 1\n\n[defaults]\nstore_extension_token_owner = \"{tgt_api}/users/521884\"\n"
+        ),
+    ).unwrap();
+
+    // --dry-run: plan is printed but no writes happen.
+    let out = Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["deploy", "test", "prod", "--dry-run"])
+        .output().unwrap();
+
+    assert!(
+        out.status.success(),
+        "dry-run deploy should succeed.\nstderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout),
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // The plan summary must contain the store-extension sub-line.
+    assert!(
+        stdout.contains("store extension"),
+        "stdout should mention 'store extension':\n{stdout}"
+    );
+    assert!(
+        stdout.contains("master-data-hub"),
+        "stdout should name the slug 'master-data-hub':\n{stdout}"
+    );
+
+    // No mutating requests (POST/PATCH/DELETE) should have reached tgt.
+    for req in prod_server.received_requests().await.unwrap_or_default() {
+        let path = req.url.path();
+        if path.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "unexpected mutating request in dry-run: {} {}",
+            req.method,
+            path
+        );
+    }
+}
