@@ -1178,6 +1178,7 @@ dependencies = [
  "clap-cargo",
  "flate2",
  "futures",
+ "http",
  "indicatif",
  "predicates",
  "pretty_assertions",
