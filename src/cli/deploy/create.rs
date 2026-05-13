@@ -30,6 +30,7 @@ use crate::cli::deploy::store_extensions::{build_install_body, find_orphan, Stor
 use crate::mapping::Mapping;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
+use crate::progress::OverallProgress;
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::email_template::write_email_template;
 use crate::snapshot::hook::{read_hook_value, write_hook};
@@ -39,6 +40,7 @@ use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, hook_combined_hash, rule_combined_hash, schema_combined_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
 use serde_json::Value;
+use std::sync::Arc;
 
 /// Common bundle threaded through every per-kind create function. Keeps
 /// signatures readable.
@@ -50,6 +52,7 @@ pub struct CreateCtx<'a> {
     pub mapping: &'a mut Mapping,
     pub tgt_overlay: &'a Option<Overlay>,
     pub tgt_client: &'a RossumClient,
+    pub progress: Option<Arc<OverallProgress>>,
 }
 
 /// Walk a src payload, rewrite cross-refs to tgt URLs, apply overlay,
@@ -115,6 +118,7 @@ pub async fn create_workspace(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()>
         },
     );
     ctx.mapping.workspaces.insert(slug.to_string(), slug.to_string());
+    ctx.progress.as_ref().map(|p| p.tick(slug));
     Ok(())
 }
 
@@ -158,6 +162,7 @@ pub async fn create_schema(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<
         },
     );
     ctx.mapping.schemas.insert(queue_slug.to_string(), queue_slug.to_string());
+    ctx.progress.as_ref().map(|p| p.tick(queue_slug));
     Ok(())
 }
 
@@ -201,6 +206,7 @@ pub async fn create_queue(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
         },
     );
     ctx.mapping.queues.insert(queue_slug.to_string(), queue_slug.to_string());
+    ctx.progress.as_ref().map(|p| p.tick(queue_slug));
 
     // Rossum auto-creates 5 default email templates per new queue. Capture
     // them now so the later email-templates phase sees them as existing
@@ -287,6 +293,7 @@ pub async fn create_inbox(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
         },
     );
     ctx.mapping.inboxes.insert(queue_slug.to_string(), queue_slug.to_string());
+    ctx.progress.as_ref().map(|p| p.tick(queue_slug));
     Ok(())
 }
 
@@ -339,10 +346,10 @@ pub async fn create_hook(
             &plan.tgt_template_url,
         ) {
             Some(orphan) => {
-                eprintln!(
-                    "adopting orphan store-extension hooks/{slug} (id {}) on tgt",
-                    orphan.id
-                );
+                match &ctx.progress {
+                    Some(p) => p.println(format!("adopting orphan store-extension hooks/{slug} (id {}) on tgt", orphan.id)),
+                    None => eprintln!("adopting orphan store-extension hooks/{slug} (id {}) on tgt", orphan.id),
+                }
                 orphan.id
             }
             None => {
@@ -409,6 +416,7 @@ pub async fn create_hook(
         },
     );
     ctx.mapping.hooks.insert(slug.to_string(), slug.to_string());
+    ctx.progress.as_ref().map(|p| p.tick(slug));
     Ok(())
 }
 
@@ -439,6 +447,7 @@ pub async fn create_rule(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
         },
     );
     ctx.mapping.rules.insert(slug.to_string(), slug.to_string());
+    ctx.progress.as_ref().map(|p| p.tick(slug));
     Ok(())
 }
 
@@ -473,6 +482,7 @@ pub async fn create_label(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
         },
     );
     ctx.mapping.labels.insert(slug.to_string(), slug.to_string());
+    ctx.progress.as_ref().map(|p| p.tick(slug));
     Ok(())
 }
 

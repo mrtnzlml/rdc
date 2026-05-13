@@ -30,12 +30,22 @@ use crate::config::ProjectConfig;
 use crate::mapping::Mapping;
 use crate::overlay::Overlay;
 use crate::paths::Paths;
+use crate::progress::OverallProgress;
 use crate::secrets::resolve_token;
 use crate::state::Lockfile;
 use anyhow::{anyhow, Context, Result};
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
+use std::sync::Arc;
 use std::time::Instant;
+
+/// Route a warning through the progress bar (if active) or directly to stderr.
+fn warn(progress: Option<&Arc<OverallProgress>>, msg: String) {
+    match progress {
+        Some(p) => p.println(&msg),
+        None => eprintln!("{msg}"),
+    }
+}
 
 /// Plan summary: how many objects per kind fall into each bucket.
 #[derive(Debug, Default)]
@@ -164,6 +174,13 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
         }
     }
 
+    // Start the progress bar for the work phase (not in dry-run).
+    let progress: Option<Arc<OverallProgress>> = if !dry_run {
+        Some(OverallProgress::start(format!("deploy {src} → {tgt}")))
+    } else {
+        None
+    };
+
     let started = Instant::now();
     let mut creates_done = 0usize;
     let mut api_calls = 0usize;
@@ -208,6 +225,7 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
             mapping: &mut mapping,
             tgt_overlay: &tgt_overlay,
             tgt_client: &tgt_client,
+            progress: progress.clone(),
         };
         // Lazily-populated cache of tgt remote hooks for store-extension
         // orphan checks. Shared across all hooks in this bootstrap run so
@@ -215,6 +233,12 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
         let mut remote_hooks_cache: Option<Vec<crate::model::Hook>> = None;
         for kind in KINDS_IN_DEP_ORDER {
             let Some(slugs) = plan.creates.get(kind) else { continue };
+            if slugs.is_empty() { continue; }
+            // Start a phase for this kind (skipped if no items).
+            progress.as_ref().map(|p| {
+                p.inc_total(slugs.len() as u64);
+                p.start_phase(format!("create {kind}"));
+            });
             for slug in slugs {
                 let result = match *kind {
                     "workspaces" => create_workspace(&mut ctx, slug).await,
@@ -253,9 +277,6 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
                 creates_done += 1;
                 api_calls += 1;
             }
-            if !slugs.is_empty() {
-                println!("  → {kind:18} {} created", slugs.len());
-            }
         }
         // Persist tgt lockfile after creates; apply re-reads from disk.
         tgt_lockfile
@@ -273,9 +294,9 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
     // 6. Run apply for the field-level update sweep. Apply now sees the
     // fully-populated mapping + tgt lockfile and PATCHes only the objects
     // whose canonical content (after URL rewrite + overlay) actually
-    // differs from the tgt remote. Apply prints its own summary line, and
-    // honors `dry_run` by tracing the same logic but skipping the PATCH.
-    crate::cli::deploy::apply::run(src, tgt, dry_run, diff)
+    // differs from the tgt remote. Apply returns its summary string; we
+    // print it after the bar is finished.
+    let apply_summary = crate::cli::deploy::apply::run(src, tgt, dry_run, diff, progress.clone())
         .await
         .with_context(|| format!(
             "update phase failed after {creates_done} create(s) succeeded"
@@ -303,20 +324,29 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
                 }
                 continue;
             }
+            // Start a delete phase for this kind.
+            progress.as_ref().map(|p| {
+                p.inc_total(slugs.len() as u64);
+                p.start_phase(format!("delete {kind}"));
+            });
             for slug in slugs {
                 if let Err(e) = delete_one(&tgt_client, &mut tgt_lockfile, &tgt_paths, kind, slug).await {
-                    eprintln!("warning: failed to delete {kind}/{slug}: {e:#}");
+                    warn(progress.as_ref(), format!("warning: failed to delete {kind}/{slug}: {e:#}"));
+                } else {
+                    progress.as_ref().map(|p| p.tick(slug));
                 }
                 deletes_done += 1;
                 api_calls += 1;
-            }
-            if !slugs.is_empty() {
-                println!("  - {kind:18} {} deleted", slugs.len());
             }
         }
         if !dry_run {
             tgt_lockfile.save(&tgt_paths.lockfile())?;
         }
+    }
+
+    // Finish the progress bar before printing summaries.
+    if let Some(p) = &progress {
+        p.finish();
     }
 
     let elapsed = started.elapsed();
@@ -329,6 +359,8 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
             elapsed.as_secs_f64()
         );
     } else {
+        // Print apply summary (captured before bar finish, printed after).
+        println!("{apply_summary}");
         println!(
             "\nDeployed {src} → {tgt}: {creates_done} created, {deletes_done} deleted, \
              {} API calls, {:.1}s",
