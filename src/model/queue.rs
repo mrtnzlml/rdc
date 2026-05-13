@@ -16,7 +16,10 @@ pub struct Queue {
     pub workspace: Option<String>,
     #[serde(default)]
     pub schema: Option<String>,
-    #[serde(default)]
+    /// `None` is serialised as **absent** rather than `null`, because the
+    /// Rossum API rejects `inbox: null` on PATCH with `"This field may not be
+    /// null."`. Queues without an inbox simply omit the key on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inbox: Option<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,

@@ -9,6 +9,12 @@ use std::path::Path;
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Mapping {
     pub version: u32,
+    /// Workspace slug → workspace slug. Workspaces themselves are pull-only
+    /// in `rdc apply` (we don't PATCH them across envs), but their URLs are
+    /// referenced by queues, so the mapping is needed to rewrite
+    /// `queue.workspace` from the src URL to the tgt URL.
+    #[serde(default)]
+    pub workspaces: BTreeMap<String, String>,
     #[serde(default)]
     pub hooks: BTreeMap<String, String>,
     #[serde(default)]
@@ -42,6 +48,7 @@ impl Default for Mapping {
     fn default() -> Self {
         Self {
             version: 1,
+            workspaces: BTreeMap::new(),
             hooks: BTreeMap::new(),
             rules: BTreeMap::new(),
             labels: BTreeMap::new(),
@@ -79,6 +86,7 @@ impl Mapping {
     /// `rdc apply`'s URL-rewrite step.
     pub fn lookup_tgt_slug(&self, kind: &str, src_slug: &str) -> Option<&str> {
         let map = match kind {
+            "workspaces" => &self.workspaces,
             "hooks" => &self.hooks,
             "rules" => &self.rules,
             "labels" => &self.labels,

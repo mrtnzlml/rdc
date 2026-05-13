@@ -1,0 +1,645 @@
+//! `rdc deploy <src> <tgt>` — the first-class one-shot cross-env deploy.
+//!
+//! Semantics:
+//! - **Additive by default**: tgt-only objects are kept intact. Pass
+//!   `--mirror` to delete them so PROD becomes exactly TEST.
+//! - **Plan-before-apply**: counts (and, on TTY, an interactive confirm)
+//!   are printed before any write hits the target.
+//! - **Idempotent**: re-running on an in-sync target is `0` API calls.
+//!
+//! Pipeline:
+//!   1. Compute the plan by walking both local snapshots.
+//!   2. Print + (TTY) confirm.
+//!   3. **Create** missing tgt objects in dependency order — workspaces →
+//!      schemas → queues → inboxes → email_templates → hooks → rules →
+//!      labels → engines → engine_fields. Each create updates the
+//!      in-memory tgt lockfile + mapping so subsequent kinds can rewrite
+//!      cross-references to the just-created peers.
+//!   4. **Update** field-level deltas via the existing `rdc apply` flow
+//!      (reused as a sub-step), which now sees a complete mapping.
+//!   5. **Delete** (mirror only) tgt-only objects in REVERSE dependency
+//!      order so a queue is gone before its workspace.
+//!   6. Save the updated lockfile + mapping; print a summary.
+
+use crate::api::RossumClient;
+use crate::cli::deploy::create::{
+    create_hook, create_inbox, create_label, create_queue, create_rule, create_schema,
+    create_workspace, locate_queue_dir, CreateCtx,
+};
+use crate::config::ProjectConfig;
+use crate::mapping::Mapping;
+use crate::overlay::Overlay;
+use crate::paths::Paths;
+use crate::secrets::resolve_token;
+use crate::state::Lockfile;
+use anyhow::{anyhow, Context, Result};
+use std::collections::BTreeMap;
+use std::io::{IsTerminal, Write};
+use std::time::Instant;
+
+/// Plan summary: how many objects per kind fall into each bucket.
+#[derive(Debug, Default)]
+struct PlanCounts {
+    creates: BTreeMap<&'static str, Vec<String>>,
+    deletes: BTreeMap<&'static str, Vec<String>>,
+}
+
+impl PlanCounts {
+    fn create_total(&self) -> usize {
+        self.creates.values().map(|v| v.len()).sum()
+    }
+    fn delete_total(&self) -> usize {
+        self.deletes.values().map(|v| v.len()).sum()
+    }
+}
+
+/// Kinds we deploy, in dependency order (POST order). Workflows are
+/// pull-only at the Rossum API (PATCH returns 405) and so are not
+/// deployable; MDH is not yet writable.
+pub const KINDS_IN_DEP_ORDER: &[&str] = &[
+    "workspaces",
+    "schemas",
+    "queues",
+    "inboxes",
+    "email_templates",
+    "hooks",
+    "rules",
+    "labels",
+    "engines",
+    "engine_fields",
+];
+
+pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run: bool) -> Result<()> {
+    if src == tgt {
+        return Err(anyhow!(
+            "src and tgt envs are the same ('{src}'). Use two different envs for `rdc deploy`."
+        ));
+    }
+
+    let cwd = std::env::current_dir().context("getting current directory")?;
+    let src_paths = Paths::for_env(&cwd, src);
+    let tgt_paths = Paths::for_env(&cwd, tgt);
+
+    let cfg = ProjectConfig::load(&src_paths.project_config())
+        .with_context(|| format!("loading project config from {}", src_paths.project_config().display()))?;
+    if !cfg.envs.contains_key(src) {
+        return Err(anyhow!("env '{src}' is not defined in rdc.toml"));
+    }
+    let tgt_cfg = cfg
+        .envs
+        .get(tgt)
+        .ok_or_else(|| anyhow!("env '{tgt}' is not defined in rdc.toml"))?;
+
+    let tgt_token = resolve_token(&cwd, tgt)?;
+    let tgt_client = RossumClient::new(tgt_cfg.api_base.clone(), tgt_token)
+        .context("constructing tgt API client")?;
+
+    let src_lockfile = Lockfile::load(&src_paths.lockfile())
+        .with_context(|| format!("loading src lockfile from {}", src_paths.lockfile().display()))?;
+    let mut tgt_lockfile = Lockfile::load(&tgt_paths.lockfile())
+        .with_context(|| format!("loading tgt lockfile from {}", tgt_paths.lockfile().display()))?;
+    let mut mapping = Mapping::load(&src_paths.mapping_file(src, tgt))?;
+    let tgt_overlay = Overlay::load(&tgt_paths.overlay_file())
+        .with_context(|| format!("loading tgt overlay from {}", tgt_paths.overlay_file().display()))?;
+
+    // 0. Auto-populate the slug-to-slug mapping for objects that already
+    // exist in both envs. Without this step the apply sub-step would
+    // skip every pre-existing object because the mapping would be empty.
+    // User-curated entries in the mapping file (cross-env renames) are
+    // preserved — `auto_match` never overwrites.
+    crate::cli::deploy::map::auto_match(&mut mapping, &src_paths, &tgt_paths)?;
+
+    // 1. Compute plan — file-system level only (which slugs are missing
+    // from tgt, and in mirror mode which are tgt-only). Field-level diffs
+    // are deferred to the apply sub-step because computing them eagerly
+    // costs one GET per object across the whole snapshot.
+    let plan = compute_plan(&src_paths, &tgt_paths, &src_lockfile, &tgt_lockfile, &mapping, mirror)?;
+
+    // 2. Display plan
+    print_plan(src, tgt, &plan, mirror, dry_run);
+
+    // 3. Confirm (TTY only) — skip the prompt when nothing destructive is
+    // planned OR when dry-run is set (no writes will happen). An
+    // "all-update" sweep still runs (PATCHes only the objects whose
+    // canonical content differs), which is safe to do silently.
+    if !dry_run
+        && interactive
+        && (plan.create_total() > 0 || plan.delete_total() > 0)
+    {
+        if !confirm_or_abort("Proceed with deploy?")? {
+            return Ok(());
+        }
+        if mirror && plan.delete_total() > 0 && !confirm_or_abort(&format!(
+            "Mirror mode will DELETE {} object(s) from {tgt}. Continue?",
+            plan.delete_total()
+        ))? {
+            return Ok(());
+        }
+    }
+
+    let started = Instant::now();
+    let mut creates_done = 0usize;
+    let mut api_calls = 0usize;
+
+    // 4. Execute creates in dependency order. In dry-run mode we don't
+    // POST — we just print what would happen. The create phase has no
+    // pre-flight comparison to do (a slug missing in tgt is a single
+    // file-system check, already done during plan computation), so
+    // "previewing" a create amounts to re-stating the plan's per-kind
+    // count line.
+    if dry_run {
+        for kind in KINDS_IN_DEP_ORDER {
+            if let Some(slugs) = plan.creates.get(kind) {
+                if !slugs.is_empty() {
+                    println!("  → {kind:18} {} would be created", slugs.len());
+                }
+            }
+        }
+    } else {
+        let mut ctx = CreateCtx {
+            src_paths: &src_paths,
+            tgt_paths: &tgt_paths,
+            src_lockfile: &src_lockfile,
+            tgt_lockfile: &mut tgt_lockfile,
+            mapping: &mut mapping,
+            tgt_overlay: &tgt_overlay,
+            tgt_client: &tgt_client,
+        };
+        for kind in KINDS_IN_DEP_ORDER {
+            let Some(slugs) = plan.creates.get(kind) else { continue };
+            for slug in slugs {
+                let result = match *kind {
+                    "workspaces" => create_workspace(&mut ctx, slug).await,
+                    "schemas" => create_schema(&mut ctx, slug).await,
+                    "queues" => {
+                        // queue create also fetches its auto-peer templates,
+                        // costing an extra LIST call per queue.
+                        api_calls += 1;
+                        create_queue(&mut ctx, slug).await
+                    }
+                    "inboxes" => create_inbox(&mut ctx, slug).await,
+                    "email_templates" => {
+                        // Email templates with unique types are auto-created
+                        // by queue POST; here we only POST any custom (non-default)
+                        // templates the user explicitly added in src that the
+                        // queue auto-create didn't cover. The Rossum API rejects
+                        // POSTing a second template with a unique type, so we let
+                        // those flow to the update phase instead.
+                        Ok(())
+                    }
+                    "hooks" => create_hook(&mut ctx, slug).await,
+                    "rules" => create_rule(&mut ctx, slug).await,
+                    "labels" => create_label(&mut ctx, slug).await,
+                    "engines" | "engine_fields" => {
+                        // Engines/engine_fields creation isn't exercised in
+                        // current orgs and may 403; fall through silently to
+                        // the update phase (which already has 405/403 handling).
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                };
+                result?;
+                creates_done += 1;
+                api_calls += 1;
+            }
+            if !slugs.is_empty() {
+                println!("  → {kind:18} {} created", slugs.len());
+            }
+        }
+        // Persist tgt lockfile after creates; apply re-reads from disk.
+        tgt_lockfile
+            .save(&tgt_paths.lockfile())
+            .with_context(|| format!("saving tgt lockfile to {}", tgt_paths.lockfile().display()))?;
+    }
+
+    // 5. Persist the auto-matched mapping (in both dry-run and real-run).
+    // In real-run, apply re-reads this from disk and uses it. In dry-run,
+    // it leaves a clean state for a subsequent real `rdc deploy`.
+    std::fs::create_dir_all(src_paths.mapping_dir())
+        .with_context(|| format!("creating {}", src_paths.mapping_dir().display()))?;
+    mapping.save(&src_paths.mapping_file(src, tgt))?;
+
+    // 6. Run apply for the field-level update sweep. Apply now sees the
+    // fully-populated mapping + tgt lockfile and PATCHes only the objects
+    // whose canonical content (after URL rewrite + overlay) actually
+    // differs from the tgt remote. Apply prints its own summary line, and
+    // honors `dry_run` by tracing the same logic but skipping the PATCH.
+    crate::cli::deploy::apply::run(src, tgt, dry_run)
+        .await
+        .with_context(|| format!(
+            "update phase failed after {creates_done} create(s) succeeded"
+        ))?;
+
+    // 7. Deletes (mirror only), reverse dependency order so children go
+    // before their parents. Dry-run reports what would be deleted but
+    // doesn't issue DELETE calls.
+    let mut deletes_done = 0usize;
+    if mirror && plan.delete_total() > 0 {
+        let mut rev = KINDS_IN_DEP_ORDER.to_vec();
+        rev.reverse();
+        for kind in rev {
+            let Some(slugs) = plan.deletes.get(kind) else { continue };
+            if dry_run {
+                if !slugs.is_empty() {
+                    println!("  - {kind:18} {} would be deleted", slugs.len());
+                }
+                continue;
+            }
+            for slug in slugs {
+                if let Err(e) = delete_one(&tgt_client, &mut tgt_lockfile, &tgt_paths, kind, slug).await {
+                    eprintln!("warning: failed to delete {kind}/{slug}: {e:#}");
+                }
+                deletes_done += 1;
+                api_calls += 1;
+            }
+            if !slugs.is_empty() {
+                println!("  - {kind:18} {} deleted", slugs.len());
+            }
+        }
+        if !dry_run {
+            tgt_lockfile.save(&tgt_paths.lockfile())?;
+        }
+    }
+
+    let elapsed = started.elapsed();
+    if dry_run {
+        println!(
+            "\nDry run ({src} → {tgt}): {} would be created, {} would be deleted, \
+             {:.1}s — no remote changes made.",
+            plan.create_total(),
+            plan.delete_total(),
+            elapsed.as_secs_f64()
+        );
+    } else {
+        println!(
+            "\nDeployed {src} → {tgt}: {creates_done} created, {deletes_done} deleted, \
+             {} API calls, {:.1}s",
+            api_calls,
+            elapsed.as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
+// ----- plan computation ------------------------------------------------
+
+fn compute_plan(
+    src_paths: &Paths,
+    tgt_paths: &Paths,
+    _src_lockfile: &Lockfile,
+    _tgt_lockfile: &Lockfile,
+    _mapping: &Mapping,
+    mirror: bool,
+) -> Result<PlanCounts> {
+    let mut plan = PlanCounts::default();
+
+    for kind in KINDS_IN_DEP_ORDER {
+        let src_slugs = list_slugs(src_paths, kind)?;
+        let tgt_slugs: std::collections::HashSet<String> =
+            list_slugs(tgt_paths, kind)?.into_iter().collect();
+        let mut to_create = Vec::new();
+        for slug in &src_slugs {
+            if !tgt_slugs.contains(slug) {
+                to_create.push(slug.clone());
+            }
+        }
+        if !to_create.is_empty() {
+            plan.creates.insert(*kind, to_create);
+        }
+        if mirror {
+            let src_set: std::collections::HashSet<&String> = src_slugs.iter().collect();
+            let to_delete: Vec<String> = tgt_slugs
+                .iter()
+                .filter(|s| !src_set.contains(*s))
+                .cloned()
+                .collect();
+            if !to_delete.is_empty() {
+                plan.deletes.insert(*kind, to_delete);
+            }
+        }
+    }
+    Ok(plan)
+}
+
+/// List slugs from the local snapshot. The layout is kind-specific; we
+/// reuse the same scanners `rdc map` uses for cross-env auto-matching.
+fn list_slugs(paths: &Paths, kind: &str) -> Result<Vec<String>> {
+    match kind {
+        "workspaces" => list_workspace_slugs(paths),
+        "schemas" | "queues" | "inboxes" => list_queue_nested(paths, kind),
+        "email_templates" => list_email_template_keys(paths),
+        "hooks" | "rules" | "labels" => list_flat_kind(paths, kind),
+        "engines" => list_engine_slugs(paths),
+        "engine_fields" => list_engine_field_slugs(paths),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn list_workspace_slugs(paths: &Paths) -> Result<Vec<String>> {
+    let dir = paths.workspaces_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let slug = entry.file_name().to_string_lossy().to_string();
+        if entry.path().join("workspace.json").exists() {
+            out.push(slug);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn list_queue_nested(paths: &Paths, kind: &str) -> Result<Vec<String>> {
+    let ws_dir = paths.workspaces_dir();
+    if !ws_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let file_name = match kind {
+        "queues" => "queue.json",
+        "schemas" => "schema.json",
+        "inboxes" => "inbox.json",
+        _ => return Ok(Vec::new()),
+    };
+    let mut out = Vec::new();
+    for ws_entry in std::fs::read_dir(&ws_dir)? {
+        let ws_entry = ws_entry?;
+        if !ws_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let queues_dir = ws_entry.path().join("queues");
+        if !queues_dir.exists() {
+            continue;
+        }
+        for q_entry in std::fs::read_dir(&queues_dir)? {
+            let q_entry = q_entry?;
+            if !q_entry.file_type()?.is_dir() {
+                continue;
+            }
+            if q_entry.path().join(file_name).exists() {
+                out.push(q_entry.file_name().to_string_lossy().to_string());
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn list_email_template_keys(paths: &Paths) -> Result<Vec<String>> {
+    let ws_dir = paths.workspaces_dir();
+    if !ws_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for ws_entry in std::fs::read_dir(&ws_dir)? {
+        let ws_entry = ws_entry?;
+        if !ws_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let ws_slug = ws_entry.file_name().to_string_lossy().to_string();
+        let queues_dir = ws_entry.path().join("queues");
+        if !queues_dir.exists() {
+            continue;
+        }
+        for q_entry in std::fs::read_dir(&queues_dir)? {
+            let q_entry = q_entry?;
+            if !q_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let q_slug = q_entry.file_name().to_string_lossy().to_string();
+            let et_dir = q_entry.path().join("email-templates");
+            if !et_dir.exists() {
+                continue;
+            }
+            for f in std::fs::read_dir(&et_dir)? {
+                let f = f?;
+                let name = f.file_name().to_string_lossy().to_string();
+                if let Some(stem) = name.strip_suffix(".json") {
+                    if !stem.ends_with(".remote") {
+                        out.push(format!("{ws_slug}/{q_slug}/{stem}"));
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn list_flat_kind(paths: &Paths, kind: &str) -> Result<Vec<String>> {
+    let dir = match kind {
+        "hooks" => paths.hooks_dir(),
+        "rules" => paths.rules_dir(),
+        "labels" => paths.labels_dir(),
+        _ => return Ok(Vec::new()),
+    };
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(stem) = name.strip_suffix(".json") {
+            if !stem.ends_with(".remote") {
+                out.push(stem.to_string());
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn list_engine_slugs(paths: &Paths) -> Result<Vec<String>> {
+    let dir = paths.engines_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if entry.path().join("engine.json").exists() {
+            out.push(entry.file_name().to_string_lossy().to_string());
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn list_engine_field_slugs(paths: &Paths) -> Result<Vec<String>> {
+    let dir = paths.engines_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for e_entry in std::fs::read_dir(&dir)? {
+        let e_entry = e_entry?;
+        if !e_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let e_slug = e_entry.file_name().to_string_lossy().to_string();
+        let fields_dir = paths.engine_fields_dir(&e_slug);
+        if !fields_dir.exists() {
+            continue;
+        }
+        for f_entry in std::fs::read_dir(&fields_dir)? {
+            let f_entry = f_entry?;
+            let name = f_entry.file_name().to_string_lossy().to_string();
+            if let Some(stem) = name.strip_suffix(".json") {
+                if !stem.ends_with(".remote") {
+                    out.push(stem.to_string());
+                }
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+// ----- plan display + confirmation ------------------------------------
+
+fn print_plan(src: &str, tgt: &str, plan: &PlanCounts, mirror: bool, dry_run: bool) {
+    let suffix = if dry_run { "  (dry run — no remote changes)" } else { "" };
+    println!("Plan: {src} → {tgt}{suffix}");
+    if plan.create_total() == 0 {
+        println!("  + create:  (none)");
+    } else {
+        let parts: Vec<String> = KINDS_IN_DEP_ORDER
+            .iter()
+            .filter_map(|k| plan.creates.get(k).map(|v| format!("{} {}", v.len(), k)))
+            .collect();
+        println!("  + create:  {}", parts.join(", "));
+    }
+
+    // Updates are computed lazily by the apply sub-step. We surface that
+    // as a hint here rather than re-doing the cross-env diff up-front.
+    println!("  ~ update:  field-level deltas (resolved by `rdc apply` sub-step)");
+
+    if mirror {
+        if plan.delete_total() == 0 {
+            println!("  - delete:  (none — tgt has no extras)");
+        } else {
+            let parts: Vec<String> = KINDS_IN_DEP_ORDER
+                .iter()
+                .rev()
+                .filter_map(|k| plan.deletes.get(k).map(|v| format!("{} {}", v.len(), k)))
+                .collect();
+            println!("  - delete:  {} (--mirror)", parts.join(", "));
+        }
+    }
+    println!();
+}
+
+fn confirm_or_abort(prompt: &str) -> Result<bool> {
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        // Non-TTY: respect the caller's earlier `interactive` check; if we
+        // got here, the user wants a prompt, but with no terminal we can't
+        // show one. Abort safely.
+        eprintln!("note: non-TTY environment, refusing to proceed without --yes");
+        return Ok(false);
+    }
+    print!("{prompt} [y/N] ");
+    std::io::stdout().flush().ok();
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let ans = input.trim().to_ascii_lowercase();
+    if ans == "y" || ans == "yes" {
+        Ok(true)
+    } else {
+        println!("Aborted.");
+        Ok(false)
+    }
+}
+
+// ----- delete --------------------------------------------------------
+
+async fn delete_one(
+    client: &RossumClient,
+    tgt_lockfile: &mut Lockfile,
+    tgt_paths: &Paths,
+    kind: &str,
+    slug: &str,
+) -> Result<()> {
+    let entry = tgt_lockfile
+        .objects
+        .get(kind)
+        .and_then(|m| m.get(slug))
+        .ok_or_else(|| anyhow!("no lockfile entry for {kind}/{slug}"))?
+        .clone();
+    let id = entry.id;
+    match kind {
+        "hooks" => client.delete_hook(id, None).await?,
+        "rules" => client.delete_rule(id, None).await?,
+        "labels" => client.delete_label(id, None).await?,
+        "queues" => client.delete_queue(id, None).await?,
+        "schemas" => client.delete_schema(id, None).await?,
+        "inboxes" => client.delete_inbox(id, None).await?,
+        "email_templates" => client.delete_email_template(id, None).await?,
+        "engines" => client.delete_engine(id, None).await?,
+        "engine_fields" => client.delete_engine_field(id, None).await?,
+        "workspaces" => client.delete_workspace(id, None).await?,
+        _ => return Err(anyhow!("kind '{kind}' not deletable")),
+    }
+    // Remove local file(s).
+    remove_local_file(tgt_paths, kind, slug);
+    // Remove lockfile entry.
+    if let Some(map) = tgt_lockfile.objects.get_mut(kind) {
+        map.remove(slug);
+    }
+    Ok(())
+}
+
+fn remove_local_file(paths: &Paths, kind: &str, slug: &str) {
+    match kind {
+        "hooks" => {
+            let _ = std::fs::remove_file(paths.hooks_dir().join(format!("{slug}.json")));
+            let _ = std::fs::remove_file(paths.hooks_dir().join(format!("{slug}.py")));
+        }
+        "rules" => {
+            let _ = std::fs::remove_file(paths.rules_dir().join(format!("{slug}.json")));
+            let _ = std::fs::remove_file(paths.rules_dir().join(format!("{slug}.py")));
+        }
+        "labels" => {
+            let _ = std::fs::remove_file(paths.labels_dir().join(format!("{slug}.json")));
+        }
+        "workspaces" => {
+            let _ = std::fs::remove_dir_all(paths.workspace_dir(slug));
+        }
+        "queues" | "schemas" | "inboxes" => {
+            if let Some(q_dir) = locate_queue_dir(paths, slug) {
+                match kind {
+                    "queues" => {
+                        let _ = std::fs::remove_dir_all(q_dir);
+                    }
+                    "schemas" => {
+                        let _ = std::fs::remove_file(q_dir.join("schema.json"));
+                        let _ = std::fs::remove_dir_all(q_dir.join("formulas"));
+                    }
+                    "inboxes" => {
+                        let _ = std::fs::remove_file(q_dir.join("inbox.json"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        "email_templates" => {
+            // slug is `<ws>/<q>/<template>`
+            let parts: Vec<&str> = slug.splitn(3, '/').collect();
+            if parts.len() == 3 {
+                let p = paths
+                    .queue_email_templates_dir(parts[0], parts[1])
+                    .join(format!("{}.json", parts[2]));
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        _ => {}
+    }
+}

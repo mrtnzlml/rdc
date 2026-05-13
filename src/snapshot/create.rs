@@ -29,14 +29,22 @@ fn kind_specific_strip(kind: &str) -> &'static [&'static str] {
         "workspaces" => &["queues"],
         // server fills `hooks`, `webhooks`, `rules` from each child's `queues` URL,
         // `inbox` is the back-ref from the inbox's `queues` URL, `counts` is
-        // a runtime aggregate.
-        "queues" => &["hooks", "webhooks", "rules", "inbox", "counts"],
+        // a runtime aggregate. `users` and `workflows` are likewise reverse
+        // membership lists (every entry references this queue from the *other*
+        // side), and a cross-env PATCH can't rewrite their src URLs reliably
+        // because users/workflows aren't deployable kinds in rdc.
+        "queues" => &["hooks", "webhooks", "rules", "inbox", "counts", "users", "workflows"],
         // server fills `queues` from each queue's `schema` URL
         "schemas" => &["queues"],
         // server assigns the inbox's email address
         "inboxes" => &["email"],
         // server-managed sub-resource on hooks
         "hooks" => &["test"],
+        // `triggers` references a sub-resource kind (`/api/v1/triggers/<id>`)
+        // that rdc doesn't pull or deploy; sending src trigger URLs to tgt
+        // 400s with "Invalid hyperlink", so strip them. The remote keeps its
+        // own triggers, which is the conservative outcome.
+        "email_templates" => &["triggers"],
         _ => &[],
     }
 }
@@ -51,6 +59,20 @@ pub fn strip_for_create(body: &mut Value, kind: &str) {
     for f in kind_specific_strip(kind) {
         obj.remove(*f);
     }
+}
+
+/// Like `strip_for_create`, but also strips `organization` — used for
+/// **cross-env PATCH bodies and cross-env idempotency comparisons**, where
+/// the src snapshot's `organization` URL belongs to the src org and would
+/// either be 400'd by the API or distort byte-equality against the tgt
+/// remote (whose `organization` belongs to the tgt org).
+///
+/// Same field set as `strip_for_create` (so creates inside an env still get
+/// to specify the org), plus `organization`.
+pub fn strip_for_cross_env_patch(body: &mut Value, kind: &str) {
+    strip_for_create(body, kind);
+    let Some(obj) = body.as_object_mut() else { return };
+    obj.remove("organization");
 }
 
 #[cfg(test)]

@@ -41,9 +41,16 @@ on purpose, or the existing default is the one we'd recommend anyway.
   labels, queues, schemas (formula round-trip), inboxes, email
   templates, engines, and engine fields. Workflows and workflow
   steps are pull-only (Rossum's API rejects PATCH on these with 405).
-- **Deploy** across environments via `rdc map` / `rdc plan` / `rdc
-  apply`. Apply rewrites cross-reference URLs from src to tgt, refuses
-  to PATCH on tgt drift, and skips no-op deploys (idempotent).
+- **Deploy** across environments in one shot via
+  **`rdc deploy <src> <tgt>`**. Bootstraps a fresh target by POSTing
+  every missing resource in dependency order (`workspaces → schemas →
+  queues → inboxes → email_templates → hooks → rules → labels →
+  engines → engine_fields`), rewriting cross-references from src URLs
+  to tgt URLs as each peer is created, and then PATCHing the remaining
+  field-level deltas. Additive by default (tgt-only objects are left
+  intact); pass `--mirror` to delete them. Plan-then-apply with TTY
+  confirmation, idempotent on a synced env (zero API calls). Pass
+  `--dry-run` to print the plan without making any remote changes.
 - **Overlays** are bidirectional: applied on push, stripped on pull
   (spec §9.3) so cross-env diffs and deploys stay quiet about
   intentional per-env divergence.
@@ -64,9 +71,9 @@ on purpose, or the existing default is the one we'd recommend anyway.
   darwin x86_64/aarch64, linux x86_64, and windows x86_64) or `cargo
   install`.
 - **AI-friendly snapshot.** `_index.md` includes a per-kind inventory
-  plus a cross-references section that resolves `hook → queues`,
-  `rule → queues`, and `email_template → queue` so AI agents can
-  navigate without parsing every JSON.
+  plus rich per-object entries with names, types, file paths, and
+  inline cross-references (e.g. each hook entry lists its attached
+  queue slugs) so AI agents can navigate without parsing every JSON.
 
 See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full
 design.
@@ -429,16 +436,22 @@ sending. Email-template push walks the queue-scoped
 - **Workflows + workflow steps** — Rossum's API is read-only for
   these (`OPTIONS` returns `Allow: GET, HEAD, OPTIONS`). The
   snapshot captures them so you can review changes, but `rdc push`
-  and `rdc apply` cannot send updates back.
+  and `rdc deploy` cannot send updates back.
 - **MDH collections + indexes** — push not yet implemented.
 
 If your token lacks permission for a writable kind (e.g. engines on
 some plans return 403), `rdc pull` warns and skips that kind, leaving
 other kinds intact.
 
-**Out of scope:** Creates (POST) and deletes are not supported —
-`rdc push` only updates existing objects. No two-phase send for
-cross-references.
+**Dry-run preview:**
+
+```sh
+rdc push <env> --dry-run
+```
+
+Runs the same scan but prints the per-kind list of slugs that would
+be POSTed / PATCHed without sending anything. The same flag exists on
+`rdc deploy` for cross-env previews.
 
 ## Status — health check
 
@@ -584,28 +597,24 @@ remote) and re-run pull.
 inventory-by-kind plus a cross-references section. Don't edit it
 by hand.
 
-The cross-references section answers "what's attached to what" without
-needing to grep every JSON. It maps each writable kind that holds queue
-references to its queue slug(s):
+Each per-kind section answers "what's attached to what" inline, so AI
+agents and humans can jump from any object to its related ones without
+grepping every JSON. Hooks, rules and email templates each list their
+attached queue slugs next to their entry; workspaces list their queues:
 
 ```markdown
-## Cross-references
+## hooks
 
-### hooks → queues
-- `master-data-hub` → playground-vol-1, playground-vol-2
-- `validator-invoices` → cost-invoices
-- `sftp-import` → (none)
-
-### rules → queues
-- `validate-totals` → cost-invoices
-
-### email_templates → queue
-- `invoices-ap/cost-invoices/default-rejection-template` → `cost-invoices`
+- `validator-invoices` (id 1234567)
+  - name: "Validator: invoices"
+  - type: function · events: [annotation_content.initialize, …]
+  - path: hooks/validator-invoices.json (+ hooks/validator-invoices.py)
+  - queues: `cost-invoices`, `utility-bills`
 ```
 
-URLs are resolved to slugs via the lockfile, so the section reflects
-exactly what's in the snapshot. Orphan refs (URLs whose target isn't
-in the snapshot) are silently dropped.
+URLs are resolved to slugs via the lockfile, so the cross-refs reflect
+exactly what's in the snapshot. Orphan refs (URLs whose target isn't in
+the snapshot) are silently dropped.
 
 ## Overlays — per-env values
 
@@ -659,12 +668,12 @@ re-applies them on the way out; pull strips them on the way in.
   drift check surfaces as "remote has changed". Run `rdc pull` once
   more after editing the overlay to re-baseline.
 
-## Map — align slugs
+## Map — align stale slugs within an env
 
-`rdc map` has two modes; the verb is the same ("align slugs"), the
-scope is set by how many envs you name:
-
-### `rdc map <env>` — within-env
+`rdc map <env>` renames any local file whose slug no longer matches
+its JSON `name` field. Cross-env promotion has its own command
+(`rdc deploy`); `rdc map` is purely about keeping local file paths
+tidy.
 
 Slugs in the snapshot are sticky to the Rossum object ID: once a hook
 has `validator-invoices` as its slug, that slug stays there even if
@@ -706,40 +715,15 @@ If `overlay.toml` or `.rdc/map/*.toml` reference an old slug, the
 command **warns but does not modify** those files — they're user-
 authored configs.
 
-### `rdc map <src> <tgt>` — cross-env
+For cross-env promotion, see **`rdc deploy`** below — there's no
+separate `map` / `plan` / `apply` step. Deploy auto-builds the
+slug-to-slug mapping in memory, prints a plan, prompts to confirm,
+and executes — all in one call.
 
-When you've validated changes in a TEST env and want to ship them to
-PROD, use the deploy commands.
-
-`rdc map <src> <tgt>` — auto-match objects by slug between two envs
-and write `.rdc/map/<src>→<tgt>.toml`. Re-runnable; existing entries
-are preserved, new auto-matches are added. `--check` dry-runs without
-writing.
-
-`rdc plan --from <src> --to <tgt>` — read-only. Print what
-`rdc apply` would do.
-
-`rdc apply --from <src> --to <tgt>` — for each mapped object, read
-the src snapshot, apply tgt's overlay, PATCH tgt's API.
-
-**Typical workflow:**
-
-```sh
-rdc pull test                          # pull both envs once
-rdc pull prod
-rdc map test prod                      # auto-match by slug
-$EDITOR .rdc/map/test→prod.toml        # hand-curate renames if any
-rdc plan --from test --to prod         # preview
-rdc apply --from test --to prod        # execute
-rdc pull prod                          # refresh prod snapshot post-apply
-```
-
-**Deployable kinds:** hooks, rules, labels, queues, schemas (with
-formula bodies), inboxes, email templates, engines, engine fields.
-Same kinds as push, by design — if you can push it within an env,
-you can deploy it across envs.
-
-The mapping file uses one section per kind:
+The mapping file (`.rdc/map/<src>→<tgt>.toml`) is still written by
+deploy as a side effect. You can hand-curate it for cross-env renames
+(e.g. `sftp-import = "sftp-import-prod"`) and the next `rdc deploy`
+will preserve those entries while auto-matching new same-slug pairs.
 
 ```toml
 version = 1
@@ -750,37 +734,117 @@ sftp-import = "sftp-import-prod"   # rename across envs
 
 [queues]
 cost-invoices = "cost-invoices"
-
-[schemas]
-cost-invoices = "cost-invoices"
-
-[email_templates]
-"invoices-ap/cost-invoices/default-rejection-template" = "invoices-ap/cost-invoices/default-rejection-template"
 ```
 
-For queue-nested kinds (queues, schemas, inboxes), the key is the
-queue's slug. For email templates, the key is the compound
-`<ws-slug>/<q-slug>/<template-slug>`. Auto-match writes 1:1 entries
-wherever both src and tgt have an object with the same key; you
-hand-edit for renames.
+For queue-nested kinds (queues, schemas, inboxes), the mapping key
+is the queue's slug. For email templates, the key is the compound
+`<ws-slug>/<q-slug>/<template-slug>`.
 
-**Apply is conservative and idempotent:**
-- **URL rewriting.** Cross-references (hook.queues, queue.schema,
-  email_template.queue, etc.) get rewritten from src URLs to tgt
-  URLs via the lockfiles + mapping. Strings that don't match a
-  known src object are left alone.
-- **Drift detection.** Before each PATCH, apply fetches the tgt
-  remote and compares its post-overlay-strip hash to the tgt
-  lockfile. If they differ, someone changed tgt since you last
-  pulled it — apply skips that object with a warning instructing
-  you to `rdc pull <tgt>` first.
-- **Idempotency.** If the post-overlay payload already equals the
-  tgt remote, apply skips the PATCH. Re-running `rdc apply` on an
-  in-sync deploy results in `0 PATCHes`. Verified live with 256
-  mapped objects → 0 API calls.
+## Deploy — one-shot cross-env promotion
 
-**Limitations:**
-- Updates only (no creates / deletes).
+`rdc deploy <src> <tgt>` is the only cross-env promotion command. It
+bootstraps a fresh target (POSTing every missing resource in dependency
+order, rewriting cross-references from src URLs to tgt URLs as it
+goes) **and** patches existing ones for field-level deltas — in one
+call. Internally it auto-builds the slug-to-slug mapping, prints a
+plan, prompts for confirmation, and executes.
+
+**Typical session, bootstrap or sync:**
+
+```sh
+rdc pull test                          # refresh both snapshots
+rdc pull prod
+rdc deploy test prod                   # one command, plan-then-apply
+```
+
+```text
+Plan: test → prod
+  + create:  4 workspaces, 24 schemas, 24 queues, 27 hooks, 1 rule, 46 labels
+  ~ update:  field-level deltas (resolved at execute time)
+
+Proceed? [y/N] y
+
+  → workspaces       4 created
+  → schemas         24 created
+  → queues          24 created
+  → hooks           27 created
+  → rules            1 created
+  → labels          46 created
+Applied 22 hooks, 0 rules, 0 labels, 0 queues, 0 schemas, 0 inboxes,
+0 email templates, 0 engines, 0 engine fields (22 PATCHes) from test to prod
+
+Deployed test → prod: 126 created, 0 deleted, 144 API calls, 89.1s
+```
+
+**Preview without executing:**
+
+```sh
+rdc deploy test prod --dry-run
+```
+
+`--dry-run` traces the same code paths as a real deploy — auto-match,
+plan computation, drift checks, URL rewrites, overlay application,
+idempotency comparison — but suppresses every actual POST / PATCH /
+DELETE call. The output uses "would be created / would apply" wording
+so the report can't be mistaken for a real run. The tgt lockfile is
+not touched; the mapping file *is* persisted (it's a pure local
+side-effect of the auto-match step) so a subsequent real `rdc deploy`
+starts from the same state.
+
+**Semantics:**
+- **Additive by default.** Objects that exist in `tgt` but not in `src`
+  are left intact. A label someone added to PROD via the UI won't
+  disappear because it isn't in your TEST snapshot.
+- **`--mirror` for strict equivalence.** Pass `--mirror` to also delete
+  tgt-only objects so PROD becomes exactly TEST. Mirror always
+  triggers a second confirmation prompt — `--yes` doesn't bypass it —
+  because the deletions are irreversible.
+- **Plan-before-apply.** A TTY session prints the plan and prompts
+  before any POST/PATCH/DELETE lands; pass `--yes` (or pipe stdin) to
+  skip the prompt in CI.
+- **Idempotent.** Re-running `rdc deploy` on an in-sync env performs
+  **zero** API calls beyond the read-only auth check.
+
+**Dependency order on bootstrap:** `workspaces → schemas → queues →
+inboxes → email_templates → hooks → rules → labels → engines →
+engine_fields`. Each POST writes the server's response back to the
+local snapshot and into the in-memory mapping + tgt lockfile, so the
+next kind's URL rewriter can resolve cross-references to the
+just-created peers without a second round-trip.
+
+**Cross-reference replication is automatic.** When deploy POSTs a hook
+whose `queues` array in `src` points at sandbox queue IDs, the body
+sent to `tgt` has those URLs rewritten to the matching prod queue
+URLs. Same mechanism for `queue.workspace`, `queue.schema`,
+`email_template.queue`, `rule.queues`, `hook.run_after`, and so on.
+Strings that don't match a known src object are left alone (best
+effort), and server-computed back-refs like `queue.hooks` are
+stripped before sending.
+
+**Side effect Rossum handles for you.** `POST /queues` auto-creates
+five default email templates per queue (`annotation-status-change-*`,
+`default-rejection-template`, etc.). Deploy detects them right after
+each queue POST, captures them into the tgt lockfile, and lets the
+later update sweep PATCH them with whatever customisations exist in
+src — instead of trying (and failing) to POST duplicates.
+
+**Failure handling.** A mid-deploy error aborts cleanly: anything
+already POSTed stays in tgt with its lockfile entry, so the next
+`rdc deploy` picks up where the previous run stopped (the failing
+object is now "missing in tgt" again and gets retried). No half-done
+PATCHes are left lurking — each PATCH is atomic at the API layer.
+
+**Mirror mode:**
+
+```sh
+rdc deploy test prod --mirror
+```
+
+Adds a `- delete:` section to the plan. Deletes run in reverse
+dependency order (hooks/labels first, then queues, then schemas, then
+workspaces) so a queue is gone before the workspace that contains it.
+Both the deploy-level confirmation and an additional mirror-specific
+confirmation must be answered `y` before any DELETE goes out.
 
 ## Global flags
 

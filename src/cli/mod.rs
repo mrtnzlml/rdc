@@ -27,39 +27,59 @@ pub enum Command {
     },
     /// Pull a Rossum environment's configuration into the local snapshot.
     Pull { env: String },
-    /// Push locally-edited hooks back to the Rossum environment.
-    Push { env: String },
-    /// Align slugs.
+    /// Push locally-edited resources back to the Rossum environment.
+    Push {
+        env: String,
+        /// Scan + report what would be POSTed / PATCHed without sending
+        /// anything to the API.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+    /// Align slugs within a single environment: rename any local slug
+    /// that no longer matches its current JSON `name` field. Pull never
+    /// moves files; this is the explicit user-driven action that brings
+    /// stale slugs into alignment. Cascade-aware (queue and workspace
+    /// renames move the whole subtree).
     ///
-    /// * `rdc map <env>` — within-env: rename any local slug that no
-    ///   longer matches its current JSON `name` field. Pull never moves
-    ///   files; this is the explicit user-driven action that brings
-    ///   stale slugs into alignment. Cascade-aware (queue and workspace
-    ///   renames move the whole subtree).
-    ///
-    /// * `rdc map <src> <tgt>` — cross-env: auto-match by slug and
-    ///   write the mapping file used by `rdc plan` / `rdc apply`.
+    /// For cross-env promotion, use `rdc deploy` — it builds the
+    /// slug-to-slug mapping automatically.
     Map {
-        src: String,
-        tgt: Option<String>,
-        /// Print pending renames (within-env) or proposed matches
-        /// (cross-env) without writing anything.
+        env: String,
+        /// Print pending renames without writing anything.
         #[arg(long)]
         check: bool,
     },
-    /// Show what `rdc apply --from <src> --to <tgt>` would do.
-    Plan {
+    /// Deploy a source env to a target env in one shot.
+    ///
+    /// First-class cross-env operation: bootstraps a fresh target (POSTing
+    /// missing resources in dependency order, rewriting cross-references
+    /// from src URLs to tgt URLs as it goes) AND patches existing ones for
+    /// field-level deltas. Plan-before-apply: a confirmation prompt summarises
+    /// what will be created / updated / deleted before any write hits the
+    /// target. Idempotent: re-running on an in-sync target performs zero
+    /// API calls.
+    ///
+    /// `rdc apply` stays the lower-level primitive for the "I already have
+    /// the slugs lined up, just push field-level edits" workflow.
+    Deploy {
+        /// Source environment (e.g. `test`).
+        src: String,
+        /// Target environment (e.g. `prod`).
+        tgt: String,
+        /// Mirror semantics: delete tgt objects that don't exist in src.
+        /// Default is additive (extras in tgt are left intact). Mirror is
+        /// always gated behind an explicit confirmation, regardless of
+        /// `--yes`, because the deletions are irreversible.
         #[arg(long)]
-        from: String,
-        #[arg(long)]
-        to: String,
-    },
-    /// Push src env's hooks (with tgt overlay applied) to tgt env per the mapping.
-    Apply {
-        #[arg(long)]
-        from: String,
-        #[arg(long)]
-        to: String,
+        mirror: bool,
+        /// Print the plan and exit without making any remote changes.
+        /// Useful for previewing a promotion in CI or before promoting
+        /// to a sensitive environment. The same code paths run that
+        /// would run in a real deploy (URL rewriting, drift checks,
+        /// overlay application) — only the actual POST/PATCH/DELETE
+        /// calls are suppressed.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
     /// Read-only health check: token, auth, lockfile, local edits.
     /// With no `env`, runs for every env defined in `rdc.toml`.
@@ -122,16 +142,17 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
             crate::cli::pull::run(&env, interactive).await
         }
-        Some(Command::Push { env }) => {
+        Some(Command::Push { env, dry_run }) => {
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
-            crate::cli::push::run(&env, interactive).await
+            crate::cli::push::run(&env, interactive, dry_run).await
         }
-        Some(Command::Map { src, tgt, check }) => match tgt {
-            Some(tgt) => crate::cli::deploy::map::run(&src, &tgt, check).await,
-            None => crate::cli::deploy::realign::run_within_env(&src, check, cli.yes).await,
-        },
-        Some(Command::Plan { from, to }) => crate::cli::deploy::plan::run(&from, &to).await,
-        Some(Command::Apply { from, to }) => crate::cli::deploy::apply::run(&from, &to).await,
+        Some(Command::Map { env, check }) => {
+            crate::cli::deploy::realign::run_within_env(&env, check, cli.yes).await
+        }
+        Some(Command::Deploy { src, tgt, mirror, dry_run }) => {
+            let interactive = crate::cli::resolve::is_interactive(cli.yes);
+            crate::cli::deploy::run::run(&src, &tgt, mirror, interactive, dry_run).await
+        }
         Some(Command::Status { env }) => crate::cli::status::run(env).await,
         Some(Command::Diff { left, right }) => crate::cli::diff::run(left, right).await,
         Some(Command::Auth { env, token }) => crate::cli::auth::run(&env, token).await,

@@ -1,78 +1,38 @@
-use crate::config::ProjectConfig;
+//! Slug-to-slug auto-matching across two local snapshots. Used by
+//! `rdc deploy` to populate the `Mapping` before its plan + execute
+//! phases, so existing same-slug objects in both envs get linked
+//! without the user having to run a separate command.
+//!
+//! There used to be a top-level `rdc map <src> <tgt>` command that
+//! exposed this same logic and wrote the result to disk; with `rdc
+//! deploy` now owning the full cross-env workflow, that surface is
+//! gone and this module is internal.
+
 use crate::mapping::Mapping;
 use crate::paths::Paths;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-pub async fn run(src: &str, tgt: &str, check: bool) -> Result<()> {
-    let cwd = std::env::current_dir().context("getting current directory")?;
-    let src_paths = Paths::for_env(&cwd, src);
-    let tgt_paths = Paths::for_env(&cwd, tgt);
-
-    let cfg = ProjectConfig::load(&src_paths.project_config())
-        .with_context(|| format!("loading project config from {}", src_paths.project_config().display()))?;
-    if !cfg.envs.contains_key(src) {
-        return Err(anyhow!("env '{src}' is not defined in rdc.toml"));
-    }
-    if !cfg.envs.contains_key(tgt) {
-        return Err(anyhow!("env '{tgt}' is not defined in rdc.toml"));
-    }
-
-    let mapping_path = src_paths.mapping_file(src, tgt);
-    let mut mapping = Mapping::load(&mapping_path)?;
-
-    let h_new = match_kind(&mut mapping.hooks, &src_paths.hooks_dir(), &tgt_paths.hooks_dir())?;
-    let r_new = match_kind(&mut mapping.rules, &src_paths.rules_dir(), &tgt_paths.rules_dir())?;
-    let l_new = match_kind(&mut mapping.labels, &src_paths.labels_dir(), &tgt_paths.labels_dir())?;
-
-    // Queue-nested kinds: walk every workspaces/<ws>/queues/<q>/ across both envs.
-    let q_new = match_queues(&mut mapping.queues, &src_paths, &tgt_paths)?;
-    let s_new = match_schemas(&mut mapping.schemas, &src_paths, &tgt_paths)?;
-    let i_new = match_inboxes(&mut mapping.inboxes, &src_paths, &tgt_paths)?;
-    let e_new = match_email_templates(&mut mapping.email_templates, &src_paths, &tgt_paths)?;
-
-    // Other org-wide flat kinds. Workflows + workflow_steps are
-    // intentionally excluded — Rossum's workflow API is read-only via PATCH
-    // on every plan we've checked (OPTIONS returns "GET, HEAD, OPTIONS"),
-    // so push/deploy can never succeed.
-    let eng_new = match_engines(&mut mapping.engines, &src_paths, &tgt_paths)?;
-    let ef_new = match_engine_fields(&mut mapping.engine_fields, &src_paths, &tgt_paths)?;
-
-    let any_total = mapping.hooks.len()
-        + mapping.rules.len()
-        + mapping.labels.len()
-        + mapping.queues.len()
-        + mapping.schemas.len()
-        + mapping.inboxes.len()
-        + mapping.email_templates.len()
-        + mapping.engines.len()
-        + mapping.engine_fields.len();
-    if check {
-        println!(
-            "Would auto-match {h_new} new hooks, {r_new} new rules, {l_new} new labels, \
-{q_new} new queues, {s_new} new schemas, {i_new} new inboxes, \
-{e_new} new email templates, {eng_new} new engines, {ef_new} new engine fields \
-by slug. Would write {}.",
-            mapping_path.display()
-        );
-        return Ok(());
-    }
-
-    if any_total > 0 {
-        std::fs::create_dir_all(src_paths.mapping_dir())
-            .with_context(|| format!("creating {}", src_paths.mapping_dir().display()))?;
-        mapping.save(&mapping_path)?;
-    }
-
-    println!(
-        "Auto-matched {h_new} new hooks, {r_new} new rules, {l_new} new labels, \
-{q_new} new queues, {s_new} new schemas, {i_new} new inboxes, \
-{e_new} new email templates, {eng_new} new engines, {ef_new} new engine fields \
-by slug. Wrote {}.",
-        mapping_path.display()
-    );
-    Ok(())
+/// Augment `mapping` with same-slug entries for every kind where both
+/// `src` and `tgt` already have a local file. Existing entries (including
+/// hand-curated cross-env renames in the mapping file) are preserved —
+/// auto-match never overwrites.
+///
+/// Returns the total number of newly-added entries across all kinds.
+pub fn auto_match(mapping: &mut Mapping, src_paths: &Paths, tgt_paths: &Paths) -> Result<usize> {
+    let mut added = 0;
+    added += match_workspaces(&mut mapping.workspaces, src_paths, tgt_paths)?;
+    added += match_kind(&mut mapping.hooks, &src_paths.hooks_dir(), &tgt_paths.hooks_dir())?;
+    added += match_kind(&mut mapping.rules, &src_paths.rules_dir(), &tgt_paths.rules_dir())?;
+    added += match_kind(&mut mapping.labels, &src_paths.labels_dir(), &tgt_paths.labels_dir())?;
+    added += match_queues(&mut mapping.queues, src_paths, tgt_paths)?;
+    added += match_schemas(&mut mapping.schemas, src_paths, tgt_paths)?;
+    added += match_inboxes(&mut mapping.inboxes, src_paths, tgt_paths)?;
+    added += match_email_templates(&mut mapping.email_templates, src_paths, tgt_paths)?;
+    added += match_engines(&mut mapping.engines, src_paths, tgt_paths)?;
+    added += match_engine_fields(&mut mapping.engine_fields, src_paths, tgt_paths)?;
+    Ok(added)
 }
 
 fn match_kind(
@@ -212,6 +172,54 @@ fn match_engine_fields(
         }
     }
     Ok(added)
+}
+
+/// Auto-match workspace slugs by directory name. Workspaces themselves are
+/// pull-only on the deploy side (we don't PATCH a workspace's name across envs),
+/// but their URLs are referenced by queues — so apply's URL rewriter needs the
+/// mapping to translate `queue.workspace` from src URL to tgt URL.
+fn match_workspaces(
+    existing: &mut BTreeMap<String, String>,
+    src_paths: &Paths,
+    tgt_paths: &Paths,
+) -> Result<usize> {
+    let src_slugs = list_workspace_slugs(src_paths)?;
+    let tgt_slugs: std::collections::HashSet<_> =
+        list_workspace_slugs(tgt_paths)?.into_iter().collect();
+    let mut added = 0;
+    for src_slug in &src_slugs {
+        if existing.contains_key(src_slug) {
+            continue;
+        }
+        if tgt_slugs.contains(src_slug) {
+            existing.insert(src_slug.clone(), src_slug.clone());
+            added += 1;
+        }
+    }
+    Ok(added)
+}
+
+fn list_workspace_slugs(paths: &Paths) -> Result<Vec<String>> {
+    let workspaces_dir = paths.workspaces_dir();
+    if !workspaces_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&workspaces_dir)
+        .with_context(|| format!("reading {}", workspaces_dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("listing {}", workspaces_dir.display()))?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let slug = entry.file_name().to_string_lossy().to_string();
+        // Only count workspaces that have their JSON on disk.
+        if entry.path().join("workspace.json").exists() {
+            out.push(slug);
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// Auto-match queue slugs by directory name. The lockfile keys queues by

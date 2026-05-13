@@ -1,5 +1,6 @@
 use crate::api::{anyhow_has_status, RossumClient};
-use crate::cli::deploy::common::{rewrite_urls, tgt_in_sync};
+use crate::cli::deploy::common::{bytes_equal_after_strip, rewrite_urls, tgt_in_sync};
+use crate::snapshot::create::strip_for_cross_env_patch;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::config::ProjectConfig;
 use crate::mapping::Mapping;
@@ -14,7 +15,14 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use std::path::PathBuf;
 
-pub async fn run(src: &str, tgt: &str) -> Result<()> {
+/// Drive the cross-env update phase.
+///
+/// `dry_run = true` traces the same code path (URL rewrite, overlay,
+/// idempotency check) but skips every actual PATCH/POST. Used by
+/// `rdc deploy --dry-run` to surface what *would* change without
+/// touching the target. The printed summary swaps "Applied" for
+/// "Would apply" in that mode.
+pub async fn run(src: &str, tgt: &str, dry_run: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let src_paths = Paths::for_env(&cwd, src);
     let tgt_paths = Paths::for_env(&cwd, tgt);
@@ -74,13 +82,18 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             skipped += 1;
             continue;
         }
-        // Idempotency.
-        if payload_json_full == remote_json_full && payload_code == remote_code {
+        // Idempotency: compare canonical (env-specific fields stripped) JSON
+        // plus the extracted code.
+        if bytes_equal_after_strip(&payload_json_full, &remote_json_full, "hooks")?
+            && payload_code == remote_code
+        {
             continue;
         }
-        // PATCH.
-        tgt_client.update_hook(tgt_id, &payload_hook, None).await
-            .with_context(|| format!("PATCH tgt hooks/{tgt_id} (mapped from src '{src_slug}')"))?;
+        // PATCH (skipped in dry-run; counter still ticks).
+        if !dry_run {
+            tgt_client.update_hook(tgt_id, &payload_hook, None).await
+                .with_context(|| format!("PATCH tgt hooks/{tgt_id} (mapped from src '{src_slug}')"))?;
+        }
         applied.hooks += 1;
     }
 
@@ -127,12 +140,16 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             skipped += 1;
             continue;
         }
-        // Idempotency: both JSON and code must match.
-        if payload_json_full == remote_json_full && payload_code == remote_code {
+        // Idempotency: both JSON and code must match (after env-specific strip).
+        if bytes_equal_after_strip(&payload_json_full, &remote_json_full, "rules")?
+            && payload_code == remote_code
+        {
             continue;
         }
-        tgt_client.update_rule(tgt_id, &payload_rule, None).await
-            .with_context(|| format!("PATCH tgt rules/{tgt_id}"))?;
+        if !dry_run {
+            tgt_client.update_rule(tgt_id, &payload_rule, None).await
+                .with_context(|| format!("PATCH tgt rules/{tgt_id}"))?;
+        }
         applied.rules += 1;
     }
 
@@ -176,11 +193,13 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             skipped += 1;
             continue;
         }
-        if payload_bytes == remote_bytes {
+        if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "labels")? {
             continue;
         }
-        tgt_client.update_label(tgt_id, &payload_label, None).await
-            .with_context(|| format!("PATCH tgt labels/{tgt_id}"))?;
+        if !dry_run {
+            tgt_client.update_label(tgt_id, &payload_label, None).await
+                .with_context(|| format!("PATCH tgt labels/{tgt_id}"))?;
+        }
         applied.labels += 1;
     }
 
@@ -207,11 +226,18 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }
-        let payload_queue: crate::model::Queue = match serde_json::from_value(payload) {
-            Ok(v) => v,
-            Err(e) => { eprintln!("warning: queues/{src_slug} → {tgt_slug}: payload not a valid Queue ({e:#}); skipping"); skipped += 1; continue; }
-        };
-        let mut payload_bytes = serde_json::to_vec_pretty(&payload_queue).context("serializing payload queue")?;
+        // Validate src payload parses as Queue (catch schema mismatches early)
+        // but keep the rewritten Value for the actual PATCH so we can strip
+        // server-computed sub-collections (`hooks`, `webhooks`, `rules`,
+        // `inbox`, `counts`) that the Rossum API rejects on PATCH.
+        if let Err(e) = serde_json::from_value::<crate::model::Queue>(payload.clone()) {
+            eprintln!("warning: queues/{src_slug} → {tgt_slug}: payload not a valid Queue ({e:#}); skipping");
+            skipped += 1;
+            continue;
+        }
+        let mut payload_for_patch = payload;
+        strip_for_cross_env_patch(&mut payload_for_patch, "queues");
+        let mut payload_bytes = serde_json::to_vec_pretty(&payload_for_patch).context("serializing payload queue")?;
         payload_bytes.push(b'\n');
         if remote_queues_cache.is_none() {
             remote_queues_cache = Some(tgt_client.list_queues(None).await.context("listing tgt queues for drift check")?);
@@ -229,11 +255,13 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             skipped += 1;
             continue;
         }
-        if payload_bytes == remote_bytes {
+        if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "queues")? {
             continue;
         }
-        tgt_client.update_queue(tgt_id, &payload_queue, None).await
-            .with_context(|| format!("PATCH tgt queues/{tgt_id}"))?;
+        if !dry_run {
+            tgt_client.patch_value(&format!("/queues/{tgt_id}"), &payload_for_patch, None).await
+                .with_context(|| format!("PATCH tgt queues/{tgt_id}"))?;
+        }
         applied.queues += 1;
     }
 
@@ -275,11 +303,15 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             skipped += 1;
             continue;
         }
-        if payload_json_full == remote_json_full && payload_formulas == remote_formulas {
+        if bytes_equal_after_strip(&payload_json_full, &remote_json_full, "schemas")?
+            && payload_formulas == remote_formulas
+        {
             continue;
         }
-        tgt_client.update_schema(tgt_id, &payload_schema, None).await
-            .with_context(|| format!("PATCH tgt schemas/{tgt_id}"))?;
+        if !dry_run {
+            tgt_client.update_schema(tgt_id, &payload_schema, None).await
+                .with_context(|| format!("PATCH tgt schemas/{tgt_id}"))?;
+        }
         applied.schemas += 1;
     }
 
@@ -320,11 +352,13 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             skipped += 1;
             continue;
         }
-        if payload_bytes == remote_bytes {
+        if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "inboxes")? {
             continue;
         }
-        tgt_client.update_inbox(tgt_id, &payload_inbox, None).await
-            .with_context(|| format!("PATCH tgt inboxes/{tgt_id}"))?;
+        if !dry_run {
+            tgt_client.update_inbox(tgt_id, &payload_inbox, None).await
+                .with_context(|| format!("PATCH tgt inboxes/{tgt_id}"))?;
+        }
         applied.inboxes += 1;
     }
 
@@ -348,11 +382,17 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }
-        let payload_template: crate::model::EmailTemplate = match serde_json::from_value(payload) {
-            Ok(t) => t,
-            Err(e) => { eprintln!("warning: email_templates/{src_key} → {tgt_key}: payload not a valid EmailTemplate ({e:#}); skipping"); skipped += 1; continue; }
-        };
-        let mut payload_bytes = serde_json::to_vec_pretty(&payload_template).context("serializing payload email template")?;
+        // Validate as EmailTemplate (catch schema mismatches), but keep the
+        // Value for the PATCH so we can strip `triggers` — which references a
+        // non-deployable sub-resource and 400s the API on cross-env send.
+        if let Err(e) = serde_json::from_value::<crate::model::EmailTemplate>(payload.clone()) {
+            eprintln!("warning: email_templates/{src_key} → {tgt_key}: payload not a valid EmailTemplate ({e:#}); skipping");
+            skipped += 1;
+            continue;
+        }
+        let mut payload_for_patch = payload;
+        strip_for_cross_env_patch(&mut payload_for_patch, "email_templates");
+        let mut payload_bytes = serde_json::to_vec_pretty(&payload_for_patch).context("serializing payload email template")?;
         payload_bytes.push(b'\n');
         if remote_template_cache.is_none() {
             remote_template_cache = Some(tgt_client.list_email_templates(None).await
@@ -371,11 +411,13 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             skipped += 1;
             continue;
         }
-        if payload_bytes == remote_bytes {
+        if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "email_templates")? {
             continue;
         }
-        tgt_client.update_email_template(tgt_id, &payload_template, None).await
-            .with_context(|| format!("PATCH tgt email_templates/{tgt_id}"))?;
+        if !dry_run {
+            tgt_client.patch_value(&format!("/email_templates/{tgt_id}"), &payload_for_patch, None).await
+                .with_context(|| format!("PATCH tgt email_templates/{tgt_id}"))?;
+        }
         applied.email_templates += 1;
     }
 
@@ -415,19 +457,23 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             skipped += 1;
             continue;
         }
-        if payload_bytes == remote_bytes {
+        if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "engines")? {
             continue;
         }
-        match tgt_client.update_engine(tgt_id, &payload_engine, None).await
-            .with_context(|| format!("PATCH tgt engines/{tgt_id}"))
-        {
-            Ok(_) => applied.engines += 1,
-            Err(e) if anyhow_has_status(&e, 405) => {
-                eprintln!("warning: engines are not writable via PATCH on tgt org/plan (405). Skipping all engine apply.");
-                skipped += 1;
-                break;
+        if dry_run {
+            applied.engines += 1;
+        } else {
+            match tgt_client.update_engine(tgt_id, &payload_engine, None).await
+                .with_context(|| format!("PATCH tgt engines/{tgt_id}"))
+            {
+                Ok(_) => applied.engines += 1,
+                Err(e) if anyhow_has_status(&e, 405) => {
+                    eprintln!("warning: engines are not writable via PATCH on tgt org/plan (405). Skipping all engine apply.");
+                    skipped += 1;
+                    break;
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
         }
     }
 
@@ -473,30 +519,46 @@ pub async fn run(src: &str, tgt: &str) -> Result<()> {
             skipped += 1;
             continue;
         }
-        if payload_bytes == remote_bytes {
+        if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "engine_fields")? {
             continue;
         }
-        match tgt_client.update_engine_field(tgt_id, &payload_field, None).await
-            .with_context(|| format!("PATCH tgt engine_fields/{tgt_id}"))
-        {
-            Ok(_) => applied.engine_fields += 1,
-            Err(e) if anyhow_has_status(&e, 405) => {
-                eprintln!("warning: engine fields are not writable via PATCH on tgt org/plan (405). Skipping all engine field apply.");
-                skipped += 1;
-                break;
+        if dry_run {
+            applied.engine_fields += 1;
+        } else {
+            match tgt_client.update_engine_field(tgt_id, &payload_field, None).await
+                .with_context(|| format!("PATCH tgt engine_fields/{tgt_id}"))
+            {
+                Ok(_) => applied.engine_fields += 1,
+                Err(e) if anyhow_has_status(&e, 405) => {
+                    eprintln!("warning: engine fields are not writable via PATCH on tgt org/plan (405). Skipping all engine field apply.");
+                    skipped += 1;
+                    break;
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
         }
     }
 
     let total = applied.total();
-    let mut summary = format!(
-        "Applied {} hooks, {} rules, {} labels, {} queues, {} schemas, {} inboxes, \
+    let verb = if dry_run { "Would apply" } else { "Applied" };
+    let suffix = if dry_run { "(dry run, no PATCHes sent)" } else { "PATCHes" };
+    let mut summary = if dry_run {
+        format!(
+            "{verb} {} hooks, {} rules, {} labels, {} queues, {} schemas, {} inboxes, \
+{} email templates, {} engines, {} engine fields ({} change(s)) from {src} to {tgt} {suffix}",
+            applied.hooks, applied.rules, applied.labels, applied.queues,
+            applied.schemas, applied.inboxes, applied.email_templates,
+            applied.engines, applied.engine_fields, total,
+        )
+    } else {
+        format!(
+            "Applied {} hooks, {} rules, {} labels, {} queues, {} schemas, {} inboxes, \
 {} email templates, {} engines, {} engine fields ({} PATCHes) from {src} to {tgt}",
-        applied.hooks, applied.rules, applied.labels, applied.queues,
-        applied.schemas, applied.inboxes, applied.email_templates,
-        applied.engines, applied.engine_fields, total,
-    );
+            applied.hooks, applied.rules, applied.labels, applied.queues,
+            applied.schemas, applied.inboxes, applied.email_templates,
+            applied.engines, applied.engine_fields, total,
+        )
+    };
     if skipped > 0 {
         summary.push_str(&format!(", {skipped} skipped"));
     }

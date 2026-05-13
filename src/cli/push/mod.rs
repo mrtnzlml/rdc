@@ -19,7 +19,7 @@ pub mod scan;
 mod schemas;
 mod workspaces;
 
-pub async fn run(env: &str, interactive: bool) -> Result<()> {
+pub async fn run(env: &str, interactive: bool, dry_run: bool) -> Result<()> {
     let push_started = std::time::Instant::now();
     let cwd = std::env::current_dir().context("getting current directory")?;
     let paths = Paths::for_env(&cwd, env);
@@ -46,6 +46,39 @@ pub async fn run(env: &str, interactive: bool) -> Result<()> {
     if changes.is_empty() {
         eprintln!(
             "✓ push envs/{env}: no changes  ({:.1}s)",
+            push_started.elapsed().as_secs_f32()
+        );
+        return Ok(());
+    }
+
+    if dry_run {
+        // Surface the per-kind breakdown so the user knows exactly what
+        // a real push would touch. POST-vs-PATCH classification is
+        // deferred (it depends on lockfile entries) but the count of
+        // candidate files per kind is the meaningful preview.
+        let kinds = [
+            ("workspaces", &changes.workspaces),
+            ("schemas", &changes.schemas),
+            ("queues", &changes.queues),
+            ("inboxes", &changes.inboxes),
+            ("email_templates", &changes.email_templates),
+            ("hooks", &changes.hooks),
+            ("rules", &changes.rules),
+            ("labels", &changes.labels),
+            ("engines", &changes.engines),
+            ("engine_fields", &changes.engine_fields),
+        ];
+        for (name, m) in kinds {
+            if !m.is_empty() {
+                println!("  → {name:18} {} would be POSTed/PATCHed", m.len());
+                for slug in m.keys() {
+                    println!("      {slug}");
+                }
+            }
+        }
+        println!(
+            "Dry run push envs/{env}: {} change(s), {:.1}s — no API calls made.",
+            changes.total(),
             push_started.elapsed().as_secs_f32()
         );
         return Ok(());

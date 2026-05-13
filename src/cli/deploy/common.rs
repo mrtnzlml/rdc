@@ -3,10 +3,112 @@
 
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::mapping::Mapping;
+use crate::snapshot::create::strip_for_cross_env_patch;
+use crate::snapshot::noise::strip_noise_fields;
 use crate::state::{content_hash, Lockfile};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::BTreeMap;
+
+/// Normalise JSON bytes for a cross-env idempotency check: strip the fields
+/// that are guaranteed to differ between two envs (`id`, `url`, the resource's
+/// own `organization` URL), strip the noise fields (`modified_at`, `modifier`)
+/// that change on every server-side touch, strip the kind-specific
+/// server-computed sub-collections (`queue.hooks`, `queue.webhooks`, etc.)
+/// that mirror back-references, then re-serialise. Two normalised payloads
+/// compare equal iff they represent the same canonical resource state.
+///
+/// Without this normalisation, byte-level equality between the src snapshot
+/// and the tgt remote would never hold and `rdc apply` would re-PATCH on
+/// every run (`README` "Idempotency" claim).
+pub fn normalize_for_cross_env_compare(bytes: &[u8], kind: &str) -> Result<Vec<u8>> {
+    let mut value: Value = serde_json::from_slice(bytes)
+        .context("parsing JSON for cross-env normalisation")?;
+    strip_for_cross_env_patch(&mut value, kind);
+    strip_noise_fields(&mut value);
+    sort_string_arrays(&mut value);
+    let mut out = serde_json::to_vec_pretty(&value)
+        .context("re-serialising normalised JSON")?;
+    out.push(b'\n');
+    Ok(out)
+}
+
+/// Recursively sort every all-string array in the tree alphabetically.
+///
+/// Rossum returns set-like URL arrays (a hook's `queues`, its `run_after`,
+/// `events`) sorted by the server's internal numeric id. The same set of
+/// queues attached to a sandbox hook and a prod hook will therefore appear
+/// in *different* orders because the ids are assigned per-env; after URL
+/// rewriting the contents match but the ordering doesn't. Sorting both sides
+/// alphabetically before comparing makes the idempotency check
+/// order-insensitive for these set-like fields, which is the README's
+/// "0 PATCHes on re-apply" contract.
+///
+/// Mixed-type arrays (containing objects, numbers, etc.) are left alone —
+/// stable order matters for `content[]` schema definitions where the array
+/// order *is* the field order users see in the UI.
+fn sort_string_arrays(value: &mut Value) {
+    match value {
+        Value::Array(arr) => {
+            let all_strings = arr.iter().all(|v| matches!(v, Value::String(_)));
+            if all_strings {
+                arr.sort_by(|a, b| match (a, b) {
+                    (Value::String(s1), Value::String(s2)) => s1.cmp(s2),
+                    _ => std::cmp::Ordering::Equal,
+                });
+            } else {
+                for v in arr {
+                    sort_string_arrays(v);
+                }
+            }
+        }
+        Value::Object(obj) => {
+            for v in obj.values_mut() {
+                sort_string_arrays(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::*;
+
+    #[test]
+    fn sort_string_arrays_sorts_top_level_url_array() {
+        let mut v = serde_json::json!({"queues": ["https://x/queues/3", "https://x/queues/1", "https://x/queues/2"]});
+        sort_string_arrays(&mut v);
+        assert_eq!(
+            v,
+            serde_json::json!({"queues": ["https://x/queues/1", "https://x/queues/2", "https://x/queues/3"]})
+        );
+    }
+
+    #[test]
+    fn sort_string_arrays_leaves_mixed_arrays_alone() {
+        // schema content[] mixes datapoint objects + section objects;
+        // their order is the UI field order and must not be sorted.
+        let mut v = serde_json::json!({"content": [{"id": "b"}, {"id": "a"}]});
+        sort_string_arrays(&mut v);
+        assert_eq!(v, serde_json::json!({"content": [{"id": "b"}, {"id": "a"}]}));
+    }
+
+    #[test]
+    fn sort_string_arrays_recurses_into_objects() {
+        let mut v = serde_json::json!({"config": {"sideload": ["b", "a"]}});
+        sort_string_arrays(&mut v);
+        assert_eq!(v, serde_json::json!({"config": {"sideload": ["a", "b"]}}));
+    }
+}
+
+/// Convenience: are two serialised payloads equivalent under
+/// `normalize_for_cross_env_compare`? Used by `rdc apply` to decide whether
+/// the src snapshot already matches the tgt remote and the PATCH can be
+/// skipped — i.e. the README's "0 PATCHes on re-apply" idempotency claim.
+pub fn bytes_equal_after_strip(a: &[u8], b: &[u8], kind: &str) -> Result<bool> {
+    Ok(normalize_for_cross_env_compare(a, kind)? == normalize_for_cross_env_compare(b, kind)?)
+}
 
 /// Walk a Value and rewrite any string that's a URL of a known src object
 /// (per `src_lockfile.lookup_url`) into the equivalent tgt URL (via

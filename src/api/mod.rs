@@ -191,6 +191,62 @@ impl RossumClient {
         self.patch_json(&format!("/engine_fields/{id}"), field, progress).await
     }
 
+    // --- delete endpoints (DELETE) ------------------------------------
+    //
+    // Used by `rdc deploy --mirror`, which prunes tgt-only resources so
+    // PROD becomes exactly TEST. Mirror mode is opt-in and gated behind
+    // an interactive confirmation; same-env `rdc push` never deletes.
+
+    /// Generic DELETE `<base>/<path>`. Accepts 204 (deleted) and 404
+    /// (already gone) as success; surfaces every other non-2xx.
+    pub async fn delete_path(&self, path: &str, progress: ProgressHandle) -> Result<()> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = retry::send_with_retry(
+            || self.http
+                .delete(&url)
+                .header("Authorization", format!("token {}", self.token)),
+            &format!("DELETE {url}"),
+            progress,
+        ).await?;
+        let status = resp.status();
+        if status.is_success() || status.as_u16() == 404 {
+            return Ok(());
+        }
+        let body = resp.text().await.unwrap_or_default();
+        Err(ApiError::Status { status: status.as_u16(), body }.into())
+    }
+
+    pub async fn delete_hook(&self, id: u64, progress: ProgressHandle) -> Result<()> {
+        self.delete_path(&format!("/hooks/{id}"), progress).await
+    }
+    pub async fn delete_workspace(&self, id: u64, progress: ProgressHandle) -> Result<()> {
+        self.delete_path(&format!("/workspaces/{id}"), progress).await
+    }
+    pub async fn delete_queue(&self, id: u64, progress: ProgressHandle) -> Result<()> {
+        self.delete_path(&format!("/queues/{id}"), progress).await
+    }
+    pub async fn delete_schema(&self, id: u64, progress: ProgressHandle) -> Result<()> {
+        self.delete_path(&format!("/schemas/{id}"), progress).await
+    }
+    pub async fn delete_inbox(&self, id: u64, progress: ProgressHandle) -> Result<()> {
+        self.delete_path(&format!("/inboxes/{id}"), progress).await
+    }
+    pub async fn delete_email_template(&self, id: u64, progress: ProgressHandle) -> Result<()> {
+        self.delete_path(&format!("/email_templates/{id}"), progress).await
+    }
+    pub async fn delete_rule(&self, id: u64, progress: ProgressHandle) -> Result<()> {
+        self.delete_path(&format!("/rules/{id}"), progress).await
+    }
+    pub async fn delete_label(&self, id: u64, progress: ProgressHandle) -> Result<()> {
+        self.delete_path(&format!("/labels/{id}"), progress).await
+    }
+    pub async fn delete_engine(&self, id: u64, progress: ProgressHandle) -> Result<()> {
+        self.delete_path(&format!("/engines/{id}"), progress).await
+    }
+    pub async fn delete_engine_field(&self, id: u64, progress: ProgressHandle) -> Result<()> {
+        self.delete_path(&format!("/engine_fields/{id}"), progress).await
+    }
+
     // --- private helpers ----------------------------------------------
 
     /// Fetch every page of `<base>/<path>` and concatenate `results`.
@@ -227,6 +283,14 @@ impl RossumClient {
         }
         resp.json::<T>().await
             .with_context(|| format!("decoding response from {url}"))
+    }
+
+    /// Public escape hatch for cross-env apply, which builds a stripped
+    /// JSON body (no id/url/organization, no server-computed sub-collections
+    /// like `queue.hooks`) and sends it via PATCH. The body has already been
+    /// shaped by the caller so we don't go through a typed struct.
+    pub async fn patch_value(&self, path: &str, body: &serde_json::Value, progress: ProgressHandle) -> Result<serde_json::Value> {
+        self.patch_json(path, body, progress).await
     }
 
     /// Generic PATCH `<base>/<path>` with `body` as JSON. Used by every

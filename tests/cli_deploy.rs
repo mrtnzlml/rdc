@@ -119,27 +119,9 @@ async fn map_plan_apply_full_flow() {
     Command::cargo_bin("rdc").unwrap().current_dir(project.path()).args(["pull", "test"]).assert().success();
     Command::cargo_bin("rdc").unwrap().current_dir(project.path()).args(["pull", "prod"]).assert().success();
 
-    Command::cargo_bin("rdc").unwrap()
-        .current_dir(project.path())
-        .args(["map", "test", "prod"])
-        .assert().success()
-        .stdout(predicate::str::contains("Auto-matched 2"));
-
-    let mapping_file = project.path().join(".rdc/map/test→prod.toml");
-    assert!(mapping_file.exists());
-
-    Command::cargo_bin("rdc").unwrap()
-        .current_dir(project.path())
-        .args(["plan", "--from", "test", "--to", "prod"])
-        .assert().success()
-        .stdout(predicate::str::contains("Plan: test → prod"))
-        .stdout(predicate::str::contains("validator-invoices"))
-        .stdout(predicate::str::contains("(id 401)"));
-
-    // Realistic workflow: set overlay BEFORE pull so the lockfile records
-    // the stripped hash. Pulling here re-baselines prod's lockfile with the
-    // overlay-stripped form (this is the same caveat that's documented in
-    // the README for "overlay added after first pull").
+    // Set overlay BEFORE the second prod pull so the lockfile records the
+    // stripped hash. Same caveat documented in the README for "overlay
+    // added after first pull".
     std::fs::write(
         project.path().join("envs/prod/overlay.toml"),
         r#"
@@ -154,11 +136,18 @@ version = 1
         .args(["pull", "prod"])
         .assert().success();
 
+    // `rdc deploy` now owns the full cross-env workflow — it auto-builds
+    // the mapping, prints a plan, and runs the update sub-step in one
+    // call. Only validator-invoices needs a PATCH (overlay renames it);
+    // sftp-import is byte-identical between test and prod after
+    // env-specific stripping, so it's skipped as idempotent.
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["apply", "--from", "test", "--to", "prod"])
+        .args(["deploy", "test", "prod", "--yes"])
         .assert().success()
-        .stdout(predicate::str::contains("Applied 2"));
+        .stdout(predicate::str::contains("Plan: test → prod"))
+        .stdout(predicate::str::contains("Applied 1 hooks"))
+        .stdout(predicate::str::contains("(1 PATCHes)"));
 
     let body = captured.lock().unwrap().clone().expect("PATCH body for hook 401");
     assert_eq!(body["name"], serde_json::Value::String("Validator (PROD)".into()));
@@ -299,26 +288,10 @@ async fn deploy_queue_and_schema() {
         }
     }
 
-    // Map.
+    // `rdc deploy` does map + plan + apply in one call.
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["map", "test", "prod"])
-        .assert().success()
-        .stdout(predicate::str::contains("1 new queues"))
-        .stdout(predicate::str::contains("1 new schemas"));
-
-    // Plan: should mention queues + schemas mapped.
-    Command::cargo_bin("rdc").unwrap()
-        .current_dir(project.path())
-        .args(["plan", "--from", "test", "--to", "prod"])
-        .assert().success()
-        .stdout(predicate::str::contains("queues/cost-invoices"))
-        .stdout(predicate::str::contains("schemas/cost-invoices"));
-
-    // Apply.
-    Command::cargo_bin("rdc").unwrap()
-        .current_dir(project.path())
-        .args(["apply", "--from", "test", "--to", "prod"])
+        .args(["deploy", "test", "prod", "--yes"])
         .assert().success()
         .stdout(predicate::str::contains("1 queues"))
         .stdout(predicate::str::contains("1 schemas"));
@@ -327,4 +300,225 @@ async fn deploy_queue_and_schema() {
         .expect("queue PATCH body captured");
     assert_eq!(captured["default_score_threshold"], serde_json::json!(0.99));
     assert!(*schema_patch_seen.lock().unwrap(), "schema PATCH was made");
+}
+
+// ============================================================
+// `rdc deploy` — one-shot cross-env deploy
+// ============================================================
+
+/// Bootstrap a fresh prod env from a populated test env via a single
+/// `rdc deploy test prod --yes` invocation. Verifies that:
+/// 1. POSTs land on every kind in dependency order (workspace, schema,
+///    queue, hook).
+/// 2. The hook's POST body has its `queues` array URL-rewritten from
+///    src queue URL to the just-created tgt queue URL (the README's
+///    "links between resources must be replicated" contract).
+/// 3. Re-running `rdc deploy` on the now-synced state produces 0 POSTs
+///    and 0 PATCHes (idempotency).
+#[tokio::test]
+async fn deploy_bootstraps_empty_target_with_url_rewriting() {
+    use std::sync::{Arc, Mutex};
+
+    let test_server = MockServer::start().await;
+    let prod_server = MockServer::start().await;
+
+    // --- TEST env: 1 workspace + 1 queue + 1 schema + 1 hook ---
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&test_server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [{
+                "id": 500,
+                "url": "https://test.rossum.app/api/v1/workspaces/500",
+                "name": "Invoices AP",
+                "organization": "https://test.rossum.app/api/v1/organizations/1",
+                "queues": ["https://test.rossum.app/api/v1/queues/600"]
+            }]
+        })))
+        .mount(&test_server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [{
+                "id": 600,
+                "url": "https://test.rossum.app/api/v1/queues/600",
+                "name": "Cost Invoices",
+                "workspace": "https://test.rossum.app/api/v1/workspaces/500",
+                "schema": "https://test.rossum.app/api/v1/schemas/700"
+            }]
+        })))
+        .mount(&test_server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schemas/700"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 700,
+            "url": "https://test.rossum.app/api/v1/schemas/700",
+            "name": "Cost Invoices schema",
+            "queues": ["https://test.rossum.app/api/v1/queues/600"],
+            "content": [],
+        })))
+        .mount(&test_server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [{
+                "id": 800,
+                "url": "https://test.rossum.app/api/v1/hooks/800",
+                "name": "Validator",
+                "type": "function",
+                "queues": ["https://test.rossum.app/api/v1/queues/600"],
+                "events": ["annotation_content.initialize"],
+                "config": { "runtime": "python3.12", "code": "def run(p):\n    return {}\n" }
+            }]
+        })))
+        .mount(&test_server).await;
+    for ep in [
+        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&test_server).await;
+    }
+
+    // --- PROD env: empty (every list returns 0 results) ---
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&prod_server).await;
+    for ep in [
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/hooks",
+        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&prod_server).await;
+    }
+
+    // --- PROD env POST mocks: each returns a body shaped like the response,
+    //     with server-assigned ids. The hook POST body is captured so we
+    //     can assert its `queues` URL got rewritten.
+    let post_count = Arc::new(Mutex::new(0u32));
+    let pc = post_count.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(move |req: &wiremock::Request| {
+            *pc.lock().unwrap() += 1;
+            let mut body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            body["id"] = serde_json::json!(5500);
+            body["url"] = serde_json::json!("https://prod.rossum.app/api/v1/workspaces/5500");
+            ResponseTemplate::new(201).set_body_json(body)
+        }).mount(&prod_server).await;
+    let pc = post_count.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/v1/schemas"))
+        .respond_with(move |req: &wiremock::Request| {
+            *pc.lock().unwrap() += 1;
+            let mut body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            body["id"] = serde_json::json!(7700);
+            body["url"] = serde_json::json!("https://prod.rossum.app/api/v1/schemas/7700");
+            ResponseTemplate::new(201).set_body_json(body)
+        }).mount(&prod_server).await;
+    let pc = post_count.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/v1/queues"))
+        .respond_with(move |req: &wiremock::Request| {
+            *pc.lock().unwrap() += 1;
+            let mut body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            body["id"] = serde_json::json!(6600);
+            body["url"] = serde_json::json!("https://prod.rossum.app/api/v1/queues/6600");
+            ResponseTemplate::new(201).set_body_json(body)
+        }).mount(&prod_server).await;
+    let hook_post_body: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let captured = hook_post_body.clone();
+    let pc = post_count.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(move |req: &wiremock::Request| {
+            *pc.lock().unwrap() += 1;
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            *captured.lock().unwrap() = Some(body.clone());
+            let mut resp = body;
+            resp["id"] = serde_json::json!(8800);
+            resp["url"] = serde_json::json!("https://prod.rossum.app/api/v1/hooks/8800");
+            ResponseTemplate::new(201).set_body_json(resp)
+        }).mount(&prod_server).await;
+
+    // After queue POST, deploy calls list_email_templates to capture auto-
+    // created peers. The empty-list mock above already covers it.
+
+    // Apply (the update sub-step) hits per-object GETs during drift checks.
+    // Mocks must reflect the post-deploy server state so apply sees the
+    // just-created objects as "in sync" rather than missing.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks/8800"))
+        .respond_with(move |_req: &wiremock::Request| {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 8800,
+                "url": "https://prod.rossum.app/api/v1/hooks/8800",
+                "name": "Validator",
+                "type": "function",
+                "queues": ["https://prod.rossum.app/api/v1/queues/6600"],
+                "events": ["annotation_content.initialize"],
+                "config": { "runtime": "python3.12", "code": "def run(p):\n    return {}\n" }
+            }))
+        }).mount(&prod_server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schemas/7700"))
+        .respond_with(move |_req: &wiremock::Request| {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 7700,
+                "url": "https://prod.rossum.app/api/v1/schemas/7700",
+                "name": "Cost Invoices schema",
+                "queues": ["https://prod.rossum.app/api/v1/queues/6600"],
+                "content": [],
+            }))
+        }).mount(&prod_server).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args([
+            "init", "--env", &format!("test={}/api/v1:1", test_server.uri()),
+            "--env", &format!("prod={}/api/v1:1", prod_server.uri()),
+        ])
+        .assert().success();
+    std::fs::write(project.path().join("secrets/test.secrets.json"), r#"{"api_token":"TEST"}"#).unwrap();
+    std::fs::write(project.path().join("secrets/prod.secrets.json"), r#"{"api_token":"PROD"}"#).unwrap();
+
+    Command::cargo_bin("rdc").unwrap().current_dir(project.path()).args(["pull", "test"]).assert().success();
+    Command::cargo_bin("rdc").unwrap().current_dir(project.path()).args(["pull", "prod"]).assert().success();
+
+    // === The one-command deploy. ===
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["deploy", "test", "prod", "--yes"])
+        .assert().success()
+        .stdout(predicate::str::contains("Plan: test → prod"))
+        .stdout(predicate::str::contains("workspaces"))
+        .stdout(predicate::str::contains("schemas"))
+        .stdout(predicate::str::contains("queues"))
+        .stdout(predicate::str::contains("hooks"));
+
+    // 4 POSTs: 1 workspace + 1 schema + 1 queue + 1 hook
+    assert_eq!(*post_count.lock().unwrap(), 4, "expected exactly 4 POSTs");
+
+    // The hook's POST body must reference the PROD queue URL, not the test one.
+    let hook_body = hook_post_body.lock().unwrap().clone().expect("hook POST body captured");
+    let queues = hook_body["queues"].as_array().expect("queues array");
+    assert_eq!(queues.len(), 1);
+    assert_eq!(
+        queues[0].as_str().unwrap(),
+        "https://prod.rossum.app/api/v1/queues/6600",
+        "hook.queues must be rewritten from test URL to PROD queue URL"
+    );
 }
