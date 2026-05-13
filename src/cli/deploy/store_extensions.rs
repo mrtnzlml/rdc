@@ -30,6 +30,18 @@ pub fn find_orphan<'a>(hooks: &'a [Hook], name: &str, template_url: &str) -> Opt
     hooks.iter().find(|h| h.name == name && h.hook_template() == Some(template_url))
 }
 
+/// Defensive guard: a hook with `extension_source: "rossum_store"` must
+/// always have `hook_template` set. Production data should never violate
+/// this, but a hand-edited snapshot could.
+pub fn check_store_extension_anomaly(hook: &Hook, slug: &str) -> Result<()> {
+    if hook.is_store_extension() && hook.hook_template().is_none() {
+        return Err(anyhow!(
+            "hooks/{slug}.json: marked as store extension (extension_source = rossum_store) but missing hook_template URL — refusing to push"
+        ));
+    }
+    Ok(())
+}
+
 /// Extract `{name, hook_template, events, queues, token_owner}` from a
 /// full hook body and return them as the `POST /hooks/create` payload.
 /// Any field present but null counts as missing (matches the API).
@@ -130,6 +142,37 @@ mod tests {
             "name": "X", "events": [], "queues": [], "token_owner": "u"
         });
         assert!(build_install_body(&no_template).is_err());
+    }
+
+    #[test]
+    fn check_anomaly_passes_for_regular_hook() {
+        let payload = serde_json::json!({"id": 1, "url": "u", "name": "x", "type": "function", "extension_source": "custom"});
+        let hook: crate::model::Hook = serde_json::from_value(payload).unwrap();
+        assert!(check_store_extension_anomaly(&hook, "x").is_ok());
+    }
+
+    #[test]
+    fn check_anomaly_passes_for_store_extension_with_template() {
+        let payload = serde_json::json!({
+            "id": 1, "url": "u", "name": "x", "type": "webhook",
+            "extension_source": "rossum_store",
+            "hook_template": "https://x/api/v1/hook_templates/1"
+        });
+        let hook: crate::model::Hook = serde_json::from_value(payload).unwrap();
+        assert!(check_store_extension_anomaly(&hook, "x").is_ok());
+    }
+
+    #[test]
+    fn check_anomaly_rejects_store_extension_without_template() {
+        let payload = serde_json::json!({
+            "id": 1, "url": "u", "name": "x", "type": "webhook",
+            "extension_source": "rossum_store"
+        });
+        let hook: crate::model::Hook = serde_json::from_value(payload).unwrap();
+        let err = check_store_extension_anomaly(&hook, "broken-slug").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("broken-slug"), "error should name the slug: {msg}");
+        assert!(msg.contains("hook_template"), "error should explain the problem: {msg}");
     }
 
     #[test]
