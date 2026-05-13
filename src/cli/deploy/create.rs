@@ -62,9 +62,10 @@ fn shape_create_body(
     src_lockfile: &Lockfile,
     tgt_lockfile: &Lockfile,
     mapping: &Mapping,
+    explicit_subs: &std::collections::BTreeMap<String, String>,
 ) -> Value {
     let mut payload = raw;
-    rewrite_urls(&mut payload, src_lockfile, tgt_lockfile, mapping);
+    rewrite_urls(&mut payload, src_lockfile, tgt_lockfile, mapping, explicit_subs);
     if let Some(p) = overlay_paths {
         apply_overrides(&mut payload, p);
     }
@@ -80,7 +81,7 @@ pub async fn create_workspace(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()>
     .with_context(|| format!("parsing {}", path.display()))?;
     // Workspaces aren't a section in the overlay schema today, so no
     // per-workspace overrides apply on create.
-    let body = shape_create_body(raw, "workspaces", None, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping);
+    let body = shape_create_body(raw, "workspaces", None, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping, &std::collections::BTreeMap::new());
     let created = ctx
         .tgt_client
         .create_workspace(&body, None)
@@ -112,7 +113,7 @@ pub async fn create_schema(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<
     let mut payload = read_schema_value(&src_queue_dir)
         .with_context(|| format!("reading src schema '{queue_slug}'"))?;
     let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.schema(queue_slug));
-    payload = shape_create_body(payload, "schemas", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping);
+    payload = shape_create_body(payload, "schemas", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping, &std::collections::BTreeMap::new());
     let created = ctx
         .tgt_client
         .create_schema(&payload, None)
@@ -157,7 +158,7 @@ pub async fn create_queue(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
     )
     .with_context(|| format!("parsing {}", queue_path.display()))?;
     let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.queue(queue_slug));
-    let body = shape_create_body(raw, "queues", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping);
+    let body = shape_create_body(raw, "queues", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping, &std::collections::BTreeMap::new());
     let created = ctx
         .tgt_client
         .create_queue(&body, None)
@@ -246,7 +247,7 @@ pub async fn create_inbox(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
     )
     .with_context(|| format!("parsing {}", inbox_path.display()))?;
     let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.inbox(queue_slug));
-    let body = shape_create_body(raw, "inboxes", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping);
+    let body = shape_create_body(raw, "inboxes", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping, &std::collections::BTreeMap::new());
     let created = ctx
         .tgt_client
         .create_inbox(&body, None)
@@ -280,7 +281,7 @@ pub async fn create_hook(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
     let payload = read_hook_value(&ctx.src_paths.hooks_dir(), slug)
         .with_context(|| format!("reading src hook '{slug}'"))?;
     let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.hook(slug));
-    let body = shape_create_body(payload, "hooks", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping);
+    let body = shape_create_body(payload, "hooks", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping, &std::collections::BTreeMap::new());
     let created = ctx
         .tgt_client
         .create_hook(&body, None)
@@ -314,7 +315,7 @@ pub async fn create_rule(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
     let payload = read_rule_value(&ctx.src_paths.rules_dir(), slug)
         .with_context(|| format!("reading src rule '{slug}'"))?;
     let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.rule(slug));
-    let body = shape_create_body(payload, "rules", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping);
+    let body = shape_create_body(payload, "rules", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping, &std::collections::BTreeMap::new());
     let created = ctx
         .tgt_client
         .create_rule(&body, None)
@@ -347,7 +348,7 @@ pub async fn create_label(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
     )
     .with_context(|| format!("parsing {}", path.display()))?;
     let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.label(slug));
-    let body = shape_create_body(raw, "labels", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping);
+    let body = shape_create_body(raw, "labels", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping, &std::collections::BTreeMap::new());
     let created = ctx
         .tgt_client
         .create_label(&body, None)

@@ -125,8 +125,13 @@ pub fn rewrite_urls(
     src_lockfile: &Lockfile,
     tgt_lockfile: &Lockfile,
     mapping: &Mapping,
+    explicit_subs: &std::collections::BTreeMap<String, String>,
 ) {
     walk_strings_mut(value, &mut |s| {
+        if let Some(tgt) = explicit_subs.get(s.as_str()) {
+            *s = tgt.clone();
+            return;
+        }
         let Some((kind, src_slug)) = src_lockfile.lookup_url(s) else { return };
         let Some(tgt_slug) = mapping.lookup_tgt_slug(kind, src_slug) else { return };
         let Some(tgt_url) = tgt_lockfile.url_for_slug(kind, tgt_slug) else { return };
@@ -204,7 +209,7 @@ mod tests {
         let mut payload = serde_json::json!({
             "queues": ["https://test/api/v1/queues/100"]
         });
-        rewrite_urls(&mut payload, &src, &tgt, &mapping);
+        rewrite_urls(&mut payload, &src, &tgt, &mapping, &BTreeMap::new());
         assert_eq!(
             payload["queues"][0],
             serde_json::Value::String("https://prod/api/v1/queues/700".into()),
@@ -221,7 +226,7 @@ mod tests {
             "ref": "https://test/api/v1/hooks/1",
             "label": "stays unchanged",
         });
-        rewrite_urls(&mut payload, &src, &tgt, &mapping);
+        rewrite_urls(&mut payload, &src, &tgt, &mapping, &BTreeMap::new());
         assert_eq!(payload["ref"].as_str().unwrap(), "https://prod/api/v1/hooks/99");
         assert_eq!(payload["label"].as_str().unwrap(), "stays unchanged");
     }
@@ -232,7 +237,7 @@ mod tests {
         let tgt = lf_with(&[]);
         let mapping = Mapping::default();
         let mut payload = serde_json::json!({"description": "see https://docs.rossum.ai"});
-        rewrite_urls(&mut payload, &src, &tgt, &mapping);
+        rewrite_urls(&mut payload, &src, &tgt, &mapping, &BTreeMap::new());
         assert_eq!(payload["description"].as_str().unwrap(), "see https://docs.rossum.ai");
     }
 
@@ -247,10 +252,30 @@ mod tests {
                 "inner": ["https://test/api/v1/queues/1"]
             }
         });
-        rewrite_urls(&mut payload, &src, &tgt, &mapping);
+        rewrite_urls(&mut payload, &src, &tgt, &mapping, &BTreeMap::new());
         assert_eq!(
             payload["outer"]["inner"][0].as_str().unwrap(),
             "https://prod/api/v1/queues/2"
         );
+    }
+
+    #[test]
+    fn rewrite_urls_explicit_subs_take_precedence() {
+        let src = Lockfile::default();
+        let tgt = Lockfile::default();
+        let mapping = Mapping::default();
+        let mut subs = BTreeMap::new();
+        subs.insert(
+            "https://test/api/v1/hook_templates/39".to_string(),
+            "https://prod/api/v1/hook_templates/41".to_string(),
+        );
+
+        let mut payload = serde_json::json!({
+            "hook_template": "https://test/api/v1/hook_templates/39",
+            "unrelated": "https://docs.rossum.ai"
+        });
+        rewrite_urls(&mut payload, &src, &tgt, &mapping, &subs);
+        assert_eq!(payload["hook_template"].as_str().unwrap(), "https://prod/api/v1/hook_templates/41");
+        assert_eq!(payload["unrelated"].as_str().unwrap(), "https://docs.rossum.ai");
     }
 }

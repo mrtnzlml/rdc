@@ -48,6 +48,7 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool) -> Result<()> 
 
     let mut applied = ApplyCounts::default();
     let mut skipped = 0usize;
+    let empty_subs: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
 
     // Hooks ------------------------------------------------------------
     for (src_slug, tgt_slug) in &mapping.hooks {
@@ -56,7 +57,7 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool) -> Result<()> 
             Ok(v) => v,
             Err(e) => { eprintln!("warning: cannot read src hooks/{src_slug}: {e:#}"); skipped += 1; continue; }
         };
-        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping);
+        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping, &empty_subs);
         let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.hook(tgt_slug));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
@@ -125,7 +126,7 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool) -> Result<()> 
             Ok(v) => v,
             Err(e) => { eprintln!("warning: cannot read src rules/{src_slug}: {e:#}"); skipped += 1; continue; }
         };
-        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping);
+        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping, &empty_subs);
         let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.rule(tgt_slug));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
@@ -197,7 +198,7 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool) -> Result<()> 
             Ok(v) => v,
             Err(e) => { eprintln!("warning: parsing labels/{src_slug}: {e:#}"); skipped += 1; continue; }
         };
-        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping);
+        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping, &empty_subs);
         let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.label(tgt_slug));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
@@ -255,7 +256,7 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool) -> Result<()> 
             Ok(v) => v,
             Err(e) => { eprintln!("warning: parsing queue '{src_slug}': {e:#}"); skipped += 1; continue; }
         };
-        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping);
+        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping, &empty_subs);
         let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.queue(tgt_slug));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
@@ -314,7 +315,7 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool) -> Result<()> 
             Ok(v) => v,
             Err(e) => { eprintln!("warning: cannot read src schema for queue '{src_slug}': {e:#}"); skipped += 1; continue; }
         };
-        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping);
+        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping, &empty_subs);
         let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.schema(tgt_slug));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
@@ -396,7 +397,7 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool) -> Result<()> 
             Ok(v) => v,
             Err(e) => { eprintln!("warning: parsing inbox for queue '{src_slug}': {e:#}"); skipped += 1; continue; }
         };
-        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping);
+        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping, &empty_subs);
         let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.inbox(tgt_slug));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
@@ -444,7 +445,7 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool) -> Result<()> 
             Err(e) => { eprintln!("warning: cannot read src email_template '{src_key}': {e:#}"); skipped += 1; continue; }
         };
         let mut payload = serde_json::to_value(&src_template).context("serializing src email template to value")?;
-        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping);
+        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping, &empty_subs);
         let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.email_template(tgt_key));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
@@ -507,7 +508,7 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool) -> Result<()> 
             Ok(v) => v,
             Err(e) => { eprintln!("warning: parsing engines/{src_slug}: {e:#}"); skipped += 1; continue; }
         };
-        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping);
+        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping, &empty_subs);
         let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.engine(tgt_slug));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
@@ -572,7 +573,7 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool) -> Result<()> 
             Ok(v) => v,
             Err(e) => { eprintln!("warning: parsing engine-fields/{src_slug}: {e:#}"); skipped += 1; continue; }
         };
-        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping);
+        rewrite_urls(&mut payload, &src_lockfile, &tgt_lockfile, &mapping, &empty_subs);
         let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.engine_field(tgt_slug));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
