@@ -26,7 +26,7 @@ These are the rules `rdc` follows so you don't have to think about them:
 - **Plan before apply.** Every command that touches the remote shows what it will do, asks once on a TTY, and accepts `--yes` for CI. `--dry-run` runs the same code paths without writing anywhere.
 - **Idempotent everywhere.** Re-running `rdc pull` on a clean environment writes nothing. Re-running `rdc deploy` on a synced env is zero API calls. Re-running `rdc push` after a successful push exits silently.
 - **The environment is the unit of work.** No partial pulls, no per-kind filters, no per-workspace scope limiters. Whole envs in, whole envs out.
-- **Snapshot is canonical.** The on-disk files are the source you edit; remote is reconciled toward them. Per-env divergences (display names, runtimes, thresholds) live in `overlay.toml` so the canonical snapshot stays clean.
+- **Snapshot is canonical, including absence.** The on-disk files are the source you edit; remote is reconciled toward them. Removing a local file is the declarative way to delete the corresponding remote object — `rdc push` will offer to make it so, with an explicit confirmation gate. Per-env divergences (display names, runtimes, thresholds) live in `overlay.toml` so the canonical snapshot stays clean.
 - **Cross-references resolve automatically.** When `rdc deploy` POSTs a hook to PROD that references TEST queue URLs, the body sent has those URLs rewritten to the matching PROD queue URLs. The user never sees this.
 - **Errors are actionable.** A missing `rdc.toml` says "not an rdc project — run `rdc init` here." A drifted target says "run `rdc pull <env>` first." A failed token says "Invalid token (401)."
 - **Atomic on disk.** All writes go through a temp-file rename. A crash mid-write never leaves a half-written JSON.
@@ -175,7 +175,7 @@ Cross-references between resources are URL-based. `rdc deploy` rewrites them aut
 | `rdc init` | Create a new project, or add an env to an existing one. |
 | `rdc auth <env>` | Set/refresh the API token for `<env>`. Validates before writing. |
 | `rdc pull <env>` | Mirror the remote into `envs/<env>/`. Three-way merges on conflict. |
-| `rdc push <env>` | Send local edits in `<env>` back to its remote. POSTs when no lockfile entry exists. |
+| `rdc push <env>` | Send local edits in `<env>` back to its remote. POSTs new files; DELETEs lockfile-tracked files that have been removed locally (gated by `--allow-deletes`). |
 | `rdc deploy <src> <tgt>` | One-shot cross-env promotion. Plan-then-apply with confirmation. |
 | `rdc status [<env>]` | Auth + lockfile health + pending edits + pending renames. Read-only. |
 | `rdc diff <env>` | Local-vs-remote diff (one GET per edited object). |
@@ -213,13 +213,55 @@ The server's response (with `id`, `url`, timestamps) is written back to disk in 
 
 Supported kinds for create: workspaces, schemas, queues, inboxes, hooks, rules, labels, engines, engine fields, email templates. Workflows and workflow steps are read-only at the Rossum API.
 
+### Delete an object
+
+Removing the local file (and committing that removal to your repo) is the declarative way to say "delete this from remote." The lockfile entry remains, which is rdc's signal that the object *was* tracked and is now meant to be gone. `rdc push <env>` discovers these tombstones in its scan phase and, after confirmation, issues `DELETE /<kind>/<id>` for each in reverse dependency order.
+
+```sh
+$ rm envs/test/labels/audit-hold.json
+$ rdc status test
+Env 'test'
+  …
+  deletes:  1 file(s) tracked but missing locally (run `rdc push test --allow-deletes` to remove from remote):
+            labels/audit-hold
+
+$ rdc push test
+✓ push envs/test: 261 files scanned, 0 changed, 1 to delete
+
+⚠  The following 1 object(s) would be DELETED from the remote:
+  - labels/audit-hold (id 10198)
+
+Proceed with deletion? [y/N] y
+  - labels/audit-hold: deleted
+✓ deletes: 1 removed, 0 skipped
+```
+
+The destructive section needs **two intentional acts** — `--yes` does not bypass:
+
+1. Removing the local file (act 1).
+2. Either answering `y` to the prompt on a TTY, or passing `--allow-deletes` (act 2).
+
+Non-TTY runs (CI) without `--allow-deletes` refuse the push and list the tombstones, pointing at the flag. This is intentional: a typoed `rm -rf envs/` in a script shouldn't quietly wipe production.
+
+Per-object drift check: if the remote's `modified_at` has changed since the last `rdc pull`, an inline resolver opens — `[k]eep delete` (force DELETE despite the drift), `[s]kip` (leave alone), `[a]bort` (stop the push), with `[r]estore` aliased to skip-with-hint pointing at `rdc pull`. Non-TTY drift defaults to skip-with-warning.
+
+Cascade order is reverse of creates: deleting a workspace directory removes its queues, schemas, inboxes, email templates, hooks attached to those queues, and so on before the workspace itself. The dry-run preview shows the exact sequence.
+
+```sh
+rdc push test --dry-run --diff   # preview deletes line-by-line
+```
+
+`rdc push --dry-run --diff` fetches each tombstone's remote and renders it as a deleted-file diff (`+++ /dev/null`) so you can audit exactly what would disappear.
+
+Supported kinds for delete: same as create, minus the read-only kinds (workflows, workflow steps, MDH datasets). A tombstone for those is silently ignored.
+
 ### Preview a push
 
 ```sh
 rdc push test --dry-run
 ```
 
-Lists every changed file and which kind would receive a POST/PATCH — no API calls made.
+Lists every changed file and which kind would receive a POST/PATCH/DELETE — no API calls made by default. Add `--diff` to also fetch the current remote per object and print unified diffs (and full deleted-body / would-be-POST-body previews).
 
 ## Promote test → prod
 

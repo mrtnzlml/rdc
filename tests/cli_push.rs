@@ -1034,3 +1034,263 @@ async fn push_creates_new_hook_with_no_lockfile_entry() {
     assert!(lf.contains("\"new-hook\""), "lockfile should have new-hook entry; got:\n{lf}");
     assert!(lf.contains("\"id\": 555"), "lockfile should record assigned id 555");
 }
+
+// ============================================================
+// Tombstones — local-file-removed → remote DELETE flow
+// ============================================================
+
+/// Removing a local label after the initial pull leaves a lockfile-only
+/// tombstone. A subsequent `rdc push <env> --allow-deletes` must:
+/// 1. Issue a DELETE for the tracked id,
+/// 2. Strip the entry from the lockfile,
+/// 3. Surface the result in stdout.
+#[tokio::test]
+async fn push_deletes_tombstoned_label_with_allow_deletes() {
+    use std::sync::{Arc, Mutex};
+
+    let server = MockServer::start().await;
+    // Pull seeds the snapshot with one label (id 9001). Every other
+    // kind comes back empty so the test stays focused.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [{
+                "id": 9001,
+                "url": "https://mock.rossum.app/api/v1/labels/9001",
+                "name": "Audit hold",
+                "organization": "https://mock.rossum.app/api/v1/organizations/1",
+                "modified_at": "2026-05-12T10:00:00.000000Z",
+                "color": "#34495E"
+            }]
+        })))
+        .mount(&server).await;
+    for ep in [
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/hooks",
+        "/api/v1/rules", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&server).await;
+    }
+
+    // The push will fetch the label by id (via list_labels) for drift
+    // detection, then issue DELETE /labels/9001.
+    let delete_seen: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    let delete_seen_clone = delete_seen.clone();
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/labels/9001"))
+        .respond_with(move |_req: &wiremock::Request| {
+            *delete_seen_clone.lock().unwrap() = true;
+            ResponseTemplate::new(204)
+        })
+        .mount(&server).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert().success();
+
+    // Sanity: the label file exists locally and the lockfile has the entry.
+    let label_path = project.path().join("envs/dev/labels/audit-hold.json");
+    assert!(label_path.exists(), "pull should have written the label");
+
+    // Remove the local file → this is the tombstone signal.
+    std::fs::remove_file(&label_path).unwrap();
+
+    // `rdc status dev` must surface the tombstone in a `deletes:` section.
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["status", "dev"])
+        .assert().success()
+        .stdout(predicate::str::contains("deletes:"))
+        .stdout(predicate::str::contains("labels/audit-hold"));
+
+    // Push with --allow-deletes + --yes (non-TTY → required) must
+    // succeed, issue the DELETE, and report the removal.
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["push", "dev", "--allow-deletes", "--yes"])
+        .assert().success()
+        .stdout(predicate::str::contains("deleted"));
+
+    assert!(*delete_seen.lock().unwrap(), "DELETE /labels/9001 should have been called");
+
+    // Lockfile entry for the deleted label must be gone.
+    let lf = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json"))
+        .unwrap();
+    assert!(
+        !lf.contains("\"audit-hold\""),
+        "lockfile should no longer contain audit-hold; got:\n{lf}"
+    );
+}
+
+/// Without `--allow-deletes`, a non-TTY `rdc push` containing tombstones
+/// must refuse and exit non-zero. No DELETE should hit the API.
+#[tokio::test]
+async fn push_refuses_tombstones_without_allow_deletes_in_non_tty() {
+    use std::sync::{Arc, Mutex};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [{
+                "id": 9002,
+                "url": "https://mock.rossum.app/api/v1/labels/9002",
+                "name": "Throwaway",
+                "organization": "https://mock.rossum.app/api/v1/organizations/1",
+                "modified_at": "2026-05-12T10:00:00.000000Z",
+                "color": null
+            }]
+        })))
+        .mount(&server).await;
+    for ep in [
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/hooks",
+        "/api/v1/rules", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&server).await;
+    }
+    // Tripwire: any DELETE attempt is a test failure.
+    let delete_attempted: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    let delete_attempted_clone = delete_attempted.clone();
+    Mock::given(method("DELETE"))
+        .respond_with(move |_req: &wiremock::Request| {
+            *delete_attempted_clone.lock().unwrap() = true;
+            ResponseTemplate::new(204)
+        })
+        .mount(&server).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert().success();
+
+    std::fs::remove_file(project.path().join("envs/dev/labels/throwaway.json")).unwrap();
+
+    // Non-TTY (assert_cmd never gives a TTY) + no --allow-deletes → refuse.
+    // The error message must point at the flag.
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["push", "dev"])
+        .assert().failure()
+        .stderr(predicate::str::contains("--allow-deletes"));
+
+    assert!(
+        !*delete_attempted.lock().unwrap(),
+        "DELETE must NOT have been issued without --allow-deletes"
+    );
+
+    // Lockfile entry should still be intact (the push was refused).
+    let lf = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json"))
+        .unwrap();
+    assert!(
+        lf.contains("\"throwaway\""),
+        "lockfile entry must survive a refused push; got:\n{lf}"
+    );
+}
+
+/// `rdc push --dry-run` must list pending tombstones and never call DELETE.
+#[tokio::test]
+async fn push_dry_run_lists_tombstones_without_calling_delete() {
+    use std::sync::{Arc, Mutex};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [{
+                "id": 9003,
+                "url": "https://mock.rossum.app/api/v1/labels/9003",
+                "name": "Dry run target",
+                "organization": "https://mock.rossum.app/api/v1/organizations/1",
+                "modified_at": "2026-05-12T10:00:00.000000Z",
+                "color": null
+            }]
+        })))
+        .mount(&server).await;
+    for ep in [
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/hooks",
+        "/api/v1/rules", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&server).await;
+    }
+    let delete_attempted: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    let delete_attempted_clone = delete_attempted.clone();
+    Mock::given(method("DELETE"))
+        .respond_with(move |_req: &wiremock::Request| {
+            *delete_attempted_clone.lock().unwrap() = true;
+            ResponseTemplate::new(204)
+        })
+        .mount(&server).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "dev"])
+        .assert().success();
+
+    std::fs::remove_file(project.path().join("envs/dev/labels/dry-run-target.json")).unwrap();
+
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["push", "dev", "--dry-run"])
+        .assert().success()
+        .stdout(predicate::str::contains("would be DELETED"))
+        .stdout(predicate::str::contains("dry-run-target"));
+
+    assert!(
+        !*delete_attempted.lock().unwrap(),
+        "dry-run must not issue any DELETE"
+    );
+}

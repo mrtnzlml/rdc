@@ -295,10 +295,44 @@ local file. Cross-references must use URLs already known to the
 lockfile (e.g. a new hook's `queues` field must point at queues that
 already exist on the remote).
 
+## Deleting an object
+
+The snapshot is the declared state of the environment, including
+absence. Remove the local file (`rm envs/<env>/labels/foo.json`) and
+the next `rdc push <env>` will detect the tombstone — the lockfile
+entry remains, signalling "this object was tracked and is now gone."
+
+Two intentional acts are required before the DELETE hits the remote:
+
+1. Removing the file (you did this).
+2. Either answering `y` to the interactive batch prompt on a TTY, or
+   passing `--allow-deletes`. `--yes` does NOT bypass — destruction
+   needs its own authorisation.
+
+In non-TTY (CI) mode, `--allow-deletes` is mandatory; without it the
+push refuses with a clear list of pending tombstones.
+
+`rdc status <env>` lists pending tombstones in a `deletes:` section.
+`rdc push --dry-run` previews them without sending anything;
+`--diff` adds the full remote body for each as a deleted-file diff.
+
+Deletes run after creates / updates in reverse dependency order
+(`engine_fields → engines → labels → rules → hooks →
+email_templates → inboxes → queues → schemas → workspaces`) so a
+queue is gone before the workspace that contained it. The Rossum
+DELETE endpoint accepts 404 as success, so an object already absent
+on the remote just gets its lockfile entry cleaned up.
+
+If the remote has been modified since the last pull, an inline
+resolver opens — `[k]eep delete` / `[s]kip` / `[a]bort` — so a
+tombstoned delete can't silently overwrite a remote update.
+
 ## Common commands
 
 - `rdc pull <env>` — fetch remote into local snapshot
-- `rdc push <env>` — push local edits back; creates new objects too
+- `rdc push <env>` — push local edits back; creates new objects too;
+  `--allow-deletes` to also remove remote objects whose local files
+  you've deleted
 - `rdc diff <env>` — local-vs-remote diff (no writes)
 - `rdc diff <a> <b>` — diff two local snapshots
 - `rdc status [<env>]` — auth + lockfile health
