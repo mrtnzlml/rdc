@@ -216,11 +216,58 @@ Supported kinds for create: workspaces, schemas, queues, inboxes, hooks, rules, 
 ### Store extensions
 
 Extensions installed via the Rossum store (Master Data Hub, Email
-Notifications, …) live under `hooks/` like any other hook, identified
-by `"extension_source": "rossum_store"` in the JSON. `rdc push` knows
-to use the dedicated install endpoint when creating one on a fresh
-environment, then PATCHes any customisations from the snapshot. Update
-and delete behave identically to regular hooks.
+Notifications, Document Splitting, …) live under `hooks/` like every
+other hook, marked by `"extension_source": "rossum_store"` in the JSON.
+
+`rdc pull` round-trips the full server body — including the
+template-managed `description`, `guide`, `settings_schema`, and the
+private webhook `config`. Diffs and edits work the same way as for
+regular hooks; only `settings`, `queues`, `active`, `run_after`,
+`metadata`, and customer-set `config.*` values are typically meant to
+diverge between environments.
+
+`rdc push` knows to use the Rossum store install endpoint
+(`POST /hooks/create`) when creating one on a fresh environment, then
+PATCHes any customisations from the snapshot. If a previous push left
+an orphan (install succeeded, PATCH failed), the next push detects it
+by `(name, hook_template)` and resumes without creating a duplicate.
+
+`rdc deploy` resolves the target cluster's matching `hook_template`
+URL by `(name, type, extension_source)` match against
+`GET /hook_templates` on the target, caching the pair in
+`.rdc/map/<src>→<tgt>.toml` under `[hook_templates]`. The first deploy
+that needs a `token_owner` on the target also prompts you to pick the
+target's service-account user from a list (ranked with
+`system_user__*` first); your choice is saved to
+`envs/<tgt>/overlay.toml`. Subsequent deploys read the overlay
+non-interactively.
+
+Update, delete, drift detection, and conflict resolution are identical
+to a regular hook.
+
+For automated CI deploys, set `token_owner` in
+`envs/<env>/overlay.toml` ahead of time — either per-hook:
+
+```toml
+[hooks.master-data-hub]
+"token_owner" = "https://prod.rossum.app/api/v1/users/<system-user-id>"
+```
+
+or as a shared default for every store extension in the env:
+
+```toml
+[defaults]
+store_extension_token_owner = "https://prod.rossum.app/api/v1/users/<system-user-id>"
+```
+
+`rdc deploy --yes` refuses to start when neither is present, listing
+the missing hook(s) and the file to edit.
+
+If the source cluster has a store template that's not available on the
+target cluster (e.g., a `request_access` template the target org hasn't
+been onboarded to), `rdc deploy` refuses with an actionable error
+naming the template — install it manually via the Rossum UI on the
+target and re-run `rdc pull` first.
 
 ### Delete an object
 
