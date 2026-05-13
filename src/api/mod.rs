@@ -7,7 +7,7 @@ pub use error::{anyhow_has_status, ApiError};
 
 use crate::model::{
     EmailTemplate, Engine, EngineField, Hook, HookTemplate, Inbox, Label, Organization, Queue,
-    Rule, Schema, Workflow, WorkflowStep, Workspace,
+    Rule, Schema, User, Workflow, WorkflowStep, Workspace,
 };
 use crate::progress::ProgressHandle;
 use anyhow::{Context, Result};
@@ -87,6 +87,10 @@ impl RossumClient {
 
     pub async fn list_hook_templates(&self, progress: ProgressHandle) -> Result<Vec<HookTemplate>> {
         self.list_paginated("/hook_templates", progress).await
+    }
+
+    pub async fn list_users(&self, progress: ProgressHandle) -> Result<Vec<User>> {
+        self.list_paginated("/users", progress).await
     }
 
     // --- get endpoints ------------------------------------------------
