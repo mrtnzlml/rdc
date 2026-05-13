@@ -13,9 +13,20 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Default)]
+pub struct Defaults {
+    /// Fallback `token_owner` URL applied to every store extension that
+    /// has no per-hook `token_owner` override. Set automatically by
+    /// `rdc deploy`'s interactive picker on first deploy; hand-editable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_extension_token_owner: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Overlay {
     pub version: u32,
+    #[serde(default)]
+    pub defaults: Defaults,
     #[serde(default)]
     pub hooks: BTreeMap<String, BTreeMap<String, Value>>,
     #[serde(default)]
@@ -287,5 +298,35 @@ version = 1
         assert!(v.get("name").is_none());
         assert!(v["config"].get("runtime").is_none());
         assert_eq!(v["config"]["timeout"], Value::Number(30.into()));
+    }
+
+    #[test]
+    fn defaults_section_parses_store_extension_token_owner() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("overlay.toml");
+        std::fs::write(&path, r#"
+version = 1
+
+[defaults]
+store_extension_token_owner = "https://prod/api/v1/users/938493"
+
+[hooks.master-data-hub]
+"name" = "MDH (PROD)"
+"#).unwrap();
+        let overlay = Overlay::load(&path).unwrap().unwrap();
+        assert_eq!(
+            overlay.defaults.store_extension_token_owner.as_deref(),
+            Some("https://prod/api/v1/users/938493")
+        );
+        assert!(overlay.hook("master-data-hub").is_some());
+    }
+
+    #[test]
+    fn defaults_section_is_optional() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("overlay.toml");
+        std::fs::write(&path, "version = 1\n").unwrap();
+        let overlay = Overlay::load(&path).unwrap().unwrap();
+        assert!(overlay.defaults.store_extension_token_owner.is_none());
     }
 }
