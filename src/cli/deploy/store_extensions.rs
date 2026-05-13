@@ -4,6 +4,8 @@
 //!   - Install-body construction (later tasks).
 //!   - Interactive `token_owner` picker (later tasks).
 
+pub use crate::cli::resolve::{prompt_token_owner, render_token_owner_picker};
+
 use anyhow::{anyhow, Result};
 use crate::model::{Hook, HookTemplate};
 use crate::overlay::Overlay;

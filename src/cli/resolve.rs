@@ -356,6 +356,75 @@ pub fn resolve_push_drift(
     }
 }
 
+/// Render the token_owner picker prompt as a string. Pure function for
+/// testability; the interactive variant `prompt_token_owner` wraps this
+/// with stdin/stdout.
+pub fn render_token_owner_picker(
+    slug: &str,
+    tgt_env: &str,
+    users: &[crate::model::User],
+    self_user_id: Option<u64>,
+) -> String {
+    let mut sorted: Vec<&crate::model::User> = users.iter().collect();
+    sorted.sort_by_key(|u| {
+        if u.is_system_user() { 0 } else if u.is_admin() { 1 } else { 2 }
+    });
+    let mut out = String::new();
+    out.push_str(&format!("Pick the token_owner for store extension '{slug}' on {tgt_env}\n"));
+    out.push_str("(used as the API service account for the extension's calls; usually a system user):\n\n");
+    for (i, u) in sorted.iter().enumerate() {
+        let mut tags = Vec::new();
+        if u.is_admin() { tags.push("admin"); }
+        if u.is_active { tags.push("active"); }
+        if Some(u.id) == self_user_id { tags.push("you"); }
+        let tags = tags.join(", ");
+        let display = if u.first_name.is_empty() && u.last_name.is_empty() {
+            u.username.clone()
+        } else {
+            format!("{} {}", u.first_name, u.last_name).trim().to_string()
+        };
+        out.push_str(&format!("  [{}] {display}   {tags}\n", i + 1));
+        out.push_str(&format!("      {}\n", u.url));
+    }
+    out.push_str("  [a] abort the deploy\n\n");
+    out.push_str("[1] > ");
+    out
+}
+
+/// Prompt interactively. Returns `Some((picked_user_url, apply_to_all))`
+/// or `None` if the user aborted. Non-TTY callers must skip this and
+/// check the overlay state up-front.
+pub fn prompt_token_owner(
+    slug: &str,
+    tgt_env: &str,
+    users: &[crate::model::User],
+    self_user_id: Option<u64>,
+) -> anyhow::Result<Option<(String, bool)>> {
+    use std::io::{self, BufRead, Write};
+    let rendered = render_token_owner_picker(slug, tgt_env, users, self_user_id);
+    print!("{rendered}");
+    io::stdout().flush().ok();
+    let stdin = io::stdin();
+    let line = stdin.lock().lines().next().ok_or_else(|| anyhow::anyhow!("stdin closed"))??;
+    let pick = line.trim();
+    if pick == "a" { return Ok(None); }
+    let n: usize = if pick.is_empty() {
+        1
+    } else {
+        pick.parse().map_err(|_| anyhow::anyhow!("expected a number or 'a', got '{pick}'"))?
+    };
+    let mut sorted: Vec<&crate::model::User> = users.iter().collect();
+    sorted.sort_by_key(|u| {
+        if u.is_system_user() { 0 } else if u.is_admin() { 1 } else { 2 }
+    });
+    let chosen = sorted.get(n - 1).ok_or_else(|| anyhow::anyhow!("'{n}' is out of range"))?;
+    print!("\nApply this choice to all remaining store extensions in this deploy? [y/N] ");
+    io::stdout().flush().ok();
+    let line2 = stdin.lock().lines().next().unwrap_or(Ok(String::new()))?;
+    let apply_all = matches!(line2.trim().to_lowercase().as_str(), "y" | "yes");
+    Ok(Some((chosen.url.clone(), apply_all)))
+}
+
 /// Sentinel error type signaling the user picked `[a]bort` at any
 /// resolver prompt (pull or push). The pull / push runner downcasts to
 /// this and skips lockfile.save().
@@ -782,5 +851,36 @@ mod tests {
         .unwrap();
         let s = String::from_utf8(output).unwrap();
         assert!(!s.contains("\x1b["), "expected no SGR codes: {s:?}");
+    }
+
+    #[test]
+    fn picker_renders_users_in_priority_order() {
+        use crate::model::User;
+        let users: Vec<User> = serde_json::from_value(serde_json::json!([
+            {"id": 100, "url": "u100", "username": "alice@x", "first_name": "Alice", "last_name": "",
+             "is_active": true, "groups": ["https://x/groups/3"]},
+            {"id": 938493, "url": "u938493", "username": "system_user__abc", "first_name": "SYS",
+             "last_name": "USER", "is_active": true, "groups": ["https://x/groups/3"]},
+            {"id": 200, "url": "u200", "username": "bob@x", "first_name": "Bob", "last_name": "",
+             "is_active": true, "groups": ["https://x/groups/3"]}
+        ])).unwrap();
+        let rendered = render_token_owner_picker("master-data-hub", "prod", &users, Some(938493));
+        // System user first.
+        let sys_pos = rendered.find("u938493").expect("sys user URL in output");
+        let alice_pos = rendered.find("u100").expect("alice URL in output");
+        assert!(sys_pos < alice_pos, "system_user__ should be ranked first");
+        // Active session's own user tagged.
+        assert!(rendered.contains("you"), "self user should be tagged");
+    }
+
+    #[test]
+    fn picker_skips_you_tag_when_self_id_is_none() {
+        use crate::model::User;
+        let users: Vec<User> = serde_json::from_value(serde_json::json!([
+            {"id": 100, "url": "u100", "username": "alice@x", "first_name": "Alice", "last_name": "",
+             "is_active": true, "groups": ["https://x/groups/3"]}
+        ])).unwrap();
+        let rendered = render_token_owner_picker("master-data-hub", "prod", &users, None);
+        assert!(!rendered.contains("you"), "no self_id → no 'you' tag");
     }
 }
