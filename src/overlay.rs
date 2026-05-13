@@ -106,6 +106,42 @@ impl Overlay {
     }
 }
 
+/// Idempotent write: load the overlay file (or create an empty one),
+/// patch in the `token_owner` (per-hook if `slug` is `Some`, otherwise
+/// into `[defaults] store_extension_token_owner`), atomically rewrite
+/// the TOML. Preserves every other key.
+pub fn write_store_extension_token_owner(
+    path: &Path,
+    slug: Option<&str>,
+    user_url: &str,
+) -> Result<()> {
+    let mut overlay = Overlay::load(path)?.unwrap_or(Overlay {
+        version: 1,
+        hooks: BTreeMap::new(),
+        rules: BTreeMap::new(),
+        labels: BTreeMap::new(),
+        schemas: BTreeMap::new(),
+        queues: BTreeMap::new(),
+        inboxes: BTreeMap::new(),
+        email_templates: BTreeMap::new(),
+        engines: BTreeMap::new(),
+        engine_fields: BTreeMap::new(),
+        defaults: Defaults::default(),
+    });
+    match slug {
+        Some(s) => {
+            let entry = overlay.hooks.entry(s.to_string()).or_insert_with(BTreeMap::new);
+            entry.insert("token_owner".into(), Value::String(user_url.into()));
+        }
+        None => {
+            overlay.defaults.store_extension_token_owner = Some(user_url.into());
+        }
+    }
+    let s = toml::to_string_pretty(&overlay).context("serializing overlay")?;
+    crate::snapshot::writer::write_atomic(path, s.as_bytes())?;
+    Ok(())
+}
+
 /// Apply a flat dotted-path → value map onto a `serde_json::Value`. Creates
 /// intermediate objects if missing. Existing values at the path are
 /// overwritten unconditionally.
@@ -328,5 +364,46 @@ store_extension_token_owner = "https://prod/api/v1/users/938493"
         std::fs::write(&path, "version = 1\n").unwrap();
         let overlay = Overlay::load(&path).unwrap().unwrap();
         assert!(overlay.defaults.store_extension_token_owner.is_none());
+    }
+
+    #[test]
+    fn write_token_owner_creates_per_hook_entry() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("overlay.toml");
+        std::fs::write(&path, "version = 1\n\n[hooks.other-hook]\n\"name\" = \"Other\"\n").unwrap();
+
+        write_store_extension_token_owner(&path, Some("master-data-hub"), "https://prod/api/v1/users/938493").unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[hooks.master-data-hub]"));
+        assert!(raw.contains("token_owner = \"https://prod/api/v1/users/938493\""));
+        assert!(raw.contains("[hooks.other-hook]"), "existing entries must be preserved");
+        assert!(raw.contains("Other"));
+    }
+
+    #[test]
+    fn write_token_owner_creates_defaults_entry_when_slug_none() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("overlay.toml");
+        std::fs::write(&path, "version = 1\n").unwrap();
+
+        write_store_extension_token_owner(&path, None, "https://prod/api/v1/users/938493").unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[defaults]"));
+        assert!(raw.contains("store_extension_token_owner = \"https://prod/api/v1/users/938493\""));
+    }
+
+    #[test]
+    fn write_token_owner_creates_file_if_missing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("overlay.toml");
+
+        write_store_extension_token_owner(&path, None, "https://prod/api/v1/users/938493").unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("version = 1"));
+        assert!(raw.contains("[defaults]"));
+        assert!(raw.contains("store_extension_token_owner"));
     }
 }
