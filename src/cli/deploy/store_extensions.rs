@@ -4,6 +4,7 @@
 //!   - Install-body construction (later tasks).
 //!   - Interactive `token_owner` picker (later tasks).
 
+use anyhow::{anyhow, Result};
 use crate::overlay::Overlay;
 use serde_json::Value;
 
@@ -19,6 +20,23 @@ pub fn effective_token_owner<'a>(overlay: Option<&'a Overlay>, slug: &str) -> Op
         return Some(per_hook);
     }
     overlay.defaults.store_extension_token_owner.as_deref()
+}
+
+/// Extract `{name, hook_template, events, queues, token_owner}` from a
+/// full hook body and return them as the `POST /hooks/create` payload.
+/// Any field present but null counts as missing (matches the API).
+pub fn build_install_body(full: &Value) -> Result<Value> {
+    let obj = full.as_object()
+        .ok_or_else(|| anyhow!("hook body is not a JSON object"))?;
+    let mut out = serde_json::Map::new();
+    for field in ["name", "hook_template", "events", "queues", "token_owner"] {
+        let value = obj.get(field)
+            .filter(|v| !v.is_null())
+            .ok_or_else(|| anyhow!("store extension is missing required field '{field}' for /hooks/create"))?
+            .clone();
+        out.insert(field.to_string(), value);
+    }
+    Ok(Value::Object(out))
 }
 
 #[cfg(test)]
@@ -72,5 +90,37 @@ mod tests {
     #[test]
     fn returns_none_when_no_overlay() {
         assert_eq!(effective_token_owner(None, "master-data-hub"), None);
+    }
+
+    #[test]
+    fn build_install_body_extracts_five_fields() {
+        let full = serde_json::json!({
+            "name": "Master Data Hub",
+            "hook_template": "https://elis/api/v1/hook_templates/39",
+            "events": ["annotation_content.initialize", "annotation_content.started"],
+            "queues": ["https://elis/api/v1/queues/100", "https://elis/api/v1/queues/101"],
+            "token_owner": "https://elis/api/v1/users/938493",
+            "settings": { "configurations": ["customized"] },
+            "active": false,
+            "description": "must not appear in install body",
+            "config": { "private": true }
+        });
+        let body = build_install_body(&full).unwrap();
+        assert_eq!(body.as_object().unwrap().len(), 5);
+        assert_eq!(body["name"].as_str().unwrap(), "Master Data Hub");
+        assert_eq!(body["hook_template"].as_str().unwrap(), "https://elis/api/v1/hook_templates/39");
+        assert_eq!(body["events"].as_array().unwrap().len(), 2);
+        assert_eq!(body["queues"].as_array().unwrap().len(), 2);
+        assert_eq!(body["token_owner"].as_str().unwrap(), "https://elis/api/v1/users/938493");
+        assert!(body.get("settings").is_none());
+        assert!(body.get("description").is_none());
+    }
+
+    #[test]
+    fn build_install_body_errors_when_required_field_missing() {
+        let no_template = serde_json::json!({
+            "name": "X", "events": [], "queues": [], "token_owner": "u"
+        });
+        assert!(build_install_body(&no_template).is_err());
     }
 }
