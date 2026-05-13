@@ -37,7 +37,7 @@ pub async fn run(left: String, right: Option<String>) -> Result<()> {
     }
 }
 
-async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) -> Result<()> {
+pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) -> Result<()> {
     let env_cfg = cfg.envs.get(env).expect("env present in cfg");
     let paths = Paths::for_env(cwd, env);
     let lockfile_path = paths.lockfile();
@@ -319,7 +319,14 @@ fn canonical_json_for_diff<T: serde::Serialize>(v: &T) -> Result<String> {
     Ok(String::from_utf8(bytes)?)
 }
 
-fn print_unified(
+/// Print a unified diff (3-line context) of two text blobs with custom
+/// header labels. If the inputs are byte-equal, prints nothing and leaves
+/// `counter` untouched — callers can pass a no-op counter (`&mut 0`) when
+/// they only care about the side effect.
+///
+/// Used by `rdc diff` directly and by `rdc push --dry-run --diff` /
+/// `rdc deploy --dry-run --diff` to surface per-object changes.
+pub fn print_unified(
     left_label: &str,
     right_label: &str,
     left: &str,
@@ -337,6 +344,20 @@ fn print_unified(
         .to_string();
     print!("{unified}");
     *counter += 1;
+}
+
+/// Print a "new file" unified diff — the right side is empty so every line
+/// of `body` shows up as a `+` insertion. Used by the dry-run preview when
+/// reporting a would-be POST (no remote counterpart yet).
+pub fn print_new_file_diff(label: &str, body: &str) {
+    print_unified("/dev/null", label, "", body, &mut 0);
+}
+
+/// Mirror of `print_new_file_diff` for would-be deletions: every line of
+/// `body` shows up as a `-` removal. Used by `rdc deploy --mirror
+/// --dry-run --diff`.
+pub fn print_deleted_file_diff(label: &str, body: &str) {
+    print_unified(label, "/dev/null", body, "", &mut 0);
 }
 
 fn diff_formulas(

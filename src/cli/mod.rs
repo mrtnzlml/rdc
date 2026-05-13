@@ -1,7 +1,12 @@
 use clap::{Parser, Subcommand};
 
+/// Cargo-style colour palette for `--help`, error messages, and usage
+/// strings. Picked up from the `clap_cargo` crate so the look matches
+/// other modern Rust CLIs (cargo, rustup, rustfmt).
+const CLI_STYLES: clap::builder::Styles = clap_cargo::style::CLAP_STYLING;
+
 #[derive(Debug, Parser)]
-#[command(name = "rdc", version, about = "Rossum Deployment as Code")]
+#[command(name = "rdc", version, about = "Rossum Deployment as Code", styles = CLI_STYLES)]
 pub struct Cli {
     /// Disable ANSI color in output. Also honored via `NO_COLOR`.
     #[arg(long = "no-color", global = true)]
@@ -34,6 +39,11 @@ pub enum Command {
         /// anything to the API.
         #[arg(long = "dry-run")]
         dry_run: bool,
+        /// Print a unified diff per changed file (local vs current
+        /// remote, or the would-be POST body for new resources).
+        /// Requires `--dry-run`; one GET per changed object.
+        #[arg(long = "diff", requires = "dry_run")]
+        diff: bool,
     },
     /// Deploy a source env to a target env in one shot.
     ///
@@ -66,6 +76,14 @@ pub enum Command {
         /// calls are suppressed.
         #[arg(long = "dry-run")]
         dry_run: bool,
+        /// In addition to the plan summary, print full unified diffs
+        /// per object: the would-be POST body for creates, the
+        /// src-vs-tgt diff for updates, and the would-be-removed body
+        /// for deletes (`--mirror` only). Both `.json` and any
+        /// extracted `.py` / formula files are shown. Requires
+        /// `--dry-run`.
+        #[arg(long = "diff", requires = "dry_run")]
+        diff: bool,
     },
     /// Read-only health check: token, auth, lockfile, local edits.
     /// With no `env`, runs for every env defined in `rdc.toml`.
@@ -148,13 +166,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
             crate::cli::pull::run(&env, interactive).await
         }
-        Some(Command::Push { env, dry_run }) => {
+        Some(Command::Push { env, dry_run, diff }) => {
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
-            crate::cli::push::run(&env, interactive, dry_run).await
+            crate::cli::push::run(&env, interactive, dry_run, diff).await
         }
-        Some(Command::Deploy { src, tgt, mirror, dry_run }) => {
+        Some(Command::Deploy { src, tgt, mirror, dry_run, diff }) => {
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
-            crate::cli::deploy::run::run(&src, &tgt, mirror, interactive, dry_run).await
+            crate::cli::deploy::run::run(&src, &tgt, mirror, interactive, dry_run, diff).await
         }
         Some(Command::Status { env }) => crate::cli::status::run(env).await,
         Some(Command::Diff { left, right }) => crate::cli::diff::run(left, right).await,

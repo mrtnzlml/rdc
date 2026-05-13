@@ -69,7 +69,7 @@ pub const KINDS_IN_DEP_ORDER: &[&str] = &[
     "engine_fields",
 ];
 
-pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run: bool) -> Result<()> {
+pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run: bool, diff: bool) -> Result<()> {
     if src == tgt {
         return Err(anyhow!(
             "src and tgt envs are the same ('{src}'). Use two different envs for `rdc deploy`."
@@ -154,6 +154,23 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
                 }
             }
         }
+        if diff && plan.create_total() > 0 {
+            // Surface the full POST body per would-be-created object so
+            // the user can audit exactly what `rdc deploy` would send.
+            // The body goes through the same shaping the real create path
+            // uses (URL rewrite, tgt overlay, server-field strip) so what
+            // you see here is what would land on the wire.
+            println!();
+            println!("--- create bodies (would-be POST) ---");
+            preview_create_bodies(
+                &plan,
+                &src_paths,
+                &src_lockfile,
+                &tgt_lockfile,
+                &mapping,
+                &tgt_overlay,
+            )?;
+        }
     } else {
         let mut ctx = CreateCtx {
             src_paths: &src_paths,
@@ -223,7 +240,7 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
     // whose canonical content (after URL rewrite + overlay) actually
     // differs from the tgt remote. Apply prints its own summary line, and
     // honors `dry_run` by tracing the same logic but skipping the PATCH.
-    crate::cli::deploy::apply::run(src, tgt, dry_run)
+    crate::cli::deploy::apply::run(src, tgt, dry_run, diff)
         .await
         .with_context(|| format!(
             "update phase failed after {creates_done} create(s) succeeded"
@@ -231,8 +248,15 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
 
     // 7. Deletes (mirror only), reverse dependency order so children go
     // before their parents. Dry-run reports what would be deleted but
-    // doesn't issue DELETE calls.
+    // doesn't issue DELETE calls; with `--diff`, the tgt-side body of
+    // each soon-to-be-removed object is dumped first so the user can
+    // see exactly what would disappear.
     let mut deletes_done = 0usize;
+    if dry_run && diff && mirror && plan.delete_total() > 0 {
+        println!();
+        println!("--- delete bodies (would be removed from {tgt}) ---");
+        preview_delete_bodies(&plan, &tgt_paths)?;
+    }
     if mirror && plan.delete_total() > 0 {
         let mut rev = KINDS_IN_DEP_ORDER.to_vec();
         rev.reverse();
@@ -641,4 +665,189 @@ fn remove_local_file(paths: &Paths, kind: &str, slug: &str) {
         }
         _ => {}
     }
+}
+
+// ----- dry-run --diff body previews ----------------------------------
+
+/// For every would-be create in the plan, build the body the real deploy
+/// would POST (URL-rewritten via the auto-matched mapping, tgt overlay
+/// applied, server-managed fields stripped) and print it as a new-file
+/// unified diff. The output matches `git diff` / `rdc diff` formatting so
+/// it pipes cleanly into a pager or review tool.
+fn preview_create_bodies(
+    plan: &PlanCounts,
+    src_paths: &Paths,
+    src_lockfile: &Lockfile,
+    tgt_lockfile: &Lockfile,
+    mapping: &Mapping,
+    tgt_overlay: &Option<Overlay>,
+) -> Result<()> {
+    use crate::cli::deploy::common::rewrite_urls;
+    use crate::overlay::apply_overrides;
+    use crate::snapshot::create::strip_for_create;
+
+    for kind in KINDS_IN_DEP_ORDER {
+        let Some(slugs) = plan.creates.get(kind) else { continue };
+        for slug in slugs {
+            // For each kind, work out the on-disk path of the src file +
+            // (when the kind is hooks/rules/schemas) the extracted code
+            // sidecar that ships alongside the JSON.
+            let (src_json, src_code) = match read_src_for_preview(kind, slug, src_paths) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("warning: cannot preview {kind}/{slug}: {e:#}");
+                    continue;
+                }
+            };
+            // Shape the body the same way create_*() does so the preview
+            // matches the real POST byte-for-byte.
+            let mut value: serde_json::Value = match serde_json::from_slice(&src_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("warning: parsing {kind}/{slug}: {e:#}");
+                    continue;
+                }
+            };
+            rewrite_urls(&mut value, src_lockfile, tgt_lockfile, mapping);
+            if let Some(overlay_paths) = overlay_for(kind, slug, tgt_overlay) {
+                apply_overrides(&mut value, overlay_paths);
+            }
+            strip_for_create(&mut value, kind);
+            let body = serde_json::to_string_pretty(&value)?;
+            crate::cli::diff::print_new_file_diff(
+                &format!("{kind}/{slug}.json (would create)"),
+                &body,
+            );
+            if let Some(code) = src_code {
+                let ext = match *kind {
+                    "hooks" | "rules" => "py",
+                    _ => "txt",
+                };
+                crate::cli::diff::print_new_file_diff(
+                    &format!("{kind}/{slug}.{ext} (would create)"),
+                    &code,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_src_for_preview(
+    kind: &str,
+    slug: &str,
+    src_paths: &Paths,
+) -> Result<(Vec<u8>, Option<String>)> {
+    match kind {
+        "workspaces" => {
+            let p = src_paths.workspace_dir(slug).join("workspace.json");
+            Ok((std::fs::read(&p)?, None))
+        }
+        "hooks" => {
+            let json_p = src_paths.hooks_dir().join(format!("{slug}.json"));
+            let py_p = src_paths.hooks_dir().join(format!("{slug}.py"));
+            let py = if py_p.exists() {
+                Some(std::fs::read_to_string(&py_p)?)
+            } else {
+                None
+            };
+            Ok((std::fs::read(&json_p)?, py))
+        }
+        "rules" => {
+            let json_p = src_paths.rules_dir().join(format!("{slug}.json"));
+            let py_p = src_paths.rules_dir().join(format!("{slug}.py"));
+            let py = if py_p.exists() {
+                Some(std::fs::read_to_string(&py_p)?)
+            } else {
+                None
+            };
+            Ok((std::fs::read(&json_p)?, py))
+        }
+        "labels" | "engines" | "engine_fields" => {
+            let dir = match kind {
+                "labels" => src_paths.labels_dir(),
+                "engines" => src_paths.engines_dir(),
+                _ => src_paths.engines_dir(),
+            };
+            let p = dir.join(format!("{slug}.json"));
+            Ok((std::fs::read(&p)?, None))
+        }
+        "queues" | "schemas" | "inboxes" => {
+            let q_dir = crate::cli::deploy::create::locate_queue_dir(src_paths, slug)
+                .ok_or_else(|| anyhow!("queue dir for '{slug}' not found"))?;
+            let fname = match kind {
+                "queues" => "queue.json",
+                "schemas" => "schema.json",
+                "inboxes" => "inbox.json",
+                _ => unreachable!(),
+            };
+            Ok((std::fs::read(q_dir.join(fname))?, None))
+        }
+        "email_templates" => {
+            // key is "<ws>/<q>/<template>"
+            let parts: Vec<&str> = slug.splitn(3, '/').collect();
+            if parts.len() != 3 {
+                return Err(anyhow!("bad email_template key '{slug}'"));
+            }
+            let p = src_paths
+                .queue_email_templates_dir(parts[0], parts[1])
+                .join(format!("{}.json", parts[2]));
+            Ok((std::fs::read(&p)?, None))
+        }
+        _ => Err(anyhow!("unsupported kind '{kind}' for preview")),
+    }
+}
+
+fn overlay_for<'a>(
+    kind: &str,
+    slug: &str,
+    overlay: &'a Option<Overlay>,
+) -> Option<&'a std::collections::BTreeMap<String, serde_json::Value>> {
+    let ov = overlay.as_ref()?;
+    match kind {
+        "hooks" => ov.hook(slug),
+        "rules" => ov.rule(slug),
+        "labels" => ov.label(slug),
+        "schemas" => ov.schema(slug),
+        "queues" => ov.queue(slug),
+        "inboxes" => ov.inbox(slug),
+        "email_templates" => ov.email_template(slug),
+        _ => None,
+    }
+}
+
+/// For every would-be delete (`--mirror` mode), dump the tgt on-disk body
+/// labelled as deletion. Reads files directly off the snapshot — no API
+/// calls.
+fn preview_delete_bodies(plan: &PlanCounts, tgt_paths: &Paths) -> Result<()> {
+    let mut rev = KINDS_IN_DEP_ORDER.to_vec();
+    rev.reverse();
+    for kind in rev {
+        let Some(slugs) = plan.deletes.get(kind) else { continue };
+        for slug in slugs {
+            let (json, code) = match read_src_for_preview(kind, slug, tgt_paths) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("warning: cannot read tgt {kind}/{slug} for delete preview: {e:#}");
+                    continue;
+                }
+            };
+            let body = String::from_utf8_lossy(&json);
+            crate::cli::diff::print_deleted_file_diff(
+                &format!("{kind}/{slug}.json (would delete)"),
+                &body,
+            );
+            if let Some(code) = code {
+                let ext = match kind {
+                    "hooks" | "rules" => "py",
+                    _ => "txt",
+                };
+                crate::cli::diff::print_deleted_file_diff(
+                    &format!("{kind}/{slug}.{ext} (would delete)"),
+                    &code,
+                );
+            }
+        }
+    }
+    Ok(())
 }

@@ -22,7 +22,11 @@ use std::path::PathBuf;
 /// `rdc deploy --dry-run` to surface what *would* change without
 /// touching the target. The printed summary swaps "Applied" for
 /// "Would apply" in that mode.
-pub async fn run(src: &str, tgt: &str, dry_run: bool) -> Result<()> {
+///
+/// `diff = true` (only meaningful with `dry_run = true`) prints a
+/// unified diff per object whose canonical content differs between src
+/// (after URL rewrite + overlay) and tgt remote.
+pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let src_paths = Paths::for_env(&cwd, src);
     let tgt_paths = Paths::for_env(&cwd, tgt);
@@ -88,6 +92,20 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool) -> Result<()> {
         {
             continue;
         }
+        if dry_run && diff {
+            print_update_diff(
+                &format!("hooks/{tgt_slug}.json"),
+                &payload_json_full,
+                &remote_json_full,
+            );
+            if payload_code != remote_code {
+                print_update_diff(
+                    &format!("hooks/{tgt_slug}.py"),
+                    payload_code.clone().unwrap_or_default().as_bytes(),
+                    remote_code.clone().unwrap_or_default().as_bytes(),
+                );
+            }
+        }
         // PATCH (skipped in dry-run; counter still ticks).
         if !dry_run {
             tgt_client.update_hook(tgt_id, &payload_hook, None).await
@@ -145,6 +163,20 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool) -> Result<()> {
         {
             continue;
         }
+        if dry_run && diff {
+            print_update_diff(
+                &format!("rules/{tgt_slug}.json"),
+                &payload_json_full,
+                &remote_json_full,
+            );
+            if payload_code != remote_code {
+                print_update_diff(
+                    &format!("rules/{tgt_slug}.py"),
+                    payload_code.clone().unwrap_or_default().as_bytes(),
+                    remote_code.clone().unwrap_or_default().as_bytes(),
+                );
+            }
+        }
         if !dry_run {
             tgt_client.update_rule(tgt_id, &payload_rule, None).await
                 .with_context(|| format!("PATCH tgt rules/{tgt_id}"))?;
@@ -194,6 +226,9 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool) -> Result<()> {
         }
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "labels")? {
             continue;
+        }
+        if dry_run && diff {
+            print_update_diff(&format!("labels/{tgt_slug}.json"), &payload_bytes, &remote_bytes);
         }
         if !dry_run {
             tgt_client.update_label(tgt_id, &payload_label, None).await
@@ -257,6 +292,9 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool) -> Result<()> {
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "queues")? {
             continue;
         }
+        if dry_run && diff {
+            print_update_diff(&format!("queues/{tgt_slug}.json"), &payload_bytes, &remote_bytes);
+        }
         if !dry_run {
             tgt_client.patch_value(&format!("/queues/{tgt_id}"), &payload_for_patch, None).await
                 .with_context(|| format!("PATCH tgt queues/{tgt_id}"))?;
@@ -307,6 +345,33 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool) -> Result<()> {
         {
             continue;
         }
+        if dry_run && diff {
+            print_update_diff(
+                &format!("schemas/{tgt_slug}/schema.json"),
+                &payload_json_full,
+                &remote_json_full,
+            );
+            // Diff each formula sidecar that differs. Set-of-formulas
+            // mismatch (one side has a field the other doesn't) shows
+            // as new-file or deleted-file diff.
+            let local_map: std::collections::BTreeMap<&str, &[u8]> =
+                payload_formulas.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+            let remote_map: std::collections::BTreeMap<&str, &[u8]> =
+                remote_formulas.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+            let mut keys: std::collections::BTreeSet<&str> = local_map.keys().copied().collect();
+            keys.extend(remote_map.keys().copied());
+            for k in keys {
+                let l = local_map.get(k).copied().unwrap_or(&[]);
+                let r = remote_map.get(k).copied().unwrap_or(&[]);
+                if l != r {
+                    print_update_diff(
+                        &format!("schemas/{tgt_slug}/formulas/{k}.py"),
+                        l,
+                        r,
+                    );
+                }
+            }
+        }
         if !dry_run {
             tgt_client.update_schema(tgt_id, &payload_schema, None).await
                 .with_context(|| format!("PATCH tgt schemas/{tgt_id}"))?;
@@ -353,6 +418,9 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool) -> Result<()> {
         }
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "inboxes")? {
             continue;
+        }
+        if dry_run && diff {
+            print_update_diff(&format!("inboxes/{tgt_slug}.json"), &payload_bytes, &remote_bytes);
         }
         if !dry_run {
             tgt_client.update_inbox(tgt_id, &payload_inbox, None).await
@@ -413,6 +481,13 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool) -> Result<()> {
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "email_templates")? {
             continue;
         }
+        if dry_run && diff {
+            print_update_diff(
+                &format!("email_templates/{tgt_key}.json"),
+                &payload_bytes,
+                &remote_bytes,
+            );
+        }
         if !dry_run {
             tgt_client.patch_value(&format!("/email_templates/{tgt_id}"), &payload_for_patch, None).await
                 .with_context(|| format!("PATCH tgt email_templates/{tgt_id}"))?;
@@ -458,6 +533,9 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool) -> Result<()> {
         }
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "engines")? {
             continue;
+        }
+        if dry_run && diff {
+            print_update_diff(&format!("engines/{tgt_slug}.json"), &payload_bytes, &remote_bytes);
         }
         if dry_run {
             applied.engines += 1;
@@ -521,6 +599,13 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool) -> Result<()> {
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "engine_fields")? {
             continue;
         }
+        if dry_run && diff {
+            print_update_diff(
+                &format!("engine_fields/{tgt_slug}.json"),
+                &payload_bytes,
+                &remote_bytes,
+            );
+        }
         if dry_run {
             applied.engine_fields += 1;
         } else {
@@ -563,6 +648,20 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool) -> Result<()> {
     }
     println!("{summary}");
     Ok(())
+}
+
+/// Emit a `--- src / +++ tgt remote` unified diff for one update.
+/// Skipped silently when bytes are equal (matches `print_unified`).
+fn print_update_diff(label: &str, src: &[u8], tgt_remote: &[u8]) {
+    let l = String::from_utf8_lossy(src);
+    let r = String::from_utf8_lossy(tgt_remote);
+    crate::cli::diff::print_unified(
+        &format!("{label} (src after overlay+rewrite)"),
+        &format!("{label} (tgt remote)"),
+        &l,
+        &r,
+        &mut 0,
+    );
 }
 
 #[derive(Default)]

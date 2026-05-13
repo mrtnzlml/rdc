@@ -19,7 +19,7 @@ pub mod scan;
 mod schemas;
 mod workspaces;
 
-pub async fn run(env: &str, interactive: bool, dry_run: bool) -> Result<()> {
+pub async fn run(env: &str, interactive: bool, dry_run: bool, diff: bool) -> Result<()> {
     let push_started = std::time::Instant::now();
     let cwd = std::env::current_dir().context("getting current directory")?;
     let paths = Paths::for_env(&cwd, env);
@@ -75,8 +75,18 @@ pub async fn run(env: &str, interactive: bool, dry_run: bool) -> Result<()> {
                 }
             }
         }
+        if diff {
+            // Delegate the line-level diff to the existing `rdc diff
+            // <env>` machinery: it walks each kind, GETs the remote,
+            // and only prints output for files that differ. POST
+            // candidates (no lockfile entry) print as new-file diffs
+            // because the remote-side serialised form is empty.
+            println!();
+            println!("--- diffs ---");
+            crate::cli::diff::diff_local_vs_remote(&cwd, &cfg, env).await?;
+        }
         println!(
-            "Dry run push envs/{env}: {} change(s), {:.1}s — no API calls made.",
+            "Dry run push envs/{env}: {} change(s), {:.1}s — no API calls beyond GETs for diff.",
             changes.total(),
             push_started.elapsed().as_secs_f32()
         );
