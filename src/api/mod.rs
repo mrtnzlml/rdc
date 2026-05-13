@@ -113,6 +113,22 @@ impl RossumClient {
         self.post_json("/hooks", body, progress).await
     }
 
+    /// POST `/hooks/create` — the Rossum store install endpoint. Unlike
+    /// `create_hook` (which posts to `/hooks/`), this accepts a minimal body
+    /// `{name, hook_template, events, queues, token_owner}` and the server
+    /// fills in the rest from the referenced template (per the template's
+    /// `install_action: "copy"`). Required for store extensions because
+    /// `POST /hooks/` rejects them with 400 (`config.url` is required for
+    /// webhook-type hooks, but store webhooks have `config.private: true`
+    /// and no URL).
+    pub async fn create_hook_via_install(
+        &self,
+        body: &serde_json::Value,
+        progress: ProgressHandle,
+    ) -> Result<Hook> {
+        self.post_json("/hooks/create", body, progress).await
+    }
+
     pub async fn create_workspace(&self, body: &serde_json::Value, progress: ProgressHandle) -> Result<Workspace> {
         self.post_json("/workspaces", body, progress).await
     }

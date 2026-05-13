@@ -430,3 +430,45 @@ async fn list_workspaces_returns_workspaces() {
     assert_eq!(workspaces[0].name, "Invoices AP");
     assert_eq!(workspaces[1].name, "Purchase Orders");
 }
+
+#[tokio::test]
+async fn create_hook_via_install_posts_to_create_endpoint() {
+    use rdc::model::Hook;
+    use serde_json::json;
+    use wiremock::matchers::body_json;
+
+    let server = MockServer::start().await;
+    let install_body = json!({
+        "name": "Master Data Hub",
+        "hook_template": "https://elis.rossum.ai/api/v1/hook_templates/39",
+        "events": ["annotation_content.initialize"],
+        "queues": [],
+        "token_owner": "https://elis.rossum.ai/api/v1/users/938493"
+    });
+    let server_response = json!({
+        "id": 1798871,
+        "url": format!("{}/api/v1/hooks/1798871", server.uri()),
+        "name": "Master Data Hub",
+        "type": "webhook",
+        "events": ["annotation_content.initialize"],
+        "queues": [],
+        "config": { "private": true, "timeout_s": 60 },
+        "settings": { "configurations": [] },
+        "extension_source": "rossum_store",
+        "hook_template": "https://elis.rossum.ai/api/v1/hook_templates/39",
+        "token_owner": "https://elis.rossum.ai/api/v1/users/938493"
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/hooks/create"))
+        .and(header("Authorization", "token TEST_TOKEN"))
+        .and(body_json(&install_body))
+        .respond_with(ResponseTemplate::new(201).set_body_json(&server_response))
+        .mount(&server)
+        .await;
+
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let hook: Hook = client.create_hook_via_install(&install_body, None).await.unwrap();
+    assert_eq!(hook.id, 1798871);
+    assert_eq!(hook.extension_source(), Some("rossum_store"));
+}
