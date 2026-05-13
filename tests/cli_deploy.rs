@@ -563,6 +563,144 @@ async fn deploy_bootstraps_empty_target_with_url_rewriting() {
     );
 }
 
+/// When `rdc deploy test prod --yes` (non-TTY: `--yes` suppresses the
+/// interactive prompt) is run and the tgt overlay has no `token_owner` for a
+/// store extension, the pre-pass must abort before issuing any mutating
+/// requests (POST/PATCH/DELETE) to the tgt server.
+#[tokio::test]
+async fn deploy_refuses_non_tty_without_token_owner_overlay() {
+    let test_server = MockServer::start().await;
+    let prod_server = MockServer::start().await;
+    let src_api = format!("{}/api/v1", test_server.uri());
+    let tgt_api = format!("{}/api/v1", prod_server.uri());
+
+    // ── Src (test) pull mocks ────────────────────────────────────────────────
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&test_server).await;
+    let mdh_src = {
+        let mut b = mdh_snapshot_body(&src_api);
+        b["id"] = serde_json::Value::from(999u64);
+        b["url"] = serde_json::Value::String(format!("{src_api}/hooks/999"));
+        b
+    };
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": {"next": null},
+            "results": [mdh_src.clone()]
+        })))
+        .mount(&test_server).await;
+    for ep in [
+        "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&test_server).await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hook_templates"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": {"next": null},
+            "results": [
+                {"url": format!("{src_api}/hook_templates/39"),
+                 "name": "Master Data Hub", "type": "webhook",
+                 "extension_source": "rossum_store", "install_action": "copy"}
+            ]
+        })))
+        .mount(&test_server).await;
+
+    // ── Tgt (prod) pull mocks ────────────────────────────────────────────────
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&prod_server).await;
+    for ep in [
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/hooks",
+        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&prod_server).await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hook_templates"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": {"next": null},
+            "results": [
+                {"url": format!("{tgt_api}/hook_templates/41"),
+                 "name": "Master Data Hub", "type": "webhook",
+                 "extension_source": "rossum_store", "install_action": "copy"}
+            ]
+        })))
+        .mount(&prod_server).await;
+
+    // ── Project bootstrap ────────────────────────────────────────────────────
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args([
+            "init",
+            "--env", &format!("test={src_api}:1"),
+            "--env", &format!("prod={tgt_api}:1"),
+        ])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/test.secrets.json"),
+        r#"{"api_token":"TKN_TEST"}"#,
+    ).unwrap();
+    std::fs::write(
+        project.path().join("secrets/prod.secrets.json"),
+        r#"{"api_token":"TKN_PROD"}"#,
+    ).unwrap();
+
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "test"])
+        .assert().success();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "prod"])
+        .assert().success();
+
+    // Deliberately omit the tgt overlay — no store_extension_token_owner set.
+
+    // Deploy with --yes (non-interactive) must fail.
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["deploy", "test", "prod", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("token_owner"))
+        .stderr(predicate::str::contains("master-data-hub"))
+        .stderr(predicate::str::contains("envs/prod/overlay.toml"));
+
+    // No mutating requests (POST/PATCH/DELETE) to Rossum API paths must have
+    // reached the tgt server. Data-storage paths use POST for reads by
+    // convention and are excluded from this check.
+    for req in prod_server.received_requests().await.unwrap_or_default() {
+        let path = req.url.path();
+        if path.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "unexpected mutating request: {} {}",
+            req.method,
+            path
+        );
+    }
+}
+
 /// Deploy pre-pass resolves cross-cluster template URLs and reads token_owner
 /// from the tgt overlay (non-interactive path). After `rdc deploy test prod
 /// --yes`, the `.rdc/map/test→prod.toml` must contain a `[hook_templates]`
