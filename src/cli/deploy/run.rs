@@ -15,8 +15,8 @@
 //!      labels → engines → engine_fields. Each create updates the
 //!      in-memory tgt lockfile + mapping so subsequent kinds can rewrite
 //!      cross-references to the just-created peers.
-//!   4. **Update** field-level deltas via the existing `rdc apply` flow
-//!      (reused as a sub-step), which now sees a complete mapping.
+//!   4. **Update** field-level deltas (the in-process update phase that
+//!      sees the full mapping built in step 1).
 //!   5. **Delete** (mirror only) tgt-only objects in REVERSE dependency
 //!      order so a queue is gone before its workspace.
 //!   6. Save the updated lockfile + mapping; print a summary.
@@ -85,6 +85,10 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
             "src and tgt envs are the same ('{src}'). Use two different envs for `rdc deploy`."
         ));
     }
+    // A dry-run is for previewing changes — there's no useful brief
+    // form, so always show the full per-object diff. The `--diff` flag
+    // stays for backward compatibility but is now a no-op.
+    let diff = diff || dry_run;
 
     let cwd = std::env::current_dir().context("getting current directory")?;
     let src_paths = Paths::for_env(&cwd, src);
@@ -643,9 +647,10 @@ fn print_plan(
         }
     }
 
-    // Updates are computed lazily by the apply sub-step. We surface that
-    // as a hint here rather than re-doing the cross-env diff up-front.
-    println!("  ~ update:  field-level deltas (resolved by `rdc apply` sub-step)");
+    // Updates are computed lazily by the update phase below. The plan
+    // summary only counts creates and deletes; the per-field diffs print
+    // inline as part of the update sweep.
+    println!("  ~ update:  field-level diffs printed below");
 
     if mirror {
         if plan.delete_total() == 0 {

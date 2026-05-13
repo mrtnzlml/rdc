@@ -2,7 +2,10 @@ use crate::config::{EnvConfig, ProjectConfig};
 use crate::paths::Paths;
 use crate::snapshot::writer::write_atomic;
 use anyhow::{anyhow, Context, Result};
-use std::io::{IsTerminal, Write};
+use inquire::error::InquireError;
+use inquire::validator::Validation;
+use inquire::{Confirm, CustomType, Text};
+use std::io::IsTerminal;
 use std::path::Path;
 
 /// Whether `rdc init` is bootstrapping a new project or extending an
@@ -80,9 +83,8 @@ pub async fn run(env_specs: Vec<String>) -> Result<()> {
 }
 
 /// Resolve the list of env specs to use. When `env_specs` is empty,
-/// prompts interactively (TTY-only). The prompt copy differs by mode
-/// so users adding to an existing project see context about what's
-/// already defined.
+/// prompts interactively (TTY-only). Invalid input re-prompts inline
+/// rather than aborting; Esc or Ctrl+C cancels.
 fn resolve_env_specs(
     env_specs: Vec<String>,
     cfg: &ProjectConfig,
@@ -109,9 +111,7 @@ fn resolve_env_specs(
     println!();
     match mode {
         InitMode::New => {
-            println!(
-                "Define one or more environments. Press Enter on the env name to finish."
-            );
+            println!("Set up a new rdc project.");
         }
         InitMode::Extend => {
             let existing = if cfg.envs.is_empty() {
@@ -119,52 +119,137 @@ fn resolve_env_specs(
             } else {
                 cfg.envs.keys().cloned().collect::<Vec<_>>().join(", ")
             };
-            println!("Adding env(s) to existing project. Existing envs: {existing}.");
-            println!(
-                "Define one or more new environments. Press Enter on the env name to finish."
-            );
+            println!("Add environments to existing project. Existing: {existing}.");
+        }
+    }
+    println!();
+
+    let mut specs: Vec<String> = Vec::new();
+    let mut taken: Vec<String> = cfg.envs.keys().cloned().collect();
+
+    loop {
+        let env_name = match prompt_env_name(&taken) {
+            Ok(s) => s,
+            Err(PromptOutcome::Cancelled) => {
+                return finish_or_cancel(specs);
+            }
+            Err(PromptOutcome::Failed(e)) => return Err(e),
+        };
+
+        let api_base = match prompt_api_base() {
+            Ok(s) => s,
+            Err(PromptOutcome::Cancelled) => {
+                return finish_or_cancel(specs);
+            }
+            Err(PromptOutcome::Failed(e)) => return Err(e),
+        };
+
+        let org_id = match prompt_org_id() {
+            Ok(n) => n,
+            Err(PromptOutcome::Cancelled) => {
+                return finish_or_cancel(specs);
+            }
+            Err(PromptOutcome::Failed(e)) => return Err(e),
+        };
+
+        taken.push(env_name.clone());
+        specs.push(format!("{env_name}={api_base}:{org_id}"));
+
+        match Confirm::new("Add another environment?")
+            .with_default(false)
+            .prompt()
+        {
+            Ok(true) => continue,
+            Ok(false) => break,
+            // Esc / Ctrl+C on the confirm = "I'm done, don't add another".
+            Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => break,
+            Err(e) => return Err(anyhow!("prompt failed: {e}")),
         }
     }
 
-    let mut env_specs: Vec<String> = Vec::new();
-    loop {
-        let env_name = prompt("\n  env name: ")?;
-        if env_name.is_empty() {
-            break;
-        }
-        if cfg.envs.contains_key(&env_name) {
-            return Err(anyhow!(
-                "env '{env_name}' already exists in this project; \
-                 to update it, edit rdc.toml directly"
-            ));
-        }
-        let api_base = prompt("  api_base (e.g. https://api.elis.rossum.ai/v1): ")?;
-        if api_base.is_empty() {
-            return Err(anyhow!("api_base cannot be empty for env '{env_name}'"));
-        }
-        let org_id = prompt("  org_id: ")?;
-        if org_id.is_empty() {
-            return Err(anyhow!("org_id cannot be empty for env '{env_name}'"));
-        }
-        // Light validation: ensure it parses as u64 here too so we
-        // surface the error before scaffolding starts.
-        org_id
-            .parse::<u64>()
-            .with_context(|| format!("org_id '{org_id}' must be a positive integer"))?;
-        env_specs.push(format!("{env_name}={api_base}:{org_id}"));
-    }
-    if env_specs.is_empty() {
+    if specs.is_empty() {
         return Err(anyhow!("at least one env is required"));
     }
-    Ok(env_specs)
+    Ok(specs)
 }
 
-fn prompt(msg: &str) -> Result<String> {
-    print!("{msg}");
-    std::io::stdout().flush().context("flushing stdout")?;
-    let mut buf = String::new();
-    std::io::stdin().read_line(&mut buf).context("reading stdin")?;
-    Ok(buf.trim().to_string())
+enum PromptOutcome {
+    Cancelled,
+    Failed(anyhow::Error),
+}
+
+fn finish_or_cancel(specs: Vec<String>) -> Result<Vec<String>> {
+    if specs.is_empty() {
+        Err(anyhow!("init cancelled — no environments defined"))
+    } else {
+        Ok(specs)
+    }
+}
+
+fn map_prompt_err(e: InquireError) -> PromptOutcome {
+    match e {
+        InquireError::OperationCanceled | InquireError::OperationInterrupted => {
+            PromptOutcome::Cancelled
+        }
+        other => PromptOutcome::Failed(anyhow!("prompt failed: {other}")),
+    }
+}
+
+fn prompt_env_name(taken: &[String]) -> std::result::Result<String, PromptOutcome> {
+    let taken_owned: Vec<String> = taken.to_vec();
+    let value = Text::new("Env name")
+        .with_help_message("short slug, e.g. dev, staging, prod (Esc to finish)")
+        .with_validator(move |input: &str| {
+            let trimmed = input.trim();
+            if trimmed.is_empty() {
+                return Ok(Validation::Invalid("env name cannot be empty".into()));
+            }
+            if !trimmed
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Ok(Validation::Invalid(
+                    "only letters, digits, '-', and '_' are allowed".into(),
+                ));
+            }
+            if taken_owned.iter().any(|n| n == trimmed) {
+                return Ok(Validation::Invalid(
+                    format!("'{trimmed}' is already defined").into(),
+                ));
+            }
+            Ok(Validation::Valid)
+        })
+        .prompt()
+        .map_err(map_prompt_err)?;
+    Ok(value.trim().to_string())
+}
+
+fn prompt_api_base() -> std::result::Result<String, PromptOutcome> {
+    let value = Text::new("API base URL")
+        .with_help_message("e.g. https://api.elis.rossum.ai/v1")
+        .with_validator(|input: &str| {
+            let trimmed = input.trim();
+            if trimmed.is_empty() {
+                return Ok(Validation::Invalid("api_base cannot be empty".into()));
+            }
+            if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+                return Ok(Validation::Invalid(
+                    "must start with http:// or https://".into(),
+                ));
+            }
+            Ok(Validation::Valid)
+        })
+        .prompt()
+        .map_err(map_prompt_err)?;
+    Ok(value.trim().to_string())
+}
+
+fn prompt_org_id() -> std::result::Result<u64, PromptOutcome> {
+    CustomType::<u64>::new("Organization ID")
+        .with_help_message("Rossum organization ID (positive integer)")
+        .with_error_message("must be a positive integer")
+        .prompt()
+        .map_err(map_prompt_err)
 }
 
 fn parse_env_spec(spec: &str) -> Result<(String, EnvConfig)> {
@@ -382,5 +467,5 @@ keep the local on disk.
   duplicate copies (one per consuming queue) and the lockfile will
   carry an entry per queue slug pointing at the same remote id. Push
   to that shared resource works (id is the truth), but cross-env
-  deploys via `rdc apply` may surface confusing diffs.
+  deploys via `rdc deploy` may surface confusing diffs.
 "#;

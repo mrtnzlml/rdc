@@ -1,12 +1,44 @@
+use clap::builder::styling::{AnsiColor, Color, Effects, RgbColor, Style, Styles};
 use clap::{Parser, Subcommand};
 
-/// Cargo-style colour palette for `--help`, error messages, and usage
-/// strings. Picked up from the `clap_cargo` crate so the look matches
-/// other modern Rust CLIs (cargo, rustup, rustfmt).
-const CLI_STYLES: clap::builder::Styles = clap_cargo::style::CLAP_STYLING;
+/// Help / error / usage palette inspired by Claude Code: warm amber
+/// accents on a clean, theme-agnostic base. Truecolor (24-bit) is used
+/// where the exact hue matters — modern terminals (iTerm2, Alacritty,
+/// kitty, Windows Terminal, VS Code, recent Apple Terminal) render
+/// these as-is; older terminals downsample to the closest 256-color.
+///
+/// Hues:
+/// - `AMBER` (#ED8E47): primary accent — section headers, usage,
+///   conflict markers, action-letter brackets.
+/// - `GRAY`  (#888888): medium gray for placeholders — readable on
+///   both light and dark backgrounds without competing with body text.
+const AMBER: Color = Color::Rgb(RgbColor(237, 142, 71));
+const GRAY: Color = Color::Rgb(RgbColor(136, 136, 136));
+
+const HEADER: Style = Style::new().fg_color(Some(AMBER)).effects(Effects::BOLD);
+const LITERAL: Style = Style::new().effects(Effects::BOLD);
+const PLACEHOLDER: Style = Style::new().fg_color(Some(GRAY));
+const ERROR: Style = AnsiColor::BrightRed.on_default().effects(Effects::BOLD);
+const VALID: Style = AnsiColor::Green.on_default().effects(Effects::BOLD);
+const INVALID: Style = Style::new().fg_color(Some(AMBER)).effects(Effects::BOLD);
+
+const CLI_STYLES: Styles = Styles::styled()
+    .header(HEADER)
+    .usage(HEADER)
+    .literal(LITERAL)
+    .placeholder(PLACEHOLDER)
+    .error(ERROR)
+    .valid(VALID)
+    .invalid(INVALID);
 
 #[derive(Debug, Parser)]
-#[command(name = "rdc", version, about = "Rossum Deployment as Code", styles = CLI_STYLES)]
+#[command(
+    name = "rdc",
+    version,
+    about = "Rossum Deployment as Code",
+    styles = CLI_STYLES,
+    disable_help_subcommand = true,
+)]
 pub struct Cli {
     /// Disable ANSI color in output. Also honored via `NO_COLOR`.
     #[arg(long = "no-color", global = true)]
@@ -31,10 +63,14 @@ pub enum Command {
         envs: Vec<String>,
     },
     /// Pull a Rossum environment's configuration into the local snapshot.
-    Pull { env: String },
+    /// Without `<env>`, picks interactively from envs defined in
+    /// `rdc.toml` (or auto-selects when only one exists).
+    Pull { env: Option<String> },
     /// Push locally-edited resources back to the Rossum environment.
+    /// Without `<env>`, picks interactively from envs defined in
+    /// `rdc.toml` (or auto-selects when only one exists).
     Push {
-        env: String,
+        env: Option<String>,
         /// Scan + report what would be POSTed / PATCHed / DELETEd
         /// without sending anything to the API.
         #[arg(long = "dry-run")]
@@ -61,15 +97,12 @@ pub enum Command {
     /// field-level deltas. Plan-before-apply: a confirmation prompt summarises
     /// what will be created / updated / deleted before any write hits the
     /// target. Idempotent: re-running on an in-sync target performs zero
-    /// API calls.
-    ///
-    /// `rdc apply` stays the lower-level primitive for the "I already have
-    /// the slugs lined up, just push field-level edits" workflow.
+    /// API calls. `--dry-run` always prints a per-object unified diff.
     Deploy {
-        /// Source environment (e.g. `test`).
-        src: String,
-        /// Target environment (e.g. `prod`).
-        tgt: String,
+        /// Source environment (e.g. `test`). Picks interactively when omitted.
+        src: Option<String>,
+        /// Target environment (e.g. `prod`). Picks interactively when omitted.
+        tgt: Option<String>,
         /// Mirror semantics: delete tgt objects that don't exist in src.
         /// Default is additive (extras in tgt are left intact). Mirror is
         /// always gated behind an explicit confirmation, regardless of
@@ -84,13 +117,11 @@ pub enum Command {
         /// calls are suppressed.
         #[arg(long = "dry-run")]
         dry_run: bool,
-        /// In addition to the plan summary, print full unified diffs
-        /// per object: the would-be POST body for creates, the
-        /// src-vs-tgt diff for updates, and the would-be-removed body
-        /// for deletes (`--mirror` only). Both `.json` and any
-        /// extracted `.py` / formula files are shown. Requires
-        /// `--dry-run`.
-        #[arg(long = "diff", requires = "dry_run")]
+        /// Deprecated — `--dry-run` always prints the full per-object
+        /// diff (would-be POST body for creates, src-vs-tgt diff for
+        /// updates, would-be-removed body for deletes when `--mirror`).
+        /// This flag is kept as a no-op for backward compatibility.
+        #[arg(long = "diff", requires = "dry_run", hide = true)]
         diff: bool,
     },
     /// Read-only health check: token, auth, lockfile, local edits.
@@ -107,9 +138,10 @@ pub enum Command {
     },
     /// Set or refresh an env's API token. Validates the token before
     /// writing to `secrets/<env>.secrets.json` (mode 0600 on Unix).
-    /// Provide the token via `--token` or pipe it on stdin.
+    /// Provide the token via `--token` or pipe it on stdin. Without
+    /// `<env>`, picks interactively from envs defined in `rdc.toml`.
     Auth {
-        env: String,
+        env: Option<String>,
         #[arg(long)]
         token: Option<String>,
     },
@@ -127,7 +159,7 @@ pub enum Command {
     ///   alignment. Cascade-aware (queue / workspace renames move the
     ///   whole subtree). Offline — no API calls.
     Repair {
-        env: String,
+        env: Option<String>,
         /// Re-pull from remote and reconstruct the lockfile. Backs up
         /// the existing one to `<name>.bak.<unix-ts>`. Destroys local
         /// edits not present on remote.
@@ -171,21 +203,33 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Some(Command::Init { envs }) => crate::cli::init::run(envs).await,
         Some(Command::Pull { env }) => {
+            let env = crate::cli::env_picker::pick_env("Which env to pull from?", env)?;
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
             crate::cli::pull::run(&env, interactive).await
         }
         Some(Command::Push { env, dry_run, diff, allow_deletes }) => {
+            let env = crate::cli::env_picker::pick_env("Which env to push to?", env)?;
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
             crate::cli::push::run(&env, interactive, dry_run, diff, allow_deletes).await
         }
         Some(Command::Deploy { src, tgt, mirror, dry_run, diff }) => {
+            let src = crate::cli::env_picker::pick_env("Deploy from which env (source)?", src)?;
+            let tgt = crate::cli::env_picker::pick_env_excluding(
+                "Deploy to which env (target)?",
+                tgt,
+                &[&src],
+            )?;
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
             crate::cli::deploy::run::run(&src, &tgt, mirror, interactive, dry_run, diff).await
         }
         Some(Command::Status { env }) => crate::cli::status::run(env).await,
         Some(Command::Diff { left, right }) => crate::cli::diff::run(left, right).await,
-        Some(Command::Auth { env, token }) => crate::cli::auth::run(&env, token).await,
+        Some(Command::Auth { env, token }) => {
+            let env = crate::cli::env_picker::pick_env("Set token for which env?", env)?;
+            crate::cli::auth::run(&env, token).await
+        }
         Some(Command::Repair { env, rebuild_lock, rename_slugs, check }) => {
+            let env = crate::cli::env_picker::pick_env("Which env to repair?", env)?;
             crate::cli::repair::run(&env, rebuild_lock, rename_slugs, check, cli.yes).await
         }
         Some(Command::Upgrade { version, check }) => {
@@ -207,6 +251,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 pub mod auth;
 pub mod deploy;
 pub mod diff;
+pub mod env_picker;
 pub mod index;
 pub mod init;
 pub mod pull;

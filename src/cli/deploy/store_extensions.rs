@@ -6,7 +6,7 @@
 //!   - Bootstrap pre-pass: resolves template URLs + prompts for token_owner.
 
 // Re-exported so deploy callers can import the picker from one place.
-pub use crate::cli::resolve::{prompt_token_owner, render_token_owner_picker};
+pub use crate::cli::resolve::{format_user_choices, prompt_token_owner};
 
 use anyhow::{anyhow, Context, Result};
 use crate::api::RossumClient;

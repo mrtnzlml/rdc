@@ -1,5 +1,6 @@
-//! Shared helpers for `rdc apply`: URL rewriting from src to tgt URLs
-//! across cross-references, plus drift + idempotency checks.
+//! Shared helpers for `rdc deploy`'s update phase: URL rewriting from
+//! src to tgt URLs across cross-references, plus drift + idempotency
+//! checks.
 
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::mapping::Mapping;
@@ -19,7 +20,7 @@ use std::collections::BTreeMap;
 /// compare equal iff they represent the same canonical resource state.
 ///
 /// Without this normalisation, byte-level equality between the src snapshot
-/// and the tgt remote would never hold and `rdc apply` would re-PATCH on
+/// and the tgt remote would never hold and `rdc deploy` would re-PATCH on
 /// every run (`README` "Idempotency" claim).
 pub fn normalize_for_cross_env_compare(bytes: &[u8], kind: &str) -> Result<Vec<u8>> {
     let mut value: Value = serde_json::from_slice(bytes)
@@ -103,9 +104,9 @@ mod normalize_tests {
 }
 
 /// Convenience: are two serialised payloads equivalent under
-/// `normalize_for_cross_env_compare`? Used by `rdc apply` to decide whether
+/// `normalize_for_cross_env_compare`? Used by `rdc deploy` to decide whether
 /// the src snapshot already matches the tgt remote and the PATCH can be
-/// skipped — i.e. the README's "0 PATCHes on re-apply" idempotency claim.
+/// skipped — i.e. the README's "0 PATCHes on re-deploy" idempotency claim.
 pub fn bytes_equal_after_strip(a: &[u8], b: &[u8], kind: &str) -> Result<bool> {
     Ok(normalize_for_cross_env_compare(a, kind)? == normalize_for_cross_env_compare(b, kind)?)
 }

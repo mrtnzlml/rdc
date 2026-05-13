@@ -127,7 +127,7 @@ impl Lockfile {
     }
 
     /// Multi-kind reverse lookup: given a URL, find which `(kind, slug)`
-    /// owns it. Used by `rdc apply` to rewrite cross-references in a
+    /// owns it. Used by `rdc deploy` to rewrite cross-references in a
     /// payload from src URLs to tgt URLs.
     pub fn lookup_url(&self, url: &str) -> Option<(&str, &str)> {
         for (kind, entries) in &self.objects {

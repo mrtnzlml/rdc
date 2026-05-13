@@ -1,4 +1,48 @@
 use assert_cmd::Command;
+
+/// In CI / piped contexts, `rdc pull` (no env arg) should fail with a
+/// useful message that lists the envs the user could have picked,
+/// instead of clap's generic "required argument" message.
+#[test]
+fn pull_without_env_in_ci_lists_available_envs() {
+    let dir = tempfile::TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--env", "dev=https://example.rossum.app/api/v1:1",
+            "--env", "prod=https://example.rossum.app/api/v1:2",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["pull"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("env argument required"))
+        .stderr(predicate::str::contains("dev"))
+        .stderr(predicate::str::contains("prod"));
+}
+
+/// Without a project at all, the picker propagates the "not an rdc
+/// project" error from `ProjectConfig::load` so the message points at
+/// `rdc init`, not at a missing TTY.
+#[test]
+fn pull_without_env_outside_project_points_at_init() {
+    let dir = tempfile::TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["pull"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not an rdc project"))
+        .stderr(predicate::str::contains("rdc init"));
+}
 use predicates::prelude::*;
 use tempfile::TempDir;
 use wiremock::matchers::{header, method, path};

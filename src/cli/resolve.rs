@@ -61,8 +61,8 @@ pub fn unified_diff(label_a: &str, a: &[u8], label_b: &str, b: &[u8]) -> String 
     let b_str = String::from_utf8_lossy(b);
     let diff = TextDiff::from_lines(a_str.as_ref(), b_str.as_ref());
     let mut out = String::new();
-    write!(out, "--- {label_a}\n").expect("writing to String never fails");
-    write!(out, "+++ {label_b}\n").expect("writing to String never fails");
+    writeln!(out, "--- {label_a}").expect("writing to String never fails");
+    writeln!(out, "+++ {label_b}").expect("writing to String never fails");
     let mut any = false;
     for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
         any = true;
@@ -72,6 +72,28 @@ pub fn unified_diff(label_a: &str, a: &[u8], label_b: &str, b: &[u8]) -> String 
         return String::new();
     }
     out
+}
+
+/// Reshape bytes for diff display. When the bytes parse as JSON, return a
+/// stable pretty-printed form (2-space indent, BTreeMap-ordered keys, trailing
+/// newline) so per-field changes show on their own diff lines. Non-JSON inputs
+/// (`.py` files, raw formula bytes) pass through unchanged.
+///
+/// On-disk snapshots and the canonical hash projection both store JSON in
+/// compact (single-line) form. Diffing that directly produces a one-line
+/// "everything changed" diff which is unreadable — this helper is what makes
+/// the conflict resolver show the actual field-level change.
+pub fn prettify_json_for_diff(bytes: &[u8]) -> Vec<u8> {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return bytes.to_vec();
+    };
+    let Ok(mut pretty) = serde_json::to_vec_pretty(&value) else {
+        return bytes.to_vec();
+    };
+    if !pretty.ends_with(b"\n") {
+        pretty.push(b'\n');
+    }
+    pretty
 }
 
 /// Read base bytes from `local_path` if it exists; used for the
@@ -122,7 +144,12 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
     writeln!(output, "{}", colorize_header(&header, mode))?;
     writeln!(output)?;
 
-    let diff = unified_diff("local", &local_canonical, "remote", &remote_canonical);
+    // Pretty-print JSON inputs so each field lands on its own line — without
+    // this, the entire compact JSON object renders as a single diff line and
+    // the actual change gets buried.
+    let local_display = prettify_json_for_diff(&local_canonical);
+    let remote_display = prettify_json_for_diff(&remote_canonical);
+    let diff = unified_diff("local", &local_display, "remote", &remote_display);
     if diff.is_empty() {
         return Ok(Resolution::KeepLocal);
     }
@@ -145,8 +172,17 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
             Some('s') | Some('S') => return Ok(Resolution::Skip),
             Some('a') | Some('A') => return Ok(Resolution::Abort),
             Some('e') | Some('E') => {
-                let edited = run_editor_with_markers(&local_bytes, remote_bytes)?;
-                return Ok(Resolution::Edit(edited));
+                match run_editor_loop(
+                    &mut input,
+                    &mut output,
+                    &local_bytes,
+                    remote_bytes,
+                    local_path,
+                    mode,
+                )? {
+                    EditOutcome::Edited(edited) => return Ok(Resolution::Edit(edited)),
+                    EditOutcome::Aborted => continue,
+                }
             }
             _ => {
                 writeln!(output, "  (unrecognized — pick one of k/r/e/s/a)")?;
@@ -156,27 +192,56 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
     }
 }
 
-/// Open `$EDITOR` (or `vi`) on a temp file pre-populated with git-style
-/// conflict markers. After the editor exits, return the file's bytes.
-fn run_editor_with_markers(local: &[u8], remote: &[u8]) -> Result<Vec<u8>> {
+/// Result of the editor loop. `Aborted` means the user backed out of the
+/// edit without producing usable bytes; the resolver falls back to the
+/// main prompt so they can pick keep-local/remote/skip/abort instead.
+enum EditOutcome {
+    Edited(Vec<u8>),
+    Aborted,
+}
+
+/// Open `$EDITOR` on a temp file pre-populated with git-style conflict
+/// markers (pretty-printed JSON between them, so each field lands on
+/// its own line). After every save:
+///
+/// - If conflict markers are still present, or the file no longer parses
+///   as JSON for a `.json` path, show a clear message and offer
+///   `[e]dit again / [a]bort` — the user's previous edits are preserved
+///   across re-tries.
+/// - Otherwise, return the bytes.
+fn run_editor_loop<R: BufRead, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    local: &[u8],
+    remote: &[u8],
+    local_path: &Path,
+    mode: ColorMode,
+) -> Result<EditOutcome> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
 
-    let dir = std::env::temp_dir();
+    let ext = local_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("tmp");
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let path = dir.join(format!("rdc-conflict-{stamp}.tmp"));
+    let path = std::env::temp_dir().join(format!("rdc-conflict-{stamp}.{ext}"));
+
+    // Pretty-print JSON content so each field is its own editor line.
+    let local_view = prettify_json_for_diff(local);
+    let remote_view = prettify_json_for_diff(remote);
 
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"<<<<<<< local\n");
-    buf.extend_from_slice(local);
-    if !local.ends_with(b"\n") {
+    buf.extend_from_slice(&local_view);
+    if !local_view.ends_with(b"\n") {
         buf.push(b'\n');
     }
     buf.extend_from_slice(b"=======\n");
-    buf.extend_from_slice(remote);
-    if !remote.ends_with(b"\n") {
+    buf.extend_from_slice(&remote_view);
+    if !remote_view.ends_with(b"\n") {
         buf.push(b'\n');
     }
     buf.extend_from_slice(b">>>>>>> remote\n");
@@ -184,20 +249,66 @@ fn run_editor_with_markers(local: &[u8], remote: &[u8]) -> Result<Vec<u8>> {
     std::fs::write(&path, &buf)
         .with_context(|| format!("writing temp conflict file {}", path.display()))?;
 
-    // Spawn the editor; inherit stdio so the user actually sees it.
-    let status = Command::new(&editor)
-        .arg(&path)
-        .status()
-        .with_context(|| format!("spawning editor '{editor}'"))?;
-    if !status.success() {
-        let _ = std::fs::remove_file(&path);
-        anyhow::bail!("editor '{editor}' exited with non-zero status");
-    }
-
-    let edited = std::fs::read(&path)
-        .with_context(|| format!("reading edited conflict file {}", path.display()))?;
+    let result = (|| -> Result<EditOutcome> {
+        loop {
+            let status = Command::new(&editor)
+                .arg(&path)
+                .status()
+                .with_context(|| format!("spawning editor '{editor}'"))?;
+            if !status.success() {
+                anyhow::bail!("editor '{editor}' exited with non-zero status");
+            }
+            let edited = std::fs::read(&path)
+                .with_context(|| format!("reading edited conflict file {}", path.display()))?;
+            match validate_edited(&edited, local_path) {
+                Ok(()) => return Ok(EditOutcome::Edited(edited)),
+                Err(reason) => {
+                    writeln!(output)?;
+                    writeln!(output, "  ✗ {reason}")?;
+                    write!(
+                        output,
+                        "{}",
+                        colorize_prompt("  [e]dit again  [a]bort edit > ", mode)
+                    )?;
+                    output.flush().ok();
+                    let mut line = String::new();
+                    if input.read_line(&mut line)? == 0 {
+                        return Ok(EditOutcome::Aborted);
+                    }
+                    match line.trim().chars().next() {
+                        Some('e') | Some('E') => continue,
+                        _ => return Ok(EditOutcome::Aborted),
+                    }
+                }
+            }
+        }
+    })();
     let _ = std::fs::remove_file(&path);
-    Ok(edited)
+    result
+}
+
+/// Check that an edited conflict file is fit to use: no unresolved
+/// markers, valid UTF-8, and valid JSON if the target path is a `.json`
+/// file. Returns the failure reason as a user-facing string.
+fn validate_edited(bytes: &[u8], local_path: &Path) -> std::result::Result<(), String> {
+    let s = std::str::from_utf8(bytes)
+        .map_err(|_| "edited file is not valid UTF-8".to_string())?;
+    for marker in ["<<<<<<<", "=======", ">>>>>>>"] {
+        if s.lines().any(|l| l.starts_with(marker)) {
+            return Err(format!(
+                "edited file still has the `{marker}` conflict marker — \
+                 remove the markers and one of the two sides, then save"
+            ));
+        }
+    }
+    if local_path.extension().and_then(|e| e.to_str()) == Some("json")
+        && let Err(e) = serde_json::from_str::<serde_json::Value>(s)
+    {
+        return Err(format!(
+            "edited file is not valid JSON ({e}) — fix the syntax and save"
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve a single sub-file within a combined-hash entity (hook
@@ -258,6 +369,18 @@ pub fn resolve_combined_file(
             Ok(remote_bytes.to_vec())
         }
         Resolution::Edit(edited) => {
+            // Defense in depth — the editor loop already validates, but a
+            // second check here means a regression in that path can never
+            // turn the local snapshot into unparseable bytes. Local edits
+            // are preserved (caller sees the error and the file on disk
+            // is whatever was there before).
+            if let Err(reason) = validate_edited(&edited, local_path) {
+                anyhow::bail!(
+                    "refusing to overwrite {} with invalid edit ({}); local file left untouched",
+                    local_path.display(),
+                    reason
+                );
+            }
             write_atomic(local_path, &edited)?;
             Ok(edited)
         }
@@ -367,36 +490,37 @@ fn sort_users_for_picker(users: &[crate::model::User]) -> Vec<&crate::model::Use
     v
 }
 
-/// Render the token_owner picker prompt as a string. Pure function for
-/// testability; the interactive variant `prompt_token_owner` wraps this
-/// with stdin/stdout.
-pub fn render_token_owner_picker(
-    slug: &str,
-    tgt_env: &str,
+/// Build the per-user labels for the token_owner picker. Users come back
+/// in priority order (system → admin → other) so the recommended pick is
+/// at the top. Each label is a single-line summary that fits in an
+/// inquire `Select`.
+pub fn format_user_choices(
     users: &[crate::model::User],
     self_user_id: Option<u64>,
-) -> String {
+) -> Vec<String> {
     let sorted = sort_users_for_picker(users);
-    let mut out = String::new();
-    write!(out, "Pick the token_owner for store extension '{slug}' on {tgt_env}\n").expect("writing to String never fails");
-    write!(out, "(used as the API service account for the extension's calls; usually a system user):\n\n").expect("writing to String never fails");
-    for (i, u) in sorted.iter().enumerate() {
-        let mut tags = Vec::new();
-        if u.is_admin() { tags.push("admin"); }
-        if u.is_active { tags.push("active"); }
-        if Some(u.id) == self_user_id { tags.push("you"); }
-        let tags = tags.join(", ");
-        let display = if u.first_name.is_empty() && u.last_name.is_empty() {
-            u.username.clone()
-        } else {
-            format!("{} {}", u.first_name, u.last_name).trim().to_string()
-        };
-        write!(out, "  [{}] {display}   {tags}\n", i + 1).expect("writing to String never fails");
-        write!(out, "      {}\n", u.url).expect("writing to String never fails");
-    }
-    write!(out, "  [a] abort the deploy\n\n").expect("writing to String never fails");
-    write!(out, "[1] > ").expect("writing to String never fails");
-    out
+    sorted
+        .iter()
+        .map(|u| {
+            let mut tags = Vec::new();
+            if u.is_admin() {
+                tags.push("admin");
+            }
+            if u.is_active {
+                tags.push("active");
+            }
+            if Some(u.id) == self_user_id {
+                tags.push("you");
+            }
+            let tags = tags.join(", ");
+            let display = if u.first_name.is_empty() && u.last_name.is_empty() {
+                u.username.clone()
+            } else {
+                format!("{} {}", u.first_name, u.last_name).trim().to_string()
+            };
+            format!("{display}   [{tags}]   {}", u.url)
+        })
+        .collect()
 }
 
 /// Prompt interactively. Returns `Some((picked_user_url, apply_to_all))`
@@ -408,25 +532,40 @@ pub fn prompt_token_owner(
     users: &[crate::model::User],
     self_user_id: Option<u64>,
 ) -> anyhow::Result<Option<(String, bool)>> {
-    use std::io::{self, BufRead, Write};
-    let rendered = render_token_owner_picker(slug, tgt_env, users, self_user_id);
-    print!("{rendered}");
-    io::stdout().flush().ok();
-    let stdin = io::stdin();
-    let line = stdin.lock().lines().next().ok_or_else(|| anyhow::anyhow!("stdin closed"))??;
-    let pick = line.trim();
-    if pick == "a" { return Ok(None); }
-    let n: usize = if pick.is_empty() {
-        1
-    } else {
-        pick.parse().map_err(|_| anyhow::anyhow!("expected a number or 'a', got '{pick}'"))?
-    };
+    use inquire::error::InquireError;
+    use inquire::{Confirm, Select};
+
     let sorted = sort_users_for_picker(users);
-    let chosen = sorted.get(n - 1).ok_or_else(|| anyhow::anyhow!("'{n}' is out of range"))?;
-    print!("\nApply this choice to all remaining store extensions in this deploy? [y/N] ");
-    io::stdout().flush().ok();
-    let line2 = stdin.lock().lines().next().unwrap_or(Ok(String::new()))?;
-    let apply_all = matches!(line2.trim().to_lowercase().as_str(), "y" | "yes");
+    let mut options = format_user_choices(users, self_user_id);
+    let abort_label = "abort the deploy".to_string();
+    options.push(abort_label.clone());
+
+    let prompt = format!("Pick the token_owner for store extension '{slug}' on {tgt_env}");
+    let help =
+        "used as the API service account for the extension's calls (usually a system user)";
+
+    let answer = match Select::new(&prompt, options.clone())
+        .with_help_message(help)
+        .raw_prompt()
+    {
+        Ok(opt) => opt,
+        Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => {
+            return Ok(None);
+        }
+        Err(e) => return Err(anyhow::anyhow!("prompt failed: {e}")),
+    };
+
+    if answer.value == abort_label {
+        return Ok(None);
+    }
+    let chosen = sorted
+        .get(answer.index)
+        .ok_or_else(|| anyhow::anyhow!("internal: picker index {} out of range", answer.index))?;
+
+    let apply_all = Confirm::new("Apply this choice to all remaining store extensions in this deploy?")
+        .with_default(false)
+        .prompt()
+        .unwrap_or(false);
     Ok(Some((chosen.url.clone(), apply_all)))
 }
 
@@ -480,6 +619,19 @@ fn decide_color_mode(no_color: bool, no_color_env: bool, is_tty: bool) -> ColorM
     }
 }
 
+// Truecolor (24-bit) SGR escapes shared across resolver/diff output.
+// The palette matches `cli::mod`'s clap styling: warm amber accent for
+// emphasis (`@@` hunk headers, conflict headers, action-letter brackets),
+// soft red for removed lines, sage green for added — chosen for
+// contrast on both light and dark terminal themes.
+const SGR_RESET: &str = "\x1b[0m";
+const SGR_AMBER: &str = "\x1b[38;2;237;142;71m";
+const SGR_AMBER_BOLD: &str = "\x1b[1;38;2;237;142;71m";
+const SGR_REMOVE: &str = "\x1b[38;2;220;80;80m";
+const SGR_REMOVE_BOLD: &str = "\x1b[1;38;2;220;80;80m";
+const SGR_ADD: &str = "\x1b[38;2;120;180;90m";
+const SGR_ADD_BOLD: &str = "\x1b[1;38;2;120;180;90m";
+
 /// Apply color to a single line of unified-diff output. Returns `line`
 /// unchanged in [`ColorMode::Plain`].
 pub fn colorize_diff_line(line: &str, mode: ColorMode) -> String {
@@ -487,31 +639,32 @@ pub fn colorize_diff_line(line: &str, mode: ColorMode) -> String {
         return line.to_string();
     }
     let prefix = if line.starts_with("--- ") {
-        "\x1b[91m" // bright red
+        SGR_REMOVE_BOLD
     } else if line.starts_with("+++ ") {
-        "\x1b[92m" // bright green
+        SGR_ADD_BOLD
     } else if line.starts_with("@@") {
-        "\x1b[36m" // cyan
+        SGR_AMBER
     } else if line.starts_with('-') {
-        "\x1b[91m" // bright red
+        SGR_REMOVE
     } else if line.starts_with('+') {
-        "\x1b[92m" // bright green
+        SGR_ADD
     } else {
         return line.to_string();
     };
-    format!("{prefix}{line}\x1b[0m")
+    format!("{prefix}{line}{SGR_RESET}")
 }
 
-/// Colorize the conflict header line. Bold yellow.
+/// Colorize the conflict header line in bold amber — matches the
+/// primary accent used by clap headers and prompt brackets.
 pub fn colorize_header(text: &str, mode: ColorMode) -> String {
     if mode == ColorMode::Plain {
         return text.to_string();
     }
-    format!("\x1b[1;93m{text}\x1b[0m")
+    format!("{SGR_AMBER_BOLD}{text}{SGR_RESET}")
 }
 
 /// Colorize the action-letter prompt line. Bracketed single-letter tokens
-/// like `[k]` are wrapped in bold cyan; the rest of the prompt is unchanged.
+/// like `[k]` are wrapped in bold amber; the rest of the prompt is unchanged.
 pub fn colorize_prompt(text: &str, mode: ColorMode) -> String {
     if mode == ColorMode::Plain {
         return text.to_string();
@@ -525,9 +678,11 @@ pub fn colorize_prompt(text: &str, mode: ColorMode) -> String {
                     chars.next(); // consume letter
                     if matches!(chars.peek(), Some(']')) {
                         chars.next(); // consume ]
-                        out.push_str("[\x1b[1;96m");
+                        out.push('[');
+                        out.push_str(SGR_AMBER_BOLD);
                         out.push(letter);
-                        out.push_str("\x1b[0m]");
+                        out.push_str(SGR_RESET);
+                        out.push(']');
                         continue;
                     } else {
                         // Not a single-letter bracketed token — emit as-is.
@@ -562,6 +717,62 @@ mod tests {
         assert!(d.contains("+++ remote"), "got: {d}");
         assert!(d.contains("-b"), "got: {d}");
         assert!(d.contains("+B"), "got: {d}");
+    }
+
+    #[test]
+    fn prettify_splits_compact_json_into_per_field_lines() {
+        let pretty = prettify_json_for_diff(br#"{"name":"x","status":"ready"}"#);
+        let s = String::from_utf8(pretty).unwrap();
+        assert!(s.contains("\"name\""));
+        assert!(s.contains("\"status\""));
+        // Two top-level fields => at least two lines plus braces.
+        assert!(s.lines().count() >= 4, "got: {s:?}");
+    }
+
+    #[test]
+    fn prettify_passes_through_non_json() {
+        let py = b"def main():\n    pass\n";
+        assert_eq!(prettify_json_for_diff(py), py.to_vec());
+    }
+
+    #[test]
+    fn diff_of_two_compact_json_objects_shows_per_field_lines() {
+        let local = br#"{"name":"x","status":"ready"}"#;
+        let remote = br#"{"name":"x","status":"pending"}"#;
+        let l = prettify_json_for_diff(local);
+        let r = prettify_json_for_diff(remote);
+        let d = unified_diff("local", &l, "remote", &r);
+        // The actual change (`status` field) must appear, and the
+        // unchanged `name` line must not be a `-`/`+` line.
+        assert!(d.contains("-  \"status\": \"ready\""), "got: {d}");
+        assert!(d.contains("+  \"status\": \"pending\""), "got: {d}");
+        assert!(!d.contains("-  \"name\""), "name should be in context only, got: {d}");
+    }
+
+    #[test]
+    fn validate_edited_rejects_unresolved_markers() {
+        let body = b"{\n<<<<<<< local\n  \"a\": 1\n=======\n  \"a\": 2\n>>>>>>> remote\n}\n";
+        let err = validate_edited(body, std::path::Path::new("x.json")).unwrap_err();
+        assert!(err.contains("conflict marker"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_edited_rejects_invalid_json_for_json_path() {
+        let body = b"{not json}\n";
+        let err = validate_edited(body, std::path::Path::new("x.json")).unwrap_err();
+        assert!(err.contains("not valid JSON"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_edited_accepts_valid_json() {
+        let body = b"{\n  \"a\": 1\n}\n";
+        validate_edited(body, std::path::Path::new("x.json")).unwrap();
+    }
+
+    #[test]
+    fn validate_edited_skips_json_check_for_py_path() {
+        let body = b"def main():\n    pass\n";
+        validate_edited(body, std::path::Path::new("x.py")).unwrap();
     }
 
     #[test]
@@ -737,19 +948,19 @@ mod tests {
     }
 
     #[test]
-    fn colorize_color_mode_renders_minus_red() {
+    fn colorize_color_mode_renders_minus_in_remove_hue() {
         let line = "-  \"name\": \"old\"";
         let out = colorize_diff_line(line, ColorMode::Color);
-        // Bright-red SGR = \x1b[91m, reset = \x1b[0m.
-        assert!(out.contains("\x1b[91m"), "expected bright red prefix in: {out:?}");
-        assert!(out.ends_with("\x1b[0m"), "expected reset suffix in: {out:?}");
+        // Truecolor SGR for the "remove" hue used by `-` lines.
+        assert!(out.contains(SGR_REMOVE), "expected remove hue in: {out:?}");
+        assert!(out.ends_with(SGR_RESET), "expected reset suffix in: {out:?}");
     }
 
     #[test]
-    fn colorize_color_mode_renders_plus_green() {
+    fn colorize_color_mode_renders_plus_in_add_hue() {
         let line = "+  \"name\": \"new\"";
         let out = colorize_diff_line(line, ColorMode::Color);
-        assert!(out.contains("\x1b[92m"), "expected bright green prefix in: {out:?}");
+        assert!(out.contains(SGR_ADD), "expected add hue in: {out:?}");
     }
 
     #[test]
@@ -762,18 +973,18 @@ mod tests {
     }
 
     #[test]
-    fn colorize_color_mode_hunk_header_is_cyan() {
+    fn colorize_color_mode_hunk_header_is_amber() {
         let line = "@@ -1,3 +1,3 @@";
         let out = colorize_diff_line(line, ColorMode::Color);
-        assert!(out.contains("\x1b[36m"), "expected cyan in: {out:?}");
+        assert!(out.contains(SGR_AMBER), "expected amber accent in: {out:?}");
     }
 
     #[test]
-    fn colorize_file_headers_are_red_and_green() {
+    fn colorize_file_headers_use_bold_remove_and_add_hues() {
         let minus_hdr = colorize_diff_line("--- local", ColorMode::Color);
         let plus_hdr = colorize_diff_line("+++ remote", ColorMode::Color);
-        assert!(minus_hdr.contains("\x1b[91m"), "got: {minus_hdr:?}");
-        assert!(plus_hdr.contains("\x1b[92m"), "got: {plus_hdr:?}");
+        assert!(minus_hdr.contains(SGR_REMOVE_BOLD), "got: {minus_hdr:?}");
+        assert!(plus_hdr.contains(SGR_ADD_BOLD), "got: {plus_hdr:?}");
     }
 
     #[test]
@@ -801,8 +1012,8 @@ mod tests {
     #[test]
     fn colorize_prompt_wraps_bracketed_letters() {
         let s = colorize_prompt("[k]eep local  [r]emote", ColorMode::Color);
-        // Expect both letters wrapped in bold-cyan SGR.
-        assert!(s.matches("\x1b[1;96m").count() == 2, "got: {s:?}");
+        // Both letters get wrapped in the bold-amber accent.
+        assert!(s.matches(SGR_AMBER_BOLD).count() == 2, "got: {s:?}");
     }
 
     #[test]
@@ -830,10 +1041,10 @@ mod tests {
         )
         .unwrap();
         let s = String::from_utf8(output).unwrap();
-        // Header bold yellow, action letters bold cyan, diff lines red/green.
-        assert!(s.contains("\x1b[1;93m"), "no header color: {s:?}");
-        assert!(s.contains("\x1b[91m") || s.contains("\x1b[92m"), "no diff color: {s:?}");
-        assert!(s.contains("\x1b[1;96m"), "no prompt color: {s:?}");
+        // Conflict header in bold amber, action letters in bold amber,
+        // diff lines in remove/add hues.
+        assert!(s.contains(SGR_AMBER_BOLD), "no amber accent: {s:?}");
+        assert!(s.contains(SGR_REMOVE) || s.contains(SGR_ADD), "no diff hue: {s:?}");
     }
 
     #[test]
@@ -869,13 +1080,12 @@ mod tests {
             {"id": 200, "url": "u200", "username": "bob@x", "first_name": "Bob", "last_name": "",
              "is_active": true, "groups": ["https://x/groups/3"]}
         ])).unwrap();
-        let rendered = render_token_owner_picker("master-data-hub", "prod", &users, Some(938493));
+        let choices = format_user_choices(&users, Some(938493));
         // System user first.
-        let sys_pos = rendered.find("u938493").expect("sys user URL in output");
-        let alice_pos = rendered.find("u100").expect("alice URL in output");
-        assert!(sys_pos < alice_pos, "system_user__ should be ranked first");
+        assert!(choices[0].contains("u938493"), "system_user should be ranked first, got {:?}", choices);
+        assert!(choices.iter().any(|c| c.contains("u100")), "alice should be present");
         // Active session's own user tagged.
-        assert!(rendered.contains("you"), "self user should be tagged");
+        assert!(choices[0].contains("you"), "self user should be tagged, got {:?}", choices[0]);
     }
 
     #[test]
@@ -885,7 +1095,7 @@ mod tests {
             {"id": 100, "url": "u100", "username": "alice@x", "first_name": "Alice", "last_name": "",
              "is_active": true, "groups": ["https://x/groups/3"]}
         ])).unwrap();
-        let rendered = render_token_owner_picker("master-data-hub", "prod", &users, None);
-        assert!(!rendered.contains("you"), "no self_id → no 'you' tag");
+        let choices = format_user_choices(&users, None);
+        assert!(!choices[0].contains("you"), "no self_id → no 'you' tag, got {:?}", choices[0]);
     }
 }

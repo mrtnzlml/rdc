@@ -25,6 +25,16 @@ fn warn(progress: &Option<Arc<OverallProgress>>, msg: String) {
     }
 }
 
+/// Cheap check on a raw payload: is this a Rossum-store hook? Used to
+/// decide whether to pin `token_owner` from the tgt overlay during the
+/// cross-env update phase.
+fn is_store_extension(payload: &Value) -> bool {
+    payload
+        .get("extension_source")
+        .and_then(|v| v.as_str())
+        == Some("rossum_store")
+}
+
 /// Drive the cross-env update phase.
 ///
 /// `dry_run = true` traces the same code path (URL rewrite, overlay,
@@ -80,6 +90,39 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool, progress: Opti
         let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.hook(tgt_slug));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
+        }
+        // `token_owner` is a tgt-env user URL; the src snapshot carries
+        // the src-env user URL, which the tgt API rejects as "Invalid
+        // hyperlink". For store extensions, always pin it to the
+        // effective overlay value (per-hook → `[defaults]`) — that's
+        // the URL the user picked during bootstrap. If neither is set,
+        // refuse to PATCH and tell the user how to fix it.
+        if is_store_extension(&payload) {
+            match crate::cli::deploy::store_extensions::effective_token_owner(
+                tgt_overlay.as_ref(),
+                tgt_slug,
+            ) {
+                Some(url) => {
+                    if let Some(obj) = payload.as_object_mut() {
+                        obj.insert(
+                            "token_owner".into(),
+                            serde_json::Value::String(url.to_string()),
+                        );
+                    }
+                }
+                None => {
+                    warn(&progress, format!(
+                        "warning: hooks/{tgt_slug} is a store extension but {} has no \
+                         token_owner for it (neither [hooks.{tgt_slug}] token_owner nor \
+                         [defaults] store_extension_token_owner). Run `rdc deploy {src} {tgt}` \
+                         on a TTY once to pick interactively, or set it in the overlay file \
+                         directly. Skipping this hook.",
+                        tgt_paths.overlay_file().display(),
+                    ));
+                    skipped += 1;
+                    continue;
+                }
+            }
         }
         let payload_hook: crate::model::Hook = match serde_json::from_value(payload.clone()) {
             Ok(h) => h,

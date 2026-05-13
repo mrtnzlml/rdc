@@ -233,13 +233,19 @@ fn diff_snapshot_vs_snapshot(cwd: &Path, src: &str, tgt: &str) -> Result<()> {
     for rel in all_keys {
         match (src_files.get(&rel), tgt_files.get(&rel)) {
             (Some(left), Some(right)) => {
-                let l = String::from_utf8_lossy(left);
-                let r = String::from_utf8_lossy(right);
-                if l != r {
+                // Strip cross-env noise (`id`, `url`, `organization`,
+                // server-managed timestamps, server-computed back-refs)
+                // before diffing — those fields always differ between
+                // envs and bury the real changes.
+                let left_norm = normalize_for_diff(&rel, left);
+                let right_norm = normalize_for_diff(&rel, right);
+                if left_norm != right_norm {
+                    let ls = String::from_utf8_lossy(&left_norm);
+                    let rs = String::from_utf8_lossy(&right_norm);
                     print_unified(
                         &format!("{rel} (in {src})"),
                         &format!("{rel} (in {tgt})"),
-                        &l, &r, &mut diffs_printed,
+                        &ls, &rs, &mut diffs_printed,
                     );
                 }
             }
@@ -258,9 +264,80 @@ fn diff_snapshot_vs_snapshot(cwd: &Path, src: &str, tgt: &str) -> Result<()> {
     }
 
     if diffs_printed == 0 {
-        println!("no diffs (snapshots '{src}' and '{tgt}' are identical)");
+        println!("no diffs (snapshots '{src}' and '{tgt}' are identical after stripping cross-env noise)");
     }
     Ok(())
+}
+
+/// Normalise bytes for a cross-env diff display.
+/// - JSON files of a recognised kind go through `normalize_for_cross_env_compare`,
+///   which strips `id`, `url`, `organization`, server-managed timestamps,
+///   and kind-specific computed back-references.
+/// - JSON files of an unrecognised kind get pretty-printed so per-field
+///   changes diff on their own lines.
+/// - Non-JSON files (`.py`, `.toml`, `.md`) pass through unchanged.
+fn normalize_for_diff(rel: &str, bytes: &[u8]) -> Vec<u8> {
+    if !rel.ends_with(".json") {
+        return bytes.to_vec();
+    }
+    if let Some(kind) = kind_from_relative_path(rel) {
+        if let Ok(normalized) =
+            crate::cli::deploy::common::normalize_for_cross_env_compare(bytes, kind)
+        {
+            return normalized;
+        }
+    }
+    // Fall back to pretty-print so the diff is still per-field readable.
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+        if let Ok(mut pretty) = serde_json::to_vec_pretty(&value) {
+            if !pretty.ends_with(b"\n") {
+                pretty.push(b'\n');
+            }
+            return pretty;
+        }
+    }
+    bytes.to_vec()
+}
+
+/// Map a snapshot-relative path to its Rossum kind. Returns `None` for
+/// paths that don't correspond to a known kind (e.g. `overlay.toml`,
+/// `.py` formula files).
+fn kind_from_relative_path(rel: &str) -> Option<&'static str> {
+    if rel.starts_with("hooks/") && rel.ends_with(".json") {
+        return Some("hooks");
+    }
+    if rel.starts_with("rules/") && rel.ends_with(".json") {
+        return Some("rules");
+    }
+    if rel.starts_with("labels/") && rel.ends_with(".json") {
+        return Some("labels");
+    }
+    if rel.starts_with("workspaces/") {
+        if rel.ends_with("/workspace.json") {
+            return Some("workspaces");
+        }
+        if rel.ends_with("/queue.json") {
+            return Some("queues");
+        }
+        if rel.ends_with("/schema.json") {
+            return Some("schemas");
+        }
+        if rel.ends_with("/inbox.json") {
+            return Some("inboxes");
+        }
+        if rel.contains("/email-templates/") && rel.ends_with(".json") {
+            return Some("email_templates");
+        }
+    }
+    if rel.starts_with("engines/") {
+        if rel.ends_with("/engine.json") {
+            return Some("engines");
+        }
+        if rel.contains("/fields/") && rel.ends_with(".json") {
+            return Some("engine_fields");
+        }
+    }
+    None
 }
 
 /// Walk `envs/<env>/` and return a map of (relative-path → bytes) for every
@@ -324,8 +401,11 @@ fn canonical_json_for_diff<T: serde::Serialize>(v: &T) -> Result<String> {
 /// `counter` untouched — callers can pass a no-op counter (`&mut 0`) when
 /// they only care about the side effect.
 ///
+/// Output is colorized for TTY stdout (red `-`, green `+`, cyan `@@`),
+/// plain otherwise (respects `NO_COLOR` and the global `--no-color` flag).
+///
 /// Used by `rdc diff` directly and by `rdc push --dry-run --diff` /
-/// `rdc deploy --dry-run --diff` to surface per-object changes.
+/// `rdc deploy --dry-run` to surface per-object changes.
 pub fn print_unified(
     left_label: &str,
     right_label: &str,
@@ -342,7 +422,10 @@ pub fn print_unified(
         .context_radius(3)
         .header(left_label, right_label)
         .to_string();
-    print!("{unified}");
+    let mode = crate::cli::resolve::detect_color_mode(false);
+    for line in unified.lines() {
+        println!("{}", crate::cli::resolve::colorize_diff_line(line, mode));
+    }
     *counter += 1;
 }
 

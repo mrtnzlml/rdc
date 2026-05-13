@@ -1,5 +1,6 @@
-//! Env-pair mapping — connects src slug ↔ tgt slug per kind. Written by
-//! `rdc map`, consumed by `rdc plan` / `rdc apply`. Per spec §10.
+//! Env-pair mapping — connects src slug ↔ tgt slug per kind. Built and
+//! consumed by `rdc deploy` (auto-matched on each run, then persisted to
+//! disk so subsequent deploys keep the same alignment).
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -10,7 +11,7 @@ use std::path::Path;
 pub struct Mapping {
     pub version: u32,
     /// Workspace slug → workspace slug. Workspaces themselves are pull-only
-    /// in `rdc apply` (we don't PATCH them across envs), but their URLs are
+    /// in `rdc deploy` (we don't PATCH them across envs), but their URLs are
     /// referenced by queues, so the mapping is needed to rewrite
     /// `queue.workspace` from the src URL to the tgt URL.
     #[serde(default)]
@@ -89,7 +90,7 @@ impl Mapping {
 
     /// Look up the tgt slug for a `(kind, src_slug)` pair. Returns `None`
     /// if the kind isn't deployable or the pair isn't mapped. Used by
-    /// `rdc apply`'s URL-rewrite step.
+    /// the URL-rewrite step inside `rdc deploy`.
     pub fn lookup_tgt_slug(&self, kind: &str, src_slug: &str) -> Option<&str> {
         let map = match kind {
             "workspaces" => &self.workspaces,

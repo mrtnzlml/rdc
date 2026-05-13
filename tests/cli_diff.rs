@@ -137,7 +137,7 @@ async fn diff_snapshot_vs_snapshot_no_api_calls() {
         .current_dir(project.path())
         .args(["diff", "a", "b"])
         .assert().success()
-        .stdout(predicate::str::contains("no diffs (snapshots 'a' and 'b' are identical)"));
+        .stdout(predicate::str::contains("no diffs"));
 
     // Diverge: edit a's hook .py.
     let py_path = project.path().join("envs/a/hooks/validator-invoices.py");
