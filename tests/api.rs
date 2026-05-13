@@ -472,3 +472,44 @@ async fn create_hook_via_install_posts_to_create_endpoint() {
     assert_eq!(hook.id, 1798871);
     assert_eq!(hook.extension_source(), Some("rossum_store"));
 }
+
+#[tokio::test]
+async fn list_hook_templates_paginates() {
+    use rdc::model::HookTemplate;
+    use serde_json::json;
+    let server = MockServer::start().await;
+    let page1 = json!({
+        "pagination": { "next": format!("{}/api/v1/hook_templates?page=2", server.uri()) },
+        "results": [
+            {"url": format!("{}/api/v1/hook_templates/39", server.uri()),
+             "name": "Master Data Hub", "type": "webhook",
+             "extension_source": "rossum_store", "install_action": "copy"}
+        ]
+    });
+    let page2 = json!({
+        "pagination": { "next": null },
+        "results": [
+            {"url": format!("{}/api/v1/hook_templates/27", server.uri()),
+             "name": "Email Notifications", "type": "webhook",
+             "extension_source": "rossum_store", "install_action": "copy"}
+        ]
+    });
+    // Mount the more-specific page-2 mock first so wiremock (which uses
+    // first-match-wins semantics) routes `?page=2` requests here and lets
+    // the catch-all page-1 mock handle everything else.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hook_templates"))
+        .and(wiremock::matchers::query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&page2))
+        .mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hook_templates"))
+        .and(header("Authorization", "token TEST_TOKEN"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&page1))
+        .mount(&server).await;
+
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let templates: Vec<HookTemplate> = client.list_hook_templates(None).await.unwrap();
+    assert_eq!(templates.len(), 2);
+    assert!(templates.iter().any(|t| t.name == "Master Data Hub"));
+}
