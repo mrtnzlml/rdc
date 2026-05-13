@@ -35,20 +35,6 @@ pub enum Command {
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
-    /// Align slugs within a single environment: rename any local slug
-    /// that no longer matches its current JSON `name` field. Pull never
-    /// moves files; this is the explicit user-driven action that brings
-    /// stale slugs into alignment. Cascade-aware (queue and workspace
-    /// renames move the whole subtree).
-    ///
-    /// For cross-env promotion, use `rdc deploy` — it builds the
-    /// slug-to-slug mapping automatically.
-    Map {
-        env: String,
-        /// Print pending renames without writing anything.
-        #[arg(long)]
-        check: bool,
-    },
     /// Deploy a source env to a target env in one shot.
     ///
     /// First-class cross-env operation: bootstraps a fresh target (POSTing
@@ -101,14 +87,34 @@ pub enum Command {
         #[arg(long)]
         token: Option<String>,
     },
-    /// Recover from a corrupted or stale lockfile by re-pulling and
-    /// reconstructing it. Backs up the existing lockfile to
-    /// `<name>.bak.<unix-ts>`. Local snapshot files are overwritten with
-    /// remote contents — back up first if you have unsaved edits.
+    /// Bring the local snapshot of `<env>` back into a clean state.
+    /// Pick one of the modes — there's no implicit default because both
+    /// touch on-disk files in irreversible ways:
+    ///
+    /// * `--rebuild-lock` — back up the existing lockfile and re-pull
+    ///   from remote. Local snapshot files are overwritten with remote
+    ///   contents. Used after a lockfile corruption or a hash-input
+    ///   change in a new rdc release.
+    /// * `--rename-slugs` — rename any local file whose slug no longer
+    ///   matches its JSON `name`. Pull never moves files; this is the
+    ///   explicit user-driven action that brings stale slugs into
+    ///   alignment. Cascade-aware (queue / workspace renames move the
+    ///   whole subtree). Offline — no API calls.
     Repair {
         env: String,
-        #[arg(long = "rebuild-lock")]
+        /// Re-pull from remote and reconstruct the lockfile. Backs up
+        /// the existing one to `<name>.bak.<unix-ts>`. Destroys local
+        /// edits not present on remote.
+        #[arg(long = "rebuild-lock", conflicts_with = "rename_slugs")]
         rebuild_lock: bool,
+        /// Rename local files whose slug no longer matches their JSON
+        /// `name` field. Offline (no API calls).
+        #[arg(long = "rename-slugs")]
+        rename_slugs: bool,
+        /// With `--rename-slugs`: print pending renames and exit
+        /// without writing anything.
+        #[arg(long)]
+        check: bool,
     },
     /// Download and install the latest rdc release in place. Replaces
     /// the running binary atomically; keeps the previous binary as
@@ -146,9 +152,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
             crate::cli::push::run(&env, interactive, dry_run).await
         }
-        Some(Command::Map { env, check }) => {
-            crate::cli::deploy::realign::run_within_env(&env, check, cli.yes).await
-        }
         Some(Command::Deploy { src, tgt, mirror, dry_run }) => {
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
             crate::cli::deploy::run::run(&src, &tgt, mirror, interactive, dry_run).await
@@ -156,8 +159,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Status { env }) => crate::cli::status::run(env).await,
         Some(Command::Diff { left, right }) => crate::cli::diff::run(left, right).await,
         Some(Command::Auth { env, token }) => crate::cli::auth::run(&env, token).await,
-        Some(Command::Repair { env, rebuild_lock }) => {
-            crate::cli::repair::run(&env, rebuild_lock).await
+        Some(Command::Repair { env, rebuild_lock, rename_slugs, check }) => {
+            crate::cli::repair::run(&env, rebuild_lock, rename_slugs, check, cli.yes).await
         }
         Some(Command::Upgrade { version, check }) => {
             let target = match version {

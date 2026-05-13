@@ -20,8 +20,7 @@ use std::path::Path;
 pub async fn run(left: String, right: Option<String>) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let cfg_path = cwd.join("rdc.toml");
-    let cfg = ProjectConfig::load(&cfg_path)
-        .with_context(|| format!("loading project config from {}", cfg_path.display()))?;
+    let cfg = ProjectConfig::load(&cfg_path)?;
 
     if !cfg.envs.contains_key(&left) {
         return Err(anyhow!("env '{left}' is not defined in rdc.toml"));

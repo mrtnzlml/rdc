@@ -53,8 +53,7 @@ pub async fn run(env: &str, interactive: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let paths = Paths::for_env(&cwd, env);
 
-    let cfg = ProjectConfig::load(&paths.project_config())
-        .with_context(|| format!("loading project config from {}", paths.project_config().display()))?;
+    let cfg = ProjectConfig::load(&paths.project_config())?;
 
     let env_cfg = cfg
         .envs
@@ -143,11 +142,11 @@ pub async fn run(env: &str, interactive: bool) -> Result<()> {
     println!("{summary}");
 
     // Stale slugs surface here: detected, never auto-applied. The user
-    // runs `rdc map <env>` when ready to commit the file moves.
+    // runs `rdc repair <env> --rename-slugs` when ready to commit the moves.
     let pending = crate::cli::deploy::realign::detect(&paths, &lockfile);
     if !pending.is_empty() {
         eprintln!(
-            "note: {} resource(s) have been renamed on remote — run `rdc map {env}` to apply",
+            "note: {} resource(s) have been renamed on remote — run `rdc repair {env} --rename-slugs` to apply",
             pending.len()
         );
     }

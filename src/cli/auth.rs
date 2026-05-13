@@ -21,8 +21,7 @@ use anyhow::{anyhow, Context, Result};
 pub async fn run(env: &str, token_arg: Option<String>) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let cfg_path = cwd.join("rdc.toml");
-    let cfg = ProjectConfig::load(&cfg_path)
-        .with_context(|| format!("loading project config from {}", cfg_path.display()))?;
+    let cfg = ProjectConfig::load(&cfg_path)?;
     let env_cfg = cfg
         .envs
         .get(env)

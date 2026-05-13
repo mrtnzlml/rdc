@@ -59,8 +59,26 @@ fn derive_data_storage_base(api_base: &str) -> String {
 
 impl ProjectConfig {
     pub fn load(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let raw = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Self-contained, actionable error. The most common reason
+                // this hits is the user running an rdc command outside a
+                // project tree — point them at `rdc init`. We swallow the
+                // raw `os error 2` and the path-in-message stays short
+                // (no nested "reading <path>: No such file …").
+                let parent = path.parent().unwrap_or(path);
+                return Err(anyhow::anyhow!(
+                    "not an rdc project: no rdc.toml in {}.\n\
+                     run `rdc init` here, or cd into an existing project directory.",
+                    parent.display()
+                ));
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("reading {}", path.display())));
+            }
+        };
         let cfg: ProjectConfig = toml::from_str(&raw)
             .with_context(|| format!("parsing {}", path.display()))?;
         Ok(cfg)
@@ -124,10 +142,15 @@ org_id = 285704
     }
 
     #[test]
-    fn missing_file_errors_with_path() {
+    fn missing_file_errors_actionable() {
         let err = ProjectConfig::load(Path::new("/nope/rdc.toml")).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("/nope/rdc.toml"), "error should name the path: {msg}");
+        // The error must surface the missing directory + an actionable hint
+        // toward `rdc init`, so a user running `rdc status` outside a project
+        // tree gets pointed at the fix instead of a raw `os error 2`.
+        assert!(msg.contains("/nope"), "error should name the directory: {msg}");
+        assert!(msg.contains("not an rdc project"), "error should explain what's wrong: {msg}");
+        assert!(msg.contains("rdc init"), "error should suggest the fix: {msg}");
     }
 
     #[test]

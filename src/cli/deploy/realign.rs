@@ -1,6 +1,6 @@
 //! Within-env slug realignment.
 //!
-//! Invoked via `rdc map <env>` (single-arg form of `rdc map`). Walks the
+//! Invoked via `rdc repair <env> --rename-slugs`. Walks the
 //! lockfile, reads each object's local JSON `name` field, slugifies it,
 //! and proposes a rename for every entry whose current sticky slug
 //! differs from the proposed one.
@@ -633,12 +633,11 @@ fn list_mapping_files(paths: &Paths) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// Entry point used by `cli::run` when `rdc map <env>` is invoked.
+/// Entry point used by `rdc repair <env> --rename-slugs`.
 pub async fn run_within_env(env: &str, check: bool, yes: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let paths = Paths::for_env(&cwd, env);
-    let cfg = crate::config::ProjectConfig::load(&paths.project_config())
-        .with_context(|| format!("loading project config from {}", paths.project_config().display()))?;
+    let cfg = crate::config::ProjectConfig::load(&paths.project_config())?;
     if !cfg.envs.contains_key(env) {
         anyhow::bail!("env '{env}' is not defined in rdc.toml");
     }

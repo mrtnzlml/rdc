@@ -24,8 +24,7 @@ pub async fn run(env: &str, interactive: bool, dry_run: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let paths = Paths::for_env(&cwd, env);
 
-    let cfg = ProjectConfig::load(&paths.project_config())
-        .with_context(|| format!("loading project config from {}", paths.project_config().display()))?;
+    let cfg = ProjectConfig::load(&paths.project_config())?;
 
     let env_cfg = cfg
         .envs

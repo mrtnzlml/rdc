@@ -24,8 +24,7 @@ use std::path::Path;
 pub async fn run(env_filter: Option<String>) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let cfg_path = cwd.join("rdc.toml");
-    let cfg = ProjectConfig::load(&cfg_path)
-        .with_context(|| format!("loading project config from {}", cfg_path.display()))?;
+    let cfg = ProjectConfig::load(&cfg_path)?;
 
     let envs_to_check: Vec<String> = match &env_filter {
         Some(e) => {
@@ -110,7 +109,7 @@ pub async fn run(env_filter: Option<String>) -> Result<()> {
             println!("  renames:  none");
         } else {
             println!(
-                "  renames:  {} pending (run `rdc map {env}` to apply):",
+                "  renames:  {} pending (run `rdc repair {env} --rename-slugs` to apply):",
                 pending.len()
             );
             for p in &pending {

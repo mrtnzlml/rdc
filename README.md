@@ -65,8 +65,10 @@ on purpose, or the existing default is the one we'd recommend anyway.
 - **Auxiliary commands.** `rdc init` accepts flags or runs an
   interactive wizard; `rdc status` is a read-only health check;
   `rdc diff` shows unified diffs (local vs remote, or two snapshots);
-  `rdc auth` sets/refreshes tokens; `rdc repair --rebuild-lock`
-  recovers a corrupted lockfile.
+  `rdc auth` sets/refreshes tokens; `rdc repair <env>` consolidates
+  local-state fixes — `--rebuild-lock` re-pulls and rewrites the
+  lockfile, `--rename-slugs` renames local files whose JSON `name`
+  has drifted.
 - **Distribution.** Single binary via `curl | sh` (pre-built for
   darwin x86_64/aarch64, linux x86_64, and windows x86_64) or `cargo
   install`.
@@ -646,7 +648,7 @@ The overlay's dotted-path keys are bidirectional:
   value.
 - **On pull** (spec §9.3), they're stripped from the snapshot
   before write. The on-disk JSON reflects the canonical (pre-overlay)
-  form, so `rdc diff test prod` and `rdc map test prod` stay quiet
+  form, so `rdc diff test prod` and `rdc deploy test prod` stay quiet
   about env-specific differences. The lockfile records the stripped
   hash, so subsequent pulls and pushes are idempotent.
 
@@ -668,12 +670,7 @@ re-applies them on the way out; pull strips them on the way in.
   drift check surfaces as "remote has changed". Run `rdc pull` once
   more after editing the overlay to re-baseline.
 
-## Map — align stale slugs within an env
-
-`rdc map <env>` renames any local file whose slug no longer matches
-its JSON `name` field. Cross-env promotion has its own command
-(`rdc deploy`); `rdc map` is purely about keeping local file paths
-tidy.
+## Stale slugs — `rdc repair <env> --rename-slugs`
 
 Slugs in the snapshot are sticky to the Rossum object ID: once a hook
 has `validator-invoices` as its slug, that slug stays there even if
@@ -683,18 +680,18 @@ references stay valid, pull stays idempotent, file paths don't churn.
 The trade-off is cosmetic staleness: `hooks/validator-invoices.json`
 whose JSON says `"name": "Validator Invoices v2"`.
 
-`rdc map <env>` is the explicit user-driven action that brings stale
-slugs into alignment. **Pull never moves files** — it stays clean for
-review. When you're ready to commit the renames in a single, easy-to-
-review diff, run:
+`rdc repair <env> --rename-slugs` is the explicit user-driven action
+that brings stale slugs into alignment. **Pull never moves files** —
+it stays clean for review. When you're ready to commit the renames in
+a single, easy-to-review diff, run:
 
 ```sh
-rdc map dev               # interactive: y/N per rename
-rdc map dev --yes         # apply all without prompting
-rdc map dev --check       # list pending without modifying anything
+rdc repair dev --rename-slugs           # interactive: y/N per rename
+rdc repair dev --rename-slugs --yes     # apply all without prompting
+rdc repair dev --rename-slugs --check   # list pending without writing anything
 ```
 
-The command is **cascade-aware**:
+The command is offline (no API calls) and **cascade-aware**:
 
 - Renaming a workspace moves the entire `workspaces/<old>/` directory
   to `<new>/` (one OS call, all children come along) and rewrites the
@@ -909,12 +906,15 @@ while Data Storage sits at the bare parent domain plus
 returns 404 and rdc skips silently — no `mdh/` directory created,
 no count in the summary.
 
-## Repair — recover a broken lockfile
+## Repair — rebuild the lockfile
 
-If your `.rdc/state/<env>.lock.json` becomes corrupted or you've
-lost it, `rdc repair --rebuild-lock <env>` backs it up (to
-`<name>.bak.<unix-ts>`) and runs `rdc pull <env>` from a clean
-slate to reconstruct it.
+`rdc repair <env> --rebuild-lock` is the second mode of `rdc repair`
+(the first, `--rename-slugs`, is documented above). It backs up the
+existing `.rdc/state/<env>.lock.json` (to `<name>.bak.<unix-ts>`) and
+runs `rdc pull <env>` from a clean slate to reconstruct it. Use it
+when the lockfile is corrupted, you've deleted it, or a new rdc
+release changed how `content_hash` is computed (the release notes
+will flag this when it happens).
 
 ```sh
 rdc repair dev --rebuild-lock
@@ -927,6 +927,14 @@ rdc repair dev --rebuild-lock
 **Warning:** because the rebuilt pull has no merge base, every
 local file is overwritten with what the remote currently has.
 Commit your snapshot to git first if you might have unsaved edits.
+
+`rdc repair` requires picking exactly one mode — there's no implicit
+default because both touch on-disk files in irreversible ways:
+
+| Flag | What it does | Online? |
+|------|--------------|---------|
+| `--rebuild-lock` | Re-pulls everything; overwrites local files | yes |
+| `--rename-slugs` | Renames local files to match current JSON names | no |
 
 ## Layout cheat sheet
 

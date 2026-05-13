@@ -302,11 +302,13 @@ already exist on the remote).
 - `rdc diff <env>` — local-vs-remote diff (no writes)
 - `rdc diff <a> <b>` — diff two local snapshots
 - `rdc status [<env>]` — auth + lockfile health
-- `rdc map <env>` — realign stale slugs after a remote rename
-- `rdc map <src> <tgt>` — auto-match for cross-env deploys
-- `rdc plan --from <src> --to <tgt>` — preview a deploy
-- `rdc apply --from <src> --to <tgt>` — execute a deploy
-- `rdc repair --rebuild-lock <env>` — recover a corrupted lockfile
+- `rdc deploy <src> <tgt>` — promote one env to another in one shot
+  (POST missing + PATCH deltas, URL rewrites included); `--dry-run`
+  previews without writing
+- `rdc repair <env> --rename-slugs` — realign stale local slugs after
+  a remote rename (offline)
+- `rdc repair <env> --rebuild-lock` — recover from a corrupted
+  lockfile by re-pulling everything
 
 ## Conflicts & drift
 
@@ -322,13 +324,10 @@ keep the local on disk.
 ## Cross-env deploys (e.g. dev → prod)
 
 1. `rdc pull dev` and `rdc pull prod` so both lockfiles are populated.
-2. `rdc map dev prod` — auto-matches by slug, writes
-   `.rdc/map/dev→prod.toml`.
-3. Hand-edit the mapping for renames or skips.
-4. `rdc plan --from dev --to prod` — shows what will change without
-   PATCHing.
-5. `rdc apply --from dev --to prod` — executes. Per-env values stay in
-   each env's `overlay.toml`.
+2. `rdc deploy dev prod --dry-run` — preview the plan.
+3. `rdc deploy dev prod` — execute. Per-env values stay in each env's
+   `overlay.toml`; the slug-to-slug mapping is built automatically and
+   stored at `.rdc/map/dev→prod.toml` (hand-edit for renames if needed).
 
 ## What NOT to edit
 

@@ -27,8 +27,7 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool) -> Result<()> {
     let src_paths = Paths::for_env(&cwd, src);
     let tgt_paths = Paths::for_env(&cwd, tgt);
 
-    let cfg = ProjectConfig::load(&src_paths.project_config())
-        .with_context(|| format!("loading project config from {}", src_paths.project_config().display()))?;
+    let cfg = ProjectConfig::load(&src_paths.project_config())?;
     let _src_cfg = cfg.envs.get(src).ok_or_else(|| anyhow!("env '{src}' is not defined in rdc.toml"))?;
     let tgt_cfg = cfg.envs.get(tgt).ok_or_else(|| anyhow!("env '{tgt}' is not defined in rdc.toml"))?;
 

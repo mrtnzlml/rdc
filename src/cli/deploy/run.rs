@@ -80,8 +80,7 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
     let src_paths = Paths::for_env(&cwd, src);
     let tgt_paths = Paths::for_env(&cwd, tgt);
 
-    let cfg = ProjectConfig::load(&src_paths.project_config())
-        .with_context(|| format!("loading project config from {}", src_paths.project_config().display()))?;
+    let cfg = ProjectConfig::load(&src_paths.project_config())?;
     if !cfg.envs.contains_key(src) {
         return Err(anyhow!("env '{src}' is not defined in rdc.toml"));
     }
