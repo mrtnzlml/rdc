@@ -12,11 +12,13 @@
 //! No interactive prompt — that keeps the binary TTY-free and avoids a
 //! new dep for password input.
 
-use crate::api::RossumClient;
-use crate::config::ProjectConfig;
+use crate::api::{anyhow_has_status, RossumClient};
+use crate::config::{EnvConfig, ProjectConfig};
 use crate::paths::Paths;
 use crate::snapshot::writer::write_atomic;
 use anyhow::{anyhow, Context, Result};
+use std::io::IsTerminal;
+use std::path::Path;
 
 pub async fn run(env: &str, token_arg: Option<String>) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
@@ -45,37 +47,113 @@ pub async fn run(env: &str, token_arg: Option<String>) -> Result<()> {
         }
     };
 
-    // Validate by hitting the org endpoint.
-    let client = RossumClient::new(env_cfg.api_base.clone(), new_token.clone())
+    let org_name = validate_and_save_token(env_cfg, &paths.secrets_file(), &new_token).await?;
+
+    println!(
+        "Token written to {} (validated against org '{}').",
+        paths.secrets_file().display(),
+        org_name,
+    );
+    Ok(())
+}
+
+/// Validate `token` by calling `GET /organizations/<id>`. On success,
+/// write it atomically to `secrets_path` with mode 0600 (Unix) and
+/// return the organization name. On failure, propagate.
+async fn validate_and_save_token(
+    env_cfg: &EnvConfig,
+    secrets_path: &Path,
+    token: &str,
+) -> Result<String> {
+    let client = RossumClient::new(env_cfg.api_base.clone(), token.to_string())
         .context("constructing Rossum API client")?;
     let org = client
         .get_organization(env_cfg.org_id, None)
         .await
-        .with_context(|| format!("validating token against {}/organizations/{}", env_cfg.api_base, env_cfg.org_id))?;
+        .with_context(|| {
+            format!(
+                "validating token against {}/organizations/{}",
+                env_cfg.api_base, env_cfg.org_id
+            )
+        })?;
 
-    // Write to secrets file (atomic).
-    let secrets_path = paths.secrets_file();
     if let Some(parent) = secrets_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let body = serde_json::json!({"api_token": new_token});
-    let mut bytes = serde_json::to_vec_pretty(&body)
-        .context("serializing token JSON")?;
+    let body = serde_json::json!({ "api_token": token });
+    let mut bytes = serde_json::to_vec_pretty(&body).context("serializing token JSON")?;
     bytes.push(b'\n');
-    write_atomic(&secrets_path, &bytes)
+    write_atomic(secrets_path, &bytes)
         .with_context(|| format!("writing {}", secrets_path.display()))?;
+    set_owner_only_read(secrets_path);
+    Ok(org.name)
+}
 
-    // Best-effort restrict the file to the owner.
-    set_owner_only_read(&secrets_path);
+/// Interactive token refresh. Called when an API call returns 401: prompts
+/// the user for a new token, validates it, saves it to the env's secrets
+/// file, and returns. On non-TTY contexts, returns an error pointing at
+/// `rdc auth <env>` instead of blocking.
+pub async fn refresh_token_interactively(env: &str) -> Result<()> {
+    if !std::io::stdin().is_terminal() {
+        return Err(anyhow!(
+            "token for env '{env}' was rejected (401). \
+             Re-run on a TTY to refresh interactively, or run \
+             `rdc auth {env} --token <new-token>`."
+        ));
+    }
 
-    println!(
-        "Token written to {} (validated against org '{}', id {}).",
-        secrets_path.display(),
-        org.name,
-        org.id,
+    let cwd = std::env::current_dir().context("getting current directory")?;
+    let cfg = ProjectConfig::load(&cwd.join("rdc.toml"))?;
+    let env_cfg = cfg
+        .envs
+        .get(env)
+        .ok_or_else(|| anyhow!("env '{env}' is not defined in rdc.toml"))?;
+    let paths = Paths::for_env(&cwd, env);
+    let secrets_path = paths.secrets_file();
+
+    eprintln!();
+    eprintln!(
+        "Token for env '{env}' was rejected (401). Paste a new one below to refresh."
     );
-    Ok(())
+
+    use inquire::error::InquireError;
+    use inquire::{Password, PasswordDisplayMode};
+
+    loop {
+        let new_token = match Password::new("New API token")
+            .with_display_mode(PasswordDisplayMode::Masked)
+            .without_confirmation()
+            .with_help_message("Ctrl+C to cancel")
+            .prompt()
+        {
+            Ok(s) => s,
+            Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => {
+                return Err(anyhow!("token refresh cancelled"));
+            }
+            Err(e) => return Err(anyhow!("token prompt failed: {e}")),
+        };
+        let trimmed = new_token.trim();
+        if trimmed.is_empty() {
+            eprintln!("  empty input — paste the token, or Ctrl+C to abort.");
+            continue;
+        }
+        match validate_and_save_token(env_cfg, &secrets_path, trimmed).await {
+            Ok(org_name) => {
+                eprintln!(
+                    "✓ Token saved to {} (validated against org '{}'). Retrying…",
+                    secrets_path.display(),
+                    org_name
+                );
+                return Ok(());
+            }
+            Err(e) if anyhow_has_status(&e, 401) => {
+                eprintln!("  rejected by server (401) — try again, or Ctrl+C to abort.");
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 #[cfg(unix)]

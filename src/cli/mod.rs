@@ -205,12 +205,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Pull { env }) => {
             let env = crate::cli::env_picker::pick_env("Which env to pull from?", env)?;
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
-            crate::cli::pull::run(&env, interactive).await
+            with_401_retry(&env, || crate::cli::pull::run(&env, interactive)).await
         }
         Some(Command::Push { env, dry_run, diff, allow_deletes }) => {
             let env = crate::cli::env_picker::pick_env("Which env to push to?", env)?;
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
-            crate::cli::push::run(&env, interactive, dry_run, diff, allow_deletes).await
+            with_401_retry(&env, || {
+                crate::cli::push::run(&env, interactive, dry_run, diff, allow_deletes)
+            })
+            .await
         }
         Some(Command::Deploy { src, tgt, mirror, dry_run, diff }) => {
             let src = crate::cli::env_picker::pick_env("Deploy from which env (source)?", src)?;
@@ -230,7 +233,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Some(Command::Repair { env, rebuild_lock, rename_slugs, check }) => {
             let env = crate::cli::env_picker::pick_env("Which env to repair?", env)?;
-            crate::cli::repair::run(&env, rebuild_lock, rename_slugs, check, cli.yes).await
+            with_401_retry(&env, || {
+                crate::cli::repair::run(&env, rebuild_lock, rename_slugs, check, cli.yes)
+            })
+            .await
         }
         Some(Command::Upgrade { version, check }) => {
             let target = match version {
@@ -245,6 +251,28 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             println!();
             Ok(())
         }
+    }
+}
+
+/// Run an env-scoped API operation and, if it fails with HTTP 401,
+/// prompt the user for a fresh token, save it, and retry the operation
+/// once. The closure must be re-callable; we invoke it twice when the
+/// first call's error chain contains an `ApiError::Status { status: 401 }`.
+///
+/// Non-TTY contexts (CI, piped) skip the prompt and surface the
+/// original error annotated with a hint to run `rdc auth <env>`.
+async fn with_401_retry<F, Fut>(env: &str, op: F) -> anyhow::Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let first = op().await;
+    match first {
+        Err(e) if crate::api::anyhow_has_status(&e, 401) => {
+            crate::cli::auth::refresh_token_interactively(env).await?;
+            op().await
+        }
+        other => other,
     }
 }
 
