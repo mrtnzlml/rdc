@@ -158,17 +158,19 @@ fn walk_strings_mut(value: &mut Value, f: &mut dyn FnMut(&mut String)) {
 }
 
 /// Drift check: hash the post-overlay-strip remote bytes and compare to
-/// the tgt lockfile's recorded `content_hash`. Returns `Ok(true)` when in
-/// sync (safe to apply), `Ok(false)` when drifted (refuse with warning).
-/// Lockfile entries with no `content_hash` (older snapshots) yield `true`
-/// to avoid spurious blocks.
-pub fn tgt_in_sync(
+/// the tgt lockfile's recorded `content_hash`. Returns `(in_sync,
+/// current_remote_hash)`. Use the hash to refresh the lockfile entry
+/// when adopting out-of-band changes.
+///
+/// Lockfile entries with no `content_hash` (older snapshots) yield
+/// `in_sync = true` so deploys don't spuriously block on legacy state.
+pub fn tgt_drift_status(
     remote_bytes: Vec<u8>,
     overlay_paths: Option<&BTreeMap<String, Value>>,
     tgt_lockfile: &Lockfile,
     kind: &str,
     tgt_slug: &str,
-) -> Result<bool> {
+) -> Result<(bool, String)> {
     let stripped = maybe_strip_overlay(remote_bytes, overlay_paths)?;
     let remote_hash = content_hash(&stripped);
     let base = tgt_lockfile
@@ -176,7 +178,8 @@ pub fn tgt_in_sync(
         .get(kind)
         .and_then(|m| m.get(tgt_slug))
         .and_then(|e| e.content_hash.as_deref());
-    Ok(base.map(|b| b == remote_hash).unwrap_or(true))
+    let in_sync = base.map(|b| b == remote_hash).unwrap_or(true);
+    Ok((in_sync, remote_hash))
 }
 
 #[cfg(test)]

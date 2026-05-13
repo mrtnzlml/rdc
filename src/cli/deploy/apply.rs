@@ -1,5 +1,5 @@
 use crate::api::{anyhow_has_status, RossumClient};
-use crate::cli::deploy::common::{bytes_equal_after_strip, rewrite_urls, tgt_in_sync};
+use crate::cli::deploy::common::{bytes_equal_after_strip, rewrite_urls, tgt_drift_status};
 use crate::snapshot::create::strip_for_cross_env_patch;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::config::ProjectConfig;
@@ -35,6 +35,34 @@ fn is_store_extension(payload: &Value) -> bool {
         == Some("rossum_store")
 }
 
+/// Adopt an out-of-band change on tgt: refresh the lockfile entry's
+/// `content_hash` to the current remote hash and emit a quiet note.
+/// Used when the drift check detects that someone modified the tgt
+/// object directly (e.g. via the Rossum UI) since the last pull — the
+/// deploy proceeds anyway, treating the remote-as-of-now as the new
+/// baseline that the upcoming PATCH overwrites.
+fn adopt_tgt_drift(
+    progress: &Option<Arc<OverallProgress>>,
+    tgt_lockfile: &mut Lockfile,
+    kind: &str,
+    tgt_slug: &str,
+    remote_hash: String,
+) {
+    if let Some(entry) = tgt_lockfile
+        .objects
+        .get_mut(kind)
+        .and_then(|m| m.get_mut(tgt_slug))
+    {
+        entry.content_hash = Some(remote_hash);
+    }
+    let msg =
+        format!("note: tgt {kind}/{tgt_slug} had out-of-band changes; adopting as new baseline");
+    match progress {
+        Some(p) => p.println(&msg),
+        None => eprintln!("{msg}"),
+    }
+}
+
 /// Drive the cross-env update phase.
 ///
 /// `dry_run = true` traces the same code path (URL rewrite, overlay,
@@ -49,7 +77,14 @@ fn is_store_extension(payload: &Value) -> bool {
 ///
 /// Returns the summary line as a `String` so the caller can print it
 /// after the progress bar is finished.
-pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool, progress: Option<Arc<OverallProgress>>) -> Result<String> {
+pub async fn run(
+    src: &str,
+    tgt: &str,
+    dry_run: bool,
+    diff: bool,
+    progress: Option<Arc<OverallProgress>>,
+    tgt_lockfile: &mut Lockfile,
+) -> Result<String> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let src_paths = Paths::for_env(&cwd, src);
     let tgt_paths = Paths::for_env(&cwd, tgt);
@@ -65,7 +100,6 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool, progress: Opti
     let mapping = Mapping::load(&src_paths.mapping_file(src, tgt))?;
     let src_lockfile = Lockfile::load(&src_paths.lockfile())
         .with_context(|| format!("loading src lockfile from {}", src_paths.lockfile().display()))?;
-    let tgt_lockfile = Lockfile::load(&tgt_paths.lockfile())?;
     let tgt_overlay = Overlay::load(&tgt_paths.overlay_file())
         .with_context(|| format!("loading tgt overlay from {}", tgt_paths.overlay_file().display()))?;
 
@@ -137,16 +171,18 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool, progress: Opti
         let remote_hook = tgt_client.get_hook(tgt_id, None).await
             .with_context(|| format!("fetching tgt hook {tgt_id} for drift check"))?;
         let (remote_json_full, remote_code) = crate::snapshot::hook::serialize_hook(&remote_hook)?;
-        let in_sync = {
-            let stripped = maybe_strip_overlay(remote_json_full.clone(), overlay_paths)?;
-            let h = crate::state::hook_combined_hash(&stripped, &remote_code);
-            let base = tgt_lockfile.objects.get("hooks").and_then(|m| m.get(tgt_slug)).and_then(|e| e.content_hash.as_deref());
-            base.map(|b| b == h).unwrap_or(true)
-        };
+        let stripped = maybe_strip_overlay(remote_json_full.clone(), overlay_paths)?;
+        let remote_combined_hash =
+            crate::state::hook_combined_hash(&stripped, &remote_code);
+        let in_sync = tgt_lockfile
+            .objects
+            .get("hooks")
+            .and_then(|m| m.get(tgt_slug))
+            .and_then(|e| e.content_hash.as_deref())
+            .map(|b| b == remote_combined_hash)
+            .unwrap_or(true);
         if !in_sync {
-            warn(&progress, format!("warning: tgt hooks/{tgt_slug} has drifted from tgt lockfile (run `rdc pull {tgt}` first); skipping"));
-            skipped += 1;
-            continue;
+            adopt_tgt_drift(&progress, tgt_lockfile, "hooks", tgt_slug, remote_combined_hash);
         }
         // Idempotency: compare canonical (env-specific fields stripped) JSON
         // plus the extracted code.
@@ -216,16 +252,18 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool, progress: Opti
             continue;
         };
         let (remote_json_full, remote_code) = crate::snapshot::rule::serialize_rule(remote)?;
-        let in_sync = {
-            let stripped = maybe_strip_overlay(remote_json_full.clone(), overlay_paths)?;
-            let h = crate::state::rule_combined_hash(&stripped, &remote_code);
-            let base = tgt_lockfile.objects.get("rules").and_then(|m| m.get(tgt_slug)).and_then(|e| e.content_hash.as_deref());
-            base.map(|b| b == h).unwrap_or(true)
-        };
+        let stripped = maybe_strip_overlay(remote_json_full.clone(), overlay_paths)?;
+        let remote_combined_hash =
+            crate::state::rule_combined_hash(&stripped, &remote_code);
+        let in_sync = tgt_lockfile
+            .objects
+            .get("rules")
+            .and_then(|m| m.get(tgt_slug))
+            .and_then(|e| e.content_hash.as_deref())
+            .map(|b| b == remote_combined_hash)
+            .unwrap_or(true);
         if !in_sync {
-            warn(&progress, format!("warning: tgt rules/{tgt_slug} has drifted from tgt lockfile (run `rdc pull {tgt}` first); skipping"));
-            skipped += 1;
-            continue;
+            adopt_tgt_drift(&progress, tgt_lockfile, "rules", tgt_slug, remote_combined_hash);
         }
         // Idempotency: both JSON and code must match (after env-specific strip).
         if bytes_equal_after_strip(&payload_json_full, &remote_json_full, "rules")?
@@ -296,10 +334,10 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool, progress: Opti
         };
         let mut remote_bytes = serde_json::to_vec_pretty(remote).context("serializing remote label")?;
         remote_bytes.push(b'\n');
-        if !tgt_in_sync(remote_bytes.clone(), overlay_paths, &tgt_lockfile, "labels", tgt_slug)? {
-            warn(&progress, format!("warning: tgt labels/{tgt_slug} has drifted from tgt lockfile (run `rdc pull {tgt}` first); skipping"));
-            skipped += 1;
-            continue;
+        let (in_sync, remote_hash) =
+            tgt_drift_status(remote_bytes.clone(), overlay_paths, tgt_lockfile, "labels", tgt_slug)?;
+        if !in_sync {
+            adopt_tgt_drift(&progress, tgt_lockfile, "labels", tgt_slug, remote_hash);
         }
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "labels")? {
             continue;
@@ -368,10 +406,10 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool, progress: Opti
         };
         let mut remote_bytes = serde_json::to_vec_pretty(remote).context("serializing remote queue")?;
         remote_bytes.push(b'\n');
-        if !tgt_in_sync(remote_bytes.clone(), overlay_paths, &tgt_lockfile, "queues", tgt_slug)? {
-            warn(&progress, format!("warning: tgt queues/{tgt_slug} has drifted from tgt lockfile (run `rdc pull {tgt}` first); skipping"));
-            skipped += 1;
-            continue;
+        let (in_sync, remote_hash) =
+            tgt_drift_status(remote_bytes.clone(), overlay_paths, tgt_lockfile, "queues", tgt_slug)?;
+        if !in_sync {
+            adopt_tgt_drift(&progress, tgt_lockfile, "queues", tgt_slug, remote_hash);
         }
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "queues")? {
             continue;
@@ -420,16 +458,18 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool, progress: Opti
             .with_context(|| format!("fetching tgt schema {tgt_id} for drift check"))?;
         let (remote_json_full, remote_formulas) =
             crate::snapshot::schema::serialize_schema(&remote_schema)?;
-        let in_sync = {
-            let stripped = maybe_strip_overlay(remote_json_full.clone(), overlay_paths)?;
-            let h = crate::state::schema_combined_hash(&stripped, &remote_formulas);
-            let base = tgt_lockfile.objects.get("schemas").and_then(|m| m.get(tgt_slug)).and_then(|e| e.content_hash.as_deref());
-            base.map(|b| b == h).unwrap_or(true)
-        };
+        let stripped = maybe_strip_overlay(remote_json_full.clone(), overlay_paths)?;
+        let remote_combined_hash =
+            crate::state::schema_combined_hash(&stripped, &remote_formulas);
+        let in_sync = tgt_lockfile
+            .objects
+            .get("schemas")
+            .and_then(|m| m.get(tgt_slug))
+            .and_then(|e| e.content_hash.as_deref())
+            .map(|b| b == remote_combined_hash)
+            .unwrap_or(true);
         if !in_sync {
-            warn(&progress, format!("warning: tgt schemas/{tgt_slug} has drifted from tgt lockfile (run `rdc pull {tgt}` first); skipping"));
-            skipped += 1;
-            continue;
+            adopt_tgt_drift(&progress, tgt_lockfile, "schemas", tgt_slug, remote_combined_hash);
         }
         if bytes_equal_after_strip(&payload_json_full, &remote_json_full, "schemas")?
             && payload_formulas == remote_formulas
@@ -509,10 +549,10 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool, progress: Opti
             .with_context(|| format!("fetching tgt inbox {tgt_id} for drift check"))?;
         let mut remote_bytes = serde_json::to_vec_pretty(&remote_inbox).context("serializing remote inbox")?;
         remote_bytes.push(b'\n');
-        if !tgt_in_sync(remote_bytes.clone(), overlay_paths, &tgt_lockfile, "inboxes", tgt_slug)? {
-            warn(&progress, format!("warning: tgt inboxes/{tgt_slug} has drifted from tgt lockfile (run `rdc pull {tgt}` first); skipping"));
-            skipped += 1;
-            continue;
+        let (in_sync, remote_hash) =
+            tgt_drift_status(remote_bytes.clone(), overlay_paths, tgt_lockfile, "inboxes", tgt_slug)?;
+        if !in_sync {
+            adopt_tgt_drift(&progress, tgt_lockfile, "inboxes", tgt_slug, remote_hash);
         }
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "inboxes")? {
             continue;
@@ -578,10 +618,10 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool, progress: Opti
         };
         let mut remote_bytes = serde_json::to_vec_pretty(remote_template).context("serializing remote email template")?;
         remote_bytes.push(b'\n');
-        if !tgt_in_sync(remote_bytes.clone(), overlay_paths, &tgt_lockfile, "email_templates", tgt_key)? {
-            warn(&progress, format!("warning: tgt email_templates/{tgt_key} has drifted from tgt lockfile (run `rdc pull {tgt}` first); skipping"));
-            skipped += 1;
-            continue;
+        let (in_sync, remote_hash) =
+            tgt_drift_status(remote_bytes.clone(), overlay_paths, tgt_lockfile, "email_templates", tgt_key)?;
+        if !in_sync {
+            adopt_tgt_drift(&progress, tgt_lockfile, "email_templates", tgt_key, remote_hash);
         }
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "email_templates")? {
             continue;
@@ -638,10 +678,10 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool, progress: Opti
         };
         let mut remote_bytes = serde_json::to_vec_pretty(remote).context("serializing remote engine")?;
         remote_bytes.push(b'\n');
-        if !tgt_in_sync(remote_bytes.clone(), overlay_paths, &tgt_lockfile, "engines", tgt_slug)? {
-            warn(&progress, format!("warning: tgt engines/{tgt_slug} has drifted from tgt lockfile (run `rdc pull {tgt}` first); skipping"));
-            skipped += 1;
-            continue;
+        let (in_sync, remote_hash) =
+            tgt_drift_status(remote_bytes.clone(), overlay_paths, tgt_lockfile, "engines", tgt_slug)?;
+        if !in_sync {
+            adopt_tgt_drift(&progress, tgt_lockfile, "engines", tgt_slug, remote_hash);
         }
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "engines")? {
             continue;
@@ -713,10 +753,10 @@ pub async fn run(src: &str, tgt: &str, dry_run: bool, diff: bool, progress: Opti
         };
         let mut remote_bytes = serde_json::to_vec_pretty(remote).context("serializing remote engine field")?;
         remote_bytes.push(b'\n');
-        if !tgt_in_sync(remote_bytes.clone(), overlay_paths, &tgt_lockfile, "engine_fields", tgt_slug)? {
-            warn(&progress, format!("warning: tgt engine-fields/{tgt_slug} has drifted from tgt lockfile (run `rdc pull {tgt}` first); skipping"));
-            skipped += 1;
-            continue;
+        let (in_sync, remote_hash) =
+            tgt_drift_status(remote_bytes.clone(), overlay_paths, tgt_lockfile, "engine_fields", tgt_slug)?;
+        if !in_sync {
+            adopt_tgt_drift(&progress, tgt_lockfile, "engine_fields", tgt_slug, remote_hash);
         }
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "engine_fields")? {
             continue;

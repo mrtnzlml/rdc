@@ -298,13 +298,27 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
     // 6. Run apply for the field-level update sweep. Apply now sees the
     // fully-populated mapping + tgt lockfile and PATCHes only the objects
     // whose canonical content (after URL rewrite + overlay) actually
-    // differs from the tgt remote. Apply returns its summary string; we
-    // print it after the bar is finished.
-    let apply_summary = crate::cli::deploy::apply::run(src, tgt, dry_run, diff, progress.clone())
-        .await
-        .with_context(|| format!(
-            "update phase failed after {creates_done} create(s) succeeded"
-        ))?;
+    // differs from the tgt remote. Apply takes the tgt lockfile by `&mut`
+    // so it can auto-adopt any out-of-band tgt changes detected by its
+    // drift check (refreshing the recorded `content_hash`) without
+    // bailing out — the upcoming PATCH overwrites the drift anyway.
+    let apply_summary = crate::cli::deploy::apply::run(
+        src,
+        tgt,
+        dry_run,
+        diff,
+        progress.clone(),
+        &mut tgt_lockfile,
+    )
+    .await
+    .with_context(|| format!(
+        "update phase failed after {creates_done} create(s) succeeded"
+    ))?;
+    if !dry_run {
+        tgt_lockfile
+            .save(&tgt_paths.lockfile())
+            .with_context(|| format!("saving tgt lockfile to {}", tgt_paths.lockfile().display()))?;
+    }
 
     // 7. Deletes (mirror only), reverse dependency order so children go
     // before their parents. Dry-run reports what would be deleted but
