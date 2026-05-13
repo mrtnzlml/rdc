@@ -648,29 +648,38 @@ async fn deploy_resolves_templates_and_prompts_for_token_owner() {
         .mount(&prod_server).await;
 
     // ── Tgt deploy mocks ─────────────────────────────────────────────────────
-    // Regular hook create (Task 20 will switch to /hooks/create; for now
-    // create_hook still calls POST /hooks). The response carries the tgt
-    // template URL so apply's drift check sees a consistent state.
-    let created_on_tgt = {
+    // The installed body returned by POST /hooks/create (template defaults,
+    // un-customised settings). The reconcile PATCH then applies customisations.
+    let installed_on_tgt = mdh_installed_body(&tgt_api, 700);
+    // The customised body returned by PATCH /hooks/700 and used for the
+    // apply drift check.
+    let customised_on_tgt = {
         let mut b = mdh_snapshot_body(&tgt_api);
         b["id"] = serde_json::Value::from(700u64);
         b["url"] = serde_json::Value::String(format!("{tgt_api}/hooks/700"));
         b["hook_template"] = serde_json::Value::String(format!("{tgt_api}/hook_templates/41"));
+        b["token_owner"] = serde_json::Value::String(format!("{tgt_api}/users/521884"));
         b
     };
-    Mock::given(method("POST"))
-        .and(path("/api/v1/hooks"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(created_on_tgt.clone()))
-        .mount(&prod_server).await;
-    // apply drift check: GET /api/v1/hooks/700
+    // Orphan check: tgt has no hooks yet.
     Mock::given(method("GET"))
-        .and(path("/api/v1/hooks/700"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(created_on_tgt.clone()))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
         .mount(&prod_server).await;
-    // apply may detect drift (e.g. token_owner URL still references src) and issue a PATCH.
+    // Two-call install: POST /hooks/create.
+    Mock::given(method("POST"))
+        .and(path("/api/v1/hooks/create"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(installed_on_tgt.clone()))
+        .mount(&prod_server).await;
+    // Reconcile PATCH /hooks/700.
     Mock::given(method("PATCH"))
         .and(path("/api/v1/hooks/700"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(created_on_tgt.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(customised_on_tgt.clone()))
+        .mount(&prod_server).await;
+    // apply drift check: GET /api/v1/hooks/700.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks/700"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(customised_on_tgt.clone()))
         .mount(&prod_server).await;
 
     // ── Project bootstrap ────────────────────────────────────────────────────
@@ -737,4 +746,15 @@ async fn deploy_resolves_templates_and_prompts_for_token_owner() {
         raw.contains("hook_templates/41"),
         "tgt template id 41 missing from map file:\n{raw}"
     );
+
+    // Task 20: After deploy the tgt lockfile must record the hook with a
+    // positive id (proving the two-call install + PATCH path ran, not just
+    // the pre-pass template resolution).
+    let lf_path = project.path().join(".rdc/state/prod.lock.json");
+    let lf_raw = std::fs::read_to_string(&lf_path).expect("tgt lockfile should exist");
+    let lf: serde_json::Value = serde_json::from_str(&lf_raw).expect("lockfile must be valid JSON");
+    let hook_id = lf["objects"]["hooks"]["master-data-hub"]["id"]
+        .as_u64()
+        .expect("hooks.master-data-hub.id must be an integer in tgt lockfile");
+    assert!(hook_id > 0, "hook id in tgt lockfile must be positive, got {hook_id}");
 }

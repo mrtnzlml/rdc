@@ -277,16 +277,104 @@ pub async fn create_inbox(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
     Ok(())
 }
 
-pub async fn create_hook(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
+pub async fn create_hook(
+    ctx: &mut CreateCtx<'_>,
+    slug: &str,
+    store_plan: Option<&crate::cli::deploy::store_extensions::StorePlan>,
+    remote_hooks_cache: &mut Option<Vec<crate::model::Hook>>,
+) -> Result<()> {
     let payload = read_hook_value(&ctx.src_paths.hooks_dir(), slug)
         .with_context(|| format!("reading src hook '{slug}'"))?;
     let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.hook(slug));
-    let body = shape_create_body(payload, "hooks", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping, &std::collections::BTreeMap::new());
-    let created = ctx
-        .tgt_client
-        .create_hook(&body, None)
-        .await
-        .with_context(|| format!("POST /hooks (creating '{slug}')"))?;
+
+    let mut explicit_subs = std::collections::BTreeMap::new();
+    if let Some(plan) = store_plan {
+        explicit_subs.insert(plan.src_template_url.clone(), plan.tgt_template_url.clone());
+    }
+
+    let created = if let Some(plan) = store_plan {
+        // Shape (rewrite URLs incl. template, apply overlay) but DO NOT strip
+        // server fields yet — we need the full body to build the install
+        // payload and to send the follow-up PATCH.
+        let mut body = payload.clone();
+        rewrite_urls(&mut body, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping, &explicit_subs);
+        if let Some(p) = overlay_paths {
+            apply_overrides(&mut body, p);
+        }
+        // The pre-pass already wrote the resolved token_owner into the
+        // tgt overlay (per-hook or [defaults]); apply_overrides above
+        // picked it up. Confirm by inserting explicitly so we're robust
+        // even when the overlay doesn't carry it yet:
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("token_owner".into(), serde_json::Value::String(plan.token_owner_url.clone()));
+        }
+
+        // Orphan check: lazily list tgt hooks once and cache.
+        if remote_hooks_cache.is_none() {
+            *remote_hooks_cache = Some(
+                ctx.tgt_client
+                    .list_hooks(None)
+                    .await
+                    .context("listing tgt hooks for store-extension orphan check")?,
+            );
+        }
+        let remote = remote_hooks_cache.as_ref().unwrap();
+        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let installed_id = match crate::cli::deploy::store_extensions::find_orphan(
+            remote,
+            &name,
+            &plan.tgt_template_url,
+        ) {
+            Some(orphan) => {
+                eprintln!(
+                    "adopting orphan store-extension hooks/{slug} (id {}) on tgt",
+                    orphan.id
+                );
+                orphan.id
+            }
+            None => {
+                let install_body =
+                    crate::cli::deploy::store_extensions::build_install_body(&body)?;
+                let installed = ctx
+                    .tgt_client
+                    .create_hook_via_install(&install_body, None)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "POST /hooks/create (installing store extension '{slug}' on tgt)"
+                        )
+                    })?;
+                installed.id
+            }
+        };
+
+        // Reconcile PATCH with the full body.
+        let typed: crate::model::Hook = serde_json::from_value(body)
+            .with_context(|| format!("deserializing reconcile body for '{slug}'"))?;
+        ctx.tgt_client
+            .update_hook(installed_id, &typed, None)
+            .await
+            .with_context(|| {
+                format!("PATCH /hooks/{installed_id} (reconciling store extension '{slug}')")
+            })?
+    } else {
+        // Regular hook POST path.
+        let body = shape_create_body(
+            payload,
+            "hooks",
+            overlay_paths,
+            ctx.src_lockfile,
+            ctx.tgt_lockfile,
+            ctx.mapping,
+            &explicit_subs,
+        );
+        ctx.tgt_client
+            .create_hook(&body, None)
+            .await
+            .with_context(|| format!("POST /hooks (creating '{slug}')"))?
+    };
+
+    // Disk + lockfile + mapping — same regardless of which branch created it.
     let tgt_hooks_dir = ctx.tgt_paths.hooks_dir();
     std::fs::create_dir_all(&tgt_hooks_dir)
         .with_context(|| format!("creating {}", tgt_hooks_dir.display()))?;

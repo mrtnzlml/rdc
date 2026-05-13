@@ -129,8 +129,6 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
     std::fs::create_dir_all(src_paths.mapping_dir())
         .with_context(|| format!("creating {}", src_paths.mapping_dir().display()))?;
     mapping.save(&src_paths.mapping_file(src, tgt))?;
-    // Suppress unused-variable warning until Task 20 threads store_plans into create_hook.
-    let _ = &store_plans;
 
     // 0b. Auto-populate the slug-to-slug mapping for objects that already
     // exist in both envs. Without this step the apply sub-step would
@@ -212,6 +210,10 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
             tgt_overlay: &tgt_overlay,
             tgt_client: &tgt_client,
         };
+        // Lazily-populated cache of tgt remote hooks for store-extension
+        // orphan checks. Shared across all hooks in this bootstrap run so
+        // we list at most once.
+        let mut remote_hooks_cache: Option<Vec<crate::model::Hook>> = None;
         for kind in KINDS_IN_DEP_ORDER {
             let Some(slugs) = plan.creates.get(kind) else { continue };
             for slug in slugs {
@@ -234,7 +236,10 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
                         // those flow to the update phase instead.
                         Ok(())
                     }
-                    "hooks" => create_hook(&mut ctx, slug).await,
+                    "hooks" => {
+                        let plan = store_plans.iter().find(|p| p.src_slug == *slug);
+                        create_hook(&mut ctx, slug, plan, &mut remote_hooks_cache).await
+                    }
                     "rules" => create_rule(&mut ctx, slug).await,
                     "labels" => create_label(&mut ctx, slug).await,
                     "engines" | "engine_fields" => {
