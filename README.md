@@ -1,191 +1,48 @@
 # rdc
 
-**Rossum Deployment as Code — snapshot, edit, and deploy Rossum configurations reliably.**
+**Rossum Deployment as Code — snapshot, edit, deploy.**
 
-`rdc` (Rossum Deployment as Code) snapshots Rossum.ai configurations to
-disk for AI-assisted local development, lets you edit them in place, and
-deploys them across environments.
-
-## Opinionated by design
-
-`rdc` does one thing and tries to do it without surprises. There is **one**
-supported workflow:
-
-1. **Pull** an environment into a local snapshot.
-2. **Edit** the snapshot (JSON files, extracted `.py` code, formula sidecars).
-3. **Push** changes back to that environment, or **deploy** them to another
-   environment via `map` / `plan` / `apply`.
-
-That's it. No partial pulls, no per-kind filters, no per-workspace scope
-limiters. The whole environment is the unit of work; an `overlay.toml`
-captures the per-env divergences (names, runtimes, thresholds) so the
-canonical snapshot stays clean.
-
-Defaults are chosen so the tool **just works**: MDH is auto-detected from
-`api_base`, server-managed fields like `modified_at` are ignored at the
-hash layer, transient API errors retry with backoff, color and progress
-bars honor TTY detection, and `rdc push` with no edits exits silently.
-If you find yourself reaching for a flag, it's probably either not there
-on purpose, or the existing default is the one we'd recommend anyway.
-
-## Capabilities
-
-- **Pull** every kind in scope: organization, workspaces, queues,
-  schemas (formula bodies extracted to `formulas/<id>.py`), inboxes,
-  hooks (code extracted to `<slug>.py`), rules, labels, engines,
-  engine fields, workflows, workflow steps, email templates, and MDH
-  collections + indexes. The Data Storage URL is derived from
-  `api_base` — no extra config. Per-queue sub-fetches (schema +
-  inbox) and per-MDH-collection index fetches are pipelined.
-- **Push** locally-edited objects back to the API for hooks, rules,
-  labels, queues, schemas (formula round-trip), inboxes, email
-  templates, engines, and engine fields. Workflows and workflow
-  steps are pull-only (Rossum's API rejects PATCH on these with 405).
-- **Deploy** across environments in one shot via
-  **`rdc deploy <src> <tgt>`**. Bootstraps a fresh target by POSTing
-  every missing resource in dependency order (`workspaces → schemas →
-  queues → inboxes → email_templates → hooks → rules → labels →
-  engines → engine_fields`), rewriting cross-references from src URLs
-  to tgt URLs as each peer is created, and then PATCHing the remaining
-  field-level deltas. Additive by default (tgt-only objects are left
-  intact); pass `--mirror` to delete them. Plan-then-apply with TTY
-  confirmation, idempotent on a synced env (zero API calls). Pass
-  `--dry-run` to print the plan without making any remote changes.
-- **Overlays** are bidirectional: applied on push, stripped on pull
-  (spec §9.3) so cross-env diffs and deploys stay quiet about
-  intentional per-env divergence.
-- **Conflict + drift resolver.** Both pull and push open an
-  interactive `[k]/[r]/[e]/[s]/[a]` resolver on TTY (spec §8.3 / §7.3
-  step 5), including the combined-hash kinds (hooks json+py, schemas
-  json+formulas) — one prompt per differing sub-file. CI / non-TTY /
-  `--yes` keeps the shadow-file / skip-with-warning flow.
-- **Resilience.** Every Rossum and Data Storage HTTP call retries on
-  `429 Too Many Requests` and transient 5xx (502/503/504) with
-  `Retry-After` / exponential backoff (up to 5 attempts).
-- **Auxiliary commands.** `rdc init` accepts flags or runs an
-  interactive wizard; `rdc status` is a read-only health check;
-  `rdc diff` shows unified diffs (local vs remote, or two snapshots);
-  `rdc auth` sets/refreshes tokens; `rdc repair <env>` consolidates
-  local-state fixes — `--rebuild-lock` re-pulls and rewrites the
-  lockfile, `--rename-slugs` renames local files whose JSON `name`
-  has drifted.
-- **Distribution.** Single binary via `curl | sh` (pre-built for
-  darwin x86_64/aarch64, linux x86_64, and windows x86_64) or `cargo
-  install`.
-- **AI-friendly snapshot.** `_index.md` includes a per-kind inventory
-  plus rich per-object entries with names, types, file paths, and
-  inline cross-references (e.g. each hook entry lists its attached
-  queue slugs) so AI agents can navigate without parsing every JSON.
-
-See `docs/superpowers/specs/2026-05-06-rdc-design.md` for the full
-design.
-
-## Upgrade
-
-Keep rdc current with one command:
+`rdc` is the tool for managing Rossum.ai configurations. Pull an environment into a local snapshot, edit it in place, push changes back, promote them to another env. One command per phase. Idempotent re-runs do nothing. There is no second tool to learn.
 
 ```sh
-rdc upgrade
+rdc pull test
+$EDITOR envs/test/hooks/validator-invoices.py
+rdc deploy test prod
 ```
 
-This downloads the latest GitHub release for your platform, runs a
-sanity-check `--version` on the new binary, and swaps it in atomically.
-The previous binary is kept at `<install_dir>/rdc.bak` for one-shot
-rollback (`mv rdc.bak rdc`).
+That's the whole loop.
 
-`rdc upgrade --check` reports the latest available version without
-installing. `rdc upgrade --version v0.0.2` pins to a specific tag —
-useful as an emergency downgrade, but you may need to re-pull
-afterward (see "Compatibility").
+## Goals
 
-**Passive nudge.** Every command does a once-daily check against the
-GitHub Releases API in the background. If a newer release exists, rdc
-prints a one-line `note: rdc vX is available — run \`rdc upgrade\` to install`
-at the top of the command. The check is best-effort: network errors,
-API rate-limits, or unreachable cluster all fail silently — the nudge
-just doesn't appear. Cache lives at `$XDG_CACHE_HOME/rdc/update.json`
-(fallback `~/.cache/rdc/update.json`) on Unix, or
-`%LOCALAPPDATA%\rdc\update.json` on Windows.
+- **Make Rossum configurations editable like code.** Every workspace, queue, schema, hook, rule, label, email template, engine, and MDH dataset lives on disk as plain JSON plus extracted Python — diffable, reviewable, version-controllable.
+- **Make cross-env promotion a single command.** `rdc deploy test prod` bootstraps a fresh target, patches an existing one, rewrites every cross-reference URL on the wire, and is idempotent on subsequent runs. No `map` / `plan` / `apply` triage.
+- **Make AI-assisted editing first-class.** A regenerated `_index.md` per environment gives agents a single entry point to navigate the whole snapshot without parsing every JSON file by hand.
 
-**Install-location detection.** `rdc upgrade` only self-replaces when
-it's safe to do so:
+## Principles
 
-| Install method | `rdc upgrade` behavior |
-|---|---|
-| `install.sh` / manual binary in a writable dir | Self-replaces atomically; previous binary kept as `rdc.bak` (or `rdc.bak.exe` on Windows). |
-| `cargo install --git …` | Refuses — would break cargo's bookkeeping. Prints the right `cargo install --force` invocation instead. |
-| Read-only dir (`/usr/local/bin`, system package manager, `C:\Program Files`, etc.) | Refuses — prints the manual download URL + commands. |
+These are the rules `rdc` follows so you don't have to think about them:
 
-**Self-replace is safe while rdc is running.** On Linux/macOS the
-kernel keeps the running binary's inode alive after its directory
-entry is replaced, so the in-flight `rdc upgrade` process completes
-normally. The swap uses a copy-aside + atomic rename pattern so
-`<install_dir>/rdc` is always a valid binary — a parallel shell tab
-running `rdc` during the upgrade never sees a missing file.
-
-On Windows the OS allows renaming (but not overwriting or deleting) a
-running `.exe`, so the swap renames the current `rdc.exe` aside to
-`rdc.bak.exe` and places the new binary at the original path. The
-in-flight upgrade completes from the renamed file; new invocations
-pick up the new binary. If the placement step fails the rename is
-rolled back so the user never ends up without a working `rdc`.
-
-## Compatibility
-
-- **Backward compat (new binary, old artifacts):** the latest rdc
-  always reads anything produced by any previous release. Lockfile
-  versions migrate forward; project config and overlay tolerate
-  missing fields via serde defaults.
-- **Forward compat (older binary, newer artifacts):** not promised.
-  But artifacts an older binary doesn't understand produce a clear
-  error pointing at `rdc upgrade`, never silent corruption. For
-  example, a downgrade-then-pull scenario where the lockfile was
-  written by a newer rdc errors with: *"lockfile … was written by a
-  newer rdc (lockfile version N, this rdc supports up to version M).
-  Run `rdc upgrade` to install a matching binary."*
-- **Downgrades.** `rdc upgrade --version <older>` is an emergency
-  escape hatch. We don't promise the older binary can still read your
-  snapshot or lockfile cleanly — you may have to delete the lockfile
-  and re-pull.
-
-### Upgrading from older lockfiles
-
-Most rdc upgrades don't touch how `content_hash` is computed and need
-no special handling. The rare exception is a release that changes the
-hash inputs themselves — for example, stripping a new server-managed
-field before hashing. The first pull on a lockfile written before such
-a change can surface false-positive conflicts on every object, because
-old hashes don't match newly-computed ones.
-
-When that happens, clear the storm without resolving each conflict by
-hand:
-
-```sh
-rdc repair --rebuild-lock <env>
-```
-
-Subsequent pulls will be clean. Real edits made before re-baselining
-remain visible — `repair` only resets the hash; it does not discard
-local edits.
-
-Hash-input changes are treated as semver-breaking events: they happen
-rarely, and the release notes will say so explicitly when they do. This
-keeps the day-to-day upgrade path quiet, with `repair --rebuild-lock`
-reserved as the one-shot recovery whenever a release notes flags it.
+- **Just works.** Defaults are the recommendations. If you reach for a flag, it's probably either not there on purpose, or the existing default is the one to use.
+- **Plan before apply.** Every command that touches the remote shows what it will do, asks once on a TTY, and accepts `--yes` for CI. `--dry-run` runs the same code paths without writing anywhere.
+- **Idempotent everywhere.** Re-running `rdc pull` on a clean environment writes nothing. Re-running `rdc deploy` on a synced env is zero API calls. Re-running `rdc push` after a successful push exits silently.
+- **The environment is the unit of work.** No partial pulls, no per-kind filters, no per-workspace scope limiters. Whole envs in, whole envs out.
+- **Snapshot is canonical.** The on-disk files are the source you edit; remote is reconciled toward them. Per-env divergences (display names, runtimes, thresholds) live in `overlay.toml` so the canonical snapshot stays clean.
+- **Cross-references resolve automatically.** When `rdc deploy` POSTs a hook to PROD that references TEST queue URLs, the body sent has those URLs rewritten to the matching PROD queue URLs. The user never sees this.
+- **Errors are actionable.** A missing `rdc.toml` says "not an rdc project — run `rdc init` here." A drifted target says "run `rdc pull <env>` first." A failed token says "Invalid token (401)."
+- **Atomic on disk.** All writes go through a temp-file rename. A crash mid-write never leaves a half-written JSON.
+- **Resilient on the wire.** Transient HTTP errors (`429`, `502`, `503`, `504`) retry with exponential backoff up to 5 attempts.
 
 ## Install
 
-Quickest path (macOS + Linux x86_64):
+Single binary via `curl | sh` (macOS + Linux x86_64):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/mrtnzlml/rossum-deployment-manager-experiment/main/install.sh | sh
 ```
 
-Downloads the matching pre-built binary from the latest GitHub release
-and installs it to `~/.local/bin/rdc`. Add that directory to your `PATH`
-if it isn't already.
+Downloads the matching pre-built release into `~/.local/bin/rdc`. Add that directory to your `PATH` if it isn't already.
 
-To install a specific version:
+Pin to a specific version:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/mrtnzlml/rossum-deployment-manager-experiment/main/install.sh | sh -s -- v0.0.1
@@ -194,76 +51,44 @@ curl -fsSL https://raw.githubusercontent.com/mrtnzlml/rossum-deployment-manager-
 Windows (PowerShell):
 
 ```powershell
-# Adjust $dest if you prefer somewhere other than %USERPROFILE%\.rdc\bin.
 $dest = "$env:USERPROFILE\.rdc\bin"
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 Invoke-WebRequest -Uri "https://github.com/mrtnzlml/rossum-deployment-manager-experiment/releases/latest/download/rdc-x86_64-pc-windows-msvc.tar.gz" -OutFile "$env:TEMP\rdc.tar.gz"
 tar -xzf "$env:TEMP\rdc.tar.gz" -C $dest
-# Add $dest to your PATH (one-time):
 [Environment]::SetEnvironmentVariable("Path", "$env:Path;$dest", "User")
 ```
 
-Or build from source with Rust:
+From source:
 
 ```sh
 cargo install --git https://github.com/mrtnzlml/rossum-deployment-manager-experiment
-# or, in a clone:
-cargo install --path .
 ```
 
-**Supported pre-built platforms:** macOS (Intel + Apple Silicon),
-Linux x86_64, Windows x86_64. For Linux aarch64, Windows aarch64, or
-other platforms, build from source.
+Supported pre-built platforms: macOS (Intel + Apple Silicon), Linux x86_64, Windows x86_64. For Linux aarch64 / Windows aarch64 / other, build from source.
 
-## Quick start
+## A 60-second tour
 
 ```sh
 mkdir my-rossum-project && cd my-rossum-project
 
-# Bootstrap. Two modes:
-#   1. Non-interactive (CI-friendly):
-rdc init --env dev=https://YOUR-ORG.rossum.app/api/v1:YOUR_ORG_ID
-#   2. Interactive wizard (when run from a terminal with no flags):
-rdc init
-# → loops over env name + api_base + org_id; blank env name finishes
-#
-# Re-running `rdc init` in an existing project adds a new environment
-# rather than failing. Existing envs are preserved.
+# Bootstrap. Repeatable: re-running adds new envs without disturbing the existing ones.
+rdc init --env test=https://your-org.rossum.app/api/v1:123456 \
+         --env prod=https://your-org.rossum.app/api/v1:789012
 
-# After init, set the API token (one of these):
-rdc auth dev --token YOUR_TOKEN          # validates + writes secrets/dev.secrets.json (mode 0600)
-echo '{"api_token":"YOUR_TOKEN"}' > secrets/dev.secrets.json
-export RDC_TOKEN_DEV=YOUR_TOKEN
+# Set tokens. Validated against the Rossum API before writing the 0600-mode secrets file.
+rdc auth test --token <test-token>
+rdc auth prod --token <prod-token>
 
-# MDH (Master Data Hub) is pulled automatically when available — the
-# data storage URL is derived from api_base, so there's no extra
-# config to set. On clusters without MDH the lookup returns 404 and
-# rdc skips silently.
-
-# Pull a complete snapshot of the env into envs/dev/.
-rdc pull dev
+# Pull both envs.
+rdc pull test
+rdc pull prod
 ```
 
-Sample pull output (TTY):
+`envs/test/` now contains the complete snapshot:
 
 ```
-⠁ workspaces  listing…
-✓ workspaces: 12 items, 2.1s
-⠁ queues      listing…
-✓ queues: 23 items, 2 orphans skipped, 4.7s
-⠁ hooks       listing…
-✓ hooks: 30 items, 3.4s
-…
-✓ pull envs/dev: 256 items, 2 orphans skipped, 0 conflicts  18.6s
-```
-
-In non-TTY mode (CI / piped output), spinners are replaced with `→ kind: listing…` lines.
-
-After `rdc pull dev`, `envs/dev/` contains:
-
-```
-envs/dev/
-├── _index.md                   ← generated inventory of every object
+envs/test/
+├── _index.md                   ← generated inventory + cross-references
 ├── organization.json
 ├── workspaces/
 │   └── invoices-ap/
@@ -272,357 +97,190 @@ envs/dev/
 │           └── cost-invoices/
 │               ├── queue.json
 │               ├── schema.json
-│               ├── inbox.json   (only if the queue has an inbox)
-│               ├── formulas/    (one .py per datapoint with a formula)
+│               ├── inbox.json
+│               ├── formulas/
 │               │   └── amount_total.py
 │               └── email-templates/
-│                   ├── annotation-status-change-confirmed.json
 │                   └── default-rejection-template.json
 ├── hooks/
 │   ├── validator-invoices.json
-│   └── validator-invoices.py    (extracted from config.code)
+│   └── validator-invoices.py    ← extracted from config.code
 ├── rules/
-│   ├── e-invoice-validation.json
-│   └── e-invoice-validation.py  (extracted from trigger_condition)
+│   ├── validate-totals.json
+│   └── validate-totals.py       ← extracted from trigger_condition
 ├── labels/
-├── engines/
-│   └── <engine-slug>/
-│       ├── engine.json
-│       └── fields/<field-slug>.json    (engine fields nest under their engine)
-├── workflows/
-│   └── <workflow-slug>/
-│       ├── workflow.json
-│       └── steps/<step-slug>.json      (workflow steps nest under their workflow)
-└── mdh/                         (only when the cluster has MDH)
-    └── <dataset-slug>/
+└── mdh/                         ← only on clusters with MDH
+    └── customers/
         ├── collection.json
         └── indexes.json
 ```
 
-The lockfile (`.rdc/state/dev.lock.json`) records each object's
-`id`, `url`, `modified_at`, and a `content_hash` of what was just
-written. It is the **merge base** for the three-way comparison on
-subsequent pulls and pushes.
-
-`rdc pull` is **idempotent**: running it again with no remote changes
-writes nothing.
-
-## Editing the snapshot
-
-Most kinds are plain JSON files; edit them directly.
-
-For files with extracted code, edit the `.py` file, **not** the JSON:
-
-- **Hook code** lives in `envs/<env>/hooks/<slug>.py`. The JSON's
-  `config.code` is stripped on pull and re-inlined on push. Don't edit
-  `config.code` in the JSON — the `.py` file is the source of truth.
-- **Schema formulas** live in
-  `envs/<env>/workspaces/<ws>/queues/<q>/formulas/<field-id>.py`. The
-  JSON's `formula` properties are stripped on pull and re-inlined on push.
-
-After any edit, `rdc push <env>` sends the change.
-
-## Push
-
-`rdc push <env>` runs in two phases: first it scans all local files against
-the lockfile hashes (phase 1), then PATCHes only the changed objects (phase 2).
-If nothing has changed, push exits immediately with a single summary line.
-
-Sample push output (TTY):
-
-```
-⠁ push envs/dev  listing…
-✓ push envs/dev: 256 files scanned, 1 changed
-⠁ hooks  listing…
-✓ hooks: 1 patched, 0.6s
-✓ push envs/dev: 1 patched  1.0s
-```
-
-In non-TTY mode (CI / piped output), spinners are replaced with `→ kind: listing…` lines.
-
-Each candidate is compared against the lockfile's `content_hash`:
-
-- **No local edits** → skipped silently.
-- **Local edits, remote unchanged since last pull** → PATCH succeeds.
-- **Local edits AND remote drifted** → resolver opens (TTY) or skip
-  + warning (non-TTY / `--yes`). See "Push drift resolver" below.
-- **No lockfile entry** → treated as a **new resource** and POSTed. See
-  "Creating new resources" below.
-
-After a successful push, the local file is rewritten with the server's
-authoritative response so the lockfile hash matches the file bytes.
-Subsequent pulls are idempotent.
-
-### Creating new resources
-
-You can create remote objects by authoring local files and pushing them.
-There is no separate `rdc create` command — push detects "local file
-exists, no lockfile entry" and POSTs.
-
-**Workflow:**
-
-1. Author the JSON. Omit `id` and `url` (the server assigns them). For a
-   new hook, write `envs/<env>/hooks/<slug>.json` with `name`, `type`,
-   `events`, `config` plus any optional fields. If the hook has code,
-   author `envs/<env>/hooks/<slug>.py` next to it — push splices it into
-   `config.code` automatically.
-
-2. Run `rdc push <env>`. Each new object is POSTed; the server's
-   response (with `id`, `url`, timestamps) is written back to disk in
-   canonical form; the lockfile is updated.
-
-**Supported kinds**: workspaces, schemas, queues, inboxes, hooks, rules,
-labels, engines, engine fields, email templates. Workflows and workflow
-steps are read-only at the API and cannot be created.
-
-**Dependency order within a single push**: workspaces → schemas →
-queues → inboxes → email templates → hooks/rules/labels/engines/engine
-fields. Cross-references between objects are URL-based, and the server
-needs the referenced URL to exist when the request lands. **`rdc push`
-does not substitute URLs across newly-created peers within a single
-push** (linear-push model — no topological URL resolution).
-
-If you're creating multiple objects with cross-references — say, a new
-queue that references a new schema — the right workflow is:
-
-1. Create the schema first (author `schema.json`, push). After the POST
-   succeeds, the server's `id` and `url` end up in your local file and
-   lockfile.
-2. Copy the schema's new `url` into the queue's `schema` field.
-3. Push again to create the queue.
-
-For independent creates (e.g. a new hook that references existing
-queues by URL), a single push is enough.
-
-**Slug uniqueness**: the file's slug must not already exist in the
-lockfile — that path is the "update existing" path. To create a similar
-object, pick a different slug.
-
-**Server-assigned fields** (`id`, `url`, `created_at`, `created_by`,
-`modified_at`, `modified_by`, `status`, plus kind-specific computed
-fields like `queues` on a workspace or `hooks` on a queue) are stripped
-from the outbound POST body. If you accidentally leave a stale `id`
-from another env in your file, it's silently dropped — the new object
-gets a fresh id.
-
-Sample stderr line on a successful create:
-
-```
-created hooks/my-new-hook (id 555)
-```
-
-### Push drift resolver
-
-When a remote object has changed since you last pulled, push uses the
-same `[k]/[r]/[e]/[s]/[a]` shape as pull but with push-side semantics
-(spec §7.3 step 5):
-
-| Choice | Effect |
-|--------|--------|
-| `k` | **Force-push.** Send the local payload to the API anyway, overwriting the remote drift. |
-| `r` | **Adopt remote.** Write the remote bytes to the local file and update the lockfile to match. No PATCH. Your local edit is discarded. |
-| `e` | **Edit then force-push.** Open `$EDITOR` on a temp file with conflict markers; the saved bytes become the PATCH payload. |
-| `s` | **Skip.** Leave both local and remote alone — same as the non-TTY fallback. |
-| `a` | **Abort.** Stop the push entirely; lockfile is not saved. Re-running picks up where you left off. |
-
-Without a TTY (or with `--yes`), every drift falls back to `s` (skip
-with warning) — same as before.
-
-**Writable kinds:** hooks, rules, labels, schemas (with formula
-bodies), queues, inboxes, email templates, engines, engine fields.
-Schema push splices extracted formulas back into `content[]` before
-sending. Email-template push walks the queue-scoped
-`email-templates/` directories.
-
-**Pull-only kinds:**
-- **Workflows + workflow steps** — Rossum's API is read-only for
-  these (`OPTIONS` returns `Allow: GET, HEAD, OPTIONS`). The
-  snapshot captures them so you can review changes, but `rdc push`
-  and `rdc deploy` cannot send updates back.
-- **MDH collections + indexes** — push not yet implemented.
-
-If your token lacks permission for a writable kind (e.g. engines on
-some plans return 403), `rdc pull` warns and skips that kind, leaving
-other kinds intact.
-
-**Dry-run preview:**
+Edit a hook's Python:
 
 ```sh
-rdc push <env> --dry-run
+$EDITOR envs/test/hooks/validator-invoices.py
 ```
 
-Runs the same scan but prints the per-kind list of slugs that would
-be POSTed / PATCHed without sending anything. The same flag exists on
-`rdc deploy` for cross-env previews.
-
-## Status — health check
-
-`rdc status [env]` prints a read-only summary per env: token
-presence, auth, lockfile, and which local files differ from the
-lockfile (= what `rdc push` would attempt to send). With no
-argument, runs for every env defined in `rdc.toml`.
-
-## Diff — see what changed
-
-Two modes, both read-only:
-
-`rdc diff <env>` — compares the local snapshot against what the
-remote API currently returns. One GET per object; no PATCHes.
+See what changed:
 
 ```sh
-$ rdc diff dev
---- hooks/validator-invoices.py (local)
-+++ hooks/validator-invoices.py (remote)
-@@ -1,3 +1,2 @@
- def validate(payload):
-     return {}
--# my local edit
-```
-
-`rdc diff <a> <b>` — compares two local snapshots without touching
-the API. Useful for "what's different between TEST and PROD?".
-
-```sh
-$ rdc diff test prod
---- hooks/validator-invoices.json (in test)
-+++ hooks/validator-invoices.json (in prod)
-@@ -3,4 +3,4 @@
-   "name": "Validator: invoices",
--  "config": { "runtime": "python3.12" }
-+  "config": { "runtime": "python3.11" }
-```
-
-Output is a standard unified diff (3 lines of context). If a file
-exists in only one snapshot, the missing side is reported.
-
-
-
-```
-$ rdc status dev
-Env 'dev'
-  api_base: https://YOUR-ORG.rossum.app/api/v1
+$ rdc status test
+Env 'test'
+  api_base: https://your-org.rossum.app/api/v1
   org_id:   123456
   token:    present
-  auth:     ok (org 'YOUR-ORG', id 123456)
-  lockfile: v2, 48 objects across 10 kinds
+  auth:     ok
+  lockfile: v2, 256 objects across 11 kinds
   edits:    1 file(s) differ from lockfile:
             hooks/validator-invoices
 ```
 
-The `edits:` line lists everything `rdc push` would consider
-sending. It does not call the API beyond the auth check, and it
-does not modify any files.
+Send the edit to test:
 
-## Conflict handling
-
-**Noise-field suppression:** Server-managed fields (`modified_at`, `modifier`)
-no longer contribute to the `content_hash`. A re-pull where only those fields
-have changed is a no-op — the bar shows zero conflicts and the on-disk file
-is unchanged. This eliminates a class of spurious conflicts that previously
-affected all lockfiles written before this algorithm change.
-
-`rdc pull` does three-way merge for every kind:
-
-| Local edited? | Remote changed? | Action |
-|---|---|---|
-| no | no | (no-op) |
-| no | yes | write the remote |
-| yes | no | keep local |
-| yes | yes | **conflict** — see resolver below |
-
-For schemas, the "combined hash" covers `schema.json` plus every
-`formulas/<id>.py` file, so a formula-only edit is detected correctly.
-For hooks, the combined hash covers `<slug>.json` plus `<slug>.py`.
-
-### Interactive resolver (TTY)
-
-When stdin is a TTY and `--yes` was not passed, `rdc pull` opens an
-inline resolver per conflict (spec §8.3):
-
-```text
-[1/3]  envs/dev/labels/audit-hold.json — conflict
-
---- local
-+++ remote
-@@ -1,7 +1,7 @@
- {
-   "id": 9931,
--  "name": "Audit hold (LOCAL EDIT)",
-+  "name": "Audit hold",
-   ...
-
-[k]eep local  [r]emote  [e]dit  [s]kip (shadow file)  [a]bort >
+```sh
+$ rdc push test
+✓ push envs/test: 1 patched, 0.6s
 ```
 
-| Choice | Effect |
-|--------|--------|
-| `k` | Keep local. No write. Lockfile records the local hash. |
-| `r` | Overwrite local with the remote bytes. Lockfile records the remote hash. |
-| `e` | Open `$EDITOR` on a temp file containing git-style conflict markers. Saved bytes become the new local + lockfile hash. |
-| `s` | Skip — fall back to the shadow-file behavior (writes `<file>.remote`, keeps local). |
-| `a` | Abort the entire pull. The lockfile is **not** saved; nothing else is written from this point on. |
+Promote everything that's diverged from prod into prod:
 
-The resolver covers every kind that uses a single JSON file (queues,
-inboxes, rules, labels, engines, engine fields, workflows, workflow
-steps, email templates, MDH metadata) **and** combined-hash kinds
-(hooks `.json` + `.py`, schemas `schema.json` + `formulas/*.py`). For
-combined-hash kinds the resolver walks each sub-file in turn — you
-can keep the local JSON but take the remote `.py`, for example. The
-`[N/M]` header reflects the per-entity sub-file count (e.g. `[2/2]`
-for the second of two files in a hook). One niche case stays on the
-shadow-file flow even on TTY: a hook that adds/removes its `.py` file
-between local and remote, or a schema whose formula set differs (one
-side added a formula the other doesn't have). Add/remove decisions
-aren't `[k]/[r]/[e]` shaped; resolve them by editing locally and
-re-running pull.
+```sh
+$ rdc deploy test prod
+Plan: test → prod
+  + create:  (none)
+  ~ update:  field-level deltas
 
-### Conflict colors
-
-When run in a TTY, `rdc pull` colorizes conflict prompts: the header is
-bold yellow, `-` (local) lines are red, `+` (remote) lines are green,
-hunk markers (`@@`) are cyan, and action letters (`[k]/[r]/[e]/[s]/[a]`)
-are bold cyan. To force plain output, set `NO_COLOR=1` or pass `--no-color`.
-
-### Non-interactive / CI (`--yes` or non-TTY)
-
-Without a TTY (CI, output piped, or `--yes`), conflicts fall back to
-the legacy shadow-file behavior: the local file is preserved and the
-remote is written to `<file>.remote` next to it. A per-conflict
-warning goes to stderr and the count appears in the summary line.
-
-After a conflict, the local copy is canonical; review the
-`<file>.remote` (and `<dir>.remote/` for schema formulas), then either
-delete it (keep local) or overwrite the local file with it (take
-remote) and re-run pull.
-
-`rdc pull` also regenerates `envs/<env>/_index.md`, an
-inventory-by-kind plus a cross-references section. Don't edit it
-by hand.
-
-Each per-kind section answers "what's attached to what" inline, so AI
-agents and humans can jump from any object to its related ones without
-grepping every JSON. Hooks, rules and email templates each list their
-attached queue slugs next to their entry; workspaces list their queues:
-
-```markdown
-## hooks
-
-- `validator-invoices` (id 1234567)
-  - name: "Validator: invoices"
-  - type: function · events: [annotation_content.initialize, …]
-  - path: hooks/validator-invoices.json (+ hooks/validator-invoices.py)
-  - queues: `cost-invoices`, `utility-bills`
+Proceed? [y/N] y
+Applied 1 hooks (1 PATCHes) from test to prod
+Deployed test → prod: 0 created, 0 deleted, 2 API calls, 1.4s
 ```
 
-URLs are resolved to slugs via the lockfile, so the cross-refs reflect
-exactly what's in the snapshot. Orphan refs (URLs whose target isn't in
-the snapshot) are silently dropped.
+Re-running yields `0 PATCHes`. The whole environment is now in sync.
+
+## Mental model
+
+Three local primitives plus one remote source of truth. Knowing them makes everything else obvious.
+
+- **`envs/<env>/`** — the **snapshot**. Plain JSON files plus extracted `.py` code. This is what you edit. `rdc pull` reconciles remote → snapshot; `rdc push` and `rdc deploy` reconcile snapshot → remote.
+- **`.rdc/state/<env>.lock.json`** — the **lockfile**. Per-object `content_hash` from the last successful pull/push. Serves as the merge base for three-way comparison. Auto-managed; commit to git alongside the snapshot.
+- **`envs/<env>/overlay.toml`** — the **overlay**. Per-env values applied on push, stripped on pull. Optional, but the right tool for divergences like "PROD's hooks use `python3.12-secure` while TEST's use `python3.12`."
+- **The remote API** — the source of truth for what's actually running.
+
+Cross-references between resources are URL-based. `rdc deploy` rewrites them automatically when moving objects between envs, using the slug-to-slug mapping stored in `.rdc/map/<src>→<tgt>.toml` (built silently on first deploy; hand-edit for renames).
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `rdc init` | Create a new project, or add an env to an existing one. |
+| `rdc auth <env>` | Set/refresh the API token for `<env>`. Validates before writing. |
+| `rdc pull <env>` | Mirror the remote into `envs/<env>/`. Three-way merges on conflict. |
+| `rdc push <env>` | Send local edits in `<env>` back to its remote. POSTs when no lockfile entry exists. |
+| `rdc deploy <src> <tgt>` | One-shot cross-env promotion. Plan-then-apply with confirmation. |
+| `rdc status [<env>]` | Auth + lockfile health + pending edits + pending renames. Read-only. |
+| `rdc diff <env>` | Local-vs-remote diff (one GET per edited object). |
+| `rdc diff <a> <b>` | Two snapshots, no API calls. |
+| `rdc repair <env>` | Local-state surgery. `--rebuild-lock` re-pulls; `--rename-slugs` realigns stale filenames. |
+| `rdc upgrade` | Self-update the binary. |
+
+Every command that writes to the remote (`push`, `deploy`) takes `--dry-run` to print the plan without sending anything.
+
+## Edit the snapshot
+
+Most files are plain JSON; open them in your editor and save. After any edit, `rdc status <env>` lists the changed files and `rdc push <env>` sends them.
+
+For objects with extracted code, the on-disk layout splits one logical object into two files. The JSON describes the object; the `.py` carries the code. **Always edit the `.py`** — pull strips the inlined field on save and push splices it back in.
+
+| Kind | On-disk files |
+|---|---|
+| Hook with Python | `hooks/<slug>.json` + `hooks/<slug>.py` |
+| Rule with trigger | `rules/<slug>.json` + `rules/<slug>.py` |
+| Schema with formulas | `workspaces/<ws>/queues/<q>/schema.json` + `…/formulas/<field-id>.py` |
+
+### Create a new object
+
+Author the JSON (and any `.py`) directly. Omit `id` and `url` — the server assigns them. Push detects "local file exists, no lockfile entry" and POSTs:
+
+```sh
+$ cat > envs/test/labels/audit-hold.json <<'JSON'
+{ "name": "Audit hold", "organization": "https://your-org.rossum.app/api/v1/organizations/123456" }
+JSON
+$ rdc push test
+created labels/audit-hold (id 10198)
+```
+
+The server's response (with `id`, `url`, timestamps) is written back to disk in canonical form, and the lockfile records the new object.
+
+Supported kinds for create: workspaces, schemas, queues, inboxes, hooks, rules, labels, engines, engine fields, email templates. Workflows and workflow steps are read-only at the Rossum API.
+
+### Preview a push
+
+```sh
+rdc push test --dry-run
+```
+
+Lists every changed file and which kind would receive a POST/PATCH — no API calls made.
+
+## Promote test → prod
+
+The one-line answer is `rdc deploy test prod`. The details:
+
+```
+Plan: test → prod
+  + create:  4 workspaces, 24 schemas, 24 queues, 27 hooks, 1 rule, 46 labels
+  ~ update:  field-level deltas (resolved at execute time)
+
+Proceed? [y/N] y
+
+  → workspaces       4 created
+  → schemas         24 created
+  → queues          24 created
+  → hooks           27 created
+  → rules            1 created
+  → labels          46 created
+Applied 22 hooks, 0 rules, 0 labels, ... (22 PATCHes) from test to prod
+
+Deployed test → prod: 126 created, 0 deleted, 144 API calls, 89.1s
+```
+
+What's happening inside:
+
+1. **Auto-mapping.** Same-slug objects in `test` and `prod` are paired silently. Hand-curated renames in `.rdc/map/test→prod.toml` are preserved.
+2. **Plan.** What would be created, what would be patched, what would be deleted (`--mirror` only).
+3. **Confirm.** TTY prompts; CI passes `--yes`.
+4. **Create.** Dependency order: `workspaces → schemas → queues → inboxes → email_templates → hooks → rules → labels → engines → engine_fields`. POSTing each missing resource. Each create updates an in-memory mapping so the next kind's URL rewriter knows where the just-created peers live.
+5. **Update.** Per-kind PATCH sweep. Fetches the tgt remote for drift check, normalises both sides (strip env-specific `id` / `url` / `organization` + noise fields, sort set-like arrays), and PATCHes only when content differs. Re-running yields `0 PATCHes`.
+6. **Delete** (with `--mirror`). Reverse dependency order. Two confirmations: one for the deploy as a whole, a second specifically for the destructive section.
+
+### Preview a deploy
+
+```sh
+rdc deploy test prod --dry-run
+```
+
+Traces the same code paths — drift checks, URL rewrites, overlay application, idempotency comparison — but suppresses every actual POST/PATCH/DELETE. The wording switches to "would be created" so you can't mistake the report for a real run.
+
+### Mirror mode
+
+```sh
+rdc deploy test prod --mirror
+```
+
+Adds a `- delete:` section to the plan. Objects in `tgt` without a matching slug in `src` are removed (reverse dependency order, children first). `--yes` does **not** bypass the mirror confirmation — it's asked separately because the deletions are irreversible.
+
+### Cross-references handled automatically
+
+When a hook in `src` references `https://test.rossum.app/api/v1/queues/600`, the body sent to `tgt` has that URL rewritten to `https://prod.rossum.app/api/v1/queues/<prod-queue-id>`. Same mechanism for `queue.workspace`, `queue.schema`, `email_template.queue`, `rule.queues`, `hook.run_after`. Strings that don't match a known src object are left alone.
+
+Server-computed back-references like `queue.hooks` or `email_template.triggers` are stripped before sending — they're populated by the API based on each child's parent URL, not by client input.
+
+### Auto-created peers
+
+`POST /queues` triggers Rossum to auto-create five default email templates per queue. Deploy lists them right after each queue POST, captures them into the tgt lockfile, and the later update sweep PATCHes them with src-side customisations. You don't see this; it just works.
 
 ## Overlays — per-env values
 
-`envs/<env>/overlay.toml` declares values that should always be set
-when pushing to that env, regardless of what the snapshot says. Useful
-for per-env names, runtimes, automation thresholds.
+Some values are intrinsically per-env: a friendly display name, a hardened runtime version, a webhook URL pointing at the env's own observability endpoint. `envs/<env>/overlay.toml` declares them once:
 
 ```toml
 version = 1
@@ -636,319 +294,144 @@ version = 1
 
 [queues.cost-invoices]
 "automation_level" = "always"
-
-[email_templates."invoices-ap/cost-invoices/default-rejection-template"]
-"subject" = "[PROD] Your invoice was rejected"
 ```
 
-The overlay's dotted-path keys are bidirectional:
+Bidirectional:
 
-- **On push**, they're merged into the outbound PATCH body, overwriting
-  any value at that path. The remote ends up with the env-specific
-  value.
-- **On pull** (spec §9.3), they're stripped from the snapshot
-  before write. The on-disk JSON reflects the canonical (pre-overlay)
-  form, so `rdc diff test prod` and `rdc deploy test prod` stay quiet
-  about env-specific differences. The lockfile records the stripped
-  hash, so subsequent pulls and pushes are idempotent.
+- **On push/deploy**, overlay values are merged into the outbound body. PROD ends up with `"Validator (PROD)"`.
+- **On pull**, overlay values are stripped from the snapshot before write. The on-disk JSON shows the canonical pre-overlay form, so `rdc diff test prod` stays quiet about intentional divergences.
 
-Round-trip: TEST and PROD snapshots agree on the canonical content.
-Each env's `overlay.toml` declares the env-specific deltas. Push
-re-applies them on the way out; pull strips them on the way in.
+The lockfile records the stripped hash, so subsequent pulls and pushes are idempotent.
 
-**Sections:** `[hooks.<slug>]`, `[rules.<slug>]`, `[labels.<slug>]`,
-`[schemas.<queue-slug>]`, `[queues.<queue-slug>]`,
-`[inboxes.<queue-slug>]`, `[engines.<slug>]`,
-`[engine_fields.<slug>]`,
-`[email_templates."<ws-slug>/<q-slug>/<template-slug>"]`.
+Sections: `[hooks.<slug>]`, `[rules.<slug>]`, `[labels.<slug>]`, `[schemas.<queue-slug>]`, `[queues.<queue-slug>]`, `[inboxes.<queue-slug>]`, `[engines.<slug>]`, `[engine_fields.<slug>]`, `[email_templates."<ws>/<q>/<template>"]`.
 
-**Limitations:**
-- Simple dotted paths only; no JMESPath wildcards or array filters.
-- The overlay must exist BEFORE you pull. If you add an overlay
-  after pulling, the next pull strips and the next push re-applies
-  — but the lockfile's pre-strip hash will now mismatch, which the
-  drift check surfaces as "remote has changed". Run `rdc pull` once
-  more after editing the overlay to re-baseline.
+If you add an overlay after a pull, run `rdc pull` once more to re-baseline — the lockfile's pre-strip hash won't match the new post-strip form otherwise.
 
-## Stale slugs — `rdc repair <env> --rename-slugs`
+## Conflicts & drift
 
-Slugs in the snapshot are sticky to the Rossum object ID: once a hook
-has `validator-invoices` as its slug, that slug stays there even if
-the hook is later renamed on the remote. This is intentional — cross-
-references stay valid, pull stays idempotent, file paths don't churn.
+A three-way merge runs on every pull. When both local and remote have diverged since the last sync, an inline resolver opens on TTY:
 
-The trade-off is cosmetic staleness: `hooks/validator-invoices.json`
-whose JSON says `"name": "Validator Invoices v2"`.
+```
+[1/3]  envs/test/labels/audit-hold.json — conflict
 
-`rdc repair <env> --rename-slugs` is the explicit user-driven action
-that brings stale slugs into alignment. **Pull never moves files** —
-it stays clean for review. When you're ready to commit the renames in
-a single, easy-to-review diff, run:
+--- local
++++ remote
+@@ -1,7 +1,7 @@
+ {
+   "id": 9931,
+-  "name": "Audit hold (LOCAL EDIT)",
++  "name": "Audit hold",
+   …
+
+[k]eep local  [r]emote  [e]dit  [s]kip (shadow file)  [a]bort >
+```
+
+| Choice | Effect |
+|---|---|
+| `k` | Keep local. Lockfile records the local hash. |
+| `r` | Overwrite local with remote. Lockfile records the remote hash. |
+| `e` | Open `$EDITOR` on git-style conflict markers. The saved bytes become the new local + lockfile hash. |
+| `s` | Skip. Local kept; remote written to `<file>.remote` for review. |
+| `a` | Abort. Nothing else writes from this point. |
+
+`rdc push` uses the same shape with push-side semantics: `k` force-pushes local, `r` adopts remote and discards your local edit, `e` edits then force-pushes, `s` skips with warning, `a` aborts.
+
+CI / non-TTY / `--yes` falls back to the shadow-file flow: local stays on disk, remote lands at `<file>.remote`, summary lists the count. Resolve by editing locally and re-running.
+
+## Recover from drift
+
+`rdc repair <env>` is the umbrella for local-state surgery. Pick one mode — neither runs implicitly because both touch on-disk files in irreversible ways:
+
+| Flag | What it does | Online? |
+|---|---|---|
+| `--rebuild-lock` | Back up the existing lockfile and re-pull from scratch. Used after lockfile corruption or a hash-input change in a new `rdc` release. **Local edits are lost.** | yes |
+| `--rename-slugs` | Rename any local file whose slug no longer matches its JSON `name`. Cascade-aware: renaming a workspace moves the whole subtree, renaming a queue carries its schema / inbox / formulas / email-templates along. | no |
+
+Slugs in the snapshot are sticky to the Rossum object ID: once a hook has `validator-invoices` as its slug, that slug stays there even if the hook is later renamed on the remote. This is intentional — cross-references stay valid, pull stays idempotent, file paths don't churn. `rdc repair <env> --rename-slugs` is the explicit user-driven action that brings stale slugs into alignment when you're ready to commit the renames in a reviewable diff.
 
 ```sh
-rdc repair dev --rename-slugs           # interactive: y/N per rename
-rdc repair dev --rename-slugs --yes     # apply all without prompting
-rdc repair dev --rename-slugs --check   # list pending without writing anything
+rdc repair test --rename-slugs            # interactive: y/N per rename
+rdc repair test --rename-slugs --yes      # apply all without prompting
+rdc repair test --rename-slugs --check    # list pending, no writes
 ```
 
-The command is offline (no API calls) and **cascade-aware**:
+Pull surfaces pending renames in its summary; `rdc status` lists each one per env.
 
-- Renaming a workspace moves the entire `workspaces/<old>/` directory
-  to `<new>/` (one OS call, all children come along) and rewrites the
-  leading segment of every `email_templates` compound key in the
-  lockfile.
-- Renaming a queue moves the queue directory (schema.json, inbox.json,
-  formulas/, email-templates/ all move with it) and rewrites the
-  `queues`, `schemas`, `inboxes` lockfile entries plus the middle
-  segment of every `email_templates` compound key under that queue.
-- Renaming a hook moves both `<slug>.json` and `<slug>.py`.
-- Renaming refuses (and warns) when the new slug would collide with
-  another existing slug.
+## File layout
 
-Pull surfaces pending renames at the end of its summary; `rdc status`
-lists each pending rename per env.
-
-If `overlay.toml` or `.rdc/map/*.toml` reference an old slug, the
-command **warns but does not modify** those files — they're user-
-authored configs.
-
-For cross-env promotion, see **`rdc deploy`** below — there's no
-separate `map` / `plan` / `apply` step. Deploy auto-builds the
-slug-to-slug mapping in memory, prints a plan, prompts to confirm,
-and executes — all in one call.
-
-The mapping file (`.rdc/map/<src>→<tgt>.toml`) is still written by
-deploy as a side effect. You can hand-curate it for cross-env renames
-(e.g. `sftp-import = "sftp-import-prod"`) and the next `rdc deploy`
-will preserve those entries while auto-matching new same-slug pairs.
-
-```toml
-version = 1
-
-[hooks]
-validator-invoices = "validator-invoices"
-sftp-import = "sftp-import-prod"   # rename across envs
-
-[queues]
-cost-invoices = "cost-invoices"
-```
-
-For queue-nested kinds (queues, schemas, inboxes), the mapping key
-is the queue's slug. For email templates, the key is the compound
-`<ws-slug>/<q-slug>/<template-slug>`.
-
-## Deploy — one-shot cross-env promotion
-
-`rdc deploy <src> <tgt>` is the only cross-env promotion command. It
-bootstraps a fresh target (POSTing every missing resource in dependency
-order, rewriting cross-references from src URLs to tgt URLs as it
-goes) **and** patches existing ones for field-level deltas — in one
-call. Internally it auto-builds the slug-to-slug mapping, prints a
-plan, prompts for confirmation, and executes.
-
-**Typical session, bootstrap or sync:**
-
-```sh
-rdc pull test                          # refresh both snapshots
-rdc pull prod
-rdc deploy test prod                   # one command, plan-then-apply
-```
-
-```text
-Plan: test → prod
-  + create:  4 workspaces, 24 schemas, 24 queues, 27 hooks, 1 rule, 46 labels
-  ~ update:  field-level deltas (resolved at execute time)
-
-Proceed? [y/N] y
-
-  → workspaces       4 created
-  → schemas         24 created
-  → queues          24 created
-  → hooks           27 created
-  → rules            1 created
-  → labels          46 created
-Applied 22 hooks, 0 rules, 0 labels, 0 queues, 0 schemas, 0 inboxes,
-0 email templates, 0 engines, 0 engine fields (22 PATCHes) from test to prod
-
-Deployed test → prod: 126 created, 0 deleted, 144 API calls, 89.1s
-```
-
-**Preview without executing:**
-
-```sh
-rdc deploy test prod --dry-run
-```
-
-`--dry-run` traces the same code paths as a real deploy — auto-match,
-plan computation, drift checks, URL rewrites, overlay application,
-idempotency comparison — but suppresses every actual POST / PATCH /
-DELETE call. The output uses "would be created / would apply" wording
-so the report can't be mistaken for a real run. The tgt lockfile is
-not touched; the mapping file *is* persisted (it's a pure local
-side-effect of the auto-match step) so a subsequent real `rdc deploy`
-starts from the same state.
-
-**Semantics:**
-- **Additive by default.** Objects that exist in `tgt` but not in `src`
-  are left intact. A label someone added to PROD via the UI won't
-  disappear because it isn't in your TEST snapshot.
-- **`--mirror` for strict equivalence.** Pass `--mirror` to also delete
-  tgt-only objects so PROD becomes exactly TEST. Mirror always
-  triggers a second confirmation prompt — `--yes` doesn't bypass it —
-  because the deletions are irreversible.
-- **Plan-before-apply.** A TTY session prints the plan and prompts
-  before any POST/PATCH/DELETE lands; pass `--yes` (or pipe stdin) to
-  skip the prompt in CI.
-- **Idempotent.** Re-running `rdc deploy` on an in-sync env performs
-  **zero** API calls beyond the read-only auth check.
-
-**Dependency order on bootstrap:** `workspaces → schemas → queues →
-inboxes → email_templates → hooks → rules → labels → engines →
-engine_fields`. Each POST writes the server's response back to the
-local snapshot and into the in-memory mapping + tgt lockfile, so the
-next kind's URL rewriter can resolve cross-references to the
-just-created peers without a second round-trip.
-
-**Cross-reference replication is automatic.** When deploy POSTs a hook
-whose `queues` array in `src` points at sandbox queue IDs, the body
-sent to `tgt` has those URLs rewritten to the matching prod queue
-URLs. Same mechanism for `queue.workspace`, `queue.schema`,
-`email_template.queue`, `rule.queues`, `hook.run_after`, and so on.
-Strings that don't match a known src object are left alone (best
-effort), and server-computed back-refs like `queue.hooks` are
-stripped before sending.
-
-**Side effect Rossum handles for you.** `POST /queues` auto-creates
-five default email templates per queue (`annotation-status-change-*`,
-`default-rejection-template`, etc.). Deploy detects them right after
-each queue POST, captures them into the tgt lockfile, and lets the
-later update sweep PATCH them with whatever customisations exist in
-src — instead of trying (and failing) to POST duplicates.
-
-**Failure handling.** A mid-deploy error aborts cleanly: anything
-already POSTed stays in tgt with its lockfile entry, so the next
-`rdc deploy` picks up where the previous run stopped (the failing
-object is now "missing in tgt" again and gets retried). No half-done
-PATCHes are left lurking — each PATCH is atomic at the API layer.
-
-**Mirror mode:**
-
-```sh
-rdc deploy test prod --mirror
-```
-
-Adds a `- delete:` section to the plan. Deletes run in reverse
-dependency order (hooks/labels first, then queues, then schemas, then
-workspaces) so a queue is gone before the workspace that contains it.
-Both the deploy-level confirmation and an additional mirror-specific
-confirmation must be answered `y` before any DELETE goes out.
-
-## Global flags
-
-These flags can be passed to any subcommand:
-
-| Flag | Description |
-|------|-------------|
-| `--no-color` | Disable ANSI color output. Also honored via the `NO_COLOR` environment variable. |
-| `--yes` | Skip interactive prompts (conflict resolver, init wizard). Auto-enabled when stdin isn't a TTY. |
-
-**Transient-error handling.** Every Rossum and Data Storage HTTP
-call retries automatically on:
-
-- `429 Too Many Requests` — honors the `Retry-After` header if the
-  server provides one.
-- `502 Bad Gateway`, `503 Service Unavailable`, `504 Gateway
-  Timeout` — transient infrastructure errors.
-
-Up to 5 attempts total, with exponential backoff (1s, 2s, 4s, 8s,
-16s — capped at 60s) between attempts. A stderr line is printed
-each time so the tool isn't quietly hung. `500 Internal Server
-Error` is **not** retried — it usually indicates a real server
-bug and retrying papers over it. Other 4xx codes (auth, permission,
-not-found, method) are returned to the caller as-is.
+| Path | Purpose |
+|---|---|
+| `rdc.toml` | Project config: name + per-env `api_base` and `org_id` |
+| `secrets/<env>.secrets.json` | Per-env API token. Gitignored. Mode 0600 on Unix. |
+| `envs/<env>/_index.md` | Generated inventory of every object with names, paths, and cross-references. Don't edit. |
+| `envs/<env>/organization.json` | Org metadata (read-only on remote) |
+| `envs/<env>/overlay.toml` | Per-env overrides. Optional. |
+| `envs/<env>/workspaces/<ws>/...` | Workspace + nested queues / schemas / formulas / email templates |
+| `envs/<env>/<kind>/<slug>.json` | Org-scoped kinds (hooks, rules, labels, engines, …) |
+| `envs/<env>/mdh/<dataset>/{collection,indexes}.json` | Master Data Hub (on clusters that have it) |
+| `.rdc/state/<env>.lock.json` | Merge base. Auto-managed. |
+| `.rdc/map/<src>→<tgt>.toml` | Slug-to-slug mapping built by `rdc deploy`. Hand-edit for cross-env renames. |
 
 ## Authentication
 
-Tokens are loaded per env, in priority order:
+Token resolution per env, in priority order:
 
-1. Environment variable `RDC_TOKEN_<ENV_UPPER>` (e.g. `RDC_TOKEN_DEV`).
-   Recommended for CI.
-2. `secrets/<env>.secrets.json` — `{"api_token": "..."}`. Recommended
-   locally; add `secrets/` to `.gitignore` (`rdc init` does this).
+1. `RDC_TOKEN_<ENV_UPPER>` environment variable (e.g. `RDC_TOKEN_TEST`). Recommended for CI.
+2. `secrets/<env>.secrets.json` — `{"api_token": "..."}`. Recommended locally. `rdc init` adds `secrets/` to `.gitignore`.
 
-To set or rotate a token:
+Set or rotate:
 
 ```sh
-# Validates the token by hitting GET /organizations/{org_id} before
-# writing. Writes secrets/<env>.secrets.json with mode 0600 on Unix.
-rdc auth dev --token <new-token>
-
-# Or pipe via stdin (token never appears in shell history):
-read -s T && echo "$T" | rdc auth dev
+rdc auth test --token <new-token>
 ```
 
-Loud error if neither is set.
-
-**Master Data Hub** is pulled automatically when the cluster has it
-enabled — no extra config. The data storage URL is derived from
-`api_base`. Examples:
-
-| `api_base`                                  | derived data storage URL                              |
-|---------------------------------------------|-------------------------------------------------------|
-| `https://api.elis.rossum.ai/v1`             | `https://elis.rossum.ai/svc/data-storage/api`         |
-| `https://customer.rossum.app/api/v1`        | `https://customer.rossum.app/svc/data-storage/api`    |
-
-The API and Data Storage services share the same parent domain on
-every Rossum cluster; the API is reached via the `api.` subdomain
-(or a `/api` path prefix on clusters that use the bare domain),
-while Data Storage sits at the bare parent domain plus
-`/svc/data-storage/api`. On clusters without MDH, the first call
-returns 404 and rdc skips silently — no `mdh/` directory created,
-no count in the summary.
-
-## Repair — rebuild the lockfile
-
-`rdc repair <env> --rebuild-lock` is the second mode of `rdc repair`
-(the first, `--rename-slugs`, is documented above). It backs up the
-existing `.rdc/state/<env>.lock.json` (to `<name>.bak.<unix-ts>`) and
-runs `rdc pull <env>` from a clean slate to reconstruct it. Use it
-when the lockfile is corrupted, you've deleted it, or a new rdc
-release changed how `content_hash` is computed (the release notes
-will flag this when it happens).
+Validates against `GET /organizations/{org_id}` before writing the file (mode 0600 on Unix). For pipe input that keeps the token out of shell history:
 
 ```sh
-rdc repair dev --rebuild-lock
-# Backed up existing lockfile to .rdc/state/dev.lock.json.bak.1762000000
-# Note: rdc pull will now overwrite local snapshot files with remote contents.
-# ...
-# Lockfile rebuilt for env 'dev'.
+read -s T && echo "$T" | rdc auth test
 ```
 
-**Warning:** because the rebuilt pull has no merge base, every
-local file is overwritten with what the remote currently has.
-Commit your snapshot to git first if you might have unsaved edits.
+Master Data Hub is pulled automatically when the cluster has it enabled. The Data Storage URL is derived from `api_base`; no extra config to set. On clusters without MDH, the lookup returns 404 and `rdc` skips silently.
 
-`rdc repair` requires picking exactly one mode — there's no implicit
-default because both touch on-disk files in irreversible ways:
+## Resilience
 
-| Flag | What it does | Online? |
-|------|--------------|---------|
-| `--rebuild-lock` | Re-pulls everything; overwrites local files | yes |
-| `--rename-slugs` | Renames local files to match current JSON names | no |
+Every Rossum and Data Storage HTTP call retries automatically on:
 
-## Layout cheat sheet
+- `429 Too Many Requests` — honors `Retry-After` if the server provides one.
+- `502` / `503` / `504` — transient infrastructure.
 
-| File | Purpose |
-|------|---------|
-| `rdc.toml` | Project config: project name, envs (api_base + org_id) |
-| `secrets/<env>.secrets.json` | Per-env API token (gitignored) |
-| `envs/<env>/_index.md` | Generated inventory; do not edit |
-| `envs/<env>/organization.json` | Org metadata (read-only on remote) |
-| `envs/<env>/overlay.toml` | Per-env overrides (applied on push, stripped on pull; optional) |
-| `envs/<env>/workspaces/<ws>/...` | Workspace + nested queues |
-| `envs/<env>/<kind>/<slug>.json` | Org-scoped kinds (hooks, rules, etc.) |
-| `.rdc/state/<env>.lock.json` | Merge base; auto-managed |
-| `.rdc/map/<src>→<tgt>.toml` | Env-pair mapping for deploy |
+Up to 5 attempts with exponential backoff (1s, 2s, 4s, 8s, 16s, capped at 60s). A stderr line marks each retry so the tool never sits silent. `500 Internal Server Error` is **not** retried — treating it as transient masks real server bugs.
+
+## Upgrade
+
+Keep `rdc` current with one command:
+
+```sh
+rdc upgrade
+```
+
+Downloads the latest GitHub release for your platform, runs `--version` on the new binary as a sanity check, and swaps it in atomically. The previous binary is kept at `<install_dir>/rdc.bak` for one-shot rollback.
+
+`rdc upgrade --check` reports the latest available version without installing. `rdc upgrade --version vX.Y.Z` pins to a specific tag.
+
+Once per day, every command does a background check against the GitHub Releases API. If a newer release exists, a one-line note appears at the top of the command's output. The check is best-effort — network errors, rate limits, or unreachable clusters fail silently.
+
+**Install-location detection.** `rdc upgrade` only self-replaces when it's safe:
+
+| Install method | Behavior |
+|---|---|
+| `install.sh` / manual binary in a writable dir | Self-replaces atomically; previous binary kept as `rdc.bak` (or `rdc.bak.exe` on Windows). |
+| `cargo install --git …` | Refuses — would break cargo's bookkeeping. Prints the right `cargo install --force` invocation instead. |
+| Read-only dir (`/usr/local/bin`, system package manager, `C:\Program Files`, …) | Refuses — prints the manual download URL + commands. |
+
+The swap uses a copy-aside + atomic rename pattern, so a parallel shell tab running `rdc` during the upgrade never sees a missing file. On Linux/macOS the kernel keeps the running binary alive after its directory entry is replaced, so an in-flight `rdc upgrade` completes normally. On Windows the OS allows renaming a running `.exe` but not overwriting one, so the current binary is renamed aside to `rdc.bak.exe` before the new one is placed at the original path.
+
+## Compatibility
+
+- **Backward compat (new binary, old artifacts):** the latest `rdc` reads anything produced by any previous release. Lockfile versions migrate forward; project config and overlay tolerate missing fields via serde defaults.
+- **Forward compat (older binary, newer artifacts):** not promised. Newer-version artifacts that an older binary doesn't understand produce a clear error pointing at `rdc upgrade`, never silent corruption.
+
+A rare class of releases changes how `content_hash` is computed (e.g. stripping a newly-noisy server-managed field). The release notes will say so explicitly when it happens. After such a release, run `rdc repair <env> --rebuild-lock` once to clear any false-positive conflicts on the first re-pull.
 
 ## Tests
 
