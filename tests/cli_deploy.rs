@@ -4,6 +4,46 @@ use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// Snapshot body for a Master Data Hub store extension, mirrored from
+/// `tests/cli_push.rs`. `api_base` is the full API base URL (e.g.
+/// `http://127.0.0.1:PORT/api/v1`).
+fn mdh_snapshot_body(api_base: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": "Master Data Hub",
+        "type": "webhook",
+        "events": ["annotation_content.initialize", "annotation_content.started", "annotation_content.updated"],
+        "queues": [],
+        "active": true,
+        "run_after": [],
+        "metadata": {},
+        "config": { "private": true, "timeout_s": 60, "payload_logging_enabled": false },
+        "settings": { "configurations": [{"name": "customised"}] },
+        "sideload": ["schemas"],
+        "settings_schema": null,
+        "secrets_schema": { "type": "object", "additionalProperties": {"type": "string"} },
+        "description": "Enhance the extracted data with details from your master records.",
+        "guide": "<div>...</div>",
+        "read_more_url": "https://docs.rossum.ai/mdh",
+        "extension_image_url": "https://example.com/mdh.png",
+        "token_lifetime_s": 7200,
+        "token_owner": format!("{api_base}/users/938493"),
+        "extension_source": "rossum_store",
+        "hook_template": format!("{api_base}/hook_templates/39")
+    })
+}
+
+/// Same shape as `mdh_snapshot_body` but representing what the server returns
+/// immediately after `POST /hooks/create` — template defaults (un-customised
+/// `settings`), plus id/url assigned. Used by Task 20's test extension.
+#[allow(dead_code)]
+fn mdh_installed_body(api_base: &str, id: u64) -> serde_json::Value {
+    let mut body = mdh_snapshot_body(api_base);
+    body["id"] = serde_json::Value::from(id);
+    body["url"] = serde_json::Value::from(format!("{api_base}/hooks/{id}"));
+    body["settings"] = serde_json::json!({"configurations": []}); // template default, NOT customised
+    body
+}
+
 fn fixture(name: &str) -> serde_json::Value {
     let raw = std::fs::read_to_string(format!("testdata/fixtures/{name}")).unwrap();
     serde_json::from_str(&raw).unwrap()
@@ -520,5 +560,181 @@ async fn deploy_bootstraps_empty_target_with_url_rewriting() {
         queues[0].as_str().unwrap(),
         "https://prod.rossum.app/api/v1/queues/6600",
         "hook.queues must be rewritten from test URL to PROD queue URL"
+    );
+}
+
+/// Task 19: Deploy pre-pass resolves template URLs and reads token_owner from
+/// the tgt overlay (non-interactive path). After `rdc deploy test prod --yes`
+/// the `.rdc/map/test→prod.toml` must contain a `[hook_templates]` section
+/// with the src→tgt template URL pair built by `plan_store_extension_bootstrap`.
+#[tokio::test]
+async fn deploy_resolves_templates_and_prompts_for_token_owner() {
+    let test_server = MockServer::start().await;
+    let prod_server = MockServer::start().await;
+    let src_api = format!("{}/api/v1", test_server.uri());
+    let tgt_api = format!("{}/api/v1", prod_server.uri());
+
+    // ── Src (test) pull mocks ────────────────────────────────────────────────
+    // org endpoint needed by rdc pull
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&test_server).await;
+    // hooks list: returns the MDH store extension
+    let mdh_src = {
+        let mut b = mdh_snapshot_body(&src_api);
+        b["id"] = serde_json::Value::from(999u64);
+        b["url"] = serde_json::Value::String(format!("{src_api}/hooks/999"));
+        b
+    };
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": {"next": null},
+            "results": [mdh_src.clone()]
+        })))
+        .mount(&test_server).await;
+    // all other src list endpoints — empty
+    for ep in [
+        "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&test_server).await;
+    }
+    // src /hook_templates — pre-pass lists this to build the src→tgt pair
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hook_templates"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": {"next": null},
+            "results": [
+                {"url": format!("{src_api}/hook_templates/39"),
+                 "name": "Master Data Hub", "type": "webhook",
+                 "extension_source": "rossum_store", "install_action": "copy"}
+            ]
+        })))
+        .mount(&test_server).await;
+
+    // ── Tgt (prod) pull mocks ────────────────────────────────────────────────
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&prod_server).await;
+    // prod starts with no hooks
+    for ep in [
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/hooks",
+        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&prod_server).await;
+    }
+    // tgt /hook_templates — pre-pass lists this; id 41 (different from src's 39)
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hook_templates"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": {"next": null},
+            "results": [
+                {"url": format!("{tgt_api}/hook_templates/41"),
+                 "name": "Master Data Hub", "type": "webhook",
+                 "extension_source": "rossum_store", "install_action": "copy"}
+            ]
+        })))
+        .mount(&prod_server).await;
+
+    // ── Tgt deploy mocks ─────────────────────────────────────────────────────
+    // Regular hook create (Task 20 will switch to /hooks/create; for now
+    // create_hook still calls POST /hooks). The response carries the tgt
+    // template URL so apply's drift check sees a consistent state.
+    let created_on_tgt = {
+        let mut b = mdh_snapshot_body(&tgt_api);
+        b["id"] = serde_json::Value::from(700u64);
+        b["url"] = serde_json::Value::String(format!("{tgt_api}/hooks/700"));
+        b["hook_template"] = serde_json::Value::String(format!("{tgt_api}/hook_templates/41"));
+        b
+    };
+    Mock::given(method("POST"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(created_on_tgt.clone()))
+        .mount(&prod_server).await;
+    // apply drift check: GET /api/v1/hooks/700
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks/700"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(created_on_tgt.clone()))
+        .mount(&prod_server).await;
+    // apply may detect drift (e.g. token_owner URL still references src) and issue a PATCH.
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/hooks/700"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(created_on_tgt.clone()))
+        .mount(&prod_server).await;
+
+    // ── Project bootstrap ────────────────────────────────────────────────────
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args([
+            "init",
+            "--env", &format!("test={src_api}:1"),
+            "--env", &format!("prod={tgt_api}:1"),
+        ])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/test.secrets.json"),
+        r#"{"api_token":"TKN_TEST"}"#,
+    ).unwrap();
+    std::fs::write(
+        project.path().join("secrets/prod.secrets.json"),
+        r#"{"api_token":"TKN_PROD"}"#,
+    ).unwrap();
+
+    // Pull both envs to establish lockfiles and snapshots.
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "test"])
+        .assert().success();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "prod"])
+        .assert().success();
+
+    // Pre-populate the tgt overlay with the system user URL so the pre-pass
+    // resolves token_owner without hanging on stdin (non-interactive path).
+    let prod_overlay_path = project.path().join("envs/prod/overlay.toml");
+    std::fs::create_dir_all(prod_overlay_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &prod_overlay_path,
+        format!(
+            "version = 1\n\n[defaults]\nstore_extension_token_owner = \"{tgt_api}/users/521884\"\n"
+        ),
+    ).unwrap();
+
+    // Deploy — pre-pass resolves templates, reads token_owner from overlay.
+    let out = Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["deploy", "test", "prod", "--yes"])
+        .output().unwrap();
+
+    assert!(
+        out.status.success(),
+        "deploy should succeed.\nstderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout),
+    );
+
+    // The map cache must contain the template URL pair built by the pre-pass.
+    let map_path = project.path().join(".rdc/map/test→prod.toml");
+    let raw = std::fs::read_to_string(&map_path).expect("map file should exist");
+    assert!(
+        raw.contains("[hook_templates]"),
+        "[hook_templates] section missing from map file:\n{raw}"
+    );
+    assert!(
+        raw.contains("hook_templates/41"),
+        "tgt template id 41 missing from map file:\n{raw}"
     );
 }

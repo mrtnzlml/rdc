@@ -1,16 +1,173 @@
 //! Store-extension support for `rdc push` and `rdc deploy`. Centralises:
 //!   - Effective `token_owner` resolution (per-hook overlay → defaults → None).
-//!   - Template-URL resolution against the target cluster (later tasks).
-//!   - Install-body construction (later tasks).
-//!   - Interactive `token_owner` picker (later tasks).
+//!   - Template-URL resolution against the target cluster.
+//!   - Install-body construction.
+//!   - Interactive `token_owner` picker.
+//!   - Bootstrap pre-pass: resolves template URLs + prompts for token_owner.
 
 pub use crate::cli::resolve::{prompt_token_owner, render_token_owner_picker};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
+use crate::api::RossumClient;
+use crate::mapping::Mapping;
 use crate::model::{Hook, HookTemplate};
-use crate::overlay::Overlay;
+use crate::overlay::{write_store_extension_token_owner, Overlay};
+use crate::progress::ProgressHandle;
+use crate::state::Lockfile;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::path::Path;
+
+/// One bootstrap entry per store extension to be created.
+#[derive(Debug, Clone)]
+pub struct StorePlan {
+    pub src_slug: String,
+    pub tgt_slug: String,
+    pub src_template_url: String,
+    pub tgt_template_url: String,
+    pub tgt_template_name: String,
+    pub token_owner_url: String,
+}
+
+/// Build the bootstrap list. Side-effects:
+///   - lists src + tgt `/hook_templates` (only when the in-memory map cache misses)
+///   - lists tgt `/users` only if at least one missing `token_owner`
+///   - prompts (TTY) or refuses (non-TTY) for missing `token_owner` values
+///   - writes the chosen URLs to the tgt overlay file
+///   - inserts resolved template URL pairs into `mapping.hook_templates`
+///     (the caller is responsible for persisting the mapping)
+pub async fn plan_store_extension_bootstrap(
+    src_paths: &crate::paths::Paths,
+    _tgt_paths: &crate::paths::Paths,
+    src_client: &RossumClient,
+    tgt_client: &RossumClient,
+    _src_lockfile: &Lockfile,
+    tgt_lockfile: &Lockfile,
+    mapping: &mut Mapping,
+    tgt_overlay_path: &Path,
+    interactive: bool,
+    self_user_id: Option<u64>,
+    tgt_env_label: &str,
+    progress: ProgressHandle,
+) -> Result<Vec<StorePlan>> {
+    // 1. Walk src snapshot hooks/, identify store-extension hooks that need
+    //    bootstrap (no tgt lockfile entry).
+    let hooks_dir = src_paths.hooks_dir();
+    let mut needed: Vec<(String, crate::model::Hook)> = Vec::new();
+    if hooks_dir.exists() {
+        for entry in std::fs::read_dir(&hooks_dir)
+            .with_context(|| format!("reading {}", hooks_dir.display()))?
+        {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let slug = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+            let hook = crate::snapshot::hook::read_hook(&hooks_dir, &slug)?;
+            if !hook.is_store_extension() {
+                continue;
+            }
+            check_store_extension_anomaly(&hook, &slug)?;
+            // Auto-mapping: same slug on tgt by default.
+            let tgt_slug = mapping.lookup_tgt_slug("hooks", &slug)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| slug.clone());
+            // Skip if tgt already has it (this is an update path, not bootstrap).
+            if tgt_lockfile.objects.get("hooks").and_then(|m| m.get(&tgt_slug)).is_some() {
+                continue;
+            }
+            needed.push((tgt_slug, hook));
+        }
+    }
+    if needed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 2. Resolve template URLs. List on cache miss only.
+    let src_urls: std::collections::BTreeSet<String> = needed.iter()
+        .filter_map(|(_, h)| h.hook_template().map(|s| s.to_string()))
+        .collect();
+    let uncached: Vec<&str> = src_urls.iter()
+        .filter(|u| !mapping.hook_templates.contains_key(*u))
+        .map(|s| s.as_str())
+        .collect();
+    let tgt_templates: Vec<crate::model::HookTemplate> = if !uncached.is_empty() {
+        let src_templates = src_client.list_hook_templates(progress.clone()).await
+            .context("listing src hook templates")?;
+        let tgt = tgt_client.list_hook_templates(progress.clone()).await
+            .context("listing tgt hook templates")?;
+        let pairs = build_template_url_map(&uncached, &src_templates, &tgt, tgt_env_label)?;
+        mapping.hook_templates.extend(pairs);
+        tgt
+    } else {
+        // Even with cache hits, we need tgt_templates for plan-output names.
+        tgt_client.list_hook_templates(progress.clone()).await
+            .context("listing tgt hook templates for plan output")?
+    };
+
+    // 3. Resolve token_owner per hook. Prompt at most once if user picks
+    //    "apply to all"; that fills `default_url`, which short-circuits
+    //    subsequent prompts in this run.
+    let mut overlay = Overlay::load(tgt_overlay_path)?;
+    let mut tgt_users: Option<Vec<crate::model::User>> = None;
+    let mut default_url: Option<String> = overlay.as_ref()
+        .and_then(|ov| ov.defaults.store_extension_token_owner.clone());
+    let mut plans = Vec::new();
+    for (tgt_slug, hook) in &needed {
+        let src_slug = tgt_slug.clone(); // same-slug default; rename via mapping handled at step 1
+        let src_template_url = hook.hook_template().unwrap().to_string();
+        let tgt_template_url = mapping.hook_templates.get(&src_template_url)
+            .ok_or_else(|| anyhow!("internal: template URL '{src_template_url}' missing from mapping after resolve"))?
+            .clone();
+        let tgt_template_name = tgt_templates.iter().find(|t| t.url == tgt_template_url)
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| "<unknown>".into());
+
+        let resolved = effective_token_owner(overlay.as_ref(), tgt_slug)
+            .map(|s| s.to_string())
+            .or_else(|| default_url.clone());
+
+        let token_owner_url = match resolved {
+            Some(u) => u,
+            None => {
+                if !interactive {
+                    return Err(anyhow!(
+                        "deploy needs token_owner for store extension '{tgt_slug}' on {tgt_env_label}, but {} has no [hooks.{tgt_slug}] token_owner and no [defaults] store_extension_token_owner.\nRun 'rdc deploy <src> {tgt_env_label}' on a TTY once to pick interactively, or edit the overlay directly. Aborting before any remote writes.",
+                        tgt_overlay_path.display()
+                    ));
+                }
+                if tgt_users.is_none() {
+                    tgt_users = Some(tgt_client.list_users(progress.clone()).await
+                        .context("listing tgt users for token_owner picker")?);
+                }
+                let users = tgt_users.as_ref().unwrap();
+                let (chosen, apply_all) = match prompt_token_owner(tgt_slug, tgt_env_label, users, self_user_id)? {
+                    Some(pair) => pair,
+                    None => return Err(anyhow!("deploy aborted at token_owner picker")),
+                };
+                if apply_all {
+                    write_store_extension_token_owner(tgt_overlay_path, None, &chosen)?;
+                    default_url = Some(chosen.clone());
+                } else {
+                    write_store_extension_token_owner(tgt_overlay_path, Some(tgt_slug), &chosen)?;
+                }
+                // Reload overlay so subsequent lookups see the write.
+                overlay = Overlay::load(tgt_overlay_path)?;
+                chosen
+            }
+        };
+
+        plans.push(StorePlan {
+            src_slug,
+            tgt_slug: tgt_slug.clone(),
+            src_template_url,
+            tgt_template_url,
+            tgt_template_name,
+            token_owner_url,
+        });
+    }
+    Ok(plans)
+}
 
 /// Resolve the effective `token_owner` URL for a store extension on a
 /// given environment. Order: per-hook overlay `token_owner` → overlay

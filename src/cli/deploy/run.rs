@@ -81,13 +81,18 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
     let tgt_paths = Paths::for_env(&cwd, tgt);
 
     let cfg = ProjectConfig::load(&src_paths.project_config())?;
-    if !cfg.envs.contains_key(src) {
-        return Err(anyhow!("env '{src}' is not defined in rdc.toml"));
-    }
+    let src_cfg = cfg
+        .envs
+        .get(src)
+        .ok_or_else(|| anyhow!("env '{src}' is not defined in rdc.toml"))?;
     let tgt_cfg = cfg
         .envs
         .get(tgt)
         .ok_or_else(|| anyhow!("env '{tgt}' is not defined in rdc.toml"))?;
+
+    let src_token = resolve_token(&cwd, src)?;
+    let src_client = RossumClient::new(src_cfg.api_base.clone(), src_token)
+        .context("constructing src API client")?;
 
     let tgt_token = resolve_token(&cwd, tgt)?;
     let tgt_client = RossumClient::new(tgt_cfg.api_base.clone(), tgt_token)
@@ -101,7 +106,33 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
     let tgt_overlay = Overlay::load(&tgt_paths.overlay_file())
         .with_context(|| format!("loading tgt overlay from {}", tgt_paths.overlay_file().display()))?;
 
-    // 0. Auto-populate the slug-to-slug mapping for objects that already
+    // 0a. Store-extension pre-pass: resolve cross-cluster template URLs and
+    // prompt for any missing token_owner values. This runs before any writes
+    // so failures abort cleanly. Produces a StorePlan list consumed by
+    // create_hook in Task 20; for now it's stored as a local variable.
+    // store_plans threaded into create_hook in Task 20.
+    let store_plans = crate::cli::deploy::store_extensions::plan_store_extension_bootstrap(
+        &src_paths,
+        &tgt_paths,
+        &src_client,
+        &tgt_client,
+        &src_lockfile,
+        &tgt_lockfile,
+        &mut mapping,
+        &tgt_paths.overlay_file(),
+        interactive,
+        None, // self_user_id — picker just won't tag "you" in the list
+        tgt,
+        None,
+    ).await?;
+    // Persist the template URL pairs added by the pre-pass.
+    std::fs::create_dir_all(src_paths.mapping_dir())
+        .with_context(|| format!("creating {}", src_paths.mapping_dir().display()))?;
+    mapping.save(&src_paths.mapping_file(src, tgt))?;
+    // Suppress unused-variable warning until Task 20 threads store_plans into create_hook.
+    let _ = &store_plans;
+
+    // 0b. Auto-populate the slug-to-slug mapping for objects that already
     // exist in both envs. Without this step the apply sub-step would
     // skip every pre-existing object because the mapping would be empty.
     // User-curated entries in the mapping file (cross-env renames) are
