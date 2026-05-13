@@ -42,6 +42,11 @@ pub struct Mapping {
     /// Engine field slug → engine field slug.
     #[serde(default)]
     pub engine_fields: BTreeMap<String, String>,
+    /// Cross-cluster hook_template URL pairs, built by `rdc deploy` on first
+    /// run and persisted so subsequent deploys don't re-list `/hook_templates`
+    /// on the target cluster. Hand-editable for forced overrides.
+    #[serde(default)]
+    pub hook_templates: BTreeMap<String, String>,
 }
 
 impl Default for Mapping {
@@ -58,6 +63,7 @@ impl Default for Mapping {
             email_templates: BTreeMap::new(),
             engines: BTreeMap::new(),
             engine_fields: BTreeMap::new(),
+            hook_templates: BTreeMap::new(),
         }
     }
 }
@@ -125,6 +131,25 @@ mod tests {
         m.rules.insert("validation-rule".into(), "validation-rule".into());
         m.labels.insert("priority-high".into(), "priority-high".into());
         m.save(&path).unwrap();
+        let loaded = Mapping::load(&path).unwrap();
+        assert_eq!(loaded, m);
+    }
+
+    #[test]
+    fn hook_templates_section_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test_to_prod.toml");
+        let mut m = Mapping::default();
+        m.hook_templates.insert(
+            "https://test.rossum.app/api/v1/hook_templates/39".into(),
+            "https://prod.rossum.app/api/v1/hook_templates/41".into(),
+        );
+        m.save(&path).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[hook_templates]"));
+        assert!(raw.contains("hook_templates/39"));
+
         let loaded = Mapping::load(&path).unwrap();
         assert_eq!(loaded, m);
     }
