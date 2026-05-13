@@ -28,6 +28,25 @@ impl Hook {
     pub fn modified_at(&self) -> Option<&str> {
         crate::model::modified_at(&self.extra)
     }
+
+    /// Returns the `extension_source` value if present and a string —
+    /// `"rossum_store"` for store extensions, `"custom"` for user-created
+    /// hooks, or `None` if the field is absent or null on the wire.
+    pub fn extension_source(&self) -> Option<&str> {
+        self.extra.get("extension_source").and_then(|v| v.as_str())
+    }
+
+    /// Returns `hook_template` (a URL) if present and a string. For regular
+    /// hooks this is `null` on the wire and yields `None` here.
+    pub fn hook_template(&self) -> Option<&str> {
+        self.extra.get("hook_template").and_then(|v| v.as_str())
+    }
+
+    /// True iff this hook came from the Rossum store and must be created via
+    /// `POST /hooks/create` rather than the regular `POST /hooks/`.
+    pub fn is_store_extension(&self) -> bool {
+        self.extension_source() == Some("rossum_store")
+    }
 }
 
 #[cfg(test)]
@@ -93,5 +112,55 @@ mod tests {
         });
         let hook: Hook = serde_json::from_value(payload).unwrap();
         assert_eq!(hook.modified_at(), None);
+    }
+
+    #[test]
+    fn extension_source_reads_from_extra() {
+        let payload = json!({
+            "id": 1, "url": "u", "name": "n", "type": "webhook",
+            "extension_source": "rossum_store",
+            "hook_template": "https://x/api/v1/hook_templates/39"
+        });
+        let h: Hook = serde_json::from_value(payload).unwrap();
+        assert_eq!(h.extension_source(), Some("rossum_store"));
+        assert_eq!(h.hook_template(), Some("https://x/api/v1/hook_templates/39"));
+        assert!(h.is_store_extension());
+    }
+
+    #[test]
+    fn extension_source_custom_is_not_store_extension() {
+        let payload = json!({
+            "id": 1, "url": "u", "name": "n", "type": "function",
+            "extension_source": "custom",
+            "hook_template": Value::Null
+        });
+        let h: Hook = serde_json::from_value(payload).unwrap();
+        assert_eq!(h.extension_source(), Some("custom"));
+        assert_eq!(h.hook_template(), None);
+        assert!(!h.is_store_extension());
+    }
+
+    #[test]
+    fn extension_source_absent_is_none() {
+        let payload = json!({"id": 1, "url": "u", "name": "n", "type": "function"});
+        let h: Hook = serde_json::from_value(payload).unwrap();
+        assert_eq!(h.extension_source(), None);
+        assert!(!h.is_store_extension());
+    }
+
+    #[test]
+    fn extension_source_explicit_null_yields_none() {
+        // `extension_source: null` on the wire is distinct from "field absent",
+        // but `extension_source()` returns `None` for both since the value isn't
+        // a string. Verifies the null-vs-absent equivalence at the accessor layer.
+        let payload = json!({
+            "id": 1, "url": "u", "name": "n", "type": "function",
+            "extension_source": Value::Null,
+            "hook_template": Value::Null
+        });
+        let h: Hook = serde_json::from_value(payload).unwrap();
+        assert_eq!(h.extension_source(), None);
+        assert_eq!(h.hook_template(), None);
+        assert!(!h.is_store_extension());
     }
 }
