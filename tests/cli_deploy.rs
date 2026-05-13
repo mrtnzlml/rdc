@@ -701,6 +701,150 @@ async fn deploy_refuses_non_tty_without_token_owner_overlay() {
     }
 }
 
+/// When the tgt cluster does not have the required hook template at all
+/// (empty `GET /api/v1/hook_templates`), `build_template_url_map` must
+/// fail fast with a user-visible error before any mutating request reaches
+/// the tgt server — even when the tgt overlay already supplies
+/// `store_extension_token_owner`.
+#[tokio::test]
+async fn deploy_errors_when_template_missing_on_tgt() {
+    let test_server = MockServer::start().await;
+    let prod_server = MockServer::start().await;
+    let src_api = format!("{}/api/v1", test_server.uri());
+    let tgt_api = format!("{}/api/v1", prod_server.uri());
+
+    // ── Src (test) pull mocks ────────────────────────────────────────────────
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&test_server).await;
+    let mdh_src = {
+        let mut b = mdh_snapshot_body(&src_api);
+        b["id"] = serde_json::Value::from(999u64);
+        b["url"] = serde_json::Value::String(format!("{src_api}/hooks/999"));
+        b
+    };
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": {"next": null},
+            "results": [mdh_src.clone()]
+        })))
+        .mount(&test_server).await;
+    for ep in [
+        "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&test_server).await;
+    }
+    // src /hook_templates — returns the MDH template (id 39)
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hook_templates"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": {"next": null},
+            "results": [
+                {"url": format!("{src_api}/hook_templates/39"),
+                 "name": "Master Data Hub", "type": "webhook",
+                 "extension_source": "rossum_store", "install_action": "copy"}
+            ]
+        })))
+        .mount(&test_server).await;
+
+    // ── Tgt (prod) pull mocks ────────────────────────────────────────────────
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&prod_server).await;
+    for ep in [
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/hooks",
+        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&prod_server).await;
+    }
+    // tgt /hook_templates — EMPTY: the template is not available on prod
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hook_templates"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": {"next": null},
+            "results": []
+        })))
+        .mount(&prod_server).await;
+
+    // ── Project bootstrap ────────────────────────────────────────────────────
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args([
+            "init",
+            "--env", &format!("test={src_api}:1"),
+            "--env", &format!("prod={tgt_api}:1"),
+        ])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/test.secrets.json"),
+        r#"{"api_token":"TKN_TEST"}"#,
+    ).unwrap();
+    std::fs::write(
+        project.path().join("secrets/prod.secrets.json"),
+        r#"{"api_token":"TKN_PROD"}"#,
+    ).unwrap();
+
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "test"])
+        .assert().success();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["pull", "prod"])
+        .assert().success();
+
+    // Tgt overlay HAS store_extension_token_owner — so the failure is
+    // purely template-related, not token-related.
+    let prod_overlay_path = project.path().join("envs/prod/overlay.toml");
+    std::fs::create_dir_all(prod_overlay_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &prod_overlay_path,
+        format!(
+            "version = 1\n\n[defaults]\nstore_extension_token_owner = \"{tgt_api}/users/521884\"\n"
+        ),
+    ).unwrap();
+
+    // Deploy with --yes must fail because the template is absent on prod.
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["deploy", "test", "prod", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Master Data Hub"))
+        .stderr(predicate::str::contains("not available on prod"));
+
+    // No mutating requests (POST/PATCH/DELETE) to Rossum API paths must have
+    // reached the tgt server before the early failure.
+    for req in prod_server.received_requests().await.unwrap_or_default() {
+        let path = req.url.path();
+        if path.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "unexpected mutating request: {} {}",
+            req.method,
+            path
+        );
+    }
+}
+
 /// Deploy pre-pass resolves cross-cluster template URLs and reads token_owner
 /// from the tgt overlay (non-interactive path). After `rdc deploy test prod
 /// --yes`, the `.rdc/map/test→prod.toml` must contain a `[hook_templates]`
