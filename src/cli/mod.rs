@@ -35,15 +35,23 @@ pub enum Command {
     /// Push locally-edited resources back to the Rossum environment.
     Push {
         env: String,
-        /// Scan + report what would be POSTed / PATCHed without sending
-        /// anything to the API.
+        /// Scan + report what would be POSTed / PATCHed / DELETEd
+        /// without sending anything to the API.
         #[arg(long = "dry-run")]
         dry_run: bool,
         /// Print a unified diff per changed file (local vs current
-        /// remote, or the would-be POST body for new resources).
-        /// Requires `--dry-run`; one GET per changed object.
+        /// remote, or the would-be POST body for new resources, or the
+        /// remote body for would-be deletes). Requires `--dry-run`;
+        /// one GET per changed object.
         #[arg(long = "diff", requires = "dry_run")]
         diff: bool,
+        /// Authorize destructive deletes for objects whose local file
+        /// is missing but whose lockfile entry remains. Required on
+        /// non-TTY (CI); on a TTY this flag skips the per-batch
+        /// confirmation prompt that would otherwise be shown.
+        /// `--yes` does NOT bypass delete confirmation.
+        #[arg(long = "allow-deletes")]
+        allow_deletes: bool,
     },
     /// Deploy a source env to a target env in one shot.
     ///
@@ -166,9 +174,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
             crate::cli::pull::run(&env, interactive).await
         }
-        Some(Command::Push { env, dry_run, diff }) => {
+        Some(Command::Push { env, dry_run, diff, allow_deletes }) => {
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
-            crate::cli::push::run(&env, interactive, dry_run, diff).await
+            crate::cli::push::run(&env, interactive, dry_run, diff, allow_deletes).await
         }
         Some(Command::Deploy { src, tgt, mirror, dry_run, diff }) => {
             let interactive = crate::cli::resolve::is_interactive(cli.yes);

@@ -3,6 +3,10 @@
 //! Phase 2 (the per-kind drivers) consumes this list — until Task 20 lands,
 //! drivers still iterate the local tree themselves; the ChangeList is used
 //! only for the early-exit "no changes" UX path.
+//!
+//! The scan also reports **tombstones**: lockfile entries whose on-disk
+//! file is missing. These are the user's explicit "delete this from
+//! remote" signal — see `Tombstones` below.
 
 use crate::paths::Paths;
 use crate::state::Lockfile;
@@ -44,10 +48,48 @@ impl ChangeList {
     }
 }
 
+/// Lockfile entries whose on-disk file is missing — the user's explicit
+/// "delete this from remote" signal. Each entry stores the lockfile-known
+/// remote `id` so the push driver can issue `DELETE /<kind>/<id>` without
+/// re-reading the lockfile.
+#[derive(Debug, Default)]
+pub struct Tombstones {
+    pub workspaces: BTreeMap<String, u64>,
+    pub hooks: BTreeMap<String, u64>,
+    pub rules: BTreeMap<String, u64>,
+    pub labels: BTreeMap<String, u64>,
+    pub queues: BTreeMap<String, u64>,
+    pub schemas: BTreeMap<String, u64>,
+    pub inboxes: BTreeMap<String, u64>,
+    pub email_templates: BTreeMap<String, u64>,
+    pub engines: BTreeMap<String, u64>,
+    pub engine_fields: BTreeMap<String, u64>,
+}
+
+impl Tombstones {
+    pub fn total(&self) -> usize {
+        self.workspaces.len()
+            + self.hooks.len()
+            + self.rules.len()
+            + self.labels.len()
+            + self.queues.len()
+            + self.schemas.len()
+            + self.inboxes.len()
+            + self.email_templates.len()
+            + self.engines.len()
+            + self.engine_fields.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+}
+
 /// Walk the local snapshot, hash every writable file, compare to lockfile,
-/// build a `ChangeList`. Returns `(scan_count, changes)`. The scan_count is
-/// the total number of files inspected (not just changed ones).
-pub fn scan(paths: &Paths, lockfile: &Lockfile) -> Result<(usize, ChangeList)> {
+/// build a `ChangeList` for POST/PATCH candidates and a `Tombstones` list
+/// for the lockfile entries whose local file is missing. Returns
+/// `(scan_count, changes, tombstones)`.
+pub fn scan(paths: &Paths, lockfile: &Lockfile) -> Result<(usize, ChangeList, Tombstones)> {
     let mut changes = ChangeList::default();
     let mut scanned = 0;
 
@@ -62,7 +104,145 @@ pub fn scan(paths: &Paths, lockfile: &Lockfile) -> Result<(usize, ChangeList)> {
     scanned += scan_engines(paths, lockfile, &mut changes.engines)?;
     scanned += scan_engine_fields(paths, lockfile, &mut changes.engine_fields)?;
 
-    Ok((scanned, changes))
+    let tombstones = detect_tombstones(paths, lockfile);
+
+    Ok((scanned, changes, tombstones))
+}
+
+/// Cross-check the lockfile against the local snapshot: every lockfile
+/// entry without a corresponding on-disk file becomes a tombstone.
+///
+/// Each kind has its own expected file location (workspace.json lives in
+/// `workspaces/<slug>/`, schemas in `workspaces/<ws>/queues/<slug>/`,
+/// email_templates use a compound key, etc.). For the queue-nested kinds
+/// we don't know the workspace from the lockfile entry, so we sweep every
+/// `workspaces/*/queues/<slug>/<file>` and treat the slug as tombstoned
+/// only if no workspace contains it.
+///
+/// Exposed `pub` so `rdc status` can surface tombstones in its summary
+/// without re-running the full scan.
+pub fn detect_tombstones(paths: &Paths, lockfile: &Lockfile) -> Tombstones {
+    let mut t = Tombstones::default();
+
+    // --- flat kinds: <kind>/<slug>.json -----------------------------
+    detect_flat(lockfile, "hooks", &paths.hooks_dir(), &mut t.hooks);
+    detect_flat(lockfile, "rules", &paths.rules_dir(), &mut t.rules);
+    detect_flat(lockfile, "labels", &paths.labels_dir(), &mut t.labels);
+
+    // --- workspaces: workspaces/<slug>/workspace.json ---------------
+    if let Some(map) = lockfile.objects.get("workspaces") {
+        for (slug, entry) in map {
+            let path = paths.workspace_dir(slug).join("workspace.json");
+            if !path.exists() {
+                t.workspaces.insert(slug.clone(), entry.id);
+            }
+        }
+    }
+
+    // --- queue-nested: workspaces/<ws>/queues/<slug>/<file> ---------
+    detect_queue_nested(paths, lockfile, "queues", "queue.json", &mut t.queues);
+    detect_queue_nested(paths, lockfile, "schemas", "schema.json", &mut t.schemas);
+    detect_queue_nested(paths, lockfile, "inboxes", "inbox.json", &mut t.inboxes);
+
+    // --- email_templates: compound key "<ws>/<q>/<template>" --------
+    if let Some(map) = lockfile.objects.get("email_templates") {
+        for (key, entry) in map {
+            let parts: Vec<&str> = key.splitn(3, '/').collect();
+            if parts.len() == 3 {
+                let path = paths
+                    .queue_email_templates_dir(parts[0], parts[1])
+                    .join(format!("{}.json", parts[2]));
+                if !path.exists() {
+                    t.email_templates.insert(key.clone(), entry.id);
+                }
+            }
+        }
+    }
+
+    // --- engines: engines/<slug>/engine.json -------------------------
+    if let Some(map) = lockfile.objects.get("engines") {
+        for (slug, entry) in map {
+            let path = paths.engines_dir().join(slug).join("engine.json");
+            if !path.exists() {
+                t.engines.insert(slug.clone(), entry.id);
+            }
+        }
+    }
+
+    // --- engine_fields: engines/<engine>/fields/<slug>.json ----------
+    if let Some(map) = lockfile.objects.get("engine_fields") {
+        for (slug, entry) in map {
+            if !engine_field_file_exists(paths, slug) {
+                t.engine_fields.insert(slug.clone(), entry.id);
+            }
+        }
+    }
+
+    t
+}
+
+fn detect_flat(
+    lockfile: &Lockfile,
+    kind: &str,
+    dir: &std::path::Path,
+    out: &mut BTreeMap<String, u64>,
+) {
+    let Some(map) = lockfile.objects.get(kind) else { return };
+    for (slug, entry) in map {
+        let path = dir.join(format!("{slug}.json"));
+        if !path.exists() {
+            out.insert(slug.clone(), entry.id);
+        }
+    }
+}
+
+fn detect_queue_nested(
+    paths: &Paths,
+    lockfile: &Lockfile,
+    kind: &str,
+    file_name: &str,
+    out: &mut BTreeMap<String, u64>,
+) {
+    let Some(map) = lockfile.objects.get(kind) else { return };
+    for (slug, entry) in map {
+        if !queue_nested_file_exists(paths, slug, file_name) {
+            out.insert(slug.clone(), entry.id);
+        }
+    }
+}
+
+fn queue_nested_file_exists(paths: &Paths, q_slug: &str, file_name: &str) -> bool {
+    let ws_dir = paths.workspaces_dir();
+    if !ws_dir.exists() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(&ws_dir) else { return false };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        if entry.path().join("queues").join(q_slug).join(file_name).exists() {
+            return true;
+        }
+    }
+    false
+}
+
+fn engine_field_file_exists(paths: &Paths, slug: &str) -> bool {
+    let engines_dir = paths.engines_dir();
+    if !engines_dir.exists() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(&engines_dir) else { return false };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        if entry.path().join("fields").join(format!("{slug}.json")).exists() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Walk `engines/<slug>/engine.json` files. Mirrors `scan_workspaces`

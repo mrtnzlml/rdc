@@ -101,6 +101,37 @@ pub async fn run(env_filter: Option<String>) -> Result<()> {
             }
         }
 
+        // Pending deletes: lockfile entries whose local file is missing.
+        // Surfaced here so users see the destructive side of a future
+        // `rdc push` before invoking it.
+        let tombstones = crate::cli::push::scan::detect_tombstones(&paths, &lockfile);
+        if tombstones.is_empty() {
+            println!("  deletes:  none");
+        } else {
+            let total = tombstones.total();
+            println!(
+                "  deletes:  {total} file(s) tracked but missing locally \
+                 (run `rdc push {env} --allow-deletes` to remove from remote):"
+            );
+            let listing: [(&str, &std::collections::BTreeMap<String, u64>); 10] = [
+                ("workspaces", &tombstones.workspaces),
+                ("schemas", &tombstones.schemas),
+                ("queues", &tombstones.queues),
+                ("inboxes", &tombstones.inboxes),
+                ("email_templates", &tombstones.email_templates),
+                ("hooks", &tombstones.hooks),
+                ("rules", &tombstones.rules),
+                ("labels", &tombstones.labels),
+                ("engines", &tombstones.engines),
+                ("engine_fields", &tombstones.engine_fields),
+            ];
+            for (name, m) in listing {
+                for slug in m.keys() {
+                    println!("            {name}/{slug}");
+                }
+            }
+        }
+
         // Pending renames: stale local slugs vs current JSON name fields.
         // Surfaced here so it's discoverable outside of pull-summary
         // scrollback. Run `rdc map <env>` to apply.

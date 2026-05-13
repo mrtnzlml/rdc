@@ -7,6 +7,7 @@ use crate::state::Lockfile;
 use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
 
+pub mod deletes;
 mod email_templates;
 mod engine_fields;
 mod engines;
@@ -19,7 +20,13 @@ pub mod scan;
 mod schemas;
 mod workspaces;
 
-pub async fn run(env: &str, interactive: bool, dry_run: bool, diff: bool) -> Result<()> {
+pub async fn run(
+    env: &str,
+    interactive: bool,
+    dry_run: bool,
+    diff: bool,
+    allow_deletes: bool,
+) -> Result<()> {
     let push_started = std::time::Instant::now();
     let cwd = std::env::current_dir().context("getting current directory")?;
     let paths = Paths::for_env(&cwd, env);
@@ -37,12 +44,16 @@ pub async fn run(env: &str, interactive: bool, dry_run: bool, diff: bool) -> Res
 
     let mut lockfile = Lockfile::load(&paths.lockfile())?;
 
-    // Phase 1: scan local files for changes.
+    // Phase 1: scan local files for changes + tombstones.
     eprintln!("→ push envs/{env}: scanning files…");
-    let (scanned, changes) = scan::scan(&paths, &lockfile)?;
-    eprintln!("✓ push envs/{env}: {scanned} files scanned, {} changed", changes.total());
+    let (scanned, changes, tombstones) = scan::scan(&paths, &lockfile)?;
+    let n_changed = changes.total();
+    let n_tombstoned = tombstones.total();
+    eprintln!(
+        "✓ push envs/{env}: {scanned} files scanned, {n_changed} changed, {n_tombstoned} to delete",
+    );
 
-    if changes.is_empty() {
+    if changes.is_empty() && tombstones.is_empty() {
         eprintln!(
             "✓ push envs/{env}: no changes  ({:.1}s)",
             push_started.elapsed().as_secs_f32()
@@ -75,6 +86,26 @@ pub async fn run(env: &str, interactive: bool, dry_run: bool, diff: bool) -> Res
                 }
             }
         }
+        let delete_kinds: [(&str, &std::collections::BTreeMap<String, u64>); 10] = [
+            ("engine_fields", &tombstones.engine_fields),
+            ("engines", &tombstones.engines),
+            ("labels", &tombstones.labels),
+            ("rules", &tombstones.rules),
+            ("hooks", &tombstones.hooks),
+            ("email_templates", &tombstones.email_templates),
+            ("inboxes", &tombstones.inboxes),
+            ("queues", &tombstones.queues),
+            ("schemas", &tombstones.schemas),
+            ("workspaces", &tombstones.workspaces),
+        ];
+        for (name, m) in &delete_kinds {
+            if !m.is_empty() {
+                println!("  - {name:18} {} would be DELETED", m.len());
+                for slug in m.keys() {
+                    println!("      {slug}");
+                }
+            }
+        }
         if diff {
             // Delegate the line-level diff to the existing `rdc diff
             // <env>` machinery: it walks each kind, GETs the remote,
@@ -84,13 +115,30 @@ pub async fn run(env: &str, interactive: bool, dry_run: bool, diff: bool) -> Res
             println!();
             println!("--- diffs ---");
             crate::cli::diff::diff_local_vs_remote(&cwd, &cfg, env).await?;
+            if n_tombstoned > 0 {
+                println!();
+                println!("--- tombstone bodies (would be removed from {env}) ---");
+                deletes::preview_tombstone_bodies(&client, &tombstones).await?;
+            }
         }
         println!(
-            "Dry run push envs/{env}: {} change(s), {:.1}s — no API calls beyond GETs for diff.",
-            changes.total(),
+            "Dry run push envs/{env}: {n_changed} change(s), {n_tombstoned} to delete, \
+             {:.1}s — no API writes made.",
             push_started.elapsed().as_secs_f32()
         );
         return Ok(());
+    }
+
+    // If there are tombstones, gate them behind the two-act
+    // destructive-confirmation flow before any phase touches the API.
+    if !tombstones.is_empty() {
+        match deletes::confirm_or_refuse(&tombstones, interactive, allow_deletes)? {
+            deletes::ConfirmOutcome::Proceed => {}
+            deletes::ConfirmOutcome::Aborted => {
+                eprintln!("push aborted: deletes not confirmed.");
+                return Ok(());
+            }
+        }
     }
 
     let progress = OverallProgress::start(format!("push envs/{env}"));
@@ -111,6 +159,25 @@ pub async fn run(env: &str, interactive: bool, dry_run: bool, diff: bool) -> Res
     };
 
     progress.finish();
+
+    // Deletes phase: tombstones run after creates/updates so any cleanup
+    // dependencies (a deleted hook may reference a queue that's also
+    // being deleted; reverse-dep order handles this) are satisfied. The
+    // confirmation gate has already been crossed; here we just execute.
+    let delete_counts = if !tombstones.is_empty() {
+        eprintln!();
+        eprintln!("→ deleting tombstoned objects (reverse dependency order)…");
+        let dc = deletes::run_deletes(&client, &mut lockfile, &tombstones, interactive).await?;
+        eprintln!(
+            "✓ deletes: {} removed, {} skipped",
+            dc.total_deleted(),
+            dc.skipped
+        );
+        dc
+    } else {
+        deletes::DeleteCounts::default()
+    };
+
     lockfile.save(&paths.lockfile())?;
     crate::cli::index::generate(&paths, &lockfile)
         .with_context(|| format!("regenerating _index.md for env '{env}'"))?;
@@ -133,6 +200,17 @@ pub async fn run(env: &str, interactive: bool, dry_run: bool, diff: bool) -> Res
         + counts.c_engines + counts.c_engine_fields;
     if total_skipped > 0 {
         summary.push_str(&format!(", {} skipped (conflict)", total_skipped));
+    }
+    if delete_counts.total_deleted() > 0 || delete_counts.skipped > 0 {
+        summary.push_str(&format!(
+            "; deleted {}{}",
+            delete_counts.total_deleted(),
+            if delete_counts.skipped > 0 {
+                format!(", {} skipped", delete_counts.skipped)
+            } else {
+                String::new()
+            }
+        ));
     }
     println!("{summary}");
     Ok(())
