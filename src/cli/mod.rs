@@ -295,3 +295,4 @@ pub mod push;
 pub mod repair;
 pub mod resolve;
 pub mod status;
+pub mod sync;
