@@ -394,7 +394,7 @@ pub(crate) fn dep_check(
             );
             for u in &unresolved {
                 msg.push_str(&format!(
-                    "  {}/{} → {}/{}\n",
+                    "  {}/{} -> {}/{}\n",
                     u.from.0, u.from.1, u.to.0, u.to.1,
                 ));
             }

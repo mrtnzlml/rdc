@@ -165,7 +165,7 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
             eprintln!();
             for u in unresolved {
                 eprintln!(
-                    "  {}/{}  → {}/{} (missing)",
+                    "  {}/{}  -> {}/{} (missing)",
                     u.from.0, u.from.1, u.to.0, u.to.1,
                 );
             }
@@ -173,6 +173,7 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
             let mut deduped: std::collections::BTreeSet<(String, String)> = Default::default();
             for u in unresolved { deduped.insert(u.to.clone()); }
             eprint!("Include these {} dependencies in the selection? [Y/n] ", deduped.len());
+            let _ = std::io::stderr().flush();
             let mut input = String::new();
             if std::io::stdin().read_line(&mut input).is_err() { return false; }
             let ans = input.trim().to_ascii_lowercase();
@@ -188,7 +189,7 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
             &mut prompt_fn,
         )?;
     }
-    let _selection = selection; // consumed by Tasks 7-10
+    let _selection = selection;
 
     // 1. Compute plan — file-system level only (which slugs are missing
     // from tgt, and in mirror mode which are tgt-only). Field-level diffs
