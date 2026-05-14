@@ -32,10 +32,6 @@ impl Selection {
     pub(crate) fn len(&self) -> usize {
         self.items.len()
     }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
 }
 
 /// Resolve a list of `--only` flags against the candidate set built from

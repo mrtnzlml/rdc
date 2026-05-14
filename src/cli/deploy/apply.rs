@@ -77,7 +77,7 @@ fn adopt_tgt_drift(
 ///
 /// Returns the summary line as a `String` so the caller can print it
 /// after the progress bar is finished.
-pub async fn run(
+pub(crate) async fn run(
     src: &str,
     tgt: &str,
     dry_run: bool,
