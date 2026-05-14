@@ -1,4 +1,4 @@
-//! Execute the classified plan. Dispatches three branches:
+//! Execute the classified plan. Dispatches four branches:
 //!
 //! - **Conflict (`BothDiverged`)** — runs first via [`resolve_conflicts`].
 //!   Each conflict prompts the user (`[k]/[r]/[e]/[s]/[a]`), then routes the
@@ -6,21 +6,28 @@
 //!   below); keep-remote writes the remote bytes to disk + lockfile;
 //!   skip writes a shadow file and records the local hash; abort bubbles
 //!   [`crate::cli::resolve::PullAborted`].
+//! - **Remote-delete + double-conflict + both-deleted** — handled by
+//!   [`resolve_remote_deletes`]. `RemoteDelete`, `LocalEditRemoteDelete`,
+//!   and `LocalDeleteRemoteEdit` share the same `[k]/[r]/[s]/[a]` prompt
+//!   shape ([`crate::cli::resolve::prompt_remote_delete`]); `BothDeleted`
+//!   converges silently by dropping the lockfile entry. `[k]` (restore on
+//!   env) drops the lockfile entry and promotes the item to the push
+//!   pipeline so it's POSTed; `[r]` mirrors the deletion locally; `[s]`
+//!   writes the `<file>.<env>-deleted` marker.
 //! - **Pull-side (`RemoteEdit`, `RemoteCreate`)** — grouped by kind and
 //!   handed off to the per-kind pull driver with a `(kind, slug)` subset
 //!   filter.
 //! - **Push-side (`LocalEdit`, `LocalCreate`)** — folded into a
 //!   `ChangeList` via [`crate::cli::push::scan::change_list_from_classified`]
 //!   and dispatched through the existing push pipeline. Items promoted
-//!   from the conflict branch (KeepLocal / Edit) are merged into the same
-//!   ChangeList so they take a single round-trip through the push driver.
-//!
-//! Remote-delete and the two double-conflict classes land in Task 17.
+//!   from the conflict and remote-delete branches are merged into the
+//!   same ChangeList so they take a single round-trip through the push
+//!   driver.
 //!
 //! Spec: docs/superpowers/specs/2026-05-14-unified-sync-design.md.
 
 use crate::cli::pull::common::{PullCtx, RemoteCatalog};
-use crate::cli::resolve::{prompt_resolve, PullAborted, Resolution};
+use crate::cli::resolve::{prompt_remote_delete, prompt_resolve, PullAborted, Resolution};
 use crate::cli::sync::classify::{ClassifiedItem, SyncClass};
 use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
@@ -29,7 +36,7 @@ use crate::state::content_hash;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::BufRead;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Items the conflict resolver promoted into the push pipeline. The caller
@@ -244,6 +251,279 @@ fn update_label_lockfile(
     );
 }
 
+/// Compute the `<file>.<env>-deleted` marker path for `local_path`.
+/// Mirrors [`crate::paths::shadow_path_for`]'s format with a `-deleted`
+/// suffix — matches what [`crate::paths::is_shadow_artifact`] already
+/// recognises so snapshot walkers and `_index.md` regeneration skip it
+/// just like the conflict-skip shadow.
+fn deleted_marker_path(local_path: &Path, env: &str) -> PathBuf {
+    let shadow = crate::paths::shadow_path_for(local_path, env);
+    let mut s = shadow.into_os_string();
+    s.push("-deleted");
+    PathBuf::from(s)
+}
+
+/// Drop a `(kind, slug)` entry from the lockfile. Used by the
+/// remote-delete dispatcher when the user accepts the delete (`[r]`),
+/// when both sides converged on deletion (`BothDeleted`), or when the
+/// user wants to restore on env via POST (`[k]` — push pipeline treats
+/// missing lockfile entry as a `LocalCreate`).
+fn drop_lockfile_entry(ctx: &mut PullCtx<'_>, kind: &str, slug: &str) {
+    if let Some(map) = ctx.lockfile.objects.get_mut(kind) {
+        map.remove(slug);
+    }
+}
+
+/// Resolve `RemoteDelete`, `LocalEditRemoteDelete`,
+/// `LocalDeleteRemoteEdit`, and `BothDeleted` items in `classified`.
+///
+/// All three "destructive direction" classes share the same prompt
+/// shape ([`crate::cli::resolve::prompt_remote_delete`]) and resolve
+/// to one of:
+/// - `[k]` **keep local** — restore on env. The lockfile entry is
+///   dropped and the item is promoted to the push pipeline, which sees
+///   the missing lockfile entry and POSTs (see
+///   `cli::push::labels::push`'s "missing lockfile entry → new label"
+///   branch).
+/// - `[r]` **use env** — mirror the env's deletion locally. The local
+///   file is removed and the lockfile entry is dropped.
+/// - `[s]` **skip / shadow marker** — write a sibling
+///   `<file>.<env>-deleted` marker, leave the local file and lockfile
+///   alone. The next sync re-presents the same conflict.
+/// - `[a]` **abort** — return [`PullAborted`] so the outer driver
+///   suppresses `lockfile.save()`.
+///
+/// `BothDeleted` short-circuits: no prompt, no marker — both sides
+/// already agree on deletion so the executor just drops the lockfile
+/// entry. Re-running the sync sees `Clean` state.
+///
+/// `interactive == false` (non-TTY / `--yes`) falls back to `[s]` for
+/// every prompted class. For `LocalDeleteRemoteEdit` the env-side
+/// bytes are restored to `local_path` before the marker is written
+/// so the user has something to review on the next interactive run.
+///
+/// Only the `labels` kind is wired today (Task 17 scope); other kinds
+/// are emitted as warnings and skipped. Subsequent tasks plumb in
+/// hashing for the remaining kinds.
+pub(crate) async fn resolve_remote_deletes<R: BufRead>(
+    ctx: &mut PullCtx<'_>,
+    catalog: &RemoteCatalog,
+    classified: &[ClassifiedItem],
+    mut input: R,
+    interactive: bool,
+    progress: &Arc<OverallProgress>,
+) -> Result<ConflictOutcome> {
+    let mut outcome = ConflictOutcome::default();
+
+    // Build a stable label-slug index up-front so `LocalDeleteRemoteEdit`
+    // items (which still have a remote body) can serialise the env-side
+    // bytes to restore the file for review. Mirrors the slug derivation
+    // used by `resolve_conflicts` and the classifier.
+    let mut label_by_slug: BTreeMap<String, &crate::model::Label> = BTreeMap::new();
+    {
+        let mut used: HashSet<String> = HashSet::new();
+        for l in &catalog.labels {
+            let slug = match ctx.lockfile.slug_for_id("labels", l.id) {
+                Some(existing) => existing.to_string(),
+                None => slugify_unique(&l.name, &used),
+            };
+            used.insert(slug.clone());
+            label_by_slug.insert(slug, l);
+        }
+    }
+
+    let env = ctx.paths.env().to_string();
+
+    for it in classified {
+        match &it.class {
+            SyncClass::BothDeleted => {
+                // Silent convergence — both sides removed the object, so
+                // the lockfile entry is the only thing left. Drop it.
+                if it.kind == "labels" {
+                    drop_lockfile_entry(ctx, "labels", &it.slug);
+                } else {
+                    // Same scope note as the conflict resolver: only
+                    // `labels` is wired today. Other kinds will land as
+                    // their adapters arrive.
+                    progress.println(format!(
+                        "warning: BothDeleted handler not yet wired for kind '{}' (slug '{}'); skipping",
+                        it.kind, it.slug,
+                    ));
+                }
+                continue;
+            }
+            SyncClass::RemoteDelete
+            | SyncClass::LocalEditRemoteDelete
+            | SyncClass::LocalDeleteRemoteEdit => {
+                if it.kind != "labels" {
+                    progress.println(format!(
+                        "warning: remote-delete dispatch not yet wired for kind '{}' (slug '{}'); skipping",
+                        it.kind, it.slug,
+                    ));
+                    continue;
+                }
+
+                let local_path = ctx.paths.labels_dir().join(format!("{}.json", it.slug));
+
+                // For LocalDeleteRemoteEdit the local file is tombstoned
+                // — restore it from the env-side bytes so the user has
+                // something to review on the next sync. The prompt also
+                // reads `local_path`, so this restoration is required
+                // before the prompt can run.
+                if matches!(it.class, SyncClass::LocalDeleteRemoteEdit) {
+                    if let Some(label) = label_by_slug.get(it.slug.as_str()) {
+                        let mut bytes = serde_json::to_vec_pretty(label).context(
+                            "serializing env-side label for LocalDeleteRemoteEdit restore",
+                        )?;
+                        bytes.push(b'\n');
+                        if let Some(parent) = local_path.parent() {
+                            std::fs::create_dir_all(parent).ok();
+                        }
+                        write_atomic(&local_path, &bytes)?;
+                    } else {
+                        progress.println(format!(
+                            "warning: LocalDeleteRemoteEdit for labels/{} but no matching env-side label in catalog; skipping",
+                            it.slug,
+                        ));
+                        continue;
+                    }
+                }
+
+                if !interactive {
+                    // CI / --yes fallback: write the deleted marker so
+                    // the next interactive sync re-presents the choice.
+                    // For RemoteDelete / LocalEditRemoteDelete the
+                    // local file already has bytes; for
+                    // LocalDeleteRemoteEdit we just restored it above.
+                    if local_path.exists() {
+                        let marker = deleted_marker_path(&local_path, &env);
+                        write_atomic(&marker, b"")?;
+                        progress.println(format!(
+                            "warning: {} — env deletion deferred (non-tty); marker at {}",
+                            local_path.display(),
+                            marker.display(),
+                        ));
+                    }
+                    continue;
+                }
+
+                if !local_path.exists() {
+                    // RemoteDelete / LocalEditRemoteDelete with no local
+                    // file: the classifier saw a tombstone-flavored
+                    // state but the file isn't there. Defensive — emit
+                    // a warning and move on rather than panic.
+                    progress.println(format!(
+                        "warning: {} — local file missing, cannot prompt; skipping",
+                        local_path.display(),
+                    ));
+                    continue;
+                }
+
+                let resolution = prompt_remote_delete(
+                    &mut input,
+                    std::io::stderr().lock(),
+                    &local_path,
+                    &env,
+                )?;
+
+                // The action a given letter triggers depends on which
+                // class we're resolving (spec §"Double-conflict cases"):
+                //   RemoteDelete / LocalEditRemoteDelete:
+                //     [k] = restore on env (POST)
+                //     [r] = delete local (mirror env's deletion)
+                //   LocalDeleteRemoteEdit:
+                //     [k] = push DELETE to env (commit the tombstone)
+                //     [r] = restore local from env (cancel the tombstone)
+                let is_local_delete_remote_edit =
+                    matches!(it.class, SyncClass::LocalDeleteRemoteEdit);
+                match resolution {
+                    Resolution::KeepLocal => {
+                        if is_local_delete_remote_edit {
+                            // Spec: `[k]` = commit the local tombstone by
+                            // DELETEing on env. Sync's executor doesn't
+                            // have a DELETE-via-classified path yet (the
+                            // push pipeline DELETEs via tombstones, not
+                            // ChangeList entries) — defer with a clear
+                            // user-facing instruction. The restored
+                            // local bytes are removed so re-running the
+                            // sync without explicit user intervention
+                            // doesn't accidentally re-create the file.
+                            std::fs::remove_file(&local_path).with_context(|| {
+                                format!("removing {}", local_path.display())
+                            })?;
+                            progress.println(format!(
+                                "note: {} — committing the local tombstone needs an \
+                                 explicit `rdc push --allow-deletes {}` follow-up; \
+                                 the lockfile entry was retained so the deletion isn't lost",
+                                local_path.display(),
+                                env,
+                            ));
+                        } else {
+                            // Restore on env: drop the lockfile entry so
+                            // the push pipeline's "missing lockfile
+                            // entry" branch POSTs the local body as a
+                            // new label.
+                            drop_lockfile_entry(ctx, "labels", &it.slug);
+                            outcome.promoted_to_push.push((
+                                "labels".to_string(),
+                                it.slug.clone(),
+                                local_path.clone(),
+                            ));
+                        }
+                    }
+                    Resolution::KeepRemote => {
+                        if is_local_delete_remote_edit {
+                            // Cancel the tombstone: the local file is
+                            // already restored from env-side bytes
+                            // (done above before prompting). Align the
+                            // lockfile to the env hash so subsequent
+                            // syncs see Clean state.
+                            if let Some(label) = label_by_slug.get(it.slug.as_str()) {
+                                let mut bytes = serde_json::to_vec_pretty(label).context(
+                                    "serializing env-side label for LocalDeleteRemoteEdit lockfile update",
+                                )?;
+                                bytes.push(b'\n');
+                                let h = content_hash(&bytes);
+                                update_label_lockfile(ctx, &it.slug, label, h);
+                            }
+                        } else {
+                            // Mirror the env's deletion: remove local +
+                            // drop lockfile entry. No push action — env
+                            // already doesn't have it.
+                            std::fs::remove_file(&local_path).with_context(|| {
+                                format!("removing {}", local_path.display())
+                            })?;
+                            drop_lockfile_entry(ctx, "labels", &it.slug);
+                        }
+                    }
+                    Resolution::Skip => {
+                        let marker = deleted_marker_path(&local_path, &env);
+                        write_atomic(&marker, b"")?;
+                        progress.println(format!(
+                            "warning: {} — env deletion deferred; marker at {}",
+                            local_path.display(),
+                            marker.display(),
+                        ));
+                    }
+                    // The remote-delete prompt never offers `[e]`; the
+                    // helper's contract documents `Resolution::Edit` as
+                    // unreachable here. Fall through to Abort defensively.
+                    Resolution::Edit(_) | Resolution::Abort => {
+                        return Err(anyhow::Error::new(PullAborted));
+                    }
+                }
+            }
+            _ => {
+                // Not a remote-delete class — skip silently. The other
+                // classes are handled by `resolve_conflicts` and the
+                // pull / push pipelines.
+            }
+        }
+    }
+
+    Ok(outcome)
+}
+
 /// Dispatch the classified items. The order is: resolve conflicts → run
 /// pull-side drivers → run push-side pipeline (with conflict-promoted
 /// items merged in). Items promoted from the conflict branch land in the
@@ -269,6 +549,14 @@ pub async fn run(
     let stdin = std::io::stdin();
     let conflict_outcome =
         resolve_conflicts(ctx, catalog, classified, stdin.lock(), interactive, progress).await?;
+
+    // Phase A2: remote-delete + double-conflict + both-deleted. Same
+    // stdin source as Phase A; `BothDiverged` items have already been
+    // resolved above so the dispatcher only sees the destructive-direction
+    // classes here.
+    let remote_delete_outcome =
+        resolve_remote_deletes(ctx, catalog, classified, stdin.lock(), interactive, progress)
+            .await?;
 
     if !no_pull {
         // Group pull-side items by kind so each driver runs at most
@@ -304,10 +592,17 @@ pub async fn run(
     if !no_push {
         // Fold LocalEdit / LocalCreate items into the same `ChangeList`
         // shape `push::scan::scan` produces, then merge in the items
-        // the conflict resolver promoted (`[k]eep local` / `[e]dit`).
+        // the conflict resolver promoted (`[k]eep local` / `[e]dit`) and
+        // the remote-delete resolver's restore-on-env promotions (`[k]`
+        // on a RemoteDelete / double-conflict — push driver POSTs them
+        // because we dropped the lockfile entry).
         let mut change_list =
             crate::cli::push::scan::change_list_from_classified(ctx.paths, classified);
-        for (kind, slug, path) in conflict_outcome.promoted_to_push {
+        let promotions = conflict_outcome
+            .promoted_to_push
+            .into_iter()
+            .chain(remote_delete_outcome.promoted_to_push);
+        for (kind, slug, path) in promotions {
             match kind.as_str() {
                 "labels" => {
                     change_list.labels.insert(slug, path);
@@ -332,7 +627,6 @@ pub async fn run(
         }
     }
 
-    // Remote-delete + double-conflict branches: Task 17.
     Ok(())
 }
 
@@ -743,5 +1037,446 @@ mod tests {
 
         assert!(outcome.promoted_to_push.is_empty(), "no items to promote");
         assert_eq!(fixture.lockfile, lf_before, "lockfile must be untouched");
+    }
+
+    // ----- remote-delete + double-conflict tests (Task 17) ---------------
+
+    /// Scaffolding for a RemoteDelete scenario: a label exists locally
+    /// with bytes matching the lockfile base hash, but the env has
+    /// dropped it. The classifier produces a `RemoteDelete` item.
+    /// Caller drives the resolver and asserts post-state.
+    struct RemoteDeleteFixture {
+        _tmp: tempfile::TempDir,
+        paths: Paths,
+        client: RossumClient,
+        lockfile: Lockfile,
+        local_path: PathBuf,
+    }
+
+    fn setup_remote_delete_fixture() -> RemoteDeleteFixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        std::fs::create_dir_all(paths.labels_dir()).unwrap();
+
+        // Local label — same bytes as the base recorded in lockfile.
+        let local_label = mk_label(42, "Audit Hold", "#aabbcc");
+        let local_bytes = label_bytes(&local_label);
+        let local_path = paths.labels_dir().join("audit-hold.json");
+        std::fs::write(&local_path, &local_bytes).unwrap();
+        let base_hash = content_hash(&local_bytes);
+
+        let mut lockfile = Lockfile::default();
+        lockfile.upsert(
+            "labels",
+            "audit-hold",
+            ObjectEntry {
+                id: 42,
+                url: Some(local_label.url.clone()),
+                modified_at: None,
+                content_hash: Some(base_hash),
+            },
+        );
+
+        let client = RossumClient::new(
+            "https://unused.invalid/api/v1".to_string(),
+            "TEST".to_string(),
+        )
+        .unwrap();
+
+        RemoteDeleteFixture {
+            _tmp: tmp,
+            paths,
+            client,
+            lockfile,
+            local_path,
+        }
+    }
+
+    fn classified_remote_delete() -> Vec<ClassifiedItem> {
+        vec![ClassifiedItem {
+            kind: "labels".to_string(),
+            slug: "audit-hold".to_string(),
+            class: SyncClass::RemoteDelete,
+            local_hash: None,
+            remote_hash: None,
+            base_hash: Some("dummy".to_string()),
+        }]
+    }
+
+    /// Scripted `k\n` ([k]eep local; restore on env) on a RemoteDelete
+    /// label: the resolver must promote a restore item (push pipeline
+    /// will POST because the lockfile entry was dropped) and leave the
+    /// local file intact.
+    #[tokio::test]
+    async fn resolve_remote_deletes_keep_local_promotes_to_restore() {
+        let mut fixture = setup_remote_delete_fixture();
+        let catalog = catalog_with_labels(vec![]);
+        let classified = classified_remote_delete();
+        let progress = OverallProgress::start("test");
+
+        let local_before = std::fs::read(&fixture.local_path).unwrap();
+
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: true,
+            };
+            resolve_remote_deletes(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b"k\n"),
+                true,
+                &progress,
+            )
+            .await
+            .expect("resolver should succeed on [k]")
+        };
+        progress.finish();
+
+        // Outcome: one entry promoted as a restore — push pipeline will
+        // POST because the lockfile entry was dropped.
+        assert_eq!(
+            outcome.promoted_to_push.len(),
+            1,
+            "should promote 1 restore item"
+        );
+        assert_eq!(outcome.promoted_to_push[0].0, "labels");
+        assert_eq!(outcome.promoted_to_push[0].1, "audit-hold");
+        assert_eq!(outcome.promoted_to_push[0].2, fixture.local_path);
+
+        // Local file unchanged — push driver re-reads it.
+        let local_after = std::fs::read(&fixture.local_path).unwrap();
+        assert_eq!(local_after, local_before, "local file must survive [k]");
+
+        // Lockfile entry dropped so push driver treats it as a POST
+        // (missing lockfile entry → create-via-POST in `push::labels::push`).
+        assert!(
+            fixture
+                .lockfile
+                .objects
+                .get("labels")
+                .and_then(|m| m.get("audit-hold"))
+                .is_none(),
+            "lockfile entry must be dropped so push POSTs the restore"
+        );
+    }
+
+    /// Scripted `r\n` ([r] use env; delete local): the resolver removes
+    /// the local file, drops the lockfile entry, does NOT promote to
+    /// push (the env's deletion wins).
+    #[tokio::test]
+    async fn resolve_remote_deletes_use_env_removes_local_and_drops_lockfile() {
+        let mut fixture = setup_remote_delete_fixture();
+        let catalog = catalog_with_labels(vec![]);
+        let classified = classified_remote_delete();
+        let progress = OverallProgress::start("test");
+
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: true,
+            };
+            resolve_remote_deletes(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b"r\n"),
+                true,
+                &progress,
+            )
+            .await
+            .expect("resolver should succeed on [r]")
+        };
+        progress.finish();
+
+        assert!(
+            outcome.promoted_to_push.is_empty(),
+            "no push items expected on [r]"
+        );
+        assert!(
+            !fixture.local_path.exists(),
+            "local file must be removed by [r]"
+        );
+        assert!(
+            fixture
+                .lockfile
+                .objects
+                .get("labels")
+                .and_then(|m| m.get("audit-hold"))
+                .is_none(),
+            "lockfile entry must be dropped"
+        );
+    }
+
+    /// Scripted `s\n` ([s]kip): the resolver writes the env-deleted
+    /// marker, leaves the local file alone, and retains the lockfile
+    /// entry so re-running the sync re-presents the same conflict.
+    #[tokio::test]
+    async fn resolve_remote_deletes_skip_writes_env_deleted_marker() {
+        let mut fixture = setup_remote_delete_fixture();
+        let catalog = catalog_with_labels(vec![]);
+        let classified = classified_remote_delete();
+        let progress = OverallProgress::start("test");
+
+        let local_before = std::fs::read(&fixture.local_path).unwrap();
+        let lf_before = fixture.lockfile.clone();
+
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: true,
+            };
+            resolve_remote_deletes(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b"s\n"),
+                true,
+                &progress,
+            )
+            .await
+            .expect("resolver should succeed on [s]")
+        };
+        progress.finish();
+
+        assert!(outcome.promoted_to_push.is_empty(), "skip never promotes");
+
+        // Marker file at `<local>.<env>-deleted` exists.
+        let marker = {
+            let shadow = crate::paths::shadow_path_for(&fixture.local_path, "test");
+            let mut s = shadow.into_os_string();
+            s.push("-deleted");
+            std::path::PathBuf::from(s)
+        };
+        assert!(
+            marker.exists(),
+            "deleted-marker should be written at {}",
+            marker.display()
+        );
+
+        // Local file untouched.
+        let local_after = std::fs::read(&fixture.local_path).unwrap();
+        assert_eq!(local_after, local_before, "local file must not be modified");
+
+        // Lockfile untouched — the conflict is deferred, not resolved.
+        assert_eq!(fixture.lockfile, lf_before, "lockfile must be unchanged");
+    }
+
+    /// `interactive == false`: the resolver writes the env-deleted
+    /// marker without reading from stdin, regardless of class.
+    #[tokio::test]
+    async fn resolve_remote_deletes_non_tty_falls_back_to_skip() {
+        let mut fixture = setup_remote_delete_fixture();
+        let catalog = catalog_with_labels(vec![]);
+        let classified = classified_remote_delete();
+        let progress = OverallProgress::start("test");
+
+        let local_before = std::fs::read(&fixture.local_path).unwrap();
+
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: false,
+            };
+            // Empty stdin — if the helper tried to read here, the read
+            // would return 0 (EOF). Non-TTY path skips the prompt entirely.
+            resolve_remote_deletes(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b""),
+                false,
+                &progress,
+            )
+            .await
+            .expect("non-tty resolver must succeed")
+        };
+        progress.finish();
+
+        assert!(outcome.promoted_to_push.is_empty());
+
+        let marker = {
+            let shadow = crate::paths::shadow_path_for(&fixture.local_path, "test");
+            let mut s = shadow.into_os_string();
+            s.push("-deleted");
+            std::path::PathBuf::from(s)
+        };
+        assert!(
+            marker.exists(),
+            "non-tty fallback must write the deleted-marker"
+        );
+        let local_after = std::fs::read(&fixture.local_path).unwrap();
+        assert_eq!(local_after, local_before, "local file must survive non-tty");
+    }
+
+    /// LocalDeleteRemoteEdit: the local file was tombstoned but the
+    /// remote still exists with edits. The dispatcher restores the
+    /// local file from env-side bytes for review, then prompts. A
+    /// scripted `s\n` writes the deleted-marker without removing the
+    /// restored local file.
+    #[tokio::test]
+    async fn resolve_remote_deletes_local_delete_remote_edit_restores_local_for_review() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        std::fs::create_dir_all(paths.labels_dir()).unwrap();
+        let local_path = paths.labels_dir().join("audit-hold.json");
+        // Local file was deleted by the user (tombstone) — do not write.
+
+        // Env still has the label with a divergent body.
+        let remote_label = mk_label(42, "Audit Hold", "#00ff00");
+        let remote_bytes = label_bytes(&remote_label);
+
+        let mut lockfile = Lockfile::default();
+        lockfile.upsert(
+            "labels",
+            "audit-hold",
+            ObjectEntry {
+                id: 42,
+                url: Some(remote_label.url.clone()),
+                modified_at: None,
+                content_hash: Some("base".to_string()),
+            },
+        );
+
+        let client = RossumClient::new(
+            "https://unused.invalid/api/v1".to_string(),
+            "TEST".to_string(),
+        )
+        .unwrap();
+
+        let catalog = catalog_with_labels(vec![remote_label.clone()]);
+        let classified = vec![ClassifiedItem {
+            kind: "labels".to_string(),
+            slug: "audit-hold".to_string(),
+            class: SyncClass::LocalDeleteRemoteEdit,
+            local_hash: None,
+            remote_hash: Some(content_hash(&remote_bytes)),
+            base_hash: Some("base".to_string()),
+        }];
+        let progress = OverallProgress::start("test");
+
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &paths,
+                client: &client,
+                lockfile: &mut lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: true,
+            };
+            resolve_remote_deletes(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b"s\n"),
+                true,
+                &progress,
+            )
+            .await
+            .expect("LocalDeleteRemoteEdit resolver should succeed on [s]")
+        };
+        progress.finish();
+
+        assert!(outcome.promoted_to_push.is_empty());
+
+        // The dispatcher restored the local file from env-side bytes so
+        // the user can review it on the next sync run.
+        assert!(
+            local_path.exists(),
+            "local file must be restored from env-side bytes for review"
+        );
+        assert_eq!(std::fs::read(&local_path).unwrap(), remote_bytes);
+
+        // Marker written too.
+        let marker = {
+            let shadow = crate::paths::shadow_path_for(&local_path, "test");
+            let mut s = shadow.into_os_string();
+            s.push("-deleted");
+            std::path::PathBuf::from(s)
+        };
+        assert!(marker.exists(), "deleted-marker should be written");
+    }
+
+    /// BothDeleted: no prompt, no marker — just drop the lockfile entry
+    /// silently so subsequent syncs see Clean state.
+    #[tokio::test]
+    async fn both_deleted_silent_drops_lockfile_entry_no_prompt() {
+        let mut fixture = setup_remote_delete_fixture();
+        // Remove the local file so the class would be BothDeleted in real life.
+        std::fs::remove_file(&fixture.local_path).unwrap();
+
+        let catalog = catalog_with_labels(vec![]);
+        let classified = vec![ClassifiedItem {
+            kind: "labels".to_string(),
+            slug: "audit-hold".to_string(),
+            class: SyncClass::BothDeleted,
+            local_hash: None,
+            remote_hash: None,
+            base_hash: Some("dummy".to_string()),
+        }];
+        let progress = OverallProgress::start("test");
+
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: true,
+            };
+            // Empty stdin — BothDeleted must not prompt.
+            resolve_remote_deletes(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b""),
+                true,
+                &progress,
+            )
+            .await
+            .expect("BothDeleted resolver must succeed without reading stdin")
+        };
+        progress.finish();
+
+        assert!(outcome.promoted_to_push.is_empty());
+        assert!(
+            fixture
+                .lockfile
+                .objects
+                .get("labels")
+                .and_then(|m| m.get("audit-hold"))
+                .is_none(),
+            "BothDeleted must drop the lockfile entry silently"
+        );
+
+        // No marker file should be written for BothDeleted.
+        let marker = {
+            let shadow = crate::paths::shadow_path_for(&fixture.local_path, "test");
+            let mut s = shadow.into_os_string();
+            s.push("-deleted");
+            std::path::PathBuf::from(s)
+        };
+        assert!(
+            !marker.exists(),
+            "BothDeleted must not write a deleted-marker"
+        );
     }
 }
