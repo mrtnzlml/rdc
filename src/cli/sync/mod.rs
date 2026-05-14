@@ -153,16 +153,29 @@ fn confirm(prompt: &str) -> Result<bool> {
 /// Fold the three sources (remote catalog, push scan, lockfile) into the
 /// `(kind, slug) -> hash` maps the classifier consumes.
 ///
-/// TODO(sync-impl): compute per-kind hashes from catalog bodies and
-/// local file bytes. Each kind has its own canonicalization rules — hooks
-/// strip `code`, schemas combine formulas, rules strip
-/// `trigger_condition`, etc. — so this isn't a one-liner; it grows across
-/// subsequent tasks.
+/// The hashing on each side must match so the classifier produces `Clean`
+/// when nothing has changed:
+/// * **`remote_hashes`** — re-runs the canonical serialization the per-kind
+///   pull driver performs before `record_object` (serialize → optional
+///   overlay strip → `content_hash`). This mirrors how the lockfile's
+///   `content_hash` was written on the last pull.
+/// * **`scan_changes`** — already computed by [`crate::cli::push::scan::scan`]
+///   over local file bytes with the same `content_hash` function. We
+///   re-derive from the on-disk path here rather than smuggling the hash
+///   through `ChangeList` to keep `scan.rs` push-only.
+/// * **`scan_tombstones`** — just the `(kind, slug)` keys, no hash needed.
+/// * **`locked`** — pulled verbatim from `lockfile.objects[kind][slug].content_hash`.
 ///
-/// Today's stub: produce empty maps. The clean-env smoke test exercises
-/// the pipeline shape (list → scan → classify → plan → confirm → execute)
-/// without depending on the hashes. Subsequent tasks build out hashing
-/// per kind.
+/// Slug derivation matches the pull drivers: prefer
+/// `lockfile.slug_for_id(kind, id)`, else `slugify_unique(name, ...)`.
+///
+/// TODO(sync-impl): only `labels` is wired today. Add hashing for the
+/// remaining kinds — `workspaces`, `queues`, `hooks` (combined hash),
+/// `rules` (combined hash), `schemas` (combined hash), `inboxes`,
+/// `engines`, `engine_fields`, `email_templates`, `mdh` — as their
+/// integration tests land. Each kind reuses its own pull driver's
+/// canonicalization rules; see `cli::pull::<kind>::process` for the
+/// authoritative serialization order.
 pub fn from_catalog_scan_lockfile(
     catalog: &crate::cli::pull::common::RemoteCatalog,
     changes: &crate::cli::push::scan::ChangeList,
@@ -170,10 +183,79 @@ pub fn from_catalog_scan_lockfile(
     lockfile: &crate::state::Lockfile,
 ) -> Vec<crate::cli::sync::classify::ClassifiedItem> {
     use std::collections::{BTreeMap, BTreeSet};
-    let _ = (catalog, changes, tombstones, lockfile);
-    let remote_hashes: BTreeMap<(String, String), String> = BTreeMap::new();
-    let scan_changes: BTreeMap<(String, String), String> = BTreeMap::new();
-    let scan_tombstones: BTreeSet<(String, String)> = BTreeSet::new();
-    let locked: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut remote_hashes: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut scan_changes: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut scan_tombstones: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut locked: BTreeMap<(String, String), String> = BTreeMap::new();
+
+    // --- labels --------------------------------------------------------
+    // Catalog hash: re-run `pull::labels::process`'s pre-record_object
+    // sequence — serialize → push newline → `content_hash`. Slug picks
+    // up the lockfile-anchored id mapping so remote renames don't churn
+    // slugs.
+    //
+    // Overlay note: the pull driver also runs `maybe_strip_overlay` on
+    // the proposed bytes when the env has a label overlay. We skip that
+    // step here because (a) threading the overlay through this signature
+    // is invasive for one TODO-listed concern, and (b) `content_hash`
+    // canonicalizes via `canonicalize_for_hash`, which only strips the
+    // server-noise fields — it does *not* strip overlay paths. As long
+    // as the pull driver also doesn't have a label overlay configured,
+    // both sides hash the same bytes. Once an overlay-aware test arrives,
+    // thread `&Overlay` into the adapter and call `maybe_strip_overlay`
+    // here.
+    let mut used_label_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for l in &catalog.labels {
+        let slug = match lockfile.slug_for_id("labels", l.id) {
+            Some(existing) => existing.to_string(),
+            None => crate::slug::slugify_unique(&l.name, &used_label_slugs),
+        };
+        used_label_slugs.insert(slug.clone());
+
+        let mut proposed = match serde_json::to_vec_pretty(l) {
+            Ok(b) => b,
+            // If a single body fails to serialize, skip it — better than
+            // tanking the whole classifier. The pull driver itself would
+            // also have errored, so the lockfile won't contain a hash and
+            // we'll get a spurious RemoteCreate. Acceptable.
+            Err(_) => continue,
+        };
+        proposed.push(b'\n');
+        let hash = crate::state::content_hash(&proposed);
+        remote_hashes.insert(("labels".to_string(), slug), hash);
+    }
+
+    // Scan changes: re-hash each on-disk path the scanner already
+    // flagged. The scanner skipped Clean items, so anything in
+    // `changes.labels` is by definition a local edit/create candidate.
+    for (slug, path) in &changes.labels {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let hash = crate::state::content_hash(&bytes);
+        scan_changes.insert(("labels".to_string(), slug.clone()), hash);
+    }
+
+    // Tombstones: just the keys.
+    for slug in tombstones.labels.keys() {
+        scan_tombstones.insert(("labels".to_string(), slug.clone()));
+    }
+
+    // Locked: lockfile-recorded base hashes.
+    if let Some(map) = lockfile.objects.get("labels") {
+        for (slug, entry) in map {
+            if let Some(h) = &entry.content_hash {
+                locked.insert(("labels".to_string(), slug.clone()), h.clone());
+            }
+        }
+    }
+
+    // TODO(sync-impl): repeat the four-source extraction for
+    // workspaces / queues / hooks / rules / schemas / inboxes /
+    // engines / engine_fields / email_templates / mdh. Each kind reuses
+    // its own pull driver's canonicalization; tests will guide which
+    // kind gets wired next.
+
     crate::cli::sync::classify::classify(&remote_hashes, &scan_changes, &scan_tombstones, &locked)
 }

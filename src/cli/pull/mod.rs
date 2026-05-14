@@ -14,7 +14,7 @@ mod email_templates;
 mod engine_fields;
 mod engines;
 mod hooks;
-mod labels;
+pub(crate) mod labels;
 mod mdh;
 mod organization;
 mod queues;

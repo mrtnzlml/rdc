@@ -133,3 +133,236 @@ async fn sync_clean_env_does_no_writes() {
         .expect("lockfile must be valid JSON");
     assert!(lf.get("version").is_some(), "lockfile should have a version: {lf_raw}");
 }
+
+/// Helper: mock every Rossum listing endpoint with an empty body. The
+/// per-test caller can then override specific endpoints with real
+/// fixtures.
+async fn mock_empty_lists_except(server: &MockServer, override_paths: &[&str]) {
+    let empty = serde_json::json!({ "pagination": { "next": null }, "results": [] });
+    for ep in [
+        "/api/v1/hooks",
+        "/api/v1/workspaces",
+        "/api/v1/queues",
+        "/api/v1/rules",
+        "/api/v1/labels",
+        "/api/v1/engines",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
+    ] {
+        if override_paths.contains(&ep) {
+            continue;
+        }
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty.clone()))
+            .mount(server)
+            .await;
+    }
+}
+
+/// Pull-side RemoteCreate: env exposes a label that doesn't exist locally
+/// and isn't in the lockfile. `sync` must classify it `RemoteCreate` and
+/// write the JSON to disk. No API mutations are issued.
+#[tokio::test]
+async fn sync_remote_create_writes_local_label() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // One label present on the env.
+    let labels_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 11,
+                "url": format!("{}/api/v1/labels/11", server.uri()),
+                "name": "Priority High",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "color": "#ff0000",
+                "modified_at": "2026-04-15T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(labels_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/labels"]).await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* diff = */ false, /* allow_deletes = */ false,
+        /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    result.expect("sync should succeed when remote has a new label");
+
+    // No API writes — pull-side only.
+    for req in server.received_requests().await.unwrap_or_default() {
+        let p = req.url.path();
+        if p.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "unexpected mutating request: {} {}",
+            req.method,
+            p
+        );
+    }
+
+    // Local file written.
+    let label_path = project.path().join("envs/dev/labels/priority-high.json");
+    assert!(
+        label_path.exists(),
+        "label JSON should be written at {}",
+        label_path.display()
+    );
+    let body = std::fs::read_to_string(&label_path).unwrap();
+    assert!(body.contains("Priority High"), "label content: {body}");
+
+    // Lockfile records the label.
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    assert!(lf_raw.contains("\"labels\""), "lockfile must record label: {lf_raw}");
+    assert!(lf_raw.contains("priority-high"), "lockfile must record slug: {lf_raw}");
+}
+
+/// Clean-state label: env has the label, local snapshot already mirrors
+/// it, lockfile records the matching hash. The classifier must mark it
+/// `Clean` and the executor must perform no writes. This pins the
+/// "hashes agree" half of the adapter contract — if hashing diverges
+/// from how pull writes / push scans, this test goes red.
+#[tokio::test]
+async fn sync_clean_label_no_writes() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let labels_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 11,
+                "url": format!("{}/api/v1/labels/11", server.uri()),
+                "name": "Priority High",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "color": "#ff0000",
+                "modified_at": "2026-04-15T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(labels_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/labels"]).await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // First sync: pulls the label and populates the lockfile.
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    rdc::cli::sync::run(
+        "dev", false, false, false, false, false, false,
+    )
+    .await
+    .expect("first sync should succeed");
+
+    // Snapshot request counts after the first sync so we can assert the
+    // second one is a no-op on writes (same write count == 0).
+    let writes_before = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| {
+            !r.url.path().contains("/svc/data-storage/")
+                && matches!(
+                    r.method,
+                    http::Method::POST | http::Method::PATCH | http::Method::DELETE
+                )
+        })
+        .count();
+
+    // Second sync: nothing should change. The label is on the env, on
+    // disk, and in the lockfile with a matching hash → Clean.
+    rdc::cli::sync::run(
+        "dev", false, false, false, false, false, false,
+    )
+    .await
+    .expect("clean-state second sync should succeed");
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    let writes_after = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| {
+            !r.url.path().contains("/svc/data-storage/")
+                && matches!(
+                    r.method,
+                    http::Method::POST | http::Method::PATCH | http::Method::DELETE
+                )
+        })
+        .count();
+    assert_eq!(
+        writes_before, writes_after,
+        "clean-state second sync must not issue any mutating requests"
+    );
+    assert_eq!(writes_before, 0, "first sync must not issue any mutating requests either");
+
+    // Label file is still present and the lockfile still records it.
+    assert!(project.path().join("envs/dev/labels/priority-high.json").exists());
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    assert!(lf_raw.contains("priority-high"));
+}
