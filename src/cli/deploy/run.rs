@@ -431,7 +431,7 @@ fn compute_plan(
 
 /// List slugs from the local snapshot. The layout is kind-specific; we
 /// reuse the same scanners `rdc map` uses for cross-env auto-matching.
-fn list_slugs(paths: &Paths, kind: &str) -> Result<Vec<String>> {
+pub(crate) fn list_slugs(paths: &Paths, kind: &str) -> Result<Vec<String>> {
     match kind {
         "workspaces" => list_workspace_slugs(paths),
         "schemas" | "queues" | "inboxes" => list_queue_nested(paths, kind),

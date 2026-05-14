@@ -11,7 +11,87 @@
 // dep-order list as the single source of truth so adding a kind in
 // run.rs automatically extends what --only accepts.
 use crate::cli::deploy::run::KINDS_IN_DEP_ORDER as DEPLOYABLE_KINDS;
+use crate::paths::Paths;
 use anyhow::{anyhow, bail, Result};
+use std::collections::BTreeSet;
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Selection {
+    pub(crate) items: BTreeSet<(String, String)>,
+}
+
+impl Selection {
+    pub(crate) fn contains(&self, kind: &str, slug: &str) -> bool {
+        self.items
+            .contains(&(kind.to_string(), slug.to_string()))
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.items.len()
+    }
+}
+
+/// Resolve a list of `--only` flags against the candidate set built from
+/// the src + tgt snapshots.
+///
+/// Returns `Ok(None)` when `raw_matchers` is empty (signalling
+/// "no filter — whole-snapshot deploy"). Every matcher must hit at least
+/// one `(kind, slug)` pair across both snapshots; otherwise we error so
+/// typos can't silently produce no-op deploys.
+pub(crate) fn resolve(
+    raw_matchers: &[String],
+    src_paths: &Paths,
+    tgt_paths: &Paths,
+) -> Result<Option<Selection>> {
+    if raw_matchers.is_empty() {
+        return Ok(None);
+    }
+
+    let matchers: Vec<Matcher> = raw_matchers
+        .iter()
+        .map(|s| Matcher::parse(s))
+        .collect::<Result<_>>()?;
+
+    let candidates = build_candidate_set(src_paths, tgt_paths)?;
+
+    let mut items: BTreeSet<(String, String)> = BTreeSet::new();
+    for m in &matchers {
+        let mut hits = 0usize;
+        for (kind, slug) in &candidates {
+            if m.matches(kind, slug) {
+                items.insert((kind.clone(), slug.clone()));
+                hits += 1;
+            }
+        }
+        if hits == 0 {
+            bail!(
+                "--only '{}' matched 0 objects across the local snapshots. \
+                 (Check the spelling, or run `rdc status` to list available slugs.)",
+                m.raw
+            );
+        }
+    }
+
+    Ok(Some(Selection { items }))
+}
+
+fn build_candidate_set(
+    src_paths: &Paths,
+    tgt_paths: &Paths,
+) -> Result<BTreeSet<(String, String)>> {
+    use crate::cli::deploy::run::{list_slugs, KINDS_IN_DEP_ORDER};
+
+    let mut set = BTreeSet::new();
+    for kind in KINDS_IN_DEP_ORDER {
+        for slug in list_slugs(src_paths, kind)? {
+            set.insert((kind.to_string(), slug));
+        }
+        for slug in list_slugs(tgt_paths, kind)? {
+            set.insert((kind.to_string(), slug));
+        }
+    }
+    Ok(set)
+}
 
 /// One `--only` selector, parsed.
 ///
@@ -202,6 +282,125 @@ mod matcher_tests {
         let m = Matcher::parse("email_templates/main/cost-invoices/rejection").unwrap();
         assert!(m.matches("email_templates", "main/cost-invoices/rejection"));
         assert!(!m.matches("email_templates", "main/cost-invoices/confirmation"));
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use crate::paths::Paths;
+    use std::fs;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    fn touch(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"{}").unwrap();
+    }
+
+    /// Build a minimal snapshot under `root/envs/<env>/` covering several
+    /// kinds and layouts so the scanners have something to find.
+    fn make_env(root: &Path, env: &str) -> Paths {
+        let env_root = root.join("envs").join(env);
+        // flat hooks/rules/labels
+        touch(&env_root.join("hooks/validator-invoices.json"));
+        touch(&env_root.join("hooks/sftp-import.json"));
+        touch(&env_root.join("rules/check-totals.json"));
+        // workspace + queue + schema (queue-nested)
+        touch(&env_root.join("workspaces/finance/workspace.json"));
+        touch(&env_root.join("workspaces/finance/queues/cost-invoices/queue.json"));
+        touch(&env_root.join("workspaces/finance/queues/cost-invoices/schema.json"));
+        touch(&env_root.join("workspaces/finance/queues/credit-notes/queue.json"));
+        // email template under cost-invoices
+        touch(&env_root.join("workspaces/finance/queues/cost-invoices/email-templates/rejection.json"));
+        Paths::for_env(root, env)
+    }
+
+    #[test]
+    fn resolve_returns_none_when_no_matchers() {
+        let tmp = TempDir::new().unwrap();
+        let p = make_env(tmp.path(), "test");
+        let sel = resolve(&[], &p, &p).unwrap();
+        assert!(sel.is_none());
+    }
+
+    #[test]
+    fn resolve_literal_hits_exactly_one() {
+        let tmp = TempDir::new().unwrap();
+        let p = make_env(tmp.path(), "test");
+        let sel = resolve(&["hooks/validator-invoices".to_string()], &p, &p)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sel.items.len(), 1);
+        assert!(sel.contains("hooks", "validator-invoices"));
+    }
+
+    #[test]
+    fn resolve_glob_within_kind() {
+        let tmp = TempDir::new().unwrap();
+        let p = make_env(tmp.path(), "test");
+        let sel = resolve(&["hooks/*".to_string()], &p, &p).unwrap().unwrap();
+        assert!(sel.contains("hooks", "validator-invoices"));
+        assert!(sel.contains("hooks", "sftp-import"));
+        assert!(!sel.contains("rules", "check-totals"));
+    }
+
+    #[test]
+    fn resolve_cross_kind_glob_spans_kinds() {
+        let tmp = TempDir::new().unwrap();
+        let p = make_env(tmp.path(), "test");
+        let sel = resolve(&["*/cost-invoices".to_string()], &p, &p)
+            .unwrap()
+            .unwrap();
+        assert!(sel.contains("queues", "cost-invoices"));
+        assert!(sel.contains("schemas", "cost-invoices"));
+        assert!(!sel.contains("queues", "credit-notes"));
+    }
+
+    #[test]
+    fn resolve_unions_multiple_matchers() {
+        let tmp = TempDir::new().unwrap();
+        let p = make_env(tmp.path(), "test");
+        let sel = resolve(
+            &[
+                "hooks/validator-invoices".to_string(),
+                "rules/check-totals".to_string(),
+            ],
+            &p,
+            &p,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(sel.items.len(), 2);
+        assert!(sel.contains("hooks", "validator-invoices"));
+        assert!(sel.contains("rules", "check-totals"));
+    }
+
+    #[test]
+    fn resolve_zero_match_errors_with_offending_selector() {
+        let tmp = TempDir::new().unwrap();
+        let p = make_env(tmp.path(), "test");
+        let err = resolve(&["hooks/nonexistent".to_string()], &p, &p).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("hooks/nonexistent"), "got: {s}");
+        assert!(s.contains("matched 0 objects"), "got: {s}");
+    }
+
+    #[test]
+    fn resolve_candidate_set_unions_src_and_tgt() {
+        // hooks/only-in-tgt is in tgt but not src; matcher should still find it.
+        let tmp = TempDir::new().unwrap();
+        let src_p = make_env(tmp.path(), "test");
+        let tgt_root = tmp.path();
+        let tgt_p = Paths::for_env(tgt_root, "prod");
+        let env_root = tgt_root.join("envs/prod");
+        fs::create_dir_all(env_root.join("hooks")).unwrap();
+        fs::write(env_root.join("hooks/only-in-tgt.json"), b"{}").unwrap();
+
+        let sel = resolve(&["hooks/only-in-tgt".to_string()], &src_p, &tgt_p)
+            .unwrap()
+            .unwrap();
+        assert!(sel.contains("hooks", "only-in-tgt"));
     }
 }
 
