@@ -3,7 +3,7 @@ use crate::model::WorkflowStep;
 use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all workflow steps from the API.
@@ -18,7 +18,15 @@ pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<
 /// Phase 2: write listed workflow steps to disk. Each step nests under
 /// its parent workflow at `workflows/<workflow_slug>/steps/<step_slug>.json`.
 /// Orphan steps (no workflow in the lockfile) are skipped with a warning.
-pub async fn process(ctx: &mut PullCtx<'_>, steps: Vec<WorkflowStep>, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
+///
+/// `subset` selects which `(kind, slug)` pairs are written; items outside
+/// the subset are skipped silently.
+pub async fn process(
+    ctx: &mut PullCtx<'_>,
+    steps: Vec<WorkflowStep>,
+    subset: &BTreeSet<(String, String)>,
+    progress: &Arc<OverallProgress>,
+) -> Result<(usize, usize)> {
     progress.start_phase("workflow_steps");
 
     let mut used: HashSet<String> = HashSet::new();
@@ -39,6 +47,10 @@ pub async fn process(ctx: &mut PullCtx<'_>, steps: Vec<WorkflowStep>, progress: 
             None => slugify_unique(&s.name, &used),
         };
         used.insert(slug.clone());
+
+        if !subset.contains(&("workflow_steps".to_string(), slug.clone())) {
+            continue;
+        }
 
         let steps_dir = ctx.paths.workflow_steps_dir(&workflow_slug);
         std::fs::create_dir_all(&steps_dir)

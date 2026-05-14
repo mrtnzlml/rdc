@@ -6,7 +6,7 @@ use crate::model::EmailTemplate;
 use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all email templates from the API.
@@ -36,8 +36,17 @@ pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<
 /// ctx.queue_locations must already be populated by queues::process before
 /// this is called.
 ///
-/// Returns `(count, conflicts)`.
-pub async fn process(ctx: &mut PullCtx<'_>, templates: Vec<EmailTemplate>, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
+/// `subset` selects which `(kind, slug)` pairs are written, where `slug`
+/// is the compound `<ws>/<q>/<tpl>` lockfile key; items outside the subset
+/// are skipped silently.
+///
+/// Returns `(count, conflicts)` of items written.
+pub async fn process(
+    ctx: &mut PullCtx<'_>,
+    templates: Vec<EmailTemplate>,
+    subset: &BTreeSet<(String, String)>,
+    progress: &Arc<OverallProgress>,
+) -> Result<(usize, usize)> {
     progress.start_phase("email_templates");
 
     let mut per_queue_used_slugs: HashMap<(String, String), HashSet<String>> = HashMap::new();
@@ -72,6 +81,10 @@ pub async fn process(ctx: &mut PullCtx<'_>, templates: Vec<EmailTemplate>, progr
         };
         used.insert(template_slug.clone());
         let lockfile_key = format!("{ws_slug}/{q_slug}/{template_slug}");
+
+        if !subset.contains(&("email_templates".to_string(), lockfile_key.clone())) {
+            continue;
+        }
 
         let dir = ctx.paths.queue_email_templates_dir(&ws_slug, &q_slug);
         std::fs::create_dir_all(&dir)

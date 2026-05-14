@@ -8,7 +8,7 @@ use crate::slug::slugify_unique;
 use crate::snapshot::rule::{serialize_rule, write_rule_code};
 use crate::state::rule_combined_hash;
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all rules from the API.
@@ -24,24 +24,37 @@ pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<
 /// `trigger_condition` (Python). When present we write it to a sibling
 /// `<slug>.py` and use a combined hash for three-way merge. Mirrors
 /// the hooks pull driver.
-pub async fn process(ctx: &mut PullCtx<'_>, rules: Vec<Rule>, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
+///
+/// `subset` selects which `(kind, slug)` pairs are written; items outside
+/// the subset are skipped silently.
+pub async fn process(
+    ctx: &mut PullCtx<'_>,
+    rules: Vec<Rule>,
+    subset: &BTreeSet<(String, String)>,
+    progress: &Arc<OverallProgress>,
+) -> Result<(usize, usize)> {
     progress.start_phase("rules");
 
     let mut used_slugs: HashSet<String> = HashSet::new();
     let mut dir_created = false;
     let mut conflicts = 0usize;
+    let mut written = 0usize;
     for r in &rules {
-        if !dir_created {
-            std::fs::create_dir_all(ctx.paths.rules_dir())
-                .with_context(|| format!("creating {}", ctx.paths.rules_dir().display()))?;
-            dir_created = true;
-        }
-
         let slug = match ctx.lockfile.slug_for_id("rules", r.id) {
             Some(existing) => existing.to_string(),
             None => slugify_unique(&r.name, &used_slugs),
         };
         used_slugs.insert(slug.clone());
+
+        if !subset.contains(&("rules".to_string(), slug.clone())) {
+            continue;
+        }
+
+        if !dir_created {
+            std::fs::create_dir_all(ctx.paths.rules_dir())
+                .with_context(|| format!("creating {}", ctx.paths.rules_dir().display()))?;
+            dir_created = true;
+        }
 
         let (proposed_json, proposed_code) = serialize_rule(r)?;
         let proposed_json = maybe_strip_overlay(
@@ -162,7 +175,8 @@ pub async fn process(ctx: &mut PullCtx<'_>, rules: Vec<Rule>, progress: &Arc<Ove
             Some(recorded_hash),
         );
         progress.tick(&r.name);
+        written += 1;
     }
 
-    Ok((rules.len(), conflicts))
+    Ok((written, conflicts))
 }

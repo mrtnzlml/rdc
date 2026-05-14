@@ -16,7 +16,7 @@ use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use futures::stream::{StreamExt, TryStreamExt};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Counts of objects pulled by the queues driver.
@@ -48,7 +48,21 @@ pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<
 
 /// Phase 2: process listed queues — filter, slug, write queue.json + schema +
 /// inbox. Also populates `ctx.queue_locations` for email_templates.
-pub async fn process(ctx: &mut PullCtx<'_>, queues: Vec<Queue>, progress: &Arc<OverallProgress>) -> Result<QueueCounts> {
+///
+/// `subset` selects which `(kind, slug)` pairs are written. Filtering is
+/// applied at the queue level: when a queue's `("queues", slug)` pair is in
+/// the subset, the queue's queue.json, schema (+ formulas), and inbox are
+/// all written together. Granular per-file selection (schema-only or
+/// inbox-only) is intentionally not modelled here — sync (Task 13+) calls
+/// classify per kind, and if a subset asks for `schemas/x` without
+/// `queues/x` that's user error surfaced upstream. Queue-nested files
+/// always travel as a unit.
+pub async fn process(
+    ctx: &mut PullCtx<'_>,
+    queues: Vec<Queue>,
+    subset: &BTreeSet<(String, String)>,
+    progress: &Arc<OverallProgress>,
+) -> Result<QueueCounts> {
     progress.start_phase("queues");
 
     let mut per_ws_used_slugs: HashMap<String, HashSet<String>> = HashMap::new();
@@ -75,6 +89,10 @@ pub async fn process(ctx: &mut PullCtx<'_>, queues: Vec<Queue>, progress: &Arc<O
             None => slugify_unique(&q.name, used),
         };
         used.insert(q_slug.clone());
+
+        if !subset.contains(&("queues".to_string(), q_slug.clone())) {
+            continue;
+        }
 
         let queue_dir = ctx.paths.queue_dir(&ws_slug, &q_slug);
         std::fs::create_dir_all(&queue_dir)

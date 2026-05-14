@@ -6,7 +6,7 @@ use crate::model::EngineField;
 use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all engine fields from the API.
@@ -22,7 +22,15 @@ pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<
 /// its parent engine at `engines/<engine_slug>/fields/<field_slug>.json`.
 /// Orphan fields (no engine in the lockfile) are skipped with a warning
 /// — same pattern as orphan queues.
-pub async fn process(ctx: &mut PullCtx<'_>, fields: Vec<EngineField>, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
+///
+/// `subset` selects which `(kind, slug)` pairs are written; items outside
+/// the subset are skipped silently.
+pub async fn process(
+    ctx: &mut PullCtx<'_>,
+    fields: Vec<EngineField>,
+    subset: &BTreeSet<(String, String)>,
+    progress: &Arc<OverallProgress>,
+) -> Result<(usize, usize)> {
     progress.start_phase("engine_fields");
 
     let mut used: HashSet<String> = HashSet::new();
@@ -43,6 +51,10 @@ pub async fn process(ctx: &mut PullCtx<'_>, fields: Vec<EngineField>, progress: 
             None => slugify_unique(&f.name, &used),
         };
         used.insert(slug.clone());
+
+        if !subset.contains(&("engine_fields".to_string(), slug.clone())) {
+            continue;
+        }
 
         let fields_dir = ctx.paths.engine_fields_dir(&engine_slug);
         std::fs::create_dir_all(&fields_dir)

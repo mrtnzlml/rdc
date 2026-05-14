@@ -6,7 +6,7 @@ use crate::model::Engine;
 use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all engines from the API.
@@ -18,18 +18,30 @@ pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<
     )
 }
 
-/// Phase 2: write listed engines to disk. Returns `(count, conflicts)`.
-pub async fn process(ctx: &mut PullCtx<'_>, engines: Vec<Engine>, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
+/// Phase 2: write listed engines to disk. `subset` selects which `(kind,
+/// slug)` pairs are written; items outside the subset are skipped silently.
+/// Returns `(count, conflicts)` of items written.
+pub async fn process(
+    ctx: &mut PullCtx<'_>,
+    engines: Vec<Engine>,
+    subset: &BTreeSet<(String, String)>,
+    progress: &Arc<OverallProgress>,
+) -> Result<(usize, usize)> {
     progress.start_phase("engines");
 
     let mut used: HashSet<String> = HashSet::new();
     let mut conflicts = 0usize;
+    let mut written = 0usize;
     for e in &engines {
         let slug = match ctx.lockfile.slug_for_id("engines", e.id) {
             Some(existing) => existing.to_string(),
             None => slugify_unique(&e.name, &used),
         };
         used.insert(slug.clone());
+
+        if !subset.contains(&("engines".to_string(), slug.clone())) {
+            continue;
+        }
 
         // Each engine owns a directory: `engines/<slug>/`. The engine's
         // JSON lives at `engine.json` inside it, alongside `fields/`.
@@ -69,7 +81,8 @@ pub async fn process(ctx: &mut PullCtx<'_>, engines: Vec<Engine>, progress: &Arc
             Some(recorded_hash),
         );
         progress.tick(&e.name);
+        written += 1;
     }
 
-    Ok((engines.len(), conflicts))
+    Ok((written, conflicts))
 }

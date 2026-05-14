@@ -3,7 +3,7 @@ use crate::model::Workflow;
 use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all workflows from the API.
@@ -15,18 +15,30 @@ pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<
     )
 }
 
-/// Phase 2: write listed workflows to disk. Returns `(count, conflicts)`.
-pub async fn process(ctx: &mut PullCtx<'_>, workflows: Vec<Workflow>, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
+/// Phase 2: write listed workflows to disk. `subset` selects which `(kind,
+/// slug)` pairs are written; items outside the subset are skipped silently.
+/// Returns `(count, conflicts)` of items written.
+pub async fn process(
+    ctx: &mut PullCtx<'_>,
+    workflows: Vec<Workflow>,
+    subset: &BTreeSet<(String, String)>,
+    progress: &Arc<OverallProgress>,
+) -> Result<(usize, usize)> {
     progress.start_phase("workflows");
 
     let mut used: HashSet<String> = HashSet::new();
     let mut conflicts = 0usize;
+    let mut written = 0usize;
     for w in &workflows {
         let slug = match ctx.lockfile.slug_for_id("workflows", w.id) {
             Some(existing) => existing.to_string(),
             None => slugify_unique(&w.name, &used),
         };
         used.insert(slug.clone());
+
+        if !subset.contains(&("workflows".to_string(), slug.clone())) {
+            continue;
+        }
 
         // Each workflow owns a directory: `workflows/<slug>/`. The
         // workflow's JSON lives at `workflow.json` inside it, alongside
@@ -63,7 +75,8 @@ pub async fn process(ctx: &mut PullCtx<'_>, workflows: Vec<Workflow>, progress: 
             Some(recorded_hash),
         );
         progress.tick(&w.name);
+        written += 1;
     }
 
-    Ok((workflows.len(), conflicts))
+    Ok((written, conflicts))
 }

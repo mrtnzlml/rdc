@@ -6,7 +6,7 @@ use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use futures::stream::{StreamExt, TryStreamExt};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Opaque listed state for MDH — the client handle plus the collection list.
@@ -42,8 +42,16 @@ pub async fn list(env_cfg: &EnvConfig, token: &str, progress: &Arc<OverallProgre
 /// `buffer_unordered(N)` (per spec §16, default N=5) so a 10-dataset MDH
 /// doesn't take 20 sequential round-trips.
 ///
-/// Returns `(collection_count, conflicts)`.
-pub async fn process(ctx: &mut PullCtx<'_>, listed: MdhListed, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
+/// `subset` selects which `(kind, slug)` pairs are written, with kind
+/// `"mdh"` keyed by dataset slug; items outside the subset are skipped
+/// silently (no fetch, no write). Returns `(collection_count, conflicts)`
+/// of items written.
+pub async fn process(
+    ctx: &mut PullCtx<'_>,
+    listed: MdhListed,
+    subset: &BTreeSet<(String, String)>,
+    progress: &Arc<OverallProgress>,
+) -> Result<(usize, usize)> {
     progress.start_phase("mdh");
 
     let MdhListed { client, collections } = listed;
@@ -55,8 +63,7 @@ pub async fn process(ctx: &mut PullCtx<'_>, listed: MdhListed, progress: &Arc<Ov
     let mut used: HashSet<String> = HashSet::new();
     let mut conflicts = 0usize;
 
-    std::fs::create_dir_all(ctx.paths.mdh_dir())
-        .with_context(|| format!("creating {}", ctx.paths.mdh_dir().display()))?;
+    let mut dir_created = false;
 
     // === Sub-phase A: assign slugs + write collection.json. Build per-collection
     //            dataset_dir map for use in sub-phase C.
@@ -64,6 +71,16 @@ pub async fn process(ctx: &mut PullCtx<'_>, listed: MdhListed, progress: &Arc<Ov
     for c in collections {
         let slug = slugify_unique(&c.name, &used);
         used.insert(slug.clone());
+
+        if !subset.contains(&("mdh".to_string(), slug.clone())) {
+            continue;
+        }
+
+        if !dir_created {
+            std::fs::create_dir_all(ctx.paths.mdh_dir())
+                .with_context(|| format!("creating {}", ctx.paths.mdh_dir().display()))?;
+            dir_created = true;
+        }
 
         let dataset_dir = ctx.paths.dataset_dir(&slug);
         std::fs::create_dir_all(&dataset_dir)

@@ -8,7 +8,7 @@ use crate::slug::slugify_unique;
 use crate::snapshot::hook::{serialize_hook, write_hook_code};
 use crate::state::hook_combined_hash;
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all hooks from the API.
@@ -20,25 +20,37 @@ pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<
     )
 }
 
-/// Phase 2: write listed hooks to disk. Returns `(count, conflicts)`.
-pub async fn process(ctx: &mut PullCtx<'_>, hooks: Vec<Hook>, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
+/// Phase 2: write listed hooks to disk. `subset` selects which `(kind, slug)`
+/// pairs are written; items outside the subset are skipped silently. Returns
+/// `(count, conflicts)` of items written.
+pub async fn process(
+    ctx: &mut PullCtx<'_>,
+    hooks: Vec<Hook>,
+    subset: &BTreeSet<(String, String)>,
+    progress: &Arc<OverallProgress>,
+) -> Result<(usize, usize)> {
     progress.start_phase("hooks");
 
     let mut used_slugs: HashSet<String> = HashSet::new();
     let mut dir_created = false;
     let mut conflicts = 0usize;
+    let mut written = 0usize;
     for hook in &hooks {
-        if !dir_created {
-            std::fs::create_dir_all(ctx.paths.hooks_dir())
-                .with_context(|| format!("creating {}", ctx.paths.hooks_dir().display()))?;
-            dir_created = true;
-        }
-
         let slug = match ctx.lockfile.slug_for_id("hooks", hook.id) {
             Some(existing) => existing.to_string(),
             None => slugify_unique(&hook.name, &used_slugs),
         };
         used_slugs.insert(slug.clone());
+
+        if !subset.contains(&("hooks".to_string(), slug.clone())) {
+            continue;
+        }
+
+        if !dir_created {
+            std::fs::create_dir_all(ctx.paths.hooks_dir())
+                .with_context(|| format!("creating {}", ctx.paths.hooks_dir().display()))?;
+            dir_created = true;
+        }
 
         let (proposed_json, proposed_code) = serialize_hook(hook)?;
         // Strip overlay-managed paths from the JSON (spec §9.3). Code in
@@ -174,7 +186,8 @@ pub async fn process(ctx: &mut PullCtx<'_>, hooks: Vec<Hook>, progress: &Arc<Ove
             Some(recorded_hash),
         );
         progress.tick(&hook.name);
+        written += 1;
     }
 
-    Ok((hooks.len(), conflicts))
+    Ok((written, conflicts))
 }
