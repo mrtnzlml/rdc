@@ -5,4 +5,4 @@ pub mod map;
 pub mod realign;
 pub mod run;
 pub mod store_extensions;
-pub mod selection;
+pub(crate) mod selection;

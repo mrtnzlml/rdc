@@ -76,4 +76,15 @@ mod glob_tests {
         assert!(glob_matches("cost-*-invoices", "cost--invoices"));
         assert!(!glob_matches("cost-*-invoices", "cost-invoices"));
     }
+
+    #[test]
+    fn empty_pattern() {
+        assert!(glob_matches("", ""));
+        assert!(!glob_matches("", "abc"));
+    }
+
+    #[test]
+    fn pattern_longer_than_text() {
+        assert!(!glob_matches("abcdef", "abc"));
+    }
 }
