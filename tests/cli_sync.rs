@@ -10,9 +10,26 @@
 //! Subsequent tasks fill in per-kind hashing (T14–17) and the executor
 //! (T14–17); their integration tests will live alongside this one.
 
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Global lock serializing tests that mutate process-global state
+/// (specifically `std::env::set_current_dir`). Cargo runs tests within a
+/// binary in parallel; without serialization here, two tests can change
+/// CWD concurrently and one will read the wrong path, producing
+/// `NotFound` errors. The lock is acquired in each test's
+/// `set_current_dir` window and released after the assertions. Using a
+/// `std::sync::Mutex` (not async) is fine — the critical section is
+/// short and the tests don't await anything across it that would benefit
+/// from yielding.
+fn cwd_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn fixture(name: &str) -> serde_json::Value {
     // Resolve via `CARGO_MANIFEST_DIR` rather than the current working
@@ -97,6 +114,7 @@ async fn sync_clean_env_does_no_writes() {
     // hop into the project root for the call. CWD is process-global, so
     // we restore it before returning to avoid bleeding state into any
     // future test that ends up in the same binary.
+    let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
@@ -217,6 +235,7 @@ async fn sync_remote_create_writes_local_label() {
     )
     .unwrap();
 
+    let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
@@ -314,6 +333,7 @@ async fn sync_clean_label_no_writes() {
     .unwrap();
 
     // First sync: pulls the label and populates the lockfile.
+    let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
     rdc::cli::sync::run(
@@ -445,6 +465,7 @@ async fn sync_local_edit_only_patches_remote_label() {
     )
     .unwrap();
 
+    let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
 
@@ -581,6 +602,7 @@ async fn sync_no_push_skips_local_edit() {
     )
     .unwrap();
 
+    let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
 
@@ -695,6 +717,7 @@ async fn sync_no_pull_skips_remote_change() {
     )
     .unwrap();
 
+    let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
@@ -803,6 +826,7 @@ async fn sync_dry_run_makes_zero_writes() {
     // Seed the lockfile + local files via a first (real) sync, then edit
     // one of the labels and delete the other so the dry-run sees a
     // LocalEdit + a RemoteCreate at the same time.
+    let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
     rdc::cli::sync::run(
@@ -898,6 +922,7 @@ async fn sync_no_push_and_no_pull_together_errors() {
     // filesystem or API access. We still create a tempdir + cd into it
     // so `current_dir()` doesn't surprise the test runner.
     let project = TempDir::new().unwrap();
+    let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
@@ -965,6 +990,7 @@ async fn sync_remote_create_writes_local_workflow() {
     )
     .unwrap();
 
+    let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
@@ -1081,6 +1107,7 @@ async fn sync_remote_create_writes_local_workflow_step() {
     )
     .unwrap();
 
+    let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
@@ -1163,6 +1190,7 @@ async fn sync_remote_create_writes_local_organization() {
     )
     .unwrap();
 
+    let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
@@ -1212,5 +1240,472 @@ async fn sync_remote_create_writes_local_organization() {
     assert!(
         lf_raw.contains("\"self\""),
         "lockfile must record the 'self' slug: {lf_raw}"
+    );
+}
+
+/// Pull-side RemoteCreate for a workspace: env exposes a workspace that
+/// doesn't exist locally and isn't in the lockfile. `sync` must classify
+/// it `RemoteCreate` and write `envs/dev/workspaces/<slug>/workspace.json`.
+/// Workspaces are push-capable so the pull-side branch in the executor
+/// must dispatch to `pull::workspaces::process`; this test pins that wire-up.
+#[tokio::test]
+async fn sync_remote_create_writes_local_workspace() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let workspaces_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 800,
+                "url": format!("{}/api/v1/workspaces/800", server.uri()),
+                "name": "Invoices AP",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "queues": [],
+                "modified_at": "2026-04-20T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(workspaces_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/workspaces"]).await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* diff = */ false, /* allow_deletes = */ false,
+        /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    result.expect("sync should succeed when remote has a new workspace");
+
+    for req in server.received_requests().await.unwrap_or_default() {
+        let p = req.url.path();
+        if p.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "unexpected mutating request: {} {}",
+            req.method,
+            p
+        );
+    }
+
+    let workspace_path = project
+        .path()
+        .join("envs/dev/workspaces/invoices-ap/workspace.json");
+    assert!(
+        workspace_path.exists(),
+        "workspace JSON should be written at {}",
+        workspace_path.display()
+    );
+    let body = std::fs::read_to_string(&workspace_path).unwrap();
+    assert!(body.contains("Invoices AP"), "workspace content: {body}");
+
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    assert!(
+        lf_raw.contains("\"workspaces\""),
+        "lockfile must record workspace: {lf_raw}"
+    );
+    assert!(
+        lf_raw.contains("invoices-ap"),
+        "lockfile must record slug: {lf_raw}"
+    );
+}
+
+/// Pull-side RemoteCreate for an engine: env exposes an engine that
+/// doesn't exist locally. `sync` must classify it `RemoteCreate` and
+/// write `envs/dev/engines/<slug>/engine.json`.
+#[tokio::test]
+async fn sync_remote_create_writes_local_engine() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let engines_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 401,
+                "url": format!("{}/api/v1/engines/401", server.uri()),
+                "name": "Invoice Engine",
+                "type": "extractor",
+                "modified_at": "2026-04-20T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/engines"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(engines_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/engines"]).await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* diff = */ false, /* allow_deletes = */ false,
+        /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    result.expect("sync should succeed when remote has a new engine");
+
+    for req in server.received_requests().await.unwrap_or_default() {
+        let p = req.url.path();
+        if p.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "unexpected mutating request: {} {}",
+            req.method,
+            p
+        );
+    }
+
+    let engine_path = project
+        .path()
+        .join("envs/dev/engines/invoice-engine/engine.json");
+    assert!(
+        engine_path.exists(),
+        "engine JSON should be written at {}",
+        engine_path.display()
+    );
+    let body = std::fs::read_to_string(&engine_path).unwrap();
+    assert!(body.contains("Invoice Engine"), "engine content: {body}");
+
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    assert!(
+        lf_raw.contains("\"engines\""),
+        "lockfile must record engine: {lf_raw}"
+    );
+    assert!(
+        lf_raw.contains("invoice-engine"),
+        "lockfile must record slug: {lf_raw}"
+    );
+}
+
+/// Pull-side RemoteCreate for an engine field. Requires the parent
+/// engine to be present too (the driver skips orphan fields), so this
+/// mocks both endpoints. Asserts the nested file at
+/// `envs/dev/engines/<engine_slug>/fields/<field_slug>.json` exists.
+#[tokio::test]
+async fn sync_remote_create_writes_local_engine_field() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let engine_url = format!("{}/api/v1/engines/401", server.uri());
+    let engines_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 401,
+                "url": engine_url,
+                "name": "Invoice Engine",
+                "type": "extractor",
+                "modified_at": "2026-04-20T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/engines"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(engines_body))
+        .mount(&server)
+        .await;
+
+    let fields_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 501,
+                "url": format!("{}/api/v1/engine_fields/501", server.uri()),
+                "name": "Invoice Number",
+                "engine": format!("{}/api/v1/engines/401", server.uri()),
+                "field_type": "string",
+                "modified_at": "2026-04-20T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/engine_fields"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fields_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/engines", "/api/v1/engine_fields"]).await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* diff = */ false, /* allow_deletes = */ false,
+        /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    result.expect("sync should succeed when remote has a new engine field");
+
+    for req in server.received_requests().await.unwrap_or_default() {
+        let p = req.url.path();
+        if p.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "unexpected mutating request: {} {}",
+            req.method,
+            p
+        );
+    }
+
+    let field_path = project
+        .path()
+        .join("envs/dev/engines/invoice-engine/fields/invoice-number.json");
+    assert!(
+        field_path.exists(),
+        "engine field JSON should be written at {}",
+        field_path.display()
+    );
+    let body = std::fs::read_to_string(&field_path).unwrap();
+    assert!(body.contains("Invoice Number"), "field content: {body}");
+
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    assert!(
+        lf_raw.contains("\"engine_fields\""),
+        "lockfile must record engine_fields: {lf_raw}"
+    );
+    assert!(
+        lf_raw.contains("invoice-number"),
+        "lockfile must record field slug: {lf_raw}"
+    );
+}
+
+/// Pull-side RemoteCreate for an MDH dataset: the Data Storage service
+/// returns one collection with an index set, and `sync` must write both
+/// `collection.json` and `indexes.json` under `envs/dev/mdh/<slug>/`.
+/// MDH is pull-only (no push pipeline), so this exercises only the
+/// pull-side branch of the executor.
+#[tokio::test]
+async fn sync_remote_create_writes_local_mdh_dataset() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &[]).await;
+
+    // Data Storage endpoints use POST with a JSON envelope `{code, message, result}`.
+    use wiremock::matchers::body_partial_json;
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/collections/list"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "ok",
+                "message": "",
+                "result": [
+                    {
+                        "name": "vendors",
+                        "type": "collection",
+                        "options": {},
+                        "idIndex": { "v": 2, "key": { "_id": 1 }, "name": "_id_" }
+                    }
+                ]
+            })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/indexes/list"))
+        .and(body_partial_json(
+            serde_json::json!({"collectionName": "vendors"}),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "ok",
+                "message": "",
+                "result": [
+                    { "v": 2, "name": "_id_", "key": { "_id": 1 } }
+                ]
+            })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/search_indexes/list"))
+        .and(body_partial_json(
+            serde_json::json!({"collectionName": "vendors"}),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "ok",
+                "message": "",
+                "result": []
+            })),
+        )
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* diff = */ false, /* allow_deletes = */ false,
+        /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    result.expect("sync should succeed when MDH has a new dataset");
+
+    // No mutating API calls on the Rossum API side — MDH is pull-only.
+    // Data Storage uses POSTs for *reads* (RPC-style), so those are
+    // excluded from the assertion (mirroring the existing cli_sync
+    // tests' convention).
+    for req in server.received_requests().await.unwrap_or_default() {
+        let p = req.url.path();
+        if p.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "unexpected mutating request: {} {}",
+            req.method,
+            p
+        );
+    }
+
+    let collection_path = project.path().join("envs/dev/mdh/vendors/collection.json");
+    let indexes_path = project.path().join("envs/dev/mdh/vendors/indexes.json");
+    assert!(
+        collection_path.exists(),
+        "collection JSON should be written at {}",
+        collection_path.display()
+    );
+    assert!(
+        indexes_path.exists(),
+        "indexes JSON should be written at {}",
+        indexes_path.display()
+    );
+    let body = std::fs::read_to_string(&collection_path).unwrap();
+    assert!(body.contains("vendors"), "collection content: {body}");
+
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    assert!(
+        lf_raw.contains("\"mdh_collections\""),
+        "lockfile must record mdh_collections: {lf_raw}"
+    );
+    assert!(
+        lf_raw.contains("\"mdh_indexes\""),
+        "lockfile must record mdh_indexes: {lf_raw}"
+    );
+    assert!(
+        lf_raw.contains("vendors"),
+        "lockfile must record dataset slug: {lf_raw}"
     );
 }

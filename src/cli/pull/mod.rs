@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 pub(crate) mod common;
 mod email_templates;
-mod engine_fields;
-mod engines;
+pub(crate) mod engine_fields;
+pub(crate) mod engines;
 mod hooks;
 pub(crate) mod labels;
 pub(crate) mod mdh;
@@ -21,7 +21,7 @@ mod queues;
 mod rules;
 pub(crate) mod workflow_steps;
 pub(crate) mod workflows;
-mod workspaces;
+pub(crate) mod workspaces;
 
 pub use common::PullCtx;
 

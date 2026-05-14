@@ -331,11 +331,169 @@ pub fn from_catalog_scan_lockfile(
         }
     }
 
-    // TODO(sync-impl): repeat the four-source extraction for
-    // workspaces / queues / hooks / rules / schemas / inboxes /
-    // engines / engine_fields / email_templates / mdh. Each kind reuses
-    // its own pull driver's canonicalization; tests will guide which
-    // kind gets wired next.
+    // --- workspaces ---------------------------------------------------
+    // Push-capable flat kind. Slug derivation mirrors
+    // `pull::workspaces::process`: lockfile-anchored id mapping first,
+    // else `slugify_unique(name, used)`. Hash matches the driver's
+    // canonical form (`serde_json::to_vec_pretty` → `\n` → content_hash);
+    // workspaces have no overlay so no strip step.
+    let mut used_workspace_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for w in &catalog.workspaces {
+        let slug = match lockfile.slug_for_id("workspaces", w.id) {
+            Some(existing) => existing.to_string(),
+            None => crate::slug::slugify_unique(&w.name, &used_workspace_slugs),
+        };
+        used_workspace_slugs.insert(slug.clone());
+
+        let mut proposed = match serde_json::to_vec_pretty(w) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        proposed.push(b'\n');
+        let hash = crate::state::content_hash(&proposed);
+        remote_hashes.insert(("workspaces".to_string(), slug), hash);
+    }
+    for (slug, path) in &changes.workspaces {
+        if let Ok(bytes) = std::fs::read(path) {
+            scan_changes.insert(
+                ("workspaces".to_string(), slug.clone()),
+                crate::state::content_hash(&bytes),
+            );
+        }
+    }
+    for slug in tombstones.workspaces.keys() {
+        scan_tombstones.insert(("workspaces".to_string(), slug.clone()));
+    }
+    if let Some(map) = lockfile.objects.get("workspaces") {
+        for (slug, entry) in map {
+            if let Some(h) = &entry.content_hash {
+                locked.insert(("workspaces".to_string(), slug.clone()), h.clone());
+            }
+        }
+    }
+
+    // --- engines ------------------------------------------------------
+    // Push-capable flat kind. Engines have an overlay; the pull driver
+    // calls `maybe_strip_overlay` before hashing. When no overlay is
+    // configured (`overlay.engines.<slug>` empty or unset),
+    // `maybe_strip_overlay` is a no-op and the adapter's hash matches
+    // the driver byte-for-byte. Once an overlay-aware test arrives,
+    // thread `&Overlay` into the adapter and replicate the strip — same
+    // caveat as labels.
+    let mut used_engine_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in &catalog.engines {
+        let slug = match lockfile.slug_for_id("engines", e.id) {
+            Some(existing) => existing.to_string(),
+            None => crate::slug::slugify_unique(&e.name, &used_engine_slugs),
+        };
+        used_engine_slugs.insert(slug.clone());
+
+        let mut proposed = match serde_json::to_vec_pretty(e) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        proposed.push(b'\n');
+        let hash = crate::state::content_hash(&proposed);
+        remote_hashes.insert(("engines".to_string(), slug), hash);
+    }
+    for (slug, path) in &changes.engines {
+        if let Ok(bytes) = std::fs::read(path) {
+            scan_changes.insert(
+                ("engines".to_string(), slug.clone()),
+                crate::state::content_hash(&bytes),
+            );
+        }
+    }
+    for slug in tombstones.engines.keys() {
+        scan_tombstones.insert(("engines".to_string(), slug.clone()));
+    }
+    if let Some(map) = lockfile.objects.get("engines") {
+        for (slug, entry) in map {
+            if let Some(h) = &entry.content_hash {
+                locked.insert(("engines".to_string(), slug.clone()), h.clone());
+            }
+        }
+    }
+
+    // --- engine_fields ------------------------------------------------
+    // Push-capable flat kind keyed by field slug alone (matching the
+    // lockfile + push scanner). Path is `engines/<engine>/fields/<slug>.json`
+    // and `change_list_from_classified` already sweeps for it. The pull
+    // driver also skips orphan fields (no parent engine in the lockfile),
+    // but the adapter emits a slug regardless; classifier emits
+    // RemoteCreate and the driver later skips with a warning.
+    //
+    // Same overlay caveat as engines / labels: no strip done here today.
+    let mut used_ef_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for f in &catalog.engine_fields {
+        let slug = match lockfile.slug_for_id("engine_fields", f.id) {
+            Some(existing) => existing.to_string(),
+            None => crate::slug::slugify_unique(&f.name, &used_ef_slugs),
+        };
+        used_ef_slugs.insert(slug.clone());
+
+        let mut proposed = match serde_json::to_vec_pretty(f) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        proposed.push(b'\n');
+        let hash = crate::state::content_hash(&proposed);
+        remote_hashes.insert(("engine_fields".to_string(), slug), hash);
+    }
+    for (slug, path) in &changes.engine_fields {
+        if let Ok(bytes) = std::fs::read(path) {
+            scan_changes.insert(
+                ("engine_fields".to_string(), slug.clone()),
+                crate::state::content_hash(&bytes),
+            );
+        }
+    }
+    for slug in tombstones.engine_fields.keys() {
+        scan_tombstones.insert(("engine_fields".to_string(), slug.clone()));
+    }
+    if let Some(map) = lockfile.objects.get("engine_fields") {
+        for (slug, entry) in map {
+            if let Some(h) = &entry.content_hash {
+                locked.insert(("engine_fields".to_string(), slug.clone()), h.clone());
+            }
+        }
+    }
+
+    // --- mdh ----------------------------------------------------------
+    // MDH is two kinds in the lockfile (`mdh_collections` and
+    // `mdh_indexes`) but a single dataset slug. The pull driver derives
+    // the slug from `Collection::name` only — there's no id-anchored
+    // lookup, so re-running the slugger is sufficient.
+    //
+    // Surface both kinds in `remote_hashes` / `locked` because they're
+    // tracked separately in the lockfile; the dispatcher in `execute::run`
+    // re-pulls both via `mdh::process` when either differs. The catalog
+    // doesn't carry the index set (it's fetched per-dataset inside
+    // `mdh::process`), so we only have the collection bytes available
+    // here for hashing. The index hash will land in `locked` if the
+    // lockfile recorded one; the classifier will compare it against an
+    // empty remote_hashes entry → RemoteEdit, which is fine: the executor
+    // dispatches to `mdh::process`, which fetches and writes both.
+    let mut used_mdh_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for c in &catalog.mdh.collections {
+        let slug = crate::slug::slugify_unique(&c.name, &used_mdh_slugs);
+        used_mdh_slugs.insert(slug.clone());
+
+        let mut proposed = match serde_json::to_vec_pretty(c) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        proposed.push(b'\n');
+        let hash = crate::state::content_hash(&proposed);
+        remote_hashes.insert(("mdh".to_string(), slug), hash);
+    }
+    if let Some(map) = lockfile.objects.get("mdh_collections") {
+        for (slug, entry) in map {
+            if let Some(h) = &entry.content_hash {
+                locked.insert(("mdh".to_string(), slug.clone()), h.clone());
+            }
+        }
+    }
 
     crate::cli::sync::classify::classify(&remote_hashes, &scan_changes, &scan_tombstones, &locked)
 }

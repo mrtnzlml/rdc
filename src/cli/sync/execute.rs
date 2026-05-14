@@ -93,6 +93,47 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
         }
     }
 
+    // Build slug → object indexes for the kinds the resolver knows
+    // about. Each kind mirrors the slug derivation rule its pull driver
+    // uses. The maps stay scoped to this function; downstream resolution
+    // looks objects up by slug.
+    let mut workspace_by_slug: BTreeMap<String, &crate::model::Workspace> = BTreeMap::new();
+    {
+        let mut used: HashSet<String> = HashSet::new();
+        for w in &catalog.workspaces {
+            let slug = match ctx.lockfile.slug_for_id("workspaces", w.id) {
+                Some(existing) => existing.to_string(),
+                None => slugify_unique(&w.name, &used),
+            };
+            used.insert(slug.clone());
+            workspace_by_slug.insert(slug, w);
+        }
+    }
+    let mut engine_by_slug: BTreeMap<String, &crate::model::Engine> = BTreeMap::new();
+    {
+        let mut used: HashSet<String> = HashSet::new();
+        for e in &catalog.engines {
+            let slug = match ctx.lockfile.slug_for_id("engines", e.id) {
+                Some(existing) => existing.to_string(),
+                None => slugify_unique(&e.name, &used),
+            };
+            used.insert(slug.clone());
+            engine_by_slug.insert(slug, e);
+        }
+    }
+    let mut engine_field_by_slug: BTreeMap<String, &crate::model::EngineField> = BTreeMap::new();
+    {
+        let mut used: HashSet<String> = HashSet::new();
+        for f in &catalog.engine_fields {
+            let slug = match ctx.lockfile.slug_for_id("engine_fields", f.id) {
+                Some(existing) => existing.to_string(),
+                None => slugify_unique(&f.name, &used),
+            };
+            used.insert(slug.clone());
+            engine_field_by_slug.insert(slug, f);
+        }
+    }
+
     let conflicts: Vec<&ClassifiedItem> = classified
         .iter()
         .filter(|it| it.class == SyncClass::BothDiverged)
@@ -107,148 +148,284 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
     let mut stderr_lock = stderr.lock();
 
     for (idx, it) in conflicts.iter().enumerate() {
-        match it.kind.as_str() {
-            "labels" => {
-                let Some(label) = label_by_slug.get(it.slug.as_str()) else {
-                    // The classifier said BothDiverged but the catalog
-                    // doesn't carry this slug. Defensive skip — surfaces as
-                    // a warning rather than a panic so the rest of the sync
-                    // can still proceed.
-                    progress.println(format!(
-                        "warning: conflict for labels/{} but no matching remote label found; skipping",
-                        it.slug
-                    ));
-                    continue;
+        // Resolve the conflict's "remote object" → (remote bytes, local
+        // path, id, url, modified_at). Each kind's catalog lookup mirrors
+        // its pull driver. mdh is pull-only and never raises BothDiverged
+        // here (no push side); we still emit a warning if it shows up.
+        let Some(refs) = (match it.kind.as_str() {
+            "labels" => label_by_slug.get(it.slug.as_str()).copied().and_then(|l| {
+                let mut bytes = match serde_json::to_vec_pretty(l) {
+                    Ok(b) => b,
+                    Err(_) => return None,
                 };
-
-                let mut remote_bytes = serde_json::to_vec_pretty(label)
-                    .context("serializing remote label for conflict resolver")?;
-                remote_bytes.push(b'\n');
-
+                bytes.push(b'\n');
                 let local_path = ctx.paths.labels_dir().join(format!("{}.json", it.slug));
-
-                if !interactive {
-                    // Non-TTY/--yes: fall back to legacy shadow-file
-                    // behavior so the run still completes without
-                    // blocking on stdin. The local file stays as-is and
-                    // the lockfile records the local hash.
-                    let conflict_path = crate::paths::shadow_path_for(&local_path, &env);
-                    write_atomic(&conflict_path, &remote_bytes)?;
-                    progress.println(format!(
-                        "warning: {} conflict — local preserved, remote at {}",
-                        local_path.display(),
-                        conflict_path.display(),
-                    ));
-                    let local_bytes = std::fs::read(&local_path)
-                        .with_context(|| format!("reading {}", local_path.display()))?;
-                    let local_hash = content_hash(&local_bytes);
-                    update_label_lockfile(ctx, &it.slug, label, local_hash);
-                    continue;
-                }
-
-                let resolution = prompt_resolve(
-                    &mut input,
-                    &mut stderr_lock,
-                    idx + 1,
-                    total,
-                    &local_path,
-                    &remote_bytes,
-                    &env,
-                )?;
-
-                match resolution {
-                    Resolution::KeepLocal => {
-                        // Local wins → must PATCH. The push driver
-                        // re-reads `local_path` and PATCHes the remote;
-                        // it also drives its own drift detection which
-                        // will now see local-vs-remote drift again, but
-                        // the `[k]eep local` decision means the user
-                        // accepted force-push.
-                        //
-                        // Pre-write a lockfile base that matches the
-                        // current remote so the push driver's drift
-                        // check passes (remote_hash == base). The PATCH
-                        // response updates the lockfile to the post-PATCH
-                        // canonical form.
-                        let remote_hash = content_hash(&remote_bytes);
-                        update_label_lockfile(ctx, &it.slug, label, remote_hash);
-                        outcome
-                            .promoted_to_push
-                            .push(("labels".to_string(), it.slug.clone(), local_path));
-                    }
-                    Resolution::KeepRemote => {
-                        write_atomic(&local_path, &remote_bytes)?;
-                        let remote_hash = content_hash(&remote_bytes);
-                        update_label_lockfile(ctx, &it.slug, label, remote_hash);
-                    }
-                    Resolution::Edit(edited) => {
-                        write_atomic(&local_path, &edited)?;
-                        // Same rationale as KeepLocal: align base to
-                        // remote so push drift detection succeeds, then
-                        // PATCH the edited bytes.
-                        let remote_hash = content_hash(&remote_bytes);
-                        update_label_lockfile(ctx, &it.slug, label, remote_hash);
-                        outcome
-                            .promoted_to_push
-                            .push(("labels".to_string(), it.slug.clone(), local_path));
-                    }
-                    Resolution::Skip => {
-                        let conflict_path = crate::paths::shadow_path_for(&local_path, &env);
-                        write_atomic(&conflict_path, &remote_bytes)?;
-                        progress.println(format!(
-                            "warning: {} conflict — local preserved, remote at {}",
-                            local_path.display(),
-                            conflict_path.display(),
-                        ));
-                        let local_bytes = std::fs::read(&local_path)
-                            .with_context(|| format!("reading {}", local_path.display()))?;
-                        let local_hash = content_hash(&local_bytes);
-                        update_label_lockfile(ctx, &it.slug, label, local_hash);
-                    }
-                    Resolution::Abort => {
-                        return Err(anyhow::Error::new(PullAborted));
-                    }
-                }
+                Some(ConflictRefs {
+                    remote_bytes: bytes,
+                    local_path,
+                    id: l.id,
+                    url: Some(l.url.clone()),
+                    modified_at: l.modified_at().map(|s| s.to_string()),
+                })
+            }),
+            "workspaces" => workspace_by_slug.get(it.slug.as_str()).copied().and_then(|w| {
+                let mut bytes = match serde_json::to_vec_pretty(w) {
+                    Ok(b) => b,
+                    Err(_) => return None,
+                };
+                bytes.push(b'\n');
+                let local_path = ctx.paths.workspace_dir(&it.slug).join("workspace.json");
+                Some(ConflictRefs {
+                    remote_bytes: bytes,
+                    local_path,
+                    id: w.id,
+                    url: Some(w.url.clone()),
+                    modified_at: w.modified_at().map(|s| s.to_string()),
+                })
+            }),
+            "engines" => engine_by_slug.get(it.slug.as_str()).copied().and_then(|e| {
+                let mut bytes = match serde_json::to_vec_pretty(e) {
+                    Ok(b) => b,
+                    Err(_) => return None,
+                };
+                bytes.push(b'\n');
+                let local_path = ctx.paths.engine_dir(&it.slug).join("engine.json");
+                Some(ConflictRefs {
+                    remote_bytes: bytes,
+                    local_path,
+                    id: e.id,
+                    url: Some(e.url.clone()),
+                    modified_at: e.modified_at().map(|s| s.to_string()),
+                })
+            }),
+            "engine_fields" => {
+                engine_field_by_slug.get(it.slug.as_str()).copied().and_then(|f| {
+                    let mut bytes = match serde_json::to_vec_pretty(f) {
+                        Ok(b) => b,
+                        Err(_) => return None,
+                    };
+                    bytes.push(b'\n');
+                    // Engine fields live under their parent engine; use the
+                    // lockfile's id → engine slug mapping (same as the pull
+                    // driver). Missing parent → defensive skip.
+                    let engine_slug = ctx
+                        .lockfile
+                        .slug_for_url("engines", &f.engine)
+                        .map(|s| s.to_string())?;
+                    let local_path = ctx
+                        .paths
+                        .engine_fields_dir(&engine_slug)
+                        .join(format!("{}.json", it.slug));
+                    Some(ConflictRefs {
+                        remote_bytes: bytes,
+                        local_path,
+                        id: f.id,
+                        url: Some(f.url.clone()),
+                        modified_at: f.modified_at().map(|s| s.to_string()),
+                    })
+                })
             }
-            // TODO(sync-impl): add per-kind arms as their hashing and
-            // pull/push adapters arrive. Each kind needs (a) a way to
-            // serialize remote bytes from the catalog and (b) a local
-            // path, both of which already live in the per-kind pull/push
-            // drivers — extract a small helper trait when the second
-            // kind lands rather than duplicating this match.
             other => {
                 progress.println(format!(
                     "warning: conflict resolver not yet wired for kind '{}' (slug '{}'); skipping",
                     other, it.slug,
                 ));
+                None
             }
-        }
+        }) else {
+            // No catalog entry / orphan / unwired kind — warn and move on.
+            progress.println(format!(
+                "warning: conflict for {}/{} but no matching remote object found; skipping",
+                it.kind, it.slug,
+            ));
+            continue;
+        };
+
+        resolve_one_conflict(
+            ctx,
+            it,
+            refs,
+            idx + 1,
+            total,
+            &mut input,
+            &mut stderr_lock,
+            interactive,
+            &env,
+            progress,
+            &mut outcome,
+        )?;
     }
 
     Ok(outcome)
 }
 
-/// Update the lockfile entry for a label so the recorded hash matches
-/// `content_hash`. Used by every resolution branch to keep the lockfile
-/// consistent with what's on disk (or, for KeepLocal/Edit, with what
-/// will be pushed). The push driver expects `base == remote_hash` to
-/// pass its drift detection; pre-seeding here is what unlocks the
-/// force-push semantics of `[k]eep local`.
-fn update_label_lockfile(
+/// Per-kind references gathered for a single `BothDiverged` resolution:
+/// the remote-canonical bytes the prompt needs, the on-disk path the
+/// resolution writes back to, and the lockfile fields (id / url /
+/// modified_at) the resolver records when it updates the entry.
+struct ConflictRefs {
+    remote_bytes: Vec<u8>,
+    local_path: PathBuf,
+    id: u64,
+    url: Option<String>,
+    modified_at: Option<String>,
+}
+
+/// Run the conflict resolution loop for one item: prompts (or applies
+/// the non-tty fallback) and routes the outcome to writes + lockfile
+/// updates + push-side promotions. Extracted so each kind's arm above
+/// stays a thin lookup; behavior matches the inlined labels block this
+/// replaced.
+#[allow(clippy::too_many_arguments)]
+fn resolve_one_conflict<R: BufRead>(
     ctx: &mut PullCtx<'_>,
-    slug: &str,
-    label: &crate::model::Label,
-    content_hash: String,
-) {
-    crate::cli::pull::common::record_object(
-        ctx.lockfile,
-        "labels",
-        slug,
-        label.id,
-        Some(label.url.clone()),
-        label.modified_at().map(|s| s.to_string()),
-        Some(content_hash),
-    );
+    it: &ClassifiedItem,
+    refs: ConflictRefs,
+    idx_one_based: usize,
+    total: usize,
+    input: &mut R,
+    stderr_lock: &mut std::io::StderrLock<'_>,
+    interactive: bool,
+    env: &str,
+    progress: &Arc<OverallProgress>,
+    outcome: &mut ConflictOutcome,
+) -> Result<()> {
+    let ConflictRefs {
+        remote_bytes,
+        local_path,
+        id,
+        url,
+        modified_at,
+    } = refs;
+
+    if !interactive {
+        // Non-TTY/--yes: fall back to legacy shadow-file behavior so the
+        // run still completes without blocking on stdin. The local file
+        // stays as-is and the lockfile records the local hash.
+        let conflict_path = crate::paths::shadow_path_for(&local_path, env);
+        write_atomic(&conflict_path, &remote_bytes)?;
+        progress.println(format!(
+            "warning: {} conflict — local preserved, remote at {}",
+            local_path.display(),
+            conflict_path.display(),
+        ));
+        let local_bytes = std::fs::read(&local_path)
+            .with_context(|| format!("reading {}", local_path.display()))?;
+        let local_hash = content_hash(&local_bytes);
+        crate::cli::pull::common::record_object(
+            ctx.lockfile,
+            &it.kind,
+            &it.slug,
+            id,
+            url,
+            modified_at,
+            Some(local_hash),
+        );
+        return Ok(());
+    }
+
+    let resolution = prompt_resolve(
+        input,
+        stderr_lock,
+        idx_one_based,
+        total,
+        &local_path,
+        &remote_bytes,
+        env,
+    )?;
+
+    match resolution {
+        Resolution::KeepLocal => {
+            // Local wins → must PATCH. The push driver re-reads
+            // `local_path` and PATCHes the remote; it also drives its
+            // own drift detection which will now see local-vs-remote
+            // drift again, but the `[k]eep local` decision means the
+            // user accepted force-push.
+            //
+            // Pre-write a lockfile base that matches the current
+            // remote so the push driver's drift check passes
+            // (remote_hash == base). The PATCH response updates the
+            // lockfile to the post-PATCH canonical form.
+            let remote_hash = content_hash(&remote_bytes);
+            crate::cli::pull::common::record_object(
+                ctx.lockfile,
+                &it.kind,
+                &it.slug,
+                id,
+                url,
+                modified_at,
+                Some(remote_hash),
+            );
+            outcome
+                .promoted_to_push
+                .push((it.kind.clone(), it.slug.clone(), local_path));
+        }
+        Resolution::KeepRemote => {
+            // Ensure parent dirs exist (workspaces / engines / engine_fields
+            // live in nested directories that may not have been created).
+            if let Some(parent) = local_path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            write_atomic(&local_path, &remote_bytes)?;
+            let remote_hash = content_hash(&remote_bytes);
+            crate::cli::pull::common::record_object(
+                ctx.lockfile,
+                &it.kind,
+                &it.slug,
+                id,
+                url,
+                modified_at,
+                Some(remote_hash),
+            );
+        }
+        Resolution::Edit(edited) => {
+            if let Some(parent) = local_path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            write_atomic(&local_path, &edited)?;
+            // Same rationale as KeepLocal: align base to remote so push
+            // drift detection succeeds, then PATCH the edited bytes.
+            let remote_hash = content_hash(&remote_bytes);
+            crate::cli::pull::common::record_object(
+                ctx.lockfile,
+                &it.kind,
+                &it.slug,
+                id,
+                url,
+                modified_at,
+                Some(remote_hash),
+            );
+            outcome
+                .promoted_to_push
+                .push((it.kind.clone(), it.slug.clone(), local_path));
+        }
+        Resolution::Skip => {
+            let conflict_path = crate::paths::shadow_path_for(&local_path, env);
+            write_atomic(&conflict_path, &remote_bytes)?;
+            progress.println(format!(
+                "warning: {} conflict — local preserved, remote at {}",
+                local_path.display(),
+                conflict_path.display(),
+            ));
+            let local_bytes = std::fs::read(&local_path)
+                .with_context(|| format!("reading {}", local_path.display()))?;
+            let local_hash = content_hash(&local_bytes);
+            crate::cli::pull::common::record_object(
+                ctx.lockfile,
+                &it.kind,
+                &it.slug,
+                id,
+                url,
+                modified_at,
+                Some(local_hash),
+            );
+        }
+        Resolution::Abort => {
+            return Err(anyhow::Error::new(PullAborted));
+        }
+    }
+
+    Ok(())
 }
 
 /// Compute the `<file>.<env>-deleted` marker path for `local_path`.
@@ -315,10 +492,11 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
 ) -> Result<ConflictOutcome> {
     let mut outcome = ConflictOutcome::default();
 
-    // Build a stable label-slug index up-front so `LocalDeleteRemoteEdit`
-    // items (which still have a remote body) can serialise the env-side
-    // bytes to restore the file for review. Mirrors the slug derivation
-    // used by `resolve_conflicts` and the classifier.
+    // Build slug → object indexes for each kind that may surface here.
+    // LocalDeleteRemoteEdit needs the env-side body to restore the file
+    // for review; KeepRemote on the same class then aligns the lockfile
+    // to the restored bytes' hash. Slug derivation mirrors the pull
+    // drivers (and `resolve_conflicts`).
     let mut label_by_slug: BTreeMap<String, &crate::model::Label> = BTreeMap::new();
     {
         let mut used: HashSet<String> = HashSet::new();
@@ -331,6 +509,42 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
             label_by_slug.insert(slug, l);
         }
     }
+    let mut workspace_by_slug: BTreeMap<String, &crate::model::Workspace> = BTreeMap::new();
+    {
+        let mut used: HashSet<String> = HashSet::new();
+        for w in &catalog.workspaces {
+            let slug = match ctx.lockfile.slug_for_id("workspaces", w.id) {
+                Some(existing) => existing.to_string(),
+                None => slugify_unique(&w.name, &used),
+            };
+            used.insert(slug.clone());
+            workspace_by_slug.insert(slug, w);
+        }
+    }
+    let mut engine_by_slug: BTreeMap<String, &crate::model::Engine> = BTreeMap::new();
+    {
+        let mut used: HashSet<String> = HashSet::new();
+        for e in &catalog.engines {
+            let slug = match ctx.lockfile.slug_for_id("engines", e.id) {
+                Some(existing) => existing.to_string(),
+                None => slugify_unique(&e.name, &used),
+            };
+            used.insert(slug.clone());
+            engine_by_slug.insert(slug, e);
+        }
+    }
+    let mut engine_field_by_slug: BTreeMap<String, &crate::model::EngineField> = BTreeMap::new();
+    {
+        let mut used: HashSet<String> = HashSet::new();
+        for f in &catalog.engine_fields {
+            let slug = match ctx.lockfile.slug_for_id("engine_fields", f.id) {
+                Some(existing) => existing.to_string(),
+                None => slugify_unique(&f.name, &used),
+            };
+            used.insert(slug.clone());
+            engine_field_by_slug.insert(slug, f);
+        }
+    }
 
     let env = ctx.paths.env().to_string();
 
@@ -339,12 +553,13 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
             SyncClass::BothDeleted => {
                 // Silent convergence — both sides removed the object, so
                 // the lockfile entry is the only thing left. Drop it.
-                if it.kind == "labels" {
-                    drop_lockfile_entry(ctx, "labels", &it.slug);
+                // All push-capable kinds use the same drop semantics.
+                if matches!(
+                    it.kind.as_str(),
+                    "labels" | "workspaces" | "engines" | "engine_fields"
+                ) {
+                    drop_lockfile_entry(ctx, &it.kind, &it.slug);
                 } else {
-                    // Same scope note as the conflict resolver: only
-                    // `labels` is wired today. Other kinds will land as
-                    // their adapters arrive.
                     progress.println(format!(
                         "warning: BothDeleted handler not yet wired for kind '{}' (slug '{}'); skipping",
                         it.kind, it.slug,
@@ -355,15 +570,114 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
             SyncClass::RemoteDelete
             | SyncClass::LocalEditRemoteDelete
             | SyncClass::LocalDeleteRemoteEdit => {
-                if it.kind != "labels" {
-                    progress.println(format!(
-                        "warning: remote-delete dispatch not yet wired for kind '{}' (slug '{}'); skipping",
-                        it.kind, it.slug,
-                    ));
-                    continue;
-                }
-
-                let local_path = ctx.paths.labels_dir().join(format!("{}.json", it.slug));
+                // Compute the per-kind (local_path, restore_bytes,
+                // id/url/modified_at) refs. `restore_bytes` is `Some`
+                // only when the catalog carries the env-side body
+                // (RemoteDelete / LocalEditRemoteDelete may lack it
+                // because the env already dropped the object — those
+                // classes only need `local_path`).
+                let refs_opt: Option<RemoteDeleteRefs> = match it.kind.as_str() {
+                    "labels" => {
+                        let local_path =
+                            ctx.paths.labels_dir().join(format!("{}.json", it.slug));
+                        let body = label_by_slug.get(it.slug.as_str()).copied();
+                        Some(RemoteDeleteRefs {
+                            local_path,
+                            restore_bytes: body
+                                .and_then(|l| serde_json::to_vec_pretty(l).ok())
+                                .map(|mut b| {
+                                    b.push(b'\n');
+                                    b
+                                }),
+                            id: body.map(|l| l.id),
+                            url: body.map(|l| l.url.clone()),
+                            modified_at: body.and_then(|l| l.modified_at().map(|s| s.to_string())),
+                        })
+                    }
+                    "workspaces" => {
+                        let local_path =
+                            ctx.paths.workspace_dir(&it.slug).join("workspace.json");
+                        let body = workspace_by_slug.get(it.slug.as_str()).copied();
+                        Some(RemoteDeleteRefs {
+                            local_path,
+                            restore_bytes: body
+                                .and_then(|w| serde_json::to_vec_pretty(w).ok())
+                                .map(|mut b| {
+                                    b.push(b'\n');
+                                    b
+                                }),
+                            id: body.map(|w| w.id),
+                            url: body.map(|w| w.url.clone()),
+                            modified_at: body.and_then(|w| w.modified_at().map(|s| s.to_string())),
+                        })
+                    }
+                    "engines" => {
+                        let local_path = ctx.paths.engine_dir(&it.slug).join("engine.json");
+                        let body = engine_by_slug.get(it.slug.as_str()).copied();
+                        Some(RemoteDeleteRefs {
+                            local_path,
+                            restore_bytes: body
+                                .and_then(|e| serde_json::to_vec_pretty(e).ok())
+                                .map(|mut b| {
+                                    b.push(b'\n');
+                                    b
+                                }),
+                            id: body.map(|e| e.id),
+                            url: body.map(|e| e.url.clone()),
+                            modified_at: body.and_then(|e| e.modified_at().map(|s| s.to_string())),
+                        })
+                    }
+                    "engine_fields" => {
+                        let body = engine_field_by_slug.get(it.slug.as_str()).copied();
+                        // For LocalDeleteRemoteEdit / RemoteDelete, the
+                        // local path depends on which engine owns the
+                        // field. Walk the lockfile / catalog mapping to
+                        // find it.
+                        let engine_slug_opt = body
+                            .and_then(|f| ctx.lockfile.slug_for_url("engines", &f.engine))
+                            .map(|s| s.to_string())
+                            .or_else(|| {
+                                // No catalog body (env-side dropped the
+                                // field): fall back to disk sweep using
+                                // the existing scanner helper.
+                                find_engine_field_engine_slug(ctx.paths, &it.slug)
+                            });
+                        let local_path = match engine_slug_opt {
+                            Some(es) => ctx
+                                .paths
+                                .engine_fields_dir(&es)
+                                .join(format!("{}.json", it.slug)),
+                            // Fallback path — won't exist, prompt will
+                            // skip via the `!local_path.exists()` guard.
+                            None => ctx
+                                .paths
+                                .engines_dir()
+                                .join("__orphan__/fields")
+                                .join(format!("{}.json", it.slug)),
+                        };
+                        Some(RemoteDeleteRefs {
+                            local_path,
+                            restore_bytes: body
+                                .and_then(|f| serde_json::to_vec_pretty(f).ok())
+                                .map(|mut b| {
+                                    b.push(b'\n');
+                                    b
+                                }),
+                            id: body.map(|f| f.id),
+                            url: body.map(|f| f.url.clone()),
+                            modified_at: body.and_then(|f| f.modified_at().map(|s| s.to_string())),
+                        })
+                    }
+                    other => {
+                        progress.println(format!(
+                            "warning: remote-delete dispatch not yet wired for kind '{}' (slug '{}'); skipping",
+                            other, it.slug,
+                        ));
+                        None
+                    }
+                };
+                let Some(refs) = refs_opt else { continue };
+                let local_path = refs.local_path.clone();
 
                 // For LocalDeleteRemoteEdit the local file is tombstoned
                 // — restore it from the env-side bytes so the user has
@@ -371,21 +685,20 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                 // reads `local_path`, so this restoration is required
                 // before the prompt can run.
                 if matches!(it.class, SyncClass::LocalDeleteRemoteEdit) {
-                    if let Some(label) = label_by_slug.get(it.slug.as_str()) {
-                        let mut bytes = serde_json::to_vec_pretty(label).context(
-                            "serializing env-side label for LocalDeleteRemoteEdit restore",
-                        )?;
-                        bytes.push(b'\n');
-                        if let Some(parent) = local_path.parent() {
-                            std::fs::create_dir_all(parent).ok();
+                    match refs.restore_bytes.as_ref() {
+                        Some(bytes) => {
+                            if let Some(parent) = local_path.parent() {
+                                std::fs::create_dir_all(parent).ok();
+                            }
+                            write_atomic(&local_path, bytes)?;
                         }
-                        write_atomic(&local_path, &bytes)?;
-                    } else {
-                        progress.println(format!(
-                            "warning: LocalDeleteRemoteEdit for labels/{} but no matching env-side label in catalog; skipping",
-                            it.slug,
-                        ));
-                        continue;
+                        None => {
+                            progress.println(format!(
+                                "warning: LocalDeleteRemoteEdit for {}/{} but no matching env-side body in catalog; skipping",
+                                it.kind, it.slug,
+                            ));
+                            continue;
+                        }
                     }
                 }
 
@@ -462,10 +775,10 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             // Restore on env: drop the lockfile entry so
                             // the push pipeline's "missing lockfile
                             // entry" branch POSTs the local body as a
-                            // new label.
-                            drop_lockfile_entry(ctx, "labels", &it.slug);
+                            // new object.
+                            drop_lockfile_entry(ctx, &it.kind, &it.slug);
                             outcome.promoted_to_push.push((
-                                "labels".to_string(),
+                                it.kind.clone(),
                                 it.slug.clone(),
                                 local_path.clone(),
                             ));
@@ -478,13 +791,21 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             // (done above before prompting). Align the
                             // lockfile to the env hash so subsequent
                             // syncs see Clean state.
-                            if let Some(label) = label_by_slug.get(it.slug.as_str()) {
-                                let mut bytes = serde_json::to_vec_pretty(label).context(
-                                    "serializing env-side label for LocalDeleteRemoteEdit lockfile update",
-                                )?;
-                                bytes.push(b'\n');
-                                let h = content_hash(&bytes);
-                                update_label_lockfile(ctx, &it.slug, label, h);
+                            if let Some(bytes) = refs.restore_bytes.as_ref() {
+                                let h = content_hash(bytes);
+                                if let (Some(id), url, modified_at) =
+                                    (refs.id, refs.url.clone(), refs.modified_at.clone())
+                                {
+                                    crate::cli::pull::common::record_object(
+                                        ctx.lockfile,
+                                        &it.kind,
+                                        &it.slug,
+                                        id,
+                                        url,
+                                        modified_at,
+                                        Some(h),
+                                    );
+                                }
                             }
                         } else {
                             // Mirror the env's deletion: remove local +
@@ -493,7 +814,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             std::fs::remove_file(&local_path).with_context(|| {
                                 format!("removing {}", local_path.display())
                             })?;
-                            drop_lockfile_entry(ctx, "labels", &it.slug);
+                            drop_lockfile_entry(ctx, &it.kind, &it.slug);
                         }
                     }
                     Resolution::Skip => {
@@ -522,6 +843,45 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
     }
 
     Ok(outcome)
+}
+
+/// Per-kind refs for one remote-delete-family resolution. `restore_bytes`
+/// is `Some` only when the env still has the object body (i.e. the class
+/// is `LocalDeleteRemoteEdit` or we just want to make a body available
+/// for the prompt's diff viewer). `id`/`url`/`modified_at` come from the
+/// same env-side body when present; they're `None` when the env already
+/// dropped the object (`RemoteDelete` / `LocalEditRemoteDelete`).
+struct RemoteDeleteRefs {
+    local_path: PathBuf,
+    restore_bytes: Option<Vec<u8>>,
+    id: Option<u64>,
+    url: Option<String>,
+    modified_at: Option<String>,
+}
+
+/// Find the engine slug that owns a given engine_field slug on disk.
+/// Mirrors the disk-sweep used by `push::scan::detect_tombstones` for
+/// engine fields; needed by the remote-delete dispatcher when the env
+/// already dropped the field (no catalog body → no `engine` URL).
+fn find_engine_field_engine_slug(paths: &crate::paths::Paths, field_slug: &str) -> Option<String> {
+    let engines_dir = paths.engines_dir();
+    if !engines_dir.exists() {
+        return None;
+    }
+    let entries = std::fs::read_dir(&engines_dir).ok()?;
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let candidate = entry
+            .path()
+            .join("fields")
+            .join(format!("{field_slug}.json"));
+        if candidate.exists() {
+            return Some(entry.file_name().to_string_lossy().to_string());
+        }
+    }
+    None
 }
 
 /// Dispatch the classified items. The order is: resolve conflicts → run
@@ -598,14 +958,31 @@ pub async fn run(
             crate::cli::pull::workflow_steps::process(ctx, catalog.workflow_steps.clone(), subset, progress).await?;
         }
 
-        // TODO(sync-impl): add per-kind dispatch as their adapter
-        // hashing arrives — workspaces, queues, schemas, inboxes,
-        // hooks, rules, engines, engine_fields, email_templates, mdh.
-        // Each kind's `process` already accepts a subset filter; the
-        // only new code is the `subsets.get("<kind>") → process(...)`
-        // line plus any catalog-side prerequisites (e.g. queues needs
-        // the workspace map populated; see `pull::run_drivers` for
-        // ordering).
+        // workspaces, engines, engine_fields, mdh — flat push-capable
+        // kinds (mdh is pull-only). Each driver already accepts a
+        // `(kind, slug)` subset filter; the dispatcher hands off the
+        // subset and lets the driver re-derive slugs.
+        if let Some(subset) = subsets.get("workspaces") {
+            crate::cli::pull::workspaces::process(ctx, catalog.workspaces.clone(), subset, progress).await?;
+        }
+        if let Some(subset) = subsets.get("engines") {
+            crate::cli::pull::engines::process(ctx, catalog.engines.clone(), subset, progress).await?;
+        }
+        if let Some(subset) = subsets.get("engine_fields") {
+            crate::cli::pull::engine_fields::process(ctx, catalog.engine_fields.clone(), subset, progress).await?;
+        }
+        if let Some(subset) = subsets.get("mdh") {
+            // MDH lives in a separate listed shape (`MdhListed` carries
+            // the Data Storage client + collection list). The pull
+            // driver consumes it by value, so we clone the constituent
+            // pieces here. `MdhListed` doesn't impl Clone, so we
+            // reconstruct it from the catalog's client + collections.
+            let listed = crate::cli::pull::mdh::MdhListed {
+                client: catalog.mdh.client.clone(),
+                collections: catalog.mdh.collections.clone(),
+            };
+            crate::cli::pull::mdh::process(ctx, listed, subset, progress).await?;
+        }
     }
 
     if !no_push {
@@ -625,6 +1002,15 @@ pub async fn run(
             match kind.as_str() {
                 "labels" => {
                     change_list.labels.insert(slug, path);
+                }
+                "workspaces" => {
+                    change_list.workspaces.insert(slug, path);
+                }
+                "engines" => {
+                    change_list.engines.insert(slug, path);
+                }
+                "engine_fields" => {
+                    change_list.engine_fields.insert(slug, path);
                 }
                 // TODO(sync-impl): mirror the change_list_from_classified
                 // kind-table once more kinds enter the conflict path.

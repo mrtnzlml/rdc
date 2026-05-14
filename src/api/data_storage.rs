@@ -24,6 +24,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+#[derive(Clone)]
 pub struct DataStorageClient {
     base_url: String,
     token: String,
