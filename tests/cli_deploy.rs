@@ -1,7 +1,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Snapshot body for a Master Data Hub store extension, mirrored from
@@ -1582,4 +1582,171 @@ async fn deploy_only_mirror_only_deletes_in_scope() {
 
     assert_eq!(*hook_delete_calls.lock().unwrap(), 1, "hook A must be deleted");
     assert_eq!(*rule_delete_calls.lock().unwrap(), 0, "rule B must survive --only hooks/*");
+}
+
+/// `rdc deploy --only hooks/h --yes` must refuse when the selected hook
+/// references a queue that is not yet on tgt and not in --only.
+/// The error message must name the missing dep (queues/q) and suggest
+/// adding it via --only.
+///
+/// Mounts the test server manually (not via mount_full_pull) so we can
+/// return a real workspace+queue pair without fighting wiremock's
+/// first-registered-wins rule. The queue must have a non-null workspace
+/// so it gets recorded in the src lockfile (orphan queues with workspace=null
+/// are skipped at pull time and thus invisible to the dep-check).
+#[tokio::test]
+async fn deploy_only_missing_dep_ci_refuses_with_suggestion() {
+    let test_server = MockServer::start().await;
+    let prod_server = MockServer::start().await;
+
+    let ws_url = format!("{}/api/v1/workspaces/500", test_server.uri());
+    let q_url = format!("{}/api/v1/queues/600", test_server.uri());
+
+    let workspace_body = serde_json::json!({
+        "id": 500, "url": ws_url,
+        "name": "ws",
+        "organization": format!("{}/api/v1/organizations/1", test_server.uri()),
+        "queues": [q_url]
+    });
+    let queue_body = serde_json::json!({
+        "id": 600, "url": q_url,
+        "name": "q", "workspace": ws_url, "schema": null
+    });
+    let hook_body = serde_json::json!({
+        "id": 100, "url": format!("{}/api/v1/hooks/100", test_server.uri()),
+        "name": "h", "type": "function",
+        "queues": [q_url],
+        "events": ["annotation_content"],
+        "config": { "runtime": "python3.12", "code": "def h(p): pass\n" }
+    });
+
+    // Mount test server manually so both workspace and queue are returned.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&test_server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": {"next": null}, "results": [hook_body]
+        })))
+        .mount(&test_server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": {"next": null}, "results": [workspace_body]
+        })))
+        .mount(&test_server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": {"next": null}, "results": [queue_body]
+        })))
+        .mount(&test_server).await;
+    for ep in [
+        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&test_server).await;
+    }
+
+    mount_full_pull(&prod_server, empty_list()).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .args(["init",
+               "--env", &format!("test={}/api/v1:1", test_server.uri()),
+               "--env", &format!("prod={}/api/v1:1", prod_server.uri())])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
+        .assert().success();
+    Command::cargo_bin("rdc").unwrap()
+        .args(["pull", "test"]).current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T").assert().success();
+    Command::cargo_bin("rdc").unwrap()
+        .args(["pull", "prod"]).current_dir(project.path())
+        .env("RDC_TOKEN_PROD", "T").assert().success();
+
+    Command::cargo_bin("rdc").unwrap()
+        .args(["deploy", "test", "prod", "--yes", "--only", "hooks/h"])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("queues/q"))
+        .stderr(predicate::str::contains("--only"));
+}
+
+/// `rdc deploy --only hooks/h --dry-run --yes` must produce zero write API
+/// calls to the target environment. The dry-run flag must suppress all
+/// POST and PATCH requests even when there is a real diff to apply.
+///
+/// The POST/PATCH catch-all mocks are mounted only after the pull commands
+/// complete, so the data-storage MDH probe (POST .../collections/list) that
+/// runs during pull sees an unmatched request → 404 → quiet MDH skip, and
+/// the counters only capture writes that the deploy phase would emit.
+#[tokio::test]
+async fn deploy_only_dry_run_makes_no_api_calls() {
+    use std::sync::{Arc, Mutex};
+    let test_server = MockServer::start().await;
+    let prod_server = MockServer::start().await;
+
+    let post_or_patch = Arc::new(Mutex::new(0u32));
+
+    let hook_body = serde_json::json!({
+        "id": 100, "url": format!("{}/api/v1/hooks/100", test_server.uri()),
+        "name": "h", "type": "function", "queues": [], "events": ["annotation_status"],
+        "config": { "runtime": "python3.12", "code": "def h(p): pass\n" }
+    });
+    mount_full_pull(
+        &test_server,
+        serde_json::json!({"pagination": {"next": null}, "results": [hook_body]}),
+    ).await;
+    mount_full_pull(&prod_server, empty_list()).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .args(["init",
+               "--env", &format!("test={}/api/v1:1", test_server.uri()),
+               "--env", &format!("prod={}/api/v1:1", prod_server.uri())])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
+        .assert().success();
+    Command::cargo_bin("rdc").unwrap()
+        .args(["pull", "test"]).current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T").assert().success();
+    Command::cargo_bin("rdc").unwrap()
+        .args(["pull", "prod"]).current_dir(project.path())
+        .env("RDC_TOKEN_PROD", "T").assert().success();
+
+    // Mount write-interceptors only after pulls so the MDH probe
+    // (POST .../collections/list) during pull returns 404 instead of
+    // hitting these catch-alls.  The regex restricts to /api/v1/* so
+    // any stray data-storage POSTs during deploy are also excluded.
+    let c1 = post_or_patch.clone();
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/api/v1/"))
+        .respond_with(move |_: &wiremock::Request| {
+            *c1.lock().unwrap() += 1;
+            ResponseTemplate::new(201).set_body_json(serde_json::json!({}))
+        }).mount(&prod_server).await;
+    let c2 = post_or_patch.clone();
+    Mock::given(method("PATCH"))
+        .and(path_regex(r"^/api/v1/"))
+        .respond_with(move |_: &wiremock::Request| {
+            *c2.lock().unwrap() += 1;
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({}))
+        }).mount(&prod_server).await;
+
+    Command::cargo_bin("rdc").unwrap()
+        .args(["deploy", "test", "prod", "--yes", "--dry-run", "--only", "hooks/h"])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
+        .assert().success();
+
+    assert_eq!(*post_or_patch.lock().unwrap(), 0,
+        "dry-run must make no write API calls");
 }
