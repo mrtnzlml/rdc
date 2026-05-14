@@ -6,13 +6,13 @@
 //! ```text
 //! [1/N]  hooks/validator-invoices.json
 //!
-//! Local has changes:
+//! local has changes:
 //!   <unified diff snippet>
 //!
-//! Remote has changes:
+//! production has changes:
 //!   <unified diff snippet>
 //!
-//! [k] keep local   [r] keep remote   [e] edit   [s] skip   [a] abort >
+//! [k] keep local   [r] use production   [e] edit   [s] skip   [a] abort >
 //! ```
 //!
 //! `[k]` keeps local, no write. `[r]` writes remote. `[e]` opens `$EDITOR`
@@ -130,7 +130,6 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
     env: &str,
     mode: ColorMode,
 ) -> Result<Resolution> {
-    let _ = env; // suppressed unused warning; Task 2 wires it into prompt text
     let local_bytes = read_local(local_path)?;
 
     // Strip noise fields before diff display so the user only sees real
@@ -152,7 +151,7 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
     // the actual change gets buried.
     let local_display = prettify_json_for_diff(&local_canonical);
     let remote_display = prettify_json_for_diff(&remote_canonical);
-    let diff = unified_diff("local", &local_display, "remote", &remote_display);
+    let diff = unified_diff("local", &local_display, env, &remote_display);
     if diff.is_empty() {
         return Ok(Resolution::KeepLocal);
     }
@@ -162,8 +161,10 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
     writeln!(output)?;
 
     loop {
-        let prompt_text = "[k]eep local  [r]emote  [e]dit  [s]kip (shadow file)  [a]bort > ";
-        write!(output, "{}", colorize_prompt(prompt_text, mode))?;
+        let prompt_text = format!(
+            "[k] keep local  [r] use {env}  [e] edit  [s] skip (shadow file)  [a] abort > "
+        );
+        write!(output, "{}", colorize_prompt(&prompt_text, mode))?;
         output.flush().ok();
         let mut line = String::new();
         if input.read_line(&mut line)? == 0 {
@@ -1110,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_resolve_interpolates_env_name() {
+    fn prompt_resolve_uses_env_name_in_labels() {
         use std::io::Cursor;
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("x.json");
@@ -1119,11 +1120,13 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let input = Cursor::new(b"s\n");
 
-        // Smoke test: at this stage, env is plumbed but not yet
-        // rendered in the prompt text (Task 2 wires it in). Asserting
-        // only that the new signature compiles and the call succeeds.
         let _ = prompt_resolve_with_color(
             input, &mut out, 1, 1, &local, remote, "production", ColorMode::Plain,
         ).unwrap();
+
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("[r] use production"), "prompt missing env-named [r] label: {s}");
+        assert!(s.contains("+++ production"), "diff header should name the env: {s}");
+        assert!(!s.contains("[r]emote"), "old literal label leaked: {s}");
     }
 }
