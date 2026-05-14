@@ -264,6 +264,161 @@ pub(crate) fn classify_unresolved(
     out
 }
 
+use anyhow::Context;
+
+/// Read the on-disk JSON for `(kind, slug)` from a snapshot. Returns the
+/// raw `serde_json::Value` so the caller can pass it to `extract_refs`.
+///
+/// Returns an empty object when the file doesn't exist (the selection
+/// may include tgt-only slugs whose src file is absent — that's fine,
+/// just means no outbound refs to walk).
+fn read_src_value(
+    paths: &Paths,
+    kind: &str,
+    slug: &str,
+) -> Result<Value> {
+    let path = match kind {
+        "hooks" => paths.hooks_dir().join(format!("{slug}.json")),
+        "rules" => paths.rules_dir().join(format!("{slug}.json")),
+        "labels" => paths.labels_dir().join(format!("{slug}.json")),
+        "workspaces" => paths.workspace_dir(slug).join("workspace.json"),
+        "engines" => paths.engines_dir().join(slug).join("engine.json"),
+        "engine_fields" => {
+            // engine_fields: walk engines/<engine>/fields/<field>.json
+            let engines_dir = paths.engines_dir();
+            if !engines_dir.exists() {
+                return Ok(Value::Object(serde_json::Map::new()));
+            }
+            for e_entry in std::fs::read_dir(&engines_dir)? {
+                let e = e_entry?;
+                if !e.file_type()?.is_dir() { continue; }
+                let candidate = e.path().join("fields").join(format!("{slug}.json"));
+                if candidate.exists() {
+                    let bytes = std::fs::read(&candidate)?;
+                    return Ok(serde_json::from_slice(&bytes)?);
+                }
+            }
+            return Ok(Value::Object(serde_json::Map::new()));
+        }
+        "queues" | "schemas" | "inboxes" => {
+            // queue-nested: walk workspaces/<ws>/queues/<slug>/<file>.
+            let ws_dir = paths.workspaces_dir();
+            if !ws_dir.exists() {
+                return Ok(Value::Object(serde_json::Map::new()));
+            }
+            let fname = match kind {
+                "queues" => "queue.json",
+                "schemas" => "schema.json",
+                "inboxes" => "inbox.json",
+                _ => unreachable!(),
+            };
+            for ws_entry in std::fs::read_dir(&ws_dir)? {
+                let ws = ws_entry?;
+                if !ws.file_type()?.is_dir() { continue; }
+                let candidate = ws.path().join("queues").join(slug).join(fname);
+                if candidate.exists() {
+                    let bytes = std::fs::read(&candidate)?;
+                    return Ok(serde_json::from_slice(&bytes)?);
+                }
+            }
+            return Ok(Value::Object(serde_json::Map::new()));
+        }
+        "email_templates" => {
+            // slug is `<ws>/<q>/<template>`
+            let parts: Vec<&str> = slug.splitn(3, '/').collect();
+            if parts.len() != 3 {
+                return Ok(Value::Object(serde_json::Map::new()));
+            }
+            paths
+                .queue_email_templates_dir(parts[0], parts[1])
+                .join(format!("{}.json", parts[2]))
+        }
+        _ => return Ok(Value::Object(serde_json::Map::new())),
+    };
+
+    if !path.exists() {
+        return Ok(Value::Object(serde_json::Map::new()));
+    }
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let v: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    Ok(v)
+}
+
+/// Iterative dep check.
+///
+/// On each pass: collect refs for every object currently in the selection,
+/// classify, and either (a) return `Ok` if there are no unresolved deps,
+/// (b) prompt + extend the selection if `interactive` and the prompt
+/// returns true, (c) return an error otherwise.
+///
+/// `prompt` is invoked with the current unresolved list and returns
+/// `true` to fold them into the selection, `false` to abort. In
+/// production the prompt is a y/N reader; in tests it's a closure.
+pub(crate) fn dep_check(
+    selection: &mut Selection,
+    src_paths: &Paths,
+    src_lockfile: &Lockfile,
+    tgt_lockfile: &Lockfile,
+    mapping: &Mapping,
+    interactive: bool,
+    prompt: &mut dyn FnMut(&[Unresolved]) -> bool,
+) -> Result<()> {
+    loop {
+        let mut refs_per_object: Vec<((String, String), Vec<String>)> = Vec::new();
+        for (kind, slug) in &selection.items {
+            let v = read_src_value(src_paths, kind, slug)?;
+            let urls = extract_refs(kind, &v);
+            refs_per_object.push(((kind.clone(), slug.clone()), urls));
+        }
+
+        let unresolved = classify_unresolved(
+            &refs_per_object,
+            selection,
+            src_lockfile,
+            tgt_lockfile,
+            mapping,
+        );
+
+        if unresolved.is_empty() {
+            return Ok(());
+        }
+
+        if !interactive {
+            let mut msg = String::from(
+                "selection has unresolved dependencies (not in --only, not yet on tgt):\n",
+            );
+            for u in &unresolved {
+                msg.push_str(&format!(
+                    "  {}/{} → {}/{}\n",
+                    u.from.0, u.from.1, u.to.0, u.to.1,
+                ));
+            }
+            msg.push_str("Re-run with these added to --only, e.g.:\n");
+            let mut deduped: std::collections::BTreeSet<(String, String)> =
+                std::collections::BTreeSet::new();
+            for u in &unresolved {
+                deduped.insert(u.to.clone());
+            }
+            for (k, s) in &deduped {
+                msg.push_str(&format!("  --only {k}/{s}\n"));
+            }
+            bail!("{msg}");
+        }
+
+        let proceed = prompt(&unresolved);
+        if !proceed {
+            bail!("dep check aborted by user; selection not modified");
+        }
+        for u in &unresolved {
+            selection.items.insert(u.to.clone());
+        }
+        // Loop: re-classify in case the newly-added deps themselves have
+        // unresolved peers (transitive).
+    }
+}
+
 /// Glob match: `pattern` may contain `*` (zero or more characters); every
 /// other byte is literal. No `?`, no character classes, no `**` — the
 /// grammar is intentionally narrow so users learn it from one sentence
@@ -895,5 +1050,253 @@ mod glob_tests {
     #[test]
     fn pattern_longer_than_text() {
         assert!(!glob_matches("abcdef", "abc"));
+    }
+}
+
+#[cfg(test)]
+mod dep_check_tests {
+    use super::*;
+    use crate::mapping::Mapping;
+    use crate::paths::Paths;
+    use crate::state::Lockfile;
+    use std::fs;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    fn touch_json(path: &Path, body: &serde_json::Value) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, serde_json::to_vec_pretty(body).unwrap()).unwrap();
+    }
+
+    fn make_src_with_hook_referencing_queue(root: &Path) -> (Paths, Lockfile) {
+        let env_root = root.join("envs/test");
+        touch_json(
+            &env_root.join("hooks/validator-invoices.json"),
+            &serde_json::json!({
+                "name": "validator",
+                "queues": ["https://test.example/api/v1/queues/600"]
+            }),
+        );
+        touch_json(
+            &env_root.join("workspaces/finance/workspace.json"),
+            &serde_json::json!({"name": "finance"}),
+        );
+        touch_json(
+            &env_root.join("workspaces/finance/queues/cost-invoices/queue.json"),
+            &serde_json::json!({"name": "cost-invoices"}),
+        );
+
+        let mut lf = Lockfile::default();
+        lf.objects.entry("queues".into()).or_default().insert(
+            "cost-invoices".into(),
+            crate::state::lockfile::ObjectEntry {
+                id: 600,
+                url: Some("https://test.example/api/v1/queues/600".into()),
+                modified_at: None,
+                content_hash: None,
+            },
+        );
+        (Paths::for_env(root, "test"), lf)
+    }
+
+    #[test]
+    fn no_unresolved_no_prompt_called() {
+        let tmp = TempDir::new().unwrap();
+        let (src_paths, src_lf) = make_src_with_hook_referencing_queue(tmp.path());
+        let mut tgt_lf = Lockfile::default();
+        tgt_lf.objects.entry("queues".into()).or_default().insert(
+            "cost-invoices".into(),
+            crate::state::lockfile::ObjectEntry {
+                id: 900,
+                url: Some("https://prod.example/api/v1/queues/900".into()),
+                modified_at: None,
+                content_hash: None,
+            },
+        );
+
+        let mut sel = Selection::default();
+        sel.items
+            .insert(("hooks".into(), "validator-invoices".into()));
+
+        let mapping = Mapping::default();
+        let mut prompt_calls = 0usize;
+        dep_check(
+            &mut sel,
+            &src_paths,
+            &src_lf,
+            &tgt_lf,
+            &mapping,
+            true,
+            &mut |_unresolved| {
+                prompt_calls += 1;
+                true
+            },
+        )
+        .unwrap();
+
+        assert_eq!(prompt_calls, 0);
+        assert_eq!(sel.items.len(), 1);
+    }
+
+    #[test]
+    fn unresolved_non_tty_refuses() {
+        let tmp = TempDir::new().unwrap();
+        let (src_paths, src_lf) = make_src_with_hook_referencing_queue(tmp.path());
+        let tgt_lf = Lockfile::default();
+
+        let mut sel = Selection::default();
+        sel.items
+            .insert(("hooks".into(), "validator-invoices".into()));
+
+        let mapping = Mapping::default();
+        let mut prompt_calls = 0usize;
+        let err = dep_check(
+            &mut sel,
+            &src_paths,
+            &src_lf,
+            &tgt_lf,
+            &mapping,
+            false,
+            &mut |_unresolved| {
+                prompt_calls += 1;
+                true
+            },
+        )
+        .unwrap_err();
+        assert_eq!(prompt_calls, 0);
+        let s = format!("{err:#}");
+        assert!(s.contains("queues/cost-invoices"), "got: {s}");
+        assert!(s.contains("--only"), "got: {s}");
+    }
+
+    #[test]
+    fn unresolved_tty_yes_includes_dep() {
+        let tmp = TempDir::new().unwrap();
+        let (src_paths, src_lf) = make_src_with_hook_referencing_queue(tmp.path());
+        let tgt_lf = Lockfile::default();
+
+        let mut sel = Selection::default();
+        sel.items
+            .insert(("hooks".into(), "validator-invoices".into()));
+
+        let mapping = Mapping::default();
+        let mut prompt_calls = 0usize;
+        dep_check(
+            &mut sel,
+            &src_paths,
+            &src_lf,
+            &tgt_lf,
+            &mapping,
+            true,
+            &mut |unresolved| {
+                prompt_calls += 1;
+                assert_eq!(unresolved.len(), 1);
+                assert_eq!(unresolved[0].to, ("queues".into(), "cost-invoices".into()));
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(prompt_calls, 1);
+        assert!(sel.contains("queues", "cost-invoices"));
+    }
+
+    #[test]
+    fn unresolved_tty_no_aborts_cleanly() {
+        let tmp = TempDir::new().unwrap();
+        let (src_paths, src_lf) = make_src_with_hook_referencing_queue(tmp.path());
+        let tgt_lf = Lockfile::default();
+
+        let mut sel = Selection::default();
+        sel.items
+            .insert(("hooks".into(), "validator-invoices".into()));
+
+        let mapping = Mapping::default();
+        let err = dep_check(
+            &mut sel,
+            &src_paths,
+            &src_lf,
+            &tgt_lf,
+            &mapping,
+            true,
+            &mut |_unresolved| false,
+        )
+        .unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("aborted"), "got: {s}");
+    }
+
+    #[test]
+    fn transitive_dep_picked_up_on_re_check() {
+        // hook → queue (missing) → workspace (also missing).
+        // First prompt offers the queue; we accept; second prompt must
+        // offer the workspace.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let env_root = root.join("envs/test");
+        touch_json(
+            &env_root.join("hooks/validator-invoices.json"),
+            &serde_json::json!({
+                "name": "v",
+                "queues": ["https://test.example/api/v1/queues/600"]
+            }),
+        );
+        touch_json(
+            &env_root.join("workspaces/finance/workspace.json"),
+            &serde_json::json!({"name": "finance"}),
+        );
+        touch_json(
+            &env_root.join("workspaces/finance/queues/cost-invoices/queue.json"),
+            &serde_json::json!({
+                "name": "cost-invoices",
+                "workspace": "https://test.example/api/v1/workspaces/3",
+                "schema": null
+            }),
+        );
+
+        let mut src_lf = Lockfile::default();
+        src_lf.objects.entry("queues".into()).or_default().insert(
+            "cost-invoices".into(),
+            crate::state::lockfile::ObjectEntry {
+                id: 600,
+                url: Some("https://test.example/api/v1/queues/600".into()),
+                modified_at: None,
+                content_hash: None,
+            },
+        );
+        src_lf.objects.entry("workspaces".into()).or_default().insert(
+            "finance".into(),
+            crate::state::lockfile::ObjectEntry {
+                id: 3,
+                url: Some("https://test.example/api/v1/workspaces/3".into()),
+                modified_at: None,
+                content_hash: None,
+            },
+        );
+
+        let tgt_lf = Lockfile::default();
+        let src_paths = Paths::for_env(root, "test");
+        let mapping = Mapping::default();
+
+        let mut sel = Selection::default();
+        sel.items
+            .insert(("hooks".into(), "validator-invoices".into()));
+
+        let mut prompt_calls = 0usize;
+        dep_check(
+            &mut sel,
+            &src_paths,
+            &src_lf,
+            &tgt_lf,
+            &mapping,
+            true,
+            &mut |_unresolved| {
+                prompt_calls += 1;
+                true
+            },
+        )
+        .unwrap();
+        assert!(prompt_calls >= 2, "expected at least two prompts; got {prompt_calls}");
+        assert!(sel.contains("queues", "cost-invoices"));
+        assert!(sel.contains("workspaces", "finance"));
     }
 }
