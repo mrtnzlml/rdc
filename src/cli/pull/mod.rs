@@ -168,94 +168,49 @@ async fn run_drivers(
 ) -> Result<PullStats> {
     // ── Phase 1: list all kinds upfront ──────────────────────────────────────
     // The bar's total denominator accumulates here. No ticks happen yet.
-
-    let org_listed = organization::list(ctx, env_cfg.org_id, progress).await
-        .with_context(|| format!("listing organization for env '{env}'"))?;
-    progress.inc_total(1); // singleton
-
-    let workspaces_listed = workspaces::list(ctx, progress).await
-        .with_context(|| format!("listing workspaces for env '{env}'"))?;
-    progress.inc_total(workspaces_listed.len() as u64);
-
-    let queues_listed = queues::list(ctx, progress).await
-        .with_context(|| format!("listing queues for env '{env}'"))?;
-    progress.inc_total(queues_listed.len() as u64);
-
-    let hooks_listed = hooks::list(ctx, progress).await
-        .with_context(|| format!("listing hooks for env '{env}'"))?;
-    progress.inc_total(hooks_listed.len() as u64);
-
-    let rules_listed = rules::list(ctx, progress).await
-        .with_context(|| format!("listing rules for env '{env}'"))?;
-    progress.inc_total(rules_listed.len() as u64);
-
-    let labels_listed = labels::list(ctx, progress).await
-        .with_context(|| format!("listing labels for env '{env}'"))?;
-    progress.inc_total(labels_listed.len() as u64);
-
-    let engines_listed = engines::list(ctx, progress).await
-        .with_context(|| format!("listing engines for env '{env}'"))?;
-    progress.inc_total(engines_listed.len() as u64);
-
-    let engine_fields_listed = engine_fields::list(ctx, progress).await
-        .with_context(|| format!("listing engine fields for env '{env}'"))?;
-    progress.inc_total(engine_fields_listed.len() as u64);
-
-    let workflows_listed = workflows::list(ctx, progress).await
-        .with_context(|| format!("listing workflows for env '{env}'"))?;
-    progress.inc_total(workflows_listed.len() as u64);
-
-    let workflow_steps_listed = workflow_steps::list(ctx, progress).await
-        .with_context(|| format!("listing workflow steps for env '{env}'"))?;
-    progress.inc_total(workflow_steps_listed.len() as u64);
-
-    let email_templates_listed = email_templates::list(ctx, progress).await
-        .with_context(|| format!("listing email templates for env '{env}'"))?;
-    progress.inc_total(email_templates_listed.len() as u64);
-
-    let mdh_listed = mdh::list(env_cfg, token, progress).await
-        .with_context(|| format!("listing MDH datasets for env '{env}'"))?;
-    progress.inc_total(mdh_listed.collections.len() as u64);
+    // Listing logic lives in `common::list_remote` so the sync classifier
+    // can reuse it; the order of calls is preserved there verbatim.
+    let catalog = common::list_remote(ctx, env_cfg, env, token, progress).await?;
 
     // ── Phase 2: process all kinds in dependency order ────────────────────────
     // Bar percentage only grows from here. queue_locations is populated by
     // queues::process and consumed by email_templates::process.
 
-    let (n_orgs, c_orgs) = organization::process(ctx, org_listed, progress).await
+    let (n_orgs, c_orgs) = organization::process(ctx, catalog.organization, progress).await
         .with_context(|| format!("pulling organization for env '{env}'"))?;
 
-    let n_workspaces = workspaces::process(ctx, workspaces_listed, progress).await
+    let n_workspaces = workspaces::process(ctx, catalog.workspaces, progress).await
         .with_context(|| format!("pulling workspaces for env '{env}'"))?;
 
-    let qc = queues::process(ctx, queues_listed, progress).await
+    let qc = queues::process(ctx, catalog.queues, progress).await
         .with_context(|| format!("pulling queues for env '{env}'"))?;
 
-    let (n_hooks, c_hooks) = hooks::process(ctx, hooks_listed, progress).await
+    let (n_hooks, c_hooks) = hooks::process(ctx, catalog.hooks, progress).await
         .with_context(|| format!("pulling hooks for env '{env}'"))?;
 
-    let (n_rules, c_rules) = rules::process(ctx, rules_listed, progress).await
+    let (n_rules, c_rules) = rules::process(ctx, catalog.rules, progress).await
         .with_context(|| format!("pulling rules for env '{env}'"))?;
 
-    let (n_labels, c_labels) = labels::process(ctx, labels_listed, progress).await
+    let (n_labels, c_labels) = labels::process(ctx, catalog.labels, progress).await
         .with_context(|| format!("pulling labels for env '{env}'"))?;
 
-    let (n_engines, c_engines) = engines::process(ctx, engines_listed, progress).await
+    let (n_engines, c_engines) = engines::process(ctx, catalog.engines, progress).await
         .with_context(|| format!("pulling engines for env '{env}'"))?;
 
-    let (n_engine_fields, c_engine_fields) = engine_fields::process(ctx, engine_fields_listed, progress).await
+    let (n_engine_fields, c_engine_fields) = engine_fields::process(ctx, catalog.engine_fields, progress).await
         .with_context(|| format!("pulling engine fields for env '{env}'"))?;
 
-    let (n_workflows, c_workflows) = workflows::process(ctx, workflows_listed, progress).await
+    let (n_workflows, c_workflows) = workflows::process(ctx, catalog.workflows, progress).await
         .with_context(|| format!("pulling workflows for env '{env}'"))?;
 
-    let (n_workflow_steps, c_workflow_steps) = workflow_steps::process(ctx, workflow_steps_listed, progress).await
+    let (n_workflow_steps, c_workflow_steps) = workflow_steps::process(ctx, catalog.workflow_steps, progress).await
         .with_context(|| format!("pulling workflow steps for env '{env}'"))?;
 
     // email_templates reads ctx.queue_locations which queues::process populated above.
-    let (n_email_templates, c_email_templates) = email_templates::process(ctx, email_templates_listed, progress).await
+    let (n_email_templates, c_email_templates) = email_templates::process(ctx, catalog.email_templates, progress).await
         .with_context(|| format!("pulling email templates for env '{env}'"))?;
 
-    let (n_datasets, c_datasets) = mdh::process(ctx, mdh_listed, progress).await
+    let (n_datasets, c_datasets) = mdh::process(ctx, catalog.mdh, progress).await
         .with_context(|| format!("pulling MDH datasets for env '{env}'"))?;
 
     Ok(PullStats {

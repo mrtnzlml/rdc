@@ -62,6 +62,91 @@ pub struct PullCtx<'a> {
 /// `list_*` calls remain serial.
 pub const PULL_FANOUT: usize = 5;
 
+/// All kinds listed from one env's API. Produced by Phase 1 of pull,
+/// consumed by Phase 2 (pull) or by the sync classifier.
+pub struct RemoteCatalog {
+    pub organization: crate::model::Organization,
+    pub workspaces: Vec<crate::model::Workspace>,
+    pub queues: Vec<crate::model::Queue>,
+    pub hooks: Vec<crate::model::Hook>,
+    pub rules: Vec<crate::model::Rule>,
+    pub labels: Vec<crate::model::Label>,
+    pub engines: Vec<crate::model::Engine>,
+    pub engine_fields: Vec<crate::model::EngineField>,
+    pub workflows: Vec<crate::model::Workflow>,
+    pub workflow_steps: Vec<crate::model::WorkflowStep>,
+    pub email_templates: Vec<crate::model::EmailTemplate>,
+    pub mdh: crate::cli::pull::mdh::MdhListed,
+}
+
+/// Phase 1 of pull: list every kind from the env's API and accumulate the
+/// progress bar's total denominator. No ticks happen here — Phase 2 (in
+/// `pull::run_drivers`) or the sync classifier consumes the catalog.
+///
+/// Listing order is preserved exactly as it was inlined in `pull::run_drivers`
+/// so cross-env diffs and bar pacing stay identical to the pre-refactor flow.
+pub async fn list_remote(
+    ctx: &mut PullCtx<'_>,
+    env_cfg: &crate::config::EnvConfig,
+    env: &str,
+    token: &str,
+    progress: &Arc<crate::progress::OverallProgress>,
+) -> Result<RemoteCatalog> {
+    let organization = crate::cli::pull::organization::list(ctx, env_cfg.org_id, progress).await
+        .with_context(|| format!("listing organization for env '{env}'"))?;
+    progress.inc_total(1);
+
+    let workspaces = crate::cli::pull::workspaces::list(ctx, progress).await
+        .with_context(|| format!("listing workspaces for env '{env}'"))?;
+    progress.inc_total(workspaces.len() as u64);
+
+    let queues = crate::cli::pull::queues::list(ctx, progress).await
+        .with_context(|| format!("listing queues for env '{env}'"))?;
+    progress.inc_total(queues.len() as u64);
+
+    let hooks = crate::cli::pull::hooks::list(ctx, progress).await
+        .with_context(|| format!("listing hooks for env '{env}'"))?;
+    progress.inc_total(hooks.len() as u64);
+
+    let rules = crate::cli::pull::rules::list(ctx, progress).await
+        .with_context(|| format!("listing rules for env '{env}'"))?;
+    progress.inc_total(rules.len() as u64);
+
+    let labels = crate::cli::pull::labels::list(ctx, progress).await
+        .with_context(|| format!("listing labels for env '{env}'"))?;
+    progress.inc_total(labels.len() as u64);
+
+    let engines = crate::cli::pull::engines::list(ctx, progress).await
+        .with_context(|| format!("listing engines for env '{env}'"))?;
+    progress.inc_total(engines.len() as u64);
+
+    let engine_fields = crate::cli::pull::engine_fields::list(ctx, progress).await
+        .with_context(|| format!("listing engine fields for env '{env}'"))?;
+    progress.inc_total(engine_fields.len() as u64);
+
+    let workflows = crate::cli::pull::workflows::list(ctx, progress).await
+        .with_context(|| format!("listing workflows for env '{env}'"))?;
+    progress.inc_total(workflows.len() as u64);
+
+    let workflow_steps = crate::cli::pull::workflow_steps::list(ctx, progress).await
+        .with_context(|| format!("listing workflow steps for env '{env}'"))?;
+    progress.inc_total(workflow_steps.len() as u64);
+
+    let email_templates = crate::cli::pull::email_templates::list(ctx, progress).await
+        .with_context(|| format!("listing email templates for env '{env}'"))?;
+    progress.inc_total(email_templates.len() as u64);
+
+    let mdh = crate::cli::pull::mdh::list(env_cfg, token, progress).await
+        .with_context(|| format!("listing MDH datasets for env '{env}'"))?;
+    progress.inc_total(mdh.collections.len() as u64);
+
+    Ok(RemoteCatalog {
+        organization, workspaces, queues, hooks, rules, labels,
+        engines, engine_fields, workflows, workflow_steps,
+        email_templates, mdh,
+    })
+}
+
 /// If `paths` is `Some` and non-empty, strip those overlay-managed dotted
 /// paths from `bytes` (parse to Value, strip, re-serialize). Otherwise
 /// return `bytes` unchanged. Used by every writable-kind pull driver to
