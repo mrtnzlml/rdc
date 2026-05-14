@@ -54,6 +54,10 @@ pub struct PullCtx<'a> {
     /// shadow-file behavior. Drivers consult `ctx.interactive` and pass
     /// it to `apply_pull_action`.
     pub interactive: bool,
+    /// Name of the env this pull is targeting (e.g. "production"). Passed
+    /// through to resolver entry points so conflict prompts and shadow
+    /// files can name the env explicitly.
+    pub env: String,
 }
 
 /// Bound for the per-item async fan-out in drivers that pipeline sub-fetches
@@ -200,6 +204,7 @@ pub fn apply_pull_action(
     remote_hash: String,
     interactive: bool,
     progress: &Arc<OverallProgress>,
+    env_name: &str,
 ) -> Result<String> {
     use crate::snapshot::writer::write_atomic;
     match action {
@@ -219,7 +224,7 @@ pub fn apply_pull_action(
         }
         PullAction::Conflict => {
             if interactive {
-                resolve_conflict_interactive(local_path, remote_bytes, &remote_hash, progress)
+                resolve_conflict_interactive(local_path, remote_bytes, &remote_hash, progress, env_name)
             } else {
                 shadow_file_conflict(local_path, remote_bytes, progress)
             }
@@ -263,6 +268,7 @@ fn resolve_conflict_interactive(
     remote_bytes: &[u8],
     remote_hash: &str,
     progress: &Arc<OverallProgress>,
+    env_name: &str,
 ) -> Result<String> {
     use crate::cli::resolve::{prompt_resolve, PullAborted, Resolution};
     use crate::snapshot::writer::write_atomic;
@@ -276,6 +282,7 @@ fn resolve_conflict_interactive(
         1,
         local_path,
         remote_bytes,
+        env_name,
     )?;
 
     match resolution {
@@ -384,7 +391,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         let p = crate::progress::OverallProgress::start("test");
-        let h = apply_pull_action(PullAction::Write, &path, b"hello", "h".repeat(64), false, &p).unwrap();
+        let h = apply_pull_action(PullAction::Write, &path, b"hello", "h".repeat(64), false, &p, "test").unwrap();
         p.finish();
         assert_eq!(h, "h".repeat(64));
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
@@ -397,7 +404,7 @@ mod tests {
         std::fs::write(&path, b"local").unwrap();
         // interactive=false → legacy shadow-file behavior.
         let p = crate::progress::OverallProgress::start("test");
-        let _ = apply_pull_action(PullAction::Conflict, &path, b"remote", "h".repeat(64), false, &p).unwrap();
+        let _ = apply_pull_action(PullAction::Conflict, &path, b"remote", "h".repeat(64), false, &p, "test").unwrap();
         p.finish();
         assert_eq!(std::fs::read(&path).unwrap(), b"local");
         assert_eq!(std::fs::read(dir.path().join("x.json.remote")).unwrap(), b"remote");
@@ -462,6 +469,7 @@ mod tests {
             "h".repeat(64),
             false,
             &p,
+            "test",
         )
         .unwrap();
         p.finish();

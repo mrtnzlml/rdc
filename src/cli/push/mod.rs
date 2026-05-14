@@ -258,7 +258,7 @@ async fn run_drivers(
     // org-level leaves. Drivers call progress.tick() per item.
     let (n_workspaces, c_workspaces) = if !changes.workspaces.is_empty() {
         progress.start_phase("workspaces");
-        workspaces::push(paths, client, lockfile, interactive, &changes.workspaces, progress).await
+        workspaces::push(paths, client, lockfile, interactive, &changes.workspaces, progress, env).await
             .with_context(|| format!("pushing workspaces for env '{env}'"))?
     } else {
         (0, 0)
@@ -266,7 +266,7 @@ async fn run_drivers(
 
     let (n_schemas, c_schemas) = if !changes.schemas.is_empty() {
         progress.start_phase("schemas");
-        schemas::push(paths, client, lockfile, interactive, &changes.schemas, progress).await
+        schemas::push(paths, client, lockfile, interactive, &changes.schemas, progress, env).await
             .with_context(|| format!("pushing schemas for env '{env}'"))?
     } else {
         (0, 0)
@@ -274,7 +274,7 @@ async fn run_drivers(
 
     let (n_queues, c_queues) = if !changes.queues.is_empty() {
         progress.start_phase("queues");
-        queues::push(paths, client, lockfile, interactive, &changes.queues, progress).await
+        queues::push(paths, client, lockfile, interactive, &changes.queues, progress, env).await
             .with_context(|| format!("pushing queues for env '{env}'"))?
     } else {
         (0, 0)
@@ -282,7 +282,7 @@ async fn run_drivers(
 
     let (n_inboxes, c_inboxes) = if !changes.inboxes.is_empty() {
         progress.start_phase("inboxes");
-        inboxes::push(paths, client, lockfile, interactive, &changes.inboxes, progress).await
+        inboxes::push(paths, client, lockfile, interactive, &changes.inboxes, progress, env).await
             .with_context(|| format!("pushing inboxes for env '{env}'"))?
     } else {
         (0, 0)
@@ -290,7 +290,7 @@ async fn run_drivers(
 
     let (n_email_templates, c_email_templates) = if !changes.email_templates.is_empty() {
         progress.start_phase("email_templates");
-        email_templates::push(paths, client, lockfile, interactive, &changes.email_templates, progress).await
+        email_templates::push(paths, client, lockfile, interactive, &changes.email_templates, progress, env).await
             .with_context(|| format!("pushing email templates for env '{env}'"))?
     } else {
         (0, 0)
@@ -298,7 +298,7 @@ async fn run_drivers(
 
     let (n_hooks, c_hooks) = if !changes.hooks.is_empty() {
         progress.start_phase("hooks");
-        hooks::push(paths, client, lockfile, interactive, &changes.hooks, progress).await
+        hooks::push(paths, client, lockfile, interactive, &changes.hooks, progress, env).await
             .with_context(|| format!("pushing hooks for env '{env}'"))?
     } else {
         (0, 0)
@@ -306,7 +306,7 @@ async fn run_drivers(
 
     let (n_rules, c_rules) = if !changes.rules.is_empty() {
         progress.start_phase("rules");
-        rules::push(paths, client, lockfile, interactive, &changes.rules, progress).await
+        rules::push(paths, client, lockfile, interactive, &changes.rules, progress, env).await
             .with_context(|| format!("pushing rules for env '{env}'"))?
     } else {
         (0, 0)
@@ -314,7 +314,7 @@ async fn run_drivers(
 
     let (n_labels, c_labels) = if !changes.labels.is_empty() {
         progress.start_phase("labels");
-        labels::push(paths, client, lockfile, interactive, &changes.labels, progress).await
+        labels::push(paths, client, lockfile, interactive, &changes.labels, progress, env).await
             .with_context(|| format!("pushing labels for env '{env}'"))?
     } else {
         (0, 0)
@@ -322,7 +322,7 @@ async fn run_drivers(
 
     let (n_engines, c_engines) = if !changes.engines.is_empty() {
         progress.start_phase("engines");
-        engines::push(paths, client, lockfile, interactive, &changes.engines, progress).await
+        engines::push(paths, client, lockfile, interactive, &changes.engines, progress, env).await
             .with_context(|| format!("pushing engines for env '{env}'"))?
     } else {
         (0, 0)
@@ -330,7 +330,7 @@ async fn run_drivers(
 
     let (n_engine_fields, c_engine_fields) = if !changes.engine_fields.is_empty() {
         progress.start_phase("engine_fields");
-        engine_fields::push(paths, client, lockfile, interactive, &changes.engine_fields, progress).await
+        engine_fields::push(paths, client, lockfile, interactive, &changes.engine_fields, progress, env).await
             .with_context(|| format!("pushing engine fields for env '{env}'"))?
     } else {
         (0, 0)

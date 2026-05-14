@@ -112,9 +112,10 @@ pub fn prompt_resolve<R: BufRead, W: Write>(
     total: usize,
     local_path: &Path,
     remote_bytes: &[u8],
+    env_name: &str,
 ) -> Result<Resolution> {
     let mode = detect_color_mode(false);
-    prompt_resolve_with_color(input, output, index, total, local_path, remote_bytes, mode)
+    prompt_resolve_with_color(input, output, index, total, local_path, remote_bytes, env_name, mode)
 }
 
 /// Color-aware core. Tests pin the mode here; production goes through
@@ -126,8 +127,10 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
     total: usize,
     local_path: &Path,
     remote_bytes: &[u8],
+    env_name: &str,
     mode: ColorMode,
 ) -> Result<Resolution> {
+    let _ = env_name; // suppressed unused warning; Task 2 wires it into prompt text
     let local_bytes = read_local(local_path)?;
 
     // Strip noise fields before diff display so the user only sees real
@@ -334,6 +337,7 @@ pub fn resolve_combined_file(
     local_bytes: &[u8],
     remote_bytes: &[u8],
     interactive: bool,
+    env_name: &str,
 ) -> Result<Vec<u8>> {
     use crate::snapshot::writer::write_atomic;
 
@@ -361,6 +365,7 @@ pub fn resolve_combined_file(
         label_total,
         local_path,
         remote_bytes,
+        env_name,
     )?;
     match resolution {
         Resolution::KeepLocal => Ok(local_bytes.to_vec()),
@@ -456,6 +461,7 @@ pub fn resolve_push_drift(
     interactive: bool,
     local_path: &Path,
     remote_bytes: &[u8],
+    env_name: &str,
 ) -> Result<PushDriftOutcome> {
     if !interactive {
         return Ok(PushDriftOutcome::Skip);
@@ -470,6 +476,7 @@ pub fn resolve_push_drift(
         1,
         local_path,
         remote_bytes,
+        env_name,
     )?;
     match resolution {
         Resolution::KeepLocal => Ok(PushDriftOutcome::Patch { payload_override: None }),
@@ -783,7 +790,7 @@ mod tests {
 
         let input = Cursor::new(b"k\n");
         let mut output: Vec<u8> = Vec::new();
-        let r = prompt_resolve(input, &mut output, 1, 1, &path, b"remote\n").unwrap();
+        let r = prompt_resolve(input, &mut output, 1, 1, &path, b"remote\n", "test").unwrap();
         assert!(matches!(r, Resolution::KeepLocal));
         let s = String::from_utf8(output).unwrap();
         assert!(s.contains("[1/1]"), "output: {s}");
@@ -797,7 +804,7 @@ mod tests {
 
         let input = Cursor::new(b"r\n");
         let mut output: Vec<u8> = Vec::new();
-        let r = prompt_resolve(input, &mut output, 1, 1, &path, b"remote\n").unwrap();
+        let r = prompt_resolve(input, &mut output, 1, 1, &path, b"remote\n", "test").unwrap();
         assert!(matches!(r, Resolution::KeepRemote));
     }
 
@@ -809,7 +816,7 @@ mod tests {
 
         let input = Cursor::new(b"s\n");
         let mut output: Vec<u8> = Vec::new();
-        let r = prompt_resolve(input, &mut output, 2, 5, &path, b"remote\n").unwrap();
+        let r = prompt_resolve(input, &mut output, 2, 5, &path, b"remote\n", "test").unwrap();
         assert!(matches!(r, Resolution::Skip));
     }
 
@@ -821,7 +828,7 @@ mod tests {
 
         let input = Cursor::new(b"a\n");
         let mut output: Vec<u8> = Vec::new();
-        let r = prompt_resolve(input, &mut output, 1, 1, &path, b"remote\n").unwrap();
+        let r = prompt_resolve(input, &mut output, 1, 1, &path, b"remote\n", "test").unwrap();
         assert!(matches!(r, Resolution::Abort));
     }
 
@@ -833,7 +840,7 @@ mod tests {
 
         let input = Cursor::new(b"q\nx\n\nk\n");
         let mut output: Vec<u8> = Vec::new();
-        let r = prompt_resolve(input, &mut output, 1, 1, &path, b"remote\n").unwrap();
+        let r = prompt_resolve(input, &mut output, 1, 1, &path, b"remote\n", "test").unwrap();
         assert!(matches!(r, Resolution::KeepLocal));
         let s = String::from_utf8(output).unwrap();
         assert!(s.contains("unrecognized"), "output: {s}");
@@ -848,7 +855,7 @@ mod tests {
         // Empty input — first read_line returns 0 (EOF).
         let input = Cursor::new(b"");
         let mut output: Vec<u8> = Vec::new();
-        let r = prompt_resolve(input, &mut output, 1, 1, &path, b"remote\n").unwrap();
+        let r = prompt_resolve(input, &mut output, 1, 1, &path, b"remote\n", "test").unwrap();
         assert!(matches!(r, Resolution::Skip));
     }
 
@@ -861,7 +868,7 @@ mod tests {
         // No input read — function short-circuits because local == remote.
         let input = Cursor::new(b"");
         let mut output: Vec<u8> = Vec::new();
-        let r = prompt_resolve(input, &mut output, 1, 1, &path, b"same\n").unwrap();
+        let r = prompt_resolve(input, &mut output, 1, 1, &path, b"same\n", "test").unwrap();
         assert!(matches!(r, Resolution::KeepLocal));
     }
 
@@ -878,7 +885,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("a.py");
         std::fs::write(&path, b"same\n").unwrap();
-        let out = resolve_combined_file(1, 2, &path, b"same\n", b"same\n", true).unwrap();
+        let out = resolve_combined_file(1, 2, &path, b"same\n", b"same\n", true, "test").unwrap();
         assert_eq!(out, b"same\n");
         // No shadow file written.
         assert!(!dir.path().join("a.py.remote").exists());
@@ -889,7 +896,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("a.py");
         std::fs::write(&path, b"local\n").unwrap();
-        let out = resolve_combined_file(1, 1, &path, b"local\n", b"remote\n", false).unwrap();
+        let out = resolve_combined_file(1, 1, &path, b"local\n", b"remote\n", false, "test").unwrap();
         assert_eq!(out, b"local\n");
         assert_eq!(std::fs::read(dir.path().join("a.py.remote")).unwrap(), b"remote\n");
         // Local file untouched.
@@ -913,7 +920,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"local\n").unwrap();
-        let r = resolve_push_drift(false, &path, b"remote\n").unwrap();
+        let r = resolve_push_drift(false, &path, b"remote\n", "test").unwrap();
         assert!(matches!(r, PushDriftOutcome::Skip));
     }
 
@@ -933,6 +940,7 @@ mod tests {
             1,
             &path,
             b"{\"name\":\"x\",\"modified_at\":\"t2\"}",
+            "test",
         )
         .unwrap();
         assert!(matches!(r, Resolution::KeepLocal));
@@ -1037,6 +1045,7 @@ mod tests {
             1,
             &path,
             b"{\"name\":\"new\"}",
+            "test",
             ColorMode::Color,
         )
         .unwrap();
@@ -1062,6 +1071,7 @@ mod tests {
             1,
             &path,
             b"{\"name\":\"new\"}",
+            "test",
             ColorMode::Plain,
         )
         .unwrap();
@@ -1097,5 +1107,23 @@ mod tests {
         ])).unwrap();
         let choices = format_user_choices(&users, None);
         assert!(!choices[0].contains("you"), "no self_id → no 'you' tag, got {:?}", choices[0]);
+    }
+
+    #[test]
+    fn prompt_resolve_interpolates_env_name() {
+        use std::io::Cursor;
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("x.json");
+        std::fs::write(&local, b"{\"a\":1}").unwrap();
+        let remote = b"{\"a\":2}";
+        let mut out: Vec<u8> = Vec::new();
+        let input = Cursor::new(b"s\n");
+
+        // Smoke test: at this stage, env_name is plumbed but not yet
+        // rendered in the prompt text (Task 2 wires it in). Asserting
+        // only that the new signature compiles and the call succeeds.
+        let _ = prompt_resolve_with_color(
+            input, &mut out, 1, 1, &local, remote, "production", ColorMode::Plain,
+        ).unwrap();
     }
 }

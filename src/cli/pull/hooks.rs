@@ -95,7 +95,7 @@ pub async fn process(ctx: &mut PullCtx<'_>, hooks: Vec<Hook>, progress: &Arc<Ove
             PullAction::Write => {
                 // The `interactive` flag is irrelevant on Write (no resolver
                 // path); pass `ctx.interactive` for consistency.
-                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone(), ctx.interactive, progress)?;
+                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone(), ctx.interactive, progress, &ctx.env)?;
                 if let Some(code) = &proposed_code {
                     write_hook_code(&ctx.paths.hooks_dir(), &slug, code)
                         .with_context(|| format!("writing hook code for '{}'", hook.name))?;
@@ -132,6 +132,7 @@ pub async fn process(ctx: &mut PullCtx<'_>, hooks: Vec<Hook>, progress: &Arc<Ove
                     local_json,
                     &proposed_json,
                     ctx.interactive && symmetric,
+                    &ctx.env,
                 )?;
 
                 let resolved_code = if symmetric {
@@ -142,6 +143,7 @@ pub async fn process(ctx: &mut PullCtx<'_>, hooks: Vec<Hook>, progress: &Arc<Ove
                             loc.as_bytes(),
                             rem.as_bytes(),
                             ctx.interactive,
+                            &ctx.env,
                         )?;
                         Some(String::from_utf8(bytes)
                             .with_context(|| format!("hook code resolved bytes for '{}' are not UTF-8", hook.name))?)

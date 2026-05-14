@@ -22,6 +22,7 @@ pub async fn push(
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
     progress: &Arc<OverallProgress>,
+    env: &str,
 ) -> Result<(usize, usize)> {
     let overlay = Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
@@ -101,7 +102,7 @@ pub async fn push(
         let mut payload_to_send = payload_schema;
         if &remote_combined != &base {
             use crate::cli::resolve::{resolve_push_drift, PushDriftOutcome};
-            match resolve_push_drift(interactive, schema_path, &remote_json)? {
+            match resolve_push_drift(interactive, schema_path, &remote_json, env)? {
                 PushDriftOutcome::Patch { payload_override } => {
                     if let Some(bytes) = payload_override {
                         payload_to_send = serde_json::from_slice(&bytes)

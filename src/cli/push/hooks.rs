@@ -18,6 +18,7 @@ pub async fn push(
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
     progress: &Arc<OverallProgress>,
+    env: &str,
 ) -> Result<(usize, usize)> {
     // Load overlay if present. Overlay drives both the outbound payload
     // (apply_overrides) AND the strip applied to remote bytes for hashing
@@ -181,7 +182,7 @@ pub async fn push(
             // common case). On Adopt, we write both .json and .py from
             // the remote so disk + lockfile stay aligned.
             use crate::cli::resolve::{resolve_push_drift, PushDriftOutcome};
-            match resolve_push_drift(interactive, local_json_path, &remote_json_stripped)? {
+            match resolve_push_drift(interactive, local_json_path, &remote_json_stripped, env)? {
                 PushDriftOutcome::Patch { payload_override } => {
                     if let Some(bytes) = payload_override {
                         payload_to_send = serde_json::from_slice(&bytes)
