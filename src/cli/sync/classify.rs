@@ -71,7 +71,9 @@ pub fn classify(
             (false, true,  true, true)  if remote_hash == base_hash => SyncClass::LocalDelete,
             (false, false, true, true)  if remote_hash != base_hash => SyncClass::RemoteEdit,
             (false, false, true, false) => SyncClass::RemoteCreate,
-            _ => continue, // Tasks 6 and 7 fill in the rest.
+            (true,  false, true,  true)  if remote_hash != base_hash => SyncClass::BothDiverged,
+            (false, true,  false, true)  => SyncClass::BothDeleted,
+            _ => continue, // Task 7 fills in the rest.
         };
 
         out.push(ClassifiedItem {
@@ -170,5 +172,27 @@ mod tests {
             &BTreeMap::new(),
         );
         assert_eq!(class_of(&result, "new"), &SyncClass::RemoteCreate);
+    }
+
+    #[test]
+    fn both_diverged_when_local_and_remote_both_changed() {
+        let result = classify(
+            &m(&[("hooks", "v1", "h_remote_new")]),
+            &m(&[("hooks", "v1", "h_local_new")]),
+            &BTreeSet::new(),
+            &m(&[("hooks", "v1", "h_base")]),
+        );
+        assert_eq!(class_of(&result, "v1"), &SyncClass::BothDiverged);
+    }
+
+    #[test]
+    fn both_deleted_when_tombstone_and_remote_absent_with_lockfile_entry() {
+        let result = classify(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &st(&[("hooks", "v1")]),
+            &m(&[("hooks", "v1", "h_base")]),
+        );
+        assert_eq!(class_of(&result, "v1"), &SyncClass::BothDeleted);
     }
 }
