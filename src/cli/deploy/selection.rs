@@ -7,6 +7,77 @@
 //! persistent state. Re-running with the same flags on the same snapshots
 //! yields a byte-identical plan.
 
+use anyhow::{anyhow, bail, Result};
+
+/// The kinds `rdc deploy` operates on. Must stay in sync with
+/// `cli::deploy::run::KINDS_IN_DEP_ORDER`.
+pub(crate) const DEPLOYABLE_KINDS: &[&str] = &[
+    "workspaces",
+    "schemas",
+    "queues",
+    "inboxes",
+    "email_templates",
+    "hooks",
+    "rules",
+    "labels",
+    "engines",
+    "engine_fields",
+];
+
+/// One `--only` selector, parsed.
+///
+/// `kind = None` represents the `*/<slug-pattern>` form: match any kind
+/// whose slug fits the pattern. Otherwise the matcher is scoped to a
+/// single kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Matcher {
+    pub(crate) kind: Option<String>,
+    pub(crate) slug_pattern: String,
+    pub(crate) raw: String,
+}
+
+impl Matcher {
+    pub(crate) fn parse(raw: &str) -> Result<Self> {
+        let (kind_part, slug_part) = raw.split_once('/').ok_or_else(|| {
+            anyhow!(
+                "invalid --only '{raw}': expected '<kind>/<slug>' or '*/<slug>' \
+                 (e.g. 'hooks/validator-invoices', 'schemas/cost-*', '*/cost-invoices')"
+            )
+        })?;
+
+        if slug_part.is_empty() {
+            bail!("invalid --only '{raw}': slug segment is empty");
+        }
+
+        let kind = if kind_part == "*" {
+            None
+        } else if DEPLOYABLE_KINDS.contains(&kind_part) {
+            Some(kind_part.to_string())
+        } else {
+            bail!(
+                "invalid --only '{raw}': unknown kind '{kind_part}'. \
+                 Valid kinds: {}, or '*' for any kind.",
+                DEPLOYABLE_KINDS.join(", ")
+            );
+        };
+
+        Ok(Self {
+            kind,
+            slug_pattern: slug_part.to_string(),
+            raw: raw.to_string(),
+        })
+    }
+
+    pub(crate) fn matches(&self, kind: &str, slug: &str) -> bool {
+        if let Some(k) = &self.kind {
+            if k != kind {
+                return false;
+            }
+        }
+        glob_matches(&self.slug_pattern, slug)
+    }
+}
+
 /// Glob match: `pattern` may contain `*` (zero or more characters); every
 /// other byte is literal. No `?`, no character classes, no `**` — the
 /// grammar is intentionally narrow so users learn it from one sentence
@@ -36,6 +107,94 @@ pub(crate) fn glob_matches(pattern: &str, text: &str) -> bool {
         pi += 1;
     }
     pi == p.len()
+}
+
+#[cfg(test)]
+mod matcher_tests {
+    use super::*;
+
+    #[test]
+    fn parse_literal() {
+        let m = Matcher::parse("hooks/validator-invoices").unwrap();
+        assert_eq!(m.kind.as_deref(), Some("hooks"));
+        assert_eq!(m.slug_pattern, "validator-invoices");
+        assert_eq!(m.raw, "hooks/validator-invoices");
+    }
+
+    #[test]
+    fn parse_glob() {
+        let m = Matcher::parse("schemas/cost-*").unwrap();
+        assert_eq!(m.kind.as_deref(), Some("schemas"));
+        assert_eq!(m.slug_pattern, "cost-*");
+    }
+
+    #[test]
+    fn parse_cross_kind_glob() {
+        let m = Matcher::parse("*/cost-invoices").unwrap();
+        assert_eq!(m.kind, None);
+        assert_eq!(m.slug_pattern, "cost-invoices");
+    }
+
+    #[test]
+    fn parse_compound_email_template() {
+        let m = Matcher::parse("email_templates/main/cost-invoices/rejection").unwrap();
+        assert_eq!(m.kind.as_deref(), Some("email_templates"));
+        assert_eq!(m.slug_pattern, "main/cost-invoices/rejection");
+    }
+
+    #[test]
+    fn parse_unknown_kind_errors() {
+        let err = Matcher::parse("hookz/foo").unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("unknown kind 'hookz'"), "got: {s}");
+        assert!(s.contains("Valid kinds:"), "got: {s}");
+    }
+
+    #[test]
+    fn parse_missing_slash_errors() {
+        let err = Matcher::parse("hooks").unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("expected '<kind>/<slug>'"), "got: {s}");
+    }
+
+    #[test]
+    fn parse_empty_slug_errors() {
+        let err = Matcher::parse("hooks/").unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("slug segment is empty"), "got: {s}");
+    }
+
+    #[test]
+    fn matches_literal_respects_kind() {
+        let m = Matcher::parse("hooks/validator-invoices").unwrap();
+        assert!(m.matches("hooks", "validator-invoices"));
+        assert!(!m.matches("hooks", "validator-credit"));
+        assert!(!m.matches("rules", "validator-invoices"));
+    }
+
+    #[test]
+    fn matches_glob_respects_kind() {
+        let m = Matcher::parse("schemas/cost-*").unwrap();
+        assert!(m.matches("schemas", "cost-invoices"));
+        assert!(m.matches("schemas", "cost-credit"));
+        assert!(!m.matches("queues", "cost-invoices"));
+    }
+
+    #[test]
+    fn matches_cross_kind_glob_spans_all_kinds() {
+        let m = Matcher::parse("*/cost-invoices").unwrap();
+        assert!(m.matches("queues", "cost-invoices"));
+        assert!(m.matches("schemas", "cost-invoices"));
+        assert!(m.matches("inboxes", "cost-invoices"));
+        assert!(!m.matches("queues", "credit-invoices"));
+    }
+
+    #[test]
+    fn matches_compound_email_template() {
+        let m = Matcher::parse("email_templates/main/cost-invoices/rejection").unwrap();
+        assert!(m.matches("email_templates", "main/cost-invoices/rejection"));
+        assert!(!m.matches("email_templates", "main/cost-invoices/confirmation"));
+    }
 }
 
 #[cfg(test)]
