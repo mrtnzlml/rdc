@@ -64,10 +64,24 @@ pub const PULL_FANOUT: usize = 5;
 
 /// All kinds listed from one env's API. Produced by Phase 1 of pull,
 /// consumed by Phase 2 (pull) or by the sync classifier.
+///
+/// `schemas_by_queue_id` and `inboxes_by_queue_id` are pre-fetched by
+/// `list_remote` because the Rossum API has no `/schemas/` or `/inboxes/`
+/// listing — each must be fetched per-queue. Pre-fetching here lets the
+/// sync classifier compute remote hashes without having to issue an
+/// additional fetch per queue; the existing pull driver still re-fetches
+/// (we'd duplicate work but the alternative is threading the prefetch
+/// through the driver, which expands the per-kind API surface).
 pub struct RemoteCatalog {
     pub organization: crate::model::Organization,
     pub workspaces: Vec<crate::model::Workspace>,
     pub queues: Vec<crate::model::Queue>,
+    /// Map of queue id → schema body. `None` when the queue has no
+    /// schema (orphan queues, hidden queues), or when the schema fetch
+    /// failed (rare; surfaces as an orphan in `pull::queues::process`).
+    pub schemas_by_queue_id: std::collections::BTreeMap<u64, crate::model::Schema>,
+    /// Map of queue id → inbox body. Most queues have no inbox.
+    pub inboxes_by_queue_id: std::collections::BTreeMap<u64, crate::model::Inbox>,
     pub hooks: Vec<crate::model::Hook>,
     pub rules: Vec<crate::model::Rule>,
     pub labels: Vec<crate::model::Label>,
@@ -140,11 +154,109 @@ pub async fn list_remote(
         .with_context(|| format!("listing MDH datasets for env '{env}'"))?;
     progress.inc_total(mdh.collections.len() as u64);
 
+    // Per-queue schema + inbox prefetch. The Rossum API has no `/schemas/`
+    // or `/inboxes/` listing — each must be fetched by id. Doing it here
+    // gives the sync classifier accurate remote hashes for queue-nested
+    // kinds; the pull driver still re-fetches inside its own process loop
+    // (extra work but the driver's signature stays unchanged).
+    //
+    // Concurrency mirrors `pull::queues::process`'s sub-phase B:
+    // `buffer_unordered(PULL_FANOUT)` over (queue_id, schema_id?, inbox_id?).
+    let (schemas_by_queue_id, inboxes_by_queue_id) =
+        prefetch_queue_children(ctx.client, &queues, progress).await
+            .with_context(|| format!("prefetching schemas + inboxes for env '{env}'"))?;
+
     Ok(RemoteCatalog {
-        organization, workspaces, queues, hooks, rules, labels,
+        organization, workspaces, queues, schemas_by_queue_id, inboxes_by_queue_id,
+        hooks, rules, labels,
         engines, engine_fields, workflows, workflow_steps,
         email_templates, mdh,
     })
+}
+
+/// Concurrent per-queue schema + inbox fetch. Mirrors the bounded fan-out
+/// in `pull::queues::process` so the catalog's prefetch and the driver
+/// keep parity on rate and ordering. Queues with no schema / no inbox
+/// contribute nothing to the returned maps.
+async fn prefetch_queue_children(
+    client: &RossumClient,
+    queues: &[crate::model::Queue],
+    progress: &Arc<crate::progress::OverallProgress>,
+) -> Result<(
+    std::collections::BTreeMap<u64, crate::model::Schema>,
+    std::collections::BTreeMap<u64, crate::model::Inbox>,
+)> {
+    use futures::stream::{StreamExt, TryStreamExt};
+
+    // Build (queue_id, schema_id?, inbox_id?) triples once so the future
+    // body doesn't borrow `queues`.
+    let triples: Vec<(u64, String, Option<u64>, Option<u64>)> = queues
+        .iter()
+        .map(|q| {
+            let s = q
+                .schema
+                .as_deref()
+                .map(parse_id_from_url)
+                .transpose()
+                .ok()
+                .flatten();
+            let i = q
+                .inbox
+                .as_deref()
+                .map(parse_id_from_url)
+                .transpose()
+                .ok()
+                .flatten();
+            (q.id, q.name.clone(), s, i)
+        })
+        .collect();
+
+    let p = progress.clone();
+    let fetched: Vec<(u64, Option<crate::model::Schema>, Option<crate::model::Inbox>)> =
+        futures::stream::iter(triples)
+            .map(|(qid, qname, sid, iid)| {
+                let p = p.clone();
+                async move {
+                    let schema = match sid {
+                        Some(id) => Some(
+                            client
+                                .get_schema(id, Some(p.clone()))
+                                .await
+                                .with_context(|| {
+                                    format!("prefetching schema {id} for queue '{qname}'")
+                                })?,
+                        ),
+                        None => None,
+                    };
+                    let inbox = match iid {
+                        Some(id) => Some(
+                            client
+                                .get_inbox(id, Some(p.clone()))
+                                .await
+                                .with_context(|| {
+                                    format!("prefetching inbox {id} for queue '{qname}'")
+                                })?,
+                        ),
+                        None => None,
+                    };
+                    Ok::<_, anyhow::Error>((qid, schema, inbox))
+                }
+            })
+            .buffer_unordered(PULL_FANOUT)
+            .try_collect()
+            .await?;
+
+    let mut schemas = std::collections::BTreeMap::new();
+    let mut inboxes = std::collections::BTreeMap::new();
+    for (qid, s, i) in fetched {
+        if let Some(s) = s {
+            schemas.insert(qid, s);
+        }
+        if let Some(i) = i {
+            inboxes.insert(qid, i);
+        }
+    }
+    Ok((schemas, inboxes))
 }
 
 /// If `paths` is `Some` and non-empty, strip those overlay-managed dotted

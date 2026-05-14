@@ -158,6 +158,54 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
         }
     }
 
+    // Queue-tree slug indexes. The queue slug keys queue / schema /
+    // inbox; email templates use the compound `<ws>/<q>/<tpl>` slug.
+    // Slug derivation mirrors `pull::queues::process` and
+    // `pull::email_templates::process`.
+    let mut queue_by_slug: BTreeMap<String, (&crate::model::Queue, String /* ws_slug */)> =
+        BTreeMap::new();
+    let mut q_url_to_ws_q: BTreeMap<String, (String, String)> = BTreeMap::new();
+    {
+        let mut per_ws: std::collections::HashMap<String, HashSet<String>> =
+            std::collections::HashMap::new();
+        for q in &catalog.queues {
+            let Some(ws_url) = q.workspace.as_ref() else { continue };
+            let ws_slug = match ctx.lockfile.slug_for_url("workspaces", ws_url) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let used = per_ws.entry(ws_slug.clone()).or_default();
+            let q_slug = match ctx.lockfile.slug_for_id("queues", q.id) {
+                Some(existing) => existing.to_string(),
+                None => slugify_unique(&q.name, used),
+            };
+            used.insert(q_slug.clone());
+            q_url_to_ws_q.insert(q.url.clone(), (ws_slug.clone(), q_slug.clone()));
+            queue_by_slug.insert(q_slug, (q, ws_slug));
+        }
+    }
+    let email_template_by_compound: BTreeMap<String, &crate::model::EmailTemplate> = {
+        let mut map: BTreeMap<String, &crate::model::EmailTemplate> = BTreeMap::new();
+        let mut per_q: std::collections::HashMap<(String, String), HashSet<String>> =
+            std::collections::HashMap::new();
+        for t in &catalog.email_templates {
+            let Some(queue_url) = t.queue.as_ref() else { continue };
+            let Some((ws_slug, q_slug)) = q_url_to_ws_q.get(queue_url).cloned() else { continue };
+            let used = per_q.entry((ws_slug.clone(), q_slug.clone())).or_default();
+            let template_slug = match ctx.lockfile.slug_for_id("email_templates", t.id) {
+                Some(existing) => existing
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(existing)
+                    .to_string(),
+                None => slugify_unique(&t.name, used),
+            };
+            used.insert(template_slug.clone());
+            map.insert(format!("{ws_slug}/{q_slug}/{template_slug}"), t);
+        }
+        map
+    };
+
     let conflicts: Vec<&ClassifiedItem> = classified
         .iter()
         .filter(|it| it.class == SyncClass::BothDiverged)
@@ -291,6 +339,90 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                     hash_strategy: HashStrategy::Rule,
                 })
             }),
+            "queues" => queue_by_slug.get(it.slug.as_str()).and_then(|(q, ws_slug)| {
+                let mut bytes = match serde_json::to_vec_pretty(*q) {
+                    Ok(b) => b,
+                    Err(_) => return None,
+                };
+                bytes.push(b'\n');
+                let local_path = ctx.paths.queue_dir(ws_slug, &it.slug).join("queue.json");
+                Some(ConflictRefs {
+                    remote_bytes: bytes,
+                    remote_code: None,
+                    local_path,
+                    id: q.id,
+                    url: Some(q.url.clone()),
+                    modified_at: q.modified_at().map(|s| s.to_string()),
+                    hash_strategy: HashStrategy::Flat,
+                })
+            }),
+            "schemas" => {
+                // schemas are keyed by queue slug in the lockfile. Look up
+                // the schema via the queue → schema_by_queue_id map; the
+                // prompt only displays the JSON portion (formulas are
+                // sidecar files and are followed by `[k]`/`[r]` decisions
+                // identical to the JSON's). Treat as flat for resolution.
+                queue_by_slug.get(it.slug.as_str()).and_then(|(q, ws_slug)| {
+                    let schema = catalog.schemas_by_queue_id.get(&q.id)?;
+                    let (json_bytes, _formulas) =
+                        crate::snapshot::schema::serialize_schema(schema).ok()?;
+                    let local_path = ctx.paths.queue_dir(ws_slug, &it.slug).join("schema.json");
+                    Some(ConflictRefs {
+                        remote_bytes: json_bytes,
+                        remote_code: None,
+                        local_path,
+                        id: schema.id,
+                        url: Some(schema.url.clone()),
+                        modified_at: schema.modified_at().map(|s| s.to_string()),
+                        hash_strategy: HashStrategy::Flat,
+                    })
+                })
+            }
+            "inboxes" => queue_by_slug.get(it.slug.as_str()).and_then(|(q, ws_slug)| {
+                let inbox = catalog.inboxes_by_queue_id.get(&q.id)?;
+                let mut bytes = match serde_json::to_vec_pretty(inbox) {
+                    Ok(b) => b,
+                    Err(_) => return None,
+                };
+                bytes.push(b'\n');
+                let local_path = ctx.paths.queue_dir(ws_slug, &it.slug).join("inbox.json");
+                Some(ConflictRefs {
+                    remote_bytes: bytes,
+                    remote_code: None,
+                    local_path,
+                    id: inbox.id,
+                    url: Some(inbox.url.clone()),
+                    modified_at: inbox.modified_at().map(|s| s.to_string()),
+                    hash_strategy: HashStrategy::Flat,
+                })
+            }),
+            "email_templates" => {
+                email_template_by_compound.get(it.slug.as_str()).copied().and_then(|t| {
+                    let mut bytes = match serde_json::to_vec_pretty(t) {
+                        Ok(b) => b,
+                        Err(_) => return None,
+                    };
+                    bytes.push(b'\n');
+                    // Compound slug split: `<ws>/<q>/<tpl>`.
+                    let parts: Vec<&str> = it.slug.splitn(3, '/').collect();
+                    if parts.len() != 3 {
+                        return None;
+                    }
+                    let local_path = ctx
+                        .paths
+                        .queue_email_templates_dir(parts[0], parts[1])
+                        .join(format!("{}.json", parts[2]));
+                    Some(ConflictRefs {
+                        remote_bytes: bytes,
+                        remote_code: None,
+                        local_path,
+                        id: t.id,
+                        url: Some(t.url.clone()),
+                        modified_at: t.modified_at().map(|s| s.to_string()),
+                        hash_strategy: HashStrategy::Flat,
+                    })
+                })
+            }
             other => {
                 progress.println(format!(
                     "warning: conflict resolver not yet wired for kind '{}' (slug '{}'); skipping",
@@ -709,6 +841,54 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
         }
     }
 
+    // Queue-tree indexes for remote-delete dispatch. Mirrors
+    // `resolve_conflicts`. The same compound-slug map for email
+    // templates is built here so `<ws>/<q>/<tpl>` → template lookups
+    // share the slug derivation.
+    let mut queue_by_slug: BTreeMap<String, (&crate::model::Queue, String /* ws_slug */)> =
+        BTreeMap::new();
+    let mut q_url_to_ws_q: BTreeMap<String, (String, String)> = BTreeMap::new();
+    {
+        let mut per_ws: std::collections::HashMap<String, HashSet<String>> =
+            std::collections::HashMap::new();
+        for q in &catalog.queues {
+            let Some(ws_url) = q.workspace.as_ref() else { continue };
+            let ws_slug = match ctx.lockfile.slug_for_url("workspaces", ws_url) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let used = per_ws.entry(ws_slug.clone()).or_default();
+            let q_slug = match ctx.lockfile.slug_for_id("queues", q.id) {
+                Some(existing) => existing.to_string(),
+                None => slugify_unique(&q.name, used),
+            };
+            used.insert(q_slug.clone());
+            q_url_to_ws_q.insert(q.url.clone(), (ws_slug.clone(), q_slug.clone()));
+            queue_by_slug.insert(q_slug, (q, ws_slug));
+        }
+    }
+    let email_template_by_compound: BTreeMap<String, &crate::model::EmailTemplate> = {
+        let mut map: BTreeMap<String, &crate::model::EmailTemplate> = BTreeMap::new();
+        let mut per_q: std::collections::HashMap<(String, String), HashSet<String>> =
+            std::collections::HashMap::new();
+        for t in &catalog.email_templates {
+            let Some(queue_url) = t.queue.as_ref() else { continue };
+            let Some((ws_slug, q_slug)) = q_url_to_ws_q.get(queue_url).cloned() else { continue };
+            let used = per_q.entry((ws_slug.clone(), q_slug.clone())).or_default();
+            let template_slug = match ctx.lockfile.slug_for_id("email_templates", t.id) {
+                Some(existing) => existing
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(existing)
+                    .to_string(),
+                None => slugify_unique(&t.name, used),
+            };
+            used.insert(template_slug.clone());
+            map.insert(format!("{ws_slug}/{q_slug}/{template_slug}"), t);
+        }
+        map
+    };
+
     let env = ctx.paths.env().to_string();
 
     for it in classified {
@@ -725,6 +905,10 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                         | "engine_fields"
                         | "hooks"
                         | "rules"
+                        | "queues"
+                        | "schemas"
+                        | "inboxes"
+                        | "email_templates"
                 ) {
                     drop_lockfile_entry(ctx, &it.kind, &it.slug);
                 } else {
@@ -876,6 +1060,148 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             url: body.map(|r| r.url.clone()),
                             modified_at: body.and_then(|r| r.modified_at().map(|s| s.to_string())),
                             hash_strategy: HashStrategy::Rule,
+                        })
+                    }
+                    "queues" => {
+                        let body = queue_by_slug.get(it.slug.as_str());
+                        // local_path needs the (ws, q) lookup; for env-side-
+                        // dropped queues the catalog body is gone, fall back
+                        // to the disk sweep used by `change_list_from_classified`.
+                        let local_path = match body {
+                            Some((_, ws_slug)) => {
+                                ctx.paths.queue_dir(ws_slug, &it.slug).join("queue.json")
+                            }
+                            None => crate::cli::push::scan::find_queue_nested_path(ctx.paths, &it.slug, "queue.json")
+                                .unwrap_or_else(|| {
+                                    ctx.paths
+                                        .workspaces_dir()
+                                        .join("__orphan__/queues")
+                                        .join(&it.slug)
+                                        .join("queue.json")
+                                }),
+                        };
+                        Some(RemoteDeleteRefs {
+                            local_path,
+                            restore_bytes: body
+                                .and_then(|(q, _)| serde_json::to_vec_pretty(*q).ok())
+                                .map(|mut b| {
+                                    b.push(b'\n');
+                                    b
+                                }),
+                            restore_code: None,
+                            id: body.map(|(q, _)| q.id),
+                            url: body.map(|(q, _)| q.url.clone()),
+                            modified_at: body.and_then(|(q, _)| q.modified_at().map(|s| s.to_string())),
+                            hash_strategy: HashStrategy::Flat,
+                        })
+                    }
+                    "schemas" => {
+                        // schemas live alongside the queue at schema.json.
+                        let body_pair = queue_by_slug.get(it.slug.as_str()).and_then(|(q, ws_slug)| {
+                            catalog
+                                .schemas_by_queue_id
+                                .get(&q.id)
+                                .map(|s| (s, ws_slug.clone()))
+                        });
+                        let local_path = match &body_pair {
+                            Some((_, ws_slug)) => {
+                                ctx.paths.queue_dir(ws_slug, &it.slug).join("schema.json")
+                            }
+                            None => crate::cli::push::scan::find_queue_nested_path(ctx.paths, &it.slug, "schema.json")
+                                .unwrap_or_else(|| {
+                                    ctx.paths
+                                        .workspaces_dir()
+                                        .join("__orphan__/queues")
+                                        .join(&it.slug)
+                                        .join("schema.json")
+                                }),
+                        };
+                        // Use flat hash strategy for the dispatcher
+                        // simplification (display only schema.json; formula
+                        // sidecars are not restored here on [k]). The
+                        // resolver's hash-into-lockfile call uses Flat so
+                        // it stays a single-file decision.
+                        Some(RemoteDeleteRefs {
+                            local_path,
+                            restore_bytes: body_pair
+                                .as_ref()
+                                .and_then(|(s, _)| crate::snapshot::schema::serialize_schema(s).ok())
+                                .map(|(json, _formulas)| json),
+                            restore_code: None,
+                            id: body_pair.as_ref().map(|(s, _)| s.id),
+                            url: body_pair.as_ref().map(|(s, _)| s.url.clone()),
+                            modified_at: body_pair
+                                .as_ref()
+                                .and_then(|(s, _)| s.modified_at().map(|x| x.to_string())),
+                            hash_strategy: HashStrategy::Flat,
+                        })
+                    }
+                    "inboxes" => {
+                        let body_pair = queue_by_slug.get(it.slug.as_str()).and_then(|(q, ws_slug)| {
+                            catalog
+                                .inboxes_by_queue_id
+                                .get(&q.id)
+                                .map(|i| (i, ws_slug.clone()))
+                        });
+                        let local_path = match &body_pair {
+                            Some((_, ws_slug)) => {
+                                ctx.paths.queue_dir(ws_slug, &it.slug).join("inbox.json")
+                            }
+                            None => crate::cli::push::scan::find_queue_nested_path(ctx.paths, &it.slug, "inbox.json")
+                                .unwrap_or_else(|| {
+                                    ctx.paths
+                                        .workspaces_dir()
+                                        .join("__orphan__/queues")
+                                        .join(&it.slug)
+                                        .join("inbox.json")
+                                }),
+                        };
+                        Some(RemoteDeleteRefs {
+                            local_path,
+                            restore_bytes: body_pair
+                                .as_ref()
+                                .and_then(|(i, _)| serde_json::to_vec_pretty(*i).ok())
+                                .map(|mut b| {
+                                    b.push(b'\n');
+                                    b
+                                }),
+                            restore_code: None,
+                            id: body_pair.as_ref().map(|(i, _)| i.id),
+                            url: body_pair.as_ref().map(|(i, _)| i.url.clone()),
+                            modified_at: body_pair
+                                .as_ref()
+                                .and_then(|(i, _)| i.modified_at().map(|x| x.to_string())),
+                            hash_strategy: HashStrategy::Flat,
+                        })
+                    }
+                    "email_templates" => {
+                        // Compound slug `<ws>/<q>/<tpl>` — split for path,
+                        // look up body via the compound map.
+                        let parts: Vec<&str> = it.slug.splitn(3, '/').collect();
+                        let local_path = if parts.len() == 3 {
+                            ctx.paths
+                                .queue_email_templates_dir(parts[0], parts[1])
+                                .join(format!("{}.json", parts[2]))
+                        } else {
+                            ctx.paths
+                                .workspaces_dir()
+                                .join("__orphan__/email-templates")
+                                .join(format!("{}.json", it.slug))
+                        };
+                        let body = email_template_by_compound.get(it.slug.as_str()).copied();
+                        Some(RemoteDeleteRefs {
+                            local_path,
+                            restore_bytes: body
+                                .and_then(|t| serde_json::to_vec_pretty(t).ok())
+                                .map(|mut b| {
+                                    b.push(b'\n');
+                                    b
+                                }),
+                            restore_code: None,
+                            id: body.map(|t| t.id),
+                            url: body.map(|t| t.url.clone()),
+                            modified_at: body.and_then(|t| t.modified_at().map(|s| s.to_string())),
+                            hash_strategy: HashStrategy::Flat,
                         })
                     }
                     other => {
@@ -1215,6 +1541,43 @@ pub async fn run(
         if let Some(subset) = subsets.get("rules") {
             crate::cli::pull::rules::process(ctx, catalog.rules.clone(), subset, progress).await?;
         }
+        // queues / schemas / inboxes — the queue pull driver writes all
+        // three file types for each queue it processes (queue.json,
+        // schema.json + formulas/, inbox.json). The driver's subset
+        // filter is keyed by `("queues", slug)`, so we union the
+        // schemas/inboxes subsets into the queues subset: any queue
+        // whose schema or inbox needs writing pulls the whole tree.
+        // This matches the "queue-nested files travel as a unit" rule
+        // documented on `pull::queues::process`.
+        let mut queue_subset: BTreeSet<(String, String)> = subsets
+            .get("queues")
+            .cloned()
+            .unwrap_or_default();
+        for it in classified {
+            if matches!(it.class, SyncClass::RemoteEdit | SyncClass::RemoteCreate)
+                && (it.kind == "schemas" || it.kind == "inboxes")
+            {
+                queue_subset.insert(("queues".to_string(), it.slug.clone()));
+            }
+        }
+        if !queue_subset.is_empty() {
+            // queues::process also writes `ctx.queue_locations` which the
+            // email_templates dispatch below needs. It's a side effect of
+            // running the driver.
+            crate::cli::pull::queues::process(ctx, catalog.queues.clone(), &queue_subset, progress).await?;
+        }
+        // email_templates — flat compound slug `<ws>/<q>/<tpl>`. The
+        // driver consults `ctx.queue_locations` (populated by the queues
+        // dispatch above) to derive the on-disk path.
+        if let Some(subset) = subsets.get("email_templates") {
+            crate::cli::pull::email_templates::process(
+                ctx,
+                catalog.email_templates.clone(),
+                subset,
+                progress,
+            )
+            .await?;
+        }
         if let Some(subset) = subsets.get("mdh") {
             // MDH lives in a separate listed shape (`MdhListed` carries
             // the Data Storage client + collection list). The pull
@@ -1262,8 +1625,18 @@ pub async fn run(
                 "rules" => {
                     change_list.rules.insert(slug, path);
                 }
-                // TODO(sync-impl): mirror the change_list_from_classified
-                // kind-table once more kinds enter the conflict path.
+                "queues" => {
+                    change_list.queues.insert(slug, path);
+                }
+                "schemas" => {
+                    change_list.schemas.insert(slug, path);
+                }
+                "inboxes" => {
+                    change_list.inboxes.insert(slug, path);
+                }
+                "email_templates" => {
+                    change_list.email_templates.insert(slug, path);
+                }
                 _ => {}
             }
         }
@@ -1310,6 +1683,8 @@ mod tests {
             },
             workspaces: vec![],
             queues: vec![],
+            schemas_by_queue_id: BTreeMap::new(),
+            inboxes_by_queue_id: BTreeMap::new(),
             hooks: vec![],
             rules: vec![],
             labels,

@@ -1952,3 +1952,393 @@ async fn sync_remote_create_writes_local_rule() {
         "lockfile must record slug: {lf_raw}"
     );
 }
+
+/// Helper: wire up a queue-tree fixture (workspace + queue + schema +
+/// inbox + email template) on the mock server. Mirrors the
+/// `pull_writes_full_workspace_tree` setup. Returns the mock-side URLs
+/// the test can assert against later. The same URLs (with `server.uri()`)
+/// are referenced by every nested object so the adapter resolves
+/// queue → workspace and template → queue cleanly.
+async fn mount_queue_tree_fixture(server: &MockServer) {
+    let ws_url = format!("{}/api/v1/workspaces/800", server.uri());
+    let queue_url = format!("{}/api/v1/queues/100", server.uri());
+    let schema_url = format!("{}/api/v1/schemas/200", server.uri());
+    let inbox_url = format!("{}/api/v1/inboxes/300", server.uri());
+
+    let workspaces_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 800,
+                "url": ws_url,
+                "name": "Invoices AP",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "queues": [queue_url.clone()],
+                "modified_at": "2026-04-20T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(workspaces_body))
+        .mount(server)
+        .await;
+
+    let queues_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 100,
+                "url": queue_url.clone(),
+                "name": "Cost Invoices",
+                "workspace": format!("{}/api/v1/workspaces/800", server.uri()),
+                "schema": schema_url.clone(),
+                "inbox": inbox_url.clone(),
+                "modified_at": "2026-04-20T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(queues_body))
+        .mount(server)
+        .await;
+
+    let schema_body = serde_json::json!({
+        "id": 200,
+        "url": schema_url,
+        "name": "Cost Invoices Schema",
+        "queues": [queue_url.clone()],
+        "content": [
+            {
+                "category": "section",
+                "id": "header",
+                "label": "Header",
+                "children": [
+                    { "category": "datapoint", "id": "invoice_id", "type": "string" },
+                    {
+                        "category": "datapoint",
+                        "id": "amount_total",
+                        "type": "number",
+                        "formula": "amount_due + amount_tax"
+                    }
+                ]
+            }
+        ],
+        "modified_at": "2026-04-10T09:00:00Z"
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schemas/200"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(schema_body))
+        .mount(server)
+        .await;
+
+    let inbox_body = serde_json::json!({
+        "id": 300,
+        "url": inbox_url,
+        "name": "Cost Invoices Inbox",
+        "email": "cost-invoices@mock.rossum.app",
+        "queues": [queue_url.clone()],
+        "modified_at": "2026-04-10T09:00:00Z",
+        "filters": []
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/inboxes/300"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(inbox_body))
+        .mount(server)
+        .await;
+
+    let email_templates_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 9001,
+                "url": format!("{}/api/v1/email_templates/9001", server.uri()),
+                "name": "Rejection Notice",
+                "subject": "Your invoice was rejected",
+                "queue": queue_url,
+                "modified_at": "2026-04-20T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/email_templates"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(email_templates_body))
+        .mount(server)
+        .await;
+}
+
+/// Pull-side RemoteCreate for the full queue tree. The env exposes
+/// a workspace, a queue (with linked schema + inbox), and an email
+/// template scoped to that queue. None of these exist locally. `sync`
+/// must classify the queue tree as RemoteCreate and dispatch through
+/// `pull::queues::process` (which writes all 4 file types) plus
+/// `pull::email_templates::process`.
+#[tokio::test]
+async fn sync_remote_create_writes_local_queue_tree() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    mount_queue_tree_fixture(&server).await;
+
+    mock_empty_lists_except(
+        &server,
+        &[
+            "/api/v1/workspaces",
+            "/api/v1/queues",
+            "/api/v1/email_templates",
+        ],
+    )
+    .await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* diff = */ false, /* allow_deletes = */ false,
+        /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    result.expect("sync should succeed when remote has a new queue tree");
+
+    // No mutating API calls.
+    for req in server.received_requests().await.unwrap_or_default() {
+        let p = req.url.path();
+        if p.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "unexpected mutating request: {} {}",
+            req.method,
+            p
+        );
+    }
+
+    let cost_dir = project
+        .path()
+        .join("envs/dev/workspaces/invoices-ap/queues/cost-invoices");
+    assert!(
+        cost_dir.join("queue.json").exists(),
+        "queue.json should be written at {}",
+        cost_dir.join("queue.json").display()
+    );
+    assert!(
+        cost_dir.join("schema.json").exists(),
+        "schema.json should be written at {}",
+        cost_dir.join("schema.json").display()
+    );
+    assert!(
+        cost_dir.join("inbox.json").exists(),
+        "inbox.json should be written at {}",
+        cost_dir.join("inbox.json").display()
+    );
+    assert!(
+        cost_dir.join("formulas/amount_total.py").exists(),
+        "formula sidecar should be written at {}",
+        cost_dir.join("formulas/amount_total.py").display()
+    );
+    let schema_json = std::fs::read_to_string(cost_dir.join("schema.json")).unwrap();
+    assert!(
+        !schema_json.contains("amount_due + amount_tax"),
+        "formula must not be in schema.json: {schema_json}"
+    );
+
+    // Email template nests under the queue.
+    let tpl_path = cost_dir.join("email-templates/rejection-notice.json");
+    assert!(
+        tpl_path.exists(),
+        "email template should be written at {}",
+        tpl_path.display()
+    );
+
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    assert!(lf_raw.contains("\"queues\""), "lockfile must record queues: {lf_raw}");
+    assert!(lf_raw.contains("\"schemas\""), "lockfile must record schemas: {lf_raw}");
+    assert!(lf_raw.contains("\"inboxes\""), "lockfile must record inboxes: {lf_raw}");
+    assert!(
+        lf_raw.contains("\"email_templates\""),
+        "lockfile must record email_templates: {lf_raw}"
+    );
+    assert!(lf_raw.contains("cost-invoices"), "queue slug recorded: {lf_raw}");
+    assert!(
+        lf_raw.contains("invoices-ap/cost-invoices/rejection-notice"),
+        "email template compound key recorded: {lf_raw}"
+    );
+}
+
+/// Idempotency for the queue tree: after an initial sync, a second
+/// sync run with no remote or local changes should be a no-op
+/// (no API mutations, no file rewrites). Pins the Clean classification
+/// for the four nested kinds.
+#[tokio::test]
+async fn sync_clean_queue_tree_no_writes() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    mount_queue_tree_fixture(&server).await;
+
+    mock_empty_lists_except(
+        &server,
+        &[
+            "/api/v1/workspaces",
+            "/api/v1/queues",
+            "/api/v1/email_templates",
+        ],
+    )
+    .await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // First sync: writes the queue tree.
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* diff = */ false, /* allow_deletes = */ false,
+        /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await
+    .expect("first sync should succeed");
+
+    // Snapshot the on-disk file mtimes so we can verify the second run
+    // doesn't rewrite them. mtime is a coarser signal than byte
+    // comparison but it's what we have without rebuilding the whole
+    // file tree; `write_atomic` skips writes when bytes match, so a
+    // no-op sync should leave the mtimes alone.
+    let cost_dir = project
+        .path()
+        .join("envs/dev/workspaces/invoices-ap/queues/cost-invoices");
+    let queue_mtime = std::fs::metadata(cost_dir.join("queue.json"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let schema_mtime = std::fs::metadata(cost_dir.join("schema.json"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let inbox_mtime = std::fs::metadata(cost_dir.join("inbox.json"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let tpl_mtime = std::fs::metadata(cost_dir.join("email-templates/rejection-notice.json"))
+        .unwrap()
+        .modified()
+        .unwrap();
+
+    // Clear the request log so the second-run assertion only sees the
+    // second-run traffic.
+    server.reset().await;
+
+    // Re-mount the same fixture (reset clears mocks too).
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+    mount_queue_tree_fixture(&server).await;
+    mock_empty_lists_except(
+        &server,
+        &[
+            "/api/v1/workspaces",
+            "/api/v1/queues",
+            "/api/v1/email_templates",
+        ],
+    )
+    .await;
+
+    // Second sync: should be a no-op.
+    rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* diff = */ false, /* allow_deletes = */ false,
+        /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await
+    .expect("second sync should succeed (clean state)");
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    // No mutating API calls in the second run.
+    for req in server.received_requests().await.unwrap_or_default() {
+        let p = req.url.path();
+        if p.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "unexpected mutating request on clean re-sync: {} {}",
+            req.method,
+            p
+        );
+    }
+
+    // Files unchanged byte-for-byte and (best-effort) mtime-stable.
+    let queue_mtime_after = std::fs::metadata(cost_dir.join("queue.json"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let schema_mtime_after = std::fs::metadata(cost_dir.join("schema.json"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let inbox_mtime_after = std::fs::metadata(cost_dir.join("inbox.json"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let tpl_mtime_after =
+        std::fs::metadata(cost_dir.join("email-templates/rejection-notice.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+    assert_eq!(queue_mtime, queue_mtime_after, "queue.json must not be rewritten");
+    assert_eq!(schema_mtime, schema_mtime_after, "schema.json must not be rewritten");
+    assert_eq!(inbox_mtime, inbox_mtime_after, "inbox.json must not be rewritten");
+    assert_eq!(tpl_mtime, tpl_mtime_after, "email template must not be rewritten");
+}

@@ -335,13 +335,22 @@ pub fn from_catalog_scan_lockfile(
     // else `slugify_unique(name, used)`. Hash matches the driver's
     // canonical form (`serde_json::to_vec_pretty` → `\n` → content_hash);
     // workspaces have no overlay so no strip step.
+    // Build a freshly-computed workspace URL → slug map alongside the
+    // hash insertion. Queue derivation below uses this map so a
+    // first-pull sync can resolve queue.workspace → ws_slug even when
+    // the lockfile is still empty (the workspace was just emitted as
+    // RemoteCreate one block above; its entry won't land in the
+    // lockfile until the executor runs).
     let mut used_workspace_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut ws_url_to_slug: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for w in &catalog.workspaces {
         let slug = match lockfile.slug_for_id("workspaces", w.id) {
             Some(existing) => existing.to_string(),
             None => crate::slug::slugify_unique(&w.name, &used_workspace_slugs),
         };
         used_workspace_slugs.insert(slug.clone());
+        ws_url_to_slug.insert(w.url.clone(), slug.clone());
 
         let mut proposed = match serde_json::to_vec_pretty(w) {
             Ok(b) => b,
@@ -588,6 +597,206 @@ pub fn from_catalog_scan_lockfile(
         for (slug, entry) in map {
             if let Some(h) = &entry.content_hash {
                 locked.insert(("rules".to_string(), slug.clone()), h.clone());
+            }
+        }
+    }
+
+    // --- queues / schemas / inboxes / email_templates -----------------
+    // Queue-nested kinds share a slug-derivation pass: the queue slug
+    // (lockfile id lookup → `slugify_unique(name, per_ws_used)`) keys
+    // `queues`, `schemas`, and `inboxes` in the lockfile. Email templates
+    // use a compound `<ws>/<q>/<tpl>` slug per `pull::email_templates::process`.
+    //
+    // The remote hash for each kind mirrors the pull driver's canonical
+    // bytes:
+    //   queues   → `serde_json::to_vec_pretty(q)` + `\n` + `content_hash`
+    //   schemas  → `serialize_schema` → `schema_combined_hash(json, formulas)`
+    //   inboxes  → `serde_json::to_vec_pretty(i)` + `\n` + `content_hash`
+    //   email_tpl→ `serde_json::to_vec_pretty(t)` + `\n` + `content_hash`
+    //
+    // The `catalog.schemas_by_queue_id` / `inboxes_by_queue_id` maps were
+    // pre-fetched in `list_remote`; we look up by queue id, since the API
+    // has no list endpoint for these.
+    //
+    // Overlay caveat (same as labels/engines/hooks/rules): the pull
+    // driver runs `maybe_strip_overlay` on the proposed bytes before
+    // hashing. We skip that step here; once an overlay-aware adapter
+    // test arrives, thread `&Overlay` in and replicate the strip on each
+    // proposed_bytes path below.
+    let mut per_ws_used_q_slugs: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    // Build per-queue (ws_slug, q_slug, q.id, q.url) tuples so the
+    // email_templates block can look up its compound key without
+    // re-deriving slugs.
+    let mut q_url_to_ws_q: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    for q in &catalog.queues {
+        let Some(ws_url) = q.workspace.as_ref() else { continue };
+        // Prefer the freshly-computed catalog mapping (so first-pull syncs
+        // resolve queue.workspace even when the lockfile is empty); fall
+        // back to the lockfile for cross-env re-attribution scenarios where
+        // the workspace was already pulled by a previous run.
+        let ws_slug = match ws_url_to_slug.get(ws_url) {
+            Some(s) => s.clone(),
+            None => match lockfile.slug_for_url("workspaces", ws_url) {
+                Some(s) => s.to_string(),
+                None => {
+                    // The pull driver also skips orphans here; without a
+                    // workspace slug we can't compute the queue's
+                    // location, so the queue (and its schema/inbox)
+                    // never enters the classifier.
+                    continue;
+                }
+            },
+        };
+        let used = per_ws_used_q_slugs.entry(ws_slug.clone()).or_default();
+        let q_slug = match lockfile.slug_for_id("queues", q.id) {
+            Some(existing) => existing.to_string(),
+            None => crate::slug::slugify_unique(&q.name, used),
+        };
+        used.insert(q_slug.clone());
+        q_url_to_ws_q.insert(q.url.clone(), (ws_slug.clone(), q_slug.clone()));
+
+        // queues — flat JSON.
+        let mut q_proposed = match serde_json::to_vec_pretty(q) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        q_proposed.push(b'\n');
+        let q_hash = crate::state::content_hash(&q_proposed);
+        remote_hashes.insert(("queues".to_string(), q_slug.clone()), q_hash);
+
+        // schemas — combined (json + formulas). Pre-fetched in `list_remote`.
+        if let Some(schema) = catalog.schemas_by_queue_id.get(&q.id) {
+            if let Ok((schema_json_bytes, schema_formulas)) =
+                crate::snapshot::schema::serialize_schema(schema)
+            {
+                let schema_hash =
+                    crate::state::schema_combined_hash(&schema_json_bytes, &schema_formulas);
+                remote_hashes.insert(("schemas".to_string(), q_slug.clone()), schema_hash);
+            }
+        }
+
+        // inboxes — flat JSON. Only present for queues that have an inbox.
+        if let Some(inbox) = catalog.inboxes_by_queue_id.get(&q.id) {
+            if let Ok(mut inbox_proposed) = serde_json::to_vec_pretty(inbox) {
+                inbox_proposed.push(b'\n');
+                let inbox_hash = crate::state::content_hash(&inbox_proposed);
+                remote_hashes.insert(("inboxes".to_string(), q_slug.clone()), inbox_hash);
+            }
+        }
+    }
+
+    // Scan-side hashes for queues / inboxes (flat) and schemas (combined).
+    for (slug, path) in &changes.queues {
+        if let Ok(bytes) = std::fs::read(path) {
+            scan_changes.insert(
+                ("queues".to_string(), slug.clone()),
+                crate::state::content_hash(&bytes),
+            );
+        }
+    }
+    for (slug, path) in &changes.inboxes {
+        if let Ok(bytes) = std::fs::read(path) {
+            scan_changes.insert(
+                ("inboxes".to_string(), slug.clone()),
+                crate::state::content_hash(&bytes),
+            );
+        }
+    }
+    for (slug, schema_path) in &changes.schemas {
+        // The push scanner stores the path to `schema.json`; the formulas
+        // sit in a sibling `formulas/` dir. Mirror `scan_schemas`.
+        let Ok(json_bytes) = std::fs::read(schema_path) else { continue };
+        let queue_dir = match schema_path.parent() {
+            Some(p) => p,
+            None => continue,
+        };
+        let formulas = crate::snapshot::schema::read_local_formulas(queue_dir).unwrap_or_default();
+        let hash = crate::state::schema_combined_hash(&json_bytes, &formulas);
+        scan_changes.insert(("schemas".to_string(), slug.clone()), hash);
+    }
+
+    for slug in tombstones.queues.keys() {
+        scan_tombstones.insert(("queues".to_string(), slug.clone()));
+    }
+    for slug in tombstones.schemas.keys() {
+        scan_tombstones.insert(("schemas".to_string(), slug.clone()));
+    }
+    for slug in tombstones.inboxes.keys() {
+        scan_tombstones.insert(("inboxes".to_string(), slug.clone()));
+    }
+
+    if let Some(map) = lockfile.objects.get("queues") {
+        for (slug, entry) in map {
+            if let Some(h) = &entry.content_hash {
+                locked.insert(("queues".to_string(), slug.clone()), h.clone());
+            }
+        }
+    }
+    if let Some(map) = lockfile.objects.get("schemas") {
+        for (slug, entry) in map {
+            if let Some(h) = &entry.content_hash {
+                locked.insert(("schemas".to_string(), slug.clone()), h.clone());
+            }
+        }
+    }
+    if let Some(map) = lockfile.objects.get("inboxes") {
+        for (slug, entry) in map {
+            if let Some(h) = &entry.content_hash {
+                locked.insert(("inboxes".to_string(), slug.clone()), h.clone());
+            }
+        }
+    }
+
+    // email_templates — compound slug `<ws>/<q>/<tpl>`. Mirrors
+    // `pull::email_templates::process`'s `lockfile_key` derivation:
+    // look up the queue's (ws_slug, q_slug) by queue URL, then pick the
+    // template slug (lockfile id lookup → `slugify_unique` per queue).
+    let mut per_queue_used_t_slugs: std::collections::HashMap<
+        (String, String),
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
+    for t in &catalog.email_templates {
+        let Some(queue_url) = t.queue.as_ref() else { continue };
+        let Some((ws_slug, q_slug)) = q_url_to_ws_q.get(queue_url).cloned() else { continue };
+        let used = per_queue_used_t_slugs
+            .entry((ws_slug.clone(), q_slug.clone()))
+            .or_default();
+        let template_slug = match lockfile.slug_for_id("email_templates", t.id) {
+            Some(existing) => existing
+                .rsplit('/')
+                .next()
+                .unwrap_or(existing)
+                .to_string(),
+            None => crate::slug::slugify_unique(&t.name, used),
+        };
+        used.insert(template_slug.clone());
+        let compound = format!("{ws_slug}/{q_slug}/{template_slug}");
+
+        let mut proposed = match serde_json::to_vec_pretty(t) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        proposed.push(b'\n');
+        let hash = crate::state::content_hash(&proposed);
+        remote_hashes.insert(("email_templates".to_string(), compound), hash);
+    }
+    for (slug, path) in &changes.email_templates {
+        if let Ok(bytes) = std::fs::read(path) {
+            scan_changes.insert(
+                ("email_templates".to_string(), slug.clone()),
+                crate::state::content_hash(&bytes),
+            );
+        }
+    }
+    for slug in tombstones.email_templates.keys() {
+        scan_tombstones.insert(("email_templates".to_string(), slug.clone()));
+    }
+    if let Some(map) = lockfile.objects.get("email_templates") {
+        for (slug, entry) in map {
+            if let Some(h) = &entry.content_hash {
+                locked.insert(("email_templates".to_string(), slug.clone()), h.clone());
             }
         }
     }

@@ -10,14 +10,14 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 pub(crate) mod common;
-mod email_templates;
+pub(crate) mod email_templates;
 pub(crate) mod engine_fields;
 pub(crate) mod engines;
 pub(crate) mod hooks;
 pub(crate) mod labels;
 pub(crate) mod mdh;
 pub(crate) mod organization;
-mod queues;
+pub(crate) mod queues;
 pub(crate) mod rules;
 pub(crate) mod workflow_steps;
 pub(crate) mod workflows;

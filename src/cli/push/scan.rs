@@ -744,8 +744,9 @@ pub fn change_list_from_classified(
 /// Sweep `workspaces/*/queues/<q_slug>/<file_name>` and return the first
 /// match. Mirrors `queue_nested_file_exists` but returns the path. Used by
 /// `change_list_from_classified` for `queues` / `schemas` / `inboxes`,
-/// whose classifier keys items by queue slug alone.
-fn find_queue_nested_path(
+/// whose classifier keys items by queue slug alone. Also used by the
+/// sync executor's remote-delete dispatcher for the same kinds.
+pub(crate) fn find_queue_nested_path(
     paths: &Paths,
     q_slug: &str,
     file_name: &str,
