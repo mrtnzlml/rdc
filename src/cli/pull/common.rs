@@ -222,26 +222,27 @@ pub fn apply_pull_action(
             if interactive {
                 resolve_conflict_interactive(local_path, remote_bytes, &remote_hash, progress, env)
             } else {
-                shadow_file_conflict(local_path, remote_bytes, progress)
+                shadow_file_conflict(local_path, remote_bytes, progress, env)
             }
         }
     }
 }
 
 /// The legacy shadow-file behavior for a conflict: write
-/// `<file>.remote`, keep local on disk, return the local hash. Used when
+/// `<file>.<env>`, keep local on disk, return the local hash. Used when
 /// `interactive == false` (CI/non-TTY/--yes) and as a fallback from the
 /// resolver when the user picks `[s]kip`.
 fn shadow_file_conflict(
     local_path: &Path,
     remote_bytes: &[u8],
     progress: &Arc<OverallProgress>,
+    env: &str,
 ) -> Result<String> {
     use crate::snapshot::writer::write_atomic;
     let mut conflict_path = local_path.to_path_buf();
     let new_name = match conflict_path.file_name().and_then(|s| s.to_str()) {
-        Some(name) => format!("{name}.remote"),
-        None => "remote".to_string(),
+        Some(name) => format!("{name}.{env}"),
+        None => format!("shadow.{env}"),
     };
     conflict_path.set_file_name(new_name);
     write_atomic(&conflict_path, remote_bytes)?;
@@ -295,7 +296,7 @@ fn resolve_conflict_interactive(
             write_atomic(local_path, &edited)?;
             Ok(content_hash(&edited))
         }
-        Resolution::Skip => shadow_file_conflict(local_path, remote_bytes, progress),
+        Resolution::Skip => shadow_file_conflict(local_path, remote_bytes, progress, env),
         Resolution::Abort => Err(anyhow::Error::new(PullAborted)),
     }
 }
@@ -403,7 +404,11 @@ mod tests {
         let _ = apply_pull_action(PullAction::Conflict, &path, b"remote", "h".repeat(64), false, &p, "test").unwrap();
         p.finish();
         assert_eq!(std::fs::read(&path).unwrap(), b"local");
-        assert_eq!(std::fs::read(dir.path().join("x.json.remote")).unwrap(), b"remote");
+        assert_eq!(
+            std::fs::read(dir.path().join("x.json.test")).unwrap(),
+            b"remote",
+            "shadow file should be named after the env"
+        );
     }
 
     #[test]

@@ -828,7 +828,7 @@ async fn re_pull_emits_remote_file_on_queue_conflict() {
     let after_local = std::fs::read_to_string(&queue_path).unwrap();
     assert_eq!(after_local, local_edit);
 
-    let remote_path = project.path().join("envs/dev/workspaces/invoices-ap/queues/cost-invoices/queue.json.remote");
+    let remote_path = project.path().join("envs/dev/workspaces/invoices-ap/queues/cost-invoices/queue.json.dev");
     assert!(remote_path.exists());
     let remote_content = std::fs::read_to_string(&remote_path).unwrap();
     assert!(remote_content.contains("REMOTE EDIT"));
