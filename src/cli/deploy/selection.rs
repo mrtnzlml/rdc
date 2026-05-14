@@ -11,8 +11,11 @@
 // dep-order list as the single source of truth so adding a kind in
 // run.rs automatically extends what --only accepts.
 use crate::cli::deploy::run::{list_slugs, KINDS_IN_DEP_ORDER as DEPLOYABLE_KINDS};
+use crate::mapping::Mapping;
 use crate::paths::Paths;
-use anyhow::{anyhow, bail, Result};
+use crate::state::Lockfile;
+use anyhow::{anyhow, bail, Context, Result};
+use serde_json::Value;
 use std::collections::BTreeSet;
 
 #[derive(Debug, Default, Clone)]
@@ -153,10 +156,6 @@ impl Matcher {
     }
 }
 
-use serde_json::Value;
-use crate::state::Lockfile;
-use crate::mapping::Mapping;
-
 /// URL-typed fields per kind. Mirrors the field list rewritten by
 /// `cli::deploy::common::rewrite_urls` — when that list changes, this
 /// one must change too.
@@ -264,8 +263,6 @@ pub(crate) fn classify_unresolved(
     out
 }
 
-use anyhow::Context;
-
 /// Read the on-disk JSON for `(kind, slug)` from a snapshot. Returns the
 /// raw `serde_json::Value` so the caller can pass it to `extract_refs`.
 ///
@@ -294,8 +291,11 @@ fn read_src_value(
                 if !e.file_type()?.is_dir() { continue; }
                 let candidate = e.path().join("fields").join(format!("{slug}.json"));
                 if candidate.exists() {
-                    let bytes = std::fs::read(&candidate)?;
-                    return Ok(serde_json::from_slice(&bytes)?);
+                    let bytes = std::fs::read(&candidate)
+                        .with_context(|| format!("reading {}", candidate.display()))?;
+                    let v: Value = serde_json::from_slice(&bytes)
+                        .with_context(|| format!("parsing {}", candidate.display()))?;
+                    return Ok(v);
                 }
             }
             return Ok(Value::Object(serde_json::Map::new()));
@@ -317,8 +317,11 @@ fn read_src_value(
                 if !ws.file_type()?.is_dir() { continue; }
                 let candidate = ws.path().join("queues").join(slug).join(fname);
                 if candidate.exists() {
-                    let bytes = std::fs::read(&candidate)?;
-                    return Ok(serde_json::from_slice(&bytes)?);
+                    let bytes = std::fs::read(&candidate)
+                        .with_context(|| format!("reading {}", candidate.display()))?;
+                    let v: Value = serde_json::from_slice(&bytes)
+                        .with_context(|| format!("parsing {}", candidate.display()))?;
+                    return Ok(v);
                 }
             }
             return Ok(Value::Object(serde_json::Map::new()));
@@ -404,7 +407,7 @@ pub(crate) fn dep_check(
             for (k, s) in &deduped {
                 msg.push_str(&format!("  --only {k}/{s}\n"));
             }
-            bail!("{msg}");
+            bail!("{}", msg.trim_end());
         }
 
         let proceed = prompt(&unresolved);
