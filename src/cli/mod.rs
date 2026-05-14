@@ -123,6 +123,14 @@ pub enum Command {
         /// This flag is kept as a no-op for backward compatibility.
         #[arg(long = "diff", requires = "dry_run", hide = true)]
         diff: bool,
+        /// Limit the deploy to the given `<kind>/<slug>` selectors. Repeatable.
+        /// Globs: `*` matches within the slug segment (e.g. `hooks/*`,
+        /// `schemas/cost-*`). Cross-kind: `*/cost-invoices` matches any kind.
+        /// Email templates use the compound `<ws>/<q>/<tpl>` slug, e.g.
+        /// `email_templates/main/cost-invoices/rejection`. Without any
+        /// `--only`, deploy operates on the whole snapshot (default).
+        #[arg(long = "only", value_name = "SELECTOR", action = clap::ArgAction::Append)]
+        only: Vec<String>,
     },
     /// Read-only health check: token, auth, lockfile, local edits.
     /// With no `env`, runs for every env defined in `rdc.toml`.
@@ -215,7 +223,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             })
             .await
         }
-        Some(Command::Deploy { src, tgt, mirror, dry_run, diff }) => {
+        Some(Command::Deploy { src, tgt, mirror, dry_run, diff, only }) => {
             let src = crate::cli::env_picker::pick_env("Deploy from which env (source)?", src)?;
             let tgt = crate::cli::env_picker::pick_env_excluding(
                 "Deploy to which env (target)?",
@@ -223,7 +231,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 &[&src],
             )?;
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
-            crate::cli::deploy::run::run(&src, &tgt, mirror, interactive, dry_run, diff).await
+            crate::cli::deploy::run::run(&src, &tgt, mirror, interactive, dry_run, diff, only).await
         }
         Some(Command::Status { env }) => crate::cli::status::run(env).await,
         Some(Command::Diff { left, right }) => crate::cli::diff::run(left, right).await,

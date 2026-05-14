@@ -1043,6 +1043,45 @@ async fn deploy_resolves_templates_and_prompts_for_token_owner() {
     assert!(hook_id > 0, "hook id in tgt lockfile must be positive, got {hook_id}");
 }
 
+/// `rdc deploy --only hooks/nonexistent` must fail fast with a clear error
+/// mentioning the offending selector and "matched 0 objects".
+#[tokio::test]
+async fn deploy_only_with_unknown_selector_errors() {
+    let test_server = MockServer::start().await;
+    let prod_server = MockServer::start().await;
+    mount_full_pull(&test_server, empty_list()).await;
+    mount_full_pull(&prod_server, empty_list()).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .args(["init", "--env", &format!("test={}/api/v1:1", test_server.uri()),
+               "--env", &format!("prod={}/api/v1:1", prod_server.uri())])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T")
+        .env("RDC_TOKEN_PROD", "T")
+        .assert().success();
+    Command::cargo_bin("rdc").unwrap()
+        .args(["pull", "test"])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T")
+        .assert().success();
+    Command::cargo_bin("rdc").unwrap()
+        .args(["pull", "prod"])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_PROD", "T")
+        .assert().success();
+
+    Command::cargo_bin("rdc").unwrap()
+        .args(["deploy", "test", "prod", "--yes", "--only", "hooks/nonexistent"])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T")
+        .env("RDC_TOKEN_PROD", "T")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("hooks/nonexistent"))
+        .stderr(predicate::str::contains("matched 0 objects"));
+}
+
 /// `rdc deploy test prod --dry-run` with a store extension in src must print
 /// the store-extension sub-line in the plan summary, naming the slug and the
 /// template on the target cluster. No writes should reach the tgt server.

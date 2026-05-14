@@ -79,7 +79,7 @@ pub const KINDS_IN_DEP_ORDER: &[&str] = &[
     "engine_fields",
 ];
 
-pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run: bool, diff: bool) -> Result<()> {
+pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run: bool, diff: bool, only: Vec<String>) -> Result<()> {
     if src == tgt {
         return Err(anyhow!(
             "src and tgt envs are the same ('{src}'). Use two different envs for `rdc deploy`."
@@ -149,6 +149,46 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
     // User-curated entries in the mapping file (cross-env renames) are
     // preserved — `auto_match` never overwrites.
     crate::cli::deploy::map::auto_match(&mut mapping, &src_paths, &tgt_paths)?;
+
+    // Resolve --only selectors against the local snapshots, then run a
+    // cross-ref dep check. On TTY with missing deps, prompt to include
+    // them. Non-TTY (--yes / CI) with missing deps → refuse.
+    //
+    // Placed AFTER auto_match so dep_check sees the same mapping the apply
+    // phase will use, including renames and same-slug auto-matched pairs.
+    let mut selection = crate::cli::deploy::selection::resolve(&only, &src_paths, &tgt_paths)?;
+    if let Some(sel) = selection.as_mut() {
+        let mut prompt_fn = |unresolved: &[crate::cli::deploy::selection::Unresolved]| -> bool {
+            eprintln!();
+            eprintln!("The following objects in your selection reference peers that aren't in");
+            eprintln!("the selection and don't exist in '{tgt}' yet:");
+            eprintln!();
+            for u in unresolved {
+                eprintln!(
+                    "  {}/{}  → {}/{} (missing)",
+                    u.from.0, u.from.1, u.to.0, u.to.1,
+                );
+            }
+            eprintln!();
+            let mut deduped: std::collections::BTreeSet<(String, String)> = Default::default();
+            for u in unresolved { deduped.insert(u.to.clone()); }
+            eprint!("Include these {} dependencies in the selection? [Y/n] ", deduped.len());
+            let mut input = String::new();
+            if std::io::stdin().read_line(&mut input).is_err() { return false; }
+            let ans = input.trim().to_ascii_lowercase();
+            ans.is_empty() || ans == "y" || ans == "yes"
+        };
+        crate::cli::deploy::selection::dep_check(
+            sel,
+            &src_paths,
+            &src_lockfile,
+            &tgt_lockfile,
+            &mapping,
+            interactive,
+            &mut prompt_fn,
+        )?;
+    }
+    let _selection = selection; // consumed by Tasks 7-10
 
     // 1. Compute plan — file-system level only (which slugs are missing
     // from tgt, and in mirror mode which are tgt-only). Field-level diffs
