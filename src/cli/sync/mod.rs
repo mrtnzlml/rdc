@@ -15,6 +15,18 @@ use crate::secrets::resolve_token;
 use crate::state::Lockfile;
 use anyhow::{anyhow, Context, Result};
 
+/// Aggregate counts from one sync cycle, used for the watch-loop summary line.
+/// For one-shot sync, callers usually don't read this — they look at the
+/// printed summary instead. Counters are populated by `execute::run` (see
+/// Task 12 in the plan; for this task they may remain at default).
+#[derive(Debug, Default)]
+pub struct CycleOutcome {
+    pub items_pushed: usize,
+    pub items_pulled: usize,
+    pub conflicts: usize,
+    pub remote_deletes_resolved: usize,
+}
+
 /// Entry point for `rdc sync <env>`. Drives the unified pipeline:
 ///
 /// 1. `list_remote` — Phase 1 of the existing pull pipeline.
@@ -38,6 +50,45 @@ pub async fn run(
     no_push: bool,
     no_pull: bool,
 ) -> Result<()> {
+    // One-shot wrapper. Watch mode goes through `cli::sync::watch::run_watch`.
+    // Argument validation lives in `run_cycle` so watch mode benefits too.
+    let cwd = std::env::current_dir().context("getting current directory")?;
+    let paths = Paths::for_env(&cwd, env);
+    let _lock = crate::cli::sync::lock::EnvLock::acquire(
+        &paths.env_lock(),
+        std::time::Duration::from_secs(30),
+    )?;
+    run_cycle(
+        env,
+        interactive,
+        dry_run,
+        diff,
+        allow_deletes,
+        no_push,
+        no_pull,
+        false,
+    )
+    .await?;
+    Ok(())
+}
+
+/// One reconciliation pass: list remote, scan local, classify, prompt-if-needed,
+/// execute, save. Caller is responsible for holding the env lock for the
+/// duration of this call.
+///
+/// `auto_confirm_non_destructive`: when true (watch mode), the plan-and-confirm
+/// prompt is suppressed for cycles with zero conflicts and zero destructive
+/// items. Conflicts and destructive deletes still prompt via the inline resolver.
+pub(crate) async fn run_cycle(
+    env: &str,
+    interactive: bool,
+    dry_run: bool,
+    diff: bool,
+    allow_deletes: bool,
+    no_push: bool,
+    no_pull: bool,
+    auto_confirm_non_destructive: bool,
+) -> Result<CycleOutcome> {
     if no_push && no_pull {
         anyhow::bail!(
             "--no-push and --no-pull are mutually exclusive. \
@@ -95,7 +146,7 @@ pub async fn run(
         let _ = diff;
         progress.finish();
         println!("Dry run sync envs/{env}: 0 writes.");
-        return Ok(());
+        return Ok(CycleOutcome::default());
     }
 
     // Destructive-delete gate: subsequent tasks will refuse to proceed
@@ -103,9 +154,22 @@ pub async fn run(
     // the executor is a no-op, so the flag is recorded for parity.
     let _ = allow_deletes;
 
-    if interactive && !classified.is_empty() && !confirm("Proceed?")? {
+    let has_conflicts_or_destructive = classified.iter().any(|c| {
+        matches!(
+            c.class,
+            crate::cli::sync::classify::SyncClass::BothDiverged
+                | crate::cli::sync::classify::SyncClass::LocalEditRemoteDelete
+                | crate::cli::sync::classify::SyncClass::LocalDeleteRemoteEdit
+                | crate::cli::sync::classify::SyncClass::RemoteDelete
+                | crate::cli::sync::classify::SyncClass::LocalDelete
+        )
+    });
+    let should_confirm = interactive
+        && !classified.is_empty()
+        && !(auto_confirm_non_destructive && !has_conflicts_or_destructive);
+    if should_confirm && !confirm("Proceed?")? {
         eprintln!("sync aborted by user.");
-        return Ok(());
+        return Ok(CycleOutcome::default());
     }
 
     // Phase 5: execute. Stub today — fills in across subsequent tasks.
@@ -136,7 +200,7 @@ pub async fn run(
 
     progress.finish();
     println!("Synced envs/{env}.");
-    Ok(())
+    Ok(CycleOutcome::default())
 }
 
 /// y/N confirmation prompt on stdin/stdout. Returns false for any input
