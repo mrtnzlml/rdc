@@ -651,3 +651,186 @@ fn scan_email_templates(
     }
     Ok(scanned)
 }
+
+/// Convert a list of classified items (from `cli::sync::classify`) into a
+/// push-side `ChangeList`. Only `LocalEdit` and `LocalCreate` items are
+/// retained — those are the classes the push pipeline knows how to PATCH /
+/// POST. `LocalDelete` is handled separately via tombstones; all remote-side
+/// classes and `Clean` are silently dropped.
+///
+/// The classified items carry only `(kind, slug)`, so for each push-side
+/// item this helper computes the on-disk path via the same layout the
+/// `scan` walkers use. For flat kinds (`hooks`, `rules`, `labels`, etc.)
+/// the path is built directly from the slug; for queue-nested kinds
+/// (`queues`, `schemas`, `inboxes`) the lockfile keys items by queue slug
+/// alone, so we sweep `workspaces/*/queues/<slug>/<file>` to find the
+/// owning workspace. For `email_templates` the slug is already the
+/// `<ws>/<queue>/<template>` compound, so the split is unambiguous. For
+/// `engine_fields` we sweep `engines/*/fields/<slug>.json` (lockfile keys
+/// fields by field slug alone, same as the existing scanner). Kinds that
+/// don't go through the push pipeline (`mdh`, `workflows`,
+/// `workflow_steps`, `organization`) are silently dropped.
+pub fn change_list_from_classified(
+    paths: &crate::paths::Paths,
+    items: &[crate::cli::sync::classify::ClassifiedItem],
+) -> ChangeList {
+    use crate::cli::sync::classify::SyncClass;
+    let mut cl = ChangeList::default();
+    for it in items {
+        if !matches!(it.class, SyncClass::LocalEdit | SyncClass::LocalCreate) {
+            continue;
+        }
+        match it.kind.as_str() {
+            "workspaces" => {
+                cl.workspaces
+                    .insert(it.slug.clone(), paths.workspace_dir(&it.slug).join("workspace.json"));
+            }
+            "hooks" => {
+                cl.hooks
+                    .insert(it.slug.clone(), paths.hooks_dir().join(format!("{}.json", it.slug)));
+            }
+            "rules" => {
+                cl.rules
+                    .insert(it.slug.clone(), paths.rules_dir().join(format!("{}.json", it.slug)));
+            }
+            "labels" => {
+                cl.labels
+                    .insert(it.slug.clone(), paths.labels_dir().join(format!("{}.json", it.slug)));
+            }
+            "engines" => {
+                cl.engines
+                    .insert(it.slug.clone(), paths.engine_dir(&it.slug).join("engine.json"));
+            }
+            "engine_fields" => {
+                if let Some(p) = find_engine_field_path(paths, &it.slug) {
+                    cl.engine_fields.insert(it.slug.clone(), p);
+                }
+            }
+            "queues" => {
+                if let Some(p) = find_queue_nested_path(paths, &it.slug, "queue.json") {
+                    cl.queues.insert(it.slug.clone(), p);
+                }
+            }
+            "schemas" => {
+                if let Some(p) = find_queue_nested_path(paths, &it.slug, "schema.json") {
+                    cl.schemas.insert(it.slug.clone(), p);
+                }
+            }
+            "inboxes" => {
+                if let Some(p) = find_queue_nested_path(paths, &it.slug, "inbox.json") {
+                    cl.inboxes.insert(it.slug.clone(), p);
+                }
+            }
+            "email_templates" => {
+                // Compound key "<ws>/<queue>/<template>".
+                let parts: Vec<&str> = it.slug.splitn(3, '/').collect();
+                if parts.len() == 3 {
+                    let p = paths
+                        .queue_email_templates_dir(parts[0], parts[1])
+                        .join(format!("{}.json", parts[2]));
+                    cl.email_templates.insert(it.slug.clone(), p);
+                }
+            }
+            // Other kinds (mdh, workflows, workflow_steps, organization) don't
+            // go through the push pipeline; silently drop. Workflows and
+            // workflow_steps are read-only at the Rossum API; organization is
+            // singleton-read.
+            _ => {}
+        }
+    }
+    cl
+}
+
+/// Sweep `workspaces/*/queues/<q_slug>/<file_name>` and return the first
+/// match. Mirrors `queue_nested_file_exists` but returns the path. Used by
+/// `change_list_from_classified` for `queues` / `schemas` / `inboxes`,
+/// whose classifier keys items by queue slug alone.
+fn find_queue_nested_path(
+    paths: &Paths,
+    q_slug: &str,
+    file_name: &str,
+) -> Option<std::path::PathBuf> {
+    let ws_dir = paths.workspaces_dir();
+    if !ws_dir.exists() {
+        return None;
+    }
+    let entries = std::fs::read_dir(&ws_dir).ok()?;
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let candidate = entry.path().join("queues").join(q_slug).join(file_name);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Sweep `engines/*/fields/<slug>.json` and return the first match.
+/// Mirrors `engine_field_file_exists` but returns the path.
+fn find_engine_field_path(paths: &Paths, slug: &str) -> Option<std::path::PathBuf> {
+    let engines_dir = paths.engines_dir();
+    if !engines_dir.exists() {
+        return None;
+    }
+    let entries = std::fs::read_dir(&engines_dir).ok()?;
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let candidate = entry.path().join("fields").join(format!("{slug}.json"));
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn change_list_from_classified_groups_push_side_items_by_kind() {
+        use crate::cli::sync::classify::{ClassifiedItem, SyncClass};
+        use crate::paths::Paths;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+
+        let items = vec![
+            ClassifiedItem {
+                kind: "hooks".into(),
+                slug: "h1".into(),
+                class: SyncClass::LocalEdit,
+                local_hash: Some("h".into()),
+                remote_hash: Some("h".into()),
+                base_hash: Some("h".into()),
+            },
+            ClassifiedItem {
+                kind: "labels".into(),
+                slug: "l1".into(),
+                class: SyncClass::LocalCreate,
+                local_hash: Some("h".into()),
+                remote_hash: None,
+                base_hash: None,
+            },
+            ClassifiedItem {
+                kind: "hooks".into(),
+                slug: "h2".into(),
+                // Not a push-side class — should be ignored.
+                class: SyncClass::RemoteEdit,
+                local_hash: Some("h".into()),
+                remote_hash: Some("h2".into()),
+                base_hash: Some("h".into()),
+            },
+        ];
+
+        let cl = change_list_from_classified(&paths, &items);
+        assert_eq!(cl.hooks.len(), 1, "only the LocalEdit hook should be in the list");
+        assert!(cl.hooks.contains_key("h1"));
+        assert_eq!(cl.labels.len(), 1);
+        assert!(cl.labels.contains_key("l1"));
+        assert!(cl.queues.is_empty());
+    }
+}
