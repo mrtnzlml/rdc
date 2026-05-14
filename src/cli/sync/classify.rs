@@ -73,7 +73,23 @@ pub fn classify(
             (false, false, true, false) => SyncClass::RemoteCreate,
             (true,  false, true,  true)  if remote_hash != base_hash => SyncClass::BothDiverged,
             (false, true,  false, true)  => SyncClass::BothDeleted,
-            _ => continue, // Task 7 fills in the rest.
+
+            // Task 7 — the final 3 classes.
+            (false, false, false, true) => SyncClass::RemoteDelete,
+            (true,  false, false, true) => SyncClass::LocalEditRemoteDelete,
+            (false, true,  true,  true) if remote_hash != base_hash => SyncClass::LocalDeleteRemoteEdit,
+
+            // Fail-loud guard: with all 11 classes covered, the only way to reach
+            // this arm is a logic bug (e.g., a hash mismatch in an unexpected
+            // combination). Panic so it surfaces in integration tests instead of
+            // silently miscategorising an object.
+            _ => panic!(
+                "classify: unhandled state for {:?}: local_changed={local_changed} \
+                 local_tombstoned={local_tombstoned} remote_present={remote_present} \
+                 locked_present={locked_present} remote_hash={remote_hash:?} \
+                 base_hash={base_hash:?}",
+                k
+            ),
         };
 
         out.push(ClassifiedItem {
@@ -194,5 +210,38 @@ mod tests {
             &m(&[("hooks", "v1", "h_base")]),
         );
         assert_eq!(class_of(&result, "v1"), &SyncClass::BothDeleted);
+    }
+
+    #[test]
+    fn remote_delete_when_remote_absent_local_unchanged_lockfile_present() {
+        let result = classify(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &m(&[("hooks", "v1", "h_base")]),
+        );
+        assert_eq!(class_of(&result, "v1"), &SyncClass::RemoteDelete);
+    }
+
+    #[test]
+    fn local_edit_remote_delete_when_local_changed_and_remote_absent() {
+        let result = classify(
+            &BTreeMap::new(),
+            &m(&[("hooks", "v1", "h_local_new")]),
+            &BTreeSet::new(),
+            &m(&[("hooks", "v1", "h_base")]),
+        );
+        assert_eq!(class_of(&result, "v1"), &SyncClass::LocalEditRemoteDelete);
+    }
+
+    #[test]
+    fn local_delete_remote_edit_when_tombstone_and_remote_diverged() {
+        let result = classify(
+            &m(&[("hooks", "v1", "h_remote_new")]),
+            &BTreeMap::new(),
+            &st(&[("hooks", "v1")]),
+            &m(&[("hooks", "v1", "h_base")]),
+        );
+        assert_eq!(class_of(&result, "v1"), &SyncClass::LocalDeleteRemoteEdit);
     }
 }
