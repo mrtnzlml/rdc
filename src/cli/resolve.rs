@@ -347,7 +347,7 @@ pub fn resolve_combined_file(
     }
 
     if !interactive {
-        let conflict_path = shadow_path_for(local_path, env);
+        let conflict_path = crate::paths::shadow_path_for(local_path, env);
         write_atomic(&conflict_path, remote_bytes)?;
         eprintln!(
             "warning: {} conflict — local preserved, remote at {}",
@@ -391,7 +391,7 @@ pub fn resolve_combined_file(
             Ok(edited)
         }
         Resolution::Skip => {
-            let conflict_path = shadow_path_for(local_path, env);
+            let conflict_path = crate::paths::shadow_path_for(local_path, env);
             write_atomic(&conflict_path, remote_bytes)?;
             eprintln!(
                 "warning: {} conflict — local preserved, remote at {}",
@@ -402,18 +402,6 @@ pub fn resolve_combined_file(
         }
         Resolution::Abort => Err(anyhow::Error::new(PullAborted)),
     }
-}
-
-/// Compute the `<file>.<env>` shadow path for a given local file. The env
-/// suffix disambiguates the shadow artifact when a project has multiple envs.
-fn shadow_path_for(local_path: &Path, env: &str) -> std::path::PathBuf {
-    let mut conflict_path = local_path.to_path_buf();
-    let new_name = match conflict_path.file_name().and_then(|s| s.to_str()) {
-        Some(name) => format!("{name}.{env}"),
-        None => format!("shadow.{env}"),
-    };
-    conflict_path.set_file_name(new_name);
-    conflict_path
 }
 
 /// Outcome of a push-drift prompt (spec §7.3 step 5). Different from a
@@ -903,18 +891,6 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("a.py.test")).unwrap(), b"remote\n");
         // Local file untouched.
         assert_eq!(std::fs::read(&path).unwrap(), b"local\n");
-    }
-
-    #[test]
-    fn shadow_path_inserts_env_suffix() {
-        let p = std::path::PathBuf::from("/tmp/x/y.json");
-        assert_eq!(shadow_path_for(&p, "dev"), std::path::PathBuf::from("/tmp/x/y.json.dev"));
-    }
-
-    #[test]
-    fn shadow_path_for_py_extension() {
-        let p = std::path::PathBuf::from("/tmp/formulas/123.py");
-        assert_eq!(shadow_path_for(&p, "production"), std::path::PathBuf::from("/tmp/formulas/123.py.production"));
     }
 
     #[test]

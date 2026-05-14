@@ -164,8 +164,28 @@ impl Paths {
 /// Returns true if this filename is a sync-generated shadow artifact for the
 /// given env. Snapshot walkers use this to skip the conflict-skip shadow
 /// (`<file>.<env>`) and the remote-delete marker (`<file>.<env>-deleted`).
+///
+/// Corner case: env names that are suffixes of each other (e.g. `dev` and
+/// `dev-deleted`) would alias here — a project that defines both as real
+/// envs would see this predicate misclassify a `<file>.dev-deleted` from
+/// the `dev-deleted` env as a remote-delete marker for `dev`. `rdc init`'s
+/// validator allows any `[A-Za-z0-9_-]+` env name, so this is technically
+/// possible but never seen in practice.
 pub fn is_shadow_artifact(name: &str, env: &str) -> bool {
     name.ends_with(&format!(".{env}")) || name.ends_with(&format!(".{env}-deleted"))
+}
+
+/// Compute the sibling shadow-file path for a local file under sync.
+/// Returns `<local_path>.<env>` (e.g. `x.json.production`).
+/// For local paths with no `file_name()` (rare; defensive), falls back to
+/// `<parent>/shadow.<env>` — and to bare `shadow.<env>` if the parent is
+/// also absent.
+pub fn shadow_path_for(local_path: &Path, env: &str) -> PathBuf {
+    let parent = local_path.parent().unwrap_or_else(|| Path::new(""));
+    match local_path.file_name().and_then(|f| f.to_str()) {
+        Some(name) => parent.join(format!("{name}.{env}")),
+        None => parent.join(format!("shadow.{env}")),
+    }
 }
 
 #[cfg(test)]
@@ -343,5 +363,32 @@ mod tests {
         assert!(!is_shadow_artifact("queue.json", "dev"));
         assert!(!is_shadow_artifact("hook.py", "dev"));
         assert!(!is_shadow_artifact("workspace.json", "production"));
+    }
+
+    #[test]
+    fn shadow_path_for_json_file() {
+        assert_eq!(
+            shadow_path_for(Path::new("envs/test/labels/audit-hold.json"), "production"),
+            PathBuf::from("envs/test/labels/audit-hold.json.production")
+        );
+    }
+
+    #[test]
+    fn shadow_path_for_py_file() {
+        assert_eq!(
+            shadow_path_for(Path::new("envs/test/hooks/x.py"), "dev"),
+            PathBuf::from("envs/test/hooks/x.py.dev")
+        );
+    }
+
+    #[test]
+    fn shadow_path_for_path_with_no_filename_falls_back() {
+        // `Path::new("/")` has no `file_name()` and its `parent()` is
+        // `None`, so the fallback parent is `""` and the result is
+        // `shadow.<env>` with no parent prefix.
+        assert_eq!(
+            shadow_path_for(Path::new("/"), "dev"),
+            PathBuf::from("shadow.dev")
+        );
     }
 }

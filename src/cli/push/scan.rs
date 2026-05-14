@@ -311,6 +311,7 @@ fn scan_engine_fields(
             let f_entry = f_entry?;
             let f_path = f_entry.path();
             let name = f_entry.file_name().to_string_lossy().to_string();
+            // Skip env-named shadow artifacts.
             if crate::paths::is_shadow_artifact(&name, paths.env()) {
                 continue;
             }
@@ -352,6 +353,7 @@ fn scan_rules(
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
+        // Skip env-named shadow artifacts.
         if crate::paths::is_shadow_artifact(&name, paths.env()) {
             continue;
         }

@@ -239,12 +239,7 @@ fn shadow_file_conflict(
     env: &str,
 ) -> Result<String> {
     use crate::snapshot::writer::write_atomic;
-    let mut conflict_path = local_path.to_path_buf();
-    let new_name = match conflict_path.file_name().and_then(|s| s.to_str()) {
-        Some(name) => format!("{name}.{env}"),
-        None => format!("shadow.{env}"),
-    };
-    conflict_path.set_file_name(new_name);
+    let conflict_path = crate::paths::shadow_path_for(local_path, env);
     write_atomic(&conflict_path, remote_bytes)?;
     progress.println(format!(
         "warning: {} conflict — local preserved, remote at {}",

@@ -290,10 +290,10 @@ fn write_schema_for_queue(
             } else {
                 // Legacy shadow-file flow.
                 let env = ctx.paths.env();
-                let remote_path = queue_dir.join(format!("schema.json.{env}"));
+                let remote_path = crate::paths::shadow_path_for(&schema_path, env);
+                let remote_formulas_dir = queue_dir.join(format!("formulas.{env}"));
                 crate::snapshot::writer::write_atomic(&remote_path, &remote_json_bytes)?;
                 if !remote_formulas.is_empty() {
-                    let remote_formulas_dir = queue_dir.join(format!("formulas.{env}"));
                     std::fs::create_dir_all(&remote_formulas_dir)
                         .with_context(|| format!("creating {}", remote_formulas_dir.display()))?;
                     for (field_id, bytes) in &remote_formulas {
@@ -304,8 +304,8 @@ fn write_schema_for_queue(
                 progress.println(format!(
                     "warning: {} conflict — local preserved, remote at {} (formulas at {})",
                     schema_path.display(),
-                    queue_dir.join(format!("schema.json.{env}")).display(),
-                    queue_dir.join(format!("formulas.{env}")).display(),
+                    remote_path.display(),
+                    remote_formulas_dir.display(),
                 ));
                 crate::state::schema_combined_hash(local_json, &pre_local_formulas)
             }
