@@ -7,22 +7,11 @@
 //! persistent state. Re-running with the same flags on the same snapshots
 //! yields a byte-identical plan.
 
+// `--only` accepts any kind that `rdc deploy` operates on. Reuse the
+// dep-order list as the single source of truth so adding a kind in
+// run.rs automatically extends what --only accepts.
+use crate::cli::deploy::run::KINDS_IN_DEP_ORDER as DEPLOYABLE_KINDS;
 use anyhow::{anyhow, bail, Result};
-
-/// The kinds `rdc deploy` operates on. Must stay in sync with
-/// `cli::deploy::run::KINDS_IN_DEP_ORDER`.
-pub(crate) const DEPLOYABLE_KINDS: &[&str] = &[
-    "workspaces",
-    "schemas",
-    "queues",
-    "inboxes",
-    "email_templates",
-    "hooks",
-    "rules",
-    "labels",
-    "engines",
-    "engine_fields",
-];
 
 /// One `--only` selector, parsed.
 ///
@@ -44,6 +33,10 @@ impl Matcher {
                  (e.g. 'hooks/validator-invoices', 'schemas/cost-*', '*/cost-invoices')"
             )
         })?;
+
+        if kind_part.is_empty() {
+            bail!("invalid --only '{raw}': kind segment is empty (use '*' for any kind, e.g. '*/cost-invoices')");
+        }
 
         if slug_part.is_empty() {
             bail!("invalid --only '{raw}': slug segment is empty");
@@ -160,6 +153,21 @@ mod matcher_tests {
     #[test]
     fn parse_empty_slug_errors() {
         let err = Matcher::parse("hooks/").unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("slug segment is empty"), "got: {s}");
+    }
+
+    #[test]
+    fn parse_slash_only_errors() {
+        let err = Matcher::parse("/").unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("invalid --only '/'"), "got: {s}");
+        assert!(s.contains("kind segment is empty"), "got: {s}");
+    }
+
+    #[test]
+    fn parse_cross_kind_with_empty_slug_errors() {
+        let err = Matcher::parse("*/").unwrap_err();
         let s = format!("{err:#}");
         assert!(s.contains("slug segment is empty"), "got: {s}");
     }
