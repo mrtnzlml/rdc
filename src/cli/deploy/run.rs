@@ -196,7 +196,7 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
     let plan = compute_plan(&src_paths, &tgt_paths, &src_lockfile, &tgt_lockfile, &mapping, mirror, selection.as_ref())?;
 
     // 2. Display plan
-    print_plan(src, tgt, &plan, mirror, dry_run, &store_plans);
+    print_plan(src, tgt, &plan, mirror, dry_run, &store_plans, selection.as_ref());
 
     // 3. Confirm (TTY only) — skip the prompt when nothing destructive is
     // planned OR when dry-run is set (no writes will happen). An
@@ -219,7 +219,7 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
 
     // Start the progress bar for the work phase (not in dry-run).
     let progress: Option<Arc<OverallProgress>> = if !dry_run {
-        Some(OverallProgress::start(format!("deploy {src} → {tgt}")))
+        Some(OverallProgress::start(format!("deploy {src} -> {tgt}")))
     } else {
         None
     };
@@ -238,7 +238,7 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
         for kind in KINDS_IN_DEP_ORDER {
             if let Some(slugs) = plan.creates.get(kind) {
                 if !slugs.is_empty() {
-                    println!("  → {kind:18} {} would be created", slugs.len());
+                    println!("  -> {kind:18} {} would be created", slugs.len());
                 }
             }
         }
@@ -409,8 +409,11 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
 
     let elapsed = started.elapsed();
     if dry_run {
+        let scope = selection.as_ref()
+            .map(|s| format!(" (scoped, {} objects)", s.len()))
+            .unwrap_or_default();
         println!(
-            "\nDry run ({src} → {tgt}): {} would be created, {} would be deleted, \
+            "\nDry run ({src} -> {tgt}){scope}: {} would be created, {} would be deleted, \
              {:.1}s — no remote changes made.",
             plan.create_total(),
             plan.delete_total(),
@@ -419,8 +422,11 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
     } else {
         // Print apply summary (captured before bar finish, printed after).
         println!("{apply_summary}");
+        let scope = selection.as_ref()
+            .map(|s| format!(" (scoped, {} objects)", s.len()))
+            .unwrap_or_default();
         println!(
-            "\nDeployed {src} → {tgt}: {creates_done} created, {deletes_done} deleted, \
+            "\nDeployed {src} -> {tgt}{scope}: {creates_done} created, {deletes_done} deleted, \
              {} API calls, {:.1}s",
             api_calls,
             elapsed.as_secs_f64()
@@ -667,9 +673,18 @@ fn print_plan(
     mirror: bool,
     dry_run: bool,
     store_plans: &[crate::cli::deploy::store_extensions::StorePlan],
+    selection: Option<&crate::cli::deploy::selection::Selection>,
 ) {
     let suffix = if dry_run { "  (dry run — no remote changes)" } else { "" };
-    println!("Plan: {src} → {tgt}{suffix}");
+    if let Some(sel) = selection {
+        println!("Plan: {src} -> {tgt}  (selection: {} objects via --only){suffix}", sel.len());
+        println!("  Selected:");
+        for (kind, slug) in &sel.items {
+            println!("    {kind}/{slug}");
+        }
+    } else {
+        println!("Plan: {src} -> {tgt}{suffix}");
+    }
     if plan.create_total() == 0 {
         println!("  + create:  (none)");
     } else {
@@ -700,7 +715,7 @@ fn print_plan(
             for sp in store_plans {
                 let tgt_id = sp.tgt_template_url.rsplit('/').next().unwrap_or("?");
                 println!(
-                    "                 {} → template '{}' on {} (id {})",
+                    "                 {} -> template '{}' on {} (id {})",
                     sp.src_slug, sp.tgt_template_name, tgt, tgt_id
                 );
             }

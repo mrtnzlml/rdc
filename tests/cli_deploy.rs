@@ -185,7 +185,7 @@ version = 1
         .current_dir(project.path())
         .args(["deploy", "test", "prod", "--yes"])
         .assert().success()
-        .stdout(predicate::str::contains("Plan: test → prod"))
+        .stdout(predicate::str::contains("Plan: test -> prod"))
         .stdout(predicate::str::contains("Applied 1 hooks"))
         .stdout(predicate::str::contains("(1 PATCHes)"));
 
@@ -543,7 +543,7 @@ async fn deploy_bootstraps_empty_target_with_url_rewriting() {
         .current_dir(project.path())
         .args(["deploy", "test", "prod", "--yes"])
         .assert().success()
-        .stdout(predicate::str::contains("Plan: test → prod"))
+        .stdout(predicate::str::contains("Plan: test -> prod"))
         .stdout(predicate::str::contains("workspaces"))
         .stdout(predicate::str::contains("schemas"))
         .stdout(predicate::str::contains("queues"))
@@ -1488,4 +1488,98 @@ async fn deploy_plan_lists_store_extensions_in_dry_run() {
             path
         );
     }
+}
+
+#[tokio::test]
+async fn deploy_only_mirror_only_deletes_in_scope() {
+    // tgt has hook A and rule B; src has neither. `--mirror --only hooks/*`
+    // should DELETE /hooks/<id> but NOT DELETE /rules/<id>.
+    use std::sync::{Arc, Mutex};
+
+    let test_server = MockServer::start().await;
+    let prod_server = MockServer::start().await;
+
+    let rule_delete_calls = Arc::new(Mutex::new(0u32));
+    let hook_delete_calls = Arc::new(Mutex::new(0u32));
+
+    mount_full_pull(&test_server, empty_list()).await;
+
+    let prod_hooks = serde_json::json!({
+        "pagination": {"next": null}, "results": [{
+            "id": 900, "url": format!("{}/api/v1/hooks/900", prod_server.uri()),
+            "name": "a", "type": "function", "queues": [], "events": ["annotation_status"],
+            "config": { "runtime": "python3.12", "code": "def a(p): pass\n" }
+        }]
+    });
+    let prod_rules = serde_json::json!({
+        "pagination": {"next": null}, "results": [{
+            "id": 950, "url": format!("{}/api/v1/rules/950", prod_server.uri()),
+            "name": "b", "queues": [], "code": "def b(): pass\n"
+        }]
+    });
+
+    // Mount prod pull manually so we can return prod_rules instead of empty.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&prod_server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(prod_hooks))
+        .mount(&prod_server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/rules"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(prod_rules))
+        .mount(&prod_server).await;
+    for ep in [
+        "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&prod_server).await;
+    }
+
+    let hc = hook_delete_calls.clone();
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/hooks/900"))
+        .respond_with(move |_: &wiremock::Request| {
+            *hc.lock().unwrap() += 1;
+            ResponseTemplate::new(204)
+        })
+        .mount(&prod_server).await;
+    let rc = rule_delete_calls.clone();
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/rules/950"))
+        .respond_with(move |_: &wiremock::Request| {
+            *rc.lock().unwrap() += 1;
+            ResponseTemplate::new(204)
+        })
+        .mount(&prod_server).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .args(["init",
+               "--env", &format!("test={}/api/v1:1", test_server.uri()),
+               "--env", &format!("prod={}/api/v1:1", prod_server.uri())])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
+        .assert().success();
+    Command::cargo_bin("rdc").unwrap()
+        .args(["pull", "test"]).current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T").assert().success();
+    Command::cargo_bin("rdc").unwrap()
+        .args(["pull", "prod"]).current_dir(project.path())
+        .env("RDC_TOKEN_PROD", "T").assert().success();
+
+    Command::cargo_bin("rdc").unwrap()
+        .args(["deploy", "test", "prod", "--yes", "--mirror", "--only", "hooks/*"])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
+        .assert().success();
+
+    assert_eq!(*hook_delete_calls.lock().unwrap(), 1, "hook A must be deleted");
+    assert_eq!(*rule_delete_calls.lock().unwrap(), 0, "rule B must survive --only hooks/*");
 }
