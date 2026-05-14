@@ -45,6 +45,16 @@ impl Paths {
             .join(format!("{}.lock.json", self.env))
     }
 
+    /// `<root>/.rdc/state/<env>.lock` — advisory lock file (sibling of the
+    /// JSON lockfile content). Empty file; existence is incidental. Used by
+    /// `EnvLock` for cross-process write serialization.
+    pub fn env_lock(&self) -> PathBuf {
+        self.root
+            .join(".rdc")
+            .join("state")
+            .join(format!("{}.lock", self.env))
+    }
+
     /// `<root>/envs/<env>/`
     pub fn env_root(&self) -> PathBuf {
         self.root.join("envs").join(&self.env)
@@ -209,6 +219,11 @@ mod tests {
     #[test]
     fn lockfile_path() {
         assert_eq!(p().lockfile(), Path::new("/proj/.rdc/state/dev.lock.json"));
+    }
+
+    #[test]
+    fn env_lock_path() {
+        assert_eq!(p().env_lock(), Path::new("/proj/.rdc/state/dev.lock"));
     }
 
     #[test]
