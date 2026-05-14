@@ -169,13 +169,11 @@ fn confirm(prompt: &str) -> Result<bool> {
 /// Slug derivation matches the pull drivers: prefer
 /// `lockfile.slug_for_id(kind, id)`, else `slugify_unique(name, ...)`.
 ///
-/// TODO(sync-impl): only `labels` is wired today. Add hashing for the
-/// remaining kinds — `workspaces`, `queues`, `hooks` (combined hash),
-/// `rules` (combined hash), `schemas` (combined hash), `inboxes`,
-/// `engines`, `engine_fields`, `email_templates`, `mdh` — as their
-/// integration tests land. Each kind reuses its own pull driver's
-/// canonicalization rules; see `cli::pull::<kind>::process` for the
-/// authoritative serialization order.
+/// TODO(sync-impl): remaining kinds — `queues`, `schemas` (combined
+/// hash), `inboxes`, `email_templates` — plug in as their integration
+/// tests land. Each kind reuses its own pull driver's canonicalization
+/// rules; see `cli::pull::<kind>::process` for the authoritative
+/// serialization order.
 pub fn from_catalog_scan_lockfile(
     catalog: &crate::cli::pull::common::RemoteCatalog,
     changes: &crate::cli::push::scan::ChangeList,
@@ -491,6 +489,105 @@ pub fn from_catalog_scan_lockfile(
         for (slug, entry) in map {
             if let Some(h) = &entry.content_hash {
                 locked.insert(("mdh".to_string(), slug.clone()), h.clone());
+            }
+        }
+    }
+
+    // --- hooks --------------------------------------------------------
+    // Push-capable split-file kind: `<slug>.json` + optional `<slug>.py`
+    // (the extracted `config.code`). The canonical hash combines both —
+    // `hook_combined_hash(json_bytes, code)` — and is what both the pull
+    // driver and the push scanner record. Slug derivation mirrors
+    // `pull::hooks::process`: lockfile-anchored id mapping first, else
+    // `slugify_unique(name, used)`.
+    //
+    // Overlay caveat (same as labels/engines): the pull driver runs
+    // `maybe_strip_overlay` on `proposed_json` before hashing. We skip
+    // that step here; once an overlay-aware adapter test arrives, thread
+    // `&Overlay` in and call `maybe_strip_overlay` on the same paths.
+    let mut used_hook_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for h in &catalog.hooks {
+        let slug = match lockfile.slug_for_id("hooks", h.id) {
+            Some(existing) => existing.to_string(),
+            None => crate::slug::slugify_unique(&h.name, &used_hook_slugs),
+        };
+        used_hook_slugs.insert(slug.clone());
+
+        // Reproduce the pull driver's canonical bytes: serialize → strip
+        // `config.code` into `code` → trailing newline on JSON.
+        let (json_bytes, code) = match crate::snapshot::hook::serialize_hook(h) {
+            Ok(pair) => pair,
+            Err(_) => continue,
+        };
+        let hash = crate::state::hook_combined_hash(&json_bytes, &code);
+        remote_hashes.insert(("hooks".to_string(), slug), hash);
+    }
+    for (slug, json_path) in &changes.hooks {
+        let json_bytes = match std::fs::read(json_path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let py_path = json_path.with_extension("py");
+        let code = if py_path.exists() {
+            std::fs::read_to_string(&py_path).ok()
+        } else {
+            None
+        };
+        let hash = crate::state::hook_combined_hash(&json_bytes, &code);
+        scan_changes.insert(("hooks".to_string(), slug.clone()), hash);
+    }
+    for slug in tombstones.hooks.keys() {
+        scan_tombstones.insert(("hooks".to_string(), slug.clone()));
+    }
+    if let Some(map) = lockfile.objects.get("hooks") {
+        for (slug, entry) in map {
+            if let Some(h) = &entry.content_hash {
+                locked.insert(("hooks".to_string(), slug.clone()), h.clone());
+            }
+        }
+    }
+
+    // --- rules --------------------------------------------------------
+    // Push-capable split-file kind, identical shape to hooks except the
+    // code lives in `trigger_condition` (top-level) rather than
+    // `config.code`. The canonical hash is `rule_combined_hash`. Slug
+    // derivation mirrors `pull::rules::process`.
+    let mut used_rule_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in &catalog.rules {
+        let slug = match lockfile.slug_for_id("rules", r.id) {
+            Some(existing) => existing.to_string(),
+            None => crate::slug::slugify_unique(&r.name, &used_rule_slugs),
+        };
+        used_rule_slugs.insert(slug.clone());
+
+        let (json_bytes, code) = match crate::snapshot::rule::serialize_rule(r) {
+            Ok(pair) => pair,
+            Err(_) => continue,
+        };
+        let hash = crate::state::rule_combined_hash(&json_bytes, &code);
+        remote_hashes.insert(("rules".to_string(), slug), hash);
+    }
+    for (slug, json_path) in &changes.rules {
+        let json_bytes = match std::fs::read(json_path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let py_path = json_path.with_extension("py");
+        let code = if py_path.exists() {
+            std::fs::read_to_string(&py_path).ok()
+        } else {
+            None
+        };
+        let hash = crate::state::rule_combined_hash(&json_bytes, &code);
+        scan_changes.insert(("rules".to_string(), slug.clone()), hash);
+    }
+    for slug in tombstones.rules.keys() {
+        scan_tombstones.insert(("rules".to_string(), slug.clone()));
+    }
+    if let Some(map) = lockfile.objects.get("rules") {
+        for (slug, entry) in map {
+            if let Some(h) = &entry.content_hash {
+                locked.insert(("rules".to_string(), slug.clone()), h.clone());
             }
         }
     }

@@ -1709,3 +1709,246 @@ async fn sync_remote_create_writes_local_mdh_dataset() {
         "lockfile must record dataset slug: {lf_raw}"
     );
 }
+
+/// Pull-side RemoteCreate for a hook. The env exposes a function hook
+/// with `config.code` populated; sync must write `<slug>.json` (with
+/// `code` stripped) AND a sibling `<slug>.py` carrying the extracted
+/// code. The combined hash recorded in the lockfile must match what
+/// `pull::hooks::process` would compute, so re-running sync sees Clean
+/// state and emits no further writes.
+#[tokio::test]
+async fn sync_remote_create_writes_local_hook() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let hooks_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 501,
+                "url": format!("{}/api/v1/hooks/501", server.uri()),
+                "name": "Validator: invoices",
+                "type": "function",
+                "queues": [],
+                "events": ["annotation_content"],
+                "config": {
+                    "runtime": "python3.12",
+                    "code": "def x(payload):\n    return {}\n"
+                },
+                "modified_at": "2026-04-20T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(hooks_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/hooks"]).await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* diff = */ false, /* allow_deletes = */ false,
+        /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    result.expect("sync should succeed when remote has a new hook");
+
+    // No mutating API calls — pull-side only.
+    for req in server.received_requests().await.unwrap_or_default() {
+        let p = req.url.path();
+        if p.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "unexpected mutating request: {} {}",
+            req.method,
+            p
+        );
+    }
+
+    let json_path = project.path().join("envs/dev/hooks/validator-invoices.json");
+    let py_path = project.path().join("envs/dev/hooks/validator-invoices.py");
+    assert!(
+        json_path.exists(),
+        "hook JSON should be written at {}",
+        json_path.display()
+    );
+    assert!(
+        py_path.exists(),
+        "hook .py sidecar should be written at {}",
+        py_path.display()
+    );
+    let json_body = std::fs::read_to_string(&json_path).unwrap();
+    assert!(
+        json_body.contains("Validator: invoices"),
+        "hook JSON content: {json_body}"
+    );
+    assert!(
+        !json_body.contains("def x"),
+        "extracted code must not be in JSON: {json_body}"
+    );
+    let py_body = std::fs::read_to_string(&py_path).unwrap();
+    assert!(
+        py_body.contains("def x"),
+        "extracted code must land in .py sidecar: {py_body}"
+    );
+
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    assert!(
+        lf_raw.contains("\"hooks\""),
+        "lockfile must record hooks: {lf_raw}"
+    );
+    assert!(
+        lf_raw.contains("validator-invoices"),
+        "lockfile must record slug: {lf_raw}"
+    );
+}
+
+/// Pull-side RemoteCreate for a rule. The env exposes a rule with
+/// `trigger_condition` set; sync must write `<slug>.json` (with the
+/// condition stripped) AND a sibling `<slug>.py` carrying the extracted
+/// condition. The combined hash recorded in the lockfile must match
+/// what `pull::rules::process` would compute.
+#[tokio::test]
+async fn sync_remote_create_writes_local_rule() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let rules_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 2597,
+                "url": format!("{}/api/v1/rules/2597", server.uri()),
+                "name": "E-invoice Validation",
+                "queues": [],
+                "trigger_condition": "annotation_content.total > 1000\n",
+                "modified_at": "2026-04-20T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/rules"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(rules_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/rules"]).await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* diff = */ false, /* allow_deletes = */ false,
+        /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    result.expect("sync should succeed when remote has a new rule");
+
+    for req in server.received_requests().await.unwrap_or_default() {
+        let p = req.url.path();
+        if p.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "unexpected mutating request: {} {}",
+            req.method,
+            p
+        );
+    }
+
+    let json_path = project.path().join("envs/dev/rules/e-invoice-validation.json");
+    let py_path = project.path().join("envs/dev/rules/e-invoice-validation.py");
+    assert!(
+        json_path.exists(),
+        "rule JSON should be written at {}",
+        json_path.display()
+    );
+    assert!(
+        py_path.exists(),
+        "rule .py sidecar should be written at {}",
+        py_path.display()
+    );
+    let json_body = std::fs::read_to_string(&json_path).unwrap();
+    assert!(
+        json_body.contains("E-invoice Validation"),
+        "rule JSON content: {json_body}"
+    );
+    assert!(
+        !json_body.contains("annotation_content.total"),
+        "trigger_condition must not be in JSON: {json_body}"
+    );
+    let py_body = std::fs::read_to_string(&py_path).unwrap();
+    assert!(
+        py_body.contains("annotation_content.total"),
+        "trigger_condition must land in .py sidecar: {py_body}"
+    );
+
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    assert!(
+        lf_raw.contains("\"rules\""),
+        "lockfile must record rules: {lf_raw}"
+    );
+    assert!(
+        lf_raw.contains("e-invoice-validation"),
+        "lockfile must record slug: {lf_raw}"
+    );
+}

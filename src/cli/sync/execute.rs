@@ -133,6 +133,30 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
             engine_field_by_slug.insert(slug, f);
         }
     }
+    let mut hook_by_slug: BTreeMap<String, &crate::model::Hook> = BTreeMap::new();
+    {
+        let mut used: HashSet<String> = HashSet::new();
+        for h in &catalog.hooks {
+            let slug = match ctx.lockfile.slug_for_id("hooks", h.id) {
+                Some(existing) => existing.to_string(),
+                None => slugify_unique(&h.name, &used),
+            };
+            used.insert(slug.clone());
+            hook_by_slug.insert(slug, h);
+        }
+    }
+    let mut rule_by_slug: BTreeMap<String, &crate::model::Rule> = BTreeMap::new();
+    {
+        let mut used: HashSet<String> = HashSet::new();
+        for r in &catalog.rules {
+            let slug = match ctx.lockfile.slug_for_id("rules", r.id) {
+                Some(existing) => existing.to_string(),
+                None => slugify_unique(&r.name, &used),
+            };
+            used.insert(slug.clone());
+            rule_by_slug.insert(slug, r);
+        }
+    }
 
     let conflicts: Vec<&ClassifiedItem> = classified
         .iter()
@@ -162,10 +186,12 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 let local_path = ctx.paths.labels_dir().join(format!("{}.json", it.slug));
                 Some(ConflictRefs {
                     remote_bytes: bytes,
+                    remote_code: None,
                     local_path,
                     id: l.id,
                     url: Some(l.url.clone()),
                     modified_at: l.modified_at().map(|s| s.to_string()),
+                    hash_strategy: HashStrategy::Flat,
                 })
             }),
             "workspaces" => workspace_by_slug.get(it.slug.as_str()).copied().and_then(|w| {
@@ -177,10 +203,12 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 let local_path = ctx.paths.workspace_dir(&it.slug).join("workspace.json");
                 Some(ConflictRefs {
                     remote_bytes: bytes,
+                    remote_code: None,
                     local_path,
                     id: w.id,
                     url: Some(w.url.clone()),
                     modified_at: w.modified_at().map(|s| s.to_string()),
+                    hash_strategy: HashStrategy::Flat,
                 })
             }),
             "engines" => engine_by_slug.get(it.slug.as_str()).copied().and_then(|e| {
@@ -192,10 +220,12 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 let local_path = ctx.paths.engine_dir(&it.slug).join("engine.json");
                 Some(ConflictRefs {
                     remote_bytes: bytes,
+                    remote_code: None,
                     local_path,
                     id: e.id,
                     url: Some(e.url.clone()),
                     modified_at: e.modified_at().map(|s| s.to_string()),
+                    hash_strategy: HashStrategy::Flat,
                 })
             }),
             "engine_fields" => {
@@ -218,13 +248,49 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                         .join(format!("{}.json", it.slug));
                     Some(ConflictRefs {
                         remote_bytes: bytes,
+                        remote_code: None,
                         local_path,
                         id: f.id,
                         url: Some(f.url.clone()),
                         modified_at: f.modified_at().map(|s| s.to_string()),
+                        hash_strategy: HashStrategy::Flat,
                     })
                 })
             }
+            "hooks" => hook_by_slug.get(it.slug.as_str()).copied().and_then(|h| {
+                // Reproduce the pull driver's canonical bytes: serialize
+                // → strip `config.code` into `code` → trailing newline.
+                let (json_bytes, code) = match crate::snapshot::hook::serialize_hook(h) {
+                    Ok(pair) => pair,
+                    Err(_) => return None,
+                };
+                let local_path = ctx.paths.hooks_dir().join(format!("{}.json", it.slug));
+                Some(ConflictRefs {
+                    remote_bytes: json_bytes,
+                    remote_code: code,
+                    local_path,
+                    id: h.id,
+                    url: Some(h.url.clone()),
+                    modified_at: h.modified_at().map(|s| s.to_string()),
+                    hash_strategy: HashStrategy::Hook,
+                })
+            }),
+            "rules" => rule_by_slug.get(it.slug.as_str()).copied().and_then(|r| {
+                let (json_bytes, code) = match crate::snapshot::rule::serialize_rule(r) {
+                    Ok(pair) => pair,
+                    Err(_) => return None,
+                };
+                let local_path = ctx.paths.rules_dir().join(format!("{}.json", it.slug));
+                Some(ConflictRefs {
+                    remote_bytes: json_bytes,
+                    remote_code: code,
+                    local_path,
+                    id: r.id,
+                    url: Some(r.url.clone()),
+                    modified_at: r.modified_at().map(|s| s.to_string()),
+                    hash_strategy: HashStrategy::Rule,
+                })
+            }),
             other => {
                 progress.println(format!(
                     "warning: conflict resolver not yet wired for kind '{}' (slug '{}'); skipping",
@@ -263,12 +329,51 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
 /// the remote-canonical bytes the prompt needs, the on-disk path the
 /// resolution writes back to, and the lockfile fields (id / url /
 /// modified_at) the resolver records when it updates the entry.
+///
+/// For split-file kinds (`hooks`, `rules`), `remote_code` carries the
+/// extracted Python sidecar bytes; `hash_strategy` picks the canonical
+/// hash function the resolver records into the lockfile. The resolver
+/// prompt itself still displays only the JSON portion — the split-file
+/// complexity is deferred per the unified-sync spec; users see a
+/// JSON-only diff and the `.py` follows the same `[k]` / `[r]` decision.
 struct ConflictRefs {
     remote_bytes: Vec<u8>,
+    /// Extracted code sidecar (e.g. `config.code` for hooks,
+    /// `trigger_condition` for rules) — `None` for flat kinds and for
+    /// split-file kinds whose remote happens not to carry code.
+    remote_code: Option<String>,
     local_path: PathBuf,
     id: u64,
     url: Option<String>,
     modified_at: Option<String>,
+    /// How to fold `(remote_bytes, remote_code)` into the lockfile
+    /// `content_hash`. Flat kinds use `Flat` (just `content_hash`);
+    /// `Hook` / `Rule` use their respective combined-hash helpers so the
+    /// adapter sees `Clean` after the resolution.
+    hash_strategy: HashStrategy,
+}
+
+/// Selects the canonical hash function for a kind. Mirrors the per-kind
+/// rules in `pull::<kind>::process` and the push scanner.
+#[derive(Clone, Copy)]
+enum HashStrategy {
+    /// Single-file kind: `content_hash(remote_bytes)`.
+    Flat,
+    /// `hooks`: `hook_combined_hash(json_bytes, code)`.
+    Hook,
+    /// `rules`: `rule_combined_hash(json_bytes, code)`.
+    Rule,
+}
+
+impl HashStrategy {
+    /// Compute the canonical lockfile hash for the resolved bytes.
+    fn hash(self, json_bytes: &[u8], code: &Option<String>) -> String {
+        match self {
+            HashStrategy::Flat => content_hash(json_bytes),
+            HashStrategy::Hook => crate::state::hook_combined_hash(json_bytes, code),
+            HashStrategy::Rule => crate::state::rule_combined_hash(json_bytes, code),
+        }
+    }
 }
 
 /// Run the conflict resolution loop for one item: prompts (or applies
@@ -292,11 +397,19 @@ fn resolve_one_conflict<R: BufRead>(
 ) -> Result<()> {
     let ConflictRefs {
         remote_bytes,
+        remote_code,
         local_path,
         id,
         url,
         modified_at,
+        hash_strategy,
     } = refs;
+
+    // For split-file kinds, the `.py` sidecar lives next to the JSON.
+    // The resolver writes it on `[r]` (adopt remote) and the local
+    // hash on `[s]`/non-tty paths includes whatever code currently
+    // sits on disk.
+    let py_path = local_path.with_extension("py");
 
     if !interactive {
         // Non-TTY/--yes: fall back to legacy shadow-file behavior so the
@@ -311,7 +424,14 @@ fn resolve_one_conflict<R: BufRead>(
         ));
         let local_bytes = std::fs::read(&local_path)
             .with_context(|| format!("reading {}", local_path.display()))?;
-        let local_hash = content_hash(&local_bytes);
+        let local_code = if matches!(hash_strategy, HashStrategy::Hook | HashStrategy::Rule)
+            && py_path.exists()
+        {
+            std::fs::read_to_string(&py_path).ok()
+        } else {
+            None
+        };
+        let local_hash = hash_strategy.hash(&local_bytes, &local_code);
         crate::cli::pull::common::record_object(
             ctx.lockfile,
             &it.kind,
@@ -346,7 +466,7 @@ fn resolve_one_conflict<R: BufRead>(
             // remote so the push driver's drift check passes
             // (remote_hash == base). The PATCH response updates the
             // lockfile to the post-PATCH canonical form.
-            let remote_hash = content_hash(&remote_bytes);
+            let remote_hash = hash_strategy.hash(&remote_bytes, &remote_code);
             crate::cli::pull::common::record_object(
                 ctx.lockfile,
                 &it.kind,
@@ -367,7 +487,19 @@ fn resolve_one_conflict<R: BufRead>(
                 std::fs::create_dir_all(parent).ok();
             }
             write_atomic(&local_path, &remote_bytes)?;
-            let remote_hash = content_hash(&remote_bytes);
+            // Adopt the remote `.py` sidecar too (or delete a stale one
+            // when the remote has no code). Mirrors `pull::hooks`'s
+            // `PullAction::Write` arm.
+            if matches!(hash_strategy, HashStrategy::Hook | HashStrategy::Rule) {
+                if let Some(code) = &remote_code {
+                    write_atomic(&py_path, code.as_bytes())?;
+                } else if py_path.exists() {
+                    std::fs::remove_file(&py_path).with_context(|| {
+                        format!("removing stale {}", py_path.display())
+                    })?;
+                }
+            }
+            let remote_hash = hash_strategy.hash(&remote_bytes, &remote_code);
             crate::cli::pull::common::record_object(
                 ctx.lockfile,
                 &it.kind,
@@ -385,7 +517,7 @@ fn resolve_one_conflict<R: BufRead>(
             write_atomic(&local_path, &edited)?;
             // Same rationale as KeepLocal: align base to remote so push
             // drift detection succeeds, then PATCH the edited bytes.
-            let remote_hash = content_hash(&remote_bytes);
+            let remote_hash = hash_strategy.hash(&remote_bytes, &remote_code);
             crate::cli::pull::common::record_object(
                 ctx.lockfile,
                 &it.kind,
@@ -409,7 +541,14 @@ fn resolve_one_conflict<R: BufRead>(
             ));
             let local_bytes = std::fs::read(&local_path)
                 .with_context(|| format!("reading {}", local_path.display()))?;
-            let local_hash = content_hash(&local_bytes);
+            let local_code = if matches!(hash_strategy, HashStrategy::Hook | HashStrategy::Rule)
+                && py_path.exists()
+            {
+                std::fs::read_to_string(&py_path).ok()
+            } else {
+                None
+            };
+            let local_hash = hash_strategy.hash(&local_bytes, &local_code);
             crate::cli::pull::common::record_object(
                 ctx.lockfile,
                 &it.kind,
@@ -545,6 +684,30 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
             engine_field_by_slug.insert(slug, f);
         }
     }
+    let mut hook_by_slug: BTreeMap<String, &crate::model::Hook> = BTreeMap::new();
+    {
+        let mut used: HashSet<String> = HashSet::new();
+        for h in &catalog.hooks {
+            let slug = match ctx.lockfile.slug_for_id("hooks", h.id) {
+                Some(existing) => existing.to_string(),
+                None => slugify_unique(&h.name, &used),
+            };
+            used.insert(slug.clone());
+            hook_by_slug.insert(slug, h);
+        }
+    }
+    let mut rule_by_slug: BTreeMap<String, &crate::model::Rule> = BTreeMap::new();
+    {
+        let mut used: HashSet<String> = HashSet::new();
+        for r in &catalog.rules {
+            let slug = match ctx.lockfile.slug_for_id("rules", r.id) {
+                Some(existing) => existing.to_string(),
+                None => slugify_unique(&r.name, &used),
+            };
+            used.insert(slug.clone());
+            rule_by_slug.insert(slug, r);
+        }
+    }
 
     let env = ctx.paths.env().to_string();
 
@@ -556,7 +719,12 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                 // All push-capable kinds use the same drop semantics.
                 if matches!(
                     it.kind.as_str(),
-                    "labels" | "workspaces" | "engines" | "engine_fields"
+                    "labels"
+                        | "workspaces"
+                        | "engines"
+                        | "engine_fields"
+                        | "hooks"
+                        | "rules"
                 ) {
                     drop_lockfile_entry(ctx, &it.kind, &it.slug);
                 } else {
@@ -589,9 +757,11 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                                     b.push(b'\n');
                                     b
                                 }),
+                            restore_code: None,
                             id: body.map(|l| l.id),
                             url: body.map(|l| l.url.clone()),
                             modified_at: body.and_then(|l| l.modified_at().map(|s| s.to_string())),
+                            hash_strategy: HashStrategy::Flat,
                         })
                     }
                     "workspaces" => {
@@ -606,9 +776,11 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                                     b.push(b'\n');
                                     b
                                 }),
+                            restore_code: None,
                             id: body.map(|w| w.id),
                             url: body.map(|w| w.url.clone()),
                             modified_at: body.and_then(|w| w.modified_at().map(|s| s.to_string())),
+                            hash_strategy: HashStrategy::Flat,
                         })
                     }
                     "engines" => {
@@ -622,9 +794,11 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                                     b.push(b'\n');
                                     b
                                 }),
+                            restore_code: None,
                             id: body.map(|e| e.id),
                             url: body.map(|e| e.url.clone()),
                             modified_at: body.and_then(|e| e.modified_at().map(|s| s.to_string())),
+                            hash_strategy: HashStrategy::Flat,
                         })
                     }
                     "engine_fields" => {
@@ -663,9 +837,45 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                                     b.push(b'\n');
                                     b
                                 }),
+                            restore_code: None,
                             id: body.map(|f| f.id),
                             url: body.map(|f| f.url.clone()),
                             modified_at: body.and_then(|f| f.modified_at().map(|s| s.to_string())),
+                            hash_strategy: HashStrategy::Flat,
+                        })
+                    }
+                    "hooks" => {
+                        let local_path =
+                            ctx.paths.hooks_dir().join(format!("{}.json", it.slug));
+                        let body = hook_by_slug.get(it.slug.as_str()).copied();
+                        // serialize_hook splits the JSON from `config.code`
+                        // — same canonical form the pull driver writes.
+                        let serialized =
+                            body.and_then(|h| crate::snapshot::hook::serialize_hook(h).ok());
+                        Some(RemoteDeleteRefs {
+                            local_path,
+                            restore_bytes: serialized.as_ref().map(|(b, _)| b.clone()),
+                            restore_code: serialized.as_ref().and_then(|(_, c)| c.clone()),
+                            id: body.map(|h| h.id),
+                            url: body.map(|h| h.url.clone()),
+                            modified_at: body.and_then(|h| h.modified_at().map(|s| s.to_string())),
+                            hash_strategy: HashStrategy::Hook,
+                        })
+                    }
+                    "rules" => {
+                        let local_path =
+                            ctx.paths.rules_dir().join(format!("{}.json", it.slug));
+                        let body = rule_by_slug.get(it.slug.as_str()).copied();
+                        let serialized =
+                            body.and_then(|r| crate::snapshot::rule::serialize_rule(r).ok());
+                        Some(RemoteDeleteRefs {
+                            local_path,
+                            restore_bytes: serialized.as_ref().map(|(b, _)| b.clone()),
+                            restore_code: serialized.as_ref().and_then(|(_, c)| c.clone()),
+                            id: body.map(|r| r.id),
+                            url: body.map(|r| r.url.clone()),
+                            modified_at: body.and_then(|r| r.modified_at().map(|s| s.to_string())),
+                            hash_strategy: HashStrategy::Rule,
                         })
                     }
                     other => {
@@ -678,6 +888,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                 };
                 let Some(refs) = refs_opt else { continue };
                 let local_path = refs.local_path.clone();
+                let py_path = local_path.with_extension("py");
 
                 // For LocalDeleteRemoteEdit the local file is tombstoned
                 // — restore it from the env-side bytes so the user has
@@ -691,6 +902,16 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                                 std::fs::create_dir_all(parent).ok();
                             }
                             write_atomic(&local_path, bytes)?;
+                            // Restore the `.py` sidecar too for split-file
+                            // kinds, so the local restore is byte-complete.
+                            if matches!(
+                                refs.hash_strategy,
+                                HashStrategy::Hook | HashStrategy::Rule
+                            ) {
+                                if let Some(code) = refs.restore_code.as_ref() {
+                                    write_atomic(&py_path, code.as_bytes())?;
+                                }
+                            }
                         }
                         None => {
                             progress.println(format!(
@@ -792,7 +1013,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             // lockfile to the env hash so subsequent
                             // syncs see Clean state.
                             if let Some(bytes) = refs.restore_bytes.as_ref() {
-                                let h = content_hash(bytes);
+                                let h = refs.hash_strategy.hash(bytes, &refs.restore_code);
                                 if let (Some(id), url, modified_at) =
                                     (refs.id, refs.url.clone(), refs.modified_at.clone())
                                 {
@@ -810,10 +1031,20 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                         } else {
                             // Mirror the env's deletion: remove local +
                             // drop lockfile entry. No push action — env
-                            // already doesn't have it.
+                            // already doesn't have it. For split-file
+                            // kinds, drop the `.py` sidecar too.
                             std::fs::remove_file(&local_path).with_context(|| {
                                 format!("removing {}", local_path.display())
                             })?;
+                            if matches!(
+                                refs.hash_strategy,
+                                HashStrategy::Hook | HashStrategy::Rule
+                            ) && py_path.exists()
+                            {
+                                std::fs::remove_file(&py_path).with_context(|| {
+                                    format!("removing {}", py_path.display())
+                                })?;
+                            }
                             drop_lockfile_entry(ctx, &it.kind, &it.slug);
                         }
                     }
@@ -851,12 +1082,19 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
 /// for the prompt's diff viewer). `id`/`url`/`modified_at` come from the
 /// same env-side body when present; they're `None` when the env already
 /// dropped the object (`RemoteDelete` / `LocalEditRemoteDelete`).
+///
+/// `restore_code` and `hash_strategy` parallel the `ConflictRefs` shape:
+/// split-file kinds (`hooks` / `rules`) carry the sidecar bytes so the
+/// resolver can write a complete restore (.json + .py) and use the
+/// matching combined-hash helper when it records the lockfile entry.
 struct RemoteDeleteRefs {
     local_path: PathBuf,
     restore_bytes: Option<Vec<u8>>,
+    restore_code: Option<String>,
     id: Option<u64>,
     url: Option<String>,
     modified_at: Option<String>,
+    hash_strategy: HashStrategy,
 }
 
 /// Find the engine slug that owns a given engine_field slug on disk.
@@ -971,6 +1209,12 @@ pub async fn run(
         if let Some(subset) = subsets.get("engine_fields") {
             crate::cli::pull::engine_fields::process(ctx, catalog.engine_fields.clone(), subset, progress).await?;
         }
+        if let Some(subset) = subsets.get("hooks") {
+            crate::cli::pull::hooks::process(ctx, catalog.hooks.clone(), subset, progress).await?;
+        }
+        if let Some(subset) = subsets.get("rules") {
+            crate::cli::pull::rules::process(ctx, catalog.rules.clone(), subset, progress).await?;
+        }
         if let Some(subset) = subsets.get("mdh") {
             // MDH lives in a separate listed shape (`MdhListed` carries
             // the Data Storage client + collection list). The pull
@@ -1011,6 +1255,12 @@ pub async fn run(
                 }
                 "engine_fields" => {
                     change_list.engine_fields.insert(slug, path);
+                }
+                "hooks" => {
+                    change_list.hooks.insert(slug, path);
+                }
+                "rules" => {
+                    change_list.rules.insert(slug, path);
                 }
                 // TODO(sync-impl): mirror the change_list_from_classified
                 // kind-table once more kinds enter the conflict path.
