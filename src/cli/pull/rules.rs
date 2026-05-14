@@ -93,7 +93,7 @@ pub async fn process(ctx: &mut PullCtx<'_>, rules: Vec<Rule>, progress: &Arc<Ove
 
         let recorded_hash = match action {
             PullAction::Write => {
-                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone(), ctx.interactive, progress, &ctx.env)?;
+                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone(), ctx.interactive, progress, ctx.paths.env())?;
                 if let Some(code) = &proposed_code {
                     write_rule_code(&ctx.paths.rules_dir(), &slug, code)
                         .with_context(|| format!("writing rule code for '{}'", r.name))?;
@@ -120,7 +120,7 @@ pub async fn process(ctx: &mut PullCtx<'_>, rules: Vec<Rule>, progress: &Arc<Ove
                     local_json,
                     &proposed_json,
                     ctx.interactive && symmetric,
-                    &ctx.env,
+                    ctx.paths.env(),
                 )?;
 
                 let resolved_code = if symmetric {
@@ -131,7 +131,7 @@ pub async fn process(ctx: &mut PullCtx<'_>, rules: Vec<Rule>, progress: &Arc<Ove
                             loc.as_bytes(),
                             rem.as_bytes(),
                             ctx.interactive,
-                            &ctx.env,
+                            ctx.paths.env(),
                         )?;
                         Some(String::from_utf8(bytes)
                             .with_context(|| format!("rule code resolved bytes for '{}' are not UTF-8", r.name))?)

@@ -84,7 +84,6 @@ pub async fn run(env: &str, interactive: bool) -> Result<()> {
             queue_locations: std::collections::BTreeMap::new(),
             overlay,
             interactive,
-            env: env.to_string(),
         };
         run_drivers(&mut ctx, env_cfg, env, &token, &progress).await
     };

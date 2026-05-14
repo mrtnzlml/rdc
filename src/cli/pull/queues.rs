@@ -101,7 +101,7 @@ pub async fn process(ctx: &mut PullCtx<'_>, queues: Vec<Queue>, progress: &Arc<O
         if q_action == PullAction::Conflict {
             counts.conflicts += 1;
         }
-        let q_recorded = apply_pull_action(q_action, &queue_path, &queue_proposed, q_remote_hash, ctx.interactive, progress, &ctx.env)?;
+        let q_recorded = apply_pull_action(q_action, &queue_path, &queue_proposed, q_remote_hash, ctx.interactive, progress, ctx.paths.env())?;
         record_object(
             ctx.lockfile,
             "queues",
@@ -266,7 +266,7 @@ fn write_schema_for_queue(
                     local_json,
                     &remote_json_bytes,
                     ctx.interactive,
-                    &ctx.env,
+                    ctx.paths.env(),
                 )?;
                 let mut resolved_formulas: Vec<(String, Vec<u8>)> =
                     Vec::with_capacity(remote_formulas.len());
@@ -282,7 +282,7 @@ fn write_schema_for_queue(
                         &local_bytes,
                         remote_bytes,
                         ctx.interactive,
-                        &ctx.env,
+                        ctx.paths.env(),
                     )?;
                     resolved_formulas.push((field_id.clone(), bytes));
                 }
@@ -348,7 +348,7 @@ fn write_inbox_for_queue(
     if i_action == PullAction::Conflict {
         counts.conflicts += 1;
     }
-    let i_recorded = apply_pull_action(i_action, &inbox_path, &inbox_proposed, i_remote_hash, ctx.interactive, progress, &ctx.env)?;
+    let i_recorded = apply_pull_action(i_action, &inbox_path, &inbox_proposed, i_remote_hash, ctx.interactive, progress, ctx.paths.env())?;
     record_object(
         ctx.lockfile,
         "inboxes",

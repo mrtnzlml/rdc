@@ -112,10 +112,10 @@ pub fn prompt_resolve<R: BufRead, W: Write>(
     total: usize,
     local_path: &Path,
     remote_bytes: &[u8],
-    env_name: &str,
+    env: &str,
 ) -> Result<Resolution> {
     let mode = detect_color_mode(false);
-    prompt_resolve_with_color(input, output, index, total, local_path, remote_bytes, env_name, mode)
+    prompt_resolve_with_color(input, output, index, total, local_path, remote_bytes, env, mode)
 }
 
 /// Color-aware core. Tests pin the mode here; production goes through
@@ -127,10 +127,10 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
     total: usize,
     local_path: &Path,
     remote_bytes: &[u8],
-    env_name: &str,
+    env: &str,
     mode: ColorMode,
 ) -> Result<Resolution> {
-    let _ = env_name; // suppressed unused warning; Task 2 wires it into prompt text
+    let _ = env; // suppressed unused warning; Task 2 wires it into prompt text
     let local_bytes = read_local(local_path)?;
 
     // Strip noise fields before diff display so the user only sees real
@@ -337,7 +337,7 @@ pub fn resolve_combined_file(
     local_bytes: &[u8],
     remote_bytes: &[u8],
     interactive: bool,
-    env_name: &str,
+    env: &str,
 ) -> Result<Vec<u8>> {
     use crate::snapshot::writer::write_atomic;
 
@@ -365,7 +365,7 @@ pub fn resolve_combined_file(
         label_total,
         local_path,
         remote_bytes,
-        env_name,
+        env,
     )?;
     match resolution {
         Resolution::KeepLocal => Ok(local_bytes.to_vec()),
@@ -461,7 +461,7 @@ pub fn resolve_push_drift(
     interactive: bool,
     local_path: &Path,
     remote_bytes: &[u8],
-    env_name: &str,
+    env: &str,
 ) -> Result<PushDriftOutcome> {
     if !interactive {
         return Ok(PushDriftOutcome::Skip);
@@ -476,7 +476,7 @@ pub fn resolve_push_drift(
         1,
         local_path,
         remote_bytes,
-        env_name,
+        env,
     )?;
     match resolution {
         Resolution::KeepLocal => Ok(PushDriftOutcome::Patch { payload_override: None }),
@@ -1119,7 +1119,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let input = Cursor::new(b"s\n");
 
-        // Smoke test: at this stage, env_name is plumbed but not yet
+        // Smoke test: at this stage, env is plumbed but not yet
         // rendered in the prompt text (Task 2 wires it in). Asserting
         // only that the new signature compiles and the call succeeds.
         let _ = prompt_resolve_with_color(

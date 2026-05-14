@@ -68,7 +68,7 @@ pub async fn process(ctx: &mut PullCtx<'_>, fields: Vec<EngineField>, progress: 
         if action == PullAction::Conflict {
             conflicts += 1;
         }
-        let recorded_hash = apply_pull_action(action, &local_path, &proposed, remote_hash, ctx.interactive, progress, &ctx.env)?;
+        let recorded_hash = apply_pull_action(action, &local_path, &proposed, remote_hash, ctx.interactive, progress, ctx.paths.env())?;
 
         record_object(
             ctx.lockfile,
