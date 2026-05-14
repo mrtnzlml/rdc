@@ -10,7 +10,7 @@
 // `--only` accepts any kind that `rdc deploy` operates on. Reuse the
 // dep-order list as the single source of truth so adding a kind in
 // run.rs automatically extends what --only accepts.
-use crate::cli::deploy::run::KINDS_IN_DEP_ORDER as DEPLOYABLE_KINDS;
+use crate::cli::deploy::run::{list_slugs, KINDS_IN_DEP_ORDER as DEPLOYABLE_KINDS};
 use crate::paths::Paths;
 use anyhow::{anyhow, bail, Result};
 use std::collections::BTreeSet;
@@ -28,6 +28,10 @@ impl Selection {
 
     pub(crate) fn len(&self) -> usize {
         self.items.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty()
     }
 }
 
@@ -66,7 +70,7 @@ pub(crate) fn resolve(
         if hits == 0 {
             bail!(
                 "--only '{}' matched 0 objects across the local snapshots. \
-                 (Check the spelling, or run `rdc status` to list available slugs.)",
+                 (Check the spelling against `envs/<env>/` in your project tree.)",
                 m.raw
             );
         }
@@ -79,10 +83,8 @@ fn build_candidate_set(
     src_paths: &Paths,
     tgt_paths: &Paths,
 ) -> Result<BTreeSet<(String, String)>> {
-    use crate::cli::deploy::run::{list_slugs, KINDS_IN_DEP_ORDER};
-
     let mut set = BTreeSet::new();
-    for kind in KINDS_IN_DEP_ORDER {
+    for kind in DEPLOYABLE_KINDS {
         for slug in list_slugs(src_paths, kind)? {
             set.insert((kind.to_string(), slug));
         }
@@ -401,6 +403,17 @@ mod selection_tests {
             .unwrap()
             .unwrap();
         assert!(sel.contains("hooks", "only-in-tgt"));
+    }
+
+    #[test]
+    fn resolve_parse_error_propagates_without_io() {
+        // Use a path that doesn't exist; if resolve reaches build_candidate_set
+        // before failing on the bad matcher, list_slugs would error on the
+        // missing dir. The fail-fast guarantee says we never get there.
+        let p = Paths::for_env(std::path::Path::new("/nonexistent"), "x");
+        let err = resolve(&["hooks".to_string()], &p, &p).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("expected '<kind>/<slug>'"), "got: {s}");
     }
 }
 
