@@ -189,13 +189,11 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
             &mut prompt_fn,
         )?;
     }
-    let _selection = selection;
-
     // 1. Compute plan — file-system level only (which slugs are missing
     // from tgt, and in mirror mode which are tgt-only). Field-level diffs
     // are deferred to the apply sub-step because computing them eagerly
     // costs one GET per object across the whole snapshot.
-    let plan = compute_plan(&src_paths, &tgt_paths, &src_lockfile, &tgt_lockfile, &mapping, mirror)?;
+    let plan = compute_plan(&src_paths, &tgt_paths, &src_lockfile, &tgt_lockfile, &mapping, mirror, selection.as_ref())?;
 
     // 2. Display plan
     print_plan(src, tgt, &plan, mirror, dry_run, &store_plans);
@@ -439,13 +437,19 @@ fn compute_plan(
     _tgt_lockfile: &Lockfile,
     _mapping: &Mapping,
     mirror: bool,
+    selection: Option<&crate::cli::deploy::selection::Selection>,
 ) -> Result<PlanCounts> {
     let mut plan = PlanCounts::default();
 
     for kind in KINDS_IN_DEP_ORDER {
-        let src_slugs = list_slugs(src_paths, kind)?;
-        let tgt_slugs: std::collections::HashSet<String> =
+        let mut src_slugs = list_slugs(src_paths, kind)?;
+        let mut tgt_slugs: std::collections::HashSet<String> =
             list_slugs(tgt_paths, kind)?.into_iter().collect();
+
+        if let Some(sel) = selection {
+            src_slugs.retain(|s| sel.contains(kind, s));
+            tgt_slugs.retain(|s| sel.contains(kind, s));
+        }
         let mut to_create = Vec::new();
         for slug in &src_slugs {
             if !tgt_slugs.contains(slug) {

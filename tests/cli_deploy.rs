@@ -1082,6 +1082,158 @@ async fn deploy_only_with_unknown_selector_errors() {
         .stderr(predicate::str::contains("matched 0 objects"));
 }
 
+/// `rdc deploy --only hooks/*` dry-run must list hooks in the plan but must
+/// NOT list rules, even when both kinds have new objects relative to tgt.
+#[tokio::test]
+async fn deploy_only_filters_plan() {
+    let test_server = MockServer::start().await;
+    let prod_server = MockServer::start().await;
+
+    let hooks_list = serde_json::json!({
+        "pagination": { "next": null },
+        "results": [{
+            "id": 100,
+            "url": format!("{}/api/v1/hooks/100", test_server.uri()),
+            "name": "validator",
+            "type": "function",
+            "queues": [],
+            "events": ["annotation_status"],
+            "config": { "runtime": "python3.12", "code": "def x(payload):\n    return {}\n" }
+        }]
+    });
+    let rules_list = serde_json::json!({
+        "pagination": { "next": null },
+        "results": [{
+            "id": 200,
+            "url": format!("{}/api/v1/rules/200", test_server.uri()),
+            "name": "check-totals",
+            "queues": [],
+            "code": "def r():\n    return None\n"
+        }]
+    });
+    mount_full_pull(&test_server, hooks_list).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/rules"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(rules_list))
+        .mount(&test_server).await;
+    mount_full_pull(&prod_server, empty_list()).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .args(["init",
+               "--env", &format!("test={}/api/v1:1", test_server.uri()),
+               "--env", &format!("prod={}/api/v1:1", prod_server.uri())])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
+        .assert().success();
+    Command::cargo_bin("rdc").unwrap()
+        .args(["pull", "test"])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T")
+        .assert().success();
+    Command::cargo_bin("rdc").unwrap()
+        .args(["pull", "prod"])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_PROD", "T")
+        .assert().success();
+
+    let assert = Command::cargo_bin("rdc").unwrap()
+        .args(["deploy", "test", "prod", "--yes", "--dry-run", "--only", "hooks/*"])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T")
+        .env("RDC_TOKEN_PROD", "T")
+        .assert().success();
+    let out = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(out.contains("hooks"), "expected hooks in plan; got:\n{out}");
+    assert!(!out.contains("rules"), "rules must not appear under --only hooks/*; got:\n{out}");
+}
+
+/// `rdc deploy --only hooks/x` must POST /hooks but never POST /rules, even
+/// when both kinds have new objects in src that are absent from tgt.
+#[tokio::test]
+async fn deploy_only_creates_filtered_kind_only() {
+    use std::sync::{Arc, Mutex};
+
+    let test_server = MockServer::start().await;
+    let prod_server = MockServer::start().await;
+
+    let rule_post_calls = Arc::new(Mutex::new(0u32));
+
+    let hooks_list = serde_json::json!({
+        "pagination": { "next": null },
+        "results": [{
+            "id": 100,
+            "url": format!("{}/api/v1/hooks/100", test_server.uri()),
+            "name": "x", "type": "function", "queues": [],
+            "events": ["annotation_status"],
+            "config": { "runtime": "python3.12", "code": "def x(p):\n    return {}\n" }
+        }]
+    });
+    let rules_list = serde_json::json!({
+        "pagination": { "next": null },
+        "results": [{
+            "id": 200,
+            "url": format!("{}/api/v1/rules/200", test_server.uri()),
+            "name": "y", "queues": [], "code": "def y():\n    return None\n"
+        }]
+    });
+    mount_full_pull(&test_server, hooks_list).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/rules"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(rules_list))
+        .mount(&test_server).await;
+    mount_full_pull(&prod_server, empty_list()).await;
+
+    let counter = rule_post_calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/v1/rules"))
+        .respond_with(move |_req: &wiremock::Request| {
+            *counter.lock().unwrap() += 1;
+            ResponseTemplate::new(201).set_body_json(serde_json::json!({}))
+        })
+        .mount(&prod_server).await;
+    let hook_body = serde_json::json!({
+        "id": 999,
+        "url": format!("{}/api/v1/hooks/999", prod_server.uri()),
+        "name": "x", "type": "function", "queues": [], "events": ["annotation_status"],
+        "config": { "runtime": "python3.12", "code": "def x(p):\n    return {}\n" }
+    });
+    Mock::given(method("POST"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(hook_body.clone()))
+        .mount(&prod_server).await;
+    // Apply's drift check does GET /hooks/999 — return the same body so apply
+    // sees the hook as already in sync and issues no PATCH.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks/999"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(hook_body))
+        .mount(&prod_server).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .args(["init",
+               "--env", &format!("test={}/api/v1:1", test_server.uri()),
+               "--env", &format!("prod={}/api/v1:1", prod_server.uri())])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
+        .assert().success();
+    Command::cargo_bin("rdc").unwrap()
+        .args(["pull", "test"]).current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T").assert().success();
+    Command::cargo_bin("rdc").unwrap()
+        .args(["pull", "prod"]).current_dir(project.path())
+        .env("RDC_TOKEN_PROD", "T").assert().success();
+
+    Command::cargo_bin("rdc").unwrap()
+        .args(["deploy", "test", "prod", "--yes", "--only", "hooks/x"])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
+        .assert().success();
+
+    assert_eq!(*rule_post_calls.lock().unwrap(), 0,
+        "POST /rules must not be called when --only hooks/x");
+}
+
 /// `rdc deploy test prod --dry-run` with a store extension in src must print
 /// the store-extension sub-line in the plan summary, naming the slug and the
 /// template on the target cluster. No writes should reach the tgt server.
