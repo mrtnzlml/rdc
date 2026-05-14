@@ -2,11 +2,12 @@
 
 **Rossum Deployment as Code — snapshot, edit, deploy.**
 
-`rdc` is the tool for managing Rossum.ai configurations. Pull an environment into a local snapshot, edit it in place, push changes back, promote them to another env. One command per phase. Idempotent re-runs do nothing. There is no second tool to learn.
+`rdc` is the tool for managing Rossum.ai configurations. Sync an environment into a local snapshot, edit it in place, sync again to send the changes back, promote them to another env. One verb per phase. Idempotent re-runs do nothing. There is no second tool to learn.
 
 ```sh
-rdc pull test
+rdc sync test
 $EDITOR envs/test/hooks/validator-invoices.py
+rdc sync test
 rdc deploy test prod
 ```
 
@@ -24,11 +25,11 @@ These are the rules `rdc` follows so you don't have to think about them:
 
 - **Just works.** Defaults are the recommendations. If you reach for a flag, it's probably either not there on purpose, or the existing default is the one to use.
 - **Plan before apply.** Every command that touches the remote shows what it will do, asks once on a TTY, and accepts `--yes` for CI. `--dry-run` runs the same code paths without writing anywhere.
-- **Idempotent everywhere.** Re-running `rdc pull` on a clean environment writes nothing. Re-running `rdc deploy` on a synced env is zero API calls. Re-running `rdc push` after a successful push exits silently.
-- **The environment is the unit of work.** No partial pulls, no per-kind filters, no per-workspace scope limiters. Whole envs in, whole envs out.
-- **Snapshot is canonical, including absence.** The on-disk files are the source you edit; remote is reconciled toward them. Removing a local file is the declarative way to delete the corresponding remote object — `rdc push` will offer to make it so, with an explicit confirmation gate. Per-env divergences (display names, runtimes, thresholds) live in `overlay.toml` so the canonical snapshot stays clean.
+- **Idempotent everywhere.** Re-running `rdc sync` on a converged environment writes nothing. Re-running `rdc deploy` on a synced env is zero API calls.
+- **The environment is the unit of work.** No partial syncs, no per-kind filters, no per-workspace scope limiters. Whole envs in, whole envs out.
+- **Snapshot is canonical, including absence.** The on-disk files are the source you edit; remote is reconciled toward them. Removing a local file is the declarative way to delete the corresponding remote object — `rdc sync` will offer to make it so, with an explicit confirmation gate. Per-env divergences (display names, runtimes, thresholds) live in `overlay.toml` so the canonical snapshot stays clean.
 - **Cross-references resolve automatically.** When `rdc deploy` POSTs a hook to PROD that references TEST queue URLs, the body sent has those URLs rewritten to the matching PROD queue URLs. The user never sees this.
-- **Errors are actionable.** A missing `rdc.toml` says "not an rdc project — run `rdc init` here." A drifted target says "run `rdc pull <env>` first." A failed token says "Invalid token (401)."
+- **Errors are actionable.** A missing `rdc.toml` says "not an rdc project — run `rdc init` here." A drifted target says "run `rdc sync <env>` first." A failed token says "Invalid token (401)."
 - **Atomic on disk.** All writes go through a temp-file rename. A crash mid-write never leaves a half-written JSON.
 - **Resilient on the wire.** Transient HTTP errors (`429`, `502`, `503`, `504`) retry with exponential backoff up to 5 attempts.
 
@@ -79,9 +80,9 @@ rdc init --env test=https://your-org.rossum.app/api/v1:123456 \
 rdc auth test --token <test-token>
 rdc auth prod --token <prod-token>
 
-# Pull both envs.
-rdc pull test
-rdc pull prod
+# Sync both envs into local snapshots.
+rdc sync test
+rdc sync prod
 ```
 
 `envs/test/` now contains the complete snapshot:
@@ -138,8 +139,8 @@ Env 'test'
 Send the edit to test:
 
 ```sh
-$ rdc push test
-✓ push envs/test: 1 patched, 0.6s
+$ rdc sync test
+✓ sync envs/test: 1 patched, 0.6s
 ```
 
 Promote everything that's diverged from prod into prod:
@@ -161,10 +162,12 @@ Re-running yields `0 PATCHes`. The whole environment is now in sync.
 
 Three local primitives plus one remote source of truth. Knowing them makes everything else obvious.
 
-- **`envs/<env>/`** — the **snapshot**. Plain JSON files plus extracted `.py` code. This is what you edit. `rdc pull` reconciles remote → snapshot; `rdc push` and `rdc deploy` reconcile snapshot → remote.
-- **`.rdc/state/<env>.lock.json`** — the **lockfile**. Per-object `content_hash` from the last successful pull/push. Serves as the merge base for three-way comparison. Auto-managed; commit to git alongside the snapshot.
-- **`envs/<env>/overlay.toml`** — the **overlay**. Per-env values applied on push, stripped on pull. Optional, but the right tool for divergences like "PROD's hooks use `python3.12-secure` while TEST's use `python3.12`."
+- **`envs/<env>/`** — the **snapshot**. Plain JSON files plus extracted `.py` code. This is what you edit. `rdc sync` reconciles snapshot ↔ remote in one pass; `rdc deploy` reconciles snapshot → remote across envs.
+- **`.rdc/state/<env>.lock.json`** — the **lockfile**. Per-object `content_hash` from the last successful sync. Serves as the merge base for three-way comparison. Auto-managed; commit to git alongside the snapshot.
+- **`envs/<env>/overlay.toml`** — the **overlay**. Per-env values applied to outbound bodies, stripped from inbound bodies. Optional, but the right tool for divergences like "PROD's hooks use `python3.12-secure` while TEST's use `python3.12`."
 - **The remote API** — the source of truth for what's actually running.
+
+`rdc sync` is the only command for local ↔ remote reconciliation. Pull-side and push-side actions happen in one invocation; the snapshot stays canonical (any skipped conflict preserves local).
 
 Cross-references between resources are URL-based. `rdc deploy` rewrites them automatically when moving objects between envs, using the slug-to-slug mapping stored in `.rdc/map/<src>-to-<tgt>.toml` (built silently on first deploy; hand-edit for renames).
 
@@ -174,8 +177,7 @@ Cross-references between resources are URL-based. `rdc deploy` rewrites them aut
 |---|---|
 | `rdc init` | Create a new project, or add an env to an existing one. |
 | `rdc auth <env>` | Set/refresh the API token for `<env>`. Validates before writing. |
-| `rdc pull <env>` | Mirror the remote into `envs/<env>/`. Three-way merges on conflict. |
-| `rdc push <env>` | Send local edits in `<env>` back to its remote. POSTs new files; DELETEs lockfile-tracked files that have been removed locally (gated by `--allow-deletes`). |
+| `rdc sync <env>` | Reconcile snapshot ↔ remote in one pass. Pulls remote changes, sends local edits, three-way merges on conflict. `--no-push` (audit mode) and `--no-pull` (deploy mode) restrict the direction for CI. `--allow-deletes` gates DELETEs from tombstones. |
 | `rdc deploy <src> <tgt>` | One-shot cross-env promotion. Plan-then-apply with confirmation. |
 | `rdc status [<env>]` | Auth + lockfile health + pending edits + pending renames. Read-only. |
 | `rdc diff <env>` | Local-vs-remote diff (one GET per edited object). |
@@ -183,13 +185,13 @@ Cross-references between resources are URL-based. `rdc deploy` rewrites them aut
 | `rdc repair <env>` | Local-state surgery. `--rebuild-lock` re-pulls; `--rename-slugs` realigns stale filenames. |
 | `rdc upgrade` | Self-update the binary. |
 
-Every command that writes to the remote (`push`, `deploy`) takes `--dry-run` to print the plan without sending anything.
+Every command that writes to the remote (`sync`, `deploy`) takes `--dry-run` to print the plan without sending anything.
 
 ## Edit the snapshot
 
-Most files are plain JSON; open them in your editor and save. After any edit, `rdc status <env>` lists the changed files and `rdc push <env>` sends them.
+Most files are plain JSON; open them in your editor and save. After any edit, `rdc status <env>` lists the changed files and `rdc sync <env>` sends them.
 
-For objects with extracted code, the on-disk layout splits one logical object into two files. The JSON describes the object; the `.py` carries the code. **Always edit the `.py`** — pull strips the inlined field on save and push splices it back in.
+For objects with extracted code, the on-disk layout splits one logical object into two files. The JSON describes the object; the `.py` carries the code. **Always edit the `.py`** — sync strips the inlined field on the pull-side write and splices it back in for the push-side write.
 
 | Kind | On-disk files |
 |---|---|
@@ -199,13 +201,13 @@ For objects with extracted code, the on-disk layout splits one logical object in
 
 ### Create a new object
 
-Author the JSON (and any `.py`) directly. Omit `id` and `url` — the server assigns them. Push detects "local file exists, no lockfile entry" and POSTs:
+Author the JSON (and any `.py`) directly. Omit `id` and `url` — the server assigns them. Sync detects "local file exists, no lockfile entry" and POSTs:
 
 ```sh
 $ cat > envs/test/labels/audit-hold.json <<'JSON'
 { "name": "Audit hold", "organization": "https://your-org.rossum.app/api/v1/organizations/123456" }
 JSON
-$ rdc push test
+$ rdc sync test
 created labels/audit-hold (id 10198)
 ```
 
@@ -219,17 +221,17 @@ Extensions installed via the Rossum store (Master Data Hub, Email
 Notifications, Document Splitting, …) live under `hooks/` like every
 other hook, marked by `"extension_source": "rossum_store"` in the JSON.
 
-`rdc pull` round-trips the full server body — including the
+`rdc sync` round-trips the full server body — including the
 template-managed `description`, `guide`, `settings_schema`, and the
 private webhook `config`. Diffs and edits work the same way as for
 regular hooks; only `settings`, `queues`, `active`, `run_after`,
 `metadata`, and customer-set `config.*` values are typically meant to
 diverge between environments.
 
-`rdc push` knows to use the Rossum store install endpoint
+`rdc sync` knows to use the Rossum store install endpoint
 (`POST /hooks/create`) when creating one on a fresh environment, then
-PATCHes any customisations from the snapshot. If a previous push left
-an orphan (install succeeded, PATCH failed), the next push detects it
+PATCHes any customisations from the snapshot. If a previous sync left
+an orphan (install succeeded, PATCH failed), the next sync detects it
 by `(name, hook_template)` and resumes without creating a duplicate.
 
 `rdc deploy` resolves the target cluster's matching `hook_template`
@@ -267,22 +269,22 @@ If the source cluster has a store template that's not available on the
 target cluster (e.g., a `request_access` template the target org hasn't
 been onboarded to), `rdc deploy` refuses with an actionable error
 naming the template — install it manually via the Rossum UI on the
-target and re-run `rdc pull` first.
+target and re-run `rdc sync` first.
 
 ### Delete an object
 
-Removing the local file (and committing that removal to your repo) is the declarative way to say "delete this from remote." The lockfile entry remains, which is rdc's signal that the object *was* tracked and is now meant to be gone. `rdc push <env>` discovers these tombstones in its scan phase and, after confirmation, issues `DELETE /<kind>/<id>` for each in reverse dependency order.
+Removing the local file (and committing that removal to your repo) is the declarative way to say "delete this from remote." The lockfile entry remains, which is rdc's signal that the object *was* tracked and is now meant to be gone. `rdc sync <env>` discovers these tombstones in its scan phase and, after confirmation, issues `DELETE /<kind>/<id>` for each in reverse dependency order.
 
 ```sh
 $ rm envs/test/labels/audit-hold.json
 $ rdc status test
 Env 'test'
   …
-  deletes:  1 file(s) tracked but missing locally (run `rdc push test --allow-deletes` to remove from remote):
+  deletes:  1 file(s) tracked but missing locally (run `rdc sync test --allow-deletes` to remove from remote):
             labels/audit-hold
 
-$ rdc push test
-✓ push envs/test: 261 files scanned, 0 changed, 1 to delete
+$ rdc sync test
+✓ sync envs/test: 261 files scanned, 0 changed, 1 to delete
 
 ⚠  The following 1 object(s) would be DELETED from the remote:
   - labels/audit-hold (id 10198)
@@ -297,24 +299,24 @@ The destructive section needs **two intentional acts** — `--yes` does not bypa
 1. Removing the local file (act 1).
 2. Either answering `y` to the prompt on a TTY, or passing `--allow-deletes` (act 2).
 
-Non-TTY runs (CI) without `--allow-deletes` refuse the push and list the tombstones, pointing at the flag. This is intentional: a typoed `rm -rf envs/` in a script shouldn't quietly wipe production.
+Non-TTY runs (CI) without `--allow-deletes` refuse the sync and list the tombstones, pointing at the flag. This is intentional: a typoed `rm -rf envs/` in a script shouldn't quietly wipe production.
 
-Per-object drift check: if the remote's `modified_at` has changed since the last `rdc pull`, an inline resolver opens — `[k]eep delete` (force DELETE despite the drift), `[s]kip` (leave alone), `[a]bort` (stop the push), with `[r]estore` aliased to skip-with-hint pointing at `rdc pull`. Non-TTY drift defaults to skip-with-warning.
+Per-object drift check: if the remote's `modified_at` has changed since the last `rdc sync`, the resolver opens — `[k]` keep delete (force DELETE despite the drift), `[s]` skip (leave alone), `[a]` abort. Non-TTY drift defaults to skip-with-warning.
 
 Cascade order is reverse of creates: deleting a workspace directory removes its queues, schemas, inboxes, email templates, hooks attached to those queues, and so on before the workspace itself. The dry-run preview shows the exact sequence.
 
 ```sh
-rdc push test --dry-run --diff   # preview deletes line-by-line
+rdc sync test --dry-run --diff   # preview deletes line-by-line
 ```
 
-`rdc push --dry-run --diff` fetches each tombstone's remote and renders it as a deleted-file diff (`+++ /dev/null`) so you can audit exactly what would disappear.
+`rdc sync --dry-run --diff` fetches each tombstone's remote and renders it as a deleted-file diff (`+++ /dev/null`) so you can audit exactly what would disappear.
 
 Supported kinds for delete: same as create, minus the read-only kinds (workflows, workflow steps, MDH datasets). A tombstone for those is silently ignored.
 
-### Preview a push
+### Preview a sync
 
 ```sh
-rdc push test --dry-run
+rdc sync test --dry-run
 ```
 
 Lists every changed file and which kind would receive a POST/PATCH/DELETE — no API calls made by default. Add `--diff` to also fetch the current remote per object and print unified diffs (and full deleted-body / would-be-POST-body previews).
@@ -421,24 +423,24 @@ version = 1
 
 Bidirectional:
 
-- **On push/deploy**, overlay values are merged into the outbound body. PROD ends up with `"Validator (PROD)"`.
-- **On pull**, overlay values are stripped from the snapshot before write. The on-disk JSON shows the canonical pre-overlay form, so `rdc diff test prod` stays quiet about intentional divergences.
+- **Outbound (sync push-side, deploy)**, overlay values are merged into the body sent to the env. PROD ends up with `"Validator (PROD)"`.
+- **Inbound (sync pull-side)**, overlay values are stripped before write. The on-disk JSON shows the canonical pre-overlay form, so `rdc diff test prod` stays quiet about intentional divergences.
 
-The lockfile records the stripped hash, so subsequent pulls and pushes are idempotent.
+The lockfile records the stripped hash, so subsequent syncs are idempotent.
 
 Sections: `[hooks.<slug>]`, `[rules.<slug>]`, `[labels.<slug>]`, `[schemas.<queue-slug>]`, `[queues.<queue-slug>]`, `[inboxes.<queue-slug>]`, `[engines.<slug>]`, `[engine_fields.<slug>]`, `[email_templates."<ws>/<q>/<template>"]`.
 
-If you add an overlay after a pull, run `rdc pull` once more to re-baseline — the lockfile's pre-strip hash won't match the new post-strip form otherwise.
+If you add an overlay after a sync, run `rdc sync` once more to re-baseline — the lockfile's pre-strip hash won't match the new post-strip form otherwise.
 
 ## Conflicts & drift
 
-A three-way merge runs on every pull. When both local and remote have diverged since the last sync, an inline resolver opens on TTY:
+A three-way merge runs on every sync. When both local and the env have diverged since the last successful sync, an inline resolver opens on TTY. Labels are env-aware so the asymmetry is concrete — the other side is named after the env you're syncing with, never the abstract word "remote":
 
 ```
 [1/3]  envs/test/labels/audit-hold.json — conflict
 
 --- local
-+++ remote
++++ test
 @@ -1,7 +1,7 @@
  {
    "id": 9931,
@@ -446,20 +448,20 @@ A three-way merge runs on every pull. When both local and remote have diverged s
 +  "name": "Audit hold",
    …
 
-[k]eep local  [r]emote  [e]dit  [s]kip (shadow file)  [a]bort >
+[k] keep local  [r] use test  [e] edit  [s] skip  [a] abort >
 ```
 
 | Choice | Effect |
 |---|---|
-| `k` | Keep local. Lockfile records the local hash. |
-| `r` | Overwrite local with remote. Lockfile records the remote hash. |
-| `e` | Open `$EDITOR` on git-style conflict markers. The saved bytes become the new local + lockfile hash. |
-| `s` | Skip. Local kept; remote written to `<file>.remote` for review. |
+| `k` | Keep local. PATCH the env with local bytes; lockfile records the local hash. |
+| `r` | Overwrite local with the env's bytes; lockfile records the env hash. |
+| `e` | Open `$EDITOR` on git-style conflict markers. The saved bytes go to both sides; lockfile records the saved hash. |
+| `s` | Skip. Local kept; the env's bytes land at `<file>.<env-name>` for review. |
 | `a` | Abort. Nothing else writes from this point. |
 
-`rdc push` uses the same shape with push-side semantics: `k` force-pushes local, `r` adopts remote and discards your local edit, `e` edits then force-pushes, `s` skips with warning, `a` aborts.
+When `--no-push` is active (audit mode) the `[k]` choice is hidden — nothing local can be sent. When `--no-pull` is active (deploy mode) the `[r]` choice is hidden — nothing local can be overwritten.
 
-CI / non-TTY / `--yes` falls back to the shadow-file flow: local stays on disk, remote lands at `<file>.remote`, summary lists the count. Resolve by editing locally and re-running.
+CI / non-TTY / `--yes` falls back to `[s]`: local stays on disk, the env's bytes land at `<file>.<env-name>`, summary lists the count. Resolve by editing locally and re-running.
 
 ## Recover from drift
 
@@ -467,10 +469,10 @@ CI / non-TTY / `--yes` falls back to the shadow-file flow: local stays on disk, 
 
 | Flag | What it does | Online? |
 |---|---|---|
-| `--rebuild-lock` | Back up the existing lockfile and re-pull from scratch. Used after lockfile corruption or a hash-input change in a new `rdc` release. **Local edits are lost.** | yes |
+| `--rebuild-lock` | Back up the existing lockfile and re-sync from scratch. Used after lockfile corruption or a hash-input change in a new `rdc` release. **Local edits are lost.** | yes |
 | `--rename-slugs` | Rename any local file whose slug no longer matches its JSON `name`. Cascade-aware: renaming a workspace moves the whole subtree, renaming a queue carries its schema / inbox / formulas / email-templates along. | no |
 
-Slugs in the snapshot are sticky to the Rossum object ID: once a hook has `validator-invoices` as its slug, that slug stays there even if the hook is later renamed on the remote. This is intentional — cross-references stay valid, pull stays idempotent, file paths don't churn. `rdc repair <env> --rename-slugs` is the explicit user-driven action that brings stale slugs into alignment when you're ready to commit the renames in a reviewable diff.
+Slugs in the snapshot are sticky to the Rossum object ID: once a hook has `validator-invoices` as its slug, that slug stays there even if the hook is later renamed on the remote. This is intentional — cross-references stay valid, sync stays idempotent, file paths don't churn. `rdc repair <env> --rename-slugs` is the explicit user-driven action that brings stale slugs into alignment when you're ready to commit the renames in a reviewable diff.
 
 ```sh
 rdc repair test --rename-slugs            # interactive: y/N per rename
@@ -478,7 +480,7 @@ rdc repair test --rename-slugs --yes      # apply all without prompting
 rdc repair test --rename-slugs --check    # list pending, no writes
 ```
 
-Pull surfaces pending renames in its summary; `rdc status` lists each one per env.
+Sync surfaces pending renames in its summary; `rdc status` lists each one per env.
 
 ## File layout
 
@@ -554,7 +556,7 @@ The swap uses a copy-aside + atomic rename pattern, so a parallel shell tab runn
 - **Backward compat (new binary, old artifacts):** the latest `rdc` reads anything produced by any previous release. Lockfile versions migrate forward; project config and overlay tolerate missing fields via serde defaults.
 - **Forward compat (older binary, newer artifacts):** not promised. Newer-version artifacts that an older binary doesn't understand produce a clear error pointing at `rdc upgrade`, never silent corruption.
 
-A rare class of releases changes how `content_hash` is computed (e.g. stripping a newly-noisy server-managed field). The release notes will say so explicitly when it happens. After such a release, run `rdc repair <env> --rebuild-lock` once to clear any false-positive conflicts on the first re-pull.
+A rare class of releases changes how `content_hash` is computed (e.g. stripping a newly-noisy server-managed field). The release notes will say so explicitly when it happens. After such a release, run `rdc repair <env> --rebuild-lock` once to clear any false-positive conflicts on the first re-sync.
 
 ## Tests
 
