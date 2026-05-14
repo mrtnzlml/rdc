@@ -153,6 +153,104 @@ impl Matcher {
     }
 }
 
+use serde_json::Value;
+use crate::state::Lockfile;
+
+/// URL-typed fields per kind. Mirrors the field list rewritten by
+/// `cli::deploy::common::rewrite_urls` — when that list changes, this
+/// one must change too.
+pub(crate) fn extract_refs(kind: &str, value: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    match kind {
+        "queues" => {
+            push_str(&mut out, value.get("workspace"));
+            push_str(&mut out, value.get("schema"));
+        }
+        "email_templates" => {
+            push_str(&mut out, value.get("queue"));
+        }
+        "hooks" => {
+            push_str_array(&mut out, value.get("queues"));
+            push_str_array(&mut out, value.get("run_after"));
+        }
+        "rules" => {
+            push_str_array(&mut out, value.get("queues"));
+        }
+        // workspaces, schemas, inboxes, labels, engines, engine_fields:
+        // no outbound URL refs we promote across envs.
+        _ => {}
+    }
+    out
+}
+
+fn push_str(out: &mut Vec<String>, v: Option<&Value>) {
+    if let Some(s) = v.and_then(|v| v.as_str()) {
+        out.push(s.to_string());
+    }
+}
+
+fn push_str_array(out: &mut Vec<String>, v: Option<&Value>) {
+    if let Some(arr) = v.and_then(|v| v.as_array()) {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                out.push(s.to_string());
+            }
+        }
+    }
+}
+
+/// One outbound reference whose target is missing from both the
+/// selection and the tgt lockfile. The `from` and `to` pairs are
+/// `(kind, slug)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Unresolved {
+    pub(crate) from: (String, String),
+    pub(crate) to: (String, String),
+}
+
+/// Classify a list of `(selected_object, [referenced_urls])` tuples.
+/// Returns only the references whose target is neither in the selection
+/// nor in the tgt lockfile (i.e., the user has to decide what to do).
+pub(crate) fn classify_unresolved(
+    refs_per_object: &[((String, String), Vec<String>)],
+    selection: &Selection,
+    src_lockfile: &Lockfile,
+    tgt_lockfile: &Lockfile,
+) -> Vec<Unresolved> {
+    let mut out = Vec::new();
+    for (from, urls) in refs_per_object {
+        for url in urls {
+            // Translate the src URL into a (kind, slug) pair via the src
+            // lockfile. If the URL doesn't resolve to a known src object,
+            // we don't treat it as an unresolved dep — URL rewrite skips
+            // it the same way at execute time.
+            let Some((kind, slug)) = src_lockfile.lookup_url(url) else {
+                continue;
+            };
+            let to = (kind.to_string(), slug.to_string());
+
+            if selection.contains(&to.0, &to.1) {
+                continue;
+            }
+            // tgt lockfile presence under the same slug → URL rewrite
+            // will handle it at execute time.
+            if tgt_lockfile
+                .objects
+                .get(&to.0)
+                .and_then(|m| m.get(&to.1))
+                .is_some()
+            {
+                continue;
+            }
+            out.push(Unresolved {
+                from: from.clone(),
+                to,
+            });
+        }
+    }
+    out
+}
+
 /// Glob match: `pattern` may contain `*` (zero or more characters); every
 /// other byte is literal. No `?`, no character classes, no `**` — the
 /// grammar is intentionally narrow so users learn it from one sentence
@@ -414,6 +512,198 @@ mod selection_tests {
         let err = resolve(&["hooks".to_string()], &p, &p).unwrap_err();
         let s = format!("{err:#}");
         assert!(s.contains("expected '<kind>/<slug>'"), "got: {s}");
+    }
+}
+
+#[cfg(test)]
+mod refs_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn hook_extracts_queue_and_run_after_urls() {
+        let body = json!({
+            "name": "validator",
+            "queues": [
+                "https://test.example/api/v1/queues/600",
+                "https://test.example/api/v1/queues/601"
+            ],
+            "run_after": ["https://test.example/api/v1/hooks/700"]
+        });
+        let urls = extract_refs("hooks", &body);
+        assert_eq!(urls.len(), 3);
+        assert!(urls.iter().any(|u| u.ends_with("/queues/600")));
+        assert!(urls.iter().any(|u| u.ends_with("/queues/601")));
+        assert!(urls.iter().any(|u| u.ends_with("/hooks/700")));
+    }
+
+    #[test]
+    fn queue_extracts_workspace_and_schema_urls() {
+        let body = json!({
+            "name": "cost-invoices",
+            "workspace": "https://test.example/api/v1/workspaces/3",
+            "schema": "https://test.example/api/v1/schemas/5"
+        });
+        let urls = extract_refs("queues", &body);
+        assert_eq!(urls.len(), 2);
+    }
+
+    #[test]
+    fn schema_has_no_refs() {
+        let body = json!({"name": "cost-invoices-schema", "content": []});
+        let urls = extract_refs("schemas", &body);
+        assert!(urls.is_empty());
+    }
+
+    #[test]
+    fn email_template_extracts_queue() {
+        let body = json!({
+            "name": "rejection",
+            "queue": "https://test.example/api/v1/queues/600"
+        });
+        let urls = extract_refs("email_templates", &body);
+        assert_eq!(urls.len(), 1);
+    }
+
+    #[test]
+    fn rule_extracts_queue_list() {
+        let body = json!({
+            "name": "check-totals",
+            "queues": ["https://test.example/api/v1/queues/600"]
+        });
+        let urls = extract_refs("rules", &body);
+        assert_eq!(urls.len(), 1);
+    }
+
+    #[test]
+    fn null_urls_ignored() {
+        let body = json!({"workspace": null, "schema": null});
+        let urls = extract_refs("queues", &body);
+        assert!(urls.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+    use crate::state::Lockfile;
+
+    fn lockfile_with(kind: &str, slug: &str, id: u64, url: &str) -> Lockfile {
+        let mut lf = Lockfile::default();
+        lf.objects
+            .entry(kind.to_string())
+            .or_default()
+            .insert(
+                slug.to_string(),
+                crate::state::lockfile::ObjectEntry {
+                    id,
+                    url: Some(url.to_string()),
+                    modified_at: None,
+                    content_hash: None,
+                },
+            );
+        lf
+    }
+
+    #[test]
+    fn ref_in_selection_is_ok() {
+        let src_lf = lockfile_with(
+            "queues",
+            "cost-invoices",
+            600,
+            "https://test.example/api/v1/queues/600",
+        );
+        let tgt_lf = Lockfile::default();
+        let mut sel = Selection::default();
+        sel.items
+            .insert(("queues".to_string(), "cost-invoices".to_string()));
+
+        let unresolved = classify_unresolved(
+            &[(
+                ("hooks".to_string(), "validator-invoices".to_string()),
+                vec!["https://test.example/api/v1/queues/600".to_string()],
+            )],
+            &sel,
+            &src_lf,
+            &tgt_lf,
+        );
+        assert!(unresolved.is_empty(), "{unresolved:?}");
+    }
+
+    #[test]
+    fn ref_in_tgt_lockfile_is_ok() {
+        let src_lf = lockfile_with(
+            "queues",
+            "cost-invoices",
+            600,
+            "https://test.example/api/v1/queues/600",
+        );
+        let tgt_lf = lockfile_with(
+            "queues",
+            "cost-invoices",
+            900,
+            "https://prod.example/api/v1/queues/900",
+        );
+        let sel = Selection::default();
+
+        let unresolved = classify_unresolved(
+            &[(
+                ("hooks".to_string(), "validator-invoices".to_string()),
+                vec!["https://test.example/api/v1/queues/600".to_string()],
+            )],
+            &sel,
+            &src_lf,
+            &tgt_lf,
+        );
+        assert!(unresolved.is_empty(), "{unresolved:?}");
+    }
+
+    #[test]
+    fn ref_missing_both_is_unresolved() {
+        let src_lf = lockfile_with(
+            "queues",
+            "cost-invoices",
+            600,
+            "https://test.example/api/v1/queues/600",
+        );
+        let tgt_lf = Lockfile::default();
+        let sel = Selection::default();
+
+        let unresolved = classify_unresolved(
+            &[(
+                ("hooks".to_string(), "validator-invoices".to_string()),
+                vec!["https://test.example/api/v1/queues/600".to_string()],
+            )],
+            &sel,
+            &src_lf,
+            &tgt_lf,
+        );
+        assert_eq!(unresolved.len(), 1);
+        let u = &unresolved[0];
+        assert_eq!(u.from, ("hooks".to_string(), "validator-invoices".to_string()));
+        assert_eq!(u.to, ("queues".to_string(), "cost-invoices".to_string()));
+    }
+
+    #[test]
+    fn unknown_url_in_src_is_silently_ignored() {
+        // Some URLs don't resolve to any known src object (e.g.
+        // workflow_step refs we don't track). They're not "unresolved
+        // deps" — they're just out-of-scope strings. URL rewrite leaves
+        // them alone too.
+        let src_lf = Lockfile::default();
+        let tgt_lf = Lockfile::default();
+        let sel = Selection::default();
+
+        let unresolved = classify_unresolved(
+            &[(
+                ("hooks".to_string(), "x".to_string()),
+                vec!["https://test.example/api/v1/queues/600".to_string()],
+            )],
+            &sel,
+            &src_lf,
+            &tgt_lf,
+        );
+        assert!(unresolved.is_empty());
     }
 }
 
