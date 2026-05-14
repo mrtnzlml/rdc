@@ -2,7 +2,7 @@
 
 **Status:** Spec, awaiting review
 **Date:** 2026-05-14
-**Scope:** Introduce `rdc sync <env>` as the single primary verb for reconciling local snapshot and remote state. Replace the directional `pull` / `push` mental model. The two existing commands are retained as thin direction-explicit aliases (`sync --no-push`, `sync --no-pull`) so CI workflows that depend on unambiguous direction keep working.
+**Scope:** Introduce `rdc sync <env>` as the single command for reconciling local snapshot and remote state. The existing `rdc pull` and `rdc push` commands are removed; their direction-explicit behavior is available via the `--no-push` and `--no-pull` flags on `sync`.
 
 ## Goal
 
@@ -14,9 +14,8 @@ The asymmetric "snapshot is canonical" model is preserved: on skip, on non-TTY r
 
 - **Background daemon / watch mode.** The motivation mentions "in sync all the time (non-intrusively)" but this spec is a foreground CLI command. A daemon can wrap `sync` later without changing its semantics.
 - **Symmetric peer semantics (git-style).** Local and remote remain asymmetric: the on-disk snapshot is the user's editable source of truth.
-- **Removing `pull` / `push` entirely.** They stay in the CLI, redefined as aliases. A future release may deprecate them; this one doesn't.
 - **Cross-env reconciliation.** `rdc sync` is single-env (local ↔ remote for one env). Cross-env promotion is still `rdc deploy <src> <tgt>`, unchanged.
-- **New conflict semantics.** The resolver UI (`[k]/[r]/[e]/[s]/[a]`) is unchanged. Sync generalizes what each choice *does*, not what the user sees.
+- **New conflict-resolver shape.** The five-option shape (`[k]/[r]/[e]/[s]/[a]`) is preserved. The only UI change is to interpolate the env name into labels (e.g., `[r] use production`) — no new options, no new keystrokes.
 - **Operation filtering.** No `--only` selector for sync in v1. The deploy `--only` machinery (see `2026-05-14-selective-deployment-design.md`) is intentionally not generalized to sync; per-file edits don't need it.
 
 ## Background
@@ -40,14 +39,18 @@ rdc sync <env> [--dry-run] [--diff] [--yes] [--allow-deletes] [--no-push] [--no-
 
 Default: bring local and remote into the same state, prompting on conflicts.
 
-`pull` and `push` are retained as **command-level aliases**:
+Direction-explicit modes (for CI workflows that need unambiguous behavior):
 
-- `rdc pull <env>` ≡ `rdc sync <env> --no-push`
-- `rdc push <env>` ≡ `rdc sync <env> --no-pull`
-
-Both keep their existing flags (`pull` already takes no flags beyond `--interactive`; `push` takes `--dry-run --diff --yes --allow-deletes`). The clap subcommands route into a single `sync::run` entry point with the appropriate `no_push` / `no_pull` set. Users who never type `sync` see no behavior change.
+- `--no-push` — audit mode. Pull remote changes into local; never POST/PATCH/DELETE on the remote. Used for drift detection against a committed snapshot.
+- `--no-pull` — deploy mode. Send local edits to the remote; never overwrite local files. Used for pipelines that publish a committed snapshot and must not mutate the working copy.
 
 `--no-push` and `--no-pull` together → error pointing at `rdc status` (the read-only inspection command).
+
+The previous `rdc pull` and `rdc push` commands are removed. User scripts that called them need to be updated:
+
+- `rdc pull <env>` → `rdc sync <env> --no-push`
+- `rdc push <env>` → `rdc sync <env> --no-pull`
+- `rdc push <env> --yes --allow-deletes` → `rdc sync <env> --no-pull --yes --allow-deletes`
 
 ### Execution pipeline
 
@@ -55,24 +58,27 @@ A single pass with five phases:
 
 1. **List remote.** Refactor of today's `cli::pull::run_drivers` Phase 1 into a `list_remote()` returning a typed catalog (per kind: list of `(id, slug, body)` from the API). The progress bar denominator is set in this phase.
 2. **Scan local.** Reuses `cli::push::scan::scan` unchanged. Yields a `ChangeList` of locally-modified files and a `TombstoneList` of files tracked in the lockfile but missing on disk.
-3. **Classify.** One pass over every `(kind, slug)` that appears on either side, against the lockfile, into one of eight classes:
+3. **Classify.** One pass over every `(kind, slug)` that appears on either side, against the lockfile, into one of eleven classes:
 
    | Class | Local vs. lockfile | Remote vs. lockfile | Action |
    |---|---|---|---|
    | clean | matches | matches | no-op |
    | local-only edit | differs | matches | push (PATCH) |
-   | local-only create | new file | absent | push (POST) |
+   | local-only create | new file (no lockfile entry) | absent | push (POST) |
    | local-only delete | tombstone | matches | push (DELETE), under destructive gate |
    | remote-only edit | matches | differs | pull (write local) |
-   | remote-only create | absent | new | pull (write local) |
-   | remote-only delete | matches | 404 from listing | prompt: drop local, or restore on remote? |
+   | remote-only create | absent | new (no lockfile entry) | pull (write local) |
+   | remote-only delete | matches | absent from listing | conflict resolver (see §"Conflict resolver under sync") |
    | both diverged | differs | differs | three-way merge resolver |
+   | local edit + remote delete | differs | absent from listing | conflict resolver (delete-aware variant) |
+   | local delete + remote edit | tombstone | differs | conflict resolver (delete-aware variant) |
+   | both deleted | tombstone | absent from listing | silent convergence: drop lockfile entry, no writes |
 
 4. **Plan.** Print the breakdown, confirm on TTY:
 
    ```
    Plan: sync test
-     ← pull:    3 remote changes
+     ← pull:    3 changes from test
                   hooks/validator-invoices
                   queues/cost-invoices
                   labels/audit-hold (new)
@@ -84,50 +90,98 @@ A single pass with five phases:
    Proceed? [y/N]
    ```
 
+   The arrow direction and the env name make the data flow explicit at a glance: `←` pulls into local from the named env, `→` pushes local out to the named env.
+
    `--dry-run` prints this plan and exits, no writes. `--diff` adds per-object unified diffs.
 
 5. **Execute.** Single ordering:
 
    1. **Pull-side writes** first. Reason: if the push phase fails partway (network, auth, drift in a conflicting object), the local snapshot has at least caught up to the latest remote state; on retry, sync resumes from up-to-date local. The lockfile is saved per-success, so partial progress isn't lost.
-   2. **Conflict resolution prompt** per conflicted object. The resolution determines whether the object goes through the pull-side or push-side writer, or both.
+   2. **Conflict resolution prompt** per conflicted object (including remote-deleted objects, which use the same resolver with delete-specific labels). The resolution determines whether the object goes through the pull-side writer, the push-side writer, or both.
    3. **Push-side writes** in dependency order: `workspaces → schemas → queues → inboxes → email_templates → hooks → rules → labels → engines → engine_fields`.
    4. **Push-side deletes** (local tombstones → remote DELETE) in reverse dependency order, after the destructive gate is crossed.
    5. **Save lockfile, regenerate `_index.md`.**
 
 ### Conflict resolver under sync
 
-The existing resolver UI is unchanged. Sync only changes what the caller does with each `Resolution`:
+The resolver UI keeps its existing shape (`[k]/[r]/[e]/[s]/[a]`) but its labels become **env-aware**. The "remote" side is named after the env passed to `rdc sync` (e.g., `production`, `test`, `staging`). This removes the abstract "remote" word from every prompt and makes the asymmetry concrete: the user sees exactly which environment is on the other side of the decision.
 
-| Choice | Pull-only (`--no-push`) | Sync default | Push-only (`--no-pull`) |
+Example, on `rdc sync production`:
+
+```
+hooks/validator-invoices — conflict
+
+local has changes:
+  <unified diff snippet>
+
+production has changes:
+  <unified diff snippet>
+
+[k] keep local   [r] use production   [e] edit   [s] skip   [a] abort >
+```
+
+Action semantics for the standard "both diverged" conflict:
+
+| Choice | Default sync | `--no-push` (audit) | `--no-pull` (deploy) |
 |---|---|---|---|
-| `[k]` keep local | no-op (hidden from prompt) | write local bytes to remote (PATCH) | write local bytes to remote (PATCH) |
-| `[r]` remote | overwrite local with remote bytes | overwrite local | no-op (hidden from prompt) |
-| `[e]` edit | $EDITOR → write local only | $EDITOR → write local and remote | $EDITOR → write remote only |
-| `[s]` skip | shadow file `<file>.remote`; local untouched | shadow file `<file>.remote`; local untouched; lockfile records local hash | shadow file `<file>.remote`; local untouched |
-| `[a]` abort | stop, lockfile unsaved | stop, lockfile unsaved | stop, lockfile unsaved |
+| `[k]` keep local | PATCH the env with local bytes; lockfile records local hash | no-op; hidden from prompt | PATCH the env with local bytes; lockfile records local hash |
+| `[r]` use <env-name> | overwrite local with env bytes; lockfile records env hash | overwrite local; lockfile records env hash | no-op; hidden from prompt |
+| `[e]` edit | $EDITOR on conflict markers; saved bytes → both sides | $EDITOR; saved bytes → local only | $EDITOR; saved bytes → env only |
+| `[s]` skip | shadow file `<file>.<env-name>`; local untouched; lockfile records local hash | same | same |
+| `[a]` abort | stop; lockfile unsaved | same | same |
 
-`[s]` always preserves local. That is the "snapshot is canonical on skip" invariant from the README, made explicit. CI / non-TTY / `--yes` falls back to `[s]` automatically, matching today's behavior.
+`[s]` always preserves local. That is the "snapshot is canonical on skip" invariant from the README, made explicit. The shadow file is named with the env (`<file>.<env-name>`) so the artifact is unambiguous when the project has multiple envs. CI / non-TTY / `--yes` falls back to `[s]` automatically.
 
-When `--no-push` or `--no-pull` is active, the resolver hides the option that would have no effect, and the prompt shows only the meaningful choices.
+When `--no-push` or `--no-pull` is active, the prompt hides the choices that would have no effect.
 
-### Remote-side delete
+#### Remote-side delete via the resolver
 
-Sync introduces one new case not present in either current command: **lockfile-tracked object missing from remote listing**.
-
-Today's `pull` never sees this — the listing is authoritative for "what exists," so a deleted remote silently drops from the next pull, leaving a stale local file. Today's `push` doesn't probe missing remotes (it only acts on locally-changed files).
-
-Under sync, the listing is cross-checked against the lockfile. A `lockfile entry + absent from listing` pair triggers:
+The `remote-only delete` class (lockfile entry present, object absent from the env's listing) is folded into the same resolver, with a shape that makes the destructive direction explicit:
 
 ```
-labels/audit-hold was deleted on remote since the last sync.
+labels/audit-hold — deleted on production
 
-[d] delete local (drop the file)
-[r] restore on remote (treat local as canonical, POST it back)
-[s] skip (write labels/audit-hold.remote-deleted as a marker)
-[a] abort
+local has the file (last sync hash: <hash>):
+  <pretty-printed JSON preview>
+
+production has it deleted.
+
+[k] keep local (restore on production)   [r] use production (delete local)   [s] skip   [a] abort >
 ```
 
-Non-TTY / `--yes` defaults to `[s]` (skip-with-marker), matching the conflict-resolver fallback. `--allow-deletes` gates *outgoing* deletes (local tombstones → remote DELETE), not this case; the remote-side delete prompt has its own per-object decision.
+Action semantics for the remote-delete case:
+
+| Choice | Default sync | `--no-push` (audit) | `--no-pull` (deploy) |
+|---|---|---|---|
+| `[k]` keep local (restore on <env-name>) | POST the local body to recreate the object on the env | no-op; hidden | POST the local body to recreate the object |
+| `[r]` use <env-name> (delete local) | remove the local file; drop the lockfile entry | remove the local file; drop the lockfile entry | no-op; hidden |
+| `[e]` | not applicable to deletes; hidden | hidden | hidden |
+| `[s]` skip | write `<file>.<env-name>-deleted` marker; local file untouched; lockfile entry retained — re-prompts next sync | same | same |
+| `[a]` abort | stop; lockfile unsaved | same | same |
+
+Non-TTY / `--yes` falls back to `[s]` (skip-with-marker). Destructive directions — restoring on the env, or deleting locally — are never taken silently in CI.
+
+`--allow-deletes` does *not* auto-confirm the `[r]` choice here. That flag gates outgoing deletes (local tombstones → remote DELETE). Mirror-from-remote is a separate destructive direction and only an explicit `[r]` choice triggers it.
+
+#### Double-conflict cases (edit + delete on opposite sides)
+
+Two derived cases reuse the same resolver shape; only the labels differ to make the destruction direction explicit:
+
+- **Local edit + remote delete** (`differs` + `absent`): the user has unsynced local edits to an object that was deleted on the env.
+  - `[k]` keep local (restore on `<env-name>` with your unsynced edits)
+  - `[r]` use `<env-name>` (delete local — your unsynced edits are dropped)
+  - `[s]` skip (`<file>.<env-name>-deleted` marker; local with edits retained)
+  - `[a]` abort
+
+- **Local delete + remote edit** (`tombstone` + `differs`): the user tombstoned an object locally, but the env has unsynced changes to it.
+  - `[k]` keep local (push DELETE to `<env-name>` — the env's unsynced changes are dropped)
+  - `[r]` use `<env-name>` (restore local file from the env's bytes — the tombstone is undone)
+  - `[s]` skip (`<file>.<env-name>-conflict` marker; both sides retained)
+  - `[a]` abort
+
+Non-TTY / `--yes` falls back to `[s]` in both cases. The destructive directions (`[k]` or `[r]` either way) need an explicit user choice.
+
+The **both-deleted** class (`tombstone` + `absent`) is a silent convergence: both sides agree the object is gone, so the sync just drops the lockfile entry. No prompt, no diff.
 
 ### `--dry-run` and `--diff`
 
@@ -142,7 +196,7 @@ The spec commits to these. They are testable as integration tests.
 2. **Stable inputs**: re-running `rdc sync test` N times in a row produces the same lockfile.
 3. **Conflict resolved via `[k]`**: subsequent sync runs exit silently (both sides now match the lockfile via PATCH).
 4. **Conflict resolved via `[r]`**: subsequent sync runs exit silently (local now matches remote via overwrite).
-5. **Conflict resolved via `[s]`**: subsequent sync runs re-surface the same conflict (until the `.remote` shadow is removed or the underlying divergence is resolved). The shadow file is not auto-deleted.
+5. **Conflict resolved via `[s]`**: subsequent sync runs re-surface the same conflict (until the `<file>.<env-name>` shadow is removed or the underlying divergence is resolved). The shadow file is not auto-deleted.
 
 ### Plan-before-apply
 
@@ -178,17 +232,16 @@ Body composes the existing per-kind drivers:
 4. `classify(remote_catalog, scan_result, lockfile) -> Classification` — new helper.
 5. Plan render + confirm.
 6. Execute:
-   - For pull-side writes: call per-kind `pull::*::process` functions, restricted to the classified pull subset. Today these process the full list; they gain an optional filter parameter (`only: Option<&BTreeSet<(String, String)>>`) that skips items not in the set when present.
+   - For pull-side writes: call per-kind `pull::*::process` functions, passing the classified pull subset (a `&BTreeSet<(kind, slug)>`). Each `process` loops over the listed catalog and skips items not in the set.
    - For conflicts: handled inline by the per-kind processors (they already call the resolver; the caller decides whether to also issue a PATCH based on the `Resolution`).
    - For push-side writes: call per-kind `push::*::push` functions with a `ChangeList` filtered to the classified push subset.
 
 Refactors required (all small, all in service of sharing code rather than duplicating):
 
-- Extract `cli::pull::run_drivers` Phase 1 (listing) into `cli::pull::common::list_remote`. The current `run_drivers` becomes a thin wrapper that calls it and then processes everything (preserving `pull`-only behavior).
-- Add an `only: Option<&BTreeSet<(kind, slug)>>` parameter to each `pull::*::process` function. When `Some`, skip items not in the set. When `None`, process all (today's behavior).
-- `cli::pull::run` → thin wrapper: parses args, calls `sync::run(env, interactive, dry_run=false, diff=false, allow_deletes=false, no_push=true, no_pull=false)`.
-- `cli::push::run` → thin wrapper: parses args, calls `sync::run(env, interactive, dry_run, diff, allow_deletes, no_push=false, no_pull=true)`.
-- Resolver: no signature changes. Where the caller previously had implicit direction (pull never PATCHed, push never overwrote local), the sync caller picks based on `Resolution` + the `no_push` / `no_pull` flags.
+- Extract `cli::pull::run_drivers` Phase 1 (listing) into `cli::pull::common::list_remote`. `run_drivers` itself is deleted along with `cli::pull::run`.
+- Each `pull::*::process` function takes the classified pull subset directly (a `&BTreeSet<(kind, slug)>` of slugs to write). The function loops over the listed catalog and skips items not in the set. With no top-level `pull` command remaining, there is no caller that needs "process everything" behavior.
+- `cli::pull::run` and `cli::push::run` are deleted (they were the CLI entry points). The per-kind drivers under `cli::pull::*` and `cli::push::*` remain as internal modules consumed by `sync::run`. A later rename to `cli::sync::pull_drivers::*` / `cli::sync::push_drivers::*` could reflect the new ownership; not required for this change.
+- Resolver: the prompt-rendering functions in `cli::resolve` gain an `env_name: &str` parameter so the `[r]` label, headers, and shadow-file paths can interpolate the actual env name. Existing callers update with a one-line plumbing change. The `Resolution` enum gains no new variants; the new remote-delete case is communicated by what the caller passes in (existing-local + absent-remote signals it) and the caller dispatches on `Resolution` accordingly.
 - Progress bar: a single `OverallProgress` covers both directions. Denominator = `remote-listed + locally-changed - intersection`.
 
 No on-disk schema changes. No lockfile format changes. No overlay changes. No new dependencies.
@@ -197,23 +250,19 @@ No on-disk schema changes. No lockfile format changes. No overlay changes. No ne
 
 ### CLI registration
 
-In `src/cli/mod.rs`:
+In `src/cli/mod.rs`, the `Pull` and `Push` variants of `Command` are removed; one `Sync` variant takes their place:
 
 ```rust
 #[derive(Subcommand)]
 pub enum Command {
     // ...
-    /// Bring local snapshot and remote state into sync. Recommended verb for everyday use.
+    /// Reconcile the local snapshot and the env's remote state in one pass.
     Sync { /* env, --dry-run, --diff, --yes, --allow-deletes, --no-push, --no-pull */ },
-    /// Mirror remote into the local snapshot (alias for `sync --no-push`).
-    Pull { /* env, --interactive */ },
-    /// Send local edits to remote (alias for `sync --no-pull`).
-    Push { /* env, --dry-run, --diff, --yes, --allow-deletes */ },
     // ...
 }
 ```
 
-`rdc --help` lists `sync` first under "Working with an environment"; `pull` and `push` follow with the alias note in their summary line.
+`rdc --help` lists `sync` under "Working with an environment"; the prior `pull` and `push` entries are gone.
 
 ### README updates
 
@@ -222,29 +271,29 @@ The 60-second tour switches to:
 ```sh
 rdc init ...
 rdc auth test --token ...
-rdc sync test            # was: rdc pull test
+rdc sync test
 $EDITOR envs/test/hooks/validator-invoices.py
-rdc sync test            # was: rdc push test
+rdc sync test
 rdc deploy test prod
 ```
 
-The "Mental model" section adds a sentence: `rdc sync` reconciles local ↔ remote in one step; `rdc pull` and `rdc push` remain for direction-explicit use (audit-only, deploy-from-snapshot).
+The "Mental model" section gets a single sentence describing `rdc sync` as the only command for local ↔ remote reconciliation.
 
-The Commands table grows one row at the top.
+The Commands table replaces the `rdc pull` and `rdc push` rows with a single `rdc sync` row. The flags column for `rdc sync` mentions `--no-push` (audit mode) and `--no-pull` (deploy mode) for CI cases.
 
 ### Errors & UX
 
 - `rdc sync <env> --no-push --no-pull` → error: `use 'rdc status' for read-only inspection.`
-- Missing env / missing token: same messages as today's `pull` / `push`.
+- Missing env / missing token: clear, actionable messages (same shape as today).
 - Listing failure mid-pipeline: same retry behavior (`429`, `5xx`) as today. On exhausted retries, exits non-zero with the last error; lockfile not saved.
-- Local scan failure (e.g., malformed JSON in a snapshot file): same error as today's `push --dry-run`. Lockfile not saved.
-- Conflict resolution path is identical to today's pull/push conflict UI — users familiar with either command see the same prompts.
+- Local scan failure (e.g., malformed JSON in a snapshot file): clear error, lockfile not saved.
+- Conflict resolution path uses the env-aware prompt shape described above. The `<env-name>` label is interpolated from the env arg.
 
 ### Testing
 
 Unit tests (`src/cli/sync.rs`):
 
-- `classify`: synthetic remote catalog + scan result + lockfile yields the expected class for each of the 8 cases.
+- `classify`: synthetic remote catalog + scan result + lockfile yields the expected class for each of the 11 cases.
 - `--no-push` filter: every entry classified as push-side becomes a no-op in the executed action set.
 - `--no-pull` filter: every entry classified as pull-side becomes a no-op in the executed action set.
 - Remote-side delete detection: `lockfile entry + absent from listing` → expected `RemoteDeleted` class with the right slug.
@@ -255,34 +304,37 @@ Integration tests (`tests/`, wiremock-backed, matching `tests/` layout for deplo
 - `sync_local_edit_only`: one local PATCH-class change, no remote drift → exactly one PATCH hits the mock.
 - `sync_remote_change_only`: one remote drift, no local edits → local file rewritten, 0 PATCHes.
 - `sync_conflict_keep_local`: both diverged, scripted-stdin `[k]` → one PATCH, lockfile records local hash.
-- `sync_conflict_keep_remote`: both diverged, scripted-stdin `[r]` → 0 PATCHes, local rewritten.
-- `sync_remote_deleted_then_skip`: lockfile entry + 404 from listing, `[s]` → `.remote-deleted` marker written, no further writes.
-- `sync_remote_deleted_then_restore`: same setup, `[r]` → POST hits the mock to restore.
+- `sync_conflict_use_env`: both diverged, scripted-stdin `[r]` → 0 PATCHes, local rewritten with env bytes.
+- `sync_conflict_skip_writes_env_shadow`: `[s]` → `<file>.<env-name>` shadow file written, local untouched.
+- `sync_remote_deleted_restore_via_keep_local`: lockfile entry + absent from listing, `[k]` → POST hits the mock to restore.
+- `sync_remote_deleted_mirror_via_use_env`: same setup, `[r]` → local file removed, lockfile entry dropped, no further writes.
+- `sync_remote_deleted_skip`: same setup, `[s]` → `<file>.<env-name>-deleted` marker written, no further writes.
+- `sync_remote_deleted_yes_falls_back_to_skip`: same setup, `--yes` → `[s]` taken automatically; no destructive direction in CI.
 - `sync_no_push`: with local edits + remote drift → only the pull-side writes happen; summary names the skipped local edits.
 - `sync_no_pull`: symmetric — only push-side writes happen.
 - `sync_yes_with_tombstones_refused`: tombstones present, `--yes` without `--allow-deletes` → refused, zero writes.
-- `sync_dry_run_diff`: prints scoped plan and per-object diffs; zero writes.
-- `pull_alias_unchanged`: `rdc pull test` (no flags) behaves identically to today on a fixture that exercises pull-only paths.
-- `push_alias_unchanged`: `rdc push test --yes` behaves identically to today on a fixture that exercises push-only paths.
-
-The last two tests guard the alias contract: anything that worked before keeps working.
+- `sync_dry_run_diff`: prints plan and per-object diffs; zero writes.
+- `sync_env_name_in_prompt`: scripted-stdin TTY run on `rdc sync production`; captured prompt text contains `use production` and `<file>.production` (not literal "remote").
+- `sync_local_edit_remote_delete_keep_local`: scripted `[k]` → POST restores the object on the env with the local edited body.
+- `sync_local_delete_remote_edit_keep_local`: scripted `[k]` → DELETE removes the object on the env despite its unsynced changes.
+- `sync_both_deleted_silent`: tombstone + absent from listing → lockfile entry dropped, no prompt, no writes.
 
 ### Compatibility
 
 - Lockfile format: unchanged.
 - Overlay format: unchanged.
 - `.rdc/map/*.toml`: untouched (deploy-only).
-- Existing user scripts calling `rdc pull` or `rdc push`: continue to work. The alias layer is a true alias; flags and output format are preserved.
+- **`rdc pull` and `rdc push` are removed.** User scripts that called them break and must be updated to `rdc sync <env>` (or `rdc sync <env> --no-push` / `--no-pull` for direction-explicit CI cases).
+- Shadow-file path: `<file>.remote` → `<file>.<env-name>` for the conflict-skip artifact, and `<file>.<env-name>-deleted` for the remote-delete skip marker. Existing `.remote` files left over from prior runs are not auto-migrated; they remain on disk as user artifacts and `rdc sync` will re-surface the underlying conflict on the next run.
 
 ## Open questions
 
-- **`pull` and `push` deprecation timeline.** Spec proposes retaining them indefinitely as aliases. If telemetry or feedback later shows nobody uses them directly, a future release can mark them deprecated. Out of scope for this spec.
 - **Conflict order across kinds.** In the rare case of conflicts in dependent kinds (e.g., a queue and its schema both diverged with different per-side edits), the resolver runs in dependency order (schema first, then queue). Confirm during implementation that the prompt phrasing makes the dependency clear, or surface a single combined prompt.
-- **Plan header limits.** For large pull or push sets (hundreds of changes), the plan output can get long. v1 lists everything; if it becomes unwieldy, fold to first-N + count (same approach noted in the selective-deployment spec's open questions).
+- **Plan header limits.** For large pull or push sets (hundreds of changes), the plan output can get long. Initial behavior is to list everything; if it becomes unwieldy, fold to first-N + count (same approach noted in the selective-deployment spec's open questions).
+- **Remote-delete preview length.** The remote-deleted prompt shows a pretty-printed JSON preview of the local file. For large objects (10+ KB hooks, schemas with many fields) the preview is unwieldy. Initial behavior is to elide after ~40 lines with a count; revisit if confusing.
 
 ## Out of scope (deferred)
 
 - **Daemon / watch mode.** "In sync all the time, non-intrusively" is the motivating phrase, but the daemon is a separate product surface (file watcher, polling cadence, conflict batching, lockfile races between concurrent invocations). Doable on top of `sync` later.
 - **`--only` selector for sync.** Sync acts naturally per-file (each change is its own atom). The `--only` machinery from deploy targets cross-env scope; it would be a different concept here. Add if a real use case emerges.
 - **Multi-env sync** (`rdc sync test prod`). That's `rdc deploy`. Keep them separate.
-- **Removing `pull` / `push` entirely.** Possible later; not part of this change.
