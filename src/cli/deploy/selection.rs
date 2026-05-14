@@ -155,6 +155,7 @@ impl Matcher {
 
 use serde_json::Value;
 use crate::state::Lockfile;
+use crate::mapping::Mapping;
 
 /// URL-typed fields per kind. Mirrors the field list rewritten by
 /// `cli::deploy::common::rewrite_urls` — when that list changes, this
@@ -173,10 +174,13 @@ pub(crate) fn extract_refs(kind: &str, value: &Value) -> Vec<String> {
             push_str_array(&mut out, value.get("queues"));
             push_str_array(&mut out, value.get("run_after"));
         }
+        "inboxes" => {
+            push_str_array(&mut out, value.get("queues"));
+        }
         "rules" => {
             push_str_array(&mut out, value.get("queues"));
         }
-        // workspaces, schemas, inboxes, labels, engines, engine_fields:
+        // workspaces, schemas, labels, engines, engine_fields:
         // no outbound URL refs we promote across envs.
         _ => {}
     }
@@ -216,7 +220,10 @@ pub(crate) fn classify_unresolved(
     selection: &Selection,
     src_lockfile: &Lockfile,
     tgt_lockfile: &Lockfile,
+    mapping: &Mapping,
 ) -> Vec<Unresolved> {
+    let mut seen: std::collections::BTreeSet<(String, String, String, String)> =
+        std::collections::BTreeSet::new();
     let mut out = Vec::new();
     for (from, urls) in refs_per_object {
         for url in urls {
@@ -232,20 +239,26 @@ pub(crate) fn classify_unresolved(
             if selection.contains(&to.0, &to.1) {
                 continue;
             }
-            // tgt lockfile presence under the same slug → URL rewrite
-            // will handle it at execute time.
+            // Honor the mapping: a rename pairs src_slug → tgt_slug.
+            // Falling back to src_slug handles the common same-slug case.
+            let tgt_slug = mapping
+                .lookup_tgt_slug(&to.0, &to.1)
+                .unwrap_or(&to.1);
             if tgt_lockfile
                 .objects
                 .get(&to.0)
-                .and_then(|m| m.get(&to.1))
+                .and_then(|m| m.get(tgt_slug))
                 .is_some()
             {
                 continue;
             }
-            out.push(Unresolved {
-                from: from.clone(),
-                to,
-            });
+            let key = (from.0.clone(), from.1.clone(), to.0.clone(), to.1.clone());
+            if seen.insert(key) {
+                out.push(Unresolved {
+                    from: from.clone(),
+                    to,
+                });
+            }
         }
     }
     out
@@ -576,6 +589,18 @@ mod refs_tests {
     }
 
     #[test]
+    fn inbox_extracts_queue_list() {
+        let body = json!({
+            "name": "cost-invoices-inbox",
+            "queues": ["https://test.example/api/v1/queues/600"],
+            "email": "invoices@example.com"
+        });
+        let urls = extract_refs("inboxes", &body);
+        assert_eq!(urls.len(), 1);
+        assert!(urls[0].ends_with("/queues/600"));
+    }
+
+    #[test]
     fn null_urls_ignored() {
         let body = json!({"workspace": null, "schema": null});
         let urls = extract_refs("queues", &body);
@@ -586,6 +611,7 @@ mod refs_tests {
 #[cfg(test)]
 mod classify_tests {
     use super::*;
+    use crate::mapping::Mapping;
     use crate::state::Lockfile;
 
     fn lockfile_with(kind: &str, slug: &str, id: u64, url: &str) -> Lockfile {
@@ -626,6 +652,7 @@ mod classify_tests {
             &sel,
             &src_lf,
             &tgt_lf,
+            &Mapping::default(),
         );
         assert!(unresolved.is_empty(), "{unresolved:?}");
     }
@@ -654,6 +681,7 @@ mod classify_tests {
             &sel,
             &src_lf,
             &tgt_lf,
+            &Mapping::default(),
         );
         assert!(unresolved.is_empty(), "{unresolved:?}");
     }
@@ -677,6 +705,7 @@ mod classify_tests {
             &sel,
             &src_lf,
             &tgt_lf,
+            &Mapping::default(),
         );
         assert_eq!(unresolved.len(), 1);
         let u = &unresolved[0];
@@ -702,8 +731,119 @@ mod classify_tests {
             &sel,
             &src_lf,
             &tgt_lf,
+            &Mapping::default(),
         );
         assert!(unresolved.is_empty());
+    }
+
+    #[test]
+    fn dedup_same_from_to_pair() {
+        // A hook references the same missing queue twice — should produce
+        // exactly one Unresolved entry, not two.
+        let src_lf = lockfile_with(
+            "queues",
+            "cost-invoices",
+            600,
+            "https://test.example/api/v1/queues/600",
+        );
+        let tgt_lf = Lockfile::default();
+        let sel = Selection::default();
+        let mapping = Mapping::default();
+
+        let unresolved = classify_unresolved(
+            &[(
+                ("hooks".to_string(), "h".to_string()),
+                vec![
+                    "https://test.example/api/v1/queues/600".to_string(),
+                    "https://test.example/api/v1/queues/600".to_string(),
+                ],
+            )],
+            &sel,
+            &src_lf,
+            &tgt_lf,
+            &mapping,
+        );
+        assert_eq!(unresolved.len(), 1);
+    }
+
+    #[test]
+    fn multiple_distinct_targets_each_reported() {
+        // One hook referencing two distinct missing queues — both must be
+        // reported.
+        let mut src_lf = Lockfile::default();
+        src_lf.objects.entry("queues".into()).or_default().insert(
+            "q-a".into(),
+            crate::state::lockfile::ObjectEntry {
+                id: 1,
+                url: Some("https://test.example/api/v1/queues/1".into()),
+                modified_at: None,
+                content_hash: None,
+            },
+        );
+        src_lf.objects.entry("queues".into()).or_default().insert(
+            "q-b".into(),
+            crate::state::lockfile::ObjectEntry {
+                id: 2,
+                url: Some("https://test.example/api/v1/queues/2".into()),
+                modified_at: None,
+                content_hash: None,
+            },
+        );
+        let tgt_lf = Lockfile::default();
+        let sel = Selection::default();
+        let mapping = Mapping::default();
+
+        let unresolved = classify_unresolved(
+            &[(
+                ("hooks".to_string(), "h".to_string()),
+                vec![
+                    "https://test.example/api/v1/queues/1".to_string(),
+                    "https://test.example/api/v1/queues/2".to_string(),
+                ],
+            )],
+            &sel,
+            &src_lf,
+            &tgt_lf,
+            &mapping,
+        );
+        assert_eq!(unresolved.len(), 2);
+    }
+
+    #[test]
+    fn mapping_rename_treats_renamed_tgt_as_present() {
+        // src has queues/cost-invoices; tgt has queues/cost-invoices-prod
+        // under a mapping rename. Classifier must NOT flag this as unresolved.
+        let src_lf = lockfile_with(
+            "queues",
+            "cost-invoices",
+            600,
+            "https://test.example/api/v1/queues/600",
+        );
+        let mut tgt_lf = Lockfile::default();
+        tgt_lf.objects.entry("queues".into()).or_default().insert(
+            "cost-invoices-prod".into(),
+            crate::state::lockfile::ObjectEntry {
+                id: 900,
+                url: Some("https://prod.example/api/v1/queues/900".into()),
+                modified_at: None,
+                content_hash: None,
+            },
+        );
+        let sel = Selection::default();
+        let mut mapping = Mapping::default();
+        mapping.queues.insert("cost-invoices".to_string(), "cost-invoices-prod".to_string());
+
+        let unresolved = classify_unresolved(
+            &[(
+                ("hooks".to_string(), "h".to_string()),
+                vec!["https://test.example/api/v1/queues/600".to_string()],
+            )],
+            &sel,
+            &src_lf,
+            &tgt_lf,
+            &mapping,
+        );
+        assert!(unresolved.is_empty(), "{unresolved:?}");
     }
 }
 
