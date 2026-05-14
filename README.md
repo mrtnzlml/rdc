@@ -366,6 +366,31 @@ rdc deploy test prod --mirror
 
 Adds a `- delete:` section to the plan. Objects in `tgt` without a matching slug in `src` are removed (reverse dependency order, children first). `--yes` does **not** bypass the mirror confirmation — it's asked separately because the deletions are irreversible.
 
+### Selective deployment
+
+Deploy only part of the snapshot by passing one or more `--only <selector>` flags:
+
+```sh
+rdc deploy test prod --only hooks/validator-invoices
+rdc deploy test prod --only 'schemas/cost-*' --only queues/cost-invoices
+rdc deploy test prod --only '*/cost-invoices'
+```
+
+Selector forms:
+
+| Form | Example | Matches |
+|---|---|---|
+| `<kind>/<slug>` | `hooks/validator-invoices` | exact `(kind, slug)` |
+| `<kind>/<glob>` | `schemas/cost-*` | `*` glob in the slug segment |
+| `email_templates/<ws>/<q>/<tpl>` | `email_templates/main/cost-invoices/rejection` | email template by compound key |
+| `*/<glob>` | `*/cost-invoices` | any kind whose slug matches |
+
+The selection applies to every phase (creates, updates, deletes). A selector that matches zero objects errors out so typos can't produce silent no-ops.
+
+If a selected object references a peer (e.g. a hook references a queue) that isn't in the selection and isn't already on the target env, rdc prompts on TTY to include the missing peer, or refuses with an actionable error on `--yes`/CI.
+
+The mapping file at `.rdc/map/<src>-to-<tgt>.toml` is untouched — `--only` is a one-shot scope filter, not a way to edit cross-env pairings.
+
 ### Cross-references handled automatically
 
 When a hook in `src` references `https://test.rossum.app/api/v1/queues/600`, the body sent to `tgt` has that URL rewritten to `https://prod.rossum.app/api/v1/queues/<prod-queue-id>`. Same mechanism for `queue.workspace`, `queue.schema`, `email_template.queue`, `rule.queues`, `hook.run_after`. Strings that don't match a known src object are left alone.
