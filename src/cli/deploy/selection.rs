@@ -123,6 +123,22 @@ impl Matcher {
             bail!("invalid --only '{raw}': slug segment is empty");
         }
 
+        // Reject glob syntax outside the supported `*` (zero-or-more chars
+        // within the slug segment). The grammar is narrow on purpose; an
+        // explicit error beats the generic "matched 0 objects" message.
+        if slug_part.contains("**") {
+            bail!(
+                "invalid --only '{raw}': `**` is not supported (use a single `*` for zero-or-more chars). \
+                 Example: 'hooks/*'."
+            );
+        }
+        if slug_part.contains('?') {
+            bail!(
+                "invalid --only '{raw}': `?` is not supported (only `*` for zero-or-more chars). \
+                 Example: 'schemas/cost-*'."
+            );
+        }
+
         let kind = if kind_part == "*" {
             None
         } else if DEPLOYABLE_KINDS.contains(&kind_part) {
@@ -517,6 +533,22 @@ mod matcher_tests {
         let err = Matcher::parse("*/").unwrap_err();
         let s = format!("{err:#}");
         assert!(s.contains("slug segment is empty"), "got: {s}");
+    }
+
+    #[test]
+    fn parse_double_star_errors_with_example() {
+        let err = Matcher::parse("hooks/**").unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("`**` is not supported"), "got: {s}");
+        assert!(s.contains("'hooks/*'"), "got: {s}");
+    }
+
+    #[test]
+    fn parse_question_mark_errors_with_example() {
+        let err = Matcher::parse("hooks/foo?bar").unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("`?` is not supported"), "got: {s}");
+        assert!(s.contains("'schemas/cost-*'"), "got: {s}");
     }
 
     #[test]
