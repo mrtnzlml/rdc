@@ -89,6 +89,27 @@ pub enum Command {
         #[arg(long = "allow-deletes")]
         allow_deletes: bool,
     },
+    /// Reconcile the local snapshot and the env's remote state in one pass.
+    /// Without `<env>`, picks interactively from envs defined in `rdc.toml`
+    /// (or auto-selects when only one exists).
+    Sync {
+        env: Option<String>,
+        /// Print the plan and exit without making any changes.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// With `--dry-run`, print per-object unified diffs.
+        #[arg(long = "diff", requires = "dry_run")]
+        diff: bool,
+        /// Permit local-tombstone → remote DELETE without per-object prompts.
+        #[arg(long = "allow-deletes")]
+        allow_deletes: bool,
+        /// Audit mode: pull changes into local but never write to the remote.
+        #[arg(long = "no-push", conflicts_with = "no_pull")]
+        no_push: bool,
+        /// Deploy mode: write local edits to the remote but never overwrite local files.
+        #[arg(long = "no-pull", conflicts_with = "no_push")]
+        no_pull: bool,
+    },
     /// Deploy a source env to a target env in one shot.
     ///
     /// First-class cross-env operation: bootstraps a fresh target (POSTing
@@ -220,6 +241,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
             with_401_retry(&env, || {
                 crate::cli::push::run(&env, interactive, dry_run, diff, allow_deletes)
+            })
+            .await
+        }
+        Some(Command::Sync { env, dry_run, diff, allow_deletes, no_push, no_pull }) => {
+            let env = crate::cli::env_picker::pick_env("Which env to sync?", env)?;
+            let interactive = crate::cli::resolve::is_interactive(cli.yes);
+            with_401_retry(&env, || {
+                crate::cli::sync::run(&env, interactive, dry_run, diff, allow_deletes, no_push, no_pull)
             })
             .await
         }
