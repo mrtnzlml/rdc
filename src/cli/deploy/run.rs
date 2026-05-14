@@ -579,10 +579,11 @@ fn list_email_template_keys(paths: &Paths) -> Result<Vec<String>> {
             for f in std::fs::read_dir(&et_dir)? {
                 let f = f?;
                 let name = f.file_name().to_string_lossy().into_owned();
+                if crate::paths::is_shadow_artifact(&name, paths.env()) {
+                    continue;
+                }
                 if let Some(stem) = name.strip_suffix(".json") {
-                    if !stem.ends_with(".remote") {
-                        out.push(format!("{ws_slug}/{q_slug}/{stem}"));
-                    }
+                    out.push(format!("{ws_slug}/{q_slug}/{stem}"));
                 }
             }
         }
@@ -605,10 +606,11 @@ fn list_flat_kind(paths: &Paths, kind: &str) -> Result<Vec<String>> {
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
+        if crate::paths::is_shadow_artifact(&name, paths.env()) {
+            continue;
+        }
         if let Some(stem) = name.strip_suffix(".json") {
-            if !stem.ends_with(".remote") {
-                out.push(stem.to_string());
-            }
+            out.push(stem.to_string());
         }
     }
     out.sort();
@@ -653,10 +655,11 @@ fn list_engine_field_slugs(paths: &Paths) -> Result<Vec<String>> {
         for f_entry in std::fs::read_dir(&fields_dir)? {
             let f_entry = f_entry?;
             let name = f_entry.file_name().to_string_lossy().into_owned();
+            if crate::paths::is_shadow_artifact(&name, paths.env()) {
+                continue;
+            }
             if let Some(stem) = name.strip_suffix(".json") {
-                if !stem.ends_with(".remote") {
-                    out.push(stem.to_string());
-                }
+                out.push(stem.to_string());
             }
         }
     }

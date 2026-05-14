@@ -141,7 +141,8 @@ pub async fn process(ctx: &mut PullCtx<'_>, rules: Vec<Rule>, progress: &Arc<Ove
                 } else {
                     // Asymmetric — fall back to shadow for the .py side.
                     if let Some(remote_code_str) = &proposed_code {
-                        let py_remote_path = ctx.paths.rules_dir().join(format!("{slug}.py.remote"));
+                        let env = ctx.paths.env();
+                        let py_remote_path = ctx.paths.rules_dir().join(format!("{slug}.py.{env}"));
                         crate::snapshot::writer::write_atomic(&py_remote_path, remote_code_str.as_bytes())?;
                     }
                     pre_local_code.clone()

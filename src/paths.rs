@@ -161,6 +161,13 @@ impl Paths {
     }
 }
 
+/// Returns true if this filename is a sync-generated shadow artifact for the
+/// given env. Snapshot walkers use this to skip the conflict-skip shadow
+/// (`<file>.<env>`) and the remote-delete marker (`<file>.<env>-deleted`).
+pub fn is_shadow_artifact(name: &str, env: &str) -> bool {
+    name.ends_with(&format!(".{env}")) || name.ends_with(&format!(".{env}-deleted"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +317,31 @@ mod tests {
     #[test]
     fn dataset_dir_path() {
         assert_eq!(p().dataset_dir("vendors"), Path::new("/proj/envs/dev/mdh/vendors"));
+    }
+
+    #[test]
+    fn is_shadow_artifact_matches_env_suffix() {
+        assert!(is_shadow_artifact("queue.json.dev", "dev"));
+        assert!(is_shadow_artifact("schema.json.production", "production"));
+        assert!(is_shadow_artifact("123.py.dev", "dev"));
+    }
+
+    #[test]
+    fn is_shadow_artifact_matches_deleted_marker() {
+        assert!(is_shadow_artifact("hook.json.dev-deleted", "dev"));
+        assert!(is_shadow_artifact("rule.json.production-deleted", "production"));
+    }
+
+    #[test]
+    fn is_shadow_artifact_rejects_other_envs() {
+        assert!(!is_shadow_artifact("queue.json.production", "dev"));
+        assert!(!is_shadow_artifact("queue.json.production-deleted", "dev"));
+    }
+
+    #[test]
+    fn is_shadow_artifact_rejects_plain_files() {
+        assert!(!is_shadow_artifact("queue.json", "dev"));
+        assert!(!is_shadow_artifact("hook.py", "dev"));
+        assert!(!is_shadow_artifact("workspace.json", "production"));
     }
 }

@@ -172,10 +172,10 @@ fn local_edits(paths: &Paths, lockfile: &Lockfile) -> Result<Vec<(String, String
         for entry in std::fs::read_dir(paths.hooks_dir())? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_string();
-            let Some(slug) = name.strip_suffix(".json") else { continue };
-            if slug.ends_with(".remote") {
+            if crate::paths::is_shadow_artifact(&name, paths.env()) {
                 continue;
             }
+            let Some(slug) = name.strip_suffix(".json") else { continue };
             let hook = match crate::snapshot::hook::read_hook(&paths.hooks_dir(), slug) {
                 Ok(h) => h,
                 Err(_) => continue,
@@ -192,7 +192,7 @@ fn local_edits(paths: &Paths, lockfile: &Lockfile) -> Result<Vec<(String, String
     // deserialize+serialize so the canonical bytes match what pull wrote
     // (struct-order typed fields, BTreeMap-sorted extra).
     rules_edits(paths, lockfile, &mut out)?;
-    flat_kind_edits::<crate::model::Label>(&paths.labels_dir(), "labels", lockfile, &mut out)?;
+    flat_kind_edits::<crate::model::Label>(&paths.labels_dir(), "labels", paths.env(), lockfile, &mut out)?;
     engines_edits(paths, lockfile, &mut out)?;
     engine_fields_edits(paths, lockfile, &mut out)?;
     // Workflows + workflow_steps are pull-only (Rossum API read-only); we
@@ -256,10 +256,10 @@ fn local_edits(paths: &Paths, lockfile: &Lockfile) -> Result<Vec<(String, String
                     for t_entry in std::fs::read_dir(&templates_dir)? {
                         let t_entry = t_entry?;
                         let name = t_entry.file_name().to_string_lossy().to_string();
-                        let Some(t_slug) = name.strip_suffix(".json") else { continue };
-                        if t_slug.ends_with(".remote") {
+                        if crate::paths::is_shadow_artifact(&name, paths.env()) {
                             continue;
                         }
+                        let Some(t_slug) = name.strip_suffix(".json") else { continue };
                         let path = templates_dir.join(format!("{t_slug}.json"));
                         let bytes = read_pretty_canonical_bytes::<crate::model::EmailTemplate>(&path)?;
                         let h = content_hash(&bytes);
@@ -311,6 +311,7 @@ fn differs(kind: &str, slug: &str, lockfile: &Lockfile, local_hash: &str) -> boo
 fn flat_kind_edits<T>(
     dir: &Path,
     kind: &str,
+    env: &str,
     lockfile: &Lockfile,
     out: &mut Vec<(String, String)>,
 ) -> Result<()>
@@ -323,10 +324,10 @@ where
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
-        let Some(slug) = name.strip_suffix(".json") else { continue };
-        if slug.ends_with(".remote") {
+        if crate::paths::is_shadow_artifact(&name, env) {
             continue;
         }
+        let Some(slug) = name.strip_suffix(".json") else { continue };
         let path = dir.join(format!("{slug}.json"));
         let bytes = read_pretty_canonical_bytes::<T>(&path)?;
         let h = content_hash(&bytes);
@@ -353,10 +354,10 @@ fn rules_edits(
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
-        let Some(slug) = name.strip_suffix(".json") else { continue };
-        if slug.ends_with(".remote") {
+        if crate::paths::is_shadow_artifact(&name, paths.env()) {
             continue;
         }
+        let Some(slug) = name.strip_suffix(".json") else { continue };
         // Re-read via splice + typed-canonical so the bytes match what
         // pull would write next.
         let rule = crate::snapshot::rule::read_rule(&dir, slug)?;
@@ -423,10 +424,10 @@ fn engine_fields_edits(
         for f_entry in std::fs::read_dir(&fields_dir)? {
             let f_entry = f_entry?;
             let name = f_entry.file_name().to_string_lossy().to_string();
-            let Some(f_slug) = name.strip_suffix(".json") else { continue };
-            if f_slug.ends_with(".remote") {
+            if crate::paths::is_shadow_artifact(&name, paths.env()) {
                 continue;
             }
+            let Some(f_slug) = name.strip_suffix(".json") else { continue };
             let path = fields_dir.join(format!("{f_slug}.json"));
             let bytes = read_pretty_canonical_bytes::<crate::model::EngineField>(&path)?;
             let h = content_hash(&bytes);

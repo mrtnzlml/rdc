@@ -23,9 +23,21 @@ use std::path::Path;
 pub fn auto_match(mapping: &mut Mapping, src_paths: &Paths, tgt_paths: &Paths) -> Result<usize> {
     let mut added = 0;
     added += match_workspaces(&mut mapping.workspaces, src_paths, tgt_paths)?;
-    added += match_kind(&mut mapping.hooks, &src_paths.hooks_dir(), &tgt_paths.hooks_dir())?;
-    added += match_kind(&mut mapping.rules, &src_paths.rules_dir(), &tgt_paths.rules_dir())?;
-    added += match_kind(&mut mapping.labels, &src_paths.labels_dir(), &tgt_paths.labels_dir())?;
+    added += match_kind(
+        &mut mapping.hooks,
+        &src_paths.hooks_dir(), src_paths.env(),
+        &tgt_paths.hooks_dir(), tgt_paths.env(),
+    )?;
+    added += match_kind(
+        &mut mapping.rules,
+        &src_paths.rules_dir(), src_paths.env(),
+        &tgt_paths.rules_dir(), tgt_paths.env(),
+    )?;
+    added += match_kind(
+        &mut mapping.labels,
+        &src_paths.labels_dir(), src_paths.env(),
+        &tgt_paths.labels_dir(), tgt_paths.env(),
+    )?;
     added += match_queues(&mut mapping.queues, src_paths, tgt_paths)?;
     added += match_schemas(&mut mapping.schemas, src_paths, tgt_paths)?;
     added += match_inboxes(&mut mapping.inboxes, src_paths, tgt_paths)?;
@@ -38,10 +50,13 @@ pub fn auto_match(mapping: &mut Mapping, src_paths: &Paths, tgt_paths: &Paths) -
 fn match_kind(
     existing: &mut BTreeMap<String, String>,
     src_dir: &Path,
+    src_env: &str,
     tgt_dir: &Path,
+    tgt_env: &str,
 ) -> Result<usize> {
-    let src_slugs = list_flat_slugs(src_dir)?;
-    let tgt_slugs: std::collections::HashSet<_> = list_flat_slugs(tgt_dir)?.into_iter().collect();
+    let src_slugs = list_flat_slugs(src_dir, src_env)?;
+    let tgt_slugs: std::collections::HashSet<_> =
+        list_flat_slugs(tgt_dir, tgt_env)?.into_iter().collect();
     let mut added = 0;
     for src_slug in &src_slugs {
         if existing.contains_key(src_slug) {
@@ -55,7 +70,7 @@ fn match_kind(
     Ok(added)
 }
 
-fn list_flat_slugs(dir: &Path) -> Result<Vec<String>> {
+fn list_flat_slugs(dir: &Path, env: &str) -> Result<Vec<String>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -66,10 +81,11 @@ fn list_flat_slugs(dir: &Path) -> Result<Vec<String>> {
         let entry = entry
             .with_context(|| format!("listing {}", dir.display()))?;
         let name = entry.file_name().to_string_lossy().to_string();
+        if crate::paths::is_shadow_artifact(&name, env) {
+            continue;
+        }
         if let Some(slug) = name.strip_suffix(".json") {
-            if !slug.ends_with(".remote") {
-                out.push(slug.to_string());
-            }
+            out.push(slug.to_string());
         }
     }
     out.sort();
@@ -121,10 +137,11 @@ fn list_engine_field_slugs(paths: &Paths) -> Result<Vec<String>> {
         for f_entry in std::fs::read_dir(&fields_dir)? {
             let f_entry = f_entry?;
             let name = f_entry.file_name().to_string_lossy().to_string();
+            if crate::paths::is_shadow_artifact(&name, paths.env()) {
+                continue;
+            }
             if let Some(slug) = name.strip_suffix(".json") {
-                if !slug.ends_with(".remote") {
-                    out.push(slug.to_string());
-                }
+                out.push(slug.to_string());
             }
         }
     }
@@ -408,10 +425,11 @@ fn collect_email_template_keys(paths: &Paths) -> Result<Vec<String>> {
             for t_entry in std::fs::read_dir(&templates_dir)? {
                 let t_entry = t_entry?;
                 let name = t_entry.file_name().to_string_lossy().to_string();
+                if crate::paths::is_shadow_artifact(&name, paths.env()) {
+                    continue;
+                }
                 if let Some(template_slug) = name.strip_suffix(".json") {
-                    if !template_slug.ends_with(".remote") {
-                        out.push(format!("{ws_slug}/{q_slug}/{template_slug}"));
-                    }
+                    out.push(format!("{ws_slug}/{q_slug}/{template_slug}"));
                 }
             }
         }

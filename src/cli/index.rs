@@ -119,8 +119,8 @@ struct IndexCtx<'a> {
 impl<'a> IndexCtx<'a> {
     fn build(paths: &'a Paths, lockfile: &'a Lockfile) -> Self {
         let queue_to_ws_slug = build_queue_to_ws(paths);
-        let queue_to_hooks = build_queue_back_refs(paths.hooks_dir(), lockfile, "queues");
-        let queue_to_rules = build_queue_back_refs(paths.rules_dir(), lockfile, "queues");
+        let queue_to_hooks = build_queue_back_refs(paths.hooks_dir(), lockfile, "queues", paths.env());
+        let queue_to_rules = build_queue_back_refs(paths.rules_dir(), lockfile, "queues", paths.env());
         let queue_to_email_templates = build_queue_to_email_templates(lockfile);
         let engine_to_fields = build_engine_to_fields(paths, lockfile);
         Self {
@@ -164,13 +164,14 @@ fn build_queue_back_refs(
     dir: PathBuf,
     lockfile: &Lockfile,
     field: &str,
+    env: &str,
 ) -> BTreeMap<String, Vec<String>> {
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let Ok(entries) = std::fs::read_dir(&dir) else { return out };
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
+        if crate::paths::is_shadow_artifact(&name, env) { continue }
         let Some(slug) = name.strip_suffix(".json") else { continue };
-        if slug.ends_with(".remote") { continue }
         let Some(v) = read_json(&e.path()) else { continue };
         let queue_slugs = urls_to_slugs(&v, field, "queues", lockfile);
         for q in queue_slugs {
@@ -213,8 +214,8 @@ fn build_engine_to_fields(paths: &Paths, lockfile: &Lockfile) -> BTreeMap<String
         let Ok(field_entries) = std::fs::read_dir(&fields_dir) else { continue };
         for f in field_entries.flatten() {
             let name = f.file_name().to_string_lossy().to_string();
+            if crate::paths::is_shadow_artifact(&name, paths.env()) { continue }
             let Some(slug) = name.strip_suffix(".json") else { continue };
-            if slug.ends_with(".remote") { continue }
             let Some(v) = read_json(&f.path()) else { continue };
             let Some(engine_url) = v.get("engine").and_then(|u| u.as_str()) else { continue };
             let Some(engine_slug) = lockfile.slug_for_url("engines", engine_url) else { continue };

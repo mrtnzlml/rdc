@@ -310,13 +310,14 @@ fn scan_engine_fields(
         for f_entry in std::fs::read_dir(&fields_dir)? {
             let f_entry = f_entry?;
             let f_path = f_entry.path();
+            let name = f_entry.file_name().to_string_lossy().to_string();
+            if crate::paths::is_shadow_artifact(&name, paths.env()) {
+                continue;
+            }
             if f_path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
             let Some(f_slug) = f_path.file_stem().and_then(|s| s.to_str()) else { continue };
-            if f_slug.ends_with(".remote") {
-                continue;
-            }
             let bytes = std::fs::read(&f_path)?;
             let local_hash = content_hash(&bytes);
             scanned += 1;
@@ -350,13 +351,14 @@ fn scan_rules(
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if crate::paths::is_shadow_artifact(&name, paths.env()) {
+            continue;
+        }
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
         let Some(slug) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-        if slug.ends_with(".remote") {
-            continue;
-        }
         let json_bytes = std::fs::read(&path)?;
         let py_path = path.with_extension("py");
         let code = if py_path.exists() {
@@ -428,14 +430,15 @@ fn scan_hooks(
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Skip env-named shadow artifacts (e.g. "validator-invoices.json.dev").
+        if crate::paths::is_shadow_artifact(&name, paths.env()) {
+            continue;
+        }
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
         let Some(slug) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-        // Skip .remote files (e.g. "validator-invoices.remote.json")
-        if slug.ends_with(".remote") {
-            continue;
-        }
         let json_bytes = std::fs::read(&path)?;
         let py_path = path.with_extension("py");
         let code = if py_path.exists() {

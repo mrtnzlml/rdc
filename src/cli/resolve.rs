@@ -18,7 +18,7 @@
 //! `[k]` keeps local, no write. `[r]` writes remote. `[e]` opens `$EDITOR`
 //! on a temp file (with conflict markers) and uses the saved bytes. `[s]`
 //! falls through to the original shadow-file behavior (writes
-//! `<file>.remote`, keeps local). `[a]` bubbles a `PullAborted` error so
+//! `<file>.<env>`, keeps local). `[a]` bubbles a `PullAborted` error so
 //! the caller stops without saving the lockfile.
 //!
 //! Activation: only on TTY stdin AND when `--yes` is not set. Otherwise
@@ -41,7 +41,7 @@ pub enum Resolution {
     /// Use these (user-edited) bytes. Lockfile records hash of these bytes.
     Edit(Vec<u8>),
     /// Treat this as the legacy shadow-file behavior — write
-    /// `<file>.remote`, keep local. Lockfile records local hash.
+    /// `<file>.<env>`, keep local. Lockfile records local hash.
     Skip,
     /// Abort the entire pull. Caller stops without saving the lockfile.
     Abort,
@@ -323,7 +323,7 @@ fn validate_edited(bytes: &[u8], local_path: &Path) -> std::result::Result<(), S
 /// - `local_bytes == remote_bytes` → no-op (no prompt, no write); returns
 ///   `local_bytes`.
 /// - `interactive == false` → legacy shadow-file: writes
-///   `<local_path>.remote`, keeps local on disk, returns `local_bytes`.
+///   `<local_path>.<env>`, keeps local on disk, returns `local_bytes`.
 /// - `interactive == true && bytes differ` → prompt the user via
 ///   [`prompt_resolve`] with `[label_index/label_total]`. On Skip / Keep
 ///   semantics match [`apply_pull_action`]. On Abort: propagate
@@ -347,7 +347,7 @@ pub fn resolve_combined_file(
     }
 
     if !interactive {
-        let conflict_path = shadow_path_for(local_path);
+        let conflict_path = shadow_path_for(local_path, env);
         write_atomic(&conflict_path, remote_bytes)?;
         eprintln!(
             "warning: {} conflict — local preserved, remote at {}",
@@ -391,7 +391,7 @@ pub fn resolve_combined_file(
             Ok(edited)
         }
         Resolution::Skip => {
-            let conflict_path = shadow_path_for(local_path);
+            let conflict_path = shadow_path_for(local_path, env);
             write_atomic(&conflict_path, remote_bytes)?;
             eprintln!(
                 "warning: {} conflict — local preserved, remote at {}",
@@ -404,12 +404,13 @@ pub fn resolve_combined_file(
     }
 }
 
-/// Compute the `<file>.remote` shadow path for a given local file.
-fn shadow_path_for(local_path: &Path) -> std::path::PathBuf {
+/// Compute the `<file>.<env>` shadow path for a given local file. The env
+/// suffix disambiguates the shadow artifact when a project has multiple envs.
+fn shadow_path_for(local_path: &Path, env: &str) -> std::path::PathBuf {
     let mut conflict_path = local_path.to_path_buf();
     let new_name = match conflict_path.file_name().and_then(|s| s.to_str()) {
-        Some(name) => format!("{name}.remote"),
-        None => "remote".to_string(),
+        Some(name) => format!("{name}.{env}"),
+        None => format!("shadow.{env}"),
     };
     conflict_path.set_file_name(new_name);
     conflict_path
@@ -889,7 +890,7 @@ mod tests {
         let out = resolve_combined_file(1, 2, &path, b"same\n", b"same\n", true, "test").unwrap();
         assert_eq!(out, b"same\n");
         // No shadow file written.
-        assert!(!dir.path().join("a.py.remote").exists());
+        assert!(!dir.path().join("a.py.test").exists());
     }
 
     #[test]
@@ -899,21 +900,21 @@ mod tests {
         std::fs::write(&path, b"local\n").unwrap();
         let out = resolve_combined_file(1, 1, &path, b"local\n", b"remote\n", false, "test").unwrap();
         assert_eq!(out, b"local\n");
-        assert_eq!(std::fs::read(dir.path().join("a.py.remote")).unwrap(), b"remote\n");
+        assert_eq!(std::fs::read(dir.path().join("a.py.test")).unwrap(), b"remote\n");
         // Local file untouched.
         assert_eq!(std::fs::read(&path).unwrap(), b"local\n");
     }
 
     #[test]
-    fn shadow_path_inserts_remote_suffix() {
+    fn shadow_path_inserts_env_suffix() {
         let p = std::path::PathBuf::from("/tmp/x/y.json");
-        assert_eq!(shadow_path_for(&p), std::path::PathBuf::from("/tmp/x/y.json.remote"));
+        assert_eq!(shadow_path_for(&p, "dev"), std::path::PathBuf::from("/tmp/x/y.json.dev"));
     }
 
     #[test]
     fn shadow_path_for_py_extension() {
         let p = std::path::PathBuf::from("/tmp/formulas/123.py");
-        assert_eq!(shadow_path_for(&p), std::path::PathBuf::from("/tmp/formulas/123.py.remote"));
+        assert_eq!(shadow_path_for(&p, "production"), std::path::PathBuf::from("/tmp/formulas/123.py.production"));
     }
 
     #[test]

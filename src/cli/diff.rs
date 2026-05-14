@@ -59,10 +59,10 @@ pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) ->
         for entry in std::fs::read_dir(paths.hooks_dir())? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_string();
-            let Some(slug) = name.strip_suffix(".json") else { continue };
-            if slug.ends_with(".remote") {
+            if crate::paths::is_shadow_artifact(&name, paths.env()) {
                 continue;
             }
+            let Some(slug) = name.strip_suffix(".json") else { continue };
 
             let local = match read_hook(&paths.hooks_dir(), slug) {
                 Ok(h) => h,
@@ -99,7 +99,7 @@ pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) ->
     diff_rules(&paths, &lockfile, &client, &mut diffs_printed).await?;
     // Flat kinds with simple typed JSON.
     diff_flat_remote::<crate::model::Label>(
-        &paths.labels_dir(), "labels", &lockfile, &client, &mut diffs_printed,
+        &paths.labels_dir(), "labels", paths.env(), &lockfile, &client, &mut diffs_printed,
         |c, id| Box::pin(async move {
             let list = c.list_labels(None).await?;
             list.into_iter().find(|l| l.id == id)
@@ -183,10 +183,10 @@ pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) ->
                     for t_entry in std::fs::read_dir(&templates_dir)? {
                         let t_entry = t_entry?;
                         let name = t_entry.file_name().to_string_lossy().to_string();
-                        let Some(t_slug) = name.strip_suffix(".json") else { continue };
-                        if t_slug.ends_with(".remote") {
+                        if crate::paths::is_shadow_artifact(&name, paths.env()) {
                             continue;
                         }
+                        let Some(t_slug) = name.strip_suffix(".json") else { continue };
                         let local = read_email_template(&templates_dir, t_slug)?;
                         let key = format!("{ws_slug}/{q_slug}/{t_slug}");
                         let id = match lookup_id(&lockfile, "email_templates", &key) {
@@ -341,34 +341,35 @@ fn kind_from_relative_path(rel: &str) -> Option<&'static str> {
 }
 
 /// Walk `envs/<env>/` and return a map of (relative-path → bytes) for every
-/// JSON, .py, and .toml file (skipping `.remote` siblings and `_index.md`).
+/// JSON, .py, and .toml file (skipping shadow artifacts and `_index.md`).
 fn collect_snapshot_files(paths: &Paths) -> Result<std::collections::BTreeMap<String, Vec<u8>>> {
     let mut out: std::collections::BTreeMap<String, Vec<u8>> = std::collections::BTreeMap::new();
     let env_root = paths.env_root();
     if !env_root.exists() {
         return Ok(out);
     }
-    walk_dir(&env_root, &env_root, &mut out)?;
+    walk_dir(&env_root, &env_root, paths.env(), &mut out)?;
     Ok(out)
 }
 
 fn walk_dir(
     base: &Path,
     dir: &Path,
+    env: &str,
     out: &mut std::collections::BTreeMap<String, Vec<u8>>,
 ) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            walk_dir(base, &path, out)?;
+            walk_dir(base, &path, env, out)?;
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
         if name == "_index.md" {
             continue;
         }
-        if name.ends_with(".remote") || name.ends_with(".remote.json") {
+        if crate::paths::is_shadow_artifact(&name, env) {
             continue;
         }
         // Only diff text-y files.
@@ -488,10 +489,10 @@ async fn diff_rules(
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
-        let Some(slug) = name.strip_suffix(".json") else { continue };
-        if slug.ends_with(".remote") {
+        if crate::paths::is_shadow_artifact(&name, paths.env()) {
             continue;
         }
+        let Some(slug) = name.strip_suffix(".json") else { continue };
         let local = match read_rule(&dir, slug) {
             Ok(r) => r,
             Err(_) => continue,
@@ -597,10 +598,10 @@ async fn diff_engine_fields(
         for f_entry in std::fs::read_dir(&fields_dir)? {
             let f_entry = f_entry?;
             let name = f_entry.file_name().to_string_lossy().to_string();
-            let Some(f_slug) = name.strip_suffix(".json") else { continue };
-            if f_slug.ends_with(".remote") {
+            if crate::paths::is_shadow_artifact(&name, paths.env()) {
                 continue;
             }
+            let Some(f_slug) = name.strip_suffix(".json") else { continue };
             let path = fields_dir.join(format!("{f_slug}.json"));
             let local: crate::model::EngineField = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
             let local_canon = canonical_json_for_diff(&local)?;
@@ -626,6 +627,7 @@ async fn diff_engine_fields(
 async fn diff_flat_remote<T>(
     dir: &Path,
     kind: &str,
+    env: &str,
     lockfile: &Lockfile,
     client: &RossumClient,
     counter: &mut usize,
@@ -640,10 +642,10 @@ where
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
-        let Some(slug) = name.strip_suffix(".json") else { continue };
-        if slug.ends_with(".remote") {
+        if crate::paths::is_shadow_artifact(&name, env) {
             continue;
         }
+        let Some(slug) = name.strip_suffix(".json") else { continue };
         let path = dir.join(format!("{slug}.json"));
         let raw = std::fs::read_to_string(&path)?;
         let local: T = serde_json::from_str(&raw)?;

@@ -191,7 +191,7 @@ pub fn decide_pull_action(
 /// On [`PullAction::Conflict`] with `interactive == true`, the function
 /// invokes the spec §8.3 resolver TUI. With `interactive == false` (CI,
 /// non-TTY, or `--yes`), it preserves the legacy shadow-file behavior:
-/// writes `<file>.remote` next to the local file, keeps local, returns
+/// writes `<file>.<env>` next to the local file, keeps local, returns
 /// the local hash.
 pub fn apply_pull_action(
     action: PullAction,

@@ -706,8 +706,8 @@ async fn re_pull_emits_remote_file_on_real_conflict() {
     let after_local = std::fs::read_to_string(&hook_path).unwrap();
     assert_eq!(after_local, local_edit, "local must be preserved on conflict");
 
-    let remote_path = project.path().join("envs/dev/hooks/validator-invoices.json.remote");
-    assert!(remote_path.exists(), "<slug>.json.remote should be written on conflict");
+    let remote_path = project.path().join("envs/dev/hooks/validator-invoices.json.dev");
+    assert!(remote_path.exists(), "<slug>.json.<env> should be written on conflict");
     let remote_content = std::fs::read_to_string(&remote_path).unwrap();
     assert!(remote_content.contains("REMOTE EDIT"), "remote file should contain remote content");
 }
@@ -1015,9 +1015,9 @@ async fn re_pull_emits_remote_files_on_formula_conflict() {
     assert_eq!(after, local_edit);
 
     let queue_dir = project.path().join("envs/dev/workspaces/invoices-ap/queues/cost-invoices");
-    assert!(queue_dir.join("schema.json.remote").exists());
-    assert!(queue_dir.join("formulas.remote/amount_total.py").exists());
-    let remote_formula = std::fs::read_to_string(queue_dir.join("formulas.remote/amount_total.py")).unwrap();
+    assert!(queue_dir.join("schema.json.dev").exists());
+    assert!(queue_dir.join("formulas.dev/amount_total.py").exists());
+    let remote_formula = std::fs::read_to_string(queue_dir.join("formulas.dev/amount_total.py")).unwrap();
     assert!(remote_formula.contains("REMOTE_FORMULA_EDIT"));
 }
 
