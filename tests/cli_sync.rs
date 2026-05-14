@@ -366,3 +366,146 @@ async fn sync_clean_label_no_writes() {
     let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
     assert!(lf_raw.contains("priority-high"));
 }
+
+/// Push-side LocalEdit: the label exists on disk with edited content, the
+/// lockfile records the pre-edit hash, and the remote still serves the
+/// pre-edit body. The classifier must mark it `LocalEdit` and the executor
+/// must PATCH the remote exactly once. This pins the push-side branch of
+/// the sync executor (Task 15).
+#[tokio::test]
+async fn sync_local_edit_only_patches_remote_label() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // The label remote serves throughout the test (both the initial pull
+    // that seeds the lockfile and the subsequent sync's listing). The
+    // sync's push driver also re-lists labels for drift detection — the
+    // body it sees here must hash to the base recorded by pull.
+    let base_label = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 99,
+                "url": format!("{}/api/v1/labels/99", server.uri()),
+                "name": "Audit Hold",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "color": "#aabbcc",
+                "modified_at": "2026-04-15T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&base_label))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/labels"]).await;
+
+    // PATCH /labels/99: server confirms the edit. `.expect(1)` enforces
+    // that exactly one PATCH call lands during the second sync.
+    let patched_color = "#ff0000";
+    let patch_response = serde_json::json!({
+        "id": 99,
+        "url": format!("{}/api/v1/labels/99", server.uri()),
+        "name": "Audit Hold",
+        "organization": format!("{}/api/v1/organizations/1", server.uri()),
+        "color": patched_color,
+        "modified_at": "2026-04-15T09:00:00Z"
+    });
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/labels/99"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&patch_response))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // First sync: pulls the label and populates the lockfile with the
+    // base content hash. Pull-side branch (Task 14) handles this.
+    rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* diff = */ false, /* allow_deletes = */ false,
+        /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await
+    .expect("first sync should succeed");
+
+    // Edit the local label file — this triggers the push-side LocalEdit
+    // class on the second sync. The remote still serves the pre-edit
+    // body, so `remote_hash == base_hash` and `local_hash != base_hash`.
+    let label_path = project.path().join("envs/dev/labels/audit-hold.json");
+    assert!(label_path.exists(), "first sync should have written the label");
+    let raw = std::fs::read_to_string(&label_path).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    v["color"] = serde_json::Value::String(patched_color.to_string());
+    std::fs::write(&label_path, format!("{}\n", serde_json::to_string_pretty(&v).unwrap()))
+        .unwrap();
+
+    // Snapshot lockfile hash before second sync so we can assert it changes.
+    let lf_before = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json"))
+        .unwrap();
+
+    // Second sync: classifier sees LocalEdit; executor must PATCH.
+    let result = rdc::cli::sync::run(
+        "dev", false, false, false, false, false, false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    result.expect("second sync should succeed and PATCH the remote label");
+
+    // wiremock's `.expect(1)` on the PATCH mock is verified on Drop, but
+    // make the assertion explicit by counting the received requests too.
+    let patch_calls = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.method == http::Method::PATCH && r.url.path() == "/api/v1/labels/99")
+        .count();
+    assert_eq!(
+        patch_calls, 1,
+        "exactly one PATCH /labels/99 expected, saw {patch_calls}"
+    );
+
+    // The local file is rewritten to the server's post-PATCH canonical
+    // form, so the edited color survives.
+    let body = std::fs::read_to_string(&label_path).unwrap();
+    assert!(
+        body.contains(patched_color),
+        "local file should retain the edited color after PATCH: {body}"
+    );
+
+    // Lockfile hash for labels/audit-hold must have changed: it now
+    // records the post-PATCH canonical form, not the pre-edit base.
+    let lf_after = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json"))
+        .unwrap();
+    assert_ne!(
+        lf_before, lf_after,
+        "lockfile must update after a successful PATCH"
+    );
+    assert!(lf_after.contains("audit-hold"), "lockfile keeps the slug: {lf_after}");
+}

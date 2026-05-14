@@ -146,7 +146,7 @@ pub async fn run(
     // Run drivers in a separate function so we can detect [a]bort
     // (PullAborted) and skip lockfile.save(). Mirrors the pull-side
     // abort flow (spec §8.3 "rolls back lockfile; nothing written").
-    let push_outcome = run_drivers(&paths, &client, &mut lockfile, env, interactive, &changes, &progress).await;
+    let push_outcome = push_classified(&paths, &client, &mut lockfile, env, interactive, &changes, &progress).await;
 
     let counts = match push_outcome {
         Ok(c) => c,
@@ -216,20 +216,23 @@ pub async fn run(
     Ok(())
 }
 
-struct PushCounts {
-    n_workspaces: usize, c_workspaces: usize,
-    n_hooks: usize, c_hooks: usize,
-    n_rules: usize, c_rules: usize,
-    n_labels: usize, c_labels: usize,
-    n_queues: usize, c_queues: usize,
-    n_schemas: usize, c_schemas: usize,
-    n_inboxes: usize, c_inboxes: usize,
-    n_email_templates: usize, c_email_templates: usize,
-    n_engines: usize, c_engines: usize,
-    n_engine_fields: usize, c_engine_fields: usize,
+pub(crate) struct PushCounts {
+    pub(crate) n_workspaces: usize, pub(crate) c_workspaces: usize,
+    pub(crate) n_hooks: usize, pub(crate) c_hooks: usize,
+    pub(crate) n_rules: usize, pub(crate) c_rules: usize,
+    pub(crate) n_labels: usize, pub(crate) c_labels: usize,
+    pub(crate) n_queues: usize, pub(crate) c_queues: usize,
+    pub(crate) n_schemas: usize, pub(crate) c_schemas: usize,
+    pub(crate) n_inboxes: usize, pub(crate) c_inboxes: usize,
+    pub(crate) n_email_templates: usize, pub(crate) c_email_templates: usize,
+    pub(crate) n_engines: usize, pub(crate) c_engines: usize,
+    pub(crate) n_engine_fields: usize, pub(crate) c_engine_fields: usize,
 }
 
-async fn run_drivers(
+/// Phase 2 of `rdc push`: run each kind's push driver in dependency
+/// order. Also reused by `rdc sync`'s push-side branch (Task 15), which
+/// builds a `ChangeList` from classified items and delegates here.
+pub(crate) async fn push_classified(
     paths: &Paths,
     client: &RossumClient,
     lockfile: &mut Lockfile,

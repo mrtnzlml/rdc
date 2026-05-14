@@ -1,8 +1,8 @@
 //! Execute the classified plan. Today this dispatches pull-side writes
-//! (`RemoteEdit`, `RemoteCreate`) by delegating to the per-kind
-//! `cli::pull::<kind>::process` driver with a subset filter. Push-side
-//! writes, the both-diverged resolver, and the remote-delete /
-//! double-conflict paths land in subsequent tasks.
+//! (`RemoteEdit`, `RemoteCreate`) and push-side writes (`LocalEdit`,
+//! `LocalCreate`) by delegating to the existing per-kind pull / push
+//! pipelines with a subset filter. The both-diverged resolver and the
+//! remote-delete / double-conflict paths land in subsequent tasks.
 //!
 //! Spec: docs/superpowers/specs/2026-05-14-unified-sync-design.md.
 
@@ -11,15 +11,16 @@ use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Dispatch the classified items. Pull-side items (`RemoteEdit` /
-/// `RemoteCreate`) are grouped by kind, and the per-kind pull driver
-/// runs once per kind with a `(kind, slug)` subset filter. Drivers
-/// silently skip items outside the subset, so only the classified
-/// slugs are written.
+/// `RemoteCreate`) are grouped by kind and the per-kind pull driver
+/// runs once per kind with a `(kind, slug)` subset filter. Push-side
+/// items (`LocalEdit` / `LocalCreate`) are folded into a `ChangeList`
+/// via [`crate::cli::push::scan::change_list_from_classified`] and
+/// handed off to [`crate::cli::push::push_classified`], the same entry
+/// point that `rdc push` uses.
 ///
-/// `no_push` is currently unused — push-side dispatch lands in Task 15.
-/// `interactive` is unused here; the conflict resolver lives in the
-/// per-driver code path (`apply_pull_action`) which already consults
-/// `ctx.interactive`.
+/// `interactive` is unused on the pull side (the per-driver
+/// `apply_pull_action` consults `ctx.interactive`); the push side reads
+/// it explicitly for the drift-resolver prompt.
 pub async fn run(
     ctx: &mut crate::cli::pull::common::PullCtx<'_>,
     catalog: &crate::cli::pull::common::RemoteCatalog,
@@ -29,11 +30,6 @@ pub async fn run(
     interactive: bool,
     progress: &std::sync::Arc<crate::progress::OverallProgress>,
 ) -> Result<()> {
-    // `no_push` and `interactive` flow into Tasks 15-17. Mark them
-    // explicitly consumed so the compiler treats today's no-op as
-    // intentional rather than a forgotten parameter.
-    let _ = (no_push, interactive);
-
     if !no_pull {
         // Group pull-side items by kind so each driver runs at most
         // once per sync. Slugs inside the subset filter through the
@@ -65,6 +61,30 @@ pub async fn run(
         // map populated; see `pull::run_drivers` for ordering).
     }
 
-    // Push-side, conflict, remote-delete branches: Tasks 15, 16, 17.
+    if !no_push {
+        // Fold LocalEdit / LocalCreate items into the same `ChangeList`
+        // shape `push::scan::scan` produces, then delegate to the
+        // existing push pipeline. `push_classified` mirrors what
+        // `rdc push <env>` runs after its own scan/dry-run gate, so
+        // sync inherits drift detection, conflict prompts, and progress
+        // ticking for free.
+        let change_list =
+            crate::cli::push::scan::change_list_from_classified(ctx.paths, classified);
+        if !change_list.is_empty() {
+            let env = ctx.paths.env().to_string();
+            crate::cli::push::push_classified(
+                ctx.paths,
+                ctx.client,
+                ctx.lockfile,
+                &env,
+                interactive,
+                &change_list,
+                progress,
+            )
+            .await?;
+        }
+    }
+
+    // Conflict + remote-delete branches: Tasks 16, 17.
     Ok(())
 }
