@@ -15,7 +15,7 @@ mod engine_fields;
 mod engines;
 mod hooks;
 pub(crate) mod labels;
-mod mdh;
+pub(crate) mod mdh;
 mod organization;
 mod queues;
 mod rules;
