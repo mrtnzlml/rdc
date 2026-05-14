@@ -1234,6 +1234,102 @@ async fn deploy_only_creates_filtered_kind_only() {
         "POST /rules must not be called when --only hooks/x");
 }
 
+/// `--only hooks/x-v2` must PATCH the matching hook but never PATCH
+/// /rules/<id>, even when both objects diverge between src and tgt.
+#[tokio::test]
+async fn deploy_only_update_sweep_skips_unmatched_kinds() {
+    // Both envs already have hook X and rule Y (existing objects).
+    // src and tgt diverge on each. `--only hooks/x-v2` must PATCH the
+    // hook but NEVER PATCH /rules/<id>.
+    use std::sync::{Arc, Mutex};
+
+    let test_server = MockServer::start().await;
+    let prod_server = MockServer::start().await;
+
+    let rule_patch_calls = Arc::new(Mutex::new(0u32));
+
+    let hook_test = serde_json::json!({
+        "id": 100, "url": format!("{}/api/v1/hooks/100", test_server.uri()),
+        "name": "x-v2", "type": "function", "queues": [], "events": ["annotation_status"],
+        "config": { "runtime": "python3.12", "code": "def x(p):\n    return {'v': 2}\n" }
+    });
+    let hook_prod = serde_json::json!({
+        "id": 900, "url": format!("{}/api/v1/hooks/900", prod_server.uri()),
+        "name": "x-v2", "type": "function", "queues": [], "events": ["annotation_status"],
+        "config": { "runtime": "python3.12", "code": "def x(p):\n    return {'v': 1}\n" }
+    });
+    let rule_test = serde_json::json!({
+        "id": 200, "url": format!("{}/api/v1/rules/200", test_server.uri()),
+        "name": "y", "queues": [], "code": "def r():\n    return 2\n"
+    });
+    let rule_prod = serde_json::json!({
+        "id": 950, "url": format!("{}/api/v1/rules/950", prod_server.uri()),
+        "name": "y", "queues": [], "code": "def r():\n    return 1\n"
+    });
+
+    mount_full_pull(
+        &test_server,
+        serde_json::json!({"pagination": {"next": null}, "results": [hook_test.clone()]}),
+    ).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/rules"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": {"next": null}, "results": [rule_test.clone()]
+        })))
+        .mount(&test_server).await;
+    mount_full_pull(
+        &prod_server,
+        serde_json::json!({"pagination": {"next": null}, "results": [hook_prod.clone()]}),
+    ).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/rules"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": {"next": null}, "results": [rule_prod.clone()]
+        })))
+        .mount(&prod_server).await;
+    // GET single hook for apply drift check.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks/900"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(hook_prod.clone()))
+        .mount(&prod_server).await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/hooks/900"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(hook_prod.clone()))
+        .mount(&prod_server).await;
+    let counter = rule_patch_calls.clone();
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/rules/950"))
+        .respond_with(move |_req: &wiremock::Request| {
+            *counter.lock().unwrap() += 1;
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({}))
+        })
+        .mount(&prod_server).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .args(["init",
+               "--env", &format!("test={}/api/v1:1", test_server.uri()),
+               "--env", &format!("prod={}/api/v1:1", prod_server.uri())])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
+        .assert().success();
+    Command::cargo_bin("rdc").unwrap()
+        .args(["pull", "test"]).current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T").assert().success();
+    Command::cargo_bin("rdc").unwrap()
+        .args(["pull", "prod"]).current_dir(project.path())
+        .env("RDC_TOKEN_PROD", "T").assert().success();
+
+    Command::cargo_bin("rdc").unwrap()
+        .args(["deploy", "test", "prod", "--yes", "--only", "hooks/x-v2"])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
+        .assert().success();
+
+    assert_eq!(*rule_patch_calls.lock().unwrap(), 0,
+        "PATCH /rules/950 must not be called when --only hooks/x-v2");
+}
+
 /// `rdc deploy test prod --dry-run` with a store extension in src must print
 /// the store-extension sub-line in the plan summary, naming the slug and the
 /// template on the target cluster. No writes should reach the tgt server.

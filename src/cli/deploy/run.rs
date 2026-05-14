@@ -348,6 +348,7 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
         diff,
         progress.clone(),
         &mut tgt_lockfile,
+        selection.as_ref(),
     )
     .await
     .with_context(|| format!(

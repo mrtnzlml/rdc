@@ -84,6 +84,7 @@ pub async fn run(
     diff: bool,
     progress: Option<Arc<OverallProgress>>,
     tgt_lockfile: &mut Lockfile,
+    selection: Option<&crate::cli::deploy::selection::Selection>,
 ) -> Result<String> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let src_paths = Paths::for_env(&cwd, src);
@@ -115,6 +116,11 @@ pub async fn run(
         });
     }
     for (src_slug, tgt_slug) in &mapping.hooks {
+        if let Some(sel) = selection {
+            if !sel.contains("hooks", src_slug) {
+                continue;
+            }
+        }
         let Some(tgt_id) = lookup_tgt_id_w(&tgt_lockfile, "hooks", tgt_slug, &mut skipped, &progress) else { continue };
         let mut payload = match read_hook_value(&src_paths.hooks_dir(), src_slug) {
             Ok(v) => v,
@@ -226,6 +232,11 @@ pub async fn run(
     }
     let mut remote_rules_cache: Option<Vec<crate::model::Rule>> = None;
     for (src_slug, tgt_slug) in &mapping.rules {
+        if let Some(sel) = selection {
+            if !sel.contains("rules", src_slug) {
+                continue;
+            }
+        }
         let Some(tgt_id) = lookup_tgt_id_w(&tgt_lockfile, "rules", tgt_slug, &mut skipped, &progress) else { continue };
         let mut payload = match crate::snapshot::rule::read_rule_value(&src_paths.rules_dir(), src_slug) {
             Ok(v) => v,
@@ -302,6 +313,11 @@ pub async fn run(
     }
     let mut remote_labels_cache: Option<Vec<crate::model::Label>> = None;
     for (src_slug, tgt_slug) in &mapping.labels {
+        if let Some(sel) = selection {
+            if !sel.contains("labels", src_slug) {
+                continue;
+            }
+        }
         let Some(tgt_id) = lookup_tgt_id_w(&tgt_lockfile, "labels", tgt_slug, &mut skipped, &progress) else { continue };
         let path = src_paths.labels_dir().join(format!("{src_slug}.json"));
         let raw = match std::fs::read_to_string(&path) {
@@ -362,6 +378,11 @@ pub async fn run(
     }
     let mut remote_queues_cache: Option<Vec<crate::model::Queue>> = None;
     for (src_slug, tgt_slug) in &mapping.queues {
+        if let Some(sel) = selection {
+            if !sel.contains("queues", src_slug) {
+                continue;
+            }
+        }
         let Some(tgt_id) = lookup_tgt_id_w(&tgt_lockfile, "queues", tgt_slug, &mut skipped, &progress) else { continue };
         let Some(src_queue_dir) = locate_queue_dir(&src_paths, src_slug) else {
             warn(&progress, format!("warning: cannot locate src queue '{src_slug}' on disk — skipping"));
@@ -433,6 +454,11 @@ pub async fn run(
         });
     }
     for (src_slug, tgt_slug) in &mapping.schemas {
+        if let Some(sel) = selection {
+            if !sel.contains("schemas", src_slug) {
+                continue;
+            }
+        }
         let Some(tgt_id) = lookup_tgt_id_w(&tgt_lockfile, "schemas", tgt_slug, &mut skipped, &progress) else { continue };
         let Some(src_queue_dir) = locate_queue_dir(&src_paths, src_slug) else {
             warn(&progress, format!("warning: cannot locate src queue '{src_slug}' for schema — skipping"));
@@ -519,6 +545,11 @@ pub async fn run(
         });
     }
     for (src_slug, tgt_slug) in &mapping.inboxes {
+        if let Some(sel) = selection {
+            if !sel.contains("inboxes", src_slug) {
+                continue;
+            }
+        }
         let Some(tgt_id) = lookup_tgt_id_w(&tgt_lockfile, "inboxes", tgt_slug, &mut skipped, &progress) else { continue };
         let Some(src_queue_dir) = locate_queue_dir(&src_paths, src_slug) else {
             warn(&progress, format!("warning: cannot locate src queue '{src_slug}' for inbox — skipping"));
@@ -577,6 +608,11 @@ pub async fn run(
     }
     let mut remote_template_cache: Option<Vec<crate::model::EmailTemplate>> = None;
     for (src_key, tgt_key) in &mapping.email_templates {
+        if let Some(sel) = selection {
+            if !sel.contains("email_templates", src_key) {
+                continue;
+            }
+        }
         let Some(tgt_id) = lookup_tgt_id_w(&tgt_lockfile, "email_templates", tgt_key, &mut skipped, &progress) else { continue };
         let Some((ws, q, t)) = split_template_key(src_key) else {
             warn(&progress, format!("warning: src email_template key '{src_key}' is not <ws>/<q>/<template>; skipping"));
@@ -649,6 +685,11 @@ pub async fn run(
         });
     }
     for (src_slug, tgt_slug) in &mapping.engines {
+        if let Some(sel) = selection {
+            if !sel.contains("engines", src_slug) {
+                continue;
+            }
+        }
         let Some(tgt_id) = lookup_tgt_id_w(&tgt_lockfile, "engines", tgt_slug, &mut skipped, &progress) else { continue };
         let path = src_paths.engines_dir().join(format!("{src_slug}.json"));
         let raw = match std::fs::read_to_string(&path) {
@@ -718,6 +759,11 @@ pub async fn run(
         });
     }
     for (src_slug, tgt_slug) in &mapping.engine_fields {
+        if let Some(sel) = selection {
+            if !sel.contains("engine_fields", src_slug) {
+                continue;
+            }
+        }
         let Some(tgt_id) = lookup_tgt_id_w(&tgt_lockfile, "engine_fields", tgt_slug, &mut skipped, &progress) else { continue };
         let Some(path) = locate_engine_field_path(&src_paths, src_slug) else {
             warn(&progress, format!(
