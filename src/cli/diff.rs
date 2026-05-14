@@ -43,7 +43,7 @@ pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) ->
     let lockfile_path = paths.lockfile();
     if !lockfile_path.exists() {
         return Err(anyhow!(
-            "no lockfile for env '{env}' (run `rdc pull {env}` first)"
+            "no lockfile for env '{env}' (run `rdc sync {env}` first)"
         ));
     }
     let lockfile = Lockfile::load(&lockfile_path)?;

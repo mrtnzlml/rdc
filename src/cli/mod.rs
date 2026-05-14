@@ -62,33 +62,6 @@ pub enum Command {
         #[arg(long = "env", value_name = "ENV_SPEC")]
         envs: Vec<String>,
     },
-    /// Pull a Rossum environment's configuration into the local snapshot.
-    /// Without `<env>`, picks interactively from envs defined in
-    /// `rdc.toml` (or auto-selects when only one exists).
-    Pull { env: Option<String> },
-    /// Push locally-edited resources back to the Rossum environment.
-    /// Without `<env>`, picks interactively from envs defined in
-    /// `rdc.toml` (or auto-selects when only one exists).
-    Push {
-        env: Option<String>,
-        /// Scan + report what would be POSTed / PATCHed / DELETEd
-        /// without sending anything to the API.
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-        /// Print a unified diff per changed file (local vs current
-        /// remote, or the would-be POST body for new resources, or the
-        /// remote body for would-be deletes). Requires `--dry-run`;
-        /// one GET per changed object.
-        #[arg(long = "diff", requires = "dry_run")]
-        diff: bool,
-        /// Authorize destructive deletes for objects whose local file
-        /// is missing but whose lockfile entry remains. Required on
-        /// non-TTY (CI); on a TTY this flag skips the per-batch
-        /// confirmation prompt that would otherwise be shown.
-        /// `--yes` does NOT bypass delete confirmation.
-        #[arg(long = "allow-deletes")]
-        allow_deletes: bool,
-    },
     /// Reconcile the local snapshot and the env's remote state in one pass.
     /// Without `<env>`, picks interactively from envs defined in `rdc.toml`
     /// (or auto-selects when only one exists).
@@ -231,19 +204,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     match cli.command {
         Some(Command::Init { envs }) => crate::cli::init::run(envs).await,
-        Some(Command::Pull { env }) => {
-            let env = crate::cli::env_picker::pick_env("Which env to pull from?", env)?;
-            let interactive = crate::cli::resolve::is_interactive(cli.yes);
-            with_401_retry(&env, || crate::cli::pull::run(&env, interactive)).await
-        }
-        Some(Command::Push { env, dry_run, diff, allow_deletes }) => {
-            let env = crate::cli::env_picker::pick_env("Which env to push to?", env)?;
-            let interactive = crate::cli::resolve::is_interactive(cli.yes);
-            with_401_retry(&env, || {
-                crate::cli::push::run(&env, interactive, dry_run, diff, allow_deletes)
-            })
-            .await
-        }
         Some(Command::Sync { env, dry_run, diff, allow_deletes, no_push, no_pull }) => {
             let env = crate::cli::env_picker::pick_env("Which env to sync?", env)?;
             let interactive = crate::cli::resolve::is_interactive(cli.yes);

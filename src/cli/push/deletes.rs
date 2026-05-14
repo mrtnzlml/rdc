@@ -238,7 +238,7 @@ async fn delete_one(
             DeleteDriftChoice::Restore => {
                 eprintln!(
                     "  - {kind}/{slug}: drift detected; restore is not automated yet — \
-                     run `rdc pull <env>` to refresh the local file, then re-edit if needed."
+                     run `rdc sync <env>` to refresh the local file, then re-edit if needed."
                 );
                 return Ok(DeleteOutcome::Skipped);
             }
@@ -292,8 +292,8 @@ fn resolve_delete_drift(interactive: bool, kind: &str, slug: &str) -> Result<Del
         // Non-TTY (CI / --yes): fall back to skip with warning so a
         // drifted delete never silently destroys someone else's work.
         eprintln!(
-            "warning: {kind}/{slug}: local file deleted but remote modified since pull; \
-             skipping (run `rdc pull <env>` then `rdc push <env>` to retry)."
+            "warning: {kind}/{slug}: local file deleted but remote modified since last sync; \
+             skipping (run `rdc sync <env>` to retry)."
         );
         return Ok(DeleteDriftChoice::Skip);
     }

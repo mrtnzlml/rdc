@@ -71,7 +71,7 @@ pub async fn run(env_filter: Option<String>) -> Result<()> {
         // Lockfile.
         let lockfile_path = paths.lockfile();
         if !lockfile_path.exists() {
-            println!("  lockfile: missing (run `rdc pull {env}`)");
+            println!("  lockfile: missing (run `rdc sync {env}`)");
             continue;
         }
         let lockfile = match Lockfile::load(&lockfile_path) {
@@ -120,7 +120,7 @@ pub async fn run(env_filter: Option<String>) -> Result<()> {
             let total = tombstones.total();
             println!(
                 "  deletes:  {total} file(s) tracked but missing locally \
-                 (run `rdc push {env} --allow-deletes` to remove from remote):"
+                 (run `rdc sync {env} --allow-deletes` to remove from remote):"
             );
             let listing: [(&str, &std::collections::BTreeMap<String, u64>); 10] = [
                 ("workspaces", &tombstones.workspaces),

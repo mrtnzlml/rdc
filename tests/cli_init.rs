@@ -37,7 +37,7 @@ fn init_creates_expected_files() {
     let body = std::fs::read_to_string(&claude_md).unwrap();
     assert!(body.contains("# Agent guide"));
     assert!(body.contains("`envs/<env>/_index.md`"));
-    assert!(body.contains("rdc push"));
+    assert!(body.contains("rdc sync"));
     assert!(body.contains("Conflicts & drift"));
 }
 
@@ -88,7 +88,7 @@ fn init_adds_new_env_to_existing_project() {
         .stdout(predicate::str::contains("Added env(s)"))
         .stdout(predicate::str::contains("prod"))
         .stdout(predicate::str::contains("rdc auth prod"))
-        .stdout(predicate::str::contains("rdc pull prod"));
+        .stdout(predicate::str::contains("rdc sync prod"));
 
     // Config now has both envs.
     let cfg = std::fs::read_to_string(dir.path().join("rdc.toml")).unwrap();
@@ -187,7 +187,7 @@ fn init_prints_next_steps() {
         .success()
         .stdout(predicate::str::contains("Next steps:"))
         .stdout(predicate::str::contains("rdc auth dev"))
-        .stdout(predicate::str::contains("rdc pull dev"));
+        .stdout(predicate::str::contains("rdc sync dev"));
 }
 
 /// A pre-existing rdc.toml that still has the legacy `[project]` section

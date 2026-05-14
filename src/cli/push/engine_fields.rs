@@ -131,7 +131,7 @@ pub async fn push(
                 }
                 PushDriftOutcome::Skip => {
                     progress.println(format!(
-                        "warning: {} — remote has changed since last pull, skipping push (run `rdc pull` first)",
+                        "warning: {} — remote has changed since last sync, skipping push (run `rdc sync` first)",
                         path.display()
                     ));
                     skipped += 1;

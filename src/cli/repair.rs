@@ -74,14 +74,21 @@ async fn rebuild_lock_run(env: &str) -> Result<()> {
         std::fs::rename(&lockfile_path, &backup)
             .with_context(|| format!("backing up lockfile to {}", backup.display()))?;
         eprintln!("Backed up existing lockfile to {}", backup.display());
-        eprintln!("Note: rdc pull will now overwrite local snapshot files with remote contents.");
+        eprintln!("Note: rdc sync will now overwrite local snapshot files with remote contents.");
     } else {
-        eprintln!("No existing lockfile at {} — proceeding with fresh pull.", lockfile_path.display());
+        eprintln!("No existing lockfile at {} — proceeding with fresh sync.", lockfile_path.display());
     }
 
     // Repair is non-interactive: with no merge base every kind's
     // three-way collapses to "Write", so there's nothing to resolve.
-    crate::cli::pull::run(env, false).await?;
+    // Sync with `--no-push` is the post-unified-sync equivalent of the
+    // old `pull` flow — every remote item lands as `RemoteCreate` and
+    // the pull-side dispatcher writes it.
+    crate::cli::sync::run(
+        env, /* interactive */ false, /* dry_run */ false, /* diff */ false,
+        /* allow_deletes */ false, /* no_push */ true, /* no_pull */ false,
+    )
+    .await?;
     println!("Lockfile rebuilt for env '{env}'.");
     Ok(())
 }

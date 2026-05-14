@@ -94,11 +94,11 @@ pub struct RemoteCatalog {
 }
 
 /// Phase 1 of pull: list every kind from the env's API and accumulate the
-/// progress bar's total denominator. No ticks happen here — Phase 2 (in
-/// `pull::run_drivers`) or the sync classifier consumes the catalog.
+/// progress bar's total denominator. No ticks happen here — the sync
+/// classifier and executor consume the catalog.
 ///
-/// Listing order is preserved exactly as it was inlined in `pull::run_drivers`
-/// so cross-env diffs and bar pacing stay identical to the pre-refactor flow.
+/// Listing order is fixed so cross-env diffs and bar pacing stay
+/// deterministic across runs.
 pub async fn list_remote(
     ctx: &mut PullCtx<'_>,
     env_cfg: &crate::config::EnvConfig,
@@ -297,16 +297,6 @@ pub fn record_object(
     );
 }
 
-/// Format `"<n> <noun>"` with correct singular/plural agreement.
-/// Used by the pull summary line and any future count-aware UX.
-pub fn pluralize(n: usize, singular: &str, plural: &str) -> String {
-    if n == 1 {
-        format!("1 {singular}")
-    } else {
-        format!("{n} {plural}")
-    }
-}
-
 /// Parse the trailing numeric ID out of a Rossum API URL, e.g.
 /// `https://x.rossum.app/api/v1/schemas/1234` -> `1234`.
 pub fn parse_id_from_url(url: &str) -> Result<u64> {
@@ -496,19 +486,6 @@ fn resolve_conflict_interactive(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pluralize_singular() {
-        assert_eq!(pluralize(1, "hook", "hooks"), "1 hook");
-        assert_eq!(pluralize(1, "inbox", "inboxes"), "1 inbox");
-    }
-
-    #[test]
-    fn pluralize_plural() {
-        assert_eq!(pluralize(0, "hook", "hooks"), "0 hooks");
-        assert_eq!(pluralize(2, "hook", "hooks"), "2 hooks");
-        assert_eq!(pluralize(0, "inbox", "inboxes"), "0 inboxes");
-    }
 
     #[test]
     fn parse_id_basic() {

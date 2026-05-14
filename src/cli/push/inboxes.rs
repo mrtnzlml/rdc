@@ -117,7 +117,7 @@ pub async fn push(
                 }
                 PushDriftOutcome::Skip => {
                     progress.println(format!(
-                        "warning: inbox for queue '{q_slug}' — remote has changed since last pull, skipping push (run `rdc pull` first)"
+                        "warning: inbox for queue '{q_slug}' — remote has changed since last sync, skipping push (run `rdc sync` first)"
                     ));
                     skipped += 1;
                     continue;

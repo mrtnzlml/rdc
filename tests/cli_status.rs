@@ -48,7 +48,7 @@ async fn status_reports_auth_ok_and_no_edits_after_pull() {
     ).unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["pull", "dev"])
+        .args(["sync", "dev", "--no-push"])
         .assert().success();
 
     Command::cargo_bin("rdc").unwrap()
@@ -150,7 +150,7 @@ async fn status_detects_local_edits() {
     ).unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["pull", "dev"])
+        .args(["sync", "dev", "--no-push"])
         .assert().success();
 
     // Edit a hook's .py file.

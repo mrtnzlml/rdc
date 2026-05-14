@@ -130,7 +130,7 @@ pub async fn push(
                 }
                 PushDriftOutcome::Skip => {
                     progress.println(format!(
-                        "warning: email template '{lockfile_key}' — remote has changed since last pull, skipping push (run `rdc pull` first)"
+                        "warning: email template '{lockfile_key}' — remote has changed since last sync, skipping push (run `rdc sync` first)"
                     ));
                     skipped += 1;
                     continue;

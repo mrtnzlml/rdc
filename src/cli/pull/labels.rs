@@ -20,9 +20,9 @@ pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<
 
 /// Phase 2: write listed labels to disk. `subset` selects which `(kind, slug)`
 /// pairs are actually written — items outside the subset are skipped silently
-/// (no tick, no lockfile update). When `pull::run_drivers` calls this it passes
-/// an all-inclusive subset built from the listed catalog; the sync classifier
-/// passes a filtered subset. Returns `(count, conflicts)` of items written.
+/// (no tick, no lockfile update). The sync dispatcher passes a subset filtered
+/// by classification (only RemoteEdit/RemoteCreate items). Returns
+/// `(count, conflicts)` of items written.
 pub async fn process(
     ctx: &mut PullCtx<'_>,
     labels: Vec<Label>,

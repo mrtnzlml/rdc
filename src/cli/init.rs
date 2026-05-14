@@ -77,7 +77,7 @@ pub async fn run(env_specs: Vec<String>) -> Result<()> {
         println!("      # or: export RDC_TOKEN_{upper}=<token>");
     }
     for env in &new_env_names {
-        println!("  • Pull a snapshot:  rdc pull {env}");
+        println!("  • Sync the snapshot:  rdc sync {env}");
     }
     Ok(())
 }
@@ -295,8 +295,8 @@ fn write_gitignore(root: &Path) -> Result<()> {
 }
 
 /// Write an agent guide at `<root>/CLAUDE.md`. Unlike `_index.md`, this
-/// is a once-only file — `rdc init` creates it, but pull/push never
-/// overwrite it. Existing files (e.g. when re-running init on an
+/// is a once-only file — `rdc init` creates it, but sync never
+/// overwrites it. Existing files (e.g. when re-running init on an
 /// already-bootstrapped repo, or when the user has hand-edited the
 /// guide) are left untouched.
 fn write_claude_md(root: &Path) -> Result<()> {
@@ -321,7 +321,7 @@ code.
   with its on-disk path, human name, type-specific signals, and the
   related objects it points at (or that point at it). Start here when
   you need to find something or understand the shape of an env.
-  Regenerated on every `rdc pull` / `rdc push` — never hand-edit.
+  Regenerated on every `rdc sync` — never hand-edit.
 - **`rdc.toml`** — project name and per-env API base URL + org id.
 
 ## Repo layout
@@ -360,21 +360,21 @@ envs/<env>/
 
 | To change… | Edit | Then run |
 |---|---|---|
-| Hook code | `envs/<env>/hooks/<slug>.py` | `rdc push <env>` |
-| Hook config (events, queues, name) | `envs/<env>/hooks/<slug>.json` | `rdc push <env>` |
-| Schema fields | `envs/<env>/workspaces/<ws>/queues/<q>/schema.json` | `rdc push <env>` |
-| A formula | `envs/<env>/workspaces/<ws>/queues/<q>/formulas/<field>.py` | `rdc push <env>` |
-| Queue settings | `envs/<env>/workspaces/<ws>/queues/<q>/queue.json` | `rdc push <env>` |
-| Rule's trigger condition (Python) | `envs/<env>/rules/<slug>.py` | `rdc push <env>` |
-| Rule config (name, queues) | `envs/<env>/rules/<slug>.json` | `rdc push <env>` |
-| Label name / colour | `envs/<env>/labels/<slug>.json` | `rdc push <env>` |
-| Email template | `envs/<env>/workspaces/<ws>/queues/<q>/email-templates/<slug>.json` | `rdc push <env>` |
-| Per-env override only | `envs/<env>/overlay.toml` | `rdc push <env>` |
+| Hook code | `envs/<env>/hooks/<slug>.py` | `rdc sync <env>` |
+| Hook config (events, queues, name) | `envs/<env>/hooks/<slug>.json` | `rdc sync <env>` |
+| Schema fields | `envs/<env>/workspaces/<ws>/queues/<q>/schema.json` | `rdc sync <env>` |
+| A formula | `envs/<env>/workspaces/<ws>/queues/<q>/formulas/<field>.py` | `rdc sync <env>` |
+| Queue settings | `envs/<env>/workspaces/<ws>/queues/<q>/queue.json` | `rdc sync <env>` |
+| Rule's trigger condition (Python) | `envs/<env>/rules/<slug>.py` | `rdc sync <env>` |
+| Rule config (name, queues) | `envs/<env>/rules/<slug>.json` | `rdc sync <env>` |
+| Label name / colour | `envs/<env>/labels/<slug>.json` | `rdc sync <env>` |
+| Email template | `envs/<env>/workspaces/<ws>/queues/<q>/email-templates/<slug>.json` | `rdc sync <env>` |
+| Per-env override only | `envs/<env>/overlay.toml` | `rdc sync <env>` |
 
 ## Adding a new object
 
 Create the JSON (and `.py` if the kind has executable code) under the
-right directory. `rdc push <env>` detects files with no lockfile entry,
+right directory. `rdc sync <env>` detects files with no lockfile entry,
 POSTs them, and writes the server-assigned `id` / `url` back into the
 local file. Cross-references must use URLs already known to the
 lockfile (e.g. a new hook's `queues` field must point at queues that
@@ -384,7 +384,7 @@ already exist on the remote).
 
 The snapshot is the declared state of the environment, including
 absence. Remove the local file (`rm envs/<env>/labels/foo.json`) and
-the next `rdc push <env>` will detect the tombstone — the lockfile
+the next `rdc sync <env>` will detect the tombstone — the lockfile
 entry remains, signalling "this object was tracked and is now gone."
 
 Two intentional acts are required before the DELETE hits the remote:
@@ -395,10 +395,10 @@ Two intentional acts are required before the DELETE hits the remote:
    needs its own authorisation.
 
 In non-TTY (CI) mode, `--allow-deletes` is mandatory; without it the
-push refuses with a clear list of pending tombstones.
+sync refuses with a clear list of pending tombstones.
 
 `rdc status <env>` lists pending tombstones in a `deletes:` section.
-`rdc push --dry-run` previews them without sending anything;
+`rdc sync --dry-run` previews them without sending anything;
 `--diff` adds the full remote body for each as a deleted-file diff.
 
 Deletes run after creates / updates in reverse dependency order
@@ -408,16 +408,17 @@ queue is gone before the workspace that contained it. The Rossum
 DELETE endpoint accepts 404 as success, so an object already absent
 on the remote just gets its lockfile entry cleaned up.
 
-If the remote has been modified since the last pull, an inline
+If the remote has been modified since the last sync, an inline
 resolver opens — `[k]eep delete` / `[s]kip` / `[a]bort` — so a
 tombstoned delete can't silently overwrite a remote update.
 
 ## Common commands
 
-- `rdc pull <env>` — fetch remote into local snapshot
-- `rdc push <env>` — push local edits back; creates new objects too;
+- `rdc sync <env>` — reconcile local snapshot and remote in one pass;
+  pulls remote edits + pushes local edits + creates new objects;
   `--allow-deletes` to also remove remote objects whose local files
-  you've deleted
+  you've deleted; `--no-push` for read-only audit; `--no-pull` to
+  deploy local edits without overwriting local files
 - `rdc diff <env>` — local-vs-remote diff (no writes)
 - `rdc diff <a> <b>` — diff two local snapshots
 - `rdc status [<env>]` — auth + lockfile health
@@ -427,22 +428,23 @@ tombstoned delete can't silently overwrite a remote update.
 - `rdc repair <env> --rename-slugs` — realign stale local slugs after
   a remote rename (offline)
 - `rdc repair <env> --rebuild-lock` — recover from a corrupted
-  lockfile by re-pulling everything
+  lockfile by re-syncing everything
 
 ## Conflicts & drift
 
-A three-way merge (local · base · remote) runs on every pull. When
-both sides have diverged, `rdc pull` prompts an inline resolver:
+A three-way merge (local · base · remote) runs on every sync. When
+both sides have diverged, `rdc sync` prompts an inline resolver:
 `[k]eep local · [r]emote · [e]dit · [s]kip · [a]bort`. In non-TTY
 (CI / `--yes`) mode, conflicts produce a `<file>.<env-name>` shadow and
 keep the local on disk.
 
-`rdc push` runs the same drift check before each PATCH. The prompt is
-`[k]` (force-push), `[r]` (adopt remote), `[s]` (skip), `[a]` (abort).
+The same drift check runs before each PATCH on the push side. The
+prompt is `[k]` (force-push), `[r]` (adopt remote), `[s]` (skip),
+`[a]` (abort).
 
 ## Cross-env deploys (e.g. dev → prod)
 
-1. `rdc pull dev` and `rdc pull prod` so both lockfiles are populated.
+1. `rdc sync dev` and `rdc sync prod` so both lockfiles are populated.
 2. `rdc deploy dev prod --dry-run` — preview the plan.
 3. `rdc deploy dev prod` — execute. Per-env values stay in each env's
    `overlay.toml`; the slug-to-slug mapping is built automatically and
@@ -450,7 +452,7 @@ keep the local on disk.
 
 ## What NOT to edit
 
-- `_index.md` (auto-regenerated by every pull/push)
+- `_index.md` (auto-regenerated by every sync)
 - `.rdc/state/<env>.lock.json` (slug↔id and base hashes; rdc owns this)
 - `*.<env-name>` files (shadow files from conflict resolution; either
   consume the changes or delete the file)

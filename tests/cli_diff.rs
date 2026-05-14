@@ -67,7 +67,7 @@ async fn diff_local_remote_no_changes() {
     ).unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["pull", "dev"])
+        .args(["sync", "dev", "--no-push"])
         .assert().success();
 
     Command::cargo_bin("rdc").unwrap()
@@ -93,7 +93,7 @@ async fn diff_local_remote_shows_edit_in_unified_format() {
     ).unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["pull", "dev"])
+        .args(["sync", "dev", "--no-push"])
         .assert().success();
 
     // Edit hook code locally.
@@ -128,9 +128,9 @@ async fn diff_snapshot_vs_snapshot_no_api_calls() {
     std::fs::write(project.path().join("secrets/a.secrets.json"), r#"{"api_token":"X"}"#).unwrap();
     std::fs::write(project.path().join("secrets/b.secrets.json"), r#"{"api_token":"X"}"#).unwrap();
     Command::cargo_bin("rdc").unwrap()
-        .current_dir(project.path()).args(["pull", "a"]).assert().success();
+        .current_dir(project.path()).args(["sync", "a", "--no-push"]).assert().success();
     Command::cargo_bin("rdc").unwrap()
-        .current_dir(project.path()).args(["pull", "b"]).assert().success();
+        .current_dir(project.path()).args(["sync", "b", "--no-push"]).assert().success();
 
     // Identical snapshots → no diffs.
     Command::cargo_bin("rdc").unwrap()

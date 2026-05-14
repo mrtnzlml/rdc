@@ -62,11 +62,11 @@ async fn repair_backs_up_lockfile_and_repulls() {
     ).unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["pull", "dev"])
+        .args(["sync", "dev", "--no-push"])
         .assert().success();
 
     let lockfile_path = project.path().join(".rdc/state/dev.lock.json");
-    assert!(lockfile_path.exists(), "lockfile created by initial pull");
+    assert!(lockfile_path.exists(), "lockfile created by initial sync");
 
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
@@ -75,7 +75,7 @@ async fn repair_backs_up_lockfile_and_repulls() {
         .stdout(predicate::str::contains("Lockfile rebuilt"))
         .stderr(predicate::str::contains("Backed up existing lockfile"));
 
-    assert!(lockfile_path.exists(), "lockfile re-created by pull");
+    assert!(lockfile_path.exists(), "lockfile re-created by sync");
 
     // Backup file should exist.
     let state_dir = project.path().join(".rdc/state");

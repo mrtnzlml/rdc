@@ -242,7 +242,7 @@ pub fn build_template_url_map(
             .collect();
         match matches.len() {
             0 => return Err(anyhow!(
-                "template '{}' is not available on {tgt_env_label}. Templates with install_action=request_access require Rossum sales to enable; copy templates may have been withdrawn. Install manually via the UI on {tgt_env_label}, then re-run rdc pull {tgt_env_label}.",
+                "template '{}' is not available on {tgt_env_label}. Templates with install_action=request_access require Rossum sales to enable; copy templates may have been withdrawn. Install manually via the UI on {tgt_env_label}, then re-run rdc sync {tgt_env_label}.",
                 src.name
             )),
             1 => { out.insert(src_url.to_string(), matches[0].url.clone()); }

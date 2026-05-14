@@ -156,8 +156,8 @@ async fn map_plan_apply_full_flow() {
         r#"{"api_token":"PROD_TOKEN"}"#,
     ).unwrap();
 
-    Command::cargo_bin("rdc").unwrap().current_dir(project.path()).args(["pull", "test"]).assert().success();
-    Command::cargo_bin("rdc").unwrap().current_dir(project.path()).args(["pull", "prod"]).assert().success();
+    Command::cargo_bin("rdc").unwrap().current_dir(project.path()).args(["sync", "test", "--no-push"]).assert().success();
+    Command::cargo_bin("rdc").unwrap().current_dir(project.path()).args(["sync", "prod", "--no-push"]).assert().success();
 
     // Set overlay BEFORE the second prod pull so the lockfile records the
     // stripped hash. Same caveat documented in the README for "overlay
@@ -173,7 +173,7 @@ version = 1
     ).unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["pull", "prod"])
+        .args(["sync", "prod", "--no-push"])
         .assert().success();
 
     // `rdc deploy` now owns the full cross-env workflow — it auto-builds
@@ -298,11 +298,11 @@ async fn deploy_queue_and_schema() {
 
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["pull", "test"])
+        .args(["sync", "test", "--no-push"])
         .assert().success();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["pull", "prod"])
+        .args(["sync", "prod", "--no-push"])
         .assert().success();
 
     // Edit test queue + schema formula to differ from prod (so apply has
@@ -535,8 +535,8 @@ async fn deploy_bootstraps_empty_target_with_url_rewriting() {
     std::fs::write(project.path().join("secrets/test.secrets.json"), r#"{"api_token":"TEST"}"#).unwrap();
     std::fs::write(project.path().join("secrets/prod.secrets.json"), r#"{"api_token":"PROD"}"#).unwrap();
 
-    Command::cargo_bin("rdc").unwrap().current_dir(project.path()).args(["pull", "test"]).assert().success();
-    Command::cargo_bin("rdc").unwrap().current_dir(project.path()).args(["pull", "prod"]).assert().success();
+    Command::cargo_bin("rdc").unwrap().current_dir(project.path()).args(["sync", "test", "--no-push"]).assert().success();
+    Command::cargo_bin("rdc").unwrap().current_dir(project.path()).args(["sync", "prod", "--no-push"]).assert().success();
 
     // === The one-command deploy. ===
     Command::cargo_bin("rdc").unwrap()
@@ -662,11 +662,11 @@ async fn deploy_refuses_non_tty_without_token_owner_overlay() {
 
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["pull", "test"])
+        .args(["sync", "test", "--no-push"])
         .assert().success();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["pull", "prod"])
+        .args(["sync", "prod", "--no-push"])
         .assert().success();
 
     // Deliberately omit the tgt overlay — no store_extension_token_owner set.
@@ -799,11 +799,11 @@ async fn deploy_errors_when_template_missing_on_tgt() {
 
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["pull", "test"])
+        .args(["sync", "test", "--no-push"])
         .assert().success();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["pull", "prod"])
+        .args(["sync", "prod", "--no-push"])
         .assert().success();
 
     // Tgt overlay HAS store_extension_token_owner — so the failure is
@@ -988,11 +988,11 @@ async fn deploy_resolves_templates_and_prompts_for_token_owner() {
     // Pull both envs to establish lockfiles and snapshots.
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["pull", "test"])
+        .args(["sync", "test", "--no-push"])
         .assert().success();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["pull", "prod"])
+        .args(["sync", "prod", "--no-push"])
         .assert().success();
 
     // Pre-populate the tgt overlay with the system user URL so the pre-pass
@@ -1061,12 +1061,12 @@ async fn deploy_only_with_unknown_selector_errors() {
         .env("RDC_TOKEN_PROD", "T")
         .assert().success();
     Command::cargo_bin("rdc").unwrap()
-        .args(["pull", "test"])
+        .args(["sync", "test", "--no-push"])
         .current_dir(project.path())
         .env("RDC_TOKEN_TEST", "T")
         .assert().success();
     Command::cargo_bin("rdc").unwrap()
-        .args(["pull", "prod"])
+        .args(["sync", "prod", "--no-push"])
         .current_dir(project.path())
         .env("RDC_TOKEN_PROD", "T")
         .assert().success();
@@ -1127,12 +1127,12 @@ async fn deploy_only_filters_plan() {
         .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
         .assert().success();
     Command::cargo_bin("rdc").unwrap()
-        .args(["pull", "test"])
+        .args(["sync", "test", "--no-push"])
         .current_dir(project.path())
         .env("RDC_TOKEN_TEST", "T")
         .assert().success();
     Command::cargo_bin("rdc").unwrap()
-        .args(["pull", "prod"])
+        .args(["sync", "prod", "--no-push"])
         .current_dir(project.path())
         .env("RDC_TOKEN_PROD", "T")
         .assert().success();
@@ -1218,10 +1218,10 @@ async fn deploy_only_creates_filtered_kind_only() {
         .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
         .assert().success();
     Command::cargo_bin("rdc").unwrap()
-        .args(["pull", "test"]).current_dir(project.path())
+        .args(["sync", "test", "--no-push"]).current_dir(project.path())
         .env("RDC_TOKEN_TEST", "T").assert().success();
     Command::cargo_bin("rdc").unwrap()
-        .args(["pull", "prod"]).current_dir(project.path())
+        .args(["sync", "prod", "--no-push"]).current_dir(project.path())
         .env("RDC_TOKEN_PROD", "T").assert().success();
 
     Command::cargo_bin("rdc").unwrap()
@@ -1314,10 +1314,10 @@ async fn deploy_only_update_sweep_skips_unmatched_kinds() {
         .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
         .assert().success();
     Command::cargo_bin("rdc").unwrap()
-        .args(["pull", "test"]).current_dir(project.path())
+        .args(["sync", "test", "--no-push"]).current_dir(project.path())
         .env("RDC_TOKEN_TEST", "T").assert().success();
     Command::cargo_bin("rdc").unwrap()
-        .args(["pull", "prod"]).current_dir(project.path())
+        .args(["sync", "prod", "--no-push"]).current_dir(project.path())
         .env("RDC_TOKEN_PROD", "T").assert().success();
 
     Command::cargo_bin("rdc").unwrap()
@@ -1429,11 +1429,11 @@ async fn deploy_plan_lists_store_extensions_in_dry_run() {
 
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["pull", "test"])
+        .args(["sync", "test", "--no-push"])
         .assert().success();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["pull", "prod"])
+        .args(["sync", "prod", "--no-push"])
         .assert().success();
 
     // Pre-populate the tgt overlay with the system user URL so the pre-pass
@@ -1568,10 +1568,10 @@ async fn deploy_only_mirror_only_deletes_in_scope() {
         .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
         .assert().success();
     Command::cargo_bin("rdc").unwrap()
-        .args(["pull", "test"]).current_dir(project.path())
+        .args(["sync", "test", "--no-push"]).current_dir(project.path())
         .env("RDC_TOKEN_TEST", "T").assert().success();
     Command::cargo_bin("rdc").unwrap()
-        .args(["pull", "prod"]).current_dir(project.path())
+        .args(["sync", "prod", "--no-push"]).current_dir(project.path())
         .env("RDC_TOKEN_PROD", "T").assert().success();
 
     Command::cargo_bin("rdc").unwrap()
@@ -1664,10 +1664,10 @@ async fn deploy_only_missing_dep_ci_refuses_with_suggestion() {
         .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
         .assert().success();
     Command::cargo_bin("rdc").unwrap()
-        .args(["pull", "test"]).current_dir(project.path())
+        .args(["sync", "test", "--no-push"]).current_dir(project.path())
         .env("RDC_TOKEN_TEST", "T").assert().success();
     Command::cargo_bin("rdc").unwrap()
-        .args(["pull", "prod"]).current_dir(project.path())
+        .args(["sync", "prod", "--no-push"]).current_dir(project.path())
         .env("RDC_TOKEN_PROD", "T").assert().success();
 
     Command::cargo_bin("rdc").unwrap()
@@ -1716,10 +1716,10 @@ async fn deploy_only_dry_run_makes_no_api_calls() {
         .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
         .assert().success();
     Command::cargo_bin("rdc").unwrap()
-        .args(["pull", "test"]).current_dir(project.path())
+        .args(["sync", "test", "--no-push"]).current_dir(project.path())
         .env("RDC_TOKEN_TEST", "T").assert().success();
     Command::cargo_bin("rdc").unwrap()
-        .args(["pull", "prod"]).current_dir(project.path())
+        .args(["sync", "prod", "--no-push"]).current_dir(project.path())
         .env("RDC_TOKEN_PROD", "T").assert().success();
 
     // Mount write-interceptors only after pulls so the MDH probe

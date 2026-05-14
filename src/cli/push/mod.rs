@@ -1,10 +1,8 @@
 use crate::api::RossumClient;
-use crate::config::ProjectConfig;
 use crate::paths::Paths;
 use crate::progress::OverallProgress;
-use crate::secrets::resolve_token;
 use crate::state::Lockfile;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use std::sync::Arc;
 
 pub mod deletes;
@@ -20,202 +18,10 @@ pub mod scan;
 mod schemas;
 mod workspaces;
 
-pub async fn run(
-    env: &str,
-    interactive: bool,
-    dry_run: bool,
-    diff: bool,
-    allow_deletes: bool,
-) -> Result<()> {
-    let push_started = std::time::Instant::now();
-    let cwd = std::env::current_dir().context("getting current directory")?;
-    let paths = Paths::for_env(&cwd, env);
-
-    let cfg = ProjectConfig::load(&paths.project_config())?;
-
-    let env_cfg = cfg
-        .envs
-        .get(env)
-        .ok_or_else(|| anyhow!("env '{env}' is not defined in rdc.toml"))?;
-
-    let token = resolve_token(&cwd, env)?;
-    let client = RossumClient::new(env_cfg.api_base.clone(), token)
-        .context("constructing Rossum API client")?;
-
-    let mut lockfile = Lockfile::load(&paths.lockfile())?;
-
-    // Phase 1: scan local files for changes + tombstones.
-    eprintln!("→ push envs/{env}: scanning files…");
-    let (scanned, changes, tombstones) = scan::scan(&paths, &lockfile)?;
-    let n_changed = changes.total();
-    let n_tombstoned = tombstones.total();
-    eprintln!(
-        "✓ push envs/{env}: {scanned} files scanned, {n_changed} changed, {n_tombstoned} to delete",
-    );
-
-    if changes.is_empty() && tombstones.is_empty() {
-        eprintln!(
-            "✓ push envs/{env}: no changes  ({:.1}s)",
-            push_started.elapsed().as_secs_f32()
-        );
-        return Ok(());
-    }
-
-    if dry_run {
-        // Surface the per-kind breakdown so the user knows exactly what
-        // a real push would touch. POST-vs-PATCH classification is
-        // deferred (it depends on lockfile entries) but the count of
-        // candidate files per kind is the meaningful preview.
-        let kinds = [
-            ("workspaces", &changes.workspaces),
-            ("schemas", &changes.schemas),
-            ("queues", &changes.queues),
-            ("inboxes", &changes.inboxes),
-            ("email_templates", &changes.email_templates),
-            ("hooks", &changes.hooks),
-            ("rules", &changes.rules),
-            ("labels", &changes.labels),
-            ("engines", &changes.engines),
-            ("engine_fields", &changes.engine_fields),
-        ];
-        for (name, m) in kinds {
-            if !m.is_empty() {
-                println!("  → {name:18} {} would be POSTed/PATCHed", m.len());
-                for slug in m.keys() {
-                    println!("      {slug}");
-                }
-            }
-        }
-        let delete_kinds: [(&str, &std::collections::BTreeMap<String, u64>); 10] = [
-            ("engine_fields", &tombstones.engine_fields),
-            ("engines", &tombstones.engines),
-            ("labels", &tombstones.labels),
-            ("rules", &tombstones.rules),
-            ("hooks", &tombstones.hooks),
-            ("email_templates", &tombstones.email_templates),
-            ("inboxes", &tombstones.inboxes),
-            ("queues", &tombstones.queues),
-            ("schemas", &tombstones.schemas),
-            ("workspaces", &tombstones.workspaces),
-        ];
-        for (name, m) in &delete_kinds {
-            if !m.is_empty() {
-                println!("  - {name:18} {} would be DELETED", m.len());
-                for slug in m.keys() {
-                    println!("      {slug}");
-                }
-            }
-        }
-        if diff {
-            // Delegate the line-level diff to the existing `rdc diff
-            // <env>` machinery: it walks each kind, GETs the remote,
-            // and only prints output for files that differ. POST
-            // candidates (no lockfile entry) print as new-file diffs
-            // because the remote-side serialised form is empty.
-            println!();
-            println!("--- diffs ---");
-            crate::cli::diff::diff_local_vs_remote(&cwd, &cfg, env).await?;
-            if n_tombstoned > 0 {
-                println!();
-                println!("--- tombstone bodies (would be removed from {env}) ---");
-                deletes::preview_tombstone_bodies(&client, &tombstones).await?;
-            }
-        }
-        println!(
-            "Dry run push envs/{env}: {n_changed} change(s), {n_tombstoned} to delete, \
-             {:.1}s — no API writes made.",
-            push_started.elapsed().as_secs_f32()
-        );
-        return Ok(());
-    }
-
-    // If there are tombstones, gate them behind the two-act
-    // destructive-confirmation flow before any phase touches the API.
-    if !tombstones.is_empty() {
-        match deletes::confirm_or_refuse(&tombstones, interactive, allow_deletes)? {
-            deletes::ConfirmOutcome::Proceed => {}
-            deletes::ConfirmOutcome::Aborted => {
-                eprintln!("push aborted: deletes not confirmed.");
-                return Ok(());
-            }
-        }
-    }
-
-    let progress = OverallProgress::start(format!("push envs/{env}"));
-
-    // Run drivers in a separate function so we can detect [a]bort
-    // (PullAborted) and skip lockfile.save(). Mirrors the pull-side
-    // abort flow (spec §8.3 "rolls back lockfile; nothing written").
-    let push_outcome = push_classified(&paths, &client, &mut lockfile, env, interactive, &changes, &progress).await;
-
-    let counts = match push_outcome {
-        Ok(c) => c,
-        Err(e) if is_aborted(&e) => {
-            progress.finish();
-            eprintln!("push aborted by user at conflict resolver; lockfile not saved.");
-            return Ok(());
-        }
-        Err(e) => return Err(e),
-    };
-
-    progress.finish();
-
-    // Deletes phase: tombstones run after creates/updates so any cleanup
-    // dependencies (a deleted hook may reference a queue that's also
-    // being deleted; reverse-dep order handles this) are satisfied. The
-    // confirmation gate has already been crossed; here we just execute.
-    let delete_counts = if !tombstones.is_empty() {
-        eprintln!();
-        eprintln!("→ deleting tombstoned objects (reverse dependency order)…");
-        let dc = deletes::run_deletes(&client, &mut lockfile, &tombstones, interactive).await?;
-        eprintln!(
-            "✓ deletes: {} removed, {} skipped",
-            dc.total_deleted(),
-            dc.skipped
-        );
-        dc
-    } else {
-        deletes::DeleteCounts::default()
-    };
-
-    lockfile.save(&paths.lockfile())?;
-    crate::cli::index::generate(&paths, &lockfile)
-        .with_context(|| format!("regenerating _index.md for env '{env}'"))?;
-
-    let mut summary = format!(
-        "Pushed {}, {}, {}, {}, {}, {}, {}, {}, {}, {} to env '{env}'",
-        crate::cli::pull::common::pluralize(counts.n_workspaces, "workspace", "workspaces"),
-        crate::cli::pull::common::pluralize(counts.n_hooks, "hook", "hooks"),
-        crate::cli::pull::common::pluralize(counts.n_rules, "rule", "rules"),
-        crate::cli::pull::common::pluralize(counts.n_labels, "label", "labels"),
-        crate::cli::pull::common::pluralize(counts.n_queues, "queue", "queues"),
-        crate::cli::pull::common::pluralize(counts.n_schemas, "schema", "schemas"),
-        crate::cli::pull::common::pluralize(counts.n_inboxes, "inbox", "inboxes"),
-        crate::cli::pull::common::pluralize(counts.n_email_templates, "email template", "email templates"),
-        crate::cli::pull::common::pluralize(counts.n_engines, "engine", "engines"),
-        crate::cli::pull::common::pluralize(counts.n_engine_fields, "engine field", "engine fields"),
-    );
-    let total_skipped = counts.c_workspaces + counts.c_hooks + counts.c_rules + counts.c_labels
-        + counts.c_queues + counts.c_schemas + counts.c_inboxes + counts.c_email_templates
-        + counts.c_engines + counts.c_engine_fields;
-    if total_skipped > 0 {
-        summary.push_str(&format!(", {} skipped (conflict)", total_skipped));
-    }
-    if delete_counts.total_deleted() > 0 || delete_counts.skipped > 0 {
-        summary.push_str(&format!(
-            "; deleted {}{}",
-            delete_counts.total_deleted(),
-            if delete_counts.skipped > 0 {
-                format!(", {} skipped", delete_counts.skipped)
-            } else {
-                String::new()
-            }
-        ));
-    }
-    println!("{summary}");
-    Ok(())
-}
-
+/// Per-kind tallies produced by [`push_classified`]. Fields are
+/// kept for future summary surfacing; the current sync flow discards
+/// the value because the plan already enumerates what was written.
+#[allow(dead_code)]
 pub(crate) struct PushCounts {
     pub(crate) n_workspaces: usize, pub(crate) c_workspaces: usize,
     pub(crate) n_hooks: usize, pub(crate) c_hooks: usize,
@@ -229,9 +35,10 @@ pub(crate) struct PushCounts {
     pub(crate) n_engine_fields: usize, pub(crate) c_engine_fields: usize,
 }
 
-/// Phase 2 of `rdc push`: run each kind's push driver in dependency
-/// order. Also reused by `rdc sync`'s push-side branch (Task 15), which
-/// builds a `ChangeList` from classified items and delegates here.
+/// Push phase: run each kind's push driver in dependency order. Called
+/// by `cli::sync::execute` after the classifier identifies local edits
+/// and creates; the executor builds a `ChangeList` from classified items
+/// and delegates here.
 pub(crate) async fn push_classified(
     paths: &Paths,
     client: &RossumClient,
@@ -351,11 +158,4 @@ pub(crate) async fn push_classified(
         n_engines, c_engines,
         n_engine_fields, c_engine_fields,
     })
-}
-
-/// Walk the anyhow error chain looking for a `PullAborted` cause. Used
-/// to detect "user picked [a]bort at the push drift resolver" through
-/// `with_context` wrappers (mirrors pull/mod.rs).
-fn is_aborted(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| c.downcast_ref::<crate::cli::resolve::PullAborted>().is_some())
 }

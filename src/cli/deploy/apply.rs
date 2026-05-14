@@ -905,7 +905,7 @@ fn lookup_tgt_id_w(
         Some(id) => Some(id),
         None => {
             warn(progress, format!(
-                "warning: tgt lockfile has no entry for {kind}/{tgt_slug} — skipping (run `rdc pull <tgt>` first)"
+                "warning: tgt lockfile has no entry for {kind}/{tgt_slug} — skipping (run `rdc sync <tgt>` first)"
             ));
             *skipped += 1;
             None
