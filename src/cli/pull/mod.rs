@@ -16,11 +16,11 @@ mod engines;
 mod hooks;
 pub(crate) mod labels;
 pub(crate) mod mdh;
-mod organization;
+pub(crate) mod organization;
 mod queues;
 mod rules;
-mod workflow_steps;
-mod workflows;
+pub(crate) mod workflow_steps;
+pub(crate) mod workflows;
 mod workspaces;
 
 pub use common::PullCtx;

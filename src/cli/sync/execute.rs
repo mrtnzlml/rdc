@@ -579,14 +579,33 @@ pub async fn run(
             crate::cli::pull::labels::process(ctx, catalog.labels.clone(), subset, progress).await?;
         }
 
+        // organization is a pull-only singleton. The classifier only
+        // ever emits "organization"/"self" for RemoteEdit / RemoteCreate
+        // (no push side), so any `subsets.get("organization")` hit means
+        // we want the driver to write the local file. The driver takes
+        // the full Organization rather than a subset filter.
+        if subsets.get("organization").is_some() {
+            crate::cli::pull::organization::process(ctx, catalog.organization.clone(), progress).await?;
+        }
+
+        // workflows and workflow_steps are pull-only (read-only at the
+        // Rossum API). Each driver respects the `(kind, slug)` subset,
+        // so the executor stays a thin dispatcher.
+        if let Some(subset) = subsets.get("workflows") {
+            crate::cli::pull::workflows::process(ctx, catalog.workflows.clone(), subset, progress).await?;
+        }
+        if let Some(subset) = subsets.get("workflow_steps") {
+            crate::cli::pull::workflow_steps::process(ctx, catalog.workflow_steps.clone(), subset, progress).await?;
+        }
+
         // TODO(sync-impl): add per-kind dispatch as their adapter
         // hashing arrives — workspaces, queues, schemas, inboxes,
-        // hooks, rules, engines, engine_fields, email_templates,
-        // workflows, workflow_steps, mdh. Each kind's `process` already
-        // accepts a subset filter; the only new code is the
-        // `subsets.get("<kind>") → process(...)` line plus any
-        // catalog-side prerequisites (e.g. queues needs the workspace
-        // map populated; see `pull::run_drivers` for ordering).
+        // hooks, rules, engines, engine_fields, email_templates, mdh.
+        // Each kind's `process` already accepts a subset filter; the
+        // only new code is the `subsets.get("<kind>") → process(...)`
+        // line plus any catalog-side prerequisites (e.g. queues needs
+        // the workspace map populated; see `pull::run_drivers` for
+        // ordering).
     }
 
     if !no_push {

@@ -915,3 +915,302 @@ async fn sync_no_push_and_no_pull_together_errors() {
         "error message should mention 'mutually exclusive' or 'rdc status': {msg}"
     );
 }
+
+/// Pull-side RemoteCreate for a workflow: env exposes a workflow that
+/// doesn't exist locally and isn't in the lockfile. `sync` must classify
+/// it `RemoteCreate` and write `envs/dev/workflows/<slug>/workflow.json`.
+/// Workflows are read-only at the Rossum API, so no mutations are issued.
+#[tokio::test]
+async fn sync_remote_create_writes_local_workflow() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let workflows_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 700,
+                "url": format!("{}/api/v1/workflows/700", server.uri()),
+                "name": "AP Approval Flow",
+                "steps": [],
+                "modified_at": "2026-04-20T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workflows"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(workflows_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/workflows"]).await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* diff = */ false, /* allow_deletes = */ false,
+        /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    result.expect("sync should succeed when remote has a new workflow");
+
+    // No API writes — pull-side only (workflows are read-only).
+    for req in server.received_requests().await.unwrap_or_default() {
+        let p = req.url.path();
+        if p.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "unexpected mutating request: {} {}",
+            req.method,
+            p
+        );
+    }
+
+    let workflow_path = project
+        .path()
+        .join("envs/dev/workflows/ap-approval-flow/workflow.json");
+    assert!(
+        workflow_path.exists(),
+        "workflow JSON should be written at {}",
+        workflow_path.display()
+    );
+    let body = std::fs::read_to_string(&workflow_path).unwrap();
+    assert!(body.contains("AP Approval Flow"), "workflow content: {body}");
+
+    // Lockfile records the workflow.
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    assert!(lf_raw.contains("\"workflows\""), "lockfile must record workflow: {lf_raw}");
+    assert!(lf_raw.contains("ap-approval-flow"), "lockfile must record slug: {lf_raw}");
+}
+
+/// Pull-side RemoteCreate for a workflow step. Requires the parent
+/// workflow to be present too (the driver skips orphan steps), so this
+/// mocks both endpoints. Asserts the nested file at
+/// `envs/dev/workflows/<workflow_slug>/steps/<step_slug>.json` exists.
+#[tokio::test]
+async fn sync_remote_create_writes_local_workflow_step() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let workflow_url = format!("{}/api/v1/workflows/700", server.uri());
+    let workflows_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 700,
+                "url": workflow_url,
+                "name": "AP Approval Flow",
+                "steps": [
+                    format!("{}/api/v1/workflow_steps/1", server.uri())
+                ],
+                "modified_at": "2026-04-20T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workflows"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(workflows_body))
+        .mount(&server)
+        .await;
+
+    let steps_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 1,
+                "url": format!("{}/api/v1/workflow_steps/1", server.uri()),
+                "name": "Manager Approval",
+                "workflow": format!("{}/api/v1/workflows/700", server.uri()),
+                "modified_at": "2026-04-20T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workflow_steps"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(steps_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/workflows", "/api/v1/workflow_steps"]).await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* diff = */ false, /* allow_deletes = */ false,
+        /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    result.expect("sync should succeed when remote has a new workflow step");
+
+    // No API mutations — both kinds are read-only.
+    for req in server.received_requests().await.unwrap_or_default() {
+        let p = req.url.path();
+        if p.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "unexpected mutating request: {} {}",
+            req.method,
+            p
+        );
+    }
+
+    let step_path = project
+        .path()
+        .join("envs/dev/workflows/ap-approval-flow/steps/manager-approval.json");
+    assert!(
+        step_path.exists(),
+        "workflow step JSON should be written at {}",
+        step_path.display()
+    );
+    let body = std::fs::read_to_string(&step_path).unwrap();
+    assert!(body.contains("Manager Approval"), "step content: {body}");
+
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    assert!(
+        lf_raw.contains("\"workflow_steps\""),
+        "lockfile must record workflow_steps: {lf_raw}"
+    );
+    assert!(
+        lf_raw.contains("manager-approval"),
+        "lockfile must record step slug: {lf_raw}"
+    );
+}
+
+/// Pull-side RemoteCreate for the organization singleton: the org JSON
+/// from `/api/v1/organizations/<id>` lands at `envs/dev/organization.json`
+/// and the lockfile records it under the `"self"` slug. The org is
+/// read-only at the Rossum API so no mutations should land.
+#[tokio::test]
+async fn sync_remote_create_writes_local_organization() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &[]).await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* diff = */ false, /* allow_deletes = */ false,
+        /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    result.expect("sync should succeed when remote serves an organization");
+
+    // No mutating calls — the org is pull-only.
+    for req in server.received_requests().await.unwrap_or_default() {
+        let p = req.url.path();
+        if p.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "unexpected mutating request: {} {}",
+            req.method,
+            p
+        );
+    }
+
+    let org_path = project.path().join("envs/dev/organization.json");
+    assert!(
+        org_path.exists(),
+        "organization JSON should be written at {}",
+        org_path.display()
+    );
+    let body = std::fs::read_to_string(&org_path).unwrap();
+    assert!(
+        body.contains("Acme Test Org"),
+        "organization content: {body}"
+    );
+
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    assert!(
+        lf_raw.contains("\"organization\""),
+        "lockfile must record organization: {lf_raw}"
+    );
+    assert!(
+        lf_raw.contains("\"self\""),
+        "lockfile must record the 'self' slug: {lf_raw}"
+    );
+}

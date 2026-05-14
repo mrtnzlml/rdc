@@ -251,6 +251,86 @@ pub fn from_catalog_scan_lockfile(
         }
     }
 
+    // --- organization (pull-only singleton) ---------------------------
+    // The org is a singleton — slug is always "self", matching
+    // `pull::organization::process`'s `record_object` key. Hash
+    // computation mirrors that driver: `serde_json::to_vec_pretty` →
+    // push `\n` → `content_hash`. Push side never touches the org, so
+    // there's no `scan_changes` / tombstones lookup here.
+    {
+        let org = &catalog.organization;
+        if let Ok(mut proposed) = serde_json::to_vec_pretty(org) {
+            proposed.push(b'\n');
+            let hash = crate::state::content_hash(&proposed);
+            remote_hashes.insert(("organization".to_string(), "self".to_string()), hash);
+        }
+        if let Some(map) = lockfile.objects.get("organization") {
+            for (slug, entry) in map {
+                if let Some(h) = &entry.content_hash {
+                    locked.insert(("organization".to_string(), slug.clone()), h.clone());
+                }
+            }
+        }
+    }
+
+    // --- workflows (pull-only) ----------------------------------------
+    // Slug derivation mirrors `pull::workflows::process`: prefer the
+    // lockfile-anchored id mapping, else `slugify_unique(name, used)`.
+    // Hash computation matches the driver byte-for-byte.
+    let mut used_workflow_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for w in &catalog.workflows {
+        let slug = match lockfile.slug_for_id("workflows", w.id) {
+            Some(existing) => existing.to_string(),
+            None => crate::slug::slugify_unique(&w.name, &used_workflow_slugs),
+        };
+        used_workflow_slugs.insert(slug.clone());
+
+        let mut proposed = match serde_json::to_vec_pretty(w) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        proposed.push(b'\n');
+        let hash = crate::state::content_hash(&proposed);
+        remote_hashes.insert(("workflows".to_string(), slug), hash);
+    }
+    if let Some(map) = lockfile.objects.get("workflows") {
+        for (slug, entry) in map {
+            if let Some(h) = &entry.content_hash {
+                locked.insert(("workflows".to_string(), slug.clone()), h.clone());
+            }
+        }
+    }
+
+    // --- workflow_steps (pull-only) -----------------------------------
+    // Flat slug derivation, like engine_fields. The driver also skips
+    // orphan steps (no parent workflow in the lockfile) but here we
+    // emit the catalog-side slug regardless — the classifier doesn't
+    // care, and an orphan step still classifies as RemoteCreate (the
+    // driver's `process` will then skip it and emit a warning).
+    let mut used_step_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for s in &catalog.workflow_steps {
+        let slug = match lockfile.slug_for_id("workflow_steps", s.id) {
+            Some(existing) => existing.to_string(),
+            None => crate::slug::slugify_unique(&s.name, &used_step_slugs),
+        };
+        used_step_slugs.insert(slug.clone());
+
+        let mut proposed = match serde_json::to_vec_pretty(s) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        proposed.push(b'\n');
+        let hash = crate::state::content_hash(&proposed);
+        remote_hashes.insert(("workflow_steps".to_string(), slug), hash);
+    }
+    if let Some(map) = lockfile.objects.get("workflow_steps") {
+        for (slug, entry) in map {
+            if let Some(h) = &entry.content_hash {
+                locked.insert(("workflow_steps".to_string(), slug.clone()), h.clone());
+            }
+        }
+    }
+
     // TODO(sync-impl): repeat the four-source extraction for
     // workspaces / queues / hooks / rules / schemas / inboxes /
     // engines / engine_fields / email_templates / mdh. Each kind reuses
