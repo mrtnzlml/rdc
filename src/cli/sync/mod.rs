@@ -3,3 +3,4 @@
 //! Spec: docs/superpowers/specs/2026-05-14-unified-sync-design.md
 
 pub mod classify;
+pub mod plan;
