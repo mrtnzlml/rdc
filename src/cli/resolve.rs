@@ -196,6 +196,88 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
     }
 }
 
+/// Top-level entry point for the remote-deleted prompt. Auto-detects color
+/// mode. The local file is shown as a preview; the env's "deleted" status
+/// is asserted in the header. Returns one of:
+/// - `Resolution::KeepLocal` — user wants to restore on env (POST it back).
+/// - `Resolution::KeepRemote` — user accepts deletion; local file should be removed.
+/// - `Resolution::Skip` — write `<file>.<env>-deleted` marker; defer decision.
+/// - `Resolution::Abort` — caller bails (e.g. via `PullAborted`).
+///
+/// `Resolution::Edit` is unreachable from this prompt (no `[e]` option offered).
+pub fn prompt_remote_delete<R: BufRead, W: Write>(
+    input: R,
+    output: W,
+    local_path: &Path,
+    env: &str,
+) -> Result<Resolution> {
+    let mode = detect_color_mode(false);
+    prompt_remote_delete_with_color(input, output, local_path, env, mode)
+}
+
+/// Color-aware variant. Tests pin the mode; production goes through
+/// `prompt_remote_delete`.
+pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
+    mut input: R,
+    mut output: W,
+    local_path: &Path,
+    env: &str,
+    mode: ColorMode,
+) -> Result<Resolution> {
+    let local_bytes = read_local(local_path)?;
+    let preview = prettify_json_for_diff(&local_bytes);
+
+    writeln!(output)?;
+    let header = format!("{} — deleted on {env}", local_path.display());
+    writeln!(output, "{}", colorize_header(&header, mode))?;
+    writeln!(output)?;
+    writeln!(output, "local has the file:")?;
+
+    // Elide the preview to ~40 lines for unwieldy bodies. The spec's
+    // open question allows this; revisit if user feedback says otherwise.
+    let s = String::from_utf8_lossy(&preview);
+    let lines: Vec<&str> = s.lines().collect();
+    let limit = 40;
+    if lines.len() <= limit {
+        for ln in &lines {
+            writeln!(output, "  {ln}")?;
+        }
+    } else {
+        for ln in &lines[..limit] {
+            writeln!(output, "  {ln}")?;
+        }
+        writeln!(output, "  … ({} more lines)", lines.len() - limit)?;
+    }
+    writeln!(output)?;
+    writeln!(output, "{env} has it deleted.")?;
+    writeln!(output)?;
+
+    loop {
+        let prompt_text = format!(
+            "[k] keep local (restore on {env})  \
+             [r] use {env} (delete local)  \
+             [s] skip  \
+             [a] abort > "
+        );
+        write!(output, "{}", colorize_prompt(&prompt_text, mode))?;
+        output.flush().ok();
+        let mut line = String::new();
+        if input.read_line(&mut line)? == 0 {
+            return Ok(Resolution::Skip);
+        }
+        match line.trim().chars().next() {
+            Some('k') | Some('K') => return Ok(Resolution::KeepLocal),
+            Some('r') | Some('R') => return Ok(Resolution::KeepRemote),
+            Some('s') | Some('S') => return Ok(Resolution::Skip),
+            Some('a') | Some('A') => return Ok(Resolution::Abort),
+            _ => {
+                writeln!(output, "  (unrecognized — pick one of k/r/s/a)")?;
+                continue;
+            }
+        }
+    }
+}
+
 /// Result of the editor loop. `Aborted` means the user backed out of the
 /// edit without producing usable bytes; the resolver falls back to the
 /// main prompt so they can pick keep-local/remote/skip/abort instead.
@@ -1105,5 +1187,69 @@ mod tests {
         assert!(s.contains("[r] use production"), "prompt missing env-named [r] label: {s}");
         assert!(s.contains("+++ production"), "diff header should name the env: {s}");
         assert!(!s.contains("[r]emote"), "old literal label leaked: {s}");
+    }
+
+    #[test]
+    fn prompt_remote_delete_offers_restore_and_mirror_labels() {
+        use std::io::Cursor;
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("labels/audit-hold.json");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(&local, b"{\"name\":\"Audit hold\"}").unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        let input = Cursor::new(b"s\n");
+        let res = prompt_remote_delete_with_color(
+            input, &mut out, &local, "production", ColorMode::Plain,
+        ).unwrap();
+        assert!(matches!(res, Resolution::Skip));
+
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("deleted on production"), "header: {s}");
+        assert!(s.contains("[k] keep local (restore on production)"), "k label: {s}");
+        assert!(s.contains("[r] use production (delete local)"), "r label: {s}");
+        assert!(!s.contains("[e]"), "no edit option in delete prompt: {s}");
+    }
+
+    #[test]
+    fn prompt_remote_delete_returns_keep_local_on_k() {
+        use std::io::Cursor;
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("x.json");
+        std::fs::write(&local, b"{}").unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let input = Cursor::new(b"k\n");
+        let res = prompt_remote_delete_with_color(
+            input, &mut out, &local, "test", ColorMode::Plain,
+        ).unwrap();
+        assert!(matches!(res, Resolution::KeepLocal));
+    }
+
+    #[test]
+    fn prompt_remote_delete_returns_keep_remote_on_r() {
+        use std::io::Cursor;
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("x.json");
+        std::fs::write(&local, b"{}").unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let input = Cursor::new(b"r\n");
+        let res = prompt_remote_delete_with_color(
+            input, &mut out, &local, "test", ColorMode::Plain,
+        ).unwrap();
+        assert!(matches!(res, Resolution::KeepRemote));
+    }
+
+    #[test]
+    fn prompt_remote_delete_returns_abort_on_a() {
+        use std::io::Cursor;
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("x.json");
+        std::fs::write(&local, b"{}").unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let input = Cursor::new(b"a\n");
+        let res = prompt_remote_delete_with_color(
+            input, &mut out, &local, "test", ColorMode::Plain,
+        ).unwrap();
+        assert!(matches!(res, Resolution::Abort));
     }
 }
