@@ -251,7 +251,7 @@ pub fn build_template_url_map(
                     .map(|t| t.url.rsplit('/').next().unwrap_or("?"))
                     .collect();
                 return Err(anyhow!(
-                    "ambiguous templates for '{}' on {tgt_env_label} ({n} matches, ids {}); add a mapping under [hook_templates] in .rdc/map/<src>→{tgt_env_label}.toml.",
+                    "ambiguous templates for '{}' on {tgt_env_label} ({n} matches, ids {}); add a mapping under [hook_templates] in .rdc/map/<src>-to-{tgt_env_label}.toml.",
                     src.name,
                     ids.join(", ")
                 ));

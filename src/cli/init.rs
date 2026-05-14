@@ -353,7 +353,7 @@ envs/<env>/
   mdh/<dataset>/                          Master Data Hub (if enabled)
 .rdc/
   state/<env>.lock.json                   slug↔id + base hashes; never edit
-  map/<src>→<tgt>.toml                    cross-env slug mappings
+  map/<src>-to-<tgt>.toml                 cross-env slug mappings
 ```
 
 ## Editing recipes
@@ -446,7 +446,7 @@ keep the local on disk.
 2. `rdc deploy dev prod --dry-run` — preview the plan.
 3. `rdc deploy dev prod` — execute. Per-env values stay in each env's
    `overlay.toml`; the slug-to-slug mapping is built automatically and
-   stored at `.rdc/map/dev→prod.toml` (hand-edit for renames if needed).
+   stored at `.rdc/map/dev-to-prod.toml` (hand-edit for renames if needed).
 
 ## What NOT to edit
 

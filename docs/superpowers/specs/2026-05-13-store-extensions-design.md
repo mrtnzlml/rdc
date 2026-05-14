@@ -172,10 +172,10 @@ Today's URL rewriter rewrites by slug-to-slug map: a src queue URL is mapped to 
 - **`hook_template`** → resolved by `(name, type, extension_source)` match against `GET /hook_templates` on the tgt cluster.
 - **`token_owner`** → resolved per-hook from `envs/<tgt>/overlay.toml`, populated interactively on first deploy.
 
-Both are looked up once at the start of the deploy and cached. The cache for templates is also persisted to `.rdc/map/<src>→<tgt>.toml` under a new `[hook_templates]` section, so subsequent deploys don't re-list:
+Both are looked up once at the start of the deploy and cached. The cache for templates is also persisted to `.rdc/map/<src>-to-<tgt>.toml` under a new `[hook_templates]` section, so subsequent deploys don't re-list:
 
 ```toml
-# .rdc/map/test→prod.toml
+# .rdc/map/test-to-prod.toml
 [hooks]
 master-data-hub = "master-data-hub"
 
@@ -198,7 +198,7 @@ On deploy start, rdc lists `GET /hook_templates` on the tgt cluster once. It bui
 Failure modes:
 
 - **No match** → `template 'Master Data Hub' is not available on prod. Templates with install_action=request_access require Rossum sales to enable; copy templates may have been withdrawn. Install manually via the UI on prod, then re-run rdc pull prod.`
-- **Multiple matches** → `ambiguous templates for 'Master Data Hub' on prod (ids 39, 41); add a mapping under [hook_templates] in .rdc/map/test→prod.toml.`
+- **Multiple matches** → `ambiguous templates for 'Master Data Hub' on prod (ids 39, 41); add a mapping under [hook_templates] in .rdc/map/test-to-prod.toml.`
 
 ### `token_owner` resolution
 

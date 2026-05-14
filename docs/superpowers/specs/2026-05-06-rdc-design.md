@@ -79,8 +79,8 @@ my-rossum-project/
       test.lock.json
       prod.lock.json
     map/
-      test→prod.toml                 # persisted env-pair mapping
-      dev→test.toml
+      test-to-prod.toml              # persisted env-pair mapping
+      dev-to-test.toml
     cache/                           # transient caches
   envs/
     dev/                             # one self-contained env snapshot
@@ -229,7 +229,7 @@ my-rossum-project/
 
 1. Load `<src>` snapshot.
 2. Pull fresh `<tgt>` state into memory (read-only, does not modify local snapshot of `<tgt>`).
-3. Load `state/.rdc/map/<src>→<tgt>.toml`.
+3. Load `state/.rdc/map/<src>-to-<tgt>.toml`.
 4. **Categorize each object's diff:**
    - **Drift** — `<tgt>` remote differs from local snapshot of `<tgt>`. User decides: accept (refresh local) or revert (push our truth).
    - **Divergence** — `<src>` differs from `<tgt>`; will propagate.
@@ -246,7 +246,7 @@ my-rossum-project/
    - Auto-match same-slug object in `<b>`. Batched confirmation.
    - Multiple candidates → interactive picker.
    - No candidate → ask create / skip.
-2. Write `state/.rdc/map/<a>→<b>.toml`. Hand-editable.
+2. Write `state/.rdc/map/<a>-to-<b>.toml`. Hand-editable.
 3. Re-runnable, idempotent. Adding new objects later updates the file.
 
 ## 8. Conflict handling
@@ -328,7 +328,7 @@ Overlay values are merged into outbound payloads. They never live in `*.json` sn
 
 ### 10.1 File format
 
-`.rdc/map/test→prod.toml`:
+`.rdc/map/test-to-prod.toml`:
 
 ```toml
 version = 1
@@ -485,7 +485,7 @@ Principles: every error names (a) what failed, (b) why, (c) the next concrete ac
 - **Env / environment** — a logical Rossum config slice: `(org, optional workspace filter)`. Defined in `rdc.toml`. Examples: dev, test, prod.
 - **Snapshot** — the on-disk file tree under `envs/<env>/` representing one env.
 - **Overlay** — `envs/<env>/overlay.toml`. Declares legitimate env-specific divergence; never propagates.
-- **Mapping** — `.rdc/map/<a>→<b>.toml`. Slug-to-slug correspondence between two envs. Required for `plan`/`apply`.
+- **Mapping** — `.rdc/map/<a>-to-<b>.toml`. Slug-to-slug correspondence between two envs. Required for `plan`/`apply`.
 - **Lockfile** — `.rdc/state/<env>.lock.json`. Last-pulled snapshot hashes + slug↔ID map per object.
 - **Drift** — divergence between local snapshot of an env and remote state of the same env.
 - **Divergence** — difference between two envs (the thing deploys propagate).

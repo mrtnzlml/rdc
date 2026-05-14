@@ -1215,7 +1215,7 @@ pub fn build_template_url_map(
                     .map(|t| t.url.rsplit('/').next().unwrap_or("?"))
                     .collect();
                 return Err(anyhow!(
-                    "ambiguous templates for '{}' on {tgt_env_label} ({n} matches, ids {}); add a mapping under [hook_templates] in .rdc/map/<src>→{tgt_env_label}.toml.",
+                    "ambiguous templates for '{}' on {tgt_env_label} ({n} matches, ids {}); add a mapping under [hook_templates] in .rdc/map/<src>-to-{tgt_env_label}.toml.",
                     src.name,
                     ids.join(", ")
                 ));
@@ -1811,7 +1811,7 @@ store_extension_token_owner = "TGT_USER_URL"
     project.run(&["deploy", "test", "prod", "--yes"]).assert().success();
 
     // The map cache should now contain the template pair.
-    let map_path = project.dot_rdc_dir().join("map").join("test→prod.toml");
+    let map_path = project.dot_rdc_dir().join("map").join("test-to-prod.toml");
     let raw = std::fs::read_to_string(&map_path).unwrap();
     assert!(raw.contains("[hook_templates]"));
     assert!(raw.contains("hook_templates/41"));

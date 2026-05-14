@@ -65,9 +65,9 @@ impl Paths {
         self.root.join(".rdc").join("map")
     }
 
-    /// `<root>/.rdc/map/<src>→<tgt>.toml`
+    /// `<root>/.rdc/map/<src>-to-<tgt>.toml`
     pub fn mapping_file(&self, src: &str, tgt: &str) -> PathBuf {
-        self.mapping_dir().join(format!("{src}→{tgt}.toml"))
+        self.mapping_dir().join(format!("{src}-to-{tgt}.toml"))
     }
 
     /// `<root>/envs/<env>/hooks/`
@@ -208,7 +208,7 @@ mod tests {
     fn mapping_file_path() {
         assert_eq!(
             p().mapping_file("test", "prod"),
-            Path::new("/proj/.rdc/map/test→prod.toml")
+            Path::new("/proj/.rdc/map/test-to-prod.toml")
         );
     }
 

@@ -166,7 +166,7 @@ Three local primitives plus one remote source of truth. Knowing them makes every
 - **`envs/<env>/overlay.toml`** — the **overlay**. Per-env values applied on push, stripped on pull. Optional, but the right tool for divergences like "PROD's hooks use `python3.12-secure` while TEST's use `python3.12`."
 - **The remote API** — the source of truth for what's actually running.
 
-Cross-references between resources are URL-based. `rdc deploy` rewrites them automatically when moving objects between envs, using the slug-to-slug mapping stored in `.rdc/map/<src>→<tgt>.toml` (built silently on first deploy; hand-edit for renames).
+Cross-references between resources are URL-based. `rdc deploy` rewrites them automatically when moving objects between envs, using the slug-to-slug mapping stored in `.rdc/map/<src>-to-<tgt>.toml` (built silently on first deploy; hand-edit for renames).
 
 ## Commands
 
@@ -235,7 +235,7 @@ by `(name, hook_template)` and resumes without creating a duplicate.
 `rdc deploy` resolves the target cluster's matching `hook_template`
 URL by `(name, type, extension_source)` match against
 `GET /hook_templates` on the target, caching the pair in
-`.rdc/map/<src>→<tgt>.toml` under `[hook_templates]`. The first deploy
+`.rdc/map/<src>-to-<tgt>.toml` under `[hook_templates]`. The first deploy
 that needs a `token_owner` on the target also prompts you to pick the
 target's service-account user from a list (ranked with
 `system_user__*` first); your choice is saved to
@@ -343,7 +343,7 @@ Deployed test → prod: 126 created, 0 deleted, 144 API calls, 89.1s
 
 What's happening inside:
 
-1. **Auto-mapping.** Same-slug objects in `test` and `prod` are paired silently. Hand-curated renames in `.rdc/map/test→prod.toml` are preserved.
+1. **Auto-mapping.** Same-slug objects in `test` and `prod` are paired silently. Hand-curated renames in `.rdc/map/test-to-prod.toml` are preserved.
 2. **Plan.** What would be created, what would be patched, what would be deleted (`--mirror` only).
 3. **Confirm.** TTY prompts; CI passes `--yes`.
 4. **Create.** Dependency order: `workspaces → schemas → queues → inboxes → email_templates → hooks → rules → labels → engines → engine_fields`. POSTing each missing resource. Each create updates an in-memory mapping so the next kind's URL rewriter knows where the just-created peers live.
@@ -468,7 +468,7 @@ Pull surfaces pending renames in its summary; `rdc status` lists each one per en
 | `envs/<env>/<kind>/<slug>.json` | Org-scoped kinds (hooks, rules, labels, engines, …) |
 | `envs/<env>/mdh/<dataset>/{collection,indexes}.json` | Master Data Hub (on clusters that have it) |
 | `.rdc/state/<env>.lock.json` | Merge base. Auto-managed. |
-| `.rdc/map/<src>→<tgt>.toml` | Slug-to-slug mapping built by `rdc deploy`. Hand-edit for cross-env renames. |
+| `.rdc/map/<src>-to-<tgt>.toml` | Slug-to-slug mapping built by `rdc deploy`. Hand-edit for cross-env renames. |
 
 ## Authentication
 

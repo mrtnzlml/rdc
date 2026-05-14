@@ -847,7 +847,7 @@ async fn deploy_errors_when_template_missing_on_tgt() {
 
 /// Deploy pre-pass resolves cross-cluster template URLs and reads token_owner
 /// from the tgt overlay (non-interactive path). After `rdc deploy test prod
-/// --yes`, the `.rdc/map/test→prod.toml` must contain a `[hook_templates]`
+/// --yes`, the `.rdc/map/test-to-prod.toml` must contain a `[hook_templates]`
 /// section with the src→tgt template URL pair, and the tgt lockfile must
 /// record the new hook id (proving both the pre-pass and the two-call install
 /// + PATCH path ran).
@@ -1020,7 +1020,7 @@ async fn deploy_resolves_templates_and_prompts_for_token_owner() {
     );
 
     // The map cache must contain the template URL pair built by the pre-pass.
-    let map_path = project.path().join(".rdc/map/test→prod.toml");
+    let map_path = project.path().join(".rdc/map/test-to-prod.toml");
     let raw = std::fs::read_to_string(&map_path).expect("map file should exist");
     assert!(
         raw.contains("[hook_templates]"),
