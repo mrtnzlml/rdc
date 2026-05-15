@@ -118,7 +118,6 @@ pub async fn create_workspace(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()>
         },
     );
     ctx.mapping.workspaces.insert(slug.to_string(), slug.to_string());
-    ctx.progress.as_ref().map(|p| p.println(format!("[ok] created/updated slug: {}", slug)));
     Ok(())
 }
 
@@ -416,7 +415,6 @@ pub async fn create_hook(
         },
     );
     ctx.mapping.hooks.insert(slug.to_string(), slug.to_string());
-    ctx.progress.as_ref().map(|p| p.println(format!("[ok] created/updated slug: {}", slug)));
     Ok(())
 }
 
@@ -447,7 +445,6 @@ pub async fn create_rule(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
         },
     );
     ctx.mapping.rules.insert(slug.to_string(), slug.to_string());
-    ctx.progress.as_ref().map(|p| p.println(format!("[ok] created/updated slug: {}", slug)));
     Ok(())
 }
 
@@ -482,7 +479,6 @@ pub async fn create_label(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
         },
     );
     ctx.mapping.labels.insert(slug.to_string(), slug.to_string());
-    ctx.progress.as_ref().map(|p| p.println(format!("[ok] created/updated slug: {}", slug)));
     Ok(())
 }
 

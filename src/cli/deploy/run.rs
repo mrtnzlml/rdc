@@ -290,11 +290,11 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
             // Start a phase for this kind (skipped if no items).
             let create_phase: Option<crate::progress::Phase> =
                 progress.as_ref().map(|p| p.phase(format!("creating {kind}")));
-            // The phase handle stays in scope through the loop so per-item
-            // lines (printed by the create_* helpers via ctx.progress) appear
-            // under the phase header.
-            let _ = create_phase;
             for slug in slugs {
+                // Per-item spinner so the user sees animation while the
+                // POST (and any peer fetches) are in flight. Skipped kinds
+                // resolve the spinner with a "skipped" note.
+                let sp = create_phase.as_ref().map(|ph| ph.item(slug.clone()));
                 let result = match *kind {
                     "workspaces" => create_workspace(&mut ctx, slug).await,
                     "schemas" => create_schema(&mut ctx, slug).await,
@@ -328,6 +328,10 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
                     }
                     _ => Ok(()),
                 };
+                match &result {
+                    Ok(()) => { if let Some(sp) = sp { sp.finish_ok(""); } }
+                    Err(_) => { drop(sp); }
+                }
                 result?;
                 creates_done += 1;
                 api_calls += 1;

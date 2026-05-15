@@ -424,17 +424,36 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
     let asset_name = platform_asset_name()?;
     let url = asset_download_url(&latest, &asset_name);
 
-    println!("downloading rdc v{latest} ({asset_name})...");
-    let bytes = http_client(UPGRADE_TIMEOUT)?
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?
-        .error_for_status()
-        .with_context(|| format!("non-2xx from {url}"))?
-        .bytes()
-        .await
-        .context("reading tarball body")?;
+    // Wrap the download in a spinner so the user sees activity while
+    // multi-megabyte tarball bytes are streaming. Spinner only — no
+    // per-byte progress bar (per the progress UX spec).
+    let progress = crate::progress::ProgressLog::start(format!("rdc upgrade -> v{latest}"));
+    let phase = progress.phase("downloading");
+    let sp = phase.item(asset_name.clone());
+    let bytes_result = async {
+        http_client(UPGRADE_TIMEOUT)?
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?
+            .error_for_status()
+            .with_context(|| format!("non-2xx from {url}"))?
+            .bytes()
+            .await
+            .context("reading tarball body")
+    }
+    .await;
+    let bytes = match bytes_result {
+        Ok(b) => {
+            sp.finish_ok(format!("{} bytes", b.len()));
+            b
+        }
+        Err(e) => {
+            sp.finish_warn("download failed");
+            progress.finish_err("upgrade aborted");
+            return Err(e);
+        }
+    };
 
     let tmp = tempfile::tempdir().context("creating temp dir for upgrade")?;
     extract_rdc_binary(bytes.as_ref(), tmp.path())
@@ -590,6 +609,7 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
         latest: latest.to_string(),
     });
 
+    progress.finish(format!("Upgraded v{current_v} -> v{latest}"));
     println!(
         "upgraded rdc v{current_v} -> v{latest}\nprevious binary at {} (delete when ready)",
         backup_path.display()

@@ -60,6 +60,9 @@ pub async fn run(env: &str, token_arg: Option<String>) -> Result<()> {
 /// Validate `token` by calling `GET /organizations/<id>`. On success,
 /// write it atomically to `secrets_path` with mode 0600 (Unix) and
 /// return the organization name. On failure, propagate.
+///
+/// A short-lived ProgressLog surrounds the validation GET so the user
+/// sees a spinner while rdc is waiting on the Rossum API.
 async fn validate_and_save_token(
     env_cfg: &EnvConfig,
     secrets_path: &Path,
@@ -67,15 +70,31 @@ async fn validate_and_save_token(
 ) -> Result<String> {
     let client = RossumClient::new(env_cfg.api_base.clone(), token.to_string())
         .context("constructing Rossum API client")?;
-    let org = client
-        .get_organization(env_cfg.org_id, None)
+
+    let progress = crate::progress::ProgressLog::start("rdc auth");
+    let phase = progress.phase("validating token");
+    let sp = phase.item(format!("GET /organizations/{}", env_cfg.org_id));
+    let org_result = client
+        .get_organization(env_cfg.org_id, Some(progress.clone()))
         .await
         .with_context(|| {
             format!(
                 "validating token against {}/organizations/{}",
                 env_cfg.api_base, env_cfg.org_id
             )
-        })?;
+        });
+    let org = match org_result {
+        Ok(o) => {
+            sp.finish_ok(o.name.clone());
+            o
+        }
+        Err(e) => {
+            sp.finish_warn("rejected by server");
+            progress.finish_err("token validation failed");
+            return Err(e);
+        }
+    };
+    progress.finish(format!("Validated against org '{}'", org.name));
 
     if let Some(parent) = secrets_path.parent() {
         std::fs::create_dir_all(parent)

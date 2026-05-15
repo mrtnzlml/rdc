@@ -115,25 +115,47 @@ pub async fn process(
     }
 
     // === Sub-phase B: concurrent index fetches per collection (regular +
-    //            search). Bounded fan-out (see common::PULL_FANOUT).
+    //            search). Bounded fan-out (see common::PULL_FANOUT). A single
+    //            spinner shows progress while the parallel batch runs.
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let client_ref = &client;
-    let progress_inner = progress.clone();
-    let fetched: Vec<(String, IndexSet)> = futures::stream::iter(
+    let total = dataset_dirs.len();
+    if total == 0 {
+        return Ok((0, conflicts));
+    }
+    let sp = Arc::new(phase.item(format!("indexes (0/{total})")));
+    let done = Arc::new(AtomicUsize::new(0));
+    let fetched_result: Result<Vec<(String, IndexSet)>> = futures::stream::iter(
         dataset_dirs.iter().map(|(slug, _, c)| (slug.clone(), c.name.clone()))
     )
     .map(|(slug, name)| {
-        let p = progress_inner.clone();
+        let sp = sp.clone();
+        let done = done.clone();
         async move {
-            let regular = client_ref.list_indexes(&name, Some(p.clone())).await
+            let regular = client_ref.list_indexes(&name, None).await
                 .with_context(|| format!("listing indexes for '{name}'"))?;
-            let search = client_ref.list_search_indexes(&name, Some(p.clone())).await
+            let search = client_ref.list_search_indexes(&name, None).await
                 .with_context(|| format!("listing search indexes for '{name}'"))?;
+            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+            sp.set_message(format!("indexes ({n}/{total})"));
             Ok::<_, anyhow::Error>((slug, IndexSet { regular, search }))
         }
     })
     .buffer_unordered(crate::cli::pull::common::PULL_FANOUT)
     .try_collect()
-    .await?;
+    .await;
+    let fetched = match fetched_result {
+        Ok(v) => {
+            if let Ok(spinner) = Arc::try_unwrap(sp) {
+                spinner.finish_ok(format!("{total} fetched"));
+            }
+            v
+        }
+        Err(e) => {
+            drop(sp);
+            return Err(e);
+        }
+    };
     let by_slug: std::collections::HashMap<String, IndexSet> = fetched.into_iter().collect();
 
     // === Sub-phase C: per-collection indexes.json write decision (sequential

@@ -8,6 +8,7 @@ use crate::cli::resolve::line_diff;
 use crate::config::ProjectConfig;
 use crate::mapping::Mapping;
 use crate::paths::Paths;
+use crate::progress::{Phase, ProgressLog};
 use crate::secrets::resolve_token;
 use crate::snapshot::email_template::read_email_template;
 use crate::snapshot::hook::{read_hook, serialize_hook};
@@ -17,6 +18,7 @@ use crate::snapshot::schema::{read_schema, serialize_schema};
 use crate::state::Lockfile;
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
+use std::sync::Arc;
 
 /// Context for src-side canonicalisation in `rdc diff <src> <tgt>`. When
 /// present, cross-reference URL strings on the src side are rewritten into
@@ -68,10 +70,17 @@ pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) ->
     let client = RossumClient::new(env_cfg.api_base.clone(), token)
         .context("constructing Rossum API client")?;
 
+    // Wire a ProgressLog so every remote-API call shows a spinner. Each
+    // kind gets its own phase, and each per-object GET resolves a spinner
+    // line — without this the user sees nothing during a multi-second
+    // sweep and can't tell whether rdc is stuck.
+    let progress = ProgressLog::start(format!("rdc diff {env}"));
+
     let mut diffs_printed = 0usize;
 
     // Hooks: combined-form (.json + .py)
     if paths.hooks_dir().exists() {
+        let phase = progress.phase("diffing hooks");
         for entry in std::fs::read_dir(paths.hooks_dir())? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_string();
@@ -90,12 +99,14 @@ pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) ->
                 Some(i) => i,
                 None => continue,
             };
-            let remote = client.get_hook(id, None).await
+            let sp = phase.item(slug.to_string());
+            let remote = client.get_hook(id, Some(progress.clone())).await
                 .with_context(|| format!("fetching hook {id} for diff"))?;
             let (remote_json, remote_code) = serialize_hook(&remote)?;
 
             let lj = String::from_utf8_lossy(&local_json);
             let rj = String::from_utf8_lossy(&remote_json);
+            let before = diffs_printed;
             print_unified(&format!("hooks/{slug}.json (local)"),
                           &format!("hooks/{slug}.json (remote)"),
                           &lj, &rj, &mut diffs_printed);
@@ -113,25 +124,31 @@ pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) ->
                               &format!("hooks/{slug}.{ext} (remote)"),
                               &lc, &rc, &mut diffs_printed);
             }
+            if diffs_printed > before {
+                sp.finish_ok("differs");
+            } else {
+                sp.finish_ok("clean");
+            }
         }
     }
 
     // Rules: combined-form (.json + optional .py for trigger_condition).
-    diff_rules(&paths, &lockfile, &client, &mut diffs_printed).await?;
+    diff_rules(&paths, &lockfile, &client, &mut diffs_printed, &progress).await?;
     // Flat kinds with simple typed JSON.
     diff_flat_remote::<crate::model::Label>(
-        &paths.labels_dir(), "labels", paths.env(), &lockfile, &client, &mut diffs_printed,
+        &paths.labels_dir(), "labels", paths.env(), &lockfile, &client, &mut diffs_printed, &progress,
         |c, id| Box::pin(async move {
             let list = c.list_labels(None).await?;
             list.into_iter().find(|l| l.id == id)
                 .ok_or_else(|| anyhow!("label id {id} not found on remote"))
         }),
     ).await?;
-    diff_engines(&paths, &lockfile, &client, &mut diffs_printed).await?;
-    diff_engine_fields(&paths, &lockfile, &client, &mut diffs_printed).await?;
+    diff_engines(&paths, &lockfile, &client, &mut diffs_printed, &progress).await?;
+    diff_engine_fields(&paths, &lockfile, &client, &mut diffs_printed, &progress).await?;
 
     // Queue-nested kinds.
     if paths.workspaces_dir().exists() {
+        let queue_phase = progress.phase("diffing queues");
         for ws_entry in std::fs::read_dir(paths.workspaces_dir())? {
             let ws_entry = ws_entry?;
             if !ws_entry.file_type()?.is_dir() {
@@ -156,7 +173,9 @@ pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) ->
                     let id = match lookup_id(&lockfile, "queues", &q_slug) {
                         Some(i) => i, None => continue,
                     };
-                    let remotes = client.list_queues(None).await?;
+                    let sp = queue_phase.item(format!("{q_slug}/queue.json"));
+                    let remotes = client.list_queues(Some(progress.clone())).await?;
+                    let before = diffs_printed;
                     if let Some(remote) = remotes.into_iter().find(|q| q.id == id) {
                         let lj = canonical_json_for_diff(&local)?;
                         let rj = canonical_json_for_diff(&remote)?;
@@ -164,6 +183,7 @@ pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) ->
                                       &format!("queues/{q_slug}/queue.json (remote)"),
                                       &lj, &rj, &mut diffs_printed);
                     }
+                    if diffs_printed > before { sp.finish_ok("differs"); } else { sp.finish_ok("clean"); }
                 }
 
                 // schema.json + formulas/
@@ -172,15 +192,18 @@ pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) ->
                     let id = match lookup_id(&lockfile, "schemas", &q_slug) {
                         Some(i) => i, None => continue,
                     };
-                    let remote = client.get_schema(id, None).await?;
+                    let sp = queue_phase.item(format!("{q_slug}/schema.json"));
+                    let remote = client.get_schema(id, Some(progress.clone())).await?;
                     let (lj, l_formulas) = serialize_schema(&local)?;
                     let (rj, r_formulas) = serialize_schema(&remote)?;
                     let ljs = String::from_utf8_lossy(&lj);
                     let rjs = String::from_utf8_lossy(&rj);
+                    let before = diffs_printed;
                     print_unified(&format!("schemas/{q_slug}/schema.json (local)"),
                                   &format!("schemas/{q_slug}/schema.json (remote)"),
                                   &ljs, &rjs, &mut diffs_printed);
                     diff_formulas(&q_slug, &l_formulas, &r_formulas, &mut diffs_printed);
+                    if diffs_printed > before { sp.finish_ok("differs"); } else { sp.finish_ok("clean"); }
                 }
 
                 // inbox.json
@@ -189,12 +212,15 @@ pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) ->
                     let id = match lookup_id(&lockfile, "inboxes", &q_slug) {
                         Some(i) => i, None => continue,
                     };
-                    let remote = client.get_inbox(id, None).await?;
+                    let sp = queue_phase.item(format!("{q_slug}/inbox.json"));
+                    let remote = client.get_inbox(id, Some(progress.clone())).await?;
                     let lj = canonical_json_for_diff(&local)?;
                     let rj = canonical_json_for_diff(&remote)?;
+                    let before = diffs_printed;
                     print_unified(&format!("inboxes/{q_slug}/inbox.json (local)"),
                                   &format!("inboxes/{q_slug}/inbox.json (remote)"),
                                   &lj, &rj, &mut diffs_printed);
+                    if diffs_printed > before { sp.finish_ok("differs"); } else { sp.finish_ok("clean"); }
                 }
 
                 // email-templates/
@@ -213,9 +239,11 @@ pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) ->
                         let id = match lookup_id(&lockfile, "email_templates", &key) {
                             Some(i) => i, None => continue,
                         };
+                        let sp = queue_phase.item(format!("{key} (template)"));
                         if remote_cache.is_none() {
-                            remote_cache = Some(client.list_email_templates(None).await?);
+                            remote_cache = Some(client.list_email_templates(Some(progress.clone())).await?);
                         }
+                        let before = diffs_printed;
                         if let Some(remote) = remote_cache.as_ref().unwrap().iter().find(|t| t.id == id) {
                             let lj = canonical_json_for_diff(&local)?;
                             let rj = canonical_json_for_diff(remote)?;
@@ -223,6 +251,7 @@ pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) ->
                                           &format!("email_templates/{key}.json (remote)"),
                                           &lj, &rj, &mut diffs_printed);
                         }
+                        if diffs_printed > before { sp.finish_ok("differs"); } else { sp.finish_ok("clean"); }
                     }
                 }
             }
@@ -230,7 +259,10 @@ pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) ->
     }
 
     if diffs_printed == 0 {
+        progress.finish(format!("Diff envs/{env}: clean (matches remote)"));
         println!("no diffs (local snapshot matches remote for env '{env}')");
+    } else {
+        progress.finish(format!("Diff envs/{env}: {diffs_printed} differing"));
     }
 
     Ok(())
@@ -552,17 +584,23 @@ fn diff_formulas(
 /// Walk `rules/<slug>.json` files and diff each against the fetched
 /// remote rule. When the local or remote has a `trigger_condition`,
 /// emit a second diff for the `.py` side too. Mirrors the hooks block.
+///
+/// The remote rule list is fetched once (lazily) under its own spinner so
+/// the user sees the LIST call animate; per-rule diff body is fast and
+/// doesn't need a spinner of its own.
 async fn diff_rules(
     paths: &Paths,
     lockfile: &Lockfile,
     client: &RossumClient,
     counter: &mut usize,
+    progress: &Arc<ProgressLog>,
 ) -> Result<()> {
     use crate::snapshot::rule::{read_rule, serialize_rule};
     let dir = paths.rules_dir();
     if !dir.exists() {
         return Ok(());
     }
+    let phase = progress.phase("diffing rules");
     let mut remote_cache: Option<Vec<crate::model::Rule>> = None;
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
@@ -581,16 +619,19 @@ async fn diff_rules(
             Some(i) => i,
             None => continue,
         };
+        let sp = phase.item(slug.to_string());
         if remote_cache.is_none() {
-            remote_cache = Some(client.list_rules(None).await?);
+            remote_cache = Some(client.list_rules(Some(progress.clone())).await?);
         }
         let Some(remote) = remote_cache.as_ref().unwrap().iter().find(|r| r.id == id).cloned() else {
+            sp.finish_warn("not on remote");
             continue;
         };
         let (remote_json, remote_code) = serialize_rule(&remote)?;
 
         let lj = String::from_utf8_lossy(&local_json);
         let rj = String::from_utf8_lossy(&remote_json);
+        let before = *counter;
         print_unified(
             &format!("rules/{slug}.json (local)"),
             &format!("rules/{slug}.json (remote)"),
@@ -606,6 +647,7 @@ async fn diff_rules(
                 &lc, &rc, counter,
             );
         }
+        if *counter > before { sp.finish_ok("differs"); } else { sp.finish_ok("clean"); }
     }
     Ok(())
 }
@@ -617,11 +659,13 @@ async fn diff_engines(
     lockfile: &Lockfile,
     client: &RossumClient,
     counter: &mut usize,
+    progress: &Arc<ProgressLog>,
 ) -> Result<()> {
     let engines_dir = paths.engines_dir();
     if !engines_dir.exists() {
         return Ok(());
     }
+    let phase = progress.phase("diffing engines");
     for e_entry in std::fs::read_dir(&engines_dir)? {
         let e_entry = e_entry?;
         if !e_entry.file_type()?.is_dir() {
@@ -635,17 +679,20 @@ async fn diff_engines(
         let local: crate::model::Engine = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
         let local_canon = canonical_json_for_diff(&local)?;
         let Some(id) = lookup_id(lockfile, "engines", &e_slug) else { continue };
-        let list = client.list_engines(None).await?;
+        let sp = phase.item(e_slug.clone());
+        let list = client.list_engines(Some(progress.clone())).await?;
         let remote = match list.into_iter().find(|e| e.id == id) {
             Some(r) => r,
-            None => continue,
+            None => { sp.finish_warn("not on remote"); continue; }
         };
         let remote_canon = canonical_json_for_diff(&remote)?;
+        let before = *counter;
         print_unified(
             &format!("engines/{e_slug}/engine.json (local)"),
             &format!("engines/{e_slug}/engine.json (remote)"),
             &local_canon, &remote_canon, counter,
         );
+        if *counter > before { sp.finish_ok("differs"); } else { sp.finish_ok("clean"); }
     }
     Ok(())
 }
@@ -657,11 +704,13 @@ async fn diff_engine_fields(
     lockfile: &Lockfile,
     client: &RossumClient,
     counter: &mut usize,
+    progress: &Arc<ProgressLog>,
 ) -> Result<()> {
     let engines_dir = paths.engines_dir();
     if !engines_dir.exists() {
         return Ok(());
     }
+    let phase = progress.phase("diffing engine fields");
     let mut remote_cache: Option<Vec<crate::model::EngineField>> = None;
     for e_entry in std::fs::read_dir(&engines_dir)? {
         let e_entry = e_entry?;
@@ -684,16 +733,22 @@ async fn diff_engine_fields(
             let local: crate::model::EngineField = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
             let local_canon = canonical_json_for_diff(&local)?;
             let Some(id) = lookup_id(lockfile, "engine_fields", f_slug) else { continue };
+            let sp = phase.item(format!("{e_slug}/{f_slug}"));
             if remote_cache.is_none() {
-                remote_cache = Some(client.list_engine_fields(None).await?);
+                remote_cache = Some(client.list_engine_fields(Some(progress.clone())).await?);
             }
-            let Some(remote) = remote_cache.as_ref().unwrap().iter().find(|f| f.id == id) else { continue };
+            let Some(remote) = remote_cache.as_ref().unwrap().iter().find(|f| f.id == id) else {
+                sp.finish_warn("not on remote");
+                continue;
+            };
             let remote_canon = canonical_json_for_diff(remote)?;
+            let before = *counter;
             print_unified(
                 &format!("engines/{e_slug}/fields/{f_slug}.json (local)"),
                 &format!("engines/{e_slug}/fields/{f_slug}.json (remote)"),
                 &local_canon, &remote_canon, counter,
             );
+            if *counter > before { sp.finish_ok("differs"); } else { sp.finish_ok("clean"); }
         }
     }
     Ok(())
@@ -702,6 +757,9 @@ async fn diff_engine_fields(
 /// Generic helper for flat-list kinds (rules / labels). Reads each
 /// `<kind>/<slug>.json`, fetches the matching remote via the supplied
 /// future, and prints unified diff if they differ.
+///
+/// Each remote fetch is wrapped in a spinner so the user sees animation
+/// while the API call is in flight.
 async fn diff_flat_remote<T>(
     dir: &Path,
     kind: &str,
@@ -709,6 +767,7 @@ async fn diff_flat_remote<T>(
     lockfile: &Lockfile,
     client: &RossumClient,
     counter: &mut usize,
+    progress: &Arc<ProgressLog>,
     fetch: impl Fn(&RossumClient, u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + '_>>,
 ) -> Result<()>
 where
@@ -717,6 +776,7 @@ where
     if !dir.exists() {
         return Ok(());
     }
+    let phase: Phase = progress.phase(format!("diffing {kind}"));
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
@@ -732,14 +792,17 @@ where
         let id = match lookup_id(lockfile, kind, slug) {
             Some(i) => i, None => continue,
         };
+        let sp = phase.item(slug.to_string());
         let remote: T = fetch(client, id).await?;
         let remote_canon = canonical_json_for_diff(&remote)?;
 
+        let before = *counter;
         print_unified(
             &format!("{kind}/{slug}.json (local)"),
             &format!("{kind}/{slug}.json (remote)"),
             &local_canon, &remote_canon, counter,
         );
+        if *counter > before { sp.finish_ok("differs"); } else { sp.finish_ok("clean"); }
     }
     Ok(())
 }

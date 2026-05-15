@@ -151,31 +151,55 @@ pub async fn process(
     }
 
     // === Sub-phase B: concurrent schema + inbox fetches ===
-    // Bounded fan-out (see common::PULL_FANOUT).
+    // Bounded fan-out (see common::PULL_FANOUT). A single spinner holds
+    // visible feedback across the parallel batch and updates its message as
+    // each fetch resolves, so the user sees a running `(N/M)` counter while
+    // rdc waits on the API.
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let client = ctx.client;
-    let progress_inner = progress.clone();
-    let fetched_vec: Vec<(u64, Option<Schema>, Option<Inbox>)> = futures::stream::iter(
+    let total = work.len();
+    if total == 0 {
+        return Ok(counts);
+    }
+    let sp = Arc::new(phase.item(format!("schemas + inboxes (0/{total})")));
+    let done = Arc::new(AtomicUsize::new(0));
+    let fetched_vec_result: Result<Vec<(u64, Option<Schema>, Option<Inbox>)>> = futures::stream::iter(
         work.iter().map(|w| (w.q.id, w.q.name.clone(), w.schema_id, w.inbox_id))
     )
     .map(|(qid, qname, sid_opt, iid_opt)| {
-        let p = progress_inner.clone();
+        let sp = sp.clone();
+        let done = done.clone();
         async move {
             let schema = match sid_opt {
-                Some(sid) => Some(client.get_schema(sid, Some(p.clone())).await
+                Some(sid) => Some(client.get_schema(sid, None).await
                     .with_context(|| format!("fetching schema {sid} for queue '{qname}'"))?),
                 None => None,
             };
             let inbox = match iid_opt {
-                Some(iid) => Some(client.get_inbox(iid, Some(p.clone())).await
+                Some(iid) => Some(client.get_inbox(iid, None).await
                     .with_context(|| format!("fetching inbox {iid} for queue '{qname}'"))?),
                 None => None,
             };
+            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+            sp.set_message(format!("schemas + inboxes ({n}/{total})"));
             Ok::<_, anyhow::Error>((qid, schema, inbox))
         }
     })
     .buffer_unordered(crate::cli::pull::common::PULL_FANOUT)
     .try_collect()
-    .await?;
+    .await;
+    let fetched_vec = match fetched_vec_result {
+        Ok(v) => {
+            if let Ok(spinner) = Arc::try_unwrap(sp) {
+                spinner.finish_ok(format!("{total} fetched"));
+            }
+            v
+        }
+        Err(e) => {
+            drop(sp);
+            return Err(e);
+        }
+    };
     let fetched: HashMap<u64, (Option<Schema>, Option<Inbox>)> =
         fetched_vec.into_iter().map(|(qid, s, i)| (qid, (s, i))).collect();
 

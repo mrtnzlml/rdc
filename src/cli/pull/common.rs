@@ -94,8 +94,12 @@ pub struct RemoteCatalog {
 }
 
 /// Phase 1 of pull: list every kind from the env's API. The catalog is
-/// consumed by the sync classifier and executor; no per-item progress
-/// happens here.
+/// consumed by the sync classifier and executor.
+///
+/// Every list call gets a spinner inside a single "listing remote" phase so
+/// the user sees animation while rdc is waiting on the API. The phase header
+/// prints once at the top; each per-kind line resolves to `[ok] <kind> <N>`
+/// after its API call returns.
 ///
 /// Listing order is fixed so cross-env diffs stay deterministic across
 /// runs.
@@ -106,41 +110,67 @@ pub async fn list_remote(
     token: &str,
     progress: &Arc<crate::progress::ProgressLog>,
 ) -> Result<RemoteCatalog> {
+    let phase = progress.phase("listing remote");
+
+    let sp = phase.item("organization");
     let organization = crate::cli::pull::organization::list(ctx, env_cfg.org_id, progress).await
         .with_context(|| format!("listing organization for env '{env}'"))?;
+    sp.finish_ok(organization.name.clone());
 
+    let sp = phase.item("workspaces");
     let workspaces = crate::cli::pull::workspaces::list(ctx, progress).await
         .with_context(|| format!("listing workspaces for env '{env}'"))?;
+    sp.finish_ok(workspaces.len().to_string());
 
+    let sp = phase.item("queues");
     let queues = crate::cli::pull::queues::list(ctx, progress).await
         .with_context(|| format!("listing queues for env '{env}'"))?;
+    sp.finish_ok(queues.len().to_string());
 
+    let sp = phase.item("hooks");
     let hooks = crate::cli::pull::hooks::list(ctx, progress).await
         .with_context(|| format!("listing hooks for env '{env}'"))?;
+    sp.finish_ok(hooks.len().to_string());
 
+    let sp = phase.item("rules");
     let rules = crate::cli::pull::rules::list(ctx, progress).await
         .with_context(|| format!("listing rules for env '{env}'"))?;
+    sp.finish_ok(rules.len().to_string());
 
+    let sp = phase.item("labels");
     let labels = crate::cli::pull::labels::list(ctx, progress).await
         .with_context(|| format!("listing labels for env '{env}'"))?;
+    sp.finish_ok(labels.len().to_string());
 
+    let sp = phase.item("engines");
     let engines = crate::cli::pull::engines::list(ctx, progress).await
         .with_context(|| format!("listing engines for env '{env}'"))?;
+    sp.finish_ok(engines.len().to_string());
 
+    let sp = phase.item("engine fields");
     let engine_fields = crate::cli::pull::engine_fields::list(ctx, progress).await
         .with_context(|| format!("listing engine fields for env '{env}'"))?;
+    sp.finish_ok(engine_fields.len().to_string());
 
+    let sp = phase.item("workflows");
     let workflows = crate::cli::pull::workflows::list(ctx, progress).await
         .with_context(|| format!("listing workflows for env '{env}'"))?;
+    sp.finish_ok(workflows.len().to_string());
 
+    let sp = phase.item("workflow steps");
     let workflow_steps = crate::cli::pull::workflow_steps::list(ctx, progress).await
         .with_context(|| format!("listing workflow steps for env '{env}'"))?;
+    sp.finish_ok(workflow_steps.len().to_string());
 
+    let sp = phase.item("email templates");
     let email_templates = crate::cli::pull::email_templates::list(ctx, progress).await
         .with_context(|| format!("listing email templates for env '{env}'"))?;
+    sp.finish_ok(email_templates.len().to_string());
 
+    let sp = phase.item("mdh datasets");
     let mdh = crate::cli::pull::mdh::list(env_cfg, token, progress).await
         .with_context(|| format!("listing MDH datasets for env '{env}'"))?;
+    sp.finish_ok(mdh.collections.len().to_string());
 
     // Per-queue schema + inbox prefetch. The Rossum API has no `/schemas/`
     // or `/inboxes/` listing — each must be fetched by id. Doing it here
@@ -150,8 +180,10 @@ pub async fn list_remote(
     //
     // Concurrency mirrors `pull::queues::process`'s sub-phase B:
     // `buffer_unordered(PULL_FANOUT)` over (queue_id, schema_id?, inbox_id?).
+    // A single spinner shows progress while the parallel batch runs; without
+    // it the user sees nothing for several seconds during a tree of dozens.
     let (schemas_by_queue_id, inboxes_by_queue_id) =
-        prefetch_queue_children(ctx.client, &queues, progress).await
+        prefetch_queue_children(ctx.client, &queues, &phase).await
             .with_context(|| format!("prefetching schemas + inboxes for env '{env}'"))?;
 
     Ok(RemoteCatalog {
@@ -166,15 +198,20 @@ pub async fn list_remote(
 /// in `pull::queues::process` so the catalog's prefetch and the driver
 /// keep parity on rate and ordering. Queues with no schema / no inbox
 /// contribute nothing to the returned maps.
+///
+/// A single spinner ("schemas + inboxes") is held by the calling task and
+/// updates its message via `set_message` as each parallel fetch completes,
+/// so the user sees a `(N/M)` running counter while the batch is in flight.
 async fn prefetch_queue_children(
     client: &RossumClient,
     queues: &[crate::model::Queue],
-    progress: &Arc<crate::progress::ProgressLog>,
+    phase: &crate::progress::Phase,
 ) -> Result<(
     std::collections::BTreeMap<u64, crate::model::Schema>,
     std::collections::BTreeMap<u64, crate::model::Inbox>,
 )> {
     use futures::stream::{StreamExt, TryStreamExt};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Build (queue_id, schema_id?, inbox_id?) triples once so the future
     // body doesn't borrow `queues`.
@@ -198,17 +235,31 @@ async fn prefetch_queue_children(
             (q.id, q.name.clone(), s, i)
         })
         .collect();
+    let total = triples.len();
 
-    let p = progress.clone();
-    let fetched: Vec<(u64, Option<crate::model::Schema>, Option<crate::model::Inbox>)> =
+    // Nothing to fetch — skip the spinner entirely so the listing phase
+    // doesn't show a redundant `(0/0)` line.
+    if total == 0 {
+        return Ok((std::collections::BTreeMap::new(), std::collections::BTreeMap::new()));
+    }
+
+    // Spinner shared across the parallel batch. Workers update only its
+    // message; the calling task holds ownership and calls finish_ok at the
+    // end. `Spinner::set_message` takes `&self`, so an `Arc<Spinner>` is
+    // safe to clone into each worker future.
+    let sp = Arc::new(phase.item(format!("schemas + inboxes (0/{total})")));
+    let done = Arc::new(AtomicUsize::new(0));
+
+    let fetched_result: Result<Vec<(u64, Option<crate::model::Schema>, Option<crate::model::Inbox>)>> =
         futures::stream::iter(triples)
             .map(|(qid, qname, sid, iid)| {
-                let p = p.clone();
+                let sp = sp.clone();
+                let done = done.clone();
                 async move {
                     let schema = match sid {
                         Some(id) => Some(
                             client
-                                .get_schema(id, Some(p.clone()))
+                                .get_schema(id, None)
                                 .await
                                 .with_context(|| {
                                     format!("prefetching schema {id} for queue '{qname}'")
@@ -219,7 +270,7 @@ async fn prefetch_queue_children(
                     let inbox = match iid {
                         Some(id) => Some(
                             client
-                                .get_inbox(id, Some(p.clone()))
+                                .get_inbox(id, None)
                                 .await
                                 .with_context(|| {
                                     format!("prefetching inbox {id} for queue '{qname}'")
@@ -227,12 +278,33 @@ async fn prefetch_queue_children(
                         ),
                         None => None,
                     };
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    sp.set_message(format!("schemas + inboxes ({n}/{total})"));
                     Ok::<_, anyhow::Error>((qid, schema, inbox))
                 }
             })
             .buffer_unordered(PULL_FANOUT)
             .try_collect()
-            .await?;
+            .await;
+
+    let fetched = match fetched_result {
+        Ok(v) => v,
+        Err(e) => {
+            // Spinner is in an Arc; we can't move it out to call finish_*
+            // (which consumes by value). Drop our reference; if workers
+            // already dropped theirs, Drop emits "(cancelled)". Otherwise
+            // the spinner finalizes when the last Arc is dropped.
+            drop(sp);
+            return Err(e);
+        }
+    };
+
+    // Finalize the spinner. `Arc::try_unwrap` can fail only if a worker
+    // future still holds a reference, which can't happen here (we awaited
+    // the whole stream). Fall through to drop on the unlikely path.
+    if let Ok(spinner) = Arc::try_unwrap(sp) {
+        spinner.finish_ok(format!("{total} fetched"));
+    }
 
     let mut schemas = std::collections::BTreeMap::new();
     let mut inboxes = std::collections::BTreeMap::new();
