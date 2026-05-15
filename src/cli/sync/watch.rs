@@ -138,9 +138,37 @@ pub(crate) async fn event_loop(
                     &paths.env_lock(),
                     std::time::Duration::from_secs(30),
                 )?;
-                let outcome = crate::cli::sync::run_cycle(
+                let outcome = match crate::cli::sync::run_cycle(
                     env, interactive, false, false, allow_deletes, no_push, no_pull, true,
-                ).await?;
+                ).await {
+                    Ok(o) => o,
+                    Err(e) if crate::api::anyhow_has_status(&e, 401) => {
+                        // Prompt for a new token inline; retry once.
+                        eprintln!("[{}] auth expired", now_hhmmss());
+                        crate::cli::auth::refresh_token_interactively(env).await?;
+                        crate::cli::sync::run_cycle(
+                            env, interactive, false, false, allow_deletes, no_push, no_pull, true,
+                        ).await?
+                    }
+                    Err(e) if is_transient_network_error(&e) => {
+                        eprintln!("[{}] cycle failed (transient): {e:#}", now_hhmmss());
+                        // Resume watcher and continue to next iteration.
+                        if let Some(w) = watcher.as_mut() {
+                            let _ = w.watch(&env_root, RecursiveMode::Recursive);
+                        }
+                        while events.try_recv().is_ok() {}
+                        continue;
+                    }
+                    Err(e) if is_local_parse_error(&e) => {
+                        eprintln!("[{}] cycle failed (local file error): {e:#}", now_hhmmss());
+                        if let Some(w) = watcher.as_mut() {
+                            let _ = w.watch(&env_root, RecursiveMode::Recursive);
+                        }
+                        while events.try_recv().is_ok() {}
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
                 drop(_lock);
 
                 // Resume watching. Drop any events that arrived during the pause —
@@ -203,6 +231,27 @@ fn now_hhmmss() -> String {
     let m = (secs_today % 3600) / 60;
     let s = secs_today % 60;
     format!("{h:02}:{m:02}:{s:02}")
+}
+
+/// Heuristic: does this error look like a transient network failure?
+/// Refine if false positives surface in integration tests.
+fn is_transient_network_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        let s = c.to_string();
+        s.contains("timed out")
+            || s.contains("connection refused")
+            || s.contains("connection reset")
+            || s.contains("5xx")
+            || s.contains("Connection")
+    })
+}
+
+/// Heuristic: does this error look like a local-file parse failure?
+fn is_local_parse_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        let s = c.to_string();
+        s.contains("invalid JSON") || s.contains("serde_json") || s.contains("expected value")
+    })
 }
 
 fn spawn_file_watcher(
@@ -355,5 +404,24 @@ mod tests {
             std::path::Path::new("/proj/envs/test/overlay.toml"),
             "test"
         ));
+    }
+
+    #[test]
+    fn transient_network_error_recognizes_timeout() {
+        let e = anyhow::anyhow!("listing labels for env 'test': connection timed out");
+        assert!(is_transient_network_error(&e));
+    }
+
+    #[test]
+    fn parse_error_recognizes_invalid_json() {
+        let e = anyhow::anyhow!("reading envs/test/labels/a.json: invalid JSON at line 3");
+        assert!(is_local_parse_error(&e));
+    }
+
+    #[test]
+    fn unknown_error_recognizes_neither() {
+        let e = anyhow::anyhow!("something totally else");
+        assert!(!is_transient_network_error(&e));
+        assert!(!is_local_parse_error(&e));
     }
 }
