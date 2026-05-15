@@ -880,8 +880,8 @@ async fn sync_dry_run_makes_zero_writes() {
         .success();
     let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
     assert!(
-        stderr.contains("(dry run)") && stderr.contains("Dry run:"),
-        "dry-run stderr must announce '(dry run)' and a 'Dry run:' summary: {stderr}"
+        stderr.contains("Dry run:"),
+        "dry-run stderr must announce a 'Dry run:' summary: {stderr}"
     );
     assert!(
         stderr.contains("would push") || stderr.contains("would pull"),

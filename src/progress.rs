@@ -43,22 +43,15 @@ struct LogInner {
 }
 
 impl ProgressLog {
-    /// Print the header line and return the handle.
-    /// `title` shows as the first line.
+    /// Construct the run-wide handle. No header line is emitted: the user
+    /// just typed the command, so echoing it back is noise. The `title`
+    /// field is retained on `LogInner` for potential future use (e.g. an
+    /// informative final summary) but never printed by `start`.
     pub fn start(title: impl Into<String>) -> Arc<Self> {
         let title: String = title.into();
         let tty = std::io::stderr().is_terminal();
         let color = crate::cli::resolve::detect_color_mode(false);
         let mp = indicatif::MultiProgress::new();
-        let styled = crate::cli::resolve::colorize_header(&title, color);
-        // Header line: no spinners are active yet, but route through
-        // `mp.println` anyway so behaviour is uniform with subsequent
-        // lines. In non-TTY mode `mp.println` falls through to stderr.
-        if tty {
-            let _ = mp.println(&styled);
-        } else {
-            eprintln!("{styled}");
-        }
         Arc::new(Self {
             inner: Mutex::new(LogInner {
                 title,
@@ -254,7 +247,11 @@ impl Spinner {
         let elapsed = self.started.elapsed();
         let line = format_final_line("[ok]", &self.name, &summary, elapsed, self.color);
         if self.tty {
-            self.bar.finish_with_message(line);
+            // Clear the bar (drops the `{spinner}` template so no frozen
+            // animation frame is left behind), then commit a permanent
+            // line above the active draw region.
+            self.bar.finish_and_clear();
+            self.bar.println(format!("  {line}"));
         } else {
             eprintln!("  {line}");
         }
@@ -268,7 +265,8 @@ impl Spinner {
         let elapsed = self.started.elapsed();
         let line = format_final_line("!", &self.name, &msg, elapsed, self.color);
         if self.tty {
-            self.bar.finish_with_message(line);
+            self.bar.finish_and_clear();
+            self.bar.println(format!("  {line}"));
         } else {
             eprintln!("  {line}");
         }
@@ -283,7 +281,8 @@ impl Spinner {
         let elapsed = self.started.elapsed();
         let line = format_final_line("[fail]", &self.name, &msg, elapsed, self.color);
         if self.tty {
-            self.bar.finish_with_message(line);
+            self.bar.finish_and_clear();
+            self.bar.println(format!("  {line}"));
         } else {
             eprintln!("  {line}");
         }
@@ -298,7 +297,8 @@ impl Drop for Spinner {
         self.resolved = true;
         let line = format!("(cancelled) {}", self.name);
         if self.tty {
-            self.bar.finish_with_message(line);
+            self.bar.finish_and_clear();
+            self.bar.println(format!("  {line}"));
         } else {
             eprintln!("  {line}");
         }
@@ -354,5 +354,35 @@ mod log_tests {
     fn format_final_line_empty_summary_just_marker_and_name() {
         let line = format_final_line("!", "hooks/x", "", Duration::from_millis(50), ColorMode::Plain);
         assert_eq!(line, "! hooks/x");
+    }
+
+    /// Regression: the formatter never PREFIXES the line with a spinner
+    /// tick glyph (`|`, `/`, `-`, `\`). The fix for the "random spinner
+    /// frame leak" issue relies on `format_final_line` producing a line
+    /// whose first non-space content is the marker (`[ok]`, `!`, `[fail]`),
+    /// never a tick. Spinner glyphs are rendered by indicatif's template,
+    /// not by this formatter; if any frame ever sneaked into the final
+    /// line it would precede the marker.
+    #[test]
+    fn format_final_line_never_starts_with_spinner_glyph() {
+        let cases = [
+            ("[ok]", "schemas", "24", Duration::from_millis(1400)),
+            ("!", "hooks/x", "warn", Duration::from_millis(50)),
+            ("[fail]", "queues/y", "boom", Duration::from_millis(2000)),
+            ("[ok]", "workspaces", "", Duration::from_millis(40)),
+        ];
+        let spinner_glyphs = ['|', '/', '-', '\\'];
+        for (marker, name, summary, elapsed) in cases {
+            let line = format_final_line(marker, name, summary, elapsed, ColorMode::Plain);
+            let first = line.chars().next().expect("non-empty line");
+            assert!(
+                !spinner_glyphs.contains(&first),
+                "final line {line:?} starts with spinner glyph {first:?}"
+            );
+            assert!(
+                line.starts_with(marker),
+                "final line {line:?} must start with marker {marker:?}"
+            );
+        }
     }
 }
