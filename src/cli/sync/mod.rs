@@ -5,7 +5,6 @@
 pub mod classify;
 pub mod execute;
 pub mod lock;
-pub mod plan;
 pub mod watch;
 
 use crate::api::RossumClient;
@@ -114,7 +113,12 @@ pub(crate) async fn run_cycle(
     let overlay = crate::overlay::Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
-    let progress = ProgressLog::start(format!("rdc sync {env}"));
+    let title = if dry_run {
+        format!("rdc sync {env} (dry run)")
+    } else {
+        format!("rdc sync {env}")
+    };
+    let progress = ProgressLog::start(title);
     let started = std::time::Instant::now();
 
     // Phase 1: list remote. Mirrors `pull::run`'s `PullCtx` construction
@@ -140,16 +144,90 @@ pub(crate) async fn run_cycle(
     let classified = from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile);
 
     // Phase 4: plan + confirm. `--dry-run` exits here without writing.
-    // The plan render is the explicit preview for `--dry-run`; regular
-    // runs rely on the per-item event log instead of an upfront inventory.
+    // Dry-run uses the same per-item event-log surface as a regular sync,
+    // grouped by direction (`would pull`, `would push`, `would prompt`),
+    // so the preview matches the live UX byte-for-byte modulo the `would`
+    // prefix on each section label.
     if dry_run {
-        let plan_text = crate::cli::sync::plan::render_plan(env, &classified);
-        print!("{plan_text}");
+        use crate::cli::sync::classify::SyncClass;
+
+        // Pull-side items (would write local).
+        let pull_items: Vec<&crate::cli::sync::classify::ClassifiedItem> = classified
+            .iter()
+            .filter(|c| matches!(c.class, SyncClass::RemoteEdit | SyncClass::RemoteCreate))
+            .collect();
+        if !pull_items.is_empty() {
+            let phase = progress.phase("would pull");
+            for it in &pull_items {
+                let note = if matches!(it.class, SyncClass::RemoteCreate) {
+                    " (new)"
+                } else {
+                    ""
+                };
+                phase.line(format!("⊙ {}/{}{}", it.kind, it.slug, note));
+            }
+        }
+
+        // Push-side items (would write remote).
+        let push_items: Vec<&crate::cli::sync::classify::ClassifiedItem> = classified
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.class,
+                    SyncClass::LocalEdit | SyncClass::LocalCreate | SyncClass::LocalDelete
+                )
+            })
+            .collect();
+        if !push_items.is_empty() {
+            let phase = progress.phase("would push");
+            for it in &push_items {
+                let action = match it.class {
+                    SyncClass::LocalEdit => "PATCH",
+                    SyncClass::LocalCreate => "POST",
+                    SyncClass::LocalDelete => "DELETE",
+                    _ => "",
+                };
+                phase.line(format!("⊙ {}/{} → {}", it.kind, it.slug, action));
+            }
+        }
+
+        // Conflict / destructive prompts.
+        let prompt_items: Vec<&crate::cli::sync::classify::ClassifiedItem> = classified
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.class,
+                    SyncClass::BothDiverged
+                        | SyncClass::LocalEditRemoteDelete
+                        | SyncClass::LocalDeleteRemoteEdit
+                        | SyncClass::RemoteDelete
+                )
+            })
+            .collect();
+        if !prompt_items.is_empty() {
+            let phase = progress.phase("would prompt");
+            for it in &prompt_items {
+                let tag = match it.class {
+                    SyncClass::BothDiverged => "both diverged",
+                    SyncClass::LocalEditRemoteDelete => "local edit, deleted on env",
+                    SyncClass::LocalDeleteRemoteEdit => "local delete, edited on env",
+                    SyncClass::RemoteDelete => "deleted on env",
+                    _ => "",
+                };
+                phase.line(format!("⊙ {}/{} — {}", it.kind, it.slug, tag));
+            }
+        }
+
         // `--diff` rendering will hook in here once the executor is
         // wired; defer until per-object bodies are available.
         let _ = diff;
-        progress.finish(format!("Dry run sync envs/{env}: 0 writes"));
-        println!("Dry run sync envs/{env}: 0 writes.");
+
+        progress.finish(format!(
+            "Dry run: {} would push, {} would pull, {} would prompt (no writes)",
+            push_items.len(),
+            pull_items.len(),
+            prompt_items.len(),
+        ));
         return Ok(CycleOutcome::default());
     }
 

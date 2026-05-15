@@ -764,10 +764,10 @@ async fn sync_no_pull_skips_remote_change() {
 /// `--dry-run` must short-circuit before any executor branch runs. With
 /// both a local edit AND a remote-only label on the env, a vanilla sync
 /// would PATCH the former and create a local file for the latter. Under
-/// `--dry-run`, neither happens, and the CLI emits a "Plan: sync …"
-/// header to stdout. We invoke the binary directly here so we can assert
-/// on the captured stdout — calling `sync::run` directly would print to
-/// the test runner's own stdout.
+/// `--dry-run`, neither happens, and the CLI emits per-item `would push`
+/// / `would pull` event-log lines plus a `Dry run: …` summary to stderr.
+/// We invoke the binary directly here so we can capture stderr — calling
+/// `sync::run` directly would print to the test runner's own stderr.
 #[tokio::test]
 async fn sync_dry_run_makes_zero_writes() {
     let server = MockServer::start().await;
@@ -869,17 +869,23 @@ async fn sync_dry_run_makes_zero_writes() {
     let edit_before = std::fs::read_to_string(&edit_path).unwrap();
     let lf_before = std::fs::read_to_string(&lf_path).unwrap();
 
-    // Drive the dry-run via the actual binary so stdout is captured.
+    // Drive the dry-run via the actual binary so stderr is captured.
+    // The dry-run preview rides on the same `ProgressLog` surface as a
+    // regular sync, which writes to stderr.
     let out = assert_cmd::Command::cargo_bin("rdc")
         .unwrap()
         .current_dir(project.path())
         .args(["sync", "dev", "--dry-run", "--yes"])
         .assert()
         .success();
-    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
     assert!(
-        stdout.contains("Plan: sync"),
-        "dry-run stdout must contain 'Plan: sync': {stdout}"
+        stderr.contains("(dry run)") && stderr.contains("Dry run:"),
+        "dry-run stderr must announce '(dry run)' and a 'Dry run:' summary: {stderr}"
+    );
+    assert!(
+        stderr.contains("would push") || stderr.contains("would pull"),
+        "dry-run stderr must list at least one direction section: {stderr}"
     );
 
     // Zero writes hit the API across the dry-run invocation. We can't

@@ -126,8 +126,12 @@ Preview what would change:
 
 ```sh
 $ rdc sync test --dry-run
-Plan: envs/test
-  ~ update: hooks/validator-invoices
+→ rdc sync test (dry run)
+
+would push
+  ⊙ hooks/validator-invoices → PATCH
+
+✔ Dry run: 1 would push, 0 would pull, 0 would prompt (no writes)
 ```
 
 Send the edit to test:
@@ -274,8 +278,12 @@ Removing the local file (and committing that removal to your repo) is the declar
 ```sh
 $ rm envs/test/labels/audit-hold.json
 $ rdc sync test --dry-run
-Plan: envs/test
-  - delete: labels/audit-hold (run `rdc sync test --allow-deletes` to remove from remote)
+→ rdc sync test (dry run)
+
+would push
+  ⊙ labels/audit-hold → DELETE
+
+✔ Dry run: 1 would push, 0 would pull, 0 would prompt (no writes)
 
 $ rdc sync test
 ✓ sync envs/test: 261 files scanned, 0 changed, 1 to delete
