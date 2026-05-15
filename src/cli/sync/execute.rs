@@ -697,9 +697,12 @@ fn resolve_one_conflict<R: BufRead>(
         // run still completes without blocking on stdin. The local file
         // stays as-is and the lockfile is pinned to the prior base —
         // advancing it would let the conflict silently disappear on
-        // subsequent runs. Defensive fallback: when there is no prior
-        // base (a conflict without a base is unusual), use the local
-        // hash so the lockfile still gets a sensible entry.
+        // subsequent runs. When there is no prior base (post-`rdc repair
+        // --rebuild-lock` with diverged sides, or any first-encounter
+        // conflict), record `None` for the content_hash so the next sync
+        // re-classifies as `BothDiverged` and re-prompts — recording
+        // local hash here would make the next sync see a one-sided
+        // `RemoteEdit` and silently overwrite the local edit.
         //
         // For combined-hash kinds where the JSON portions are byte-
         // identical (post-canonicalize) but the sidecar diverges,
@@ -760,10 +763,7 @@ fn resolve_one_conflict<R: BufRead>(
             shadow_anchor.display(),
             conflict_path.display(),
         ));
-        let preserved_hash = match it.base_hash.as_deref() {
-            Some(prior) => prior.to_string(),
-            None => canonical_local_hash.clone(),
-        };
+        let preserved_hash: Option<String> = it.base_hash.clone();
         crate::cli::pull::common::record_object(
             ctx.lockfile,
             &it.kind,
@@ -771,7 +771,7 @@ fn resolve_one_conflict<R: BufRead>(
             id,
             url,
             modified_at,
-            Some(preserved_hash),
+            preserved_hash,
         );
         return Ok(());
     }
@@ -1011,10 +1011,12 @@ fn resolve_one_conflict<R: BufRead>(
                 "warn: {} partially resolved (markers retained); lockfile base preserved; re-run to resolve",
                 edit_target.display(),
             ));
-            let preserved_hash = match it.base_hash.as_deref() {
-                Some(prior) => prior.to_string(),
-                None => canonical_local_hash.clone(),
-            };
+            // When base is absent (post-`rdc repair --rebuild-lock`, or any
+            // first-encounter conflict), record `None` for the content_hash
+            // so the next sync re-classifies as `BothDiverged` and re-prompts
+            // — recording local hash here would let the next sync see a
+            // one-sided `RemoteEdit` and silently overwrite the local edit.
+            let preserved_hash: Option<String> = it.base_hash.clone();
             crate::cli::pull::common::record_object(
                 ctx.lockfile,
                 &it.kind,
@@ -1022,7 +1024,7 @@ fn resolve_one_conflict<R: BufRead>(
                 id,
                 url,
                 modified_at,
-                Some(preserved_hash),
+                preserved_hash,
             );
         }
         Resolution::Skip => {
@@ -1041,10 +1043,12 @@ fn resolve_one_conflict<R: BufRead>(
                 prompt_path.display(),
                 conflict_path.display(),
             ));
-            let preserved_hash = match it.base_hash.as_deref() {
-                Some(prior) => prior.to_string(),
-                None => canonical_local_hash.clone(),
-            };
+            // When base is absent (post-`rdc repair --rebuild-lock`, or any
+            // first-encounter conflict), record `None` for the content_hash
+            // so the next sync re-classifies as `BothDiverged` and re-prompts
+            // — recording local hash here would let the next sync see a
+            // one-sided `RemoteEdit` and silently overwrite the local edit.
+            let preserved_hash: Option<String> = it.base_hash.clone();
             crate::cli::pull::common::record_object(
                 ctx.lockfile,
                 &it.kind,
@@ -1052,7 +1056,7 @@ fn resolve_one_conflict<R: BufRead>(
                 id,
                 url,
                 modified_at,
-                Some(preserved_hash),
+                preserved_hash,
             );
         }
         Resolution::Abort => {
@@ -1956,9 +1960,18 @@ pub async fn run(
         // Group pull-side items by kind so each driver runs at most
         // once per sync. Slugs inside the subset filter through the
         // driver's own `subset.contains(...)` guard.
+        //
+        // Also include `Clean` items whose lockfile entry is missing
+        // (`base_hash` is `None`) — this is the post-`rdc repair
+        // --rebuild-lock` "in sync but no lockfile entry" case. Routing
+        // through the pull driver is a safe no-op write (the bytes
+        // canonicalize equal) and lets `record_object` rebuild the
+        // lockfile entry so the next sync sees it as truly `Clean`.
         let mut subsets: BTreeMap<&str, BTreeSet<(String, String)>> = BTreeMap::new();
         for it in classified {
-            if matches!(it.class, SyncClass::RemoteEdit | SyncClass::RemoteCreate) {
+            let needs_pull_dispatch = matches!(it.class, SyncClass::RemoteEdit | SyncClass::RemoteCreate)
+                || (matches!(it.class, SyncClass::Clean) && it.base_hash.is_none());
+            if needs_pull_dispatch {
                 subsets
                     .entry(it.kind.as_str())
                     .or_default()

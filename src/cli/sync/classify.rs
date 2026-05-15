@@ -79,9 +79,22 @@ pub fn classify(
             (true,  false, false, true) => SyncClass::LocalEditRemoteDelete,
             (false, true,  true,  true) if remote_hash != base_hash => SyncClass::LocalDeleteRemoteEdit,
 
-            // Fail-loud guard: with all 11 classes covered, the only way to reach
-            // this arm is a logic bug (e.g., a hash mismatch in an unexpected
-            // combination). Panic so it surfaces in integration tests instead of
+            // Lockfile entry missing (e.g., after `rdc repair --rebuild-lock`
+            // or a fresh checkout where the file pre-exists), local and
+            // remote both present. If they agree, treat as `Clean` — the
+            // executor will record the hash, effectively rebuilding the
+            // lockfile entry. If they disagree, treat as `BothDiverged` so
+            // the resolver fires; with no base to compare against any
+            // divergence is a user-resolution conflict, never a silent
+            // overwrite of local edits.
+            (true, false, true, false) if remote_hash == local_hash => SyncClass::Clean,
+            (true, false, true, false) /* if remote_hash != local_hash */ => SyncClass::BothDiverged,
+
+            // Fail-loud guard: with the covered classes above, the only way to
+            // reach this arm is a logic bug (e.g., a hash mismatch in an
+            // unexpected combination, or a tombstone without a lockfile entry
+            // which `scan::detect_tombstones` is structurally incapable of
+            // producing). Panic so it surfaces in integration tests instead of
             // silently miscategorising an object.
             _ => panic!(
                 "classify: unhandled state for {:?}: local_changed={local_changed} \
@@ -243,6 +256,39 @@ mod tests {
             &m(&[("hooks", "v1", "h_base")]),
         );
         assert_eq!(class_of(&result, "v1"), &SyncClass::LocalDeleteRemoteEdit);
+    }
+
+    /// Regression: simulates a post-`rdc repair --rebuild-lock` state where
+    /// the lockfile is empty but local and remote happen to be byte-equivalent.
+    /// `scan` reports the local file as changed (no lockfile entry to compare
+    /// against), the remote listing has the same hash, and the classifier
+    /// must mark the item `Clean` so the executor rebuilds the lockfile entry
+    /// without any prompts or writes.
+    #[test]
+    fn classify_rebuild_lock_matching_hashes_yields_clean() {
+        let result = classify(
+            &m(&[("email_templates", "x", "h_same")]), // remote
+            &m(&[("email_templates", "x", "h_same")]), // scan changes (local)
+            &BTreeSet::new(),
+            &BTreeMap::new(), // locked is EMPTY (post `--rebuild-lock`)
+        );
+        assert_eq!(class_of(&result, "x"), &SyncClass::Clean);
+    }
+
+    /// Regression: companion to the above — post-`--rebuild-lock` state
+    /// where local and remote disagree. With no base to compare against,
+    /// any divergence is a user-resolution conflict. The classifier MUST
+    /// emit `BothDiverged` so the resolver fires; never a one-sided write
+    /// class that would silently overwrite local edits.
+    #[test]
+    fn classify_rebuild_lock_diverged_hashes_yields_both_diverged() {
+        let result = classify(
+            &m(&[("email_templates", "x", "h_remote")]),
+            &m(&[("email_templates", "x", "h_local")]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(class_of(&result, "x"), &SyncClass::BothDiverged);
     }
 
     // ------------------------------------------------------------------

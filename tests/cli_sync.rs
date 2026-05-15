@@ -4138,3 +4138,308 @@ async fn sync_schema_conflict_local_removed_formula_remote_edited_never_silently
 async fn sync_schema_conflict_json_and_formula_both_edited_never_silently_pushes() {
     run_schema_conflict_scenario(SchemaConflictVariant::JsonAndFormulaBothEdited).await;
 }
+
+// ====================================================================
+// Regression: `rdc repair --rebuild-lock` followed by `rdc sync` must
+// not panic on the classifier's `(local_changed=true, local_tombstoned=
+// false, remote_present=true, locked_present=false)` cell. This used to
+// fall into the catch-all panic arm because no class covered the
+// "lockfile-missing, both sides present" state — a state the rebuild-
+// lock workflow legitimately produces.
+//
+// Both sub-cases are covered:
+//   1. Local matches remote byte-for-byte → classify as `Clean`, sync
+//      rebuilds the lockfile entry, no writes hit the API.
+//   2. Local differs from remote → classify as `BothDiverged`. The
+//      resolver fires; in non-TTY mode it falls back to the shadow file
+//      path, leaves the lockfile base unset (so the next sync re-prompts),
+//      and never silently PATCHes the user's local edit onto remote.
+// ====================================================================
+
+/// Sub-case 1: post-`rebuild-lock` with local==remote. Sync must classify
+/// the label as `Clean`, rebuild the lockfile entry, and issue zero writes.
+#[tokio::test]
+async fn sync_after_rebuild_lock_in_sync_label_yields_clean_and_rebuilds_lockfile() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // A single stable label served by every listing call. The body
+    // hashes identically across the initial sync, the post-rebuild sync,
+    // and any drift re-list during push (there is no push here).
+    let label_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 42,
+                "url": format!("{}/api/v1/labels/42", server.uri()),
+                "name": "Rebuild Lock Stable",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "color": "#abcdef",
+                "modified_at": "2026-05-14T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&label_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/labels"]).await;
+
+    // Any mutating call would be the bug. `.expect(0)` makes wiremock
+    // fail the test on Drop if any PATCH lands.
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/labels/42"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // First sync: pulls the label and seeds the lockfile.
+    rdc::cli::sync::run(
+        "dev", false, false, false, false, false, false,
+    )
+    .await
+    .expect("first sync seeds the lockfile");
+
+    let label_path = project.path().join("envs/dev/labels/rebuild-lock-stable.json");
+    assert!(label_path.exists(), "first sync writes the label file");
+
+    // Snapshot the local bytes so we can later prove they survive the
+    // rebuild-lock → sync round trip byte-for-byte.
+    let local_before = std::fs::read(&label_path).unwrap();
+
+    // Simulate `rdc repair --rebuild-lock`: wipe the lockfile but leave
+    // the local snapshot file on disk. The remote still serves the same
+    // body. Classifier will see: local_changed=true (no lockfile to
+    // compare), remote_present=true, locked_present=false → the
+    // previously-panicking cell.
+    let lockfile_path = project.path().join(".rdc/state/dev.lock.json");
+    std::fs::remove_file(&lockfile_path).unwrap();
+
+    // Second sync: this would have panicked pre-fix. With the fix in
+    // place, the canonical hashes match → classify as Clean → executor
+    // dispatches through pull driver to rebuild the lockfile entry.
+    let result = rdc::cli::sync::run(
+        "dev", false, false, false, false, false, false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+    result.expect("post-rebuild-lock sync must not panic when local==remote");
+
+    // Local file still there with the canonical body. The pull driver
+    // may re-write byte-identical content; the bytes on disk must still
+    // match what was there before (post-canonicalize).
+    let local_after = std::fs::read(&label_path).unwrap();
+    assert_eq!(
+        local_before, local_after,
+        "Clean post-rebuild-lock must not corrupt or alter local bytes"
+    );
+
+    // No mutating API calls hit the mock — Clean is pull-and-record only.
+    for req in server.received_requests().await.unwrap_or_default() {
+        let p = req.url.path();
+        if p.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "unexpected mutating request: {} {}",
+            req.method,
+            p
+        );
+    }
+
+    // Lockfile entry is rebuilt — the second sync recorded the hash
+    // so subsequent syncs see truly-Clean state.
+    let lf_raw = std::fs::read_to_string(&lockfile_path).unwrap();
+    let lf: serde_json::Value = serde_json::from_str(&lf_raw).unwrap();
+    let recorded = lf
+        .pointer("/objects/labels/rebuild-lock-stable/content_hash")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    assert!(
+        recorded.is_some(),
+        "post-rebuild-lock sync must rebuild the lockfile entry: {lf_raw}"
+    );
+
+    // No shadow file landed — Clean means "no conflict, no prompt".
+    let shadow = project.path().join("envs/dev/labels/rebuild-lock-stable.json.dev");
+    assert!(
+        !shadow.exists(),
+        "Clean post-rebuild-lock must not produce a shadow file at {}",
+        shadow.display()
+    );
+}
+
+/// Sub-case 2: post-`rebuild-lock` with local != remote. Sync must
+/// classify the label as `BothDiverged`. In non-TTY mode the resolver
+/// falls back to the shadow file path, no PATCH lands, and the lockfile
+/// stays unset so the next sync re-prompts. This is the load-bearing
+/// case — pre-fix it would have panicked; pre-hardening it would have
+/// silently overwritten the user's local edit onto remote.
+#[tokio::test]
+async fn sync_after_rebuild_lock_diverged_label_does_not_panic_and_does_not_silently_push() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // Remote serves a "remote-color" body on every listing call.
+    let remote_label_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 73,
+                "url": format!("{}/api/v1/labels/73", server.uri()),
+                "name": "Rebuild Lock Diverged",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "color": "#aa0000",
+                "modified_at": "2026-05-14T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&remote_label_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/labels"]).await;
+
+    // Any PATCH on labels/73 here would be a silent push — the load-
+    // bearing assertion against the original silent-data-loss bug.
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/labels/73"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // First sync seeds local + lockfile from remote.
+    rdc::cli::sync::run(
+        "dev", false, false, false, false, false, false,
+    )
+    .await
+    .expect("first sync seeds the lockfile");
+
+    let label_path = project.path().join("envs/dev/labels/rebuild-lock-diverged.json");
+    assert!(label_path.exists(), "first sync writes the label file");
+
+    // Locally edit the label so it no longer matches the remote body.
+    let raw = std::fs::read_to_string(&label_path).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    v["color"] = serde_json::Value::String("#00ff00".to_string());
+    let local_edited_bytes = format!("{}\n", serde_json::to_string_pretty(&v).unwrap());
+    std::fs::write(&label_path, &local_edited_bytes).unwrap();
+
+    // Simulate `rdc repair --rebuild-lock`: wipe the lockfile. The
+    // local edit stays on disk. Remote still serves the original body.
+    let lockfile_path = project.path().join(".rdc/state/dev.lock.json");
+    std::fs::remove_file(&lockfile_path).unwrap();
+
+    // Second sync: classifier sees (true, false, true, false) with
+    // local_hash != remote_hash → BothDiverged. Non-TTY → shadow file
+    // fallback, no push, base preserved (None) so the next sync
+    // re-prompts.
+    let result = rdc::cli::sync::run(
+        "dev", false, false, false, false, false, false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+    result.expect("post-rebuild-lock diverged sync must not panic");
+
+    // No PATCH/POST/DELETE on the label.
+    let patch_calls = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.method == http::Method::PATCH && r.url.path() == "/api/v1/labels/73")
+        .count();
+    assert_eq!(
+        patch_calls, 0,
+        "BothDiverged post-rebuild-lock must NOT be silently PATCHed (saw {patch_calls} PATCH calls)"
+    );
+
+    // Local edit survives — the user's edit is not discarded by the
+    // conflict path.
+    let local_after = std::fs::read_to_string(&label_path).unwrap();
+    assert_eq!(
+        local_after, local_edited_bytes,
+        "local edit must survive the conflict path: {local_after}"
+    );
+
+    // Shadow file is written next to the local file so the user sees
+    // the env-side body.
+    let shadow = project.path().join("envs/dev/labels/rebuild-lock-diverged.json.dev");
+    assert!(
+        shadow.exists(),
+        "BothDiverged in non-TTY mode must produce a shadow file at {}",
+        shadow.display()
+    );
+
+    // Lockfile must NOT advance to either side's hash — without a base,
+    // any hash recorded here would mean the next sync no longer sees
+    // a conflict. The contract is: preserve "no base" so the user
+    // re-prompts.
+    let lf_raw = std::fs::read_to_string(&lockfile_path).unwrap();
+    let lf: serde_json::Value = serde_json::from_str(&lf_raw).unwrap();
+    let recorded = lf
+        .pointer("/objects/labels/rebuild-lock-diverged/content_hash")
+        .and_then(|v| v.as_str());
+    assert!(
+        recorded.is_none(),
+        "BothDiverged conflict path must not advance the lockfile base, got: {recorded:?}"
+    );
+}
