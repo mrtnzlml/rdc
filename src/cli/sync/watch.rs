@@ -113,8 +113,13 @@ pub(crate) async fn event_loop(
             biased;
             _ = &mut shutdown => break,
             evt = events.recv() => {
-                let Some(_trigger) = evt else { break };
-                // Coalesce: drain any other pending events with try_recv.
+                let Some(trigger) = evt else { break };
+                // Debounce only file events. Poll events run immediately.
+                if matches!(trigger, CycleTrigger::FileEvent) {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                // Coalesce any pending events that arrived during the debounce window
+                // (or during a previous cycle execution).
                 while events.try_recv().is_ok() {}
 
                 let cycle_started = std::time::Instant::now();
@@ -276,6 +281,27 @@ mod tests {
         tokio::time::advance(Duration::from_secs(60)).await;
         let evt = rx.recv().await.unwrap();
         assert_eq!(evt, CycleTrigger::Poll);
+    }
+
+    async fn drain_after_debounce<T>(rx: &mut tokio::sync::mpsc::Receiver<T>) -> usize {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let mut drained = 0;
+        while rx.try_recv().is_ok() {
+            drained += 1;
+        }
+        drained
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debounce_then_drain_coalesces_burst() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CycleTrigger>(16);
+        for _ in 0..5 {
+            tx.send(CycleTrigger::FileEvent).await.unwrap();
+        }
+        // Consume the first event (caller would have done this with rx.recv()).
+        let _ = rx.recv().await.unwrap();
+        let extras = drain_after_debounce(&mut rx).await;
+        assert_eq!(extras, 4, "expected 4 extra events drained after debounce");
     }
 
     #[test]
