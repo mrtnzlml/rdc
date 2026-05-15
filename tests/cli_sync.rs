@@ -2429,3 +2429,105 @@ async fn sync_watch_initial_reconcile_pulls_remote_creates() {
         label_path.display()
     );
 }
+
+/// Watch-mode auto-confirm for non-destructive cycles (Task 13). The
+/// initial reconcile in `run_watch` runs `run_cycle` with
+/// `auto_confirm_non_destructive=true`. For a plan that contains only
+/// non-destructive actions (here: a single `RemoteCreate` for a label
+/// that exists upstream but not locally), the prompt must be skipped —
+/// `confirm()` would otherwise read stdin, and in a non-tty test
+/// process that read would block forever (or, on a closed stdin,
+/// return an error and abort the cycle before the pull lands).
+///
+/// We run `run_watch` with `interactive=true` under a short timeout. If
+/// the auto-confirm path works, the cycle completes, the label is
+/// written to disk, and `run_watch` then blocks on `ctrl_c` — so the
+/// timeout fires (Err). If the auto-confirm path is broken,
+/// `run_watch` either errors out of `confirm()` (Ok result) or hangs
+/// inside the prompt without ever pulling the label (label file
+/// missing). Both failure modes are caught by the two assertions
+/// below.
+#[tokio::test]
+async fn sync_watch_non_destructive_cycle_skips_confirm() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let labels_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 21,
+                "url": format!("{}/api/v1/labels/21", server.uri()),
+                "name": "Audit Hold",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "color": "#00ff00",
+                "modified_at": "2026-05-01T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(labels_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/labels"]).await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // The key difference from `sync_watch_initial_reconcile_pulls_remote_creates`:
+    // `interactive = true`. Without the auto-confirm path set up in Task 2,
+    // the non-destructive plan would still hit the confirm prompt and the
+    // pull would never reach disk (or the cycle would error and `run_watch`
+    // would return Ok/Err immediately instead of blocking on ctrl_c).
+    let res = tokio::time::timeout(
+        std::time::Duration::from_millis(800),
+        rdc::cli::sync::watch::run_watch(
+            "dev", /* interactive = */ true, /* allow_deletes = */ false,
+            /* no_push = */ false, /* no_pull = */ false,
+            /* poll_interval = */ None, /* verbose = */ false,
+        ),
+    )
+    .await;
+    // If auto-confirm worked, the cycle finished and `run_watch` is now
+    // sitting on `ctrl_c` → timeout fires (Err). If it didn't, either
+    // `confirm()` returned an error (Ok(Err(_))) or it returned early
+    // success (Ok(Ok(_))) — both are wrong.
+    assert!(
+        res.is_err(),
+        "run_watch should still be blocked on ctrl_c (auto-confirm should have skipped the prompt), got {:?}",
+        res
+    );
+
+    let label_path = project.path().join("envs/dev/labels/audit-hold.json");
+    let exists = label_path.exists();
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    assert!(
+        exists,
+        "label should have been pulled despite interactive=true (auto-confirm should have skipped the prompt): {}",
+        label_path.display()
+    );
+}
