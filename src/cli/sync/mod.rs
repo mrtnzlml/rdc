@@ -93,7 +93,7 @@ pub(crate) async fn run_cycle(
     if no_push && no_pull {
         anyhow::bail!(
             "--no-push and --no-pull are mutually exclusive. \
-             Use 'rdc status' for read-only inspection."
+             Use 'rdc sync <env> --dry-run' for a read-only preview."
         );
     }
 

@@ -122,18 +122,12 @@ Edit a hook's Python:
 $EDITOR envs/test/hooks/validator-invoices.py
 ```
 
-See what changed:
+Preview what would change:
 
 ```sh
-$ rdc status test
-Env 'test'
-  api_base: https://your-org.rossum.app/api/v1
-  org_id:   123456
-  token:    present
-  auth:     ok
-  lockfile: v2, 256 objects across 11 kinds
-  edits:    1 file(s) differ from lockfile:
-            hooks/validator-invoices
+$ rdc sync test --dry-run
+Plan: envs/test
+  ~ update: hooks/validator-invoices
 ```
 
 Send the edit to test:
@@ -179,7 +173,6 @@ Cross-references between resources are URL-based. `rdc deploy` rewrites them aut
 | `rdc auth <env>` | Set/refresh the API token for `<env>`. Validates before writing. |
 | `rdc sync <env>` | Reconcile snapshot ↔ remote in one pass. Pulls remote changes, sends local edits, three-way merges on conflict. `--no-push` (audit mode) and `--no-pull` (deploy mode) restrict the direction for CI. `--allow-deletes` gates DELETEs from tombstones. `--watch` runs a foreground continuous sync. |
 | `rdc deploy <src> <tgt>` | One-shot cross-env promotion. Plan-then-apply with confirmation. |
-| `rdc status [<env>]` | Auth + lockfile health + pending edits + pending renames. Read-only. |
 | `rdc diff <env>` | Local-vs-remote diff (one GET per edited object). |
 | `rdc diff <a> <b>` | Two snapshots, no API calls. |
 | `rdc repair <env>` | Local-state surgery. `--rebuild-lock` re-pulls; `--rename-slugs` realigns stale filenames. |
@@ -189,7 +182,7 @@ Every command that writes to the remote (`sync`, `deploy`) takes `--dry-run` to 
 
 ## Edit the snapshot
 
-Most files are plain JSON; open them in your editor and save. After any edit, `rdc status <env>` lists the changed files and `rdc sync <env>` sends them.
+Most files are plain JSON; open them in your editor and save. After any edit, `rdc sync <env> --dry-run` lists the changed files and `rdc sync <env>` sends them.
 
 For objects with extracted code, the on-disk layout splits one logical object into two files. The JSON describes the object; the sidecar carries the code. **Always edit the sidecar** — sync strips the inlined field on the pull-side write and splices it back in for the push-side write.
 
@@ -280,11 +273,9 @@ Removing the local file (and committing that removal to your repo) is the declar
 
 ```sh
 $ rm envs/test/labels/audit-hold.json
-$ rdc status test
-Env 'test'
-  …
-  deletes:  1 file(s) tracked but missing locally (run `rdc sync test --allow-deletes` to remove from remote):
-            labels/audit-hold
+$ rdc sync test --dry-run
+Plan: envs/test
+  - delete: labels/audit-hold (run `rdc sync test --allow-deletes` to remove from remote)
 
 $ rdc sync test
 ✓ sync envs/test: 261 files scanned, 0 changed, 1 to delete
@@ -511,7 +502,7 @@ rdc repair test --rename-slugs --yes      # apply all without prompting
 rdc repair test --rename-slugs --check    # list pending, no writes
 ```
 
-Sync surfaces pending renames in its summary; `rdc status` lists each one per env.
+Sync surfaces pending renames in its summary.
 
 ## File layout
 

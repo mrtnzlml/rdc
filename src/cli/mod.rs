@@ -139,11 +139,6 @@ pub enum Command {
         #[arg(long = "only", value_name = "SELECTOR", action = clap::ArgAction::Append)]
         only: Vec<String>,
     },
-    /// Read-only health check: token, auth, lockfile, local edits.
-    /// With no `env`, runs for every env defined in `rdc.toml`.
-    Status {
-        env: Option<String>,
-    },
     /// Show diffs.
     /// `rdc diff <env>` — local snapshot vs remote (one GET per edited object).
     /// `rdc diff <a> <b>` — two local snapshots, no API calls.
@@ -266,7 +261,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
             crate::cli::deploy::run::run(&src, &tgt, mirror, interactive, dry_run, diff, only).await
         }
-        Some(Command::Status { env }) => crate::cli::status::run(env).await,
         Some(Command::Diff { left, right }) => crate::cli::diff::run(left, right).await,
         Some(Command::Auth { env, token }) => {
             let env = crate::cli::env_picker::pick_env("Set token for which env?", env)?;
@@ -347,5 +341,4 @@ pub mod pull;
 pub mod push;
 pub mod repair;
 pub mod resolve;
-pub mod status;
 pub mod sync;

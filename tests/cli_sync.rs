@@ -914,8 +914,8 @@ async fn sync_dry_run_makes_zero_writes() {
 }
 
 /// `--no-push` and `--no-pull` together are nonsensical: that combination
-/// is a read-only inspection, which is `rdc status`'s job. The sync entry
-/// point must reject the pairing up-front with a message that points
+/// is a read-only inspection, which `rdc sync --dry-run` covers. The sync
+/// entry point must reject the pairing up-front with a message that points
 /// users at the right tool.
 #[tokio::test]
 async fn sync_no_push_and_no_pull_together_errors() {
@@ -937,8 +937,8 @@ async fn sync_no_push_and_no_pull_together_errors() {
     let err = result.expect_err("--no-push + --no-pull must error");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("mutually exclusive") || msg.contains("rdc status"),
-        "error message should mention 'mutually exclusive' or 'rdc status': {msg}"
+        msg.contains("mutually exclusive") || msg.contains("--dry-run"),
+        "error message should mention 'mutually exclusive' or '--dry-run': {msg}"
     );
 }
 

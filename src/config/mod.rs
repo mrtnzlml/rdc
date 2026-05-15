@@ -146,8 +146,8 @@ org_id = 285704
         let err = ProjectConfig::load(Path::new("/nope/rdc.toml")).unwrap_err();
         let msg = format!("{err:#}");
         // The error must surface the missing directory + an actionable hint
-        // toward `rdc init`, so a user running `rdc status` outside a project
-        // tree gets pointed at the fix instead of a raw `os error 2`.
+        // toward `rdc init`, so a user running an rdc command outside a
+        // project tree gets pointed at the fix instead of a raw `os error 2`.
         assert!(msg.contains("/nope"), "error should name the directory: {msg}");
         assert!(msg.contains("not an rdc project"), "error should explain what's wrong: {msg}");
         assert!(msg.contains("rdc init"), "error should suggest the fix: {msg}");

@@ -119,7 +119,7 @@ pub fn scan(paths: &Paths, lockfile: &Lockfile) -> Result<(usize, ChangeList, To
 /// `workspaces/*/queues/<slug>/<file>` and treat the slug as tombstoned
 /// only if no workspace contains it.
 ///
-/// Exposed `pub` so `rdc status` can surface tombstones in its summary
+/// Exposed `pub` so sync can surface tombstones in its summary
 /// without re-running the full scan.
 pub fn detect_tombstones(paths: &Paths, lockfile: &Lockfile) -> Tombstones {
     let mut t = Tombstones::default();

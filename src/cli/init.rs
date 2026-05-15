@@ -397,9 +397,9 @@ Two intentional acts are required before the DELETE hits the remote:
 In non-TTY (CI) mode, `--allow-deletes` is mandatory; without it the
 sync refuses with a clear list of pending tombstones.
 
-`rdc status <env>` lists pending tombstones in a `deletes:` section.
-`rdc sync --dry-run` previews them without sending anything;
-`--diff` adds the full remote body for each as a deleted-file diff.
+`rdc sync <env> --dry-run` lists pending tombstones in a `deletes:`
+section without sending anything; `--diff` adds the full remote body
+for each as a deleted-file diff.
 
 Deletes run after creates / updates in reverse dependency order
 (`engine_fields → engines → labels → rules → hooks →
@@ -421,7 +421,6 @@ tombstoned delete can't silently overwrite a remote update.
   deploy local edits without overwriting local files
 - `rdc diff <env>` — local-vs-remote diff (no writes)
 - `rdc diff <a> <b>` — diff two local snapshots
-- `rdc status [<env>]` — auth + lockfile health
 - `rdc deploy <src> <tgt>` — promote one env to another in one shot
   (POST missing + PATCH deltas, URL rewrites included); `--dry-run`
   previews without writing
