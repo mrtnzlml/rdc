@@ -177,7 +177,7 @@ Cross-references between resources are URL-based. `rdc deploy` rewrites them aut
 |---|---|
 | `rdc init` | Create a new project, or add an env to an existing one. |
 | `rdc auth <env>` | Set/refresh the API token for `<env>`. Validates before writing. |
-| `rdc sync <env>` | Reconcile snapshot ↔ remote in one pass. Pulls remote changes, sends local edits, three-way merges on conflict. `--no-push` (audit mode) and `--no-pull` (deploy mode) restrict the direction for CI. `--allow-deletes` gates DELETEs from tombstones. |
+| `rdc sync <env>` | Reconcile snapshot ↔ remote in one pass. Pulls remote changes, sends local edits, three-way merges on conflict. `--no-push` (audit mode) and `--no-pull` (deploy mode) restrict the direction for CI. `--allow-deletes` gates DELETEs from tombstones. `--watch` runs a foreground continuous sync. |
 | `rdc deploy <src> <tgt>` | One-shot cross-env promotion. Plan-then-apply with confirmation. |
 | `rdc status [<env>]` | Auth + lockfile health + pending edits + pending renames. Read-only. |
 | `rdc diff <env>` | Local-vs-remote diff (one GET per edited object). |
@@ -320,6 +320,34 @@ rdc sync test --dry-run
 ```
 
 Lists every changed file and which kind would receive a POST/PATCH/DELETE — no API calls made by default. Add `--diff` to also fetch the current remote per object and print unified diffs (and full deleted-body / would-be-POST-body previews).
+
+## Watch mode
+
+`rdc sync --watch <env>` runs a foreground continuous sync. Save a file in `envs/<env>/`; the daemon pushes the change within a second or two. Run `rdc sync` from another shell, or edit via the Rossum UI; the daemon pulls within the configured poll interval (default `60s`).
+
+```sh
+$ rdc sync --watch test
+watching envs/test/ ...
+polling test every 60s ...
+
+[14:02:17] → cycle: pushed 1, pulled 0, conflicts 0, deletes 0 (0.6s)
+[14:05:41] ← cycle: pushed 0, pulled 1, conflicts 0, deletes 0 (0.4s)
+[14:09:03] hooks/finance-totals — conflict
+  local has changes:
+    - threshold: 0.85
+    + threshold: 0.95
+  test has changes:
+    - threshold: 0.85
+    + threshold: 0.80
+  [k] keep local  [r] use test  [e] edit  [s] skip  [a] abort > k
+[14:09:21] → cycle: pushed 1, pulled 0, conflicts 1, deletes 0 (0.4s)
+```
+
+Ctrl-C stops the watch. The daemon stays foreground — it doesn't fork; close the terminal tab to stop it. `--no-poll` disables remote polling (file events only). `--poll-interval 30s` tunes the cadence.
+
+While the watch is running, you can still run `rdc sync test`, `rdc deploy test prod`, etc. from other shells — they coordinate via an advisory lock and wait briefly if the watch is mid-cycle.
+
+Conflicts and destructive deletes prompt inline in the watch terminal. Non-destructive cycles auto-apply silently. `-v` prints every cycle including idle polls.
 
 ## Promote test → prod
 
