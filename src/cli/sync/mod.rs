@@ -1,6 +1,107 @@
 //! `rdc sync <env>` — reconcile local snapshot and remote state in one pass.
 //!
 //! Spec: docs/superpowers/specs/2026-05-14-unified-sync-design.md
+//!
+//! # Safety contract: never silently lose remote changes
+//!
+//! `rdc sync` must NEVER PATCH/POST/DELETE against a remote whose state
+//! has diverged from the lockfile-recorded base without an explicit
+//! user decision. Anything else is silent data loss — a local edit
+//! overwriting concurrent remote edits the user never saw.
+//!
+//! This invariant is enforced by **four independent defense layers**.
+//! For silent data loss to occur, all four must fail simultaneously.
+//!
+//! ## Layer 1 — Classifier
+//!
+//! [`classify::classify`] folds `(remote_hash, local_hash, base_hash)`
+//! into one of eleven [`classify::SyncClass`] values. When both local
+//! AND remote differ from base, the classifier MUST emit a conflict
+//! class ([`classify::SyncClass::BothDiverged`],
+//! [`classify::SyncClass::LocalEditRemoteDelete`], or
+//! [`classify::SyncClass::LocalDeleteRemoteEdit`]) — never a one-sided
+//! "push it" / "pull it" class. This invariant is pinned by property
+//! tests in `classify::tests` (search for `classify_emits_conflict_*`).
+//!
+//! For combined-hash kinds (hooks, rules, schemas) the hash passed to
+//! the classifier already includes sidecar bytes (`.py` code,
+//! `formulas/<id>.py`), so any divergence in any part of the state
+//! propagates into the comparison. See
+//! [`crate::cli::sync::from_catalog_scan_lockfile`] for the per-kind
+//! hash composition.
+//!
+//! ## Layer 2 — Resolver
+//!
+//! [`execute::resolve_conflicts`] processes every `BothDiverged` item
+//! and, for combined-hash kinds, MUST NOT rely on
+//! [`crate::cli::resolve::prompt_resolve`]'s `local_canonical ==
+//! remote_canonical` short-circuit. That short-circuit only compares
+//! the JSON portion; for hooks/rules the actual state also includes
+//! the `.py` sidecar, and for schemas it includes every formula
+//! sidecar.
+//!
+//! When the JSON portion canonicalizes-equal but the sidecar
+//! diverges (symmetric or asymmetric), the resolver redirects the
+//! prompt to a bytes-driven variant
+//! ([`crate::cli::resolve::prompt_resolve_with_bytes`]) that shows the
+//! actual divergent bytes. The redirect handles asymmetric cases
+//! (one side has a sidecar, the other doesn't) by passing empty
+//! bytes for the missing side — `prompt_resolve_with_bytes` does
+//! not require the path to exist on disk.
+//!
+//! Every Resolution branch records the canonical combined hash
+//! (`hash_combined(json, code/formulas)`) into the lockfile so a
+//! subsequent classify-side comparison sees the right base.
+//!
+//! ## Layer 3 — Push-side drift check (`resolve_push_drift`)
+//!
+//! Every per-kind push driver
+//! ([`crate::cli::push::hooks::push`],
+//! [`crate::cli::push::rules::push`],
+//! [`crate::cli::push::schemas::push`],
+//! [`crate::cli::push::labels::push`],
+//! [`crate::cli::push::workspaces::push`],
+//! [`crate::cli::push::engines::push`],
+//! [`crate::cli::push::engine_fields::push`],
+//! [`crate::cli::push::queues::push`],
+//! [`crate::cli::push::inboxes::push`],
+//! [`crate::cli::push::email_templates::push`])
+//! re-fetches the remote object just before issuing the PATCH/POST,
+//! re-serializes it through the canonical form, and compares its
+//! combined hash against the lockfile-recorded `content_hash`. If
+//! the hashes differ, the driver routes to
+//! [`crate::cli::resolve::resolve_push_drift`] which prompts on
+//! TTY and falls back to `Skip` on non-interactive runs. This
+//! catches the case where remote changed between the resolver and
+//! the actual PATCH — including any case where the resolver's
+//! lockfile update was incorrect.
+//!
+//! ## Layer 4 — Defensive last-mile hash compare
+//!
+//! Layer 3's GET + hash-compare IS the defensive last-mile check.
+//! The hash comparison catches content drift regardless of whether
+//! the remote's `modified_at` timestamp changed (some Rossum API
+//! endpoints don't bump `modified_at` on every modification). The
+//! same GET feeds both the drift check and the post-PATCH
+//! reconciliation (re-reading the remote after the write to record
+//! the post-PATCH canonical hash), so the cost is one extra GET
+//! per object — already paid by the existing drift check.
+//!
+//! ## Invariant summary
+//!
+//! For silent data loss, ALL of the following must fail at once:
+//! - The classifier emits a one-sided class for a both-diverged state
+//!   (impossible by construction + property tests).
+//! - The resolver short-circuits on JSON canonical equality when a
+//!   sidecar has actually diverged (fixed by the redirect described
+//!   in Layer 2).
+//! - The push driver's drift check sees `remote_hash == base_hash`
+//!   when the remote has actually changed (impossible if the lockfile
+//!   wasn't corrupted upstream — the canonical hash is content-
+//!   addressed).
+//! - Both interactive prompts (resolver + push drift) get past
+//!   without a `[k]eep local` from the user (the user explicitly
+//!   accepting force-push is the only sanctioned escape hatch).
 
 pub mod classify;
 pub mod execute;

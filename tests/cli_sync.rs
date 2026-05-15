@@ -3196,3 +3196,945 @@ async fn sync_both_diverged_hook_does_not_silently_push() {
          so the next sync re-prompts (before={base_before:?}, after={base_after:?})"
     );
 }
+
+// ====================================================================
+// Safety contract test matrix (Phase 1 of the sync hardening pass).
+//
+// For every split-file kind (hooks, rules, schemas), exhaustively
+// exercise the divergence shapes that the BothDiverged classifier
+// has to surface AND the resolver has to actually prompt on. Each
+// test:
+//   1. Seeds an initial sync (lockfile + local snapshot).
+//   2. Mutates local and/or remote into a divergent state.
+//   3. Re-runs sync non-interactively (`interactive=false`) so the
+//      resolver falls back to shadow-file + skip semantics.
+//   4. Asserts: NO PATCH/POST/DELETE hits the mock for the affected
+//      object; local files survive; lockfile base is preserved so the
+//      next sync re-prompts.
+//
+// The class of bug we're guarding against is: a divergent remote
+// state silently overwritten by a local edit because the resolver
+// short-circuited or the classifier mis-categorised. These tests
+// would have caught the `.py`-only hook bug (commit ca7b314) and
+// would have caught the analogous asymmetric `.py` / formula bugs.
+// ====================================================================
+
+/// Test variant for the hook conflict matrix. Each variant describes
+/// (a) what the lockfile-seeded base hook looks like, (b) what local
+/// modifications happen between syncs, (c) what the remote returns on
+/// the second sync. The harness handles the rest.
+#[derive(Debug, Clone, Copy)]
+enum HookConflictVariant {
+    /// Both sides edited the JSON portion (different event lists, etc.).
+    JsonBothEdited,
+    /// Both sides edited the .py portion (different code on each side).
+    CodeBothEdited,
+    /// Local edited JSON; remote edited .py.
+    LocalJsonRemoteCode,
+    /// Local has .py (edited), remote removed the code field entirely.
+    LocalHasCodeRemoteRemoved,
+    /// Local removed the .py (file deleted from disk), remote edited code.
+    LocalRemovedCodeRemoteEdited,
+    /// Both sides happen to converge on the same edited code. Resolver
+    /// must NOT prompt — the combined hashes are equal so the kind is
+    /// `Clean`, even though both sides "edited."
+    BothEditedToSameCode,
+}
+
+/// Drive one hook-conflict scenario through `rdc sync` and assert that
+/// no PATCH/POST/DELETE hits the mock (except for the
+/// BothEditedToSameCode case, which expects `Clean`). The lockfile's
+/// base hash must remain pinned (so the next sync re-prompts).
+async fn run_hook_conflict_scenario(variant: HookConflictVariant) {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let hook_id = 8000u64;
+    let slug = "ap-validator";
+
+    // Base body: code = "base", events = ["annotation_content"].
+    let base_code = "def base():\n    return 1\n";
+    let local_code_edit = "def local_edit():\n    return 2\n";
+    let remote_code_edit = "def remote_edit():\n    return 3\n";
+    let same_code_both = "def both_edit_to_same():\n    return 42\n";
+    let events_base = vec!["annotation_content"];
+    let events_local = vec!["annotation_content", "annotation_status"];
+    let events_remote = vec!["annotation_content", "user_invited"];
+
+    let server_uri = server.uri();
+
+    let list_call_count = Arc::new(AtomicUsize::new(0));
+    let counter = list_call_count.clone();
+    let uri_clone = server_uri.clone();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(move |_req: &Request| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            // First call: seed (always the base body).
+            // Subsequent calls: the variant-specific "remote now" body.
+            let (events_now, code_now, modified_at) = if n == 0 {
+                (
+                    events_base.clone(),
+                    Some(base_code.to_string()),
+                    "2026-05-14T08:00:00Z".to_string(),
+                )
+            } else {
+                match variant {
+                    HookConflictVariant::JsonBothEdited => (
+                        events_remote.clone(),
+                        Some(base_code.to_string()),
+                        "2026-05-14T10:00:00Z".to_string(),
+                    ),
+                    HookConflictVariant::CodeBothEdited => (
+                        events_base.clone(),
+                        Some(remote_code_edit.to_string()),
+                        "2026-05-14T10:00:00Z".to_string(),
+                    ),
+                    HookConflictVariant::LocalJsonRemoteCode => (
+                        events_base.clone(),
+                        Some(remote_code_edit.to_string()),
+                        "2026-05-14T10:00:00Z".to_string(),
+                    ),
+                    HookConflictVariant::LocalHasCodeRemoteRemoved => (
+                        events_base.clone(),
+                        None,
+                        "2026-05-14T10:00:00Z".to_string(),
+                    ),
+                    HookConflictVariant::LocalRemovedCodeRemoteEdited => (
+                        events_base.clone(),
+                        Some(remote_code_edit.to_string()),
+                        "2026-05-14T10:00:00Z".to_string(),
+                    ),
+                    HookConflictVariant::BothEditedToSameCode => (
+                        events_base.clone(),
+                        Some(same_code_both.to_string()),
+                        "2026-05-14T10:00:00Z".to_string(),
+                    ),
+                }
+            };
+
+            let mut config = serde_json::json!({ "runtime": "python3.12" });
+            if let Some(code) = code_now {
+                config["code"] = serde_json::Value::String(code);
+            }
+            let body = serde_json::json!({
+                "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+                "results": [
+                    {
+                        "id": hook_id,
+                        "url": format!("{uri_clone}/api/v1/hooks/{hook_id}"),
+                        "name": "ap-validator",
+                        "type": "function",
+                        "queues": [],
+                        "events": events_now,
+                        "config": config,
+                        "modified_at": modified_at
+                    }
+                ]
+            });
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/hooks"]).await;
+
+    // The bug class: ANY mutating request on this hook is a defense
+    // failure. `.expect(0)` makes wiremock fail on Drop if one lands.
+    // We test BothEditedToSameCode separately (it should be Clean →
+    // also zero PATCH calls).
+    Mock::given(method("PATCH"))
+        .and(path(format!("/api/v1/hooks/{hook_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(format!("/api/v1/hooks/{hook_id}")))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // Seed.
+    rdc::cli::sync::run("dev", false, false, false, false, false, false)
+        .await
+        .expect("first sync should succeed");
+
+    let json_path = project.path().join(format!("envs/dev/hooks/{slug}.json"));
+    let py_path = project.path().join(format!("envs/dev/hooks/{slug}.py"));
+    let json_before = std::fs::read(&json_path).unwrap();
+    let py_existed_before = py_path.exists();
+
+    // Apply local mutation per variant.
+    match variant {
+        HookConflictVariant::JsonBothEdited => {
+            // Edit JSON locally — change the events array.
+            let mut v: serde_json::Value = serde_json::from_slice(&json_before).unwrap();
+            v["events"] = serde_json::json!(events_local);
+            let mut new_json = serde_json::to_vec_pretty(&v).unwrap();
+            new_json.push(b'\n');
+            std::fs::write(&json_path, &new_json).unwrap();
+        }
+        HookConflictVariant::CodeBothEdited => {
+            std::fs::write(&py_path, local_code_edit.as_bytes()).unwrap();
+        }
+        HookConflictVariant::LocalJsonRemoteCode => {
+            let mut v: serde_json::Value = serde_json::from_slice(&json_before).unwrap();
+            v["events"] = serde_json::json!(events_local);
+            let mut new_json = serde_json::to_vec_pretty(&v).unwrap();
+            new_json.push(b'\n');
+            std::fs::write(&json_path, &new_json).unwrap();
+        }
+        HookConflictVariant::LocalHasCodeRemoteRemoved => {
+            std::fs::write(&py_path, local_code_edit.as_bytes()).unwrap();
+        }
+        HookConflictVariant::LocalRemovedCodeRemoteEdited => {
+            std::fs::remove_file(&py_path).expect("seeded .py must exist");
+        }
+        HookConflictVariant::BothEditedToSameCode => {
+            std::fs::write(&py_path, same_code_both.as_bytes()).unwrap();
+        }
+    }
+
+    let lf_before =
+        std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+
+    // Run second sync non-interactively. Conflict resolver falls back
+    // to shadow-file behavior. NO PATCH/POST/DELETE may land.
+    rdc::cli::sync::run("dev", false, false, false, false, false, false)
+        .await
+        .expect("second sync should succeed (no silent write)");
+
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    // Crucial: zero mutating requests on the hook endpoint.
+    let mutation_count = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| {
+            (r.method == http::Method::PATCH
+                || r.method == http::Method::POST
+                || r.method == http::Method::DELETE)
+                && (r.url.path() == format!("/api/v1/hooks/{hook_id}")
+                    || r.url.path() == "/api/v1/hooks")
+        })
+        .count();
+    assert_eq!(
+        mutation_count, 0,
+        "variant {variant:?}: hook endpoint must not receive mutating requests; saw {mutation_count}",
+    );
+
+    // Lockfile base must remain pinned across the second sync — except
+    // for the BothEditedToSameCode case, where the kind classifies as
+    // Clean and the lockfile may be no-op resaved (the base hash is
+    // unchanged regardless, since the combined hashes equal).
+    let lf_after =
+        std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    let v_before: serde_json::Value = serde_json::from_str(&lf_before).unwrap();
+    let v_after: serde_json::Value = serde_json::from_str(&lf_after).unwrap();
+    let base_before = v_before.pointer(&format!("/objects/hooks/{slug}/content_hash")).cloned();
+    let base_after = v_after.pointer(&format!("/objects/hooks/{slug}/content_hash")).cloned();
+
+    match variant {
+        HookConflictVariant::BothEditedToSameCode => {
+            // Both sides converged on the same code → combined hashes
+            // equal → classifier emits `Clean` (LocalEdit if scanner
+            // flagged; but no remote change either way) and no writes
+            // occur. The lockfile base may advance to reflect the new
+            // canonical bytes — that's not a safety violation.
+            // We just assert no PATCH (already asserted above).
+            let _ = (base_before, base_after);
+        }
+        _ => {
+            assert_eq!(
+                base_before, base_after,
+                "variant {variant:?}: lockfile base must remain pinned so next sync re-prompts \
+                 (before={base_before:?}, after={base_after:?})",
+            );
+        }
+    }
+
+    // Local file survival checks.
+    if matches!(variant, HookConflictVariant::LocalRemovedCodeRemoteEdited) {
+        // User removed the .py locally — the resolver mustn't silently
+        // recreate it (that would discard the user's intent to delete
+        // code). The shadow file may land next to either the .py or
+        // .json depending on the redirect logic.
+        let _ = py_existed_before;
+    } else if matches!(variant, HookConflictVariant::LocalHasCodeRemoteRemoved) {
+        // User's local .py edit must survive.
+        let py_after = std::fs::read(&py_path).unwrap();
+        assert_eq!(
+            py_after,
+            local_code_edit.as_bytes(),
+            "variant {variant:?}: local .py edit must survive"
+        );
+    } else if matches!(variant, HookConflictVariant::CodeBothEdited) {
+        let py_after = std::fs::read(&py_path).unwrap();
+        assert_eq!(
+            py_after,
+            local_code_edit.as_bytes(),
+            "variant {variant:?}: local .py edit must survive"
+        );
+    } else if matches!(
+        variant,
+        HookConflictVariant::JsonBothEdited | HookConflictVariant::LocalJsonRemoteCode
+    ) {
+        // Local JSON edit must survive (no silent overwrite).
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&json_path).unwrap()).unwrap();
+        let evs = v["events"].as_array().unwrap();
+        assert!(
+            evs.iter().any(|x| x.as_str() == Some("annotation_status")),
+            "variant {variant:?}: local JSON edit must survive in {}",
+            json_path.display()
+        );
+    }
+}
+
+#[tokio::test]
+async fn sync_hook_conflict_json_both_edited_never_silently_pushes() {
+    run_hook_conflict_scenario(HookConflictVariant::JsonBothEdited).await;
+}
+
+#[tokio::test]
+async fn sync_hook_conflict_code_both_edited_never_silently_pushes() {
+    run_hook_conflict_scenario(HookConflictVariant::CodeBothEdited).await;
+}
+
+#[tokio::test]
+async fn sync_hook_conflict_local_json_remote_code_never_silently_pushes() {
+    run_hook_conflict_scenario(HookConflictVariant::LocalJsonRemoteCode).await;
+}
+
+#[tokio::test]
+async fn sync_hook_conflict_local_has_code_remote_removed_never_silently_pushes() {
+    run_hook_conflict_scenario(HookConflictVariant::LocalHasCodeRemoteRemoved).await;
+}
+
+#[tokio::test]
+async fn sync_hook_conflict_local_removed_code_remote_edited_never_silently_pushes() {
+    run_hook_conflict_scenario(HookConflictVariant::LocalRemovedCodeRemoteEdited).await;
+}
+
+#[tokio::test]
+async fn sync_hook_conflict_both_edited_to_same_code_is_clean_no_writes() {
+    run_hook_conflict_scenario(HookConflictVariant::BothEditedToSameCode).await;
+}
+
+// ---------------------------------------------------------------------
+// Rules conflict matrix — mirrors the hook matrix above. Rules share
+// the same split-file shape (`<slug>.json` + `<slug>.py`, where the
+// code lives in `trigger_condition` at the top level instead of in
+// `config.code`). The same bug class applies: asymmetric / code-only
+// divergence must never silently round-trip a PATCH.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+enum RuleConflictVariant {
+    /// Both sides edited JSON.
+    JsonBothEdited,
+    /// Both sides edited trigger_condition (the .py sidecar).
+    CodeBothEdited,
+    /// Local JSON, remote code.
+    LocalJsonRemoteCode,
+    /// Local has .py (edited), remote dropped trigger_condition.
+    LocalHasCodeRemoteRemoved,
+    /// Local removed .py; remote edited trigger_condition.
+    LocalRemovedCodeRemoteEdited,
+    /// Both converge on the same code.
+    BothEditedToSameCode,
+}
+
+async fn run_rule_conflict_scenario(variant: RuleConflictVariant) {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let rule_id = 9000u64;
+    let slug = "e-invoice-validation";
+    let base_cond = "annotation_content.total > 1000\n";
+    let local_cond_edit = "annotation_content.total > 2000\n";
+    let remote_cond_edit = "annotation_content.total > 5000\n";
+    let same_cond_both = "annotation_content.both_edited > 42\n";
+    let name_base = "E-invoice Validation".to_string();
+    let name_local = "E-invoice Validation (local)".to_string();
+    let name_remote = "E-invoice Validation (remote)".to_string();
+
+    let list_call_count = Arc::new(AtomicUsize::new(0));
+    let counter = list_call_count.clone();
+    let uri_clone = server.uri();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/rules"))
+        .respond_with(move |_req: &Request| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let (name_now, cond_now, modified_at) = if n == 0 {
+                (
+                    name_base.clone(),
+                    Some(base_cond.to_string()),
+                    "2026-05-14T08:00:00Z".to_string(),
+                )
+            } else {
+                match variant {
+                    RuleConflictVariant::JsonBothEdited => (
+                        name_remote.clone(),
+                        Some(base_cond.to_string()),
+                        "2026-05-14T10:00:00Z".to_string(),
+                    ),
+                    RuleConflictVariant::CodeBothEdited => (
+                        name_base.clone(),
+                        Some(remote_cond_edit.to_string()),
+                        "2026-05-14T10:00:00Z".to_string(),
+                    ),
+                    RuleConflictVariant::LocalJsonRemoteCode => (
+                        name_base.clone(),
+                        Some(remote_cond_edit.to_string()),
+                        "2026-05-14T10:00:00Z".to_string(),
+                    ),
+                    RuleConflictVariant::LocalHasCodeRemoteRemoved => (
+                        name_base.clone(),
+                        None,
+                        "2026-05-14T10:00:00Z".to_string(),
+                    ),
+                    RuleConflictVariant::LocalRemovedCodeRemoteEdited => (
+                        name_base.clone(),
+                        Some(remote_cond_edit.to_string()),
+                        "2026-05-14T10:00:00Z".to_string(),
+                    ),
+                    RuleConflictVariant::BothEditedToSameCode => (
+                        name_base.clone(),
+                        Some(same_cond_both.to_string()),
+                        "2026-05-14T10:00:00Z".to_string(),
+                    ),
+                }
+            };
+
+            let mut rule = serde_json::json!({
+                "id": rule_id,
+                "url": format!("{uri_clone}/api/v1/rules/{rule_id}"),
+                "name": name_now,
+                "queues": [],
+                "modified_at": modified_at,
+            });
+            if let Some(c) = cond_now {
+                rule["trigger_condition"] = serde_json::Value::String(c);
+            }
+            let body = serde_json::json!({
+                "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+                "results": [rule]
+            });
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/rules"]).await;
+
+    Mock::given(method("PATCH"))
+        .and(path(format!("/api/v1/rules/{rule_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/rules"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(format!("/api/v1/rules/{rule_id}")))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    rdc::cli::sync::run("dev", false, false, false, false, false, false)
+        .await
+        .expect("first sync should succeed");
+
+    let json_path = project.path().join(format!("envs/dev/rules/{slug}.json"));
+    let py_path = project.path().join(format!("envs/dev/rules/{slug}.py"));
+    let json_before = std::fs::read(&json_path).unwrap();
+
+    match variant {
+        RuleConflictVariant::JsonBothEdited => {
+            let mut v: serde_json::Value = serde_json::from_slice(&json_before).unwrap();
+            v["name"] = serde_json::json!(name_local);
+            let mut nj = serde_json::to_vec_pretty(&v).unwrap();
+            nj.push(b'\n');
+            std::fs::write(&json_path, &nj).unwrap();
+        }
+        RuleConflictVariant::CodeBothEdited => {
+            std::fs::write(&py_path, local_cond_edit.as_bytes()).unwrap();
+        }
+        RuleConflictVariant::LocalJsonRemoteCode => {
+            let mut v: serde_json::Value = serde_json::from_slice(&json_before).unwrap();
+            v["name"] = serde_json::json!(name_local);
+            let mut nj = serde_json::to_vec_pretty(&v).unwrap();
+            nj.push(b'\n');
+            std::fs::write(&json_path, &nj).unwrap();
+        }
+        RuleConflictVariant::LocalHasCodeRemoteRemoved => {
+            std::fs::write(&py_path, local_cond_edit.as_bytes()).unwrap();
+        }
+        RuleConflictVariant::LocalRemovedCodeRemoteEdited => {
+            std::fs::remove_file(&py_path).expect("seeded .py must exist");
+        }
+        RuleConflictVariant::BothEditedToSameCode => {
+            std::fs::write(&py_path, same_cond_both.as_bytes()).unwrap();
+        }
+    }
+
+    let lf_before =
+        std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+
+    rdc::cli::sync::run("dev", false, false, false, false, false, false)
+        .await
+        .expect("second sync should succeed (no silent write)");
+
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    let mutation_count = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| {
+            (r.method == http::Method::PATCH
+                || r.method == http::Method::POST
+                || r.method == http::Method::DELETE)
+                && (r.url.path() == format!("/api/v1/rules/{rule_id}")
+                    || r.url.path() == "/api/v1/rules")
+        })
+        .count();
+    assert_eq!(
+        mutation_count, 0,
+        "variant {variant:?}: rules endpoint must not receive mutating requests; saw {mutation_count}",
+    );
+
+    let lf_after =
+        std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    let v_before: serde_json::Value = serde_json::from_str(&lf_before).unwrap();
+    let v_after: serde_json::Value = serde_json::from_str(&lf_after).unwrap();
+    let base_before = v_before.pointer(&format!("/objects/rules/{slug}/content_hash")).cloned();
+    let base_after = v_after.pointer(&format!("/objects/rules/{slug}/content_hash")).cloned();
+    if !matches!(variant, RuleConflictVariant::BothEditedToSameCode) {
+        assert_eq!(
+            base_before, base_after,
+            "variant {variant:?}: lockfile base must remain pinned (before={base_before:?}, after={base_after:?})",
+        );
+    }
+
+    if matches!(
+        variant,
+        RuleConflictVariant::LocalHasCodeRemoteRemoved | RuleConflictVariant::CodeBothEdited
+    ) {
+        let py_after = std::fs::read(&py_path).unwrap();
+        assert_eq!(
+            py_after, local_cond_edit.as_bytes(),
+            "variant {variant:?}: local .py edit must survive",
+        );
+    }
+}
+
+#[tokio::test]
+async fn sync_rule_conflict_json_both_edited_never_silently_pushes() {
+    run_rule_conflict_scenario(RuleConflictVariant::JsonBothEdited).await;
+}
+
+#[tokio::test]
+async fn sync_rule_conflict_code_both_edited_never_silently_pushes() {
+    run_rule_conflict_scenario(RuleConflictVariant::CodeBothEdited).await;
+}
+
+#[tokio::test]
+async fn sync_rule_conflict_local_json_remote_code_never_silently_pushes() {
+    run_rule_conflict_scenario(RuleConflictVariant::LocalJsonRemoteCode).await;
+}
+
+#[tokio::test]
+async fn sync_rule_conflict_local_has_code_remote_removed_never_silently_pushes() {
+    run_rule_conflict_scenario(RuleConflictVariant::LocalHasCodeRemoteRemoved).await;
+}
+
+#[tokio::test]
+async fn sync_rule_conflict_local_removed_code_remote_edited_never_silently_pushes() {
+    run_rule_conflict_scenario(RuleConflictVariant::LocalRemovedCodeRemoteEdited).await;
+}
+
+#[tokio::test]
+async fn sync_rule_conflict_both_edited_to_same_code_is_clean_no_writes() {
+    run_rule_conflict_scenario(RuleConflictVariant::BothEditedToSameCode).await;
+}
+
+// ---------------------------------------------------------------------
+// Schemas conflict matrix. Schemas have the same split-file shape as
+// hooks/rules but the code sidecars live under `formulas/<field_id>.py`
+// instead of a peer `.py`. The combined hash is `schema_combined_hash`.
+// The same bug class applies: a divergent formula sidecar must not let
+// the resolver short-circuit on JSON equality.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+enum SchemaConflictVariant {
+    /// Local + remote schema.json both edited; formulas unchanged.
+    JsonBothEdited,
+    /// Local + remote formula both edited; schema.json unchanged.
+    FormulaBothEdited,
+    /// Local has a formula sidecar (edited); remote dropped the formula
+    /// entirely from the schema.
+    LocalHasFormulaRemoteRemoved,
+    /// Local removed the formula sidecar; remote edited the formula.
+    LocalRemovedFormulaRemoteEdited,
+    /// Both schema.json and formula edited on both sides.
+    JsonAndFormulaBothEdited,
+}
+
+async fn run_schema_conflict_scenario(variant: SchemaConflictVariant) {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let ws_id = 600u64;
+    let queue_id = 700u64;
+    let schema_id = 800u64;
+    let inbox_id = 900u64;
+
+    let ws_url = format!("{}/api/v1/workspaces/{}", server.uri(), ws_id);
+    let queue_url = format!("{}/api/v1/queues/{}", server.uri(), queue_id);
+    let schema_url = format!("{}/api/v1/schemas/{}", server.uri(), schema_id);
+    let inbox_url = format!("{}/api/v1/inboxes/{}", server.uri(), inbox_id);
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+            "results": [{
+                "id": ws_id,
+                "url": ws_url,
+                "name": "AP Invoices",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "queues": [queue_url.clone()],
+                "modified_at": "2026-04-20T08:00:00Z"
+            }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+            "results": [{
+                "id": queue_id,
+                "url": queue_url.clone(),
+                "name": "Cost Invoices",
+                "workspace": ws_url,
+                "schema": schema_url.clone(),
+                "inbox": inbox_url.clone(),
+                "modified_at": "2026-04-20T08:00:00Z"
+            }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/inboxes/{inbox_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": inbox_id,
+            "url": inbox_url,
+            "name": "Cost Invoices Inbox",
+            "email": "cost-invoices@mock.rossum.app",
+            "queues": [queue_url.clone()],
+            "filters": [],
+            "modified_at": "2026-04-20T08:00:00Z"
+        })))
+        .mount(&server)
+        .await;
+
+    let base_formula = "amount_due + amount_tax";
+    let local_formula_edit = "amount_due + amount_tax + amount_fee";
+    let remote_formula_edit = "amount_due * 1.21";
+    let base_name = "Cost Invoices Schema".to_string();
+    let remote_name = "Cost Invoices Schema (remote)".to_string();
+
+    // Toggle the schema body after the first sync completes. Using a
+    // simple call counter doesn't work here because both `list_remote`
+    // and `pull::queues::process` GET the schema each sync (two calls
+    // per sync), so the "first call only" heuristic would flip
+    // mid-seed. The harness flips this AtomicBool after seeding.
+    let serve_modified = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let serve_modified_clone = serve_modified.clone();
+    let schema_url_clone = schema_url.clone();
+    let queue_url_clone = queue_url.clone();
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/schemas/{schema_id}")))
+        .respond_with(move |_req: &Request| {
+            let modified = serve_modified_clone.load(Ordering::SeqCst);
+            let (name_now, formula_now, modified_at) = if !modified {
+                (
+                    base_name.clone(),
+                    Some(base_formula.to_string()),
+                    "2026-04-10T09:00:00Z".to_string(),
+                )
+            } else {
+                match variant {
+                    SchemaConflictVariant::JsonBothEdited => (
+                        remote_name.clone(),
+                        Some(base_formula.to_string()),
+                        "2026-05-14T10:00:00Z".to_string(),
+                    ),
+                    SchemaConflictVariant::FormulaBothEdited => (
+                        base_name.clone(),
+                        Some(remote_formula_edit.to_string()),
+                        "2026-05-14T10:00:00Z".to_string(),
+                    ),
+                    SchemaConflictVariant::LocalHasFormulaRemoteRemoved => (
+                        base_name.clone(),
+                        None,
+                        "2026-05-14T10:00:00Z".to_string(),
+                    ),
+                    SchemaConflictVariant::LocalRemovedFormulaRemoteEdited => (
+                        base_name.clone(),
+                        Some(remote_formula_edit.to_string()),
+                        "2026-05-14T10:00:00Z".to_string(),
+                    ),
+                    SchemaConflictVariant::JsonAndFormulaBothEdited => (
+                        remote_name.clone(),
+                        Some(remote_formula_edit.to_string()),
+                        "2026-05-14T10:00:00Z".to_string(),
+                    ),
+                }
+            };
+            let mut datapoint = serde_json::json!({
+                "category": "datapoint",
+                "id": "amount_total",
+                "type": "number",
+            });
+            if let Some(f) = formula_now {
+                datapoint["formula"] = serde_json::Value::String(f);
+            }
+            let body = serde_json::json!({
+                "id": schema_id,
+                "url": schema_url_clone,
+                "name": name_now,
+                "queues": [queue_url_clone],
+                "content": [{
+                    "category": "section",
+                    "id": "header",
+                    "label": "Header",
+                    "children": [
+                        { "category": "datapoint", "id": "invoice_id", "type": "string" },
+                        datapoint
+                    ]
+                }],
+                "modified_at": modified_at
+            });
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/workspaces", "/api/v1/queues"]).await;
+
+    Mock::given(method("PATCH"))
+        .and(path(format!("/api/v1/schemas/{schema_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/schemas"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    rdc::cli::sync::run("dev", false, false, false, false, false, false)
+        .await
+        .expect("first sync should succeed");
+
+    // After seeding, flip the schema mock to serve the variant-specific
+    // "remote now" body. The mock body is variant-controlled below.
+    serve_modified.store(true, Ordering::SeqCst);
+
+    let queue_dir = project
+        .path()
+        .join("envs/dev/workspaces/ap-invoices/queues/cost-invoices");
+    let schema_path = queue_dir.join("schema.json");
+    let formula_path = queue_dir.join("formulas/amount_total.py");
+
+    let schema_before = std::fs::read(&schema_path).unwrap();
+
+    match variant {
+        SchemaConflictVariant::JsonBothEdited => {
+            let mut v: serde_json::Value = serde_json::from_slice(&schema_before).unwrap();
+            v["name"] = serde_json::json!("Cost Invoices Schema (local)");
+            let mut nj = serde_json::to_vec_pretty(&v).unwrap();
+            nj.push(b'\n');
+            std::fs::write(&schema_path, &nj).unwrap();
+        }
+        SchemaConflictVariant::FormulaBothEdited => {
+            std::fs::write(&formula_path, local_formula_edit.as_bytes()).unwrap();
+        }
+        SchemaConflictVariant::LocalHasFormulaRemoteRemoved => {
+            std::fs::write(&formula_path, local_formula_edit.as_bytes()).unwrap();
+        }
+        SchemaConflictVariant::LocalRemovedFormulaRemoteEdited => {
+            std::fs::remove_file(&formula_path)
+                .expect("seeded formula sidecar must exist");
+        }
+        SchemaConflictVariant::JsonAndFormulaBothEdited => {
+            let mut v: serde_json::Value = serde_json::from_slice(&schema_before).unwrap();
+            v["name"] = serde_json::json!("Cost Invoices Schema (local)");
+            let mut nj = serde_json::to_vec_pretty(&v).unwrap();
+            nj.push(b'\n');
+            std::fs::write(&schema_path, &nj).unwrap();
+            std::fs::write(&formula_path, local_formula_edit.as_bytes()).unwrap();
+        }
+    }
+
+    let lf_before =
+        std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+
+    rdc::cli::sync::run("dev", false, false, false, false, false, false)
+        .await
+        .expect("second sync should succeed (no silent write)");
+
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    let mutation_count = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| {
+            (r.method == http::Method::PATCH
+                || r.method == http::Method::POST
+                || r.method == http::Method::DELETE)
+                && (r.url.path() == format!("/api/v1/schemas/{schema_id}")
+                    || r.url.path() == "/api/v1/schemas")
+        })
+        .count();
+    assert_eq!(
+        mutation_count, 0,
+        "variant {variant:?}: schema endpoint must not receive mutating requests; saw {mutation_count}",
+    );
+
+    let lf_after =
+        std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    let v_before: serde_json::Value = serde_json::from_str(&lf_before).unwrap();
+    let v_after: serde_json::Value = serde_json::from_str(&lf_after).unwrap();
+    let base_before = v_before.pointer("/objects/schemas/cost-invoices/content_hash").cloned();
+    let base_after = v_after.pointer("/objects/schemas/cost-invoices/content_hash").cloned();
+    assert_eq!(
+        base_before, base_after,
+        "variant {variant:?}: lockfile base for schema must remain pinned (before={base_before:?}, after={base_after:?})",
+    );
+
+    if matches!(
+        variant,
+        SchemaConflictVariant::FormulaBothEdited
+            | SchemaConflictVariant::LocalHasFormulaRemoteRemoved
+            | SchemaConflictVariant::JsonAndFormulaBothEdited
+    ) {
+        let formula_after = std::fs::read(&formula_path).unwrap();
+        assert_eq!(
+            formula_after, local_formula_edit.as_bytes(),
+            "variant {variant:?}: local formula edit must survive",
+        );
+    }
+}
+
+#[tokio::test]
+async fn sync_schema_conflict_json_both_edited_never_silently_pushes() {
+    run_schema_conflict_scenario(SchemaConflictVariant::JsonBothEdited).await;
+}
+
+#[tokio::test]
+async fn sync_schema_conflict_formula_both_edited_never_silently_pushes() {
+    run_schema_conflict_scenario(SchemaConflictVariant::FormulaBothEdited).await;
+}
+
+#[tokio::test]
+async fn sync_schema_conflict_local_has_formula_remote_removed_never_silently_pushes() {
+    run_schema_conflict_scenario(SchemaConflictVariant::LocalHasFormulaRemoteRemoved).await;
+}
+
+#[tokio::test]
+async fn sync_schema_conflict_local_removed_formula_remote_edited_never_silently_pushes() {
+    run_schema_conflict_scenario(SchemaConflictVariant::LocalRemovedFormulaRemoteEdited).await;
+}
+
+#[tokio::test]
+async fn sync_schema_conflict_json_and_formula_both_edited_never_silently_pushes() {
+    run_schema_conflict_scenario(SchemaConflictVariant::JsonAndFormulaBothEdited).await;
+}

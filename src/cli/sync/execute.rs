@@ -235,6 +235,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 Some(ConflictRefs {
                     remote_bytes: bytes,
                     remote_code: None,
+                    remote_formulas: Vec::new(),
                     local_path,
                     id: l.id,
                     url: Some(l.url.clone()),
@@ -252,6 +253,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 Some(ConflictRefs {
                     remote_bytes: bytes,
                     remote_code: None,
+                    remote_formulas: Vec::new(),
                     local_path,
                     id: w.id,
                     url: Some(w.url.clone()),
@@ -269,6 +271,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 Some(ConflictRefs {
                     remote_bytes: bytes,
                     remote_code: None,
+                    remote_formulas: Vec::new(),
                     local_path,
                     id: e.id,
                     url: Some(e.url.clone()),
@@ -297,6 +300,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                     Some(ConflictRefs {
                         remote_bytes: bytes,
                         remote_code: None,
+                        remote_formulas: Vec::new(),
                         local_path,
                         id: f.id,
                         url: Some(f.url.clone()),
@@ -316,6 +320,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 Some(ConflictRefs {
                     remote_bytes: json_bytes,
                     remote_code: code,
+                    remote_formulas: Vec::new(),
                     local_path,
                     id: h.id,
                     url: Some(h.url.clone()),
@@ -332,6 +337,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 Some(ConflictRefs {
                     remote_bytes: json_bytes,
                     remote_code: code,
+                    remote_formulas: Vec::new(),
                     local_path,
                     id: r.id,
                     url: Some(r.url.clone()),
@@ -349,6 +355,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 Some(ConflictRefs {
                     remote_bytes: bytes,
                     remote_code: None,
+                    remote_formulas: Vec::new(),
                     local_path,
                     id: q.id,
                     url: Some(q.url.clone()),
@@ -357,24 +364,29 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 })
             }),
             "schemas" => {
-                // schemas are keyed by queue slug in the lockfile. Look up
-                // the schema via the queue → schema_by_queue_id map; the
-                // prompt only displays the JSON portion (formulas are
-                // sidecar files and are followed by `[k]`/`[r]` decisions
-                // identical to the JSON's). Treat as flat for resolution.
+                // Schemas use `HashStrategy::Schema` so the resolver
+                // hashes the canonical schema_combined_hash (json +
+                // formulas) into the lockfile. Without this, a
+                // formula-only divergence would record only the JSON
+                // hash and either (a) silently round-trip via
+                // KeepLocal short-circuit on JSON canonicalize-equal
+                // bytes, or (b) leave the lockfile in a corrupt state
+                // where the recorded hash doesn't match what the
+                // classifier next computes.
                 queue_by_slug.get(it.slug.as_str()).and_then(|(q, ws_slug)| {
                     let schema = catalog.schemas_by_queue_id.get(&q.id)?;
-                    let (json_bytes, _formulas) =
+                    let (json_bytes, formulas) =
                         crate::snapshot::schema::serialize_schema(schema).ok()?;
                     let local_path = ctx.paths.queue_dir(ws_slug, &it.slug).join("schema.json");
                     Some(ConflictRefs {
                         remote_bytes: json_bytes,
                         remote_code: None,
+                        remote_formulas: formulas,
                         local_path,
                         id: schema.id,
                         url: Some(schema.url.clone()),
                         modified_at: schema.modified_at().map(|s| s.to_string()),
-                        hash_strategy: HashStrategy::Flat,
+                        hash_strategy: HashStrategy::Schema,
                     })
                 })
             }
@@ -389,6 +401,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 Some(ConflictRefs {
                     remote_bytes: bytes,
                     remote_code: None,
+                    remote_formulas: Vec::new(),
                     local_path,
                     id: inbox.id,
                     url: Some(inbox.url.clone()),
@@ -415,6 +428,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                     Some(ConflictRefs {
                         remote_bytes: bytes,
                         remote_code: None,
+                        remote_formulas: Vec::new(),
                         local_path,
                         id: t.id,
                         url: Some(t.url.clone()),
@@ -474,6 +488,12 @@ struct ConflictRefs {
     /// `trigger_condition` for rules) — `None` for flat kinds and for
     /// split-file kinds whose remote happens not to carry code.
     remote_code: Option<String>,
+    /// For `HashStrategy::Schema`, the list of `(field_id, formula_bytes)`
+    /// sidecars extracted from the remote schema. Empty for other
+    /// strategies. Used by the resolver to (a) compute the canonical
+    /// `schema_combined_hash` so the lockfile records the right base,
+    /// and (b) write/remove formula sidecars on `[r]` (adopt remote).
+    remote_formulas: Vec<(String, Vec<u8>)>,
     local_path: PathBuf,
     id: u64,
     url: Option<String>,
@@ -481,7 +501,8 @@ struct ConflictRefs {
     /// How to fold `(remote_bytes, remote_code)` into the lockfile
     /// `content_hash`. Flat kinds use `Flat` (just `content_hash`);
     /// `Hook` / `Rule` use their respective combined-hash helpers so the
-    /// adapter sees `Clean` after the resolution.
+    /// adapter sees `Clean` after the resolution. `Schema` includes
+    /// the formula sidecar bytes.
     hash_strategy: HashStrategy,
 }
 
@@ -495,16 +516,40 @@ enum HashStrategy {
     Hook,
     /// `rules`: `rule_combined_hash(json_bytes, code)`.
     Rule,
+    /// `schemas`: `schema_combined_hash(json_bytes, formulas)` —
+    /// formulas are a list of `(field_id, bytes)` sidecars that live
+    /// under `formulas/<field_id>.py`. The canonical hash mirrors what
+    /// `pull::queues::write_schema_for_queue` and the push scanner
+    /// record. Without this strategy the resolver would only hash
+    /// the JSON portion and a formula-only divergence would
+    /// silently round-trip through `KeepLocal`.
+    Schema,
 }
 
 impl HashStrategy {
     /// Compute the canonical lockfile hash for the resolved bytes.
+    /// For `Schema`, `code` is unused (the formulas sidecar list is
+    /// derived from the queue dir by the caller); use `hash_schema`
+    /// instead.
     fn hash(self, json_bytes: &[u8], code: &Option<String>) -> String {
         match self {
             HashStrategy::Flat => content_hash(json_bytes),
             HashStrategy::Hook => crate::state::hook_combined_hash(json_bytes, code),
             HashStrategy::Rule => crate::state::rule_combined_hash(json_bytes, code),
+            // For Schema the caller must use `hash_schema` so the
+            // formulas sidecar list is included. Falling back to the
+            // bare json-only hash here would silently drop the
+            // formulas from the canonical hash — exactly the bug
+            // this strategy exists to fix.
+            HashStrategy::Schema => content_hash(json_bytes),
         }
+    }
+
+    /// Compute the canonical lockfile hash for schema items, including
+    /// formulas. Use this for `HashStrategy::Schema` instead of `hash`.
+    fn hash_schema(self, json_bytes: &[u8], formulas: &[(String, Vec<u8>)]) -> String {
+        debug_assert!(matches!(self, HashStrategy::Schema));
+        crate::state::schema_combined_hash(json_bytes, formulas)
     }
 }
 
@@ -513,6 +558,24 @@ impl HashStrategy {
 /// updates + push-side promotions. Extracted so each kind's arm above
 /// stays a thin lookup; behavior matches the inlined labels block this
 /// replaced.
+///
+/// Safety contract (defense layer 2 — see module-level docs):
+/// For combined-hash kinds (`Hook`, `Rule`, `Schema`) we DON'T trust
+/// `prompt_resolve`'s `local_canonical == remote_canonical` short-
+/// circuit, because that only compares the JSON portion. If the JSON
+/// canonicalizes-equal but the sidecar (`.py` for hooks/rules,
+/// `formulas/*.py` for schemas) differs — symmetric or asymmetric —
+/// the short-circuit would silently return `KeepLocal`, promoting
+/// the item to push and overwriting the divergent remote state.
+///
+/// To prevent that, this function:
+/// - Detects sidecar divergence directly (regardless of JSON state).
+/// - When sidecar diverges, redirects the prompt to the sidecar bytes
+///   via `prompt_resolve_with_bytes` (which doesn't require the path
+///   to exist — important for asymmetric "remote has code, local
+///   doesn't" cases).
+/// - Records the canonical combined hash on every Resolution arm so
+///   the lockfile stays consistent with the classifier's view.
 #[allow(clippy::too_many_arguments)]
 fn resolve_one_conflict<R: BufRead>(
     ctx: &mut PullCtx<'_>,
@@ -530,6 +593,7 @@ fn resolve_one_conflict<R: BufRead>(
     let ConflictRefs {
         remote_bytes,
         remote_code,
+        remote_formulas,
         local_path,
         id,
         url,
@@ -540,10 +604,93 @@ fn resolve_one_conflict<R: BufRead>(
     // For split-file kinds, the sidecar lives next to the JSON. For
     // hooks the extension depends on `config.runtime` (`.py` or `.js`);
     // for rules it is always `.py` (Python is the only valid trigger
-    // language). The resolver writes the sidecar on `[r]` (adopt
-    // remote) and the local hash on `[s]`/non-tty paths includes
-    // whatever code currently sits on disk.
+    // language). For schemas, the sidecars live in `formulas/<id>.py`
+    // under the queue dir. The resolver writes the sidecar on `[r]`
+    // (adopt remote) and the local hash on `[s]`/non-tty paths
+    // includes whatever code currently sits on disk.
     let code_path = sidecar_path_for_conflict(&local_path, hash_strategy);
+
+    // Read the local code (sidecar) state once; it informs both the
+    // redirect decision and the canonical-hash recompute on Skip /
+    // non-interactive paths. Schemas don't use `code_path` for their
+    // sidecars (they have a directory of formulas); instead we
+    // re-derive the local formulas list from the queue dir.
+    let (local_code, local_formulas): (Option<String>, Vec<(String, Vec<u8>)>) =
+        match hash_strategy {
+            HashStrategy::Hook | HashStrategy::Rule => {
+                let code = if code_path.exists() {
+                    std::fs::read_to_string(&code_path).ok()
+                } else {
+                    None
+                };
+                (code, Vec::new())
+            }
+            HashStrategy::Schema => {
+                // Local formulas live under `<queue_dir>/formulas/`.
+                // `local_path` is `<queue_dir>/schema.json` so its
+                // parent is the queue dir.
+                let queue_dir = local_path.parent().unwrap_or(&local_path);
+                let formulas = crate::snapshot::schema::read_local_formulas(queue_dir)
+                    .unwrap_or_default();
+                (None, formulas)
+            }
+            HashStrategy::Flat => (None, Vec::new()),
+        };
+
+    // Decide whether the divergence is in the JSON portion or only in
+    // the sidecar. `sidecar_diverges` covers both symmetric (both
+    // sides have differing code) AND asymmetric cases (one side has
+    // code, the other doesn't). Without this branch firing on the
+    // asymmetric cases, the resolver hands `prompt_resolve` a
+    // canonicalize-equal JSON pair which short-circuits to
+    // `KeepLocal` — silently routing the item to push.
+    let local_json_bytes = std::fs::read(&local_path).unwrap_or_default();
+    let local_json_canon = crate::snapshot::noise::canonicalize_for_hash(&local_json_bytes);
+    let remote_json_canon = crate::snapshot::noise::canonicalize_for_hash(&remote_bytes);
+    let json_canonicalize_equal = local_json_canon == remote_json_canon;
+    let sidecar_diverges = match hash_strategy {
+        HashStrategy::Hook | HashStrategy::Rule => {
+            local_code.as_deref() != remote_code.as_deref()
+        }
+        HashStrategy::Schema => {
+            // Compare local formulas (slug-sorted by `read_local_formulas`)
+            // to remote formulas (slug-sorted by `serialize_schema`).
+            local_formulas != remote_formulas
+        }
+        HashStrategy::Flat => false,
+    };
+
+    // Compose the canonical "local combined" bytes used by the
+    // bytes-driven prompt and the hash recompute. The "combined" hash
+    // is what the classifier compares; the prompt should reflect the
+    // same view of state.
+    let canonical_remote_hash = match hash_strategy {
+        HashStrategy::Schema => hash_strategy.hash_schema(&remote_bytes, &remote_formulas),
+        _ => hash_strategy.hash(&remote_bytes, &remote_code),
+    };
+    let canonical_local_hash = match hash_strategy {
+        HashStrategy::Schema => hash_strategy.hash_schema(&local_json_bytes, &local_formulas),
+        HashStrategy::Hook | HashStrategy::Rule => {
+            hash_strategy.hash(&local_json_bytes, &local_code)
+        }
+        HashStrategy::Flat => hash_strategy.hash(&local_json_bytes, &None),
+    };
+
+    // Defensive sanity: if the canonical hashes already match, the
+    // classifier was confused (e.g. by a transient catalog reorder).
+    // Treat as Clean — record the matching hash and don't promote.
+    if canonical_local_hash == canonical_remote_hash {
+        crate::cli::pull::common::record_object(
+            ctx.lockfile,
+            &it.kind,
+            &it.slug,
+            id,
+            url,
+            modified_at,
+            Some(canonical_local_hash),
+        );
+        return Ok(());
+    }
 
     if !interactive {
         // Non-TTY/--yes: fall back to legacy shadow-file behavior so the
@@ -554,39 +701,59 @@ fn resolve_one_conflict<R: BufRead>(
         // base (a conflict without a base is unusual), use the local
         // hash so the lockfile still gets a sensible entry.
         //
-        // Split-file kinds: when the JSON portions canonicalize-equal
-        // but the code sidecars differ (the user-reported BothDiverged
-        // scenario for hooks/rules), land the shadow next to the
-        // sidecar so the user sees the actual divergence — a `.json.<env>`
-        // shadow with byte-identical-to-local content would be
-        // misleading.
-        let (shadow_anchor, shadow_bytes): (&std::path::Path, Vec<u8>) =
-            match hash_strategy {
-                HashStrategy::Hook | HashStrategy::Rule => {
-                    let local_json = std::fs::read(&local_path).unwrap_or_default();
-                    let local_json_canon =
-                        crate::snapshot::noise::canonicalize_for_hash(&local_json);
-                    let remote_json_canon =
-                        crate::snapshot::noise::canonicalize_for_hash(&remote_bytes);
-                    let local_code = if code_path.exists() {
-                        std::fs::read_to_string(&code_path).ok()
-                    } else {
-                        None
-                    };
-                    let symmetric =
-                        matches!((&local_code, &remote_code), (Some(_), Some(_)));
-                    let codes_differ = local_code.as_deref() != remote_code.as_deref();
-                    if local_json_canon == remote_json_canon && symmetric && codes_differ {
+        // For combined-hash kinds where the JSON portions are byte-
+        // identical (post-canonicalize) but the sidecar diverges,
+        // land the shadow next to the sidecar so the user sees the
+        // actual divergence — a `.json.<env>` shadow with byte-
+        // identical-to-local content would be misleading.
+        let (shadow_anchor, shadow_bytes): (PathBuf, Vec<u8>) =
+            if json_canonicalize_equal && sidecar_diverges {
+                match hash_strategy {
+                    HashStrategy::Hook | HashStrategy::Rule => {
                         let remote_code_bytes =
                             remote_code.clone().unwrap_or_default().into_bytes();
-                        (code_path.as_path(), remote_code_bytes)
-                    } else {
-                        (local_path.as_path(), remote_bytes.clone())
+                        (code_path.clone(), remote_code_bytes)
                     }
+                    HashStrategy::Schema => {
+                        // Pick the first divergent formula as the
+                        // representative shadow anchor; the lockfile
+                        // base is preserved so the next sync re-prompts
+                        // with proper UX. Schemas with multiple
+                        // divergent formulas land the shadow on the
+                        // first one for visibility.
+                        let queue_dir = local_path.parent().unwrap_or(&local_path);
+                        let formulas_dir = queue_dir.join("formulas");
+                        let representative = remote_formulas
+                            .iter()
+                            .find(|(id, bytes)| {
+                                local_formulas
+                                    .iter()
+                                    .find(|(lid, _)| lid == id)
+                                    .map(|(_, lb)| lb)
+                                    != Some(bytes)
+                            })
+                            .or_else(|| {
+                                // Local formula present, remote absent:
+                                // pick the first that's only in local.
+                                local_formulas.iter().find(|(id, _)| {
+                                    !remote_formulas.iter().any(|(rid, _)| rid == id)
+                                })
+                            })
+                            .map(|(fid, bytes)| {
+                                (
+                                    formulas_dir.join(format!("{fid}.py")),
+                                    bytes.clone(),
+                                )
+                            })
+                            .unwrap_or_else(|| (local_path.clone(), remote_bytes.clone()));
+                        representative
+                    }
+                    HashStrategy::Flat => (local_path.clone(), remote_bytes.clone()),
                 }
-                HashStrategy::Flat => (local_path.as_path(), remote_bytes.clone()),
+            } else {
+                (local_path.clone(), remote_bytes.clone())
             };
-        let conflict_path = crate::paths::shadow_path_for(shadow_anchor, env);
+        let conflict_path = crate::paths::shadow_path_for(&shadow_anchor, env);
         write_atomic(&conflict_path, &shadow_bytes)?;
         progress.println(format!(
             "warn: {} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
@@ -595,20 +762,7 @@ fn resolve_one_conflict<R: BufRead>(
         ));
         let preserved_hash = match it.base_hash.as_deref() {
             Some(prior) => prior.to_string(),
-            None => {
-                let local_bytes = std::fs::read(&local_path)
-                    .with_context(|| format!("reading {}", local_path.display()))?;
-                let local_code = if matches!(
-                    hash_strategy,
-                    HashStrategy::Hook | HashStrategy::Rule
-                ) && code_path.exists()
-                {
-                    std::fs::read_to_string(&code_path).ok()
-                } else {
-                    None
-                };
-                hash_strategy.hash(&local_bytes, &local_code)
-            }
+            None => canonical_local_hash.clone(),
         };
         crate::cli::pull::common::record_object(
             ctx.lockfile,
@@ -622,58 +776,104 @@ fn resolve_one_conflict<R: BufRead>(
         return Ok(());
     }
 
-    // Split-file kinds (`hooks`, `rules`) carry their executable code in
-    // a sibling sidecar. The JSON portions can be byte-identical (e.g.,
-    // only `.py` was edited on both sides) while the combined hash
-    // differs — that's why the classifier put us here. Pointing the
-    // prompt at `local_path` (the `.json`) would let `prompt_resolve`
-    // short-circuit to `KeepLocal` on canonicalize-equal JSON, silently
-    // promoting the item to push without ever showing a prompt. To
-    // avoid that, when the JSON portions canonicalize-equal but the
-    // code portions differ AND both sides actually carry code (so the
-    // sidecar exists locally and remote has a `config.code`),
-    // redirect the prompt at the sidecar instead so the user sees the
-    // code conflict. Asymmetric cases (one side has code, the other
-    // doesn't) fall through to the JSON-based prompt; the legacy
-    // shadow-file flow in `pull::hooks` handles those separately.
-    // `code_conflict_only` tracks that redirection so the resolution
-    // branches below write the user's choice to the sidecar (not to
-    // `local_path`).
-    let mut code_conflict_only = false;
-    let (prompt_path, prompt_remote_bytes): (PathBuf, Vec<u8>) = match hash_strategy {
-        HashStrategy::Hook | HashStrategy::Rule => {
-            let local_json = std::fs::read(&local_path).unwrap_or_default();
-            let local_json_canon =
-                crate::snapshot::noise::canonicalize_for_hash(&local_json);
-            let remote_json_canon =
-                crate::snapshot::noise::canonicalize_for_hash(&remote_bytes);
-            let local_code = if code_path.exists() {
-                std::fs::read_to_string(&code_path).ok()
-            } else {
-                None
-            };
-            let symmetric = matches!((&local_code, &remote_code), (Some(_), Some(_)));
-            let codes_differ = local_code.as_deref() != remote_code.as_deref();
-            if local_json_canon == remote_json_canon && symmetric && codes_differ {
-                code_conflict_only = true;
-                let remote_code_str = remote_code.clone().unwrap_or_default();
-                (code_path.clone(), remote_code_str.into_bytes())
-            } else {
-                (local_path.clone(), remote_bytes.clone())
+    // Interactive prompt setup. For combined-hash kinds with a
+    // JSON-equal-but-sidecar-divergent state, we redirect the prompt
+    // to a bytes-driven variant that doesn't require the sidecar to
+    // exist on disk — important for asymmetric cases (one side has
+    // a sidecar, the other doesn't).
+    //
+    // `code_conflict_only` tracks the redirect so write-back branches
+    // below know to write to the sidecar (not the JSON).
+    let (resolution, code_conflict_only, prompt_local_bytes, prompt_remote_bytes, prompt_path)
+        : (Resolution, bool, Vec<u8>, Vec<u8>, PathBuf) =
+    {
+        if json_canonicalize_equal && sidecar_diverges {
+            match hash_strategy {
+                HashStrategy::Hook | HashStrategy::Rule => {
+                    let local_bytes = local_code.clone().unwrap_or_default().into_bytes();
+                    let remote_bytes_for_prompt =
+                        remote_code.clone().unwrap_or_default().into_bytes();
+                    let r = crate::cli::resolve::prompt_resolve_with_bytes(
+                        input,
+                        stderr_lock,
+                        idx_one_based,
+                        total,
+                        &code_path,
+                        &local_bytes,
+                        &remote_bytes_for_prompt,
+                        env,
+                    )?;
+                    (r, true, local_bytes, remote_bytes_for_prompt, code_path.clone())
+                }
+                HashStrategy::Schema => {
+                    // Pick the first divergent formula sidecar for the
+                    // prompt focus. The user resolves the formula; we
+                    // record the schema_combined_hash on resolution.
+                    let queue_dir = local_path.parent().unwrap_or(&local_path);
+                    let formulas_dir = queue_dir.join("formulas");
+                    let (fid, local_b, remote_b) = {
+                        let mut chosen: Option<(String, Vec<u8>, Vec<u8>)> = None;
+                        for (rid, rbytes) in &remote_formulas {
+                            let lb = local_formulas
+                                .iter()
+                                .find(|(lid, _)| lid == rid)
+                                .map(|(_, b)| b.clone());
+                            if lb.as_deref() != Some(rbytes.as_slice()) {
+                                chosen = Some((rid.clone(), lb.unwrap_or_default(), rbytes.clone()));
+                                break;
+                            }
+                        }
+                        if chosen.is_none() {
+                            // Local-only formula (remote dropped it).
+                            for (lid, lbytes) in &local_formulas {
+                                if !remote_formulas.iter().any(|(rid, _)| rid == lid) {
+                                    chosen = Some((lid.clone(), lbytes.clone(), Vec::new()));
+                                    break;
+                                }
+                            }
+                        }
+                        chosen.unwrap_or_else(|| ("unknown".to_string(), Vec::new(), Vec::new()))
+                    };
+                    let formula_path = formulas_dir.join(format!("{fid}.py"));
+                    let r = crate::cli::resolve::prompt_resolve_with_bytes(
+                        input,
+                        stderr_lock,
+                        idx_one_based,
+                        total,
+                        &formula_path,
+                        &local_b,
+                        &remote_b,
+                        env,
+                    )?;
+                    // For schemas we don't write the sidecar from the
+                    // resolver — the `[r]` path adopts the whole
+                    // schema including all formulas (handled below).
+                    // `code_conflict_only` remains false because the
+                    // KeepLocal/KeepRemote/Edit branches need to
+                    // handle the whole schema, not just one formula.
+                    (r, false, local_b, remote_b, formula_path)
+                }
+                HashStrategy::Flat => unreachable!(),
             }
+        } else {
+            // Standard JSON-based prompt (path-driven; reads
+            // `local_path` for local bytes).
+            let r = prompt_resolve(
+                input,
+                stderr_lock,
+                idx_one_based,
+                total,
+                &local_path,
+                &remote_bytes,
+                env,
+            )?;
+            (r, false, local_json_bytes.clone(), remote_bytes.clone(), local_path.clone())
         }
-        HashStrategy::Flat => (local_path.clone(), remote_bytes.clone()),
     };
 
-    let resolution = prompt_resolve(
-        input,
-        stderr_lock,
-        idx_one_based,
-        total,
-        &prompt_path,
-        &prompt_remote_bytes,
-        env,
-    )?;
+    // Suppress unused-warning for prompt_local_bytes when no Skip arm
+    // reads it (the variable carries diagnostic value for future hooks).
+    let _ = prompt_local_bytes;
 
     match resolution {
         Resolution::KeepLocal => {
@@ -687,7 +887,6 @@ fn resolve_one_conflict<R: BufRead>(
             // remote so the push driver's drift check passes
             // (remote_hash == base). The PATCH response updates the
             // lockfile to the post-PATCH canonical form.
-            let remote_hash = hash_strategy.hash(&remote_bytes, &remote_code);
             crate::cli::pull::common::record_object(
                 ctx.lockfile,
                 &it.kind,
@@ -695,7 +894,7 @@ fn resolve_one_conflict<R: BufRead>(
                 id,
                 url,
                 modified_at,
-                Some(remote_hash),
+                Some(canonical_remote_hash.clone()),
             );
             outcome
                 .promoted_to_push
@@ -708,12 +907,9 @@ fn resolve_one_conflict<R: BufRead>(
                 std::fs::create_dir_all(parent).ok();
             }
             write_atomic(&local_path, &remote_bytes)?;
-            // Adopt the remote sidecar too (or delete a stale one when
-            // the remote has no code). Mirrors `pull::hooks`'s
-            // `PullAction::Write` arm. For hooks we also recompute the
-            // canonical sidecar path from the *remote* bytes, since the
-            // remote runtime may have shifted between Python and
-            // Node.js — sweep the now-stale opposite-extension file.
+            // Adopt the remote sidecar(s) too. Hooks/rules write a
+            // single `.py`/`.js` sidecar; schemas adopt the full
+            // formulas dir.
             if matches!(hash_strategy, HashStrategy::Hook | HashStrategy::Rule) {
                 let canonical_code_path = if matches!(hash_strategy, HashStrategy::Hook) {
                     sidecar_path_for_remote(&local_path, &remote_bytes)
@@ -734,8 +930,35 @@ fn resolve_one_conflict<R: BufRead>(
                         format!("removing stale {}", code_path.display())
                     })?;
                 }
+            } else if matches!(hash_strategy, HashStrategy::Schema) {
+                // Adopt full remote formulas dir: write every remote
+                // formula and remove any local formula not present in
+                // remote.
+                let queue_dir = local_path.parent().unwrap_or(&local_path);
+                let formulas_dir = queue_dir.join("formulas");
+                if !remote_formulas.is_empty() {
+                    std::fs::create_dir_all(&formulas_dir).with_context(|| {
+                        format!("creating {}", formulas_dir.display())
+                    })?;
+                }
+                for (fid, bytes) in &remote_formulas {
+                    write_atomic(
+                        &formulas_dir.join(format!("{fid}.py")),
+                        bytes,
+                    )?;
+                }
+                // Sweep formulas that exist locally but not remotely.
+                for (lid, _) in &local_formulas {
+                    if !remote_formulas.iter().any(|(rid, _)| rid == lid) {
+                        let stale = formulas_dir.join(format!("{lid}.py"));
+                        if stale.exists() {
+                            std::fs::remove_file(&stale).with_context(|| {
+                                format!("removing stale {}", stale.display())
+                            })?;
+                        }
+                    }
+                }
             }
-            let remote_hash = hash_strategy.hash(&remote_bytes, &remote_code);
             crate::cli::pull::common::record_object(
                 ctx.lockfile,
                 &it.kind,
@@ -743,7 +966,7 @@ fn resolve_one_conflict<R: BufRead>(
                 id,
                 url,
                 modified_at,
-                Some(remote_hash),
+                Some(canonical_remote_hash.clone()),
             );
         }
         Resolution::Edit(edited) => {
@@ -758,7 +981,6 @@ fn resolve_one_conflict<R: BufRead>(
                 std::fs::create_dir_all(parent).ok();
             }
             write_atomic(edit_target, &edited)?;
-            let remote_hash = hash_strategy.hash(&remote_bytes, &remote_code);
             crate::cli::pull::common::record_object(
                 ctx.lockfile,
                 &it.kind,
@@ -766,7 +988,7 @@ fn resolve_one_conflict<R: BufRead>(
                 id,
                 url,
                 modified_at,
-                Some(remote_hash),
+                Some(canonical_remote_hash.clone()),
             );
             outcome
                 .promoted_to_push
@@ -791,7 +1013,7 @@ fn resolve_one_conflict<R: BufRead>(
             ));
             let preserved_hash = match it.base_hash.as_deref() {
                 Some(prior) => prior.to_string(),
-                None => hash_strategy.hash(&edited, &remote_code),
+                None => canonical_local_hash.clone(),
             };
             crate::cli::pull::common::record_object(
                 ctx.lockfile,
@@ -821,20 +1043,7 @@ fn resolve_one_conflict<R: BufRead>(
             ));
             let preserved_hash = match it.base_hash.as_deref() {
                 Some(prior) => prior.to_string(),
-                None => {
-                    let local_bytes = std::fs::read(&local_path)
-                        .with_context(|| format!("reading {}", local_path.display()))?;
-                    let local_code = if matches!(
-                        hash_strategy,
-                        HashStrategy::Hook | HashStrategy::Rule
-                    ) && code_path.exists()
-                    {
-                        std::fs::read_to_string(&code_path).ok()
-                    } else {
-                        None
-                    };
-                    hash_strategy.hash(&local_bytes, &local_code)
-                }
+                None => canonical_local_hash.clone(),
             };
             crate::cli::pull::common::record_object(
                 ctx.lockfile,
@@ -873,6 +1082,16 @@ fn sidecar_path_for_conflict(local_path: &Path, strategy: HashStrategy) -> PathB
         }
         // Rules and Flat — `trigger_condition` is always Python.
         HashStrategy::Rule | HashStrategy::Flat => local_path.with_extension("py"),
+        // Schemas don't have a single sidecar — they have a
+        // `formulas/<id>.py` per datapoint with a formula. The
+        // resolver picks the specific formula at prompt time; this
+        // function's return value isn't used on the schema path.
+        // Return the formulas directory as a sentinel so a misuse
+        // surfaces (writing to a directory fails).
+        HashStrategy::Schema => local_path
+            .parent()
+            .map(|p| p.join("formulas"))
+            .unwrap_or_else(|| local_path.with_extension("py")),
     }
 }
 
@@ -3158,6 +3377,544 @@ mod tests {
         assert_eq!(
             json_canon_before, json_canon_after,
             "JSON canonical form must remain stable on [r] (was identical before)"
+        );
+    }
+
+    // ==============================================================
+    // Asymmetric & schema BothDiverged tests (Phase 2 of the sync
+    // hardening pass). Each test stages a divergent state where the
+    // JSON portions canonicalize-equal but the code/formula portions
+    // differ in an asymmetric way (one side has code/formula, the
+    // other doesn't). Before the resolver hardening, the prompt
+    // short-circuited to `KeepLocal` on JSON equality and silently
+    // promoted the item to push.
+    // ==============================================================
+
+    /// Stage a `BothDiverged` hook where local has a `.py` sidecar
+    /// (edited from base) and remote returns the hook WITHOUT
+    /// `config.code` (the code was removed remotely). Both sides have
+    /// diverged from the lockfile-recorded base (which had code).
+    /// `(local_code, remote_code) = (Some, None)` — the prior fix's
+    /// `symmetric` redirect doesn't fire here. This was the bug.
+    fn setup_hook_local_code_remote_none() -> (
+        tempfile::TempDir,
+        Paths,
+        Lockfile,
+        std::path::PathBuf, /* json path */
+        std::path::PathBuf, /* py path */
+        RemoteCatalog,
+        Vec<ClassifiedItem>,
+        String, /* base_combined */
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+
+        let slug = "ap-validator";
+        let local_json_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "id": 42,
+            "url": "https://x.invalid/api/v1/hooks/42",
+            "name": "ap-validator",
+            "type": "function",
+            "queues": [],
+            "events": ["annotation_content"],
+            "config": { "runtime": "python3.12" }
+        }))
+        .unwrap();
+        let mut local_json_with_newline = local_json_bytes;
+        local_json_with_newline.push(b'\n');
+        let local_json_path = paths.hooks_dir().join(format!("{slug}.json"));
+        let local_py_path = paths.hooks_dir().join(format!("{slug}.py"));
+        std::fs::write(&local_json_path, &local_json_with_newline).unwrap();
+        std::fs::write(&local_py_path, b"def local_edit():\n    return 2\n").unwrap();
+
+        // Remote returns the hook with NO `config.code`. (Rossum's API
+        // returns `code: null` typically; we model that as a missing
+        // field which the deserializer treats as `None`.)
+        let remote_hook: crate::model::Hook = serde_json::from_value(serde_json::json!({
+            "id": 42,
+            "url": "https://x.invalid/api/v1/hooks/42",
+            "name": "ap-validator",
+            "type": "function",
+            "queues": [],
+            "events": ["annotation_content"],
+            "config": { "runtime": "python3.12" },
+            "modified_at": "2026-05-14T10:00:00Z"
+        }))
+        .unwrap();
+
+        // Base: hook had code = "base" — both sides have since diverged.
+        let base_code = "def base():\n    return 1\n".to_string();
+        let base_combined =
+            crate::state::hook_combined_hash(&local_json_with_newline, &Some(base_code));
+        let mut lockfile = Lockfile::default();
+        lockfile.upsert(
+            "hooks",
+            slug,
+            ObjectEntry {
+                id: 42,
+                url: Some("https://x.invalid/api/v1/hooks/42".to_string()),
+                modified_at: Some("2026-05-14T08:00:00Z".to_string()),
+                content_hash: Some(base_combined.clone()),
+            },
+        );
+
+        let catalog = catalog_with_hooks(vec![remote_hook.clone()]);
+
+        let (remote_json_full, remote_code) =
+            crate::snapshot::hook::serialize_hook(&remote_hook).unwrap();
+        let remote_combined =
+            crate::state::hook_combined_hash(&remote_json_full, &remote_code);
+        let local_combined = crate::state::hook_combined_hash(
+            &local_json_with_newline,
+            &Some("def local_edit():\n    return 2\n".to_string()),
+        );
+        let classified = vec![ClassifiedItem {
+            kind: "hooks".to_string(),
+            slug: slug.to_string(),
+            class: SyncClass::BothDiverged,
+            local_hash: Some(local_combined),
+            remote_hash: Some(remote_combined),
+            base_hash: Some(base_combined.clone()),
+        }];
+
+        (tmp, paths, lockfile, local_json_path, local_py_path, catalog, classified, base_combined)
+    }
+
+    /// Asymmetric: local has code, remote doesn't. With empty stdin
+    /// (TTY simulated) the resolver must NOT silently promote — it
+    /// MUST prompt. The bug was: JSON portions canonicalize-equal +
+    /// asymmetric → falls through to JSON prompt → JSON
+    /// canonicalize-equal short-circuit → `KeepLocal` silent push.
+    #[tokio::test]
+    async fn resolve_conflicts_hook_prompts_when_local_has_code_remote_does_not() {
+        let (_tmp, paths, mut lockfile, _json_path, py_path, catalog, classified, base_combined) =
+            setup_hook_local_code_remote_none();
+        let client = RossumClient::new(
+            "https://unused.invalid/api/v1".to_string(),
+            "TEST".to_string(),
+        )
+        .unwrap();
+        let progress = ProgressLog::start("test");
+
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &paths,
+                client: &client,
+                lockfile: &mut lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: true,
+            };
+            // Empty stdin → resolver hits the legacy `read_line == 0`
+            // fallback, returns `Skip`. NO promotion to push, NO
+            // KeepLocal short-circuit. With the bug, the resolver
+            // never reads stdin and silently promotes.
+            resolve_conflicts(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b""),
+                true,
+                &progress,
+            )
+            .await
+            .expect("resolver should succeed (Skip on empty stdin)")
+        };
+        progress.finish("");
+
+        assert!(
+            outcome.promoted_to_push.is_empty(),
+            "asymmetric (local code, remote none): resolver MUST NOT silently promote; \
+             promoted = {:?}",
+            outcome.promoted_to_push,
+        );
+
+        let py_after = std::fs::read(&py_path).unwrap();
+        assert_eq!(
+            py_after, b"def local_edit():\n    return 2\n",
+            "local .py edit must survive when resolver prompts/skips"
+        );
+
+        let recorded = lockfile
+            .objects
+            .get("hooks")
+            .and_then(|m| m.get("ap-validator"))
+            .and_then(|e| e.content_hash.clone())
+            .expect("lockfile entry must persist");
+        assert_eq!(
+            recorded, base_combined,
+            "lockfile base must remain pinned on Skip (next sync re-prompts); got {recorded}"
+        );
+    }
+
+    /// Mirror of `setup_hook_local_code_remote_none` but local has NO
+    /// `.py` (the user deleted it) and remote returns code. Asymmetric
+    /// `(local_code, remote_code) = (None, Some)`. Empty stdin →
+    /// resolver must prompt/Skip, not silently promote.
+    fn setup_hook_local_none_remote_code() -> (
+        tempfile::TempDir,
+        Paths,
+        Lockfile,
+        std::path::PathBuf, /* json path */
+        RemoteCatalog,
+        Vec<ClassifiedItem>,
+        String, /* base_combined */
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+
+        let slug = "ap-validator";
+        let local_json_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "id": 42,
+            "url": "https://x.invalid/api/v1/hooks/42",
+            "name": "ap-validator",
+            "type": "function",
+            "queues": [],
+            "events": ["annotation_content"],
+            "config": { "runtime": "python3.12" }
+        }))
+        .unwrap();
+        let mut local_json_with_newline = local_json_bytes;
+        local_json_with_newline.push(b'\n');
+        let local_json_path = paths.hooks_dir().join(format!("{slug}.json"));
+        std::fs::write(&local_json_path, &local_json_with_newline).unwrap();
+        // No .py on disk — user removed it.
+
+        let remote_hook: crate::model::Hook = serde_json::from_value(serde_json::json!({
+            "id": 42,
+            "url": "https://x.invalid/api/v1/hooks/42",
+            "name": "ap-validator",
+            "type": "function",
+            "queues": [],
+            "events": ["annotation_content"],
+            "config": {
+                "runtime": "python3.12",
+                "code": "def remote_edit():\n    return 3\n"
+            },
+            "modified_at": "2026-05-14T10:00:00Z"
+        }))
+        .unwrap();
+
+        // Base: hook had code = "base" — both sides have since diverged.
+        let base_code = "def base():\n    return 1\n".to_string();
+        let base_combined =
+            crate::state::hook_combined_hash(&local_json_with_newline, &Some(base_code));
+        let mut lockfile = Lockfile::default();
+        lockfile.upsert(
+            "hooks",
+            slug,
+            ObjectEntry {
+                id: 42,
+                url: Some("https://x.invalid/api/v1/hooks/42".to_string()),
+                modified_at: Some("2026-05-14T08:00:00Z".to_string()),
+                content_hash: Some(base_combined.clone()),
+            },
+        );
+
+        let catalog = catalog_with_hooks(vec![remote_hook.clone()]);
+
+        let (remote_json_full, remote_code) =
+            crate::snapshot::hook::serialize_hook(&remote_hook).unwrap();
+        let remote_combined =
+            crate::state::hook_combined_hash(&remote_json_full, &remote_code);
+        // Local has no .py → local hash = `hook_combined_hash(json, None)`.
+        let local_combined =
+            crate::state::hook_combined_hash(&local_json_with_newline, &None);
+        let classified = vec![ClassifiedItem {
+            kind: "hooks".to_string(),
+            slug: slug.to_string(),
+            class: SyncClass::BothDiverged,
+            local_hash: Some(local_combined),
+            remote_hash: Some(remote_combined),
+            base_hash: Some(base_combined.clone()),
+        }];
+
+        (tmp, paths, lockfile, local_json_path, catalog, classified, base_combined)
+    }
+
+    #[tokio::test]
+    async fn resolve_conflicts_hook_prompts_when_local_has_no_code_remote_does() {
+        let (_tmp, paths, mut lockfile, _json_path, catalog, classified, base_combined) =
+            setup_hook_local_none_remote_code();
+        let client = RossumClient::new(
+            "https://unused.invalid/api/v1".to_string(),
+            "TEST".to_string(),
+        )
+        .unwrap();
+        let progress = ProgressLog::start("test");
+
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &paths,
+                client: &client,
+                lockfile: &mut lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: true,
+            };
+            resolve_conflicts(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b""),
+                true,
+                &progress,
+            )
+            .await
+            .expect("resolver should succeed (Skip on empty stdin)")
+        };
+        progress.finish("");
+
+        assert!(
+            outcome.promoted_to_push.is_empty(),
+            "asymmetric (local none, remote code): resolver MUST NOT silently promote; \
+             promoted = {:?}",
+            outcome.promoted_to_push,
+        );
+
+        let recorded = lockfile
+            .objects
+            .get("hooks")
+            .and_then(|m| m.get("ap-validator"))
+            .and_then(|e| e.content_hash.clone())
+            .expect("lockfile entry must persist");
+        assert_eq!(
+            recorded, base_combined,
+            "lockfile base must remain pinned on Skip (next sync re-prompts); got {recorded}"
+        );
+    }
+
+    /// Schema BothDiverged where the schema JSON canonicalizes equal
+    /// across local and remote but the formula sidecars differ (both
+    /// sides edited the formula). The classifier emits BothDiverged
+    /// because `schema_combined_hash` includes formula bytes. The
+    /// resolver currently dispatches with `HashStrategy::Flat` →
+    /// `prompt_resolve` sees JSON-canonicalize-equal bytes →
+    /// short-circuits → silent KeepLocal promotion. This test pins
+    /// the safety property: NO silent promotion on a BothDiverged
+    /// schema, regardless of whether the divergence is in the JSON
+    /// or in the formulas.
+    fn setup_schema_formula_only_conflict() -> (
+        tempfile::TempDir,
+        Paths,
+        Lockfile,
+        std::path::PathBuf, /* schema.json path */
+        std::path::PathBuf, /* formula path */
+        RemoteCatalog,
+        Vec<ClassifiedItem>,
+        String, /* base_combined */
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        let ws_slug = "ap-invoices";
+        let q_slug = "cost-invoices";
+        let queue_dir = paths.queue_dir(ws_slug, q_slug);
+        std::fs::create_dir_all(queue_dir.join("formulas")).unwrap();
+
+        // Build a schema with one formula datapoint.
+        let schema_id = 200u64;
+        let queue_url = "https://x.invalid/api/v1/queues/100".to_string();
+        let schema_url = "https://x.invalid/api/v1/schemas/200".to_string();
+        let base_schema: crate::model::Schema = serde_json::from_value(serde_json::json!({
+            "id": schema_id,
+            "url": schema_url,
+            "name": "Cost Invoices Schema",
+            "queues": [queue_url.clone()],
+            "content": [{
+                "category": "section",
+                "id": "header",
+                "label": "Header",
+                "children": [
+                    { "category": "datapoint", "id": "invoice_id", "type": "string" },
+                    { "category": "datapoint", "id": "amount_total", "type": "number",
+                      "formula": "amount_due + amount_tax" }
+                ]
+            }],
+            "modified_at": "2026-04-10T09:00:00Z"
+        }))
+        .unwrap();
+
+        // The base on-disk: schema.json + formulas/amount_total.py
+        // post-extraction. Use serialize_schema to derive the exact
+        // bytes the pull driver would have written.
+        let (base_json_bytes, base_formulas) =
+            crate::snapshot::schema::serialize_schema(&base_schema).unwrap();
+        let schema_path = queue_dir.join("schema.json");
+        std::fs::write(&schema_path, &base_json_bytes).unwrap();
+        let formula_path = queue_dir.join("formulas/amount_total.py");
+        std::fs::write(&formula_path, &base_formulas[0].1).unwrap();
+
+        let base_combined =
+            crate::state::schema_combined_hash(&base_json_bytes, &base_formulas);
+        let mut lockfile = Lockfile::default();
+        lockfile.upsert(
+            "schemas",
+            q_slug,
+            ObjectEntry {
+                id: schema_id,
+                url: Some(schema_url.clone()),
+                modified_at: Some("2026-04-10T09:00:00Z".to_string()),
+                content_hash: Some(base_combined.clone()),
+            },
+        );
+
+        // Local edit: change the formula sidecar.
+        std::fs::write(&formula_path, b"amount_due + amount_tax + amount_fee").unwrap();
+
+        // Remote returns the schema with a different formula.
+        let remote_schema: crate::model::Schema = serde_json::from_value(serde_json::json!({
+            "id": schema_id,
+            "url": schema_url,
+            "name": "Cost Invoices Schema",
+            "queues": [queue_url.clone()],
+            "content": [{
+                "category": "section",
+                "id": "header",
+                "label": "Header",
+                "children": [
+                    { "category": "datapoint", "id": "invoice_id", "type": "string" },
+                    { "category": "datapoint", "id": "amount_total", "type": "number",
+                      "formula": "amount_due * 1.21" }
+                ]
+            }],
+            "modified_at": "2026-05-14T10:00:00Z"
+        }))
+        .unwrap();
+        let (remote_json_bytes, remote_formulas) =
+            crate::snapshot::schema::serialize_schema(&remote_schema).unwrap();
+        let remote_combined =
+            crate::state::schema_combined_hash(&remote_json_bytes, &remote_formulas);
+
+        // Construct a queue + workspace + catalog so resolve_conflicts'
+        // schema lookup arm finds the entry.
+        let workspace: crate::model::Workspace = serde_json::from_value(serde_json::json!({
+            "id": 800,
+            "url": "https://x.invalid/api/v1/workspaces/800",
+            "name": "AP Invoices",
+            "organization": "https://x.invalid/api/v1/organizations/1",
+            "queues": [queue_url.clone()],
+            "modified_at": "2026-04-20T08:00:00Z"
+        }))
+        .unwrap();
+        let queue: crate::model::Queue = serde_json::from_value(serde_json::json!({
+            "id": 100,
+            "url": queue_url,
+            "name": "Cost Invoices",
+            "workspace": "https://x.invalid/api/v1/workspaces/800",
+            "schema": schema_url,
+            "modified_at": "2026-04-20T08:00:00Z"
+        }))
+        .unwrap();
+        lockfile.upsert(
+            "workspaces",
+            ws_slug,
+            ObjectEntry {
+                id: 800,
+                url: Some("https://x.invalid/api/v1/workspaces/800".to_string()),
+                modified_at: Some("2026-04-20T08:00:00Z".to_string()),
+                content_hash: None,
+            },
+        );
+        lockfile.upsert(
+            "queues",
+            q_slug,
+            ObjectEntry {
+                id: 100,
+                url: Some(queue.url.clone()),
+                modified_at: Some("2026-04-20T08:00:00Z".to_string()),
+                content_hash: None,
+            },
+        );
+
+        let mut catalog = catalog_with_labels(vec![]);
+        catalog.workspaces = vec![workspace];
+        catalog.queues = vec![queue.clone()];
+        catalog.schemas_by_queue_id.insert(queue.id, remote_schema);
+
+        // Local hash uses scan-side formula bytes.
+        let mut local_formulas = base_formulas.clone();
+        local_formulas[0].1 = b"amount_due + amount_tax + amount_fee".to_vec();
+        let local_combined =
+            crate::state::schema_combined_hash(&base_json_bytes, &local_formulas);
+
+        let classified = vec![ClassifiedItem {
+            kind: "schemas".to_string(),
+            slug: q_slug.to_string(),
+            class: SyncClass::BothDiverged,
+            local_hash: Some(local_combined),
+            remote_hash: Some(remote_combined),
+            base_hash: Some(base_combined.clone()),
+        }];
+
+        (tmp, paths, lockfile, schema_path, formula_path, catalog, classified, base_combined)
+    }
+
+    /// Regression for the schema bug: with formula-only divergence on
+    /// both sides, the resolver must NOT silently promote the schema
+    /// to push. The classifier emits BothDiverged (combined hash
+    /// differs), but the resolver's `prompt_resolve` short-circuit on
+    /// canonicalize-equal JSON sneaks `KeepLocal` past without ever
+    /// reading stdin. This test pins the safety: empty stdin must
+    /// yield Skip (no promotion), and the lockfile base must remain
+    /// pinned.
+    #[tokio::test]
+    async fn resolve_conflicts_schema_prompts_when_only_formula_differs() {
+        let (_tmp, paths, mut lockfile, _schema_path, formula_path, catalog, classified, base_combined) =
+            setup_schema_formula_only_conflict();
+        let client = RossumClient::new(
+            "https://unused.invalid/api/v1".to_string(),
+            "TEST".to_string(),
+        )
+        .unwrap();
+        let progress = ProgressLog::start("test");
+
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &paths,
+                client: &client,
+                lockfile: &mut lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: true,
+            };
+            resolve_conflicts(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b""),
+                true,
+                &progress,
+            )
+            .await
+            .expect("resolver should succeed (Skip on empty stdin)")
+        };
+        progress.finish("");
+
+        assert!(
+            outcome.promoted_to_push.is_empty(),
+            "formula-only schema divergence: resolver MUST NOT silently promote; \
+             promoted = {:?}",
+            outcome.promoted_to_push,
+        );
+
+        // Local formula edit must survive.
+        let formula_after = std::fs::read(&formula_path).unwrap();
+        assert_eq!(
+            formula_after, b"amount_due + amount_tax + amount_fee",
+            "local formula edit must survive"
+        );
+
+        let recorded = lockfile
+            .objects
+            .get("schemas")
+            .and_then(|m| m.get("cost-invoices"))
+            .and_then(|e| e.content_hash.clone())
+            .expect("lockfile entry must persist");
+        assert_eq!(
+            recorded, base_combined,
+            "lockfile base must remain pinned on Skip (next sync re-prompts); got {recorded}"
         );
     }
 }

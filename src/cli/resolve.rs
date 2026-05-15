@@ -144,8 +144,8 @@ pub fn prompt_resolve<R: BufRead, W: Write>(
 /// Color-aware core. Tests pin the mode here; production goes through
 /// `prompt_resolve` which auto-detects.
 pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
-    mut input: R,
-    mut output: W,
+    input: R,
+    output: W,
     index: usize,
     total: usize,
     local_path: &Path,
@@ -154,10 +154,56 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
     mode: ColorMode,
 ) -> Result<Resolution> {
     let local_bytes = read_local(local_path)?;
+    prompt_resolve_with_bytes_and_color(
+        input, output, index, total, local_path, &local_bytes, remote_bytes, env, mode,
+    )
+}
 
+/// Bytes-driven variant of [`prompt_resolve_with_color`]. Used by the
+/// sync executor's conflict resolver when the divergence lives in a
+/// sidecar (`.py`, `formulas/<id>.py`) that may not exist on disk
+/// (asymmetric case where one side has the sidecar and the other
+/// doesn't). Reading from disk would fail; callers compose the
+/// `local_bytes` directly and pass them here.
+///
+/// `local_path` is used only for the prompt header (it appears as
+/// "local") and for the `[e]dit` editor's tempfile extension; it does
+/// NOT need to exist on disk.
+pub fn prompt_resolve_with_bytes<R: BufRead, W: Write>(
+    input: R,
+    output: W,
+    index: usize,
+    total: usize,
+    local_path: &Path,
+    local_bytes: &[u8],
+    remote_bytes: &[u8],
+    env: &str,
+) -> Result<Resolution> {
+    let mode = detect_color_mode(false);
+    prompt_resolve_with_bytes_and_color(
+        input, output, index, total, local_path, local_bytes, remote_bytes, env, mode,
+    )
+}
+
+/// Color-aware bytes-driven core. Shares the prompt + diff +
+/// `[e]dit`/`[h]` plumbing with [`prompt_resolve_with_color`]; the
+/// only difference is that local bytes come from the caller, not
+/// from `local_path`.
+#[allow(clippy::too_many_arguments)]
+pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
+    mut input: R,
+    mut output: W,
+    index: usize,
+    total: usize,
+    local_path: &Path,
+    local_bytes: &[u8],
+    remote_bytes: &[u8],
+    env: &str,
+    mode: ColorMode,
+) -> Result<Resolution> {
     // Strip noise fields before diff display so the user only sees real
     // changes. modified_at server-churn must not appear in the resolver.
-    let local_canonical = crate::snapshot::noise::canonicalize_for_hash(&local_bytes);
+    let local_canonical = crate::snapshot::noise::canonicalize_for_hash(local_bytes);
     let remote_canonical = crate::snapshot::noise::canonicalize_for_hash(remote_bytes);
 
     if local_canonical == remote_canonical {
