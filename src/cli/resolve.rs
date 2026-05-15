@@ -25,11 +25,27 @@
 //! callers fall through to shadow-file (legacy behavior, CI-safe).
 
 use anyhow::{Context, Result};
-use similar::TextDiff;
+use similar::{Algorithm, TextDiff};
 use std::fmt::Write as FmtWrite;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 use std::process::Command;
+
+/// Build a line-level `TextDiff` using the Histogram algorithm.
+///
+/// `similar`'s default Myers (and Patience / Lcs) can emit non-contiguous,
+/// inconsistent `DiffOp` cursors after `Compact` post-processing on pathological
+/// inputs (e.g. long runs of identical blank lines paired with short remotes),
+/// which makes `ops()` unwalkable — the hunk walker drops lines, the unified-diff
+/// renderer can mis-attribute regions, and `iter_all_changes()` fails to
+/// round-trip. Histogram is robust on these cases and is what Git uses by default.
+///
+/// All `TextDiff::from_lines` call sites in this crate should go through this
+/// helper so the resolver UI, hunk walker, and conflict-buffer builder all agree
+/// on the same op sequence.
+pub fn line_diff<'old, 'new>(old: &'old str, new: &'new str) -> TextDiff<'old, 'new, str> {
+    TextDiff::configure().algorithm(Algorithm::Histogram).diff_lines(old, new)
+}
 
 /// Outcome of presenting a single conflict to the user.
 #[derive(Debug)]
@@ -66,7 +82,7 @@ pub fn is_interactive(yes_flag: bool) -> bool {
 pub fn unified_diff(label_a: &str, a: &[u8], label_b: &str, b: &[u8]) -> String {
     let a_str = String::from_utf8_lossy(a);
     let b_str = String::from_utf8_lossy(b);
-    let diff = TextDiff::from_lines(a_str.as_ref(), b_str.as_ref());
+    let diff = line_diff(a_str.as_ref(), b_str.as_ref());
     let mut out = String::new();
     writeln!(out, "--- {label_a}").expect("writing to String never fails");
     writeln!(out, "+++ {label_b}").expect("writing to String never fails");
@@ -255,7 +271,7 @@ fn count_conflict_hunks(local: &[u8], remote: &[u8]) -> usize {
     use similar::DiffTag;
     let local_str = String::from_utf8_lossy(local);
     let remote_str = String::from_utf8_lossy(remote);
-    let diff = TextDiff::from_lines(local_str.as_ref(), remote_str.as_ref());
+    let diff = line_diff(local_str.as_ref(), remote_str.as_ref());
     diff.ops()
         .iter()
         .filter(|op| op.tag() != DiffTag::Equal)
@@ -368,7 +384,7 @@ fn build_conflict_buffer(local: &[u8], remote: &[u8], env: &str) -> Vec<u8> {
 
     let local_str = String::from_utf8_lossy(local);
     let remote_str = String::from_utf8_lossy(remote);
-    let diff = TextDiff::from_lines(local_str.as_ref(), remote_str.as_ref());
+    let diff = line_diff(local_str.as_ref(), remote_str.as_ref());
 
     let mut out = String::new();
     let mut local_chunk: Vec<&str> = Vec::new();
@@ -561,7 +577,7 @@ fn prompt_hunk_by_hunk<R: BufRead, W: Write>(
 
     let local_str = String::from_utf8_lossy(local);
     let remote_str = String::from_utf8_lossy(remote);
-    let diff = TextDiff::from_lines(local_str.as_ref(), remote_str.as_ref());
+    let diff = line_diff(local_str.as_ref(), remote_str.as_ref());
 
     // Index lines by their position in each side so we can slice them
     // out by `old_range()` / `new_range()` from each DiffOp.
@@ -2002,7 +2018,7 @@ mod tests {
         use similar::DiffTag;
         let local_str = String::from_utf8_lossy(local);
         let remote_str = String::from_utf8_lossy(remote);
-        let diff = similar::TextDiff::from_lines(local_str.as_ref(), remote_str.as_ref());
+        let diff = line_diff(local_str.as_ref(), remote_str.as_ref());
         diff.ops()
             .iter()
             .filter(|op| op.tag() != DiffTag::Equal)

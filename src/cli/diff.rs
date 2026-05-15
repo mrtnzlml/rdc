@@ -4,6 +4,7 @@
 //! Both modes produce unified diffs on stdout. No file writes, no PATCHes.
 
 use crate::api::RossumClient;
+use crate::cli::resolve::line_diff;
 use crate::config::ProjectConfig;
 use crate::paths::Paths;
 use crate::secrets::resolve_token;
@@ -14,7 +15,6 @@ use crate::snapshot::queue::read_queue;
 use crate::snapshot::schema::{read_schema, serialize_schema};
 use crate::state::Lockfile;
 use anyhow::{anyhow, Context, Result};
-use similar::TextDiff;
 use std::path::Path;
 
 pub async fn run(left: String, right: Option<String>) -> Result<()> {
@@ -422,7 +422,7 @@ pub fn print_unified(
     if left == right {
         return;
     }
-    let diff = TextDiff::from_lines(left, right);
+    let diff = line_diff(left, right);
     let unified = diff
         .unified_diff()
         .context_radius(3)
