@@ -401,7 +401,7 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
                 if let Err(e) = delete_one(&tgt_client, &mut tgt_lockfile, &tgt_paths, kind, slug).await {
                     warn(progress.as_ref(), format!("warning: failed to delete {kind}/{slug}: {e:#}"));
                 } else {
-                    delete_phase.as_ref().map(|ph| ph.line(format!("✓ {kind}/{slug}")));
+                    delete_phase.as_ref().map(|ph| ph.line(format!("[ok] {kind}/{slug}")));
                 }
                 deletes_done += 1;
                 api_calls += 1;
@@ -428,7 +428,7 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
         }
         println!(
             "\nDry run ({src} -> {tgt}){scope}: {} would be created, {} would be deleted, \
-             {:.1}s — no remote changes made.",
+             {:.1}s; no remote changes made.",
             plan.create_total(),
             plan.delete_total(),
             elapsed.as_secs_f64()
@@ -699,7 +699,7 @@ fn print_plan(
     store_plans: &[crate::cli::deploy::store_extensions::StorePlan],
     selection: Option<&crate::cli::deploy::selection::Selection>,
 ) {
-    let suffix = if dry_run { "  (dry run — no remote changes)" } else { "" };
+    let suffix = if dry_run { "  (dry run; no remote changes)" } else { "" };
     if let Some(sel) = selection {
         println!("Plan: {src} -> {tgt}  (selection: {} objects via --only){suffix}", sel.len());
         println!("  Selected:");
@@ -726,13 +726,13 @@ fn print_plan(
             let hooks_to_create = plan.creates.get("hooks").map(|v| v.len()).unwrap_or(0);
             if hooks_to_create > 0 && hooks_to_create >= n {
                 println!(
-                    "             ↳ {} of the {} hooks are store extensions (POST /hooks/create + PATCH each):",
+                    "             > {} of the {} hooks are store extensions (POST /hooks/create + PATCH each):",
                     n, hooks_to_create
                 );
             } else {
                 let ext_word = if n == 1 { "store extension" } else { "store extensions" };
                 println!(
-                    "             ↳ {} {} will be installed (POST /hooks/create + PATCH each):",
+                    "             > {} {} will be installed (POST /hooks/create + PATCH each):",
                     n, ext_word
                 );
             }
@@ -753,7 +753,7 @@ fn print_plan(
 
     if mirror {
         if plan.delete_total() == 0 {
-            println!("  - delete:  (none — tgt has no extras)");
+            println!("  - delete:  (none; tgt has no extras)");
         } else {
             let parts: Vec<String> = KINDS_IN_DEP_ORDER
                 .iter()

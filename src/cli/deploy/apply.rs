@@ -166,7 +166,7 @@ pub(crate) async fn run(
         let payload_hook: crate::model::Hook = match serde_json::from_value(payload.clone()) {
             Ok(h) => h,
             Err(e) => {
-                warn(&progress, format!("warning: hooks/{src_slug} → {tgt_slug}: payload not a valid Hook ({e:#}); skipping. Did you forget to set tgt overlay for required fields?"));
+                warn(&progress, format!("warn: hooks/{src_slug} -> {tgt_slug}: payload not a valid Hook ({e:#}); skipping. Did you forget to set tgt overlay for required fields?"));
                 skipped += 1;
                 continue;
             }
@@ -220,7 +220,7 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt hooks/{tgt_id} (mapped from src '{src_slug}')"))?;
         }
         applied.hooks += 1;
-        hooks_phase.as_ref().map(|ph| ph.line(format!("✓ hooks/{tgt_slug}")));
+        hooks_phase.as_ref().map(|ph| ph.line(format!("[ok] hooks/{tgt_slug}")));
     }
 
     // Rules ------------------------------------------------------------
@@ -251,7 +251,7 @@ pub(crate) async fn run(
         }
         let payload_rule: crate::model::Rule = match serde_json::from_value(payload) {
             Ok(v) => v,
-            Err(e) => { warn(&progress, format!("warning: rules/{src_slug} → {tgt_slug}: payload not a valid Rule ({e:#}); skipping")); skipped += 1; continue; }
+            Err(e) => { warn(&progress, format!("warn: rules/{src_slug} -> {tgt_slug}: payload not a valid Rule ({e:#}); skipping")); skipped += 1; continue; }
         };
         let (payload_json_full, payload_code) = crate::snapshot::rule::serialize_rule(&payload_rule)?;
 
@@ -303,7 +303,7 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt rules/{tgt_id}"))?;
         }
         applied.rules += 1;
-        rules_phase.as_ref().map(|ph| ph.line(format!("✓ rules/{tgt_slug}")));
+        rules_phase.as_ref().map(|ph| ph.line(format!("[ok] rules/{tgt_slug}")));
     }
 
     // Labels -----------------------------------------------------------
@@ -336,7 +336,7 @@ pub(crate) async fn run(
         }
         let payload_label: crate::model::Label = match serde_json::from_value(payload) {
             Ok(v) => v,
-            Err(e) => { warn(&progress, format!("warning: labels/{src_slug} → {tgt_slug}: payload not a valid Label ({e:#}); skipping")); skipped += 1; continue; }
+            Err(e) => { warn(&progress, format!("warn: labels/{src_slug} -> {tgt_slug}: payload not a valid Label ({e:#}); skipping")); skipped += 1; continue; }
         };
         let mut payload_bytes = serde_json::to_vec_pretty(&payload_label).context("serializing payload label")?;
         payload_bytes.push(b'\n');
@@ -367,7 +367,7 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt labels/{tgt_id}"))?;
         }
         applied.labels += 1;
-        labels_phase.as_ref().map(|ph| ph.line(format!("✓ labels/{tgt_slug}")));
+        labels_phase.as_ref().map(|ph| ph.line(format!("[ok] labels/{tgt_slug}")));
     }
 
     // Queues -----------------------------------------------------------
@@ -385,7 +385,7 @@ pub(crate) async fn run(
         }
         let Some(tgt_id) = lookup_tgt_id_w(&tgt_lockfile, "queues", tgt_slug, &mut skipped, &progress) else { continue };
         let Some(src_queue_dir) = locate_queue_dir(&src_paths, src_slug) else {
-            warn(&progress, format!("warning: cannot locate src queue '{src_slug}' on disk — skipping"));
+            warn(&progress, format!("warn: cannot locate src queue '{src_slug}' on disk; skipping"));
             skipped += 1;
             continue;
         };
@@ -408,7 +408,7 @@ pub(crate) async fn run(
         // server-computed sub-collections (`hooks`, `webhooks`, `rules`,
         // `inbox`, `counts`) that the Rossum API rejects on PATCH.
         if let Err(e) = serde_json::from_value::<crate::model::Queue>(payload.clone()) {
-            warn(&progress, format!("warning: queues/{src_slug} → {tgt_slug}: payload not a valid Queue ({e:#}); skipping"));
+            warn(&progress, format!("warn: queues/{src_slug} -> {tgt_slug}: payload not a valid Queue ({e:#}); skipping"));
             skipped += 1;
             continue;
         }
@@ -443,7 +443,7 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt queues/{tgt_id}"))?;
         }
         applied.queues += 1;
-        queues_phase.as_ref().map(|ph| ph.line(format!("✓ queues/{tgt_slug}")));
+        queues_phase.as_ref().map(|ph| ph.line(format!("[ok] queues/{tgt_slug}")));
     }
 
     // Schemas ----------------------------------------------------------
@@ -460,7 +460,7 @@ pub(crate) async fn run(
         }
         let Some(tgt_id) = lookup_tgt_id_w(&tgt_lockfile, "schemas", tgt_slug, &mut skipped, &progress) else { continue };
         let Some(src_queue_dir) = locate_queue_dir(&src_paths, src_slug) else {
-            warn(&progress, format!("warning: cannot locate src queue '{src_slug}' for schema — skipping"));
+            warn(&progress, format!("warn: cannot locate src queue '{src_slug}' for schema; skipping"));
             skipped += 1;
             continue;
         };
@@ -475,7 +475,7 @@ pub(crate) async fn run(
         }
         let payload_schema: crate::model::Schema = match serde_json::from_value(payload) {
             Ok(s) => s,
-            Err(e) => { warn(&progress, format!("warning: schemas/{src_slug} → {tgt_slug}: payload not a valid Schema ({e:#}); skipping")); skipped += 1; continue; }
+            Err(e) => { warn(&progress, format!("warn: schemas/{src_slug} -> {tgt_slug}: payload not a valid Schema ({e:#}); skipping")); skipped += 1; continue; }
         };
         let (payload_json_full, payload_formulas) =
             crate::snapshot::schema::serialize_schema(&payload_schema)?;
@@ -533,7 +533,7 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt schemas/{tgt_id}"))?;
         }
         applied.schemas += 1;
-        schemas_phase.as_ref().map(|ph| ph.line(format!("✓ schemas/{tgt_slug}")));
+        schemas_phase.as_ref().map(|ph| ph.line(format!("[ok] schemas/{tgt_slug}")));
     }
 
     // Inboxes ----------------------------------------------------------
@@ -550,7 +550,7 @@ pub(crate) async fn run(
         }
         let Some(tgt_id) = lookup_tgt_id_w(&tgt_lockfile, "inboxes", tgt_slug, &mut skipped, &progress) else { continue };
         let Some(src_queue_dir) = locate_queue_dir(&src_paths, src_slug) else {
-            warn(&progress, format!("warning: cannot locate src queue '{src_slug}' for inbox — skipping"));
+            warn(&progress, format!("warn: cannot locate src queue '{src_slug}' for inbox; skipping"));
             skipped += 1;
             continue;
         };
@@ -570,7 +570,7 @@ pub(crate) async fn run(
         }
         let payload_inbox: crate::model::Inbox = match serde_json::from_value(payload) {
             Ok(i) => i,
-            Err(e) => { warn(&progress, format!("warning: inboxes/{src_slug} → {tgt_slug}: payload not a valid Inbox ({e:#}); skipping")); skipped += 1; continue; }
+            Err(e) => { warn(&progress, format!("warn: inboxes/{src_slug} -> {tgt_slug}: payload not a valid Inbox ({e:#}); skipping")); skipped += 1; continue; }
         };
         let mut payload_bytes = serde_json::to_vec_pretty(&payload_inbox).context("serializing payload inbox")?;
         payload_bytes.push(b'\n');
@@ -594,7 +594,7 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt inboxes/{tgt_id}"))?;
         }
         applied.inboxes += 1;
-        inboxes_phase.as_ref().map(|ph| ph.line(format!("✓ inboxes/{tgt_slug}")));
+        inboxes_phase.as_ref().map(|ph| ph.line(format!("[ok] inboxes/{tgt_slug}")));
     }
 
     // Email templates --------------------------------------------------
@@ -631,7 +631,7 @@ pub(crate) async fn run(
         // Value for the PATCH so we can strip `triggers` — which references a
         // non-deployable sub-resource and 400s the API on cross-env send.
         if let Err(e) = serde_json::from_value::<crate::model::EmailTemplate>(payload.clone()) {
-            warn(&progress, format!("warning: email_templates/{src_key} → {tgt_key}: payload not a valid EmailTemplate ({e:#}); skipping"));
+            warn(&progress, format!("warn: email_templates/{src_key} -> {tgt_key}: payload not a valid EmailTemplate ({e:#}); skipping"));
             skipped += 1;
             continue;
         }
@@ -671,7 +671,7 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt email_templates/{tgt_id}"))?;
         }
         applied.email_templates += 1;
-        email_templates_phase.as_ref().map(|ph| ph.line(format!("✓ email_templates/{tgt_key}")));
+        email_templates_phase.as_ref().map(|ph| ph.line(format!("[ok] email_templates/{tgt_key}")));
     }
 
     // Engines ----------------------------------------------------------
@@ -703,7 +703,7 @@ pub(crate) async fn run(
         }
         let payload_engine: crate::model::Engine = match serde_json::from_value(payload) {
             Ok(e) => e,
-            Err(e) => { warn(&progress, format!("warning: engines/{src_slug} → {tgt_slug}: payload not a valid Engine ({e:#}); skipping")); skipped += 1; continue; }
+            Err(e) => { warn(&progress, format!("warn: engines/{src_slug} -> {tgt_slug}: payload not a valid Engine ({e:#}); skipping")); skipped += 1; continue; }
         };
         let mut payload_bytes = serde_json::to_vec_pretty(&payload_engine).context("serializing payload engine")?;
         payload_bytes.push(b'\n');
@@ -728,14 +728,14 @@ pub(crate) async fn run(
         }
         if dry_run {
             applied.engines += 1;
-            engines_phase.as_ref().map(|ph| ph.line(format!("✓ engines/{tgt_slug}")));
+            engines_phase.as_ref().map(|ph| ph.line(format!("[ok] engines/{tgt_slug}")));
         } else {
             match tgt_client.update_engine(tgt_id, &payload_engine, None).await
                 .with_context(|| format!("PATCH tgt engines/{tgt_id}"))
             {
                 Ok(_) => {
                     applied.engines += 1;
-                    engines_phase.as_ref().map(|ph| ph.line(format!("✓ engines/{tgt_slug}")));
+                    engines_phase.as_ref().map(|ph| ph.line(format!("[ok] engines/{tgt_slug}")));
                 }
                 Err(e) if anyhow_has_status(&e, 405) => {
                     warn(&progress, format!("warning: engines are not writable via PATCH on tgt org/plan (405). Skipping all engine apply."));
@@ -782,7 +782,7 @@ pub(crate) async fn run(
         }
         let payload_field: crate::model::EngineField = match serde_json::from_value(payload) {
             Ok(f) => f,
-            Err(e) => { warn(&progress, format!("warning: engine-fields/{src_slug} → {tgt_slug}: payload not a valid EngineField ({e:#}); skipping")); skipped += 1; continue; }
+            Err(e) => { warn(&progress, format!("warn: engine-fields/{src_slug} -> {tgt_slug}: payload not a valid EngineField ({e:#}); skipping")); skipped += 1; continue; }
         };
         let mut payload_bytes = serde_json::to_vec_pretty(&payload_field).context("serializing payload engine field")?;
         payload_bytes.push(b'\n');
@@ -811,14 +811,14 @@ pub(crate) async fn run(
         }
         if dry_run {
             applied.engine_fields += 1;
-            engine_fields_phase.as_ref().map(|ph| ph.line(format!("✓ engine_fields/{tgt_slug}")));
+            engine_fields_phase.as_ref().map(|ph| ph.line(format!("[ok] engine_fields/{tgt_slug}")));
         } else {
             match tgt_client.update_engine_field(tgt_id, &payload_field, None).await
                 .with_context(|| format!("PATCH tgt engine_fields/{tgt_id}"))
             {
                 Ok(_) => {
                     applied.engine_fields += 1;
-                    engine_fields_phase.as_ref().map(|ph| ph.line(format!("✓ engine_fields/{tgt_slug}")));
+                    engine_fields_phase.as_ref().map(|ph| ph.line(format!("[ok] engine_fields/{tgt_slug}")));
                 }
                 Err(e) if anyhow_has_status(&e, 405) => {
                     warn(&progress, format!("warning: engine fields are not writable via PATCH on tgt org/plan (405). Skipping all engine field apply."));
@@ -900,7 +900,7 @@ fn lookup_tgt_id_w(
         Some(id) => Some(id),
         None => {
             warn(progress, format!(
-                "warning: tgt lockfile has no entry for {kind}/{tgt_slug} — skipping (run `rdc sync <tgt>` first)"
+                "warn: tgt lockfile has no entry for {kind}/{tgt_slug}; skipping (run `rdc sync <tgt>` first)"
             ));
             *skipped += 1;
             None

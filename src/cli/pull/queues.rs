@@ -135,7 +135,7 @@ pub async fn process(
                 .with_context(|| format!("parsing schema URL '{}' for queue '{}'", url, q.name))?),
             None => {
                 phase.line(format!(
-                    "⚠️ queue '{}' (id {}) has no schema — skipping schema + inbox",
+                    "! queue '{}' (id {}) has no schema; skipping schema + inbox",
                     q.name, q.id,
                 ));
                 None
@@ -334,7 +334,7 @@ fn write_schema_for_queue(
                     }
                 }
                 phase.line(format!(
-                    "⚠️ {} conflict — local preserved, remote at {} (formulas at {}); lockfile base preserved",
+                    "! {} conflict: local preserved, remote at {} (formulas at {}); lockfile base preserved",
                     schema_path.display(),
                     remote_path.display(),
                     remote_formulas_dir.display(),

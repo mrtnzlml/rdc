@@ -40,7 +40,7 @@ pub async fn run(env: &str, token_arg: Option<String>) -> Result<()> {
             let trimmed = buf.trim().to_string();
             if trimmed.is_empty() {
                 return Err(anyhow!(
-                    "no token provided — pass `--token <value>` or pipe via stdin"
+                    "no token provided; pass `--token <value>` or pipe via stdin"
                 ));
             }
             trimmed
@@ -135,20 +135,20 @@ pub async fn refresh_token_interactively(env: &str) -> Result<()> {
         };
         let trimmed = new_token.trim();
         if trimmed.is_empty() {
-            eprintln!("  empty input — paste the token, or Ctrl+C to abort.");
+            eprintln!("  empty input; paste the token, or Ctrl+C to abort.");
             continue;
         }
         match validate_and_save_token(env_cfg, &secrets_path, trimmed).await {
             Ok(org_name) => {
                 eprintln!(
-                    "✓ Token saved to {} (validated against org '{}'). Retrying…",
+                    "[ok] Token saved to {} (validated against org '{}'). Retrying...",
                     secrets_path.display(),
                     org_name
                 );
                 return Ok(());
             }
             Err(e) if anyhow_has_status(&e, 401) => {
-                eprintln!("  rejected by server (401) — try again, or Ctrl+C to abort.");
+                eprintln!("  rejected by server (401); try again, or Ctrl+C to abort.");
                 continue;
             }
             Err(e) => return Err(e),

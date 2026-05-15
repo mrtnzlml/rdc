@@ -57,18 +57,18 @@ impl PendingRename {
     /// One-line summary for the interactive prompt and `--check` listing.
     pub fn describe(&self) -> String {
         match self {
-            PendingRename::Workspace { old, new } => format!("workspaces/{old} → {new}"),
-            PendingRename::Queue { ws, old, new } => format!("queues/{ws}/{old} → {new}"),
+            PendingRename::Workspace { old, new } => format!("workspaces/{old} -> {new}"),
+            PendingRename::Queue { ws, old, new } => format!("queues/{ws}/{old} -> {new}"),
             PendingRename::EmailTemplate { ws, q, old, new } => {
-                format!("email_templates/{ws}/{q}/{old} → {new}")
+                format!("email_templates/{ws}/{q}/{old} -> {new}")
             }
-            PendingRename::Hook { old, new } => format!("hooks/{old} → {new}"),
-            PendingRename::Rule { old, new } => format!("rules/{old} → {new}"),
-            PendingRename::Label { old, new } => format!("labels/{old} → {new}"),
-            PendingRename::Engine { old, new } => format!("engines/{old} → {new}"),
-            PendingRename::EngineField { old, new } => format!("engine_fields/{old} → {new}"),
-            PendingRename::Workflow { old, new } => format!("workflows/{old} → {new}"),
-            PendingRename::WorkflowStep { old, new } => format!("workflow_steps/{old} → {new}"),
+            PendingRename::Hook { old, new } => format!("hooks/{old} -> {new}"),
+            PendingRename::Rule { old, new } => format!("rules/{old} -> {new}"),
+            PendingRename::Label { old, new } => format!("labels/{old} -> {new}"),
+            PendingRename::Engine { old, new } => format!("engines/{old} -> {new}"),
+            PendingRename::EngineField { old, new } => format!("engine_fields/{old} -> {new}"),
+            PendingRename::Workflow { old, new } => format!("workflows/{old} -> {new}"),
+            PendingRename::WorkflowStep { old, new } => format!("workflow_steps/{old} -> {new}"),
         }
     }
 }
@@ -549,7 +549,7 @@ fn move_file(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     std::fs::rename(from, to)
-        .with_context(|| format!("moving {} → {}", from.display(), to.display()))
+        .with_context(|| format!("moving {} -> {}", from.display(), to.display()))
 }
 
 fn move_optional(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
@@ -564,7 +564,7 @@ fn move_dir(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
         anyhow::bail!("destination {} already exists", to.display());
     }
     std::fs::rename(from, to)
-        .with_context(|| format!("moving {} → {}", from.display(), to.display()))
+        .with_context(|| format!("moving {} -> {}", from.display(), to.display()))
 }
 
 /// Move a slug-keyed entry within a lockfile kind.
@@ -620,7 +620,7 @@ fn collect_orphans(paths: &Paths, kind: &str, old: &str, out: &mut Vec<String>) 
         let Ok(raw) = std::fs::read_to_string(&path) else { continue };
         if raw.contains(&needle) || raw.contains(&dotted) {
             let msg = format!(
-                "  {} references {kind}/{old} — update manually",
+                "  {} references {kind}/{old}; update manually",
                 path.display()
             );
             if seen.insert(msg.clone()) {
@@ -794,11 +794,11 @@ mod tests {
     #[test]
     fn describe_formats_each_kind() {
         let h = PendingRename::Hook { old: "a".into(), new: "b".into() };
-        assert_eq!(h.describe(), "hooks/a → b");
+        assert_eq!(h.describe(), "hooks/a -> b");
         let q = PendingRename::Queue { ws: "ws".into(), old: "a".into(), new: "b".into() };
-        assert_eq!(q.describe(), "queues/ws/a → b");
+        assert_eq!(q.describe(), "queues/ws/a -> b");
         let t = PendingRename::EmailTemplate { ws: "ws".into(), q: "q".into(), old: "t".into(), new: "t2".into() };
-        assert_eq!(t.describe(), "email_templates/ws/q/t → t2");
+        assert_eq!(t.describe(), "email_templates/ws/q/t -> t2");
     }
 
     /// Stage a hook on disk + in a lockfile, with a mismatched name, and

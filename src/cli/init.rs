@@ -72,12 +72,12 @@ pub async fn run(env_specs: Vec<String>) -> Result<()> {
     println!("Next steps:");
     for env in &new_env_names {
         let upper = env.to_uppercase();
-        println!("  • Set the API token for env '{env}':");
+        println!("  - Set the API token for env '{env}':");
         println!("      rdc auth {env} --token <token>     # validates + writes secrets/{env}.secrets.json");
         println!("      # or: export RDC_TOKEN_{upper}=<token>");
     }
     for env in &new_env_names {
-        println!("  • Sync the snapshot:  rdc sync {env}");
+        println!("  - Sync the snapshot:  rdc sync {env}");
     }
     Ok(())
 }
@@ -180,7 +180,7 @@ enum PromptOutcome {
 
 fn finish_or_cancel(specs: Vec<String>) -> Result<Vec<String>> {
     if specs.is_empty() {
-        Err(anyhow!("init cancelled — no environments defined"))
+        Err(anyhow!("init cancelled; no environments defined"))
     } else {
         Ok(specs)
     }

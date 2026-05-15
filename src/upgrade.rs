@@ -190,12 +190,12 @@ pub fn platform_asset_name() -> Result<String> {
         "macos" => "apple-darwin",
         "linux" => "unknown-linux-gnu",
         "windows" => "pc-windows-msvc",
-        other => anyhow::bail!("unsupported OS '{other}' — build from source instead"),
+        other => anyhow::bail!("unsupported OS '{other}'; build from source instead"),
     };
     let arch = match std::env::consts::ARCH {
         "x86_64" => "x86_64",
         "aarch64" => "aarch64",
-        other => anyhow::bail!("unsupported arch '{other}' — build from source instead"),
+        other => anyhow::bail!("unsupported arch '{other}'; build from source instead"),
     };
     if os == "unknown-linux-gnu" && arch == "aarch64" {
         anyhow::bail!("linux aarch64 isn't pre-built; build from source instead");
@@ -346,7 +346,7 @@ pub async fn refresh_cache_if_stale() {
 /// Called once per command, just before the dispatch.
 pub fn emit_nudge_if_available() {
     if let Some(latest) = cached_upgrade_available() {
-        eprintln!("note: rdc v{latest} is available — run `rdc upgrade` to install");
+        eprintln!("note: rdc v{latest} is available; run `rdc upgrade` to install");
     }
 }
 
@@ -362,7 +362,7 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
 
     if check_only {
         if latest > current_v {
-            println!("rdc v{current_v} → v{latest} available");
+            println!("rdc v{current_v} -> v{latest} available");
         } else if latest == current_v {
             println!("rdc v{current_v} is the latest");
         } else {
@@ -424,7 +424,7 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
     let asset_name = platform_asset_name()?;
     let url = asset_download_url(&latest, &asset_name);
 
-    println!("downloading rdc v{latest} ({asset_name})…");
+    println!("downloading rdc v{latest} ({asset_name})...");
     let bytes = http_client(UPGRADE_TIMEOUT)?
         .get(&url)
         .send()
@@ -564,7 +564,7 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
             let _ = std::fs::remove_file(&staging_path);
             return Err(anyhow::Error::new(e)).with_context(|| {
                 format!(
-                    "renaming current binary {} → {} (no changes applied)",
+                    "renaming current binary {} -> {} (no changes applied)",
                     target_path.display(),
                     backup_path.display()
                 )
@@ -591,7 +591,7 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
     });
 
     println!(
-        "upgraded rdc v{current_v} → v{latest}\nprevious binary at {} (delete when ready)",
+        "upgraded rdc v{current_v} -> v{latest}\nprevious binary at {} (delete when ready)",
         backup_path.display()
     );
     Ok(())

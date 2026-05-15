@@ -118,7 +118,7 @@ pub async fn create_workspace(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()>
         },
     );
     ctx.mapping.workspaces.insert(slug.to_string(), slug.to_string());
-    ctx.progress.as_ref().map(|p| p.println(format!("✓ created/updated slug: {}", slug)));
+    ctx.progress.as_ref().map(|p| p.println(format!("[ok] created/updated slug: {}", slug)));
     Ok(())
 }
 
@@ -162,7 +162,7 @@ pub async fn create_schema(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<
         },
     );
     ctx.mapping.schemas.insert(queue_slug.to_string(), queue_slug.to_string());
-    ctx.progress.as_ref().map(|p| p.println(format!("✓ created/updated queue_slug: {}", queue_slug)));
+    ctx.progress.as_ref().map(|p| p.println(format!("[ok] created/updated queue_slug: {}", queue_slug)));
     Ok(())
 }
 
@@ -206,7 +206,7 @@ pub async fn create_queue(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
         },
     );
     ctx.mapping.queues.insert(queue_slug.to_string(), queue_slug.to_string());
-    ctx.progress.as_ref().map(|p| p.println(format!("✓ created/updated queue_slug: {}", queue_slug)));
+    ctx.progress.as_ref().map(|p| p.println(format!("[ok] created/updated queue_slug: {}", queue_slug)));
 
     // Rossum auto-creates 5 default email templates per new queue. Capture
     // them now so the later email-templates phase sees them as existing
@@ -293,7 +293,7 @@ pub async fn create_inbox(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
         },
     );
     ctx.mapping.inboxes.insert(queue_slug.to_string(), queue_slug.to_string());
-    ctx.progress.as_ref().map(|p| p.println(format!("✓ created/updated queue_slug: {}", queue_slug)));
+    ctx.progress.as_ref().map(|p| p.println(format!("[ok] created/updated queue_slug: {}", queue_slug)));
     Ok(())
 }
 
@@ -416,7 +416,7 @@ pub async fn create_hook(
         },
     );
     ctx.mapping.hooks.insert(slug.to_string(), slug.to_string());
-    ctx.progress.as_ref().map(|p| p.println(format!("✓ created/updated slug: {}", slug)));
+    ctx.progress.as_ref().map(|p| p.println(format!("[ok] created/updated slug: {}", slug)));
     Ok(())
 }
 
@@ -447,7 +447,7 @@ pub async fn create_rule(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
         },
     );
     ctx.mapping.rules.insert(slug.to_string(), slug.to_string());
-    ctx.progress.as_ref().map(|p| p.println(format!("✓ created/updated slug: {}", slug)));
+    ctx.progress.as_ref().map(|p| p.println(format!("[ok] created/updated slug: {}", slug)));
     Ok(())
 }
 
@@ -482,7 +482,7 @@ pub async fn create_label(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
         },
     );
     ctx.mapping.labels.insert(slug.to_string(), slug.to_string());
-    ctx.progress.as_ref().map(|p| p.println(format!("✓ created/updated slug: {}", slug)));
+    ctx.progress.as_ref().map(|p| p.println(format!("[ok] created/updated slug: {}", slug)));
     Ok(())
 }
 

@@ -65,7 +65,7 @@ pub async fn push(
                     content_hash: Some(created_hash),
                 },
             );
-            sp.finish_ok(format!("→ POST (id {})", created.id));
+            sp.finish_ok(format!("POST (id {})", created.id));
             pushed += 1;
             continue;
         }
@@ -172,7 +172,7 @@ pub async fn push(
                 content_hash: Some(updated_hash),
             },
         );
-        sp.finish_ok("→ PATCH");
+        sp.finish_ok("PATCH");
         pushed += 1;
     }
 

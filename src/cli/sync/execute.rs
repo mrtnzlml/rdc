@@ -556,7 +556,7 @@ fn resolve_one_conflict<R: BufRead>(
         let conflict_path = crate::paths::shadow_path_for(&local_path, env);
         write_atomic(&conflict_path, &remote_bytes)?;
         progress.println(format!(
-            "warning: {} conflict — local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
+            "warn: {} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
             local_path.display(),
             conflict_path.display(),
         ));
@@ -704,7 +704,7 @@ fn resolve_one_conflict<R: BufRead>(
             }
             write_atomic(&local_path, &edited)?;
             progress.println(format!(
-                "warning: {} partially resolved (markers retained); lockfile base preserved — re-run to resolve",
+                "warn: {} partially resolved (markers retained); lockfile base preserved; re-run to resolve",
                 local_path.display(),
             ));
             let preserved_hash = match it.base_hash.as_deref() {
@@ -729,7 +729,7 @@ fn resolve_one_conflict<R: BufRead>(
             let conflict_path = crate::paths::shadow_path_for(&local_path, env);
             write_atomic(&conflict_path, &remote_bytes)?;
             progress.println(format!(
-                "warning: {} conflict — local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
+                "warn: {} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
                 local_path.display(),
                 conflict_path.display(),
             ));
@@ -1369,7 +1369,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                         let marker = deleted_marker_path(&local_path, &env);
                         write_atomic(&marker, b"")?;
                         progress.println(format!(
-                            "warning: {} — env deletion deferred (non-tty); marker at {}",
+                            "warn: {}: env deletion deferred (non-tty); marker at {}",
                             local_path.display(),
                             marker.display(),
                         ));
@@ -1383,7 +1383,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     // state but the file isn't there. Defensive — emit
                     // a warning and move on rather than panic.
                     progress.println(format!(
-                        "warning: {} — local file missing, cannot prompt; skipping",
+                        "warn: {}: local file missing, cannot prompt; skipping",
                         local_path.display(),
                     ));
                     continue;
@@ -1422,7 +1422,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                                 format!("removing {}", local_path.display())
                             })?;
                             progress.println(format!(
-                                "note: {} — committing the local tombstone needs an \
+                                "note: {}: committing the local tombstone needs an \
                                  explicit `rdc push --allow-deletes {}` follow-up; \
                                  the lockfile entry was retained so the deletion isn't lost",
                                 local_path.display(),
@@ -1509,7 +1509,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                         let marker = deleted_marker_path(&local_path, &env);
                         write_atomic(&marker, b"")?;
                         progress.println(format!(
-                            "warning: {} — env deletion deferred; marker at {}",
+                            "warn: {}: env deletion deferred; marker at {}",
                             local_path.display(),
                             marker.display(),
                         ));

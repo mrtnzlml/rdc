@@ -126,32 +126,32 @@ Preview what would change:
 
 ```sh
 $ rdc sync test --dry-run
-→ rdc sync test (dry run)
+rdc sync test (dry run)
 
 would push
-  ⊙ hooks/validator-invoices → PATCH
+  - hooks/validator-invoices PATCH
 
-✔ Dry run: 1 would push, 0 would pull, 0 would prompt (no writes)
+DONE: Dry run: 1 would push, 0 would pull, 0 would prompt (no writes)
 ```
 
 Send the edit to test:
 
 ```sh
 $ rdc sync test
-✓ sync envs/test: 1 patched, 0.6s
+[ok] sync envs/test: 1 patched, 0.6s
 ```
 
 Promote everything that's diverged from prod into prod:
 
 ```sh
 $ rdc deploy test prod
-Plan: test → prod
+Plan: test -> prod
   + create:  (none)
   ~ update:  field-level deltas
 
 Proceed? [y/N] y
 Applied 1 hooks (1 PATCHes) from test to prod
-Deployed test → prod: 0 created, 0 deleted, 2 API calls, 1.4s
+Deployed test -> prod: 0 created, 0 deleted, 2 API calls, 1.4s
 ```
 
 Re-running yields `0 PATCHes`. The whole environment is now in sync.
@@ -278,22 +278,22 @@ Removing the local file (and committing that removal to your repo) is the declar
 ```sh
 $ rm envs/test/labels/audit-hold.json
 $ rdc sync test --dry-run
-→ rdc sync test (dry run)
+rdc sync test (dry run)
 
 would push
-  ⊙ labels/audit-hold → DELETE
+  - labels/audit-hold DELETE
 
-✔ Dry run: 1 would push, 0 would pull, 0 would prompt (no writes)
+DONE: Dry run: 1 would push, 0 would pull, 0 would prompt (no writes)
 
 $ rdc sync test
-✓ sync envs/test: 261 files scanned, 0 changed, 1 to delete
+[ok] sync envs/test: 261 files scanned, 0 changed, 1 to delete
 
-⚠️  The following 1 object(s) would be DELETED from the remote:
+! The following 1 object(s) would be DELETED from the remote:
   - labels/audit-hold (id 10198)
 
 Proceed with deletion? [y/N] y
   - labels/audit-hold: deleted
-✓ deletes: 1 removed, 0 skipped
+[ok] deletes: 1 removed, 0 skipped
 ```
 
 The destructive section needs **two intentional acts** — `--yes` does not bypass:
@@ -332,9 +332,9 @@ $ rdc sync --watch test
 watching envs/test/ ...
 polling test every 60s ...
 
-[14:02:17] → cycle: pushed 1, pulled 0, conflicts 0, deletes 0 (0.6s)
-[14:05:41] ← cycle: pushed 0, pulled 1, conflicts 0, deletes 0 (0.4s)
-[14:09:03] hooks/finance-totals — conflict
+[14:02:17] push cycle: pushed 1, pulled 0, conflicts 0, deletes 0 (0.6s)
+[14:05:41] pull cycle: pushed 0, pulled 1, conflicts 0, deletes 0 (0.4s)
+[14:09:03] hooks/finance-totals -- conflict
   local has changes:
     - threshold: 0.85
     + threshold: 0.95
@@ -342,7 +342,7 @@ polling test every 60s ...
     - threshold: 0.85
     + threshold: 0.80
   [k] keep local  [r] use test  [e] edit  [s] skip  [a] abort > k
-[14:09:21] → cycle: pushed 1, pulled 0, conflicts 1, deletes 0 (0.4s)
+[14:09:21] push cycle: pushed 1, pulled 0, conflicts 1, deletes 0 (0.4s)
 ```
 
 Ctrl-C stops the watch. The daemon stays foreground — it doesn't fork; close the terminal tab to stop it. `--no-poll` disables remote polling (file events only). `--poll-interval 30s` tunes the cadence.

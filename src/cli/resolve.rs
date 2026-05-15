@@ -177,11 +177,11 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
     writeln!(output)?;
     let header = if hunk_count >= 2 {
         format!(
-            "[{index}/{total}]  {} — conflict ({hunk_count} hunks)",
+            "[{index}/{total}]  {} -- conflict ({hunk_count} hunks)",
             local_path.display()
         )
     } else {
-        format!("[{index}/{total}]  {} — conflict", local_path.display())
+        format!("[{index}/{total}]  {} -- conflict", local_path.display())
     };
     writeln!(output, "{}", colorize_header(&header, mode))?;
     writeln!(output)?;
@@ -252,9 +252,9 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
             }
             _ => {
                 let hint = if hunk_count >= 2 {
-                    "  (unrecognized — pick one of k/r/e/h/s/a)"
+                    "  (unrecognized; pick one of k/r/e/h/s/a)"
                 } else {
-                    "  (unrecognized — pick one of k/r/e/s/a)"
+                    "  (unrecognized; pick one of k/r/e/s/a)"
                 };
                 writeln!(output, "{hint}")?;
                 continue;
@@ -310,7 +310,7 @@ pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
     let preview = prettify_json_for_diff(&local_bytes);
 
     writeln!(output)?;
-    let header = format!("{} — deleted on {env}", local_path.display());
+    let header = format!("{} -- deleted on {env}", local_path.display());
     writeln!(output, "{}", colorize_header(&header, mode))?;
     writeln!(output)?;
     writeln!(output, "local has the file:")?;
@@ -328,7 +328,7 @@ pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
         for ln in &lines[..limit] {
             writeln!(output, "  {ln}")?;
         }
-        writeln!(output, "  … ({} more lines)", lines.len() - limit)?;
+        writeln!(output, "  ... ({} more lines)", lines.len() - limit)?;
     }
     writeln!(output)?;
     writeln!(output, "{env} has it deleted.")?;
@@ -353,7 +353,7 @@ pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
             Some('s') | Some('S') => return Ok(Resolution::Skip),
             Some('a') | Some('A') => return Ok(Resolution::Abort),
             _ => {
-                writeln!(output, "  (unrecognized — pick one of k/r/s/a)")?;
+                writeln!(output, "  (unrecognized; pick one of k/r/s/a)")?;
                 continue;
             }
         }
@@ -496,7 +496,7 @@ fn run_editor_loop<R: BufRead, W: Write>(
                 Ok(()) => return Ok(EditOutcome::Edited(edited)),
                 Err(reason) => {
                     writeln!(output)?;
-                    writeln!(output, "  ✗ {reason}")?;
+                    writeln!(output, "  [fail] {reason}")?;
                     write!(
                         output,
                         "{}",
@@ -532,7 +532,7 @@ fn validate_edited(bytes: &[u8], local_path: &Path) -> std::result::Result<(), S
     for marker in ["<<<<<<<", "=======", ">>>>>>>"] {
         if s.lines().any(|l| l.trim_start().starts_with(marker)) {
             return Err(format!(
-                "edited file still has the `{marker}` conflict marker — \
+                "edited file still has the `{marker}` conflict marker; \
                  remove the markers and one of the two sides, then save"
             ));
         }
@@ -541,7 +541,7 @@ fn validate_edited(bytes: &[u8], local_path: &Path) -> std::result::Result<(), S
         && let Err(e) = serde_json::from_str::<serde_json::Value>(s)
     {
         return Err(format!(
-            "edited file is not valid JSON ({e}) — fix the syntax and save"
+            "edited file is not valid JSON ({e}); fix the syntax and save"
         ));
     }
     Ok(())
@@ -770,7 +770,7 @@ fn prompt_single_hunk<R: BufRead, W: Write>(
                 }
             }
             _ => {
-                writeln!(output, "  (unrecognized — pick one of k/r/e/b/s/a)")?;
+                writeln!(output, "  (unrecognized; pick one of k/r/e/b/s/a)")?;
                 continue;
             }
         }
@@ -834,7 +834,7 @@ fn run_single_hunk_editor<R: BufRead, W: Write>(
                 Ok(()) => return Ok(Some(edited)),
                 Err(reason) => {
                     writeln!(output)?;
-                    writeln!(output, "  ✗ {reason}")?;
+                    writeln!(output, "  [fail] {reason}")?;
                     write!(
                         output,
                         "{}",
@@ -869,7 +869,7 @@ fn validate_edited_markers_only(bytes: &[u8]) -> std::result::Result<(), String>
     for marker in ["<<<<<<<", "=======", ">>>>>>>"] {
         if s.lines().any(|l| l.trim_start().starts_with(marker)) {
             return Err(format!(
-                "edited hunk still has the `{marker}` conflict marker — \
+                "edited hunk still has the `{marker}` conflict marker; \
                  remove the markers and one of the two sides, then save"
             ));
         }
@@ -954,7 +954,7 @@ pub fn resolve_combined_file(
         let conflict_path = crate::paths::shadow_path_for(local_path, env);
         write_atomic(&conflict_path, remote_bytes)?;
         eprintln!(
-            "warning: {} conflict — local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
+            "warn: {} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
             local_path.display(),
             conflict_path.display()
         );
@@ -1015,7 +1015,7 @@ pub fn resolve_combined_file(
             let conflict_path = crate::paths::shadow_path_for(local_path, env);
             write_atomic(&conflict_path, remote_bytes)?;
             eprintln!(
-                "warning: {} conflict — local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
+                "warn: {} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
                 local_path.display(),
                 conflict_path.display()
             );

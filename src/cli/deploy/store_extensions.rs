@@ -197,7 +197,7 @@ pub fn find_orphan<'a>(hooks: &'a [Hook], name: &str, template_url: &str) -> Opt
 pub fn check_store_extension_anomaly(hook: &Hook, slug: &str) -> Result<()> {
     if hook.is_store_extension() && hook.hook_template().is_none() {
         return Err(anyhow!(
-            "hooks/{slug}.json: marked as store extension (extension_source = rossum_store) but missing hook_template URL — refusing to push"
+            "hooks/{slug}.json: marked as store extension (extension_source = rossum_store) but missing hook_template URL; refusing to push"
         ));
     }
     Ok(())
@@ -234,7 +234,7 @@ pub fn build_template_url_map(
     for src_url in needed_src_urls {
         let src = src_templates.iter().find(|t| t.url == *src_url)
             .ok_or_else(|| anyhow!(
-                "internal: needed src template '{src_url}' not present in src template listing — pull the src env first"
+                "internal: needed src template '{src_url}' not present in src template listing; pull the src env first"
             ))?;
         let key = (src.name.as_str(), src.template_type.as_str(), src.extension_source.as_str());
         let matches: Vec<&HookTemplate> = tgt_templates.iter()

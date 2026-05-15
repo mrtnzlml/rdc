@@ -1,7 +1,13 @@
-//! Per-run UX during pull/push/deploy/sync — colored event log with
+//! Per-run UX during pull/push/deploy/sync: colored event log with
 //! per-line spinners while individual operations are in flight.
 //!
 //! Spec: docs/superpowers/specs/2026-05-15-progress-log-design.md
+//!
+//! Every line is routed through `MultiProgress::println` (TTY mode) so
+//! warnings, info notes, and phase headers cleanly suspend any active
+//! spinner, print above it, and let it resume. In non-TTY mode lines
+//! fall through to plain `eprintln!`. All glyphs are ASCII to keep
+//! column widths predictable across terminals.
 
 use std::io::IsTerminal;
 use std::sync::{Arc, Mutex};
@@ -38,16 +44,21 @@ struct LogInner {
 
 impl ProgressLog {
     /// Print the header line and return the handle.
-    /// `title` shows as the first line (`→ rdc sync test`).
+    /// `title` shows as the first line.
     pub fn start(title: impl Into<String>) -> Arc<Self> {
         let title: String = title.into();
         let tty = std::io::stderr().is_terminal();
         let color = crate::cli::resolve::detect_color_mode(false);
         let mp = indicatif::MultiProgress::new();
-        // Header line goes through `eprintln!` (not the MP) because there's
-        // no in-flight item to animate — it's a stable line at the top.
-        let header = format!("→ {title}");
-        eprintln!("{}", crate::cli::resolve::colorize_header(&header, color));
+        let styled = crate::cli::resolve::colorize_header(&title, color);
+        // Header line: no spinners are active yet, but route through
+        // `mp.println` anyway so behaviour is uniform with subsequent
+        // lines. In non-TTY mode `mp.println` falls through to stderr.
+        if tty {
+            let _ = mp.println(&styled);
+        } else {
+            eprintln!("{styled}");
+        }
         Arc::new(Self {
             inner: Mutex::new(LogInner {
                 title,
@@ -68,13 +79,24 @@ impl ProgressLog {
         let label: String = label.into();
         {
             let mut inner = self.inner.lock().unwrap();
-            // Blank line before each subsequent phase.
+            let styled = crate::cli::resolve::colorize_header(&label, inner.color);
+            // Blank line before each subsequent phase. Route both the
+            // blank line and the header through `mp.println` so any
+            // in-flight spinner (from a prior phase that didn't fully
+            // resolve before re-entering) is properly suspended.
             if inner.current_phase.is_some() {
-                eprintln!();
+                if inner.tty {
+                    let _ = inner.mp.println("");
+                } else {
+                    eprintln!();
+                }
+            }
+            if inner.tty {
+                let _ = inner.mp.println(&styled);
+            } else {
+                eprintln!("{styled}");
             }
             inner.current_phase = Some(label.clone());
-            let styled = crate::cli::resolve::colorize_header(&label, inner.color);
-            eprintln!("{styled}");
         }
         Phase {
             log: self.clone(),
@@ -83,7 +105,7 @@ impl ProgressLog {
     }
 
     /// Print a free-standing line that doesn't fit the spinner shape.
-    /// Used by HTTP retry warnings from the API layer — the message needs
+    /// Used by HTTP retry warnings from the API layer: the message needs
     /// to appear without corrupting any in-flight spinner draw. In TTY
     /// mode this goes through `MultiProgress::println` which redraws
     /// cleanly above the bars; otherwise it falls through to `eprintln!`.
@@ -97,7 +119,7 @@ impl ProgressLog {
         }
     }
 
-    /// Final summary line on success. Idempotent — calling twice is a no-op.
+    /// Final summary line on success. Idempotent: calling twice is a no-op.
     pub fn finish(self: &Arc<Self>, summary: impl Into<String>) {
         let summary: String = summary.into();
         let mut inner = self.inner.lock().unwrap();
@@ -105,13 +127,21 @@ impl ProgressLog {
             return;
         }
         inner.finished = true;
+        let line = format!("DONE: {summary}");
+        let styled = crate::cli::resolve::colorize_final_ok(&line, inner.color);
         // Blank line before the final line if any phase was emitted.
         if inner.current_phase.is_some() {
-            eprintln!();
+            if inner.tty {
+                let _ = inner.mp.println("");
+            } else {
+                eprintln!();
+            }
         }
-        let line = format!("✔ {summary}");
-        let styled = crate::cli::resolve::colorize_final_ok(&line, inner.color);
-        eprintln!("{styled}");
+        if inner.tty {
+            let _ = inner.mp.println(&styled);
+        } else {
+            eprintln!("{styled}");
+        }
     }
 
     /// Final summary line on error. Idempotent.
@@ -122,12 +152,20 @@ impl ProgressLog {
             return;
         }
         inner.finished = true;
-        if inner.current_phase.is_some() {
-            eprintln!();
-        }
-        let line = format!("✗ {msg}");
+        let line = format!("FAIL: {msg}");
         let styled = crate::cli::resolve::colorize_error(&line, inner.color);
-        eprintln!("{styled}");
+        if inner.current_phase.is_some() {
+            if inner.tty {
+                let _ = inner.mp.println("");
+            } else {
+                eprintln!();
+            }
+        }
+        if inner.tty {
+            let _ = inner.mp.println(&styled);
+        } else {
+            eprintln!("{styled}");
+        }
     }
 }
 
@@ -153,9 +191,9 @@ impl Phase {
             bar.set_style(
                 ProgressStyle::with_template("  {spinner} {msg}")
                     .unwrap()
-                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+                    .tick_strings(&["|", "/", "-", "\\"]),
             );
-            bar.enable_steady_tick(std::time::Duration::from_millis(80));
+            bar.enable_steady_tick(std::time::Duration::from_millis(120));
             bar.set_message(name.clone());
             bar
         } else {
@@ -175,11 +213,18 @@ impl Phase {
 
     /// One-shot summary line without a spinner. Used for steps where the
     /// work is so fast a spinner would flicker (`scanning local`,
-    /// `classifying`). Renders as `  <content>`.
+    /// `classifying`). Renders as `  <content>` and routes through
+    /// `MultiProgress::println` so any active spinner is suspended for
+    /// the duration of the write.
     pub fn line(&self, content: impl Into<String>) {
         let content: String = content.into();
-        let _inner = self.log.inner.lock().unwrap();
-        eprintln!("  {content}");
+        let inner = self.log.inner.lock().unwrap();
+        let line = format!("  {content}");
+        if inner.tty {
+            let _ = inner.mp.println(&line);
+        } else {
+            eprintln!("{line}");
+        }
     }
 }
 
@@ -201,13 +246,13 @@ impl Spinner {
         self.bar.set_message(msg.into());
     }
 
-    /// Resolve with a ✓ and optional summary.
+    /// Resolve with an `[ok]` and optional summary.
     pub fn finish_ok(mut self, summary: impl Into<String>) {
         if self.resolved { return; }
         self.resolved = true;
         let summary: String = summary.into();
         let elapsed = self.started.elapsed();
-        let line = format_final_line("✓", &self.name, &summary, elapsed, self.color);
+        let line = format_final_line("[ok]", &self.name, &summary, elapsed, self.color);
         if self.tty {
             self.bar.finish_with_message(line);
         } else {
@@ -215,13 +260,13 @@ impl Spinner {
         }
     }
 
-    /// Resolve with a ⚠️ and one-line warning.
+    /// Resolve with a `!` warning marker and one-line warning text.
     pub fn finish_warn(mut self, msg: impl Into<String>) {
         if self.resolved { return; }
         self.resolved = true;
         let msg: String = msg.into();
         let elapsed = self.started.elapsed();
-        let line = format_final_line("⚠\u{FE0F}", &self.name, &msg, elapsed, self.color);
+        let line = format_final_line("!", &self.name, &msg, elapsed, self.color);
         if self.tty {
             self.bar.finish_with_message(line);
         } else {
@@ -229,14 +274,14 @@ impl Spinner {
         }
     }
 
-    /// Resolve with a ✗ and one-line error.
+    /// Resolve with a `[fail]` marker and one-line error.
     #[allow(dead_code)]
     pub fn finish_err(mut self, msg: impl Into<String>) {
         if self.resolved { return; }
         self.resolved = true;
         let msg: String = msg.into();
         let elapsed = self.started.elapsed();
-        let line = format_final_line("✗", &self.name, &msg, elapsed, self.color);
+        let line = format_final_line("[fail]", &self.name, &msg, elapsed, self.color);
         if self.tty {
             self.bar.finish_with_message(line);
         } else {
@@ -251,7 +296,7 @@ impl Drop for Spinner {
             return;
         }
         self.resolved = true;
-        let line = format!("⊘ {} (cancelled)", self.name);
+        let line = format!("(cancelled) {}", self.name);
         if self.tty {
             self.bar.finish_with_message(line);
         } else {
@@ -263,26 +308,26 @@ impl Drop for Spinner {
 /// Build one resolved line. Public so tests can poke at it without
 /// constructing a full Spinner.
 fn format_final_line(
-    glyph: &str,
+    marker: &str,
     name: &str,
     summary: &str,
     elapsed: std::time::Duration,
     color: crate::cli::resolve::ColorMode,
 ) -> String {
     let body = if summary.is_empty() {
-        format!("{glyph} {name}")
+        format!("{marker} {name}")
     } else {
-        format!("{glyph} {name} {summary}")
+        format!("{marker} {name} {summary}")
     };
     let body = if elapsed > std::time::Duration::from_millis(200) {
         format!("{body} ({:.1}s)", elapsed.as_secs_f32())
     } else {
         body
     };
-    match glyph {
-        "✓" => crate::cli::resolve::colorize_success(&body, color),
-        "⚠\u{FE0F}" => crate::cli::resolve::colorize_warning(&body, color),
-        "✗" => crate::cli::resolve::colorize_error(&body, color),
+    match marker {
+        "[ok]" => crate::cli::resolve::colorize_success(&body, color),
+        "!" => crate::cli::resolve::colorize_warning(&body, color),
+        "[fail]" => crate::cli::resolve::colorize_error(&body, color),
         _ => body,
     }
 }
@@ -295,19 +340,19 @@ mod log_tests {
 
     #[test]
     fn format_final_line_short_op_omits_elapsed() {
-        let line = format_final_line("✓", "workspaces", "4", Duration::from_millis(40), ColorMode::Plain);
-        assert_eq!(line, "✓ workspaces 4");
+        let line = format_final_line("[ok]", "workspaces", "4", Duration::from_millis(40), ColorMode::Plain);
+        assert_eq!(line, "[ok] workspaces 4");
     }
 
     #[test]
     fn format_final_line_long_op_includes_elapsed() {
-        let line = format_final_line("✓", "schemas", "24", Duration::from_millis(1400), ColorMode::Plain);
-        assert_eq!(line, "✓ schemas 24 (1.4s)");
+        let line = format_final_line("[ok]", "schemas", "24", Duration::from_millis(1400), ColorMode::Plain);
+        assert_eq!(line, "[ok] schemas 24 (1.4s)");
     }
 
     #[test]
-    fn format_final_line_empty_summary_just_glyph_and_name() {
-        let line = format_final_line("⚠\u{FE0F}", "hooks/x", "", Duration::from_millis(50), ColorMode::Plain);
-        assert_eq!(line, "⚠\u{FE0F} hooks/x");
+    fn format_final_line_empty_summary_just_marker_and_name() {
+        let line = format_final_line("!", "hooks/x", "", Duration::from_millis(50), ColorMode::Plain);
+        assert_eq!(line, "! hooks/x");
     }
 }

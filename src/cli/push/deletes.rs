@@ -80,7 +80,7 @@ pub fn confirm_or_refuse(
 ) -> Result<ConfirmOutcome> {
     let n = tombstones.total();
     eprintln!();
-    eprintln!("⚠️  The following {n} object(s) would be DELETED from the remote:");
+    eprintln!("! The following {n} object(s) would be DELETED from the remote:");
     print_tombstone_list(tombstones);
     eprintln!();
 
@@ -237,7 +237,7 @@ async fn delete_one(
             }
             DeleteDriftChoice::Restore => {
                 eprintln!(
-                    "  - {kind}/{slug}: drift detected; restore is not automated yet — \
+                    "  - {kind}/{slug}: drift detected; restore is not automated yet; \
                      run `rdc sync <env>` to refresh the local file, then re-edit if needed."
                 );
                 return Ok(DeleteOutcome::Skipped);

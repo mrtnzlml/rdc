@@ -164,7 +164,7 @@ pub(crate) async fn run_cycle(
                 } else {
                     ""
                 };
-                phase.line(format!("⊙ {}/{}{}", it.kind, it.slug, note));
+                phase.line(format!("- {}/{}{}", it.kind, it.slug, note));
             }
         }
 
@@ -187,7 +187,7 @@ pub(crate) async fn run_cycle(
                     SyncClass::LocalDelete => "DELETE",
                     _ => "",
                 };
-                phase.line(format!("⊙ {}/{} → {}", it.kind, it.slug, action));
+                phase.line(format!("- {}/{} {}", it.kind, it.slug, action));
             }
         }
 
@@ -214,7 +214,7 @@ pub(crate) async fn run_cycle(
                     SyncClass::RemoteDelete => "deleted on env",
                     _ => "",
                 };
-                phase.line(format!("⊙ {}/{} — {}", it.kind, it.slug, tag));
+                phase.line(format!("- {}/{} -- {}", it.kind, it.slug, tag));
             }
         }
 

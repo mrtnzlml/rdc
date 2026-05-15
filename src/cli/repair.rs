@@ -76,7 +76,7 @@ async fn rebuild_lock_run(env: &str) -> Result<()> {
         eprintln!("Backed up existing lockfile to {}", backup.display());
         eprintln!("Note: rdc sync will now overwrite local snapshot files with remote contents.");
     } else {
-        eprintln!("No existing lockfile at {} — proceeding with fresh sync.", lockfile_path.display());
+        eprintln!("No existing lockfile at {}; proceeding with fresh sync.", lockfile_path.display());
     }
 
     // Repair is non-interactive: with no merge base every kind's

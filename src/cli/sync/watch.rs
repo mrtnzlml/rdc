@@ -199,11 +199,11 @@ fn print_cycle_summary(
     }
     let now = now_hhmmss();
     let dir = if outcome.items_pulled > 0 && outcome.items_pushed == 0 {
-        "\u{2190}" // ←
+        "pull"
     } else if outcome.items_pushed > 0 && outcome.items_pulled == 0 {
-        "\u{2192}" // →
+        "push"
     } else {
-        "\u{2194}" // ↔
+        "sync"
     };
     if total == 0 {
         eprintln!("[{now}] (idle)");
