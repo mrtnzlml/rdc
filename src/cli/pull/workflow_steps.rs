@@ -1,13 +1,13 @@
 use super::common::{apply_pull_action, decide_pull_action, record_object, skip_on_permission_denied, PullAction, PullCtx};
 use crate::model::WorkflowStep;
-use crate::progress::OverallProgress;
+use crate::progress::ProgressLog;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all workflow steps from the API.
-pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<Vec<WorkflowStep>> {
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<ProgressLog>) -> Result<Vec<WorkflowStep>> {
     skip_on_permission_denied(
         ctx.client.list_workflow_steps(Some(progress.clone())).await.context("listing workflow steps"),
         "workflow_steps",
@@ -25,18 +25,17 @@ pub async fn process(
     ctx: &mut PullCtx<'_>,
     steps: Vec<WorkflowStep>,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<OverallProgress>,
+    progress: &Arc<ProgressLog>,
 ) -> Result<(usize, usize)> {
-    progress.start_phase("workflow_steps");
+    let phase = progress.phase("pulling workflow_steps");
 
     let mut used: HashSet<String> = HashSet::new();
     let mut conflicts = 0usize;
     let mut written = 0usize;
     for s in &steps {
         let Some(workflow_slug) = ctx.lockfile.slug_for_url("workflows", &s.workflow).map(|x| x.to_string()) else {
-            progress.skipped_orphan();
-            progress.println(format!(
-                "warning: workflow step '{}' (id {}) has unknown workflow URL '{}'; skipping",
+            phase.line(format!(
+                "⚠ workflow step '{}' (id {}) has unknown workflow URL '{}'; skipping",
                 s.name, s.id, s.workflow
             ));
             continue;
@@ -51,6 +50,8 @@ pub async fn process(
         if !subset.contains(&("workflow_steps".to_string(), slug.clone())) {
             continue;
         }
+
+        let sp = phase.item(&s.name);
 
         let steps_dir = ctx.paths.workflow_steps_dir(&workflow_slug);
         std::fs::create_dir_all(&steps_dir)
@@ -83,7 +84,7 @@ pub async fn process(
             s.modified_at().map(|x| x.to_string()),
             Some(recorded_hash),
         );
-        progress.tick(&s.name);
+        sp.finish_ok("");
         written += 1;
     }
 

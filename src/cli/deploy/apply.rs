@@ -6,7 +6,7 @@ use crate::config::ProjectConfig;
 use crate::mapping::Mapping;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::OverallProgress;
+use crate::progress::ProgressLog;
 use crate::secrets::resolve_token;
 use crate::snapshot::email_template::read_email_template;
 use crate::snapshot::hook::read_hook_value;
@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Emit a warning through the progress bar if active, or to stderr directly.
-fn warn(progress: &Option<Arc<OverallProgress>>, msg: String) {
+fn warn(progress: &Option<Arc<ProgressLog>>, msg: String) {
     match progress {
         Some(p) => p.println(&msg),
         None => eprintln!("{msg}"),
@@ -42,7 +42,7 @@ fn is_store_extension(payload: &Value) -> bool {
 /// deploy proceeds anyway, treating the remote-as-of-now as the new
 /// baseline that the upcoming PATCH overwrites.
 fn adopt_tgt_drift(
-    progress: &Option<Arc<OverallProgress>>,
+    progress: &Option<Arc<ProgressLog>>,
     tgt_lockfile: &mut Lockfile,
     kind: &str,
     tgt_slug: &str,
@@ -82,7 +82,7 @@ pub(crate) async fn run(
     tgt: &str,
     dry_run: bool,
     diff: bool,
-    progress: Option<Arc<OverallProgress>>,
+    progress: Option<Arc<ProgressLog>>,
     tgt_lockfile: &mut Lockfile,
     selection: Option<&crate::cli::deploy::selection::Selection>,
 ) -> Result<String> {
@@ -109,12 +109,11 @@ pub(crate) async fn run(
     let empty_subs: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
 
     // Hooks ------------------------------------------------------------
-    if !mapping.hooks.is_empty() {
-        progress.as_ref().map(|p| {
-            p.inc_total(mapping.hooks.len() as u64);
-            p.start_phase("update hooks");
-        });
-    }
+    let hooks_phase: Option<crate::progress::Phase> = if !mapping.hooks.is_empty() {
+        progress.as_ref().map(|p| p.phase("updating hooks"))
+    } else {
+        None
+    };
     for (src_slug, tgt_slug) in &mapping.hooks {
         if let Some(sel) = selection {
             if !sel.contains("hooks", src_slug) {
@@ -221,19 +220,18 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt hooks/{tgt_id} (mapped from src '{src_slug}')"))?;
         }
         applied.hooks += 1;
-        progress.as_ref().map(|p| p.tick(tgt_slug));
+        hooks_phase.as_ref().map(|ph| ph.line(format!("✓ hooks/{tgt_slug}")));
     }
 
     // Rules ------------------------------------------------------------
     // Rules are a combined-hash kind (json + trigger_condition .py),
     // so the drift check and idempotency check both consider the
     // extracted code, not just the JSON bytes.
-    if !mapping.rules.is_empty() {
-        progress.as_ref().map(|p| {
-            p.inc_total(mapping.rules.len() as u64);
-            p.start_phase("update rules");
-        });
-    }
+    let rules_phase: Option<crate::progress::Phase> = if !mapping.rules.is_empty() {
+        progress.as_ref().map(|p| p.phase("updating rules"))
+    } else {
+        None
+    };
     let mut remote_rules_cache: Option<Vec<crate::model::Rule>> = None;
     for (src_slug, tgt_slug) in &mapping.rules {
         if let Some(sel) = selection {
@@ -305,16 +303,15 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt rules/{tgt_id}"))?;
         }
         applied.rules += 1;
-        progress.as_ref().map(|p| p.tick(tgt_slug));
+        rules_phase.as_ref().map(|ph| ph.line(format!("✓ rules/{tgt_slug}")));
     }
 
     // Labels -----------------------------------------------------------
-    if !mapping.labels.is_empty() {
-        progress.as_ref().map(|p| {
-            p.inc_total(mapping.labels.len() as u64);
-            p.start_phase("update labels");
-        });
-    }
+    let labels_phase: Option<crate::progress::Phase> = if !mapping.labels.is_empty() {
+        progress.as_ref().map(|p| p.phase("updating labels"))
+    } else {
+        None
+    };
     let mut remote_labels_cache: Option<Vec<crate::model::Label>> = None;
     for (src_slug, tgt_slug) in &mapping.labels {
         if let Some(sel) = selection {
@@ -370,16 +367,15 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt labels/{tgt_id}"))?;
         }
         applied.labels += 1;
-        progress.as_ref().map(|p| p.tick(tgt_slug));
+        labels_phase.as_ref().map(|ph| ph.line(format!("✓ labels/{tgt_slug}")));
     }
 
     // Queues -----------------------------------------------------------
-    if !mapping.queues.is_empty() {
-        progress.as_ref().map(|p| {
-            p.inc_total(mapping.queues.len() as u64);
-            p.start_phase("update queues");
-        });
-    }
+    let queues_phase: Option<crate::progress::Phase> = if !mapping.queues.is_empty() {
+        progress.as_ref().map(|p| p.phase("updating queues"))
+    } else {
+        None
+    };
     let mut remote_queues_cache: Option<Vec<crate::model::Queue>> = None;
     for (src_slug, tgt_slug) in &mapping.queues {
         if let Some(sel) = selection {
@@ -447,16 +443,15 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt queues/{tgt_id}"))?;
         }
         applied.queues += 1;
-        progress.as_ref().map(|p| p.tick(tgt_slug));
+        queues_phase.as_ref().map(|ph| ph.line(format!("✓ queues/{tgt_slug}")));
     }
 
     // Schemas ----------------------------------------------------------
-    if !mapping.schemas.is_empty() {
-        progress.as_ref().map(|p| {
-            p.inc_total(mapping.schemas.len() as u64);
-            p.start_phase("update schemas");
-        });
-    }
+    let schemas_phase: Option<crate::progress::Phase> = if !mapping.schemas.is_empty() {
+        progress.as_ref().map(|p| p.phase("updating schemas"))
+    } else {
+        None
+    };
     for (src_slug, tgt_slug) in &mapping.schemas {
         if let Some(sel) = selection {
             if !sel.contains("schemas", src_slug) {
@@ -538,16 +533,15 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt schemas/{tgt_id}"))?;
         }
         applied.schemas += 1;
-        progress.as_ref().map(|p| p.tick(tgt_slug));
+        schemas_phase.as_ref().map(|ph| ph.line(format!("✓ schemas/{tgt_slug}")));
     }
 
     // Inboxes ----------------------------------------------------------
-    if !mapping.inboxes.is_empty() {
-        progress.as_ref().map(|p| {
-            p.inc_total(mapping.inboxes.len() as u64);
-            p.start_phase("update inboxes");
-        });
-    }
+    let inboxes_phase: Option<crate::progress::Phase> = if !mapping.inboxes.is_empty() {
+        progress.as_ref().map(|p| p.phase("updating inboxes"))
+    } else {
+        None
+    };
     for (src_slug, tgt_slug) in &mapping.inboxes {
         if let Some(sel) = selection {
             if !sel.contains("inboxes", src_slug) {
@@ -600,16 +594,15 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt inboxes/{tgt_id}"))?;
         }
         applied.inboxes += 1;
-        progress.as_ref().map(|p| p.tick(tgt_slug));
+        inboxes_phase.as_ref().map(|ph| ph.line(format!("✓ inboxes/{tgt_slug}")));
     }
 
     // Email templates --------------------------------------------------
-    if !mapping.email_templates.is_empty() {
-        progress.as_ref().map(|p| {
-            p.inc_total(mapping.email_templates.len() as u64);
-            p.start_phase("update email_templates");
-        });
-    }
+    let email_templates_phase: Option<crate::progress::Phase> = if !mapping.email_templates.is_empty() {
+        progress.as_ref().map(|p| p.phase("updating email_templates"))
+    } else {
+        None
+    };
     let mut remote_template_cache: Option<Vec<crate::model::EmailTemplate>> = None;
     for (src_key, tgt_key) in &mapping.email_templates {
         if let Some(sel) = selection {
@@ -678,16 +671,15 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt email_templates/{tgt_id}"))?;
         }
         applied.email_templates += 1;
-        progress.as_ref().map(|p| p.tick(tgt_key));
+        email_templates_phase.as_ref().map(|ph| ph.line(format!("✓ email_templates/{tgt_key}")));
     }
 
     // Engines ----------------------------------------------------------
-    if !mapping.engines.is_empty() {
-        progress.as_ref().map(|p| {
-            p.inc_total(mapping.engines.len() as u64);
-            p.start_phase("update engines");
-        });
-    }
+    let engines_phase: Option<crate::progress::Phase> = if !mapping.engines.is_empty() {
+        progress.as_ref().map(|p| p.phase("updating engines"))
+    } else {
+        None
+    };
     for (src_slug, tgt_slug) in &mapping.engines {
         if let Some(sel) = selection {
             if !sel.contains("engines", src_slug) {
@@ -736,14 +728,14 @@ pub(crate) async fn run(
         }
         if dry_run {
             applied.engines += 1;
-            progress.as_ref().map(|p| p.tick(tgt_slug));
+            engines_phase.as_ref().map(|ph| ph.line(format!("✓ engines/{tgt_slug}")));
         } else {
             match tgt_client.update_engine(tgt_id, &payload_engine, None).await
                 .with_context(|| format!("PATCH tgt engines/{tgt_id}"))
             {
                 Ok(_) => {
                     applied.engines += 1;
-                    progress.as_ref().map(|p| p.tick(tgt_slug));
+                    engines_phase.as_ref().map(|ph| ph.line(format!("✓ engines/{tgt_slug}")));
                 }
                 Err(e) if anyhow_has_status(&e, 405) => {
                     warn(&progress, format!("warning: engines are not writable via PATCH on tgt org/plan (405). Skipping all engine apply."));
@@ -756,12 +748,11 @@ pub(crate) async fn run(
     }
 
     // Engine fields ----------------------------------------------------
-    if !mapping.engine_fields.is_empty() {
-        progress.as_ref().map(|p| {
-            p.inc_total(mapping.engine_fields.len() as u64);
-            p.start_phase("update engine_fields");
-        });
-    }
+    let engine_fields_phase: Option<crate::progress::Phase> = if !mapping.engine_fields.is_empty() {
+        progress.as_ref().map(|p| p.phase("updating engine_fields"))
+    } else {
+        None
+    };
     for (src_slug, tgt_slug) in &mapping.engine_fields {
         if let Some(sel) = selection {
             if !sel.contains("engine_fields", src_slug) {
@@ -820,14 +811,14 @@ pub(crate) async fn run(
         }
         if dry_run {
             applied.engine_fields += 1;
-            progress.as_ref().map(|p| p.tick(tgt_slug));
+            engine_fields_phase.as_ref().map(|ph| ph.line(format!("✓ engine_fields/{tgt_slug}")));
         } else {
             match tgt_client.update_engine_field(tgt_id, &payload_field, None).await
                 .with_context(|| format!("PATCH tgt engine_fields/{tgt_id}"))
             {
                 Ok(_) => {
                     applied.engine_fields += 1;
-                    progress.as_ref().map(|p| p.tick(tgt_slug));
+                    engine_fields_phase.as_ref().map(|ph| ph.line(format!("✓ engine_fields/{tgt_slug}")));
                 }
                 Err(e) if anyhow_has_status(&e, 405) => {
                     warn(&progress, format!("warning: engine fields are not writable via PATCH on tgt org/plan (405). Skipping all engine field apply."));
@@ -903,7 +894,7 @@ fn lookup_tgt_id_w(
     kind: &str,
     tgt_slug: &str,
     skipped: &mut usize,
-    progress: &Option<Arc<OverallProgress>>,
+    progress: &Option<Arc<ProgressLog>>,
 ) -> Option<u64> {
     match tgt_lockfile.objects.get(kind).and_then(|m| m.get(tgt_slug)).map(|e| e.id) {
         Some(id) => Some(id),

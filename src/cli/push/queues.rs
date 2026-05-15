@@ -2,7 +2,7 @@ use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::OverallProgress;
+use crate::progress::ProgressLog;
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
@@ -16,12 +16,13 @@ pub async fn push(
     lockfile: &mut Lockfile,
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
-    progress: &Arc<OverallProgress>,
+    progress: &Arc<ProgressLog>,
     env: &str,
 ) -> Result<(usize, usize)> {
     let overlay = Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
+    let phase = progress.phase("pushing queues");
     let mut pushed = 0usize;
     let mut skipped = 0usize;
     let mut remote_cache: std::collections::HashMap<u64, crate::model::Queue> =
@@ -29,6 +30,8 @@ pub async fn push(
 
     for (q_slug, queue_path) in changes {
         let overlay_paths = overlay.as_ref().and_then(|ov| ov.queue(q_slug));
+
+        let sp = phase.item(format!("queues/{q_slug}"));
 
         // Missing lockfile entry → new queue, POST. User must already have
         // POSTed the referenced workspace + schema (linear push); if not,
@@ -61,8 +64,7 @@ pub async fn push(
                     content_hash: Some(created_hash),
                 },
             );
-            progress.println(format!("created queues/{q_slug} (id {})", created.id));
-            progress.tick(q_slug.as_str());
+            sp.finish_ok(format!("→ POST (id {})", created.id));
             pushed += 1;
             continue;
         }
@@ -71,7 +73,7 @@ pub async fn push(
             .with_context(|| format!("reading {}", queue_path.display()))?;
         let entry = lockfile.objects.get("queues").and_then(|m| m.get(q_slug.as_str())).unwrap();
         let Some(base) = &entry.content_hash else {
-            progress.println(format!("warning: queue '{q_slug}' — lockfile entry has no content_hash, skipping"));
+            sp.finish_warn("lockfile entry has no content_hash, skipping");
             skipped += 1;
             continue;
         };
@@ -94,7 +96,7 @@ pub async fn push(
             }
         }
         let Some(remote_queue) = remote_cache.get(&id).cloned() else {
-            progress.println(format!("warning: queue '{q_slug}' — id {id} not found on remote, skipping"));
+            sp.finish_warn(format!("id {id} not found on remote, skipping"));
             skipped += 1;
             continue;
         };
@@ -126,13 +128,12 @@ pub async fn push(
                             content_hash: Some(remote_combined),
                         },
                     );
+                    sp.finish_warn("adopted remote (drift)");
                     skipped += 1;
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    progress.println(format!(
-                        "warning: queue '{q_slug}' — remote has changed since last sync, skipping push (run `rdc sync` first)"
-                    ));
+                    sp.finish_warn("remote has changed since last sync, skipping push (run `rdc sync` first)");
                     skipped += 1;
                     continue;
                 }
@@ -160,7 +161,7 @@ pub async fn push(
                 content_hash: Some(updated_hash),
             },
         );
-        progress.tick(q_slug.as_str());
+        sp.finish_ok("→ PATCH");
         pushed += 1;
     }
 

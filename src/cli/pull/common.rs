@@ -1,6 +1,6 @@
 use crate::api::{ApiError, RossumClient};
 use crate::paths::Paths;
-use crate::progress::OverallProgress;
+use crate::progress::ProgressLog;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
 use anyhow::{anyhow, Context, Result};
 use std::collections::BTreeMap;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 pub fn skip_on_permission_denied<T>(
     result: Result<Vec<T>>,
     kind: &str,
-    progress: &Arc<OverallProgress>,
+    progress: &Arc<ProgressLog>,
 ) -> Result<Vec<T>> {
     match result {
         Ok(v) => Ok(v),
@@ -24,7 +24,7 @@ pub fn skip_on_permission_denied<T>(
                     .unwrap_or(false)
             });
             if is_403 {
-                progress.println(format!("warning: skipping {kind} — token lacks permission (403)"));
+                progress.println(format!("⚠ skipping {kind} — token lacks permission (403)"));
                 Ok(Vec::new())
             } else {
                 Err(e)
@@ -93,66 +93,54 @@ pub struct RemoteCatalog {
     pub mdh: crate::cli::pull::mdh::MdhListed,
 }
 
-/// Phase 1 of pull: list every kind from the env's API and accumulate the
-/// progress bar's total denominator. No ticks happen here — the sync
-/// classifier and executor consume the catalog.
+/// Phase 1 of pull: list every kind from the env's API. The catalog is
+/// consumed by the sync classifier and executor; no per-item progress
+/// happens here.
 ///
-/// Listing order is fixed so cross-env diffs and bar pacing stay
-/// deterministic across runs.
+/// Listing order is fixed so cross-env diffs stay deterministic across
+/// runs.
 pub async fn list_remote(
     ctx: &mut PullCtx<'_>,
     env_cfg: &crate::config::EnvConfig,
     env: &str,
     token: &str,
-    progress: &Arc<crate::progress::OverallProgress>,
+    progress: &Arc<crate::progress::ProgressLog>,
 ) -> Result<RemoteCatalog> {
     let organization = crate::cli::pull::organization::list(ctx, env_cfg.org_id, progress).await
         .with_context(|| format!("listing organization for env '{env}'"))?;
-    progress.inc_total(1);
 
     let workspaces = crate::cli::pull::workspaces::list(ctx, progress).await
         .with_context(|| format!("listing workspaces for env '{env}'"))?;
-    progress.inc_total(workspaces.len() as u64);
 
     let queues = crate::cli::pull::queues::list(ctx, progress).await
         .with_context(|| format!("listing queues for env '{env}'"))?;
-    progress.inc_total(queues.len() as u64);
 
     let hooks = crate::cli::pull::hooks::list(ctx, progress).await
         .with_context(|| format!("listing hooks for env '{env}'"))?;
-    progress.inc_total(hooks.len() as u64);
 
     let rules = crate::cli::pull::rules::list(ctx, progress).await
         .with_context(|| format!("listing rules for env '{env}'"))?;
-    progress.inc_total(rules.len() as u64);
 
     let labels = crate::cli::pull::labels::list(ctx, progress).await
         .with_context(|| format!("listing labels for env '{env}'"))?;
-    progress.inc_total(labels.len() as u64);
 
     let engines = crate::cli::pull::engines::list(ctx, progress).await
         .with_context(|| format!("listing engines for env '{env}'"))?;
-    progress.inc_total(engines.len() as u64);
 
     let engine_fields = crate::cli::pull::engine_fields::list(ctx, progress).await
         .with_context(|| format!("listing engine fields for env '{env}'"))?;
-    progress.inc_total(engine_fields.len() as u64);
 
     let workflows = crate::cli::pull::workflows::list(ctx, progress).await
         .with_context(|| format!("listing workflows for env '{env}'"))?;
-    progress.inc_total(workflows.len() as u64);
 
     let workflow_steps = crate::cli::pull::workflow_steps::list(ctx, progress).await
         .with_context(|| format!("listing workflow steps for env '{env}'"))?;
-    progress.inc_total(workflow_steps.len() as u64);
 
     let email_templates = crate::cli::pull::email_templates::list(ctx, progress).await
         .with_context(|| format!("listing email templates for env '{env}'"))?;
-    progress.inc_total(email_templates.len() as u64);
 
     let mdh = crate::cli::pull::mdh::list(env_cfg, token, progress).await
         .with_context(|| format!("listing MDH datasets for env '{env}'"))?;
-    progress.inc_total(mdh.collections.len() as u64);
 
     // Per-queue schema + inbox prefetch. The Rossum API has no `/schemas/`
     // or `/inboxes/` listing — each must be fetched by id. Doing it here
@@ -181,7 +169,7 @@ pub async fn list_remote(
 async fn prefetch_queue_children(
     client: &RossumClient,
     queues: &[crate::model::Queue],
-    progress: &Arc<crate::progress::OverallProgress>,
+    progress: &Arc<crate::progress::ProgressLog>,
 ) -> Result<(
     std::collections::BTreeMap<u64, crate::model::Schema>,
     std::collections::BTreeMap<u64, crate::model::Inbox>,
@@ -386,7 +374,7 @@ pub fn apply_pull_action(
     remote_bytes: &[u8],
     remote_hash: String,
     interactive: bool,
-    progress: &Arc<OverallProgress>,
+    progress: &Arc<ProgressLog>,
     env: &str,
 ) -> Result<String> {
     use crate::snapshot::writer::write_atomic;
@@ -422,14 +410,14 @@ pub fn apply_pull_action(
 fn shadow_file_conflict(
     local_path: &Path,
     remote_bytes: &[u8],
-    progress: &Arc<OverallProgress>,
+    progress: &Arc<ProgressLog>,
     env: &str,
 ) -> Result<String> {
     use crate::snapshot::writer::write_atomic;
     let conflict_path = crate::paths::shadow_path_for(local_path, env);
     write_atomic(&conflict_path, remote_bytes)?;
     progress.println(format!(
-        "warning: {} conflict — local preserved, remote at {}",
+        "⚠ {} conflict — local preserved, remote at {}",
         local_path.display(),
         conflict_path.display(),
     ));
@@ -446,7 +434,7 @@ fn resolve_conflict_interactive(
     local_path: &Path,
     remote_bytes: &[u8],
     remote_hash: &str,
-    progress: &Arc<OverallProgress>,
+    progress: &Arc<ProgressLog>,
     env: &str,
 ) -> Result<String> {
     use crate::cli::resolve::{prompt_resolve, PullAborted, Resolution};
@@ -565,9 +553,9 @@ mod tests {
     fn apply_write_creates_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
-        let p = crate::progress::OverallProgress::start("test");
+        let p = crate::progress::ProgressLog::start("test");
         let h = apply_pull_action(PullAction::Write, &path, b"hello", "h".repeat(64), false, &p, "test").unwrap();
-        p.finish();
+        p.finish("test");
         assert_eq!(h, "h".repeat(64));
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
     }
@@ -578,9 +566,9 @@ mod tests {
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"local").unwrap();
         // interactive=false → legacy shadow-file behavior.
-        let p = crate::progress::OverallProgress::start("test");
+        let p = crate::progress::ProgressLog::start("test");
         let _ = apply_pull_action(PullAction::Conflict, &path, b"remote", "h".repeat(64), false, &p, "test").unwrap();
-        p.finish();
+        p.finish("test");
         assert_eq!(std::fs::read(&path).unwrap(), b"local");
         assert_eq!(
             std::fs::read(dir.path().join("x.json.test")).unwrap(),
@@ -595,9 +583,9 @@ mod tests {
             status: 403,
             body: "permission_denied".into()
         }));
-        let p = crate::progress::OverallProgress::start("test");
+        let p = crate::progress::ProgressLog::start("test");
         let out = skip_on_permission_denied(err, "engines", &p).unwrap();
-        p.finish();
+        p.finish("test");
         assert!(out.is_empty());
     }
 
@@ -607,16 +595,16 @@ mod tests {
             status: 500,
             body: "boom".into()
         }));
-        let p = crate::progress::OverallProgress::start("test");
+        let p = crate::progress::ProgressLog::start("test");
         assert!(skip_on_permission_denied(err, "engines", &p).is_err());
     }
 
     #[test]
     fn skip_on_permission_denied_passes_through_ok() {
         let v: Result<Vec<u32>> = Ok(vec![1, 2, 3]);
-        let p = crate::progress::OverallProgress::start("test");
+        let p = crate::progress::ProgressLog::start("test");
         let out = skip_on_permission_denied(v, "engines", &p).unwrap();
-        p.finish();
+        p.finish("test");
         assert_eq!(out, vec![1, 2, 3]);
     }
 
@@ -640,7 +628,7 @@ mod tests {
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"original").unwrap();
         let original_bytes = std::fs::read(&path).unwrap();
-        let p = crate::progress::OverallProgress::start("test");
+        let p = crate::progress::ProgressLog::start("test");
         let h = apply_pull_action(
             PullAction::NoChange,
             &path,
@@ -651,7 +639,7 @@ mod tests {
             "test",
         )
         .unwrap();
-        p.finish();
+        p.finish("test");
         assert_eq!(h, "h".repeat(64));
         // Local file unchanged byte-for-byte.
         assert_eq!(std::fs::read(&path).unwrap(), original_bytes);

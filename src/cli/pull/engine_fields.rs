@@ -3,14 +3,14 @@ use super::common::{
     skip_on_permission_denied, PullAction, PullCtx,
 };
 use crate::model::EngineField;
-use crate::progress::OverallProgress;
+use crate::progress::ProgressLog;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all engine fields from the API.
-pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<Vec<EngineField>> {
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<ProgressLog>) -> Result<Vec<EngineField>> {
     skip_on_permission_denied(
         ctx.client.list_engine_fields(Some(progress.clone())).await.context("listing engine fields"),
         "engine_fields",
@@ -29,18 +29,17 @@ pub async fn process(
     ctx: &mut PullCtx<'_>,
     fields: Vec<EngineField>,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<OverallProgress>,
+    progress: &Arc<ProgressLog>,
 ) -> Result<(usize, usize)> {
-    progress.start_phase("engine_fields");
+    let phase = progress.phase("pulling engine_fields");
 
     let mut used: HashSet<String> = HashSet::new();
     let mut conflicts = 0usize;
     let mut written = 0usize;
     for f in &fields {
         let Some(engine_slug) = ctx.lockfile.slug_for_url("engines", &f.engine).map(|s| s.to_string()) else {
-            progress.skipped_orphan();
-            progress.println(format!(
-                "warning: engine field '{}' (id {}) has unknown engine URL '{}'; skipping",
+            phase.line(format!(
+                "⚠ engine field '{}' (id {}) has unknown engine URL '{}'; skipping",
                 f.name, f.id, f.engine
             ));
             continue;
@@ -55,6 +54,8 @@ pub async fn process(
         if !subset.contains(&("engine_fields".to_string(), slug.clone())) {
             continue;
         }
+
+        let sp = phase.item(&f.name);
 
         let fields_dir = ctx.paths.engine_fields_dir(&engine_slug);
         std::fs::create_dir_all(&fields_dir)
@@ -91,7 +92,7 @@ pub async fn process(
             f.modified_at().map(|s| s.to_string()),
             Some(recorded_hash),
         );
-        progress.tick(&f.name);
+        sp.finish_ok("");
         written += 1;
     }
 

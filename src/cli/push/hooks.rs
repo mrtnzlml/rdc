@@ -2,7 +2,7 @@ use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::OverallProgress;
+use crate::progress::ProgressLog;
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::hook::{
     hook_code_extension, hook_code_extension_from_value, read_hook_value, serialize_hook,
@@ -20,7 +20,7 @@ pub async fn push(
     lockfile: &mut Lockfile,
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
-    progress: &Arc<OverallProgress>,
+    progress: &Arc<ProgressLog>,
     env: &str,
 ) -> Result<(usize, usize)> {
     // Load overlay if present. Overlay drives both the outbound payload
@@ -31,6 +31,7 @@ pub async fn push(
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
     let hooks_dir = paths.hooks_dir();
+    let phase = progress.phase("pushing hooks");
     let mut pushed = 0usize;
     let mut skipped = 0usize;
 
@@ -38,6 +39,8 @@ pub async fn push(
 
     for (slug, local_json_path) in changes {
         let overlay_paths = overlay.as_ref().and_then(|ov| ov.hook(slug));
+
+        let sp = phase.item(format!("hooks/{slug}"));
 
         // Missing lockfile entry = new hook → POST. Local file becomes the
         // create payload; server response (with id/url assigned) overwrites
@@ -69,8 +72,8 @@ pub async fn push(
                     remote, &typed.name, template_url,
                 ) {
                     Some(orphan) => {
-                        progress.println(format!(
-                            "adopting orphan store-extension hooks/{slug} (id {})",
+                        sp.set_message(format!(
+                            "hooks/{slug} (adopting orphan store-extension id {})",
                             orphan.id
                         ));
                         orphan.id
@@ -86,8 +89,8 @@ pub async fn push(
                                     "POST /hooks/create (installing store extension '{slug}')"
                                 )
                             })?;
-                        progress.println(format!(
-                            "installed store extension hooks/{slug} (id {})",
+                        sp.set_message(format!(
+                            "hooks/{slug} (installed store extension id {})",
                             installed.id
                         ));
                         installed.id
@@ -142,17 +145,14 @@ pub async fn push(
                     content_hash: Some(created_hash),
                 },
             );
-            progress.println(format!("created hooks/{slug} (id {})", created.id));
-            progress.tick(slug.as_str());
+            sp.finish_ok(format!("→ POST (id {})", created.id));
             pushed += 1;
             continue;
         }
 
         let entry = lockfile.objects.get("hooks").and_then(|m| m.get(slug.as_str())).unwrap();
         let Some(base) = &entry.content_hash else {
-            progress.println(format!(
-                "warning: hooks/{slug}.json — lockfile entry has no content_hash, skipping"
-            ));
+            sp.finish_warn("lockfile entry has no content_hash, skipping");
             skipped += 1;
             continue;
         };
@@ -185,9 +185,7 @@ pub async fn push(
         }
         let remote_list = remote_hooks.as_ref().expect("remote_hooks was just populated above");
         let Some(remote_hook) = remote_list.iter().find(|h| h.id == id) else {
-            progress.println(format!(
-                "warning: hooks/{slug}.json — id {id} not found on remote, skipping"
-            ));
+            sp.finish_warn(format!("id {id} not found on remote, skipping"));
             skipped += 1;
             continue;
         };
@@ -243,13 +241,12 @@ pub async fn push(
                             content_hash: Some(remote_combined),
                         },
                     );
+                    sp.finish_warn("adopted remote (drift)");
                     skipped += 1;
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    progress.println(format!(
-                        "warning: hooks/{slug}.json — remote has changed since last sync, skipping push (run `rdc sync` first)"
-                    ));
+                    sp.finish_warn("remote has changed since last sync, skipping push (run `rdc sync` first)");
                     skipped += 1;
                     continue;
                 }
@@ -291,7 +288,7 @@ pub async fn push(
                 content_hash: Some(updated_hash),
             },
         );
-        progress.tick(slug.as_str());
+        sp.finish_ok("→ PATCH");
         pushed += 1;
     }
 

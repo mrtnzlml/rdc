@@ -3,7 +3,7 @@ use super::common::{
     skip_on_permission_denied, PullAction, PullCtx,
 };
 use crate::model::EmailTemplate;
-use crate::progress::OverallProgress;
+use crate::progress::ProgressLog;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -12,7 +12,7 @@ use std::sync::Arc;
 /// Phase 1: list all email templates from the API.
 /// Note: the orphan-skipping logic (templates without a known queue_location)
 /// lives in `process`, where ctx.queue_locations is fully populated.
-pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<Vec<EmailTemplate>> {
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<ProgressLog>) -> Result<Vec<EmailTemplate>> {
     skip_on_permission_denied(
         ctx.client.list_email_templates(Some(progress.clone())).await.context("listing email templates"),
         "email_templates",
@@ -45,9 +45,9 @@ pub async fn process(
     ctx: &mut PullCtx<'_>,
     templates: Vec<EmailTemplate>,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<OverallProgress>,
+    progress: &Arc<ProgressLog>,
 ) -> Result<(usize, usize)> {
-    progress.start_phase("email_templates");
+    let phase = progress.phase("pulling email_templates");
 
     let mut per_queue_used_slugs: HashMap<(String, String), HashSet<String>> = HashMap::new();
     let mut count = 0usize;
@@ -56,14 +56,10 @@ pub async fn process(
     for t in &templates {
         let queue_url = match &t.queue {
             Some(u) => u,
-            None => {
-                progress.skipped_orphan();
-                continue;
-            }
+            None => continue,
         };
 
         let Some((ws_slug, q_slug)) = ctx.queue_locations.get(queue_url).cloned() else {
-            progress.skipped_orphan();
             continue;
         };
 
@@ -85,6 +81,8 @@ pub async fn process(
         if !subset.contains(&("email_templates".to_string(), lockfile_key.clone())) {
             continue;
         }
+
+        let sp = phase.item(&t.name);
 
         let dir = ctx.paths.queue_email_templates_dir(&ws_slug, &q_slug);
         std::fs::create_dir_all(&dir)
@@ -122,7 +120,7 @@ pub async fn process(
             Some(recorded_hash),
         );
         count += 1;
-        progress.tick(&t.name);
+        sp.finish_ok("");
     }
 
     Ok((count, conflicts))

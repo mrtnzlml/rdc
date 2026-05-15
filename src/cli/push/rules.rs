@@ -2,7 +2,7 @@ use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::OverallProgress;
+use crate::progress::ProgressLog;
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::rule::{read_rule_value, serialize_rule, write_rule_code};
 use crate::snapshot::writer::write_atomic;
@@ -17,13 +17,14 @@ pub async fn push(
     lockfile: &mut Lockfile,
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
-    progress: &Arc<OverallProgress>,
+    progress: &Arc<ProgressLog>,
     env: &str,
 ) -> Result<(usize, usize)> {
     let overlay = Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
     let rules_dir = paths.rules_dir();
+    let phase = progress.phase("pushing rules");
     let mut pushed = 0usize;
     let mut skipped = 0usize;
 
@@ -32,6 +33,8 @@ pub async fn push(
     for (slug, local_json_path) in changes {
         let local_py_path = rules_dir.join(format!("{slug}.py"));
         let overlay_paths = overlay.as_ref().and_then(|ov| ov.rule(slug));
+
+        let sp = phase.item(format!("rules/{slug}"));
 
         // CREATE — no lockfile entry yet.
         if lockfile.objects.get("rules").and_then(|m| m.get(slug.as_str())).is_none() {
@@ -62,8 +65,7 @@ pub async fn push(
                     content_hash: Some(created_hash),
                 },
             );
-            progress.println(format!("created rules/{slug} (id {})", created.id));
-            progress.tick(slug.as_str());
+            sp.finish_ok(format!("→ POST (id {})", created.id));
             pushed += 1;
             continue;
         }
@@ -71,10 +73,7 @@ pub async fn push(
         // UPDATE — read JSON+.py, splice, drift-check, PATCH.
         let entry = lockfile.objects.get("rules").and_then(|m| m.get(slug.as_str())).unwrap();
         let Some(base) = &entry.content_hash else {
-            progress.println(format!(
-                "warning: {} — lockfile entry has no content_hash, skipping",
-                local_json_path.display()
-            ));
+            sp.finish_warn("lockfile entry has no content_hash, skipping");
             skipped += 1;
             continue;
         };
@@ -96,10 +95,7 @@ pub async fn push(
         }
         let remote_list = remote_rules.as_ref().unwrap();
         let Some(remote_rule) = remote_list.iter().find(|r| r.id == id) else {
-            progress.println(format!(
-                "warning: {} — id {id} not found on remote, skipping",
-                local_json_path.display()
-            ));
+            sp.finish_warn(format!("id {id} not found on remote, skipping"));
             skipped += 1;
             continue;
         };
@@ -136,14 +132,12 @@ pub async fn push(
                             content_hash: Some(remote_combined),
                         },
                     );
+                    sp.finish_warn("adopted remote (drift)");
                     skipped += 1;
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    progress.println(format!(
-                        "warning: {} — remote has changed since last sync, skipping push (run `rdc sync` first)",
-                        local_json_path.display()
-                    ));
+                    sp.finish_warn("remote has changed since last sync, skipping push (run `rdc sync` first)");
                     skipped += 1;
                     continue;
                 }
@@ -178,7 +172,7 @@ pub async fn push(
                 content_hash: Some(updated_hash),
             },
         );
-        progress.tick(slug.as_str());
+        sp.finish_ok("→ PATCH");
         pushed += 1;
     }
 

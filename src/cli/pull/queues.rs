@@ -12,7 +12,7 @@ use super::common::{
     record_object, skip_on_permission_denied, PullAction, PullCtx,
 };
 use crate::model::{Inbox, Queue, Schema};
-use crate::progress::OverallProgress;
+use crate::progress::{Phase, ProgressLog};
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use futures::stream::{StreamExt, TryStreamExt};
@@ -38,7 +38,7 @@ struct QueueWork<'a> {
 }
 
 /// Phase 1: list all queues from the API.
-pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<Vec<Queue>> {
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<ProgressLog>) -> Result<Vec<Queue>> {
     skip_on_permission_denied(
         ctx.client.list_queues(Some(progress.clone())).await.context("listing queues"),
         "queues",
@@ -61,9 +61,9 @@ pub async fn process(
     ctx: &mut PullCtx<'_>,
     queues: Vec<Queue>,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<OverallProgress>,
+    progress: &Arc<ProgressLog>,
 ) -> Result<QueueCounts> {
-    progress.start_phase("queues");
+    let phase = progress.phase("pulling queues");
 
     let mut per_ws_used_slugs: HashMap<String, HashSet<String>> = HashMap::new();
     let mut counts = QueueCounts { queues: 0, schemas: 0, inboxes: 0, conflicts: 0 };
@@ -73,10 +73,7 @@ pub async fn process(
     for q in &queues {
         let ws_url = match &q.workspace {
             Some(u) => u,
-            None => {
-                progress.skipped_orphan();
-                continue;
-            }
+            None => continue,
         };
         let ws_slug = match ctx.lockfile.slug_for_url("workspaces", ws_url) {
             Some(s) => s.to_string(),
@@ -137,8 +134,8 @@ pub async fn process(
             Some(url) => Some(parse_id_from_url(url)
                 .with_context(|| format!("parsing schema URL '{}' for queue '{}'", url, q.name))?),
             None => {
-                progress.println(format!(
-                    "warning: queue '{}' (id {}) has no schema — skipping schema + inbox",
+                phase.line(format!(
+                    "⚠ queue '{}' (id {}) has no schema — skipping schema + inbox",
                     q.name, q.id,
                 ));
                 None
@@ -186,13 +183,14 @@ pub async fn process(
     for w in &work {
         let Some((schema_opt, inbox_opt)) = fetched.get(&w.q.id) else { continue };
 
+        let sp = phase.item(&w.q.name);
         if let Some(schema) = schema_opt {
-            write_schema_for_queue(ctx, &mut counts, w, schema, progress)?;
+            write_schema_for_queue(ctx, &mut counts, w, schema, progress, &phase)?;
         }
         if let Some(inbox) = inbox_opt {
             write_inbox_for_queue(ctx, &mut counts, w, inbox, progress)?;
         }
-        progress.tick(&w.q.name);
+        sp.finish_ok("");
     }
 
     Ok(counts)
@@ -203,7 +201,8 @@ fn write_schema_for_queue(
     counts: &mut QueueCounts,
     w: &QueueWork<'_>,
     schema: &Schema,
-    progress: &Arc<OverallProgress>,
+    _progress: &Arc<ProgressLog>,
+    phase: &Phase,
 ) -> Result<()> {
     let queue_dir = &w.queue_dir;
     let schema_path = queue_dir.join("schema.json");
@@ -319,8 +318,8 @@ fn write_schema_for_queue(
                         crate::snapshot::writer::write_atomic(&p, bytes)?;
                     }
                 }
-                progress.println(format!(
-                    "warning: {} conflict — local preserved, remote at {} (formulas at {})",
+                phase.line(format!(
+                    "⚠ {} conflict — local preserved, remote at {} (formulas at {})",
                     schema_path.display(),
                     remote_path.display(),
                     remote_formulas_dir.display(),
@@ -347,7 +346,7 @@ fn write_inbox_for_queue(
     counts: &mut QueueCounts,
     w: &QueueWork<'_>,
     inbox: &Inbox,
-    progress: &Arc<OverallProgress>,
+    progress: &Arc<ProgressLog>,
 ) -> Result<()> {
     let inbox_path = w.queue_dir.join("inbox.json");
     let mut inbox_proposed = serde_json::to_vec_pretty(inbox).context("serializing inbox")?;

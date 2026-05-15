@@ -11,7 +11,7 @@ pub mod watch;
 use crate::api::RossumClient;
 use crate::config::ProjectConfig;
 use crate::paths::Paths;
-use crate::progress::OverallProgress;
+use crate::progress::ProgressLog;
 use crate::secrets::resolve_token;
 use crate::state::Lockfile;
 use anyhow::{anyhow, Context, Result};
@@ -114,7 +114,8 @@ pub(crate) async fn run_cycle(
     let overlay = crate::overlay::Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
-    let progress = OverallProgress::start(format!("sync envs/{env}"));
+    let progress = ProgressLog::start(format!("rdc sync {env}"));
+    let started = std::time::Instant::now();
 
     // Phase 1: list remote. Mirrors `pull::run`'s `PullCtx` construction
     // verbatim so the listing semantics are identical.
@@ -145,7 +146,7 @@ pub(crate) async fn run_cycle(
         // `--diff` rendering will hook in here once the executor is
         // wired; defer until per-object bodies are available.
         let _ = diff;
-        progress.finish();
+        progress.finish(format!("Dry run sync envs/{env}: 0 writes"));
         println!("Dry run sync envs/{env}: 0 writes.");
         return Ok(CycleOutcome::default());
     }
@@ -199,7 +200,12 @@ pub(crate) async fn run_cycle(
     crate::cli::index::generate(&paths, &lockfile)
         .with_context(|| format!("generating _index.md for env '{env}'"))?;
 
-    progress.finish();
+    let elapsed = started.elapsed();
+    let total_changed = outcome.items_pushed + outcome.items_pulled;
+    progress.finish(format!(
+        "Synced envs/{env} ({total_changed} changed, {:.1}s)",
+        elapsed.as_secs_f32()
+    ));
     println!("Synced envs/{env}.");
     Ok(outcome)
 }

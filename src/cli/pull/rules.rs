@@ -3,7 +3,7 @@ use super::common::{
     PullAction, PullCtx,
 };
 use crate::model::Rule;
-use crate::progress::OverallProgress;
+use crate::progress::ProgressLog;
 use crate::slug::slugify_unique;
 use crate::snapshot::rule::{serialize_rule, write_rule_code};
 use crate::state::rule_combined_hash;
@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all rules from the API.
-pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<Vec<Rule>> {
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<ProgressLog>) -> Result<Vec<Rule>> {
     skip_on_permission_denied(
         ctx.client.list_rules(Some(progress.clone())).await.context("listing rules"),
         "rules",
@@ -31,9 +31,9 @@ pub async fn process(
     ctx: &mut PullCtx<'_>,
     rules: Vec<Rule>,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<OverallProgress>,
+    progress: &Arc<ProgressLog>,
 ) -> Result<(usize, usize)> {
-    progress.start_phase("rules");
+    let phase = progress.phase("pulling rules");
 
     let mut used_slugs: HashSet<String> = HashSet::new();
     let mut dir_created = false;
@@ -49,6 +49,8 @@ pub async fn process(
         if !subset.contains(&("rules".to_string(), slug.clone())) {
             continue;
         }
+
+        let sp = phase.item(&r.name);
 
         if !dir_created {
             std::fs::create_dir_all(ctx.paths.rules_dir())
@@ -174,7 +176,7 @@ pub async fn process(
             r.modified_at().map(|s| s.to_string()),
             Some(recorded_hash),
         );
-        progress.tick(&r.name);
+        sp.finish_ok("");
         written += 1;
     }
 

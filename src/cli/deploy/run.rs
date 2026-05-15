@@ -30,7 +30,7 @@ use crate::config::ProjectConfig;
 use crate::mapping::Mapping;
 use crate::overlay::Overlay;
 use crate::paths::Paths;
-use crate::progress::OverallProgress;
+use crate::progress::ProgressLog;
 use crate::secrets::resolve_token;
 use crate::state::Lockfile;
 use anyhow::{anyhow, Context, Result};
@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// Route a warning through the progress bar (if active) or directly to stderr.
-fn warn(progress: Option<&Arc<OverallProgress>>, msg: String) {
+fn warn(progress: Option<&Arc<ProgressLog>>, msg: String) {
     match progress {
         Some(p) => p.println(&msg),
         None => eprintln!("{msg}"),
@@ -228,8 +228,8 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
     )?;
 
     // Start the progress bar for the work phase (not in dry-run).
-    let progress: Option<Arc<OverallProgress>> = if !dry_run {
-        Some(OverallProgress::start(format!("deploy {src} -> {tgt}")))
+    let progress: Option<Arc<ProgressLog>> = if !dry_run {
+        Some(ProgressLog::start(format!("deploy {src} -> {tgt}")))
     } else {
         None
     };
@@ -288,10 +288,12 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
             let Some(slugs) = plan.creates.get(kind) else { continue };
             if slugs.is_empty() { continue; }
             // Start a phase for this kind (skipped if no items).
-            progress.as_ref().map(|p| {
-                p.inc_total(slugs.len() as u64);
-                p.start_phase(format!("create {kind}"));
-            });
+            let create_phase: Option<crate::progress::Phase> =
+                progress.as_ref().map(|p| p.phase(format!("creating {kind}")));
+            // The phase handle stays in scope through the loop so per-item
+            // lines (printed by the create_* helpers via ctx.progress) appear
+            // under the phase header.
+            let _ = create_phase;
             for slug in slugs {
                 let result = match *kind {
                     "workspaces" => create_workspace(&mut ctx, slug).await,
@@ -393,15 +395,13 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
                 continue;
             }
             // Start a delete phase for this kind.
-            progress.as_ref().map(|p| {
-                p.inc_total(slugs.len() as u64);
-                p.start_phase(format!("delete {kind}"));
-            });
+            let delete_phase: Option<crate::progress::Phase> =
+                progress.as_ref().map(|p| p.phase(format!("deleting {kind}")));
             for slug in slugs {
                 if let Err(e) = delete_one(&tgt_client, &mut tgt_lockfile, &tgt_paths, kind, slug).await {
                     warn(progress.as_ref(), format!("warning: failed to delete {kind}/{slug}: {e:#}"));
                 } else {
-                    progress.as_ref().map(|p| p.tick(slug));
+                    delete_phase.as_ref().map(|ph| ph.line(format!("✓ {kind}/{slug}")));
                 }
                 deletes_done += 1;
                 api_calls += 1;
@@ -412,16 +412,20 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
         }
     }
 
-    // Finish the progress bar before printing summaries.
-    if let Some(p) = &progress {
-        p.finish();
-    }
-
     let elapsed = started.elapsed();
     if dry_run {
         let scope = selection.as_ref()
             .map(|s| format!(" (scoped, {} objects)", s.len()))
             .unwrap_or_default();
+        // Finish the progress (no-op if None).
+        if let Some(p) = &progress {
+            p.finish(format!(
+                "Dry run ({src} -> {tgt}){scope}: {} would be created, {} would be deleted, {:.1}s",
+                plan.create_total(),
+                plan.delete_total(),
+                elapsed.as_secs_f64()
+            ));
+        }
         println!(
             "\nDry run ({src} -> {tgt}){scope}: {} would be created, {} would be deleted, \
              {:.1}s — no remote changes made.",
@@ -430,11 +434,18 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
             elapsed.as_secs_f64()
         );
     } else {
-        // Print apply summary (captured before bar finish, printed after).
-        println!("{apply_summary}");
         let scope = selection.as_ref()
             .map(|s| format!(" (scoped, {} objects)", s.len()))
             .unwrap_or_default();
+        // Finish the progress log so the success summary lands after all phase output.
+        if let Some(p) = &progress {
+            p.finish(format!(
+                "Deployed {src} -> {tgt}{scope}: {creates_done} created, {deletes_done} deleted, {api_calls} API calls, {:.1}s",
+                elapsed.as_secs_f64()
+            ));
+        }
+        // Print apply summary.
+        println!("{apply_summary}");
         println!(
             "\nDeployed {src} -> {tgt}{scope}: {creates_done} created, {deletes_done} deleted, \
              {} API calls, {:.1}s",

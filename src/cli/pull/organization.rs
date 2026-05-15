@@ -1,11 +1,11 @@
 use super::common::{apply_pull_action, decide_pull_action, record_object, PullAction, PullCtx};
 use crate::model::Organization;
-use crate::progress::OverallProgress;
+use crate::progress::ProgressLog;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
 /// Phase 1: fetch the org singleton from the API.
-pub async fn list(ctx: &PullCtx<'_>, org_id: u64, progress: &Arc<OverallProgress>) -> Result<Organization> {
+pub async fn list(ctx: &PullCtx<'_>, org_id: u64, progress: &Arc<ProgressLog>) -> Result<Organization> {
     ctx.client
         .get_organization(org_id, Some(progress.clone()))
         .await
@@ -13,8 +13,9 @@ pub async fn list(ctx: &PullCtx<'_>, org_id: u64, progress: &Arc<OverallProgress
 }
 
 /// Phase 2: write the org to disk. Returns `(count, conflicts)`.
-pub async fn process(ctx: &mut PullCtx<'_>, org: Organization, progress: &Arc<OverallProgress>) -> Result<(usize, usize)> {
-    progress.start_phase("organization");
+pub async fn process(ctx: &mut PullCtx<'_>, org: Organization, progress: &Arc<ProgressLog>) -> Result<(usize, usize)> {
+    let phase = progress.phase("pulling organization");
+    let sp = phase.item(&org.name);
 
     let path = ctx.paths.organization_file();
     if let Some(parent) = path.parent() {
@@ -45,7 +46,7 @@ pub async fn process(ctx: &mut PullCtx<'_>, org: Organization, progress: &Arc<Ov
         org.modified_at().map(|s| s.to_string()),
         Some(recorded_hash),
     );
-    progress.tick(&org.name);
+    sp.finish_ok("");
 
     Ok((1, conflicts))
 }

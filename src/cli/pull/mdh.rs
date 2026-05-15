@@ -2,7 +2,7 @@ use super::common::{apply_pull_action, decide_pull_action, record_object, PullAc
 use crate::api::{anyhow_has_status, DataStorageClient};
 use crate::config::EnvConfig;
 use crate::model::{Collection, IndexSet};
-use crate::progress::OverallProgress;
+use crate::progress::ProgressLog;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use futures::stream::{StreamExt, TryStreamExt};
@@ -19,7 +19,7 @@ pub struct MdhListed {
 
 /// Phase 1: list MDH collections (or return an empty list if MDH is not
 /// enabled on this cluster — 404 → quiet skip matching the 403 pattern).
-pub async fn list(env_cfg: &EnvConfig, token: &str, progress: &Arc<OverallProgress>) -> Result<MdhListed> {
+pub async fn list(env_cfg: &EnvConfig, token: &str, progress: &Arc<ProgressLog>) -> Result<MdhListed> {
     let base = env_cfg.data_storage_base();
     let client = DataStorageClient::new(base, token.to_string())
         .context("constructing Data Storage client")?;
@@ -50,9 +50,9 @@ pub async fn process(
     ctx: &mut PullCtx<'_>,
     listed: MdhListed,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<OverallProgress>,
+    progress: &Arc<ProgressLog>,
 ) -> Result<(usize, usize)> {
-    progress.start_phase("mdh");
+    let phase = progress.phase("pulling mdh");
 
     let MdhListed { client, collections } = listed;
 
@@ -141,6 +141,7 @@ pub async fn process(
     for (slug, dataset_dir, c) in &dataset_dirs {
         let Some(index_set) = by_slug.get(slug) else { continue };
 
+        let sp = phase.item(&c.name);
         let ix_path = dataset_dir.join("indexes.json");
         let mut ix_proposed = serde_json::to_vec_pretty(index_set).context("serializing index set")?;
         ix_proposed.push(b'\n');
@@ -165,7 +166,7 @@ pub async fn process(
             None,
             Some(i_recorded),
         );
-        progress.tick(&c.name);
+        sp.finish_ok("");
     }
 
     Ok((dataset_dirs.len(), conflicts))

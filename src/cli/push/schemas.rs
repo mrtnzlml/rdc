@@ -2,7 +2,7 @@ use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::OverallProgress;
+use crate::progress::ProgressLog;
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::schema::{read_schema_value, serialize_schema, write_schema_bytes};
 use crate::state::{schema_combined_hash, Lockfile, ObjectEntry};
@@ -21,12 +21,13 @@ pub async fn push(
     lockfile: &mut Lockfile,
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
-    progress: &Arc<OverallProgress>,
+    progress: &Arc<ProgressLog>,
     env: &str,
 ) -> Result<(usize, usize)> {
     let overlay = Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
+    let phase = progress.phase("pushing schemas");
     let mut pushed = 0usize;
     let mut skipped = 0usize;
     let mut remote_cache: std::collections::HashMap<u64, crate::model::Schema> =
@@ -37,6 +38,8 @@ pub async fn push(
         let queue_dir = schema_path.parent()
             .with_context(|| format!("schema path has no parent: {}", schema_path.display()))?;
         let overlay_paths = overlay.as_ref().and_then(|ov| ov.schema(q_slug));
+
+        let sp = phase.item(format!("schemas/{q_slug}"));
 
         // Missing lockfile entry → new schema, POST.
         if lockfile.objects.get("schemas").and_then(|m| m.get(q_slug.as_str())).is_none() {
@@ -63,15 +66,14 @@ pub async fn push(
                     content_hash: Some(created_hash),
                 },
             );
-            progress.println(format!("created schemas/{q_slug} (id {})", created.id));
-            progress.tick(q_slug.as_str());
+            sp.finish_ok(format!("→ POST (id {})", created.id));
             pushed += 1;
             continue;
         }
 
         let entry = lockfile.objects.get("schemas").and_then(|m| m.get(q_slug.as_str())).unwrap();
         let Some(base) = &entry.content_hash else {
-            progress.println(format!("warning: schema for queue '{q_slug}' — lockfile entry has no content_hash, skipping"));
+            sp.finish_warn("lockfile entry has no content_hash, skipping");
             skipped += 1;
             continue;
         };
@@ -124,13 +126,12 @@ pub async fn push(
                             content_hash: Some(remote_combined),
                         },
                     );
+                    sp.finish_warn("adopted remote (drift)");
                     skipped += 1;
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    progress.println(format!(
-                        "warning: schema for queue '{q_slug}' — remote has changed since last sync, skipping push (run `rdc sync` first)"
-                    ));
+                    sp.finish_warn("remote has changed since last sync, skipping push (run `rdc sync` first)");
                     skipped += 1;
                     continue;
                 }
@@ -156,7 +157,7 @@ pub async fn push(
                 content_hash: Some(updated_hash),
             },
         );
-        progress.tick(q_slug.as_str());
+        sp.finish_ok("→ PATCH");
         pushed += 1;
     }
 

@@ -3,14 +3,14 @@ use super::common::{
     skip_on_permission_denied, PullAction, PullCtx,
 };
 use crate::model::Label;
-use crate::progress::OverallProgress;
+use crate::progress::ProgressLog;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all labels from the API.
-pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<Vec<Label>> {
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<ProgressLog>) -> Result<Vec<Label>> {
     skip_on_permission_denied(
         ctx.client.list_labels(Some(progress.clone())).await.context("listing labels"),
         "labels",
@@ -20,16 +20,16 @@ pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<OverallProgress>) -> Result<
 
 /// Phase 2: write listed labels to disk. `subset` selects which `(kind, slug)`
 /// pairs are actually written — items outside the subset are skipped silently
-/// (no tick, no lockfile update). The sync dispatcher passes a subset filtered
+/// (no line, no lockfile update). The sync dispatcher passes a subset filtered
 /// by classification (only RemoteEdit/RemoteCreate items). Returns
 /// `(count, conflicts)` of items written.
 pub async fn process(
     ctx: &mut PullCtx<'_>,
     labels: Vec<Label>,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<OverallProgress>,
+    progress: &Arc<ProgressLog>,
 ) -> Result<(usize, usize)> {
-    progress.start_phase("labels");
+    let phase = progress.phase("pulling labels");
 
     let mut used: HashSet<String> = HashSet::new();
     let mut dir_created = false;
@@ -45,6 +45,8 @@ pub async fn process(
         if !subset.contains(&("labels".to_string(), slug.clone())) {
             continue;
         }
+
+        let sp = phase.item(&l.name);
 
         if !dir_created {
             std::fs::create_dir_all(ctx.paths.labels_dir())
@@ -83,7 +85,7 @@ pub async fn process(
             l.modified_at().map(|s| s.to_string()),
             Some(recorded_hash),
         );
-        progress.tick(&l.name);
+        sp.finish_ok("");
         written += 1;
     }
 
@@ -124,7 +126,7 @@ mod tests {
         )
         .unwrap();
         let mut lockfile = Lockfile::default();
-        let progress = OverallProgress::start("test");
+        let progress = ProgressLog::start("test");
 
         let mut ctx = PullCtx {
             paths: &paths,
@@ -140,7 +142,7 @@ mod tests {
         subset.insert(("labels".to_string(), "in-scope".to_string()));
 
         let (written, conflicts) = process(&mut ctx, labels, &subset, &progress).await.unwrap();
-        progress.finish();
+        progress.finish("test");
 
         assert_eq!(written, 1, "only the in-subset label should be written");
         assert_eq!(conflicts, 0);
