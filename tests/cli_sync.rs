@@ -10,10 +10,11 @@
 //! Subsequent tasks fill in per-kind hashing (T14–17) and the executor
 //! (T14–17); their integration tests will live alongside this one.
 
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tempfile::TempDir;
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 /// Global lock serializing tests that mutate process-global state
 /// (specifically `std::env::set_current_dir`). Cargo runs tests within a
@@ -2529,5 +2530,199 @@ async fn sync_watch_non_destructive_cycle_skips_confirm() {
         exists,
         "label should have been pulled despite interactive=true (auto-confirm should have skipped the prompt): {}",
         label_path.display()
+    );
+}
+
+/// Watch-mode polling end-to-end (Task 15). Proves that polling actually
+/// drives reconcile cycles — not just that the initial reconcile works.
+///
+/// Setup: one label is mounted statically on the server. With a short
+/// poll interval and a generous timeout, the initial reconcile pulls the
+/// label and at least one poll cycle re-lists `/api/v1/labels`. We assert
+/// both by counting the responder's invocations and by checking the file
+/// landed on disk. If the poll wiring is broken, the responder records
+/// exactly one hit and the call-count assertion fails.
+///
+/// Timing: each cycle costs ~1–2s in this harness (12 wiremock endpoints
+/// queried serially plus filesystem work), so the 6s timeout is sized
+/// for at least one full poll-driven cycle to complete after the initial
+/// reconcile. Tightening the timeout below ~5s makes the test flaky.
+#[tokio::test]
+async fn sync_watch_poll_catches_remote_drift() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // Single label, served on every call. We count invocations via a
+    // stateful responder so we can later assert that polling re-listed
+    // the endpoint at least once.
+    let server_uri = server.uri();
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let responder = {
+        let call_count = call_count.clone();
+        move |_req: &Request| {
+            call_count.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+                "results": [
+                    {
+                        "id": 31,
+                        "url": format!("{server_uri}/api/v1/labels/31"),
+                        "name": "Audit Hold",
+                        "organization": format!("{server_uri}/api/v1/organizations/1"),
+                        "color": "#00ff00",
+                        "modified_at": "2026-05-01T08:00:00Z"
+                    }
+                ]
+            }))
+        }
+    };
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(responder)
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/labels"]).await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // 200ms poll interval with a generous 6s overall timeout. Empirically
+    // each sync cycle hits ~10 listing endpoints serialised through
+    // wiremock — on CI a single cycle can take a few hundred ms, so the
+    // window must be wide enough for at least one poll-driven cycle to
+    // finish after the initial reconcile.
+    let res = tokio::time::timeout(
+        std::time::Duration::from_millis(6000),
+        rdc::cli::sync::watch::run_watch(
+            "dev", /* interactive = */ false, /* allow_deletes = */ false,
+            /* no_push = */ false, /* no_pull = */ false,
+            /* poll_interval = */ Some(std::time::Duration::from_millis(200)),
+            /* verbose = */ false,
+        ),
+    )
+    .await;
+    // The timeout fires after the polls have had a chance to run.
+    assert!(res.is_err(), "watch should still be blocked on ctrl_c, got {:?}", res);
+
+    let label_path = project.path().join("envs/dev/labels/audit-hold.json");
+    let exists = label_path.exists();
+    let calls = call_count.load(Ordering::SeqCst);
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    assert!(
+        exists,
+        "initial reconcile should have pulled the label to {}",
+        label_path.display()
+    );
+    assert!(
+        calls >= 2,
+        "polling should have re-listed /api/v1/labels at least once after the initial reconcile — got only {calls} hit(s)"
+    );
+}
+
+/// Watch-mode does not deadlock with concurrent one-shot `sync` (Task 15).
+/// The env lock inside `run_watch` is dropped after the initial reconcile
+/// and re-acquired only briefly around each cycle; so a one-shot
+/// `sync::run` issued while watch is blocked on ctrl_c must acquire the
+/// lock and complete.
+///
+/// We run watch with `poll_interval = None` so the lock is held only
+/// during the initial reconcile (no periodic cycles contending for it).
+/// After 300ms (well past the initial reconcile), the one-shot runs.
+/// Both futures share the same task — `run_cycle` is `!Send`, so
+/// `tokio::spawn` would not compile; `tokio::join!` polls them
+/// cooperatively on the current task instead.
+#[tokio::test]
+async fn sync_watch_does_not_deadlock_with_one_shot_sync() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &[]).await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // Watch future under a timeout — blocks on ctrl_c after the initial
+    // reconcile releases the env lock.
+    let watch_with_timeout = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        rdc::cli::sync::watch::run_watch(
+            "dev", /* interactive = */ false, /* allow_deletes = */ false,
+            /* no_push = */ false, /* no_pull = */ false,
+            /* poll_interval = */ None, /* verbose = */ false,
+        ),
+    );
+
+    // One-shot future: wait 300ms (long enough for the initial reconcile
+    // to release the lock), then run a normal `sync::run`.
+    let one_shot_fut = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        rdc::cli::sync::run(
+            "dev", /* interactive = */ false, /* dry_run = */ false,
+            /* diff = */ false, /* allow_deletes = */ false,
+            /* no_push = */ false, /* no_pull = */ false,
+        )
+        .await
+    };
+
+    // `tokio::join!` polls both futures on the current task — required
+    // because `run_cycle` is `!Send` and so neither future can be moved
+    // onto a spawned task.
+    let (watch_res, one_shot_res) = tokio::join!(watch_with_timeout, one_shot_fut);
+
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    // Watch should still be waiting on ctrl_c — timeout fired (Err).
+    assert!(
+        watch_res.is_err(),
+        "watch should have timed out on ctrl_c, not exited: {watch_res:?}"
+    );
+    // One-shot must have acquired the lock and completed.
+    assert!(
+        one_shot_res.is_ok(),
+        "one-shot sync should succeed while watch is idle on ctrl_c: {one_shot_res:?}"
     );
 }
