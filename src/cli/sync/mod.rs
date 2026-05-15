@@ -6,6 +6,7 @@ pub mod classify;
 pub mod execute;
 pub mod lock;
 pub mod plan;
+pub mod watch;
 
 use crate::api::RossumClient;
 use crate::config::ProjectConfig;

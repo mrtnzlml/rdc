@@ -82,6 +82,19 @@ pub enum Command {
         /// Deploy mode: write local edits to the remote but never overwrite local files.
         #[arg(long = "no-pull", conflicts_with = "no_push")]
         no_pull: bool,
+        /// Watch local files + poll the env continuously; reconcile on each event.
+        #[arg(long = "watch", conflicts_with_all = ["dry_run", "diff"])]
+        watch: bool,
+        /// Poll cadence for remote drift in watch mode. Accepts human durations
+        /// (`30s`, `2m`, `5m`). Default `60s`.
+        #[arg(long = "poll-interval", value_name = "DURATION", default_value = "60s", requires = "watch")]
+        poll_interval: String,
+        /// Disable remote polling in watch mode. Outbound (file-event) sync stays.
+        #[arg(long = "no-poll", requires = "watch", conflicts_with = "poll_interval")]
+        no_poll: bool,
+        /// Print every cycle in watch mode, including no-op cycles.
+        #[arg(short = 'v', long = "verbose", requires = "watch")]
+        verbose: bool,
     },
     /// Deploy a source env to a target env in one shot.
     ///
@@ -204,13 +217,44 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     match cli.command {
         Some(Command::Init { envs }) => crate::cli::init::run(envs).await,
-        Some(Command::Sync { env, dry_run, diff, allow_deletes, no_push, no_pull }) => {
+        Some(Command::Sync {
+            env,
+            dry_run,
+            diff,
+            allow_deletes,
+            no_push,
+            no_pull,
+            watch,
+            poll_interval,
+            no_poll,
+            verbose,
+        }) => {
             let env = crate::cli::env_picker::pick_env("Which env to sync?", env)?;
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
-            with_401_retry(&env, || {
-                crate::cli::sync::run(&env, interactive, dry_run, diff, allow_deletes, no_push, no_pull)
-            })
-            .await
+            if watch {
+                let poll = if no_poll {
+                    None
+                } else {
+                    Some(parse_duration(&poll_interval)?)
+                };
+                with_401_retry(&env, || {
+                    crate::cli::sync::watch::run_watch(
+                        &env,
+                        interactive,
+                        allow_deletes,
+                        no_push,
+                        no_pull,
+                        poll,
+                        verbose,
+                    )
+                })
+                .await
+            } else {
+                with_401_retry(&env, || {
+                    crate::cli::sync::run(&env, interactive, dry_run, diff, allow_deletes, no_push, no_pull)
+                })
+                .await
+            }
         }
         Some(Command::Deploy { src, tgt, mirror, dry_run, diff, only }) => {
             let src = crate::cli::env_picker::pick_env("Deploy from which env (source)?", src)?;
@@ -270,6 +314,26 @@ where
             op().await
         }
         other => other,
+    }
+}
+
+/// Parse a human-friendly duration string (`30s`, `2m`, `5m`, `1h`) into
+/// a [`std::time::Duration`]. Plain integers are treated as seconds.
+/// Used to validate `--poll-interval` after clap accepts it as a string.
+fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(
+        s.find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(s.len()),
+    );
+    let n: u64 = num.parse().map_err(|_| {
+        anyhow::anyhow!("invalid duration '{s}'; expected forms like '30s', '2m', '5m'")
+    })?;
+    match unit {
+        "s" | "" => Ok(std::time::Duration::from_secs(n)),
+        "m" => Ok(std::time::Duration::from_secs(n * 60)),
+        "h" => Ok(std::time::Duration::from_secs(n * 3600)),
+        _ => anyhow::bail!("invalid duration unit '{unit}'; use s / m / h"),
     }
 }
 
