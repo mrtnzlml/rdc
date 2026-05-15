@@ -8,10 +8,15 @@
 //! lock file is left behind; subsequent runs reuse it.
 
 use anyhow::{Context, Result};
-use fs4::fs_std::FileExt;
+use fs4::{FileExt, TryLockError};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::time::Duration;
+
+// Disambiguate from the inherent `try_lock` / `unlock` methods on
+// `std::fs::File` (stable since Rust 1.89). We call fs4's trait
+// methods explicitly via fully-qualified syntax below so the trait
+// import is genuinely used and the behaviour stays sourced from fs4.
 
 #[derive(Debug)]
 pub struct EnvLock {
@@ -37,9 +42,9 @@ impl EnvLock {
 
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            match file.try_lock_exclusive() {
+            match <File as FileExt>::try_lock(&file) {
                 Ok(()) => return Ok(EnvLock { file }),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(TryLockError::WouldBlock) => {
                     if std::time::Instant::now() >= deadline {
                         anyhow::bail!(
                             "timed out after {:?} waiting for env lock at {}",
@@ -49,7 +54,7 @@ impl EnvLock {
                     }
                     std::thread::sleep(Duration::from_millis(200));
                 }
-                Err(e) => {
+                Err(TryLockError::Error(e)) => {
                     return Err(e).with_context(|| {
                         format!("acquiring exclusive lock on {}", lock_path.display())
                     });
@@ -61,7 +66,7 @@ impl EnvLock {
 
 impl Drop for EnvLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = <File as FileExt>::unlock(&self.file);
     }
 }
 
