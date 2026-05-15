@@ -76,7 +76,7 @@ pub async fn run_watch(
     }
 
     let env_root = paths.env_root();
-    let _watcher = spawn_file_watcher(env.to_string(), env_root, events_tx.clone())?;
+    let watcher = spawn_file_watcher(env.to_string(), env_root.clone(), events_tx.clone())?;
 
     event_loop(
         env,
@@ -87,6 +87,8 @@ pub async fn run_watch(
         verbose,
         events_rx,
         shutdown_rx,
+        Some(watcher),
+        env_root,
     )
     .await?;
     eprintln!("\nstopping watch.");
@@ -104,7 +106,11 @@ pub(crate) async fn event_loop(
     verbose: bool,
     mut events: tokio::sync::mpsc::Receiver<CycleTrigger>,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
+    mut watcher: Option<notify::RecommendedWatcher>,
+    env_root: std::path::PathBuf,
 ) -> Result<()> {
+    use notify::{RecursiveMode, Watcher};
+
     let cwd = std::env::current_dir()?;
     let paths = crate::paths::Paths::for_env(&cwd, env);
 
@@ -122,6 +128,11 @@ pub(crate) async fn event_loop(
                 // (or during a previous cycle execution).
                 while events.try_recv().is_ok() {}
 
+                // Pause the watcher around our own writes to avoid feedback loops.
+                if let Some(w) = watcher.as_mut() {
+                    let _ = w.unwatch(&env_root);
+                }
+
                 let cycle_started = std::time::Instant::now();
                 let _lock = crate::cli::sync::lock::EnvLock::acquire(
                     &paths.env_lock(),
@@ -131,6 +142,13 @@ pub(crate) async fn event_loop(
                     env, interactive, false, false, allow_deletes, no_push, no_pull, true,
                 ).await?;
                 drop(_lock);
+
+                // Resume watching. Drop any events that arrived during the pause —
+                // those events are our own writes.
+                if let Some(w) = watcher.as_mut() {
+                    let _ = w.watch(&env_root, RecursiveMode::Recursive);
+                }
+                while events.try_recv().is_ok() {}
 
                 let elapsed = cycle_started.elapsed();
                 print_cycle_summary(&outcome, elapsed, verbose);
@@ -247,7 +265,10 @@ mod tests {
         std::env::set_current_dir(tmp.path()).unwrap();
 
         sh_tx.send(()).unwrap(); // shutdown before any event
-        let result = event_loop("test", false, false, false, false, false, rx, sh_rx).await;
+        let result = event_loop(
+            "test", false, false, false, false, false, rx, sh_rx,
+            None, std::path::PathBuf::new(),
+        ).await;
 
         std::env::set_current_dir(saved_cwd).unwrap();
         assert!(result.is_ok(), "{result:?}");
