@@ -663,9 +663,10 @@ fn prompt_hunk_by_hunk<R: BufRead, W: Write>(
                     output,
                     hunk_idx,
                     conflict_total,
-                    local_slice,
-                    remote_slice,
+                    &local_lines,
                     op.old_range(),
+                    &remote_lines,
+                    op.new_range(),
                     local_path,
                     env,
                     mode,
@@ -737,19 +738,41 @@ fn append_lines(out: &mut String, lines: &[&str]) {
 
 /// Render the per-hunk prompt and read the user's decision for a single
 /// hunk. The user can pick keep / remote / both / edit / skip / abort.
+///
+/// The display shows up to `CONTEXT` lines of equal context before and
+/// after the differing hunk so the user can orient themselves in the
+/// file. Equal lines are taken from `local_lines` and follow the
+/// unified-diff convention (leading space); the hunk's removed / added
+/// lines use `-` / `+`.
 #[allow(clippy::too_many_arguments)]
 fn prompt_single_hunk<R: BufRead, W: Write>(
     input: &mut R,
     output: &mut W,
     hunk_idx: usize,
     hunk_total: usize,
-    local_slice: &[&str],
-    remote_slice: &[&str],
+    local_lines: &[&str],
     local_range: std::ops::Range<usize>,
+    remote_lines: &[&str],
+    remote_range: std::ops::Range<usize>,
     local_path: &Path,
     env: &str,
     mode: ColorMode,
 ) -> Result<HunkOutcome> {
+    /// Lines of equal context to render before and after the hunk.
+    const CONTEXT: usize = 3;
+
+    let local_slice = &local_lines[local_range.clone()];
+    let remote_slice = &remote_lines[remote_range.clone()];
+
+    // Equal context comes from `local_lines` — by definition those
+    // lines are identical on the remote side (anything different would
+    // be inside a non-Equal hunk).
+    let prefix_start = local_range.start.saturating_sub(CONTEXT);
+    let prefix = &local_lines[prefix_start..local_range.start];
+
+    let suffix_end = local_range.end.saturating_add(CONTEXT).min(local_lines.len());
+    let suffix = &local_lines[local_range.end..suffix_end];
+
     writeln!(output)?;
     // Line numbers are 1-based and inclusive. An empty range (pure Insert
     // on the local side) still has start == end; show "after line N" instead.
@@ -770,6 +793,12 @@ fn prompt_single_hunk<R: BufRead, W: Write>(
     );
     writeln!(output, "{}", colorize_header(&header, mode))?;
 
+    // Context before the hunk: unified-diff convention prefixes equal
+    // lines with a single space (no color).
+    for line in prefix {
+        let stripped = line.strip_suffix('\n').unwrap_or(line);
+        writeln!(output, " {stripped}")?;
+    }
     for line in local_slice {
         let stripped = line.strip_suffix('\n').unwrap_or(line);
         let formatted = format!("-{stripped}");
@@ -779,6 +808,11 @@ fn prompt_single_hunk<R: BufRead, W: Write>(
         let stripped = line.strip_suffix('\n').unwrap_or(line);
         let formatted = format!("+{stripped}");
         writeln!(output, "{}", colorize_diff_line(&formatted, mode))?;
+    }
+    // Context after the hunk.
+    for line in suffix {
+        let stripped = line.strip_suffix('\n').unwrap_or(line);
+        writeln!(output, " {stripped}")?;
     }
     writeln!(output)?;
 
@@ -2079,6 +2113,49 @@ mod tests {
             &mut input, &mut output, &local, &remote, path, "production", ColorMode::Plain,
         ).unwrap();
         assert!(matches!(outcome, EditOutcome::Aborted), "got {outcome:?}");
+    }
+
+    #[test]
+    fn prompt_single_hunk_displays_surrounding_context() {
+        // Local has 10 lines, hunk at line 4 (one line changed). The
+        // display must render at least one line of equal context above
+        // and below the differing block, following the unified-diff
+        // convention (leading space).
+        let local = b"line1\nline2\nline3\nLOCAL_LINE\nline5\nline6\nline7\nline8\nline9\nline10\n";
+        let remote = b"line1\nline2\nline3\nREMOTE_LINE\nline5\nline6\nline7\nline8\nline9\nline10\n";
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.py");
+        std::fs::write(&path, local).unwrap();
+
+        let mut input = Cursor::new(b"s\n".to_vec());
+        let mut output: Vec<u8> = Vec::new();
+        let _ = prompt_hunk_by_hunk(
+            &mut input,
+            &mut output,
+            local,
+            remote,
+            &path,
+            "test",
+            ColorMode::Plain,
+        )
+        .unwrap();
+
+        let s = String::from_utf8_lossy(&output);
+        // The differing lines themselves:
+        assert!(s.contains("-LOCAL_LINE"), "diff should show local-removed: {s}");
+        assert!(s.contains("+REMOTE_LINE"), "diff should show remote-added: {s}");
+        // Surrounding context — at least one of the lines before / after
+        // the hunk must appear with the leading-space prefix that the
+        // unified-diff convention uses for equal lines.
+        assert!(
+            s.contains(" line1") || s.contains(" line2") || s.contains(" line3"),
+            "should include lines preceding the hunk as context: {s}"
+        );
+        assert!(
+            s.contains(" line5") || s.contains(" line6") || s.contains(" line7"),
+            "should include lines following the hunk as context: {s}"
+        );
     }
 
     #[test]
