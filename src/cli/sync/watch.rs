@@ -60,7 +60,6 @@ pub async fn run_watch(
         let _ = shutdown_tx.send(());
     });
 
-    // TODO Task 9: wire file watcher into events_tx.
     if let Some(interval_duration) = poll_interval {
         let tx = events_tx.clone();
         tokio::spawn(async move {
@@ -75,7 +74,9 @@ pub async fn run_watch(
             }
         });
     }
-    let _ = events_tx; // suppress unused for now
+
+    let env_root = paths.env_root();
+    let _watcher = spawn_file_watcher(env.to_string(), env_root, events_tx.clone())?;
 
     event_loop(
         env,
@@ -181,6 +182,46 @@ fn now_hhmmss() -> String {
     format!("{h:02}:{m:02}:{s:02}")
 }
 
+fn spawn_file_watcher(
+    env: String,
+    env_root: std::path::PathBuf,
+    tx: tokio::sync::mpsc::Sender<CycleTrigger>,
+) -> Result<notify::RecommendedWatcher> {
+    use notify::{RecursiveMode, Watcher};
+
+    let event_handler = move |result: notify::Result<notify::Event>| {
+        let Ok(event) = result else {
+            return;
+        };
+        for path in &event.paths {
+            if path_should_be_ignored(path, &env) {
+                continue;
+            }
+            // Non-blocking send: if the channel is full, the cycle worker is
+            // behind — dropping a triggering event is fine since events
+            // coalesce anyway.
+            let _ = tx.blocking_send(CycleTrigger::FileEvent);
+            return;
+        }
+    };
+
+    let mut watcher = notify::recommended_watcher(event_handler)?;
+    watcher.watch(&env_root, RecursiveMode::Recursive)?;
+    Ok(watcher)
+}
+
+fn path_should_be_ignored(path: &std::path::Path, env: &str) -> bool {
+    // Ignore .rdc/ subtree — daemon-managed.
+    if path.components().any(|c| c.as_os_str() == ".rdc") {
+        return true;
+    }
+    // Ignore shadow artifacts.
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    crate::paths::is_shadow_artifact(name, env)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +276,37 @@ mod tests {
         tokio::time::advance(Duration::from_secs(60)).await;
         let evt = rx.recv().await.unwrap();
         assert_eq!(evt, CycleTrigger::Poll);
+    }
+
+    #[test]
+    fn path_should_be_ignored_rejects_rdc_subtree() {
+        assert!(path_should_be_ignored(
+            std::path::Path::new("/proj/.rdc/state/test.lock.json"),
+            "test"
+        ));
+    }
+
+    #[test]
+    fn path_should_be_ignored_rejects_shadow_files() {
+        assert!(path_should_be_ignored(
+            std::path::Path::new("/proj/envs/test/labels/a.json.test"),
+            "test"
+        ));
+        assert!(path_should_be_ignored(
+            std::path::Path::new("/proj/envs/test/labels/a.json.test-deleted"),
+            "test"
+        ));
+    }
+
+    #[test]
+    fn path_should_be_ignored_accepts_normal_files() {
+        assert!(!path_should_be_ignored(
+            std::path::Path::new("/proj/envs/test/labels/a.json"),
+            "test"
+        ));
+        assert!(!path_should_be_ignored(
+            std::path::Path::new("/proj/envs/test/overlay.toml"),
+            "test"
+        ));
     }
 }
