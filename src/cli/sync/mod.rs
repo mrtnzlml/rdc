@@ -174,7 +174,7 @@ pub(crate) async fn run_cycle(
     }
 
     // Phase 5: execute. Stub today — fills in across subsequent tasks.
-    {
+    let outcome = {
         let mut ctx = crate::cli::pull::common::PullCtx {
             paths: &paths,
             client: &client,
@@ -192,8 +192,8 @@ pub(crate) async fn run_cycle(
             interactive,
             &progress,
         )
-        .await?;
-    }
+        .await?
+    };
 
     lockfile.save(&paths.lockfile())?;
     crate::cli::index::generate(&paths, &lockfile)
@@ -201,7 +201,7 @@ pub(crate) async fn run_cycle(
 
     progress.finish();
     println!("Synced envs/{env}.");
-    Ok(CycleOutcome::default())
+    Ok(outcome)
 }
 
 /// y/N confirmation prompt on stdin/stdout. Returns false for any input

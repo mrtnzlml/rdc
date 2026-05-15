@@ -1465,7 +1465,38 @@ pub async fn run(
     no_pull: bool,
     interactive: bool,
     progress: &Arc<OverallProgress>,
-) -> Result<()> {
+) -> Result<crate::cli::sync::CycleOutcome> {
+    // Tally cycle counters up front by inspecting the static classification.
+    // The dispatch branches below may early-return on user abort or
+    // upstream errors; counting here keeps the watch summary aligned with
+    // the plan the user saw rather than with whatever the dispatch managed
+    // to push through. `no_push` / `no_pull` suppress the corresponding
+    // counters so the summary matches what was actually attempted.
+    let mut outcome = crate::cli::sync::CycleOutcome::default();
+    for it in classified {
+        match it.class {
+            SyncClass::LocalEdit | SyncClass::LocalCreate | SyncClass::LocalDelete => {
+                if !no_push {
+                    outcome.items_pushed += 1;
+                }
+            }
+            SyncClass::RemoteEdit | SyncClass::RemoteCreate => {
+                if !no_pull {
+                    outcome.items_pulled += 1;
+                }
+            }
+            SyncClass::BothDiverged
+            | SyncClass::LocalEditRemoteDelete
+            | SyncClass::LocalDeleteRemoteEdit => {
+                outcome.conflicts += 1;
+            }
+            SyncClass::RemoteDelete => {
+                outcome.remote_deletes_resolved += 1;
+            }
+            SyncClass::Clean | SyncClass::BothDeleted => {}
+        }
+    }
+
     // Phase A: conflicts. Runs first so the user resolves drift before
     // the executor commits to either side. The stdin read here is the
     // only blocking-on-user-input call in the executor; the helper takes
@@ -1655,7 +1686,7 @@ pub async fn run(
         }
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 #[cfg(test)]
