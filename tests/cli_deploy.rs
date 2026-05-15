@@ -1750,3 +1750,74 @@ async fn deploy_only_dry_run_makes_no_api_calls() {
     assert_eq!(*post_or_patch.lock().unwrap(), 0,
         "dry-run must make no write API calls");
 }
+
+/// Deploy must wait for the target env's lock before entering its write
+/// phase. A separate thread holds the prod lock for ~600ms; we then spawn
+/// `rdc deploy test prod` and assert it spent at least 400ms blocked on
+/// lock acquisition before returning.
+#[tokio::test]
+async fn deploy_waits_for_tgt_env_lock() {
+    use rdc::cli::sync::lock::EnvLock;
+    use std::time::Duration;
+
+    let tmp = TempDir::new().unwrap();
+    let project_dir = tmp.path().to_path_buf();
+
+    // Hold the prod lock for 600ms in a background thread.
+    let lock_dir = project_dir.join(".rdc/state");
+    std::fs::create_dir_all(&lock_dir).unwrap();
+    let lock_path = lock_dir.join("prod.lock");
+    let blocker = std::thread::spawn({
+        let lock_path = lock_path.clone();
+        move || {
+            let l = EnvLock::acquire(&lock_path, Duration::from_secs(2)).unwrap();
+            std::thread::sleep(Duration::from_millis(600));
+            drop(l);
+        }
+    });
+
+    // Give the blocker thread time to acquire.
+    std::thread::sleep(Duration::from_millis(50));
+
+    // Minimum project layout — empty snapshots, both envs point at an
+    // unreachable URL. We don't need a real deploy to succeed; we only
+    // need execution to reach the lock-acquisition point. With empty
+    // snapshots the store-extension prepass exits early without API
+    // calls, and the (empty) plan skips the confirm.
+    std::fs::write(
+        project_dir.join("rdc.toml"),
+        r#"[envs.test]
+api_base = "http://127.0.0.1:1/api/v1"
+org_id = 1
+[envs.prod]
+api_base = "http://127.0.0.1:1/api/v1"
+org_id = 1
+"#,
+    ).unwrap();
+    std::fs::create_dir_all(project_dir.join("secrets")).unwrap();
+    std::fs::write(project_dir.join("secrets/test.secrets.json"), r#"{"api_token":"t"}"#).unwrap();
+    std::fs::write(project_dir.join("secrets/prod.secrets.json"), r#"{"api_token":"t"}"#).unwrap();
+    std::fs::create_dir_all(project_dir.join("envs/test")).unwrap();
+    std::fs::create_dir_all(project_dir.join("envs/prod")).unwrap();
+
+    let start = std::time::Instant::now();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rdc"))
+        .args(["--yes", "deploy", "test", "prod"])
+        .current_dir(&project_dir)
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    blocker.join().unwrap();
+
+    // Deploy may succeed or fail (the API URL is unreachable). What
+    // matters is the elapsed time — it must have waited for the lock.
+    // 400ms (a little less than 500) accommodates thread-start jitter.
+    assert!(
+        elapsed >= Duration::from_millis(400),
+        "deploy returned too quickly ({elapsed:?}); should have waited for the lock. \
+         stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}

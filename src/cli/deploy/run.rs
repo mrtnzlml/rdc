@@ -217,6 +217,16 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
         }
     }
 
+    // Acquire an exclusive lock on the target env for the duration of the
+    // write phase (creates + applies). Sync (one-shot or --watch) targeting
+    // `tgt` will wait briefly here; deploy will wait briefly if a sync is
+    // mid-cycle. Source env stays read-only — atomic-rename consistency
+    // suffices for reading its snapshot.
+    let _tgt_lock = crate::cli::sync::lock::EnvLock::acquire(
+        &tgt_paths.env_lock(),
+        std::time::Duration::from_secs(30),
+    )?;
+
     // Start the progress bar for the work phase (not in dry-run).
     let progress: Option<Arc<OverallProgress>> = if !dry_run {
         Some(OverallProgress::start(format!("deploy {src} -> {tgt}")))
