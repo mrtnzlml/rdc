@@ -140,9 +140,11 @@ pub(crate) async fn run_cycle(
     let classified = from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile);
 
     // Phase 4: plan + confirm. `--dry-run` exits here without writing.
-    let plan_text = crate::cli::sync::plan::render_plan(env, &classified);
-    print!("{plan_text}");
+    // The plan render is the explicit preview for `--dry-run`; regular
+    // runs rely on the per-item event log instead of an upfront inventory.
     if dry_run {
+        let plan_text = crate::cli::sync::plan::render_plan(env, &classified);
+        print!("{plan_text}");
         // `--diff` rendering will hook in here once the executor is
         // wired; defer until per-object bodies are available.
         let _ = diff;
