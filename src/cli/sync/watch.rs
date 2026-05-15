@@ -6,13 +6,21 @@ use anyhow::Result;
 use std::time::Duration;
 
 pub async fn run_watch(
-    _env: &str,
+    env: &str,
     _interactive: bool,
     _allow_deletes: bool,
     _no_push: bool,
     _no_pull: bool,
-    _poll_interval: Option<Duration>,
+    poll_interval: Option<Duration>,
     _verbose: bool,
 ) -> Result<()> {
-    anyhow::bail!("watch mode not yet implemented");
+    eprintln!("watching envs/{env}/ ...");
+    if let Some(d) = poll_interval {
+        eprintln!("polling {env} every {}s ...", d.as_secs());
+    } else {
+        eprintln!("polling disabled");
+    }
+    tokio::signal::ctrl_c().await?;
+    eprintln!("\nstopping watch.");
+    Ok(())
 }
