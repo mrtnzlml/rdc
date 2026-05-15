@@ -60,9 +60,22 @@ pub async fn run_watch(
         let _ = shutdown_tx.send(());
     });
 
-    // TODO Task 8/9: wire file watcher + poll timer into events_tx.
+    // TODO Task 9: wire file watcher into events_tx.
+    if let Some(interval_duration) = poll_interval {
+        let tx = events_tx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval_duration);
+            // skip the immediate first tick — initial reconcile already ran
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                if tx.send(CycleTrigger::Poll).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
     let _ = events_tx; // suppress unused for now
-    let _ = poll_interval; // suppress unused for now
 
     event_loop(
         env,
@@ -192,5 +205,35 @@ mod tests {
 
         std::env::set_current_dir(saved_cwd).unwrap();
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_interval_produces_one_event_per_tick() {
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::channel::<CycleTrigger>(8);
+        let interval = Duration::from_secs(60);
+        let _h = tokio::spawn(async move {
+            let mut t = tokio::time::interval(interval);
+            t.tick().await; // skip first
+            loop {
+                t.tick().await;
+                if tx.send(CycleTrigger::Poll).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Advance time by 70 s — should produce exactly one Poll.
+        tokio::time::advance(Duration::from_secs(70)).await;
+        let evt = rx.recv().await.unwrap();
+        assert_eq!(evt, CycleTrigger::Poll);
+        assert!(rx.try_recv().is_err(), "second event arrived too soon");
+
+        // Advance another 60 s — second Poll.
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let evt = rx.recv().await.unwrap();
+        assert_eq!(evt, CycleTrigger::Poll);
     }
 }
