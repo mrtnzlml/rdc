@@ -425,6 +425,10 @@ Server-computed back-references like `queue.hooks` or `email_template.triggers` 
 
 `POST /queues` triggers Rossum to auto-create five default email templates per queue. Deploy lists them right after each queue POST, captures them into the tgt lockfile, and the later update sweep PATCHes them with src-side customisations. You don't see this; it just works.
 
+### Cross-env diff
+
+`rdc diff <src> <tgt>` reuses the same machinery to keep the output focused on semantic drift. It strips env-specific noise (`id`, `url`, `organization`, server timestamps, computed back-refs) on both sides, and — if `.rdc/map/<src>-to-<tgt>.toml` exists — rewrites cross-reference URLs on the src side into their tgt form using the saved mapping. Same-content objects compare equal; deploy-managed ID and URL changes are silent. Without the mapping file the diff still strips top-level noise but cross-reference URLs (`hook.queues`, `queue.workspace`, …) show as differences.
+
 ## Overlays — per-env values
 
 Some values are intrinsically per-env: a friendly display name, a hardened runtime version, a webhook URL pointing at the env's own observability endpoint. `envs/<env>/overlay.toml` declares them once:

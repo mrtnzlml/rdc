@@ -6,6 +6,7 @@
 use crate::api::RossumClient;
 use crate::cli::resolve::line_diff;
 use crate::config::ProjectConfig;
+use crate::mapping::Mapping;
 use crate::paths::Paths;
 use crate::secrets::resolve_token;
 use crate::snapshot::email_template::read_email_template;
@@ -16,6 +17,21 @@ use crate::snapshot::schema::{read_schema, serialize_schema};
 use crate::state::Lockfile;
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
+
+/// Context for src-side canonicalisation in `rdc diff <src> <tgt>`. When
+/// present, cross-reference URL strings on the src side are rewritten into
+/// their tgt equivalents (per the deploy-managed mapping) so the line-diff
+/// reports semantic drift only, not deploy-managed ID renumbering.
+///
+/// All three fields must be present for rewriting to be useful — the
+/// mapping pairs slugs, the src lockfile resolves URLs → slugs, the tgt
+/// lockfile resolves slugs → URLs. Missing any one falls back to noise
+/// stripping alone.
+struct RewriteCtx<'a> {
+    mapping: &'a Mapping,
+    src_lockfile: &'a Lockfile,
+    tgt_lockfile: &'a Lockfile,
+}
 
 pub async fn run(left: String, right: Option<String>) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
@@ -226,6 +242,24 @@ fn diff_snapshot_vs_snapshot(cwd: &Path, src: &str, tgt: &str) -> Result<()> {
 
     let mut diffs_printed = 0usize;
 
+    // Try to load the deploy-managed mapping and both lockfiles so URL
+    // cross-references on the src side can be rewritten into their tgt
+    // equivalents before line-diffing. Any missing piece degrades to
+    // noise-stripping only — the diff still works, it just shows
+    // deploy-managed URLs as differences.
+    let mapping_path = src_paths.mapping_file(src, tgt);
+    let mapping = if mapping_path.exists() {
+        Mapping::load(&mapping_path).ok()
+    } else {
+        None
+    };
+    let src_lockfile = Lockfile::load(&src_paths.lockfile()).ok();
+    let tgt_lockfile = Lockfile::load(&tgt_paths.lockfile()).ok();
+    let ctx = match (mapping.as_ref(), src_lockfile.as_ref(), tgt_lockfile.as_ref()) {
+        (Some(m), Some(s), Some(t)) => Some(RewriteCtx { mapping: m, src_lockfile: s, tgt_lockfile: t }),
+        _ => None,
+    };
+
     // Diff every JSON file pairwise. Walk both trees and union the file
     // set; for each file present in both, diff bytes; for added/removed,
     // print a single-sided header.
@@ -241,9 +275,12 @@ fn diff_snapshot_vs_snapshot(cwd: &Path, src: &str, tgt: &str) -> Result<()> {
                 // Strip cross-env noise (`id`, `url`, `organization`,
                 // server-managed timestamps, server-computed back-refs)
                 // before diffing — those fields always differ between
-                // envs and bury the real changes.
-                let left_norm = normalize_for_diff(&rel, left);
-                let right_norm = normalize_for_diff(&rel, right);
+                // envs and bury the real changes. When the deploy-managed
+                // mapping is available, also rewrite src-side
+                // cross-reference URLs (queue.workspace, hook.queues, …)
+                // into their tgt form so paired objects compare equal.
+                let left_norm = normalize_for_diff(&rel, left, ctx.as_ref());
+                let right_norm = normalize_for_diff(&rel, right, None);
                 if left_norm != right_norm {
                     let ls = String::from_utf8_lossy(&left_norm);
                     let rs = String::from_utf8_lossy(&right_norm);
@@ -281,7 +318,12 @@ fn diff_snapshot_vs_snapshot(cwd: &Path, src: &str, tgt: &str) -> Result<()> {
 /// - JSON files of an unrecognised kind get pretty-printed so per-field
 ///   changes diff on their own lines.
 /// - Non-JSON files (`.py`, `.toml`, `.md`) pass through unchanged.
-fn normalize_for_diff(rel: &str, bytes: &[u8]) -> Vec<u8> {
+///
+/// When `rewrite_ctx` is `Some`, cross-reference URL strings in the JSON
+/// are also rewritten src → tgt using the deploy-managed mapping. Pass
+/// `Some(...)` on the src side and `None` on the tgt side so paired
+/// objects compare byte-equal after canonicalisation.
+fn normalize_for_diff(rel: &str, bytes: &[u8], rewrite_ctx: Option<&RewriteCtx<'_>>) -> Vec<u8> {
     if !rel.ends_with(".json") {
         return bytes.to_vec();
     }
@@ -289,6 +331,12 @@ fn normalize_for_diff(rel: &str, bytes: &[u8]) -> Vec<u8> {
         if let Ok(normalized) =
             crate::cli::deploy::common::normalize_for_cross_env_compare(bytes, kind)
         {
+            // If we have a mapping context, rewrite cross-reference URLs
+            // on this side (only called on the src side for two-snapshot
+            // diff) so paired objects compare byte-equal.
+            if let Some(ctx) = rewrite_ctx {
+                return rewrite_urls_in_bytes(&normalized, ctx);
+            }
             return normalized;
         }
     }
@@ -302,6 +350,31 @@ fn normalize_for_diff(rel: &str, bytes: &[u8]) -> Vec<u8> {
         }
     }
     bytes.to_vec()
+}
+
+/// Parse `bytes` as JSON, rewrite every URL string that matches a known
+/// src object into its tgt equivalent (via the deploy-managed mapping),
+/// and re-serialise. Returns `bytes` unchanged if parsing or re-serialising
+/// fails — the caller still gets a readable, noise-stripped diff in that
+/// case, just without URL rewriting.
+fn rewrite_urls_in_bytes(bytes: &[u8], ctx: &RewriteCtx<'_>) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return bytes.to_vec();
+    };
+    crate::cli::deploy::common::rewrite_urls(
+        &mut value,
+        ctx.src_lockfile,
+        ctx.tgt_lockfile,
+        ctx.mapping,
+        &std::collections::BTreeMap::new(),
+    );
+    let Ok(mut out) = serde_json::to_vec_pretty(&value) else {
+        return bytes.to_vec();
+    };
+    if !out.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+    out
 }
 
 /// Map a snapshot-relative path to its Rossum kind. Returns `None` for
