@@ -553,11 +553,44 @@ fn resolve_one_conflict<R: BufRead>(
         // subsequent runs. Defensive fallback: when there is no prior
         // base (a conflict without a base is unusual), use the local
         // hash so the lockfile still gets a sensible entry.
-        let conflict_path = crate::paths::shadow_path_for(&local_path, env);
-        write_atomic(&conflict_path, &remote_bytes)?;
+        //
+        // Split-file kinds: when the JSON portions canonicalize-equal
+        // but the code sidecars differ (the user-reported BothDiverged
+        // scenario for hooks/rules), land the shadow next to the
+        // sidecar so the user sees the actual divergence — a `.json.<env>`
+        // shadow with byte-identical-to-local content would be
+        // misleading.
+        let (shadow_anchor, shadow_bytes): (&std::path::Path, Vec<u8>) =
+            match hash_strategy {
+                HashStrategy::Hook | HashStrategy::Rule => {
+                    let local_json = std::fs::read(&local_path).unwrap_or_default();
+                    let local_json_canon =
+                        crate::snapshot::noise::canonicalize_for_hash(&local_json);
+                    let remote_json_canon =
+                        crate::snapshot::noise::canonicalize_for_hash(&remote_bytes);
+                    let local_code = if code_path.exists() {
+                        std::fs::read_to_string(&code_path).ok()
+                    } else {
+                        None
+                    };
+                    let symmetric =
+                        matches!((&local_code, &remote_code), (Some(_), Some(_)));
+                    let codes_differ = local_code.as_deref() != remote_code.as_deref();
+                    if local_json_canon == remote_json_canon && symmetric && codes_differ {
+                        let remote_code_bytes =
+                            remote_code.clone().unwrap_or_default().into_bytes();
+                        (code_path.as_path(), remote_code_bytes)
+                    } else {
+                        (local_path.as_path(), remote_bytes.clone())
+                    }
+                }
+                HashStrategy::Flat => (local_path.as_path(), remote_bytes.clone()),
+            };
+        let conflict_path = crate::paths::shadow_path_for(shadow_anchor, env);
+        write_atomic(&conflict_path, &shadow_bytes)?;
         progress.println(format!(
             "warn: {} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
-            local_path.display(),
+            shadow_anchor.display(),
             conflict_path.display(),
         ));
         let preserved_hash = match it.base_hash.as_deref() {
@@ -589,13 +622,56 @@ fn resolve_one_conflict<R: BufRead>(
         return Ok(());
     }
 
+    // Split-file kinds (`hooks`, `rules`) carry their executable code in
+    // a sibling sidecar. The JSON portions can be byte-identical (e.g.,
+    // only `.py` was edited on both sides) while the combined hash
+    // differs — that's why the classifier put us here. Pointing the
+    // prompt at `local_path` (the `.json`) would let `prompt_resolve`
+    // short-circuit to `KeepLocal` on canonicalize-equal JSON, silently
+    // promoting the item to push without ever showing a prompt. To
+    // avoid that, when the JSON portions canonicalize-equal but the
+    // code portions differ AND both sides actually carry code (so the
+    // sidecar exists locally and remote has a `config.code`),
+    // redirect the prompt at the sidecar instead so the user sees the
+    // code conflict. Asymmetric cases (one side has code, the other
+    // doesn't) fall through to the JSON-based prompt; the legacy
+    // shadow-file flow in `pull::hooks` handles those separately.
+    // `code_conflict_only` tracks that redirection so the resolution
+    // branches below write the user's choice to the sidecar (not to
+    // `local_path`).
+    let mut code_conflict_only = false;
+    let (prompt_path, prompt_remote_bytes): (PathBuf, Vec<u8>) = match hash_strategy {
+        HashStrategy::Hook | HashStrategy::Rule => {
+            let local_json = std::fs::read(&local_path).unwrap_or_default();
+            let local_json_canon =
+                crate::snapshot::noise::canonicalize_for_hash(&local_json);
+            let remote_json_canon =
+                crate::snapshot::noise::canonicalize_for_hash(&remote_bytes);
+            let local_code = if code_path.exists() {
+                std::fs::read_to_string(&code_path).ok()
+            } else {
+                None
+            };
+            let symmetric = matches!((&local_code, &remote_code), (Some(_), Some(_)));
+            let codes_differ = local_code.as_deref() != remote_code.as_deref();
+            if local_json_canon == remote_json_canon && symmetric && codes_differ {
+                code_conflict_only = true;
+                let remote_code_str = remote_code.clone().unwrap_or_default();
+                (code_path.clone(), remote_code_str.into_bytes())
+            } else {
+                (local_path.clone(), remote_bytes.clone())
+            }
+        }
+        HashStrategy::Flat => (local_path.clone(), remote_bytes.clone()),
+    };
+
     let resolution = prompt_resolve(
         input,
         stderr_lock,
         idx_one_based,
         total,
-        &local_path,
-        &remote_bytes,
+        &prompt_path,
+        &prompt_remote_bytes,
         env,
     )?;
 
@@ -673,11 +749,15 @@ fn resolve_one_conflict<R: BufRead>(
         Resolution::Edit(edited) => {
             // Fully-resolved edit — write bytes to disk and align base to
             // remote so push drift detection succeeds, then promote the
-            // item to the push pipeline.
-            if let Some(parent) = local_path.parent() {
+            // item to the push pipeline. When the prompt was redirected
+            // to the code sidecar (`code_conflict_only`), the edited
+            // bytes are code, not JSON, and must land on the sidecar
+            // path; the JSON file is untouched.
+            let edit_target = if code_conflict_only { &code_path } else { &local_path };
+            if let Some(parent) = edit_target.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
-            write_atomic(&local_path, &edited)?;
+            write_atomic(edit_target, &edited)?;
             let remote_hash = hash_strategy.hash(&remote_bytes, &remote_code);
             crate::cli::pull::common::record_object(
                 ctx.lockfile,
@@ -699,13 +779,15 @@ fn resolve_one_conflict<R: BufRead>(
             // pull/sync re-classifies the slug as a conflict — otherwise
             // the markers get silently baked in as the new base.
             // No push promotion either (the API would reject markers).
-            if let Some(parent) = local_path.parent() {
+            // When prompt was on the sidecar, edited bytes are code.
+            let edit_target = if code_conflict_only { &code_path } else { &local_path };
+            if let Some(parent) = edit_target.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
-            write_atomic(&local_path, &edited)?;
+            write_atomic(edit_target, &edited)?;
             progress.println(format!(
                 "warn: {} partially resolved (markers retained); lockfile base preserved; re-run to resolve",
-                local_path.display(),
+                edit_target.display(),
             ));
             let preserved_hash = match it.base_hash.as_deref() {
                 Some(prior) => prior.to_string(),
@@ -722,15 +804,19 @@ fn resolve_one_conflict<R: BufRead>(
             );
         }
         Resolution::Skip => {
-            // Shadow-file fallback. Write `<file>.<env>` with the remote
-            // bytes, keep local on disk, pin the lockfile to the prior
-            // base so subsequent runs re-prompt. Defensive fallback (no
-            // prior base) uses the local hash to keep a sensible entry.
-            let conflict_path = crate::paths::shadow_path_for(&local_path, env);
-            write_atomic(&conflict_path, &remote_bytes)?;
+            // Shadow-file fallback. Write `<prompt>.<env>` with the
+            // remote bytes (the same content the prompt would have
+            // shown), keep local on disk, pin the lockfile to the prior
+            // base so subsequent runs re-prompt. When the prompt was
+            // redirected to the sidecar, the shadow file lands next to
+            // the sidecar; this way the user gets a `.py.<env>` shadow
+            // showing the remote code, not a redundant copy of an
+            // identical-to-local `.json`.
+            let conflict_path = crate::paths::shadow_path_for(&prompt_path, env);
+            write_atomic(&conflict_path, &prompt_remote_bytes)?;
             progress.println(format!(
                 "warn: {} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
-                local_path.display(),
+                prompt_path.display(),
                 conflict_path.display(),
             ));
             let preserved_hash = match it.base_hash.as_deref() {
@@ -2748,6 +2834,330 @@ mod tests {
         assert!(
             !marker.exists(),
             "BothDeleted must not write a deleted-marker"
+        );
+    }
+
+    /// Build a minimal RemoteCatalog with the given hooks. Same shape as
+    /// `catalog_with_labels` but seeds the hooks slot.
+    fn catalog_with_hooks(hooks: Vec<crate::model::Hook>) -> RemoteCatalog {
+        let mut c = catalog_with_labels(vec![]);
+        c.hooks = hooks;
+        c
+    }
+
+    /// Helper used by the next two tests. Stages a `BothDiverged` hook
+    /// where the JSON portions are byte-identical (post-canonicalize)
+    /// but the `.py` sidecars differ on both sides. Returns everything
+    /// the caller needs to drive `resolve_conflicts` and verify the
+    /// resolution effects.
+    fn setup_hook_code_only_conflict() -> (
+        tempfile::TempDir,
+        Paths,
+        Lockfile,
+        std::path::PathBuf, /* json path */
+        std::path::PathBuf, /* py path */
+        RemoteCatalog,
+        Vec<ClassifiedItem>,
+        String, /* base_combined */
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+
+        let slug = "ap-reject-if-no-doc-id";
+        let local_json_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "id": 42,
+            "url": "https://x.invalid/api/v1/hooks/42",
+            "name": "ap-reject-if-no-doc-id",
+            "type": "function",
+            "queues": [],
+            "events": ["annotation_content"],
+            "config": { "runtime": "python3.12" }
+        }))
+        .unwrap();
+        let mut local_json_with_newline = local_json_bytes;
+        local_json_with_newline.push(b'\n');
+        let local_json_path = paths.hooks_dir().join(format!("{slug}.json"));
+        let local_py_path = paths.hooks_dir().join(format!("{slug}.py"));
+        std::fs::write(&local_json_path, &local_json_with_newline).unwrap();
+        std::fs::write(&local_py_path, b"def local_edit():\n    return 2\n").unwrap();
+
+        let remote_hook: crate::model::Hook = serde_json::from_value(serde_json::json!({
+            "id": 42,
+            "url": "https://x.invalid/api/v1/hooks/42",
+            "name": "ap-reject-if-no-doc-id",
+            "type": "function",
+            "queues": [],
+            "events": ["annotation_content"],
+            "config": {
+                "runtime": "python3.12",
+                "code": "def remote_edit():\n    return 3\n"
+            },
+            "modified_at": "2026-05-14T10:00:00Z"
+        }))
+        .unwrap();
+
+        let base_code = "def base():\n    return 1\n".to_string();
+        let base_combined =
+            crate::state::hook_combined_hash(&local_json_with_newline, &Some(base_code));
+        let mut lockfile = Lockfile::default();
+        lockfile.upsert(
+            "hooks",
+            slug,
+            ObjectEntry {
+                id: 42,
+                url: Some("https://x.invalid/api/v1/hooks/42".to_string()),
+                modified_at: Some("2026-05-14T08:00:00Z".to_string()),
+                content_hash: Some(base_combined.clone()),
+            },
+        );
+
+        let catalog = catalog_with_hooks(vec![remote_hook.clone()]);
+
+        let (remote_json_full, remote_code) =
+            crate::snapshot::hook::serialize_hook(&remote_hook).unwrap();
+        let remote_combined =
+            crate::state::hook_combined_hash(&remote_json_full, &remote_code);
+        let local_combined = crate::state::hook_combined_hash(
+            &local_json_with_newline,
+            &Some("def local_edit():\n    return 2\n".to_string()),
+        );
+        let classified = vec![ClassifiedItem {
+            kind: "hooks".to_string(),
+            slug: slug.to_string(),
+            class: SyncClass::BothDiverged,
+            local_hash: Some(local_combined),
+            remote_hash: Some(remote_combined.clone()),
+            base_hash: Some(base_combined.clone()),
+        }];
+
+        (
+            tmp,
+            paths,
+            lockfile,
+            local_json_path,
+            local_py_path,
+            catalog,
+            classified,
+            base_combined,
+        )
+    }
+
+    /// Regression: `BothDiverged` for a hook where local and remote
+    /// JSON portions are byte-identical (post-canonicalize) but the
+    /// `.py` sidecars differ. The resolver MUST prompt — short-
+    /// circuiting on JSON equality silently routes the item to
+    /// `KeepLocal` (the user's local code overwrites remote on push)
+    /// without ever showing the conflict prompt.
+    #[tokio::test]
+    async fn resolve_conflicts_hook_prompts_when_only_py_sidecar_differs() {
+        let (_tmp, paths, mut lockfile, _json_path, py_path, catalog, classified, base_combined) =
+            setup_hook_code_only_conflict();
+        let client = RossumClient::new(
+            "https://unused.invalid/api/v1".to_string(),
+            "TEST".to_string(),
+        )
+        .unwrap();
+        let progress = ProgressLog::start("test");
+
+        // Empty stdin → the resolver tries to read a response but
+        // must NOT short-circuit silently. With the bug present
+        // (JSON-only comparison), the resolver returns `KeepLocal`
+        // without reading stdin and promotes the item to push. With
+        // the fix, the resolver redirects the prompt to the `.py`
+        // sidecar — empty stdin returns `Skip` (the legacy
+        // `read_line == 0` fallback) → no promotion, lockfile base
+        // preserved.
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &paths,
+                client: &client,
+                lockfile: &mut lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: true,
+            };
+            resolve_conflicts(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b""),
+                true,
+                &progress,
+            )
+            .await
+            .expect("resolver should succeed (even with empty stdin → Skip)")
+        };
+        progress.finish("");
+
+        assert!(
+            outcome.promoted_to_push.is_empty(),
+            "hook with only-.py divergence must NOT be silently promoted to push; \
+             promoted = {:?}",
+            outcome.promoted_to_push,
+        );
+
+        let py_after = std::fs::read(&py_path).unwrap();
+        assert_eq!(
+            py_after, b"def local_edit():\n    return 2\n",
+            "local .py edit must survive a conflict-without-prompt"
+        );
+
+        let recorded = lockfile
+            .objects
+            .get("hooks")
+            .and_then(|m| m.get("ap-reject-if-no-doc-id"))
+            .and_then(|e| e.content_hash.clone())
+            .expect("lockfile entry must persist");
+        assert_eq!(
+            recorded, base_combined,
+            "lockfile base must remain pinned on Skip/no-prompt; got {recorded}"
+        );
+
+        // Shadow file written next to the .py (not the .json) since the
+        // prompt was redirected to the code sidecar.
+        let shadow = crate::paths::shadow_path_for(&py_path, "test");
+        assert!(
+            shadow.exists(),
+            "shadow file should land next to the .py sidecar: {}",
+            shadow.display()
+        );
+        let shadow_body = std::fs::read(&shadow).unwrap();
+        assert_eq!(
+            shadow_body, b"def remote_edit():\n    return 3\n",
+            "shadow file must carry the remote code, not the JSON"
+        );
+    }
+
+    /// Same setup as above but the user picks `[k]eep local` interactively.
+    /// The resolver must promote the hook to the push pipeline and
+    /// pre-align the lockfile to the remote combined hash so the push
+    /// driver's drift check passes.
+    #[tokio::test]
+    async fn resolve_conflicts_hook_keep_local_on_code_conflict_promotes_to_push() {
+        let (_tmp, paths, mut lockfile, _json_path, py_path, catalog, classified, _base_combined) =
+            setup_hook_code_only_conflict();
+        let client = RossumClient::new(
+            "https://unused.invalid/api/v1".to_string(),
+            "TEST".to_string(),
+        )
+        .unwrap();
+        let progress = ProgressLog::start("test");
+
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &paths,
+                client: &client,
+                lockfile: &mut lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: true,
+            };
+            resolve_conflicts(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b"k\n"),
+                true,
+                &progress,
+            )
+            .await
+            .expect("resolver should succeed on [k]")
+        };
+        progress.finish("");
+
+        assert_eq!(
+            outcome.promoted_to_push.len(),
+            1,
+            "[k] must promote the hook to push"
+        );
+        assert_eq!(outcome.promoted_to_push[0].0, "hooks");
+        assert_eq!(outcome.promoted_to_push[0].1, "ap-reject-if-no-doc-id");
+
+        // Local .py must survive — the push driver re-reads it.
+        let py_after = std::fs::read(&py_path).unwrap();
+        assert_eq!(
+            py_after, b"def local_edit():\n    return 2\n",
+            "local .py edit must survive [k]"
+        );
+
+        // Lockfile base aligned to remote combined hash so the push
+        // driver's drift check passes.
+        let recorded = lockfile
+            .objects
+            .get("hooks")
+            .and_then(|m| m.get("ap-reject-if-no-doc-id"))
+            .and_then(|e| e.content_hash.clone())
+            .expect("lockfile entry must persist");
+        let remote_hook = &catalog.hooks[0];
+        let (remote_json_full, remote_code) =
+            crate::snapshot::hook::serialize_hook(remote_hook).unwrap();
+        let expected =
+            crate::state::hook_combined_hash(&remote_json_full, &remote_code);
+        assert_eq!(
+            recorded, expected,
+            "lockfile base should equal remote combined hash after [k]"
+        );
+    }
+
+    /// Same setup, but the user picks `[r]use env`. Resolver must adopt
+    /// the remote code into the local `.py`, leave the JSON alone (it
+    /// was already identical), and NOT promote to push.
+    #[tokio::test]
+    async fn resolve_conflicts_hook_keep_remote_on_code_conflict_adopts_remote_code() {
+        let (_tmp, paths, mut lockfile, json_path, py_path, catalog, classified, _base_combined) =
+            setup_hook_code_only_conflict();
+        let client = RossumClient::new(
+            "https://unused.invalid/api/v1".to_string(),
+            "TEST".to_string(),
+        )
+        .unwrap();
+        let progress = ProgressLog::start("test");
+
+        let json_before = std::fs::read(&json_path).unwrap();
+
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &paths,
+                client: &client,
+                lockfile: &mut lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: true,
+            };
+            resolve_conflicts(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b"r\n"),
+                true,
+                &progress,
+            )
+            .await
+            .expect("resolver should succeed on [r]")
+        };
+        progress.finish("");
+
+        assert!(outcome.promoted_to_push.is_empty(), "no push on [r]");
+
+        let py_after = std::fs::read(&py_path).unwrap();
+        assert_eq!(
+            py_after, b"def remote_edit():\n    return 3\n",
+            "local .py must be replaced by remote code on [r]"
+        );
+
+        // JSON portion was identical canonically — writing the remote
+        // JSON over the same content is a no-op effectively. Verify
+        // bytes match either before or post-write (both acceptable
+        // shapes).
+        let json_after = std::fs::read(&json_path).unwrap();
+        let json_canon_before =
+            crate::snapshot::noise::canonicalize_for_hash(&json_before);
+        let json_canon_after =
+            crate::snapshot::noise::canonicalize_for_hash(&json_after);
+        assert_eq!(
+            json_canon_before, json_canon_after,
+            "JSON canonical form must remain stable on [r] (was identical before)"
         );
     }
 }

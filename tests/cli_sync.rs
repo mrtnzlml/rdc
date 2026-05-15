@@ -2858,3 +2858,341 @@ async fn sync_watch_does_not_deadlock_with_one_shot_sync() {
         "one-shot sync should succeed while watch is idle on ctrl_c: {one_shot_res:?}"
     );
 }
+
+/// Regression for the user-reported bug: hook .py sidecar edited
+/// locally AND code edited remotely (same JSON portion on both sides).
+/// Before the fix the conflict resolver's JSON-only short-circuit
+/// silently routed this to `KeepLocal` and the push driver PATCHed
+/// local over remote without ever prompting. With the fix the resolver
+/// redirects the prompt to the `.py` sidecar so the user sees the
+/// code conflict; in non-TTY mode it writes the shadow file and
+/// preserves the lockfile base.
+#[tokio::test]
+async fn sync_hook_code_only_divergence_does_not_silently_push() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // Same JSON portion on both calls — only `config.code` changes
+    // between the seed pull and the second sync's listing. Stateful
+    // counter so the FIRST call serves base code and subsequent calls
+    // serve remote-edited code.
+    let hook_id = 712u64;
+    let list_call_count = Arc::new(AtomicUsize::new(0));
+    let server_uri = server.uri();
+    let counter = list_call_count.clone();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(move |_req: &Request| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let code = if n == 0 {
+                "def base():\n    return 1\n"
+            } else {
+                "def remote_edit():\n    return 3\n"
+            };
+            let modified_at = if n == 0 {
+                "2026-05-14T08:00:00Z"
+            } else {
+                "2026-05-14T10:00:00Z"
+            };
+            let body = serde_json::json!({
+                "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+                "results": [
+                    {
+                        "id": hook_id,
+                        "url": format!("{server_uri}/api/v1/hooks/{hook_id}"),
+                        "name": "ap-reject-if-no-doc-id",
+                        "type": "function",
+                        "queues": [],
+                        "events": ["annotation_content"],
+                        "config": { "runtime": "python3.12", "code": code },
+                        "modified_at": modified_at
+                    }
+                ]
+            });
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/hooks"]).await;
+
+    Mock::given(method("PATCH"))
+        .and(path(format!("/api/v1/hooks/{hook_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // Seed.
+    rdc::cli::sync::run("dev", false, false, false, false, false, false)
+        .await
+        .expect("first sync should succeed");
+
+    // Edit local .py only — JSON file is untouched on disk.
+    let py_path = project.path().join("envs/dev/hooks/ap-reject-if-no-doc-id.py");
+    let json_path = project.path().join("envs/dev/hooks/ap-reject-if-no-doc-id.json");
+    let json_before = std::fs::read(&json_path).unwrap();
+    std::fs::write(&py_path, b"def local_edit():\n    return 2\n").unwrap();
+
+    let lf_before =
+        std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+
+    // Second sync — remote now serves the modified-code hook.
+    rdc::cli::sync::run("dev", false, false, false, false, false, false)
+        .await
+        .expect("second sync should succeed (no silent push)");
+
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    // No PATCH may have been issued — the bug would silently push local
+    // code over remote on this path.
+    let patch_calls = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| {
+            r.method == http::Method::PATCH
+                && r.url.path() == format!("/api/v1/hooks/{hook_id}")
+        })
+        .count();
+    assert_eq!(
+        patch_calls, 0,
+        "hook with only-.py divergence must NOT be silently PATCHed; saw {patch_calls}"
+    );
+
+    // Local .py edit survived; JSON file unchanged.
+    let py_after = std::fs::read(&py_path).unwrap();
+    assert_eq!(py_after, b"def local_edit():\n    return 2\n");
+    let json_after = std::fs::read(&json_path).unwrap();
+    assert_eq!(json_after, json_before, "JSON file must not be touched");
+
+    // Lockfile base preserved so the next sync re-prompts.
+    let lf_after =
+        std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    let v_before: serde_json::Value = serde_json::from_str(&lf_before).unwrap();
+    let v_after: serde_json::Value = serde_json::from_str(&lf_after).unwrap();
+    assert_eq!(
+        v_before.pointer("/objects/hooks/ap-reject-if-no-doc-id/content_hash"),
+        v_after.pointer("/objects/hooks/ap-reject-if-no-doc-id/content_hash"),
+        "lockfile base must remain pinned so the next sync re-prompts"
+    );
+
+    // Shadow file written next to the .py sidecar (the prompt
+    // redirected away from the JSON, so the shadow lives next to the
+    // code).
+    let shadow = project.path().join("envs/dev/hooks/ap-reject-if-no-doc-id.py.dev");
+    assert!(shadow.exists(), "shadow file should land next to the .py: {}", shadow.display());
+    let shadow_body = std::fs::read(&shadow).unwrap();
+    assert_eq!(shadow_body, b"def remote_edit():\n    return 3\n");
+}
+
+/// Regression for the reported bug: with both local and remote changed
+/// since the lockfile-recorded base, sync must NOT silently PATCH local
+/// over remote — the conflict resolver should kick in (or, in non-TTY
+/// mode, write a shadow file and skip the push).
+///
+/// Scenario:
+/// 1. First sync seeds the lockfile from a clean hook (code "base").
+/// 2. Local .py sidecar is edited to "local-edit".
+/// 3. The hooks GET mock is updated to return the hook with code
+///    "remote-edit" and a newer `modified_at`.
+/// 4. Second sync runs with `interactive=false` — the conflict resolver
+///    falls back to the shadow-file path (it writes
+///    `<file>.<env>` with the remote bytes and skips). Crucially: NO
+///    `PATCH /hooks/<id>` is sent.
+#[tokio::test]
+async fn sync_both_diverged_hook_does_not_silently_push() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // Initial hook body — what the first sync pulls. Acts as the lockfile
+    // base.
+    let hook_id = 711u64;
+    let base_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": hook_id,
+                "url": format!("{}/api/v1/hooks/{hook_id}", server.uri()),
+                "name": "ap-reject-if-no-doc-id",
+                "type": "function",
+                "queues": [],
+                "events": ["annotation_content"],
+                "config": {
+                    "runtime": "python3.12",
+                    "code": "def base():\n    return 1\n"
+                },
+                "modified_at": "2026-05-14T08:00:00Z"
+            }
+        ]
+    });
+
+    // Use a stateful counter so the FIRST list call serves the base body
+    // and subsequent calls serve the "remote-edited" body (different
+    // code, newer modified_at) — mimicking what happens when the user
+    // edits remote via the Rossum UI between pulls.
+    let list_call_count = Arc::new(AtomicUsize::new(0));
+    let base_body_clone = base_body.clone();
+    let server_uri = server.uri();
+    let counter = list_call_count.clone();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(move |_req: &Request| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                ResponseTemplate::new(200).set_body_json(&base_body_clone)
+            } else {
+                let edited = serde_json::json!({
+                    "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+                    "results": [
+                        {
+                            "id": hook_id,
+                            "url": format!("{server_uri}/api/v1/hooks/{hook_id}"),
+                            "name": "ap-reject-if-no-doc-id",
+                            "type": "function",
+                            "queues": [],
+                            "events": ["annotation_content"],
+                            "config": {
+                                "runtime": "python3.12",
+                                "code": "def remote_edit():\n    return 3\n"
+                            },
+                            "modified_at": "2026-05-14T10:00:00Z"
+                        }
+                    ]
+                });
+                ResponseTemplate::new(200).set_body_json(edited)
+            }
+        })
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/hooks"]).await;
+
+    // Critical: ANY PATCH on this hook would be the bug. `.expect(0)`
+    // makes wiremock fail the test on Drop if a PATCH lands.
+    Mock::given(method("PATCH"))
+        .and(path(format!("/api/v1/hooks/{hook_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // First sync — seeds the lockfile with base bytes.
+    rdc::cli::sync::run(
+        "dev", false, false, false, false, false, false,
+    )
+    .await
+    .expect("first sync should succeed");
+
+    // Locally edit the .py sidecar — different code from base.
+    let py_path = project.path().join("envs/dev/hooks/ap-reject-if-no-doc-id.py");
+    assert!(py_path.exists(), "first sync should have written the .py sidecar");
+    std::fs::write(&py_path, b"def local_edit():\n    return 2\n").unwrap();
+
+    // Snapshot the lockfile so we can confirm the conflict path doesn't
+    // advance the base hash (the base must stay pinned so the next sync
+    // re-prompts).
+    let lf_before =
+        std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+
+    // Second sync — remote now serves the modified hook. Both sides have
+    // diverged from the lockfile-recorded base → classifier MUST emit
+    // BothDiverged, and the non-TTY fallback MUST NOT push.
+    let result = rdc::cli::sync::run(
+        "dev", false, false, false, false, false, false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    result.expect("second sync should succeed (no push, conflict deferred)");
+
+    // The crucial assertion: no PATCH was issued.
+    let patch_calls = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| {
+            r.method == http::Method::PATCH
+                && r.url.path() == format!("/api/v1/hooks/{hook_id}")
+        })
+        .count();
+    assert_eq!(
+        patch_calls, 0,
+        "BothDiverged hook must NOT be silently PATCHed (saw {patch_calls} PATCH calls)"
+    );
+
+    // Local .py file survived the conflict — the user's edit must not be
+    // discarded.
+    let py_after = std::fs::read_to_string(&py_path).unwrap();
+    assert_eq!(
+        py_after, "def local_edit():\n    return 2\n",
+        "local .py edit must survive: {py_after}"
+    );
+
+    // Lockfile base is preserved so the next sync re-classifies as a
+    // conflict (the base hash for this hook must equal what it was
+    // before the second sync).
+    let lf_after =
+        std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    let v_before: serde_json::Value = serde_json::from_str(&lf_before).unwrap();
+    let v_after: serde_json::Value = serde_json::from_str(&lf_after).unwrap();
+    let base_before = v_before
+        .pointer("/objects/hooks/ap-reject-if-no-doc-id/content_hash")
+        .cloned();
+    let base_after = v_after
+        .pointer("/objects/hooks/ap-reject-if-no-doc-id/content_hash")
+        .cloned();
+    assert_eq!(
+        base_before, base_after,
+        "BothDiverged: lockfile base must remain pinned to the prior base \
+         so the next sync re-prompts (before={base_before:?}, after={base_after:?})"
+    );
+}

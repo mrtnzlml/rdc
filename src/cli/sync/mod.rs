@@ -139,9 +139,11 @@ pub(crate) async fn run_cycle(
     // matches `push --dry-run` byte for byte.
     let (_scanned, changes, tombstones) = crate::cli::push::scan::scan(&paths, &lockfile)?;
 
-    // Phase 3: classify. The clean-env adapter is intentionally minimal;
-    // subsequent tasks fill in per-kind hashing.
-    let classified = from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile);
+    // Phase 3: classify. The adapter re-runs each pull driver's
+    // canonical hashing (including overlay strip) so the recomputed
+    // remote hashes match what the lockfile recorded on last pull.
+    let classified =
+        from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile, overlay.as_ref());
 
     // Phase 4: plan + confirm. `--dry-run` exits here without writing.
     // Dry-run uses the same per-item event-log surface as a regular sync,
@@ -280,7 +282,12 @@ pub(crate) async fn run_cycle(
 /// * **`remote_hashes`** — re-runs the canonical serialization the per-kind
 ///   pull driver performs before `record_object` (serialize → optional
 ///   overlay strip → `content_hash`). This mirrors how the lockfile's
-///   `content_hash` was written on the last pull.
+///   `content_hash` was written on the last pull. The `overlay` arg lets
+///   the adapter apply the same `maybe_strip_overlay` the pull driver
+///   ran; without it, an env with any writable-kind overlay would emit
+///   spurious `RemoteEdit` for objects that haven't actually changed
+///   (since the lockfile recorded the post-strip hash, but the adapter
+///   would hash the pre-strip bytes).
 /// * **`scan_changes`** — already computed by [`crate::cli::push::scan::scan`]
 ///   over local file bytes with the same `content_hash` function. We
 ///   re-derive from the on-disk path here rather than smuggling the hash
@@ -290,17 +297,12 @@ pub(crate) async fn run_cycle(
 ///
 /// Slug derivation matches the pull drivers: prefer
 /// `lockfile.slug_for_id(kind, id)`, else `slugify_unique(name, ...)`.
-///
-/// TODO(sync-impl): remaining kinds — `queues`, `schemas` (combined
-/// hash), `inboxes`, `email_templates` — plug in as their integration
-/// tests land. Each kind reuses its own pull driver's canonicalization
-/// rules; see `cli::pull::<kind>::process` for the authoritative
-/// serialization order.
 pub fn from_catalog_scan_lockfile(
     catalog: &crate::cli::pull::common::RemoteCatalog,
     changes: &crate::cli::push::scan::ChangeList,
     tombstones: &crate::cli::push::scan::Tombstones,
     lockfile: &crate::state::Lockfile,
+    overlay: Option<&crate::overlay::Overlay>,
 ) -> Vec<crate::cli::sync::classify::ClassifiedItem> {
     use std::collections::{BTreeMap, BTreeSet};
     let mut remote_hashes: BTreeMap<(String, String), String> = BTreeMap::new();
@@ -310,20 +312,9 @@ pub fn from_catalog_scan_lockfile(
 
     // --- labels --------------------------------------------------------
     // Catalog hash: re-run `pull::labels::process`'s pre-record_object
-    // sequence — serialize → push newline → `content_hash`. Slug picks
-    // up the lockfile-anchored id mapping so remote renames don't churn
-    // slugs.
-    //
-    // Overlay note: the pull driver also runs `maybe_strip_overlay` on
-    // the proposed bytes when the env has a label overlay. We skip that
-    // step here because (a) threading the overlay through this signature
-    // is invasive for one TODO-listed concern, and (b) `content_hash`
-    // canonicalizes via `canonicalize_for_hash`, which only strips the
-    // server-noise fields — it does *not* strip overlay paths. As long
-    // as the pull driver also doesn't have a label overlay configured,
-    // both sides hash the same bytes. Once an overlay-aware test arrives,
-    // thread `&Overlay` into the adapter and call `maybe_strip_overlay`
-    // here.
+    // sequence — serialize → optional overlay strip → push newline →
+    // `content_hash`. Slug picks up the lockfile-anchored id mapping so
+    // remote renames don't churn slugs.
     let mut used_label_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for l in &catalog.labels {
         let slug = match lockfile.slug_for_id("labels", l.id) {
@@ -341,6 +332,13 @@ pub fn from_catalog_scan_lockfile(
             Err(_) => continue,
         };
         proposed.push(b'\n');
+        let proposed = match crate::cli::pull::common::maybe_strip_overlay(
+            proposed,
+            overlay.and_then(|o| o.label(&slug)),
+        ) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
         let hash = crate::state::content_hash(&proposed);
         remote_hashes.insert(("labels".to_string(), slug), hash);
     }
@@ -503,12 +501,9 @@ pub fn from_catalog_scan_lockfile(
 
     // --- engines ------------------------------------------------------
     // Push-capable flat kind. Engines have an overlay; the pull driver
-    // calls `maybe_strip_overlay` before hashing. When no overlay is
-    // configured (`overlay.engines.<slug>` empty or unset),
-    // `maybe_strip_overlay` is a no-op and the adapter's hash matches
-    // the driver byte-for-byte. Once an overlay-aware test arrives,
-    // thread `&Overlay` into the adapter and replicate the strip — same
-    // caveat as labels.
+    // calls `maybe_strip_overlay` before hashing. The adapter mirrors
+    // that strip so the recomputed remote hash matches the lockfile
+    // base for unchanged envs.
     let mut used_engine_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for e in &catalog.engines {
         let slug = match lockfile.slug_for_id("engines", e.id) {
@@ -522,6 +517,13 @@ pub fn from_catalog_scan_lockfile(
             Err(_) => continue,
         };
         proposed.push(b'\n');
+        let proposed = match crate::cli::pull::common::maybe_strip_overlay(
+            proposed,
+            overlay.and_then(|o| o.engine(&slug)),
+        ) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
         let hash = crate::state::content_hash(&proposed);
         remote_hashes.insert(("engines".to_string(), slug), hash);
     }
@@ -552,7 +554,8 @@ pub fn from_catalog_scan_lockfile(
     // but the adapter emits a slug regardless; classifier emits
     // RemoteCreate and the driver later skips with a warning.
     //
-    // Same overlay caveat as engines / labels: no strip done here today.
+    // Overlay strip matches the pull driver so the recomputed remote hash
+    // lines up with the lockfile base for unchanged envs.
     let mut used_ef_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for f in &catalog.engine_fields {
         let slug = match lockfile.slug_for_id("engine_fields", f.id) {
@@ -566,6 +569,13 @@ pub fn from_catalog_scan_lockfile(
             Err(_) => continue,
         };
         proposed.push(b'\n');
+        let proposed = match crate::cli::pull::common::maybe_strip_overlay(
+            proposed,
+            overlay.and_then(|o| o.engine_field(&slug)),
+        ) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
         let hash = crate::state::content_hash(&proposed);
         remote_hashes.insert(("engine_fields".to_string(), slug), hash);
     }
@@ -632,10 +642,12 @@ pub fn from_catalog_scan_lockfile(
     // `pull::hooks::process`: lockfile-anchored id mapping first, else
     // `slugify_unique(name, used)`.
     //
-    // Overlay caveat (same as labels/engines): the pull driver runs
-    // `maybe_strip_overlay` on `proposed_json` before hashing. We skip
-    // that step here; once an overlay-aware adapter test arrives, thread
-    // `&Overlay` in and call `maybe_strip_overlay` on the same paths.
+    // Overlay strip mirrors `pull::hooks::process`: serialize → strip
+    // overlay-managed paths from JSON → hash json+code. Without the
+    // strip, an env with any hook overlay configured would always see
+    // the recomputed remote hash differ from the lockfile base (which
+    // was recorded post-strip) and the classifier would emit spurious
+    // RemoteEdit / BothDiverged.
     let mut used_hook_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for h in &catalog.hooks {
         let slug = match lockfile.slug_for_id("hooks", h.id) {
@@ -645,9 +657,17 @@ pub fn from_catalog_scan_lockfile(
         used_hook_slugs.insert(slug.clone());
 
         // Reproduce the pull driver's canonical bytes: serialize → strip
-        // `config.code` into `code` → trailing newline on JSON.
+        // `config.code` into `code` → strip overlay paths from JSON →
+        // trailing newline already applied by serialize.
         let (json_bytes, code) = match crate::snapshot::hook::serialize_hook(h) {
             Ok(pair) => pair,
+            Err(_) => continue,
+        };
+        let json_bytes = match crate::cli::pull::common::maybe_strip_overlay(
+            json_bytes,
+            overlay.and_then(|o| o.hook(&slug)),
+        ) {
+            Ok(b) => b,
             Err(_) => continue,
         };
         let hash = crate::state::hook_combined_hash(&json_bytes, &code);
@@ -691,7 +711,8 @@ pub fn from_catalog_scan_lockfile(
     // Push-capable split-file kind, identical shape to hooks except the
     // code lives in `trigger_condition` (top-level) rather than
     // `config.code`. The canonical hash is `rule_combined_hash`. Slug
-    // derivation mirrors `pull::rules::process`.
+    // derivation mirrors `pull::rules::process`. Overlay strip applied
+    // for the same parity-with-pull reason as hooks.
     let mut used_rule_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for r in &catalog.rules {
         let slug = match lockfile.slug_for_id("rules", r.id) {
@@ -702,6 +723,13 @@ pub fn from_catalog_scan_lockfile(
 
         let (json_bytes, code) = match crate::snapshot::rule::serialize_rule(r) {
             Ok(pair) => pair,
+            Err(_) => continue,
+        };
+        let json_bytes = match crate::cli::pull::common::maybe_strip_overlay(
+            json_bytes,
+            overlay.and_then(|o| o.rule(&slug)),
+        ) {
+            Ok(b) => b,
             Err(_) => continue,
         };
         let hash = crate::state::rule_combined_hash(&json_bytes, &code);
@@ -740,20 +768,18 @@ pub fn from_catalog_scan_lockfile(
     //
     // The remote hash for each kind mirrors the pull driver's canonical
     // bytes:
-    //   queues   → `serde_json::to_vec_pretty(q)` + `\n` + `content_hash`
-    //   schemas  → `serialize_schema` → `schema_combined_hash(json, formulas)`
-    //   inboxes  → `serde_json::to_vec_pretty(i)` + `\n` + `content_hash`
-    //   email_tpl→ `serde_json::to_vec_pretty(t)` + `\n` + `content_hash`
+    //   queues   → `serde_json::to_vec_pretty(q)` + `\n` + strip + `content_hash`
+    //   schemas  → `serialize_schema` → strip → `schema_combined_hash(json, formulas)`
+    //   inboxes  → `serde_json::to_vec_pretty(i)` + `\n` + strip + `content_hash`
+    //   email_tpl→ `serde_json::to_vec_pretty(t)` + `\n` + strip + `content_hash`
     //
     // The `catalog.schemas_by_queue_id` / `inboxes_by_queue_id` maps were
     // pre-fetched in `list_remote`; we look up by queue id, since the API
     // has no list endpoint for these.
     //
-    // Overlay caveat (same as labels/engines/hooks/rules): the pull
-    // driver runs `maybe_strip_overlay` on the proposed bytes before
-    // hashing. We skip that step here; once an overlay-aware adapter
-    // test arrives, thread `&Overlay` in and replicate the strip on each
-    // proposed_bytes path below.
+    // Overlay strip on each branch keeps the recomputed remote hash in
+    // parity with the lockfile base (which was recorded post-strip on
+    // last pull).
     let mut per_ws_used_q_slugs: std::collections::HashMap<String, std::collections::HashSet<String>> =
         std::collections::HashMap::new();
     // Build per-queue (ws_slug, q_slug, q.id, q.url) tuples so the
@@ -794,6 +820,13 @@ pub fn from_catalog_scan_lockfile(
             Err(_) => continue,
         };
         q_proposed.push(b'\n');
+        let q_proposed = match crate::cli::pull::common::maybe_strip_overlay(
+            q_proposed,
+            overlay.and_then(|o| o.queue(&q_slug)),
+        ) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
         let q_hash = crate::state::content_hash(&q_proposed);
         remote_hashes.insert(("queues".to_string(), q_slug.clone()), q_hash);
 
@@ -802,9 +835,14 @@ pub fn from_catalog_scan_lockfile(
             if let Ok((schema_json_bytes, schema_formulas)) =
                 crate::snapshot::schema::serialize_schema(schema)
             {
-                let schema_hash =
-                    crate::state::schema_combined_hash(&schema_json_bytes, &schema_formulas);
-                remote_hashes.insert(("schemas".to_string(), q_slug.clone()), schema_hash);
+                if let Ok(schema_json_bytes) = crate::cli::pull::common::maybe_strip_overlay(
+                    schema_json_bytes,
+                    overlay.and_then(|o| o.schema(&q_slug)),
+                ) {
+                    let schema_hash =
+                        crate::state::schema_combined_hash(&schema_json_bytes, &schema_formulas);
+                    remote_hashes.insert(("schemas".to_string(), q_slug.clone()), schema_hash);
+                }
             }
         }
 
@@ -812,8 +850,13 @@ pub fn from_catalog_scan_lockfile(
         if let Some(inbox) = catalog.inboxes_by_queue_id.get(&q.id) {
             if let Ok(mut inbox_proposed) = serde_json::to_vec_pretty(inbox) {
                 inbox_proposed.push(b'\n');
-                let inbox_hash = crate::state::content_hash(&inbox_proposed);
-                remote_hashes.insert(("inboxes".to_string(), q_slug.clone()), inbox_hash);
+                if let Ok(inbox_proposed) = crate::cli::pull::common::maybe_strip_overlay(
+                    inbox_proposed,
+                    overlay.and_then(|o| o.inbox(&q_slug)),
+                ) {
+                    let inbox_hash = crate::state::content_hash(&inbox_proposed);
+                    remote_hashes.insert(("inboxes".to_string(), q_slug.clone()), inbox_hash);
+                }
             }
         }
     }
@@ -910,6 +953,13 @@ pub fn from_catalog_scan_lockfile(
             Err(_) => continue,
         };
         proposed.push(b'\n');
+        let proposed = match crate::cli::pull::common::maybe_strip_overlay(
+            proposed,
+            overlay.and_then(|o| o.email_template(&compound)),
+        ) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
         let hash = crate::state::content_hash(&proposed);
         remote_hashes.insert(("email_templates".to_string(), compound), hash);
     }
@@ -933,4 +983,404 @@ pub fn from_catalog_scan_lockfile(
     }
 
     crate::cli::sync::classify::classify(&remote_hashes, &scan_changes, &scan_tombstones, &locked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::pull::common::RemoteCatalog;
+    use crate::cli::sync::classify::SyncClass;
+    use crate::model::Hook;
+    use crate::paths::Paths;
+    use crate::snapshot::hook::serialize_hook;
+    use crate::state::{hook_combined_hash, Lockfile, ObjectEntry};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    /// Build an empty `RemoteCatalog` whose `hooks` the caller fills in.
+    /// Mirrors `execute.rs::catalog_with_labels` but seeds the hooks slot.
+    fn catalog_with_hooks(hooks: Vec<Hook>) -> RemoteCatalog {
+        RemoteCatalog {
+            organization: crate::model::Organization {
+                id: 1,
+                url: "https://x.invalid/api/v1/organizations/1".to_string(),
+                name: "test".to_string(),
+                extra: BTreeMap::new(),
+            },
+            workspaces: vec![],
+            queues: vec![],
+            schemas_by_queue_id: BTreeMap::new(),
+            inboxes_by_queue_id: BTreeMap::new(),
+            hooks,
+            rules: vec![],
+            labels: vec![],
+            engines: vec![],
+            engine_fields: vec![],
+            workflows: vec![],
+            workflow_steps: vec![],
+            email_templates: vec![],
+            mdh: crate::cli::pull::mdh::MdhListed {
+                client: crate::api::data_storage::DataStorageClient::new(
+                    "https://unused.invalid/svc/data-storage/api/v1".to_string(),
+                    "TEST".to_string(),
+                )
+                .unwrap(),
+                collections: vec![],
+            },
+        }
+    }
+
+    /// Build a Python `function` hook with the given `code`. The hook's
+    /// `modified_at` (lives in `extra`) is set so the lockfile can capture
+    /// a pre-edit timestamp for the regression test below.
+    fn mk_hook(id: u64, name: &str, code: &str, modified_at: &str) -> Hook {
+        let v = json!({
+            "id": id,
+            "url": format!("https://x.invalid/api/v1/hooks/{id}"),
+            "name": name,
+            "type": "function",
+            "queues": [],
+            "events": ["annotation_content"],
+            "config": { "runtime": "python3.12", "code": code },
+            "modified_at": modified_at,
+        });
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// Hash a hook the way the pull driver does (serialize + optional
+    /// overlay strip + `hook_combined_hash`) so the test seeds the
+    /// lockfile with the same base hash production would have written.
+    fn pull_driver_hash(h: &Hook, overlay_paths: Option<&BTreeMap<String, serde_json::Value>>) -> String {
+        let (json_bytes, code) = serialize_hook(h).unwrap();
+        let stripped = crate::cli::pull::common::maybe_strip_overlay(json_bytes, overlay_paths).unwrap();
+        hook_combined_hash(&stripped, &code)
+    }
+
+    /// Regression for the conflict-resolution bypass: when both local
+    /// and remote have diverged from the lockfile-recorded base, the
+    /// adapter MUST classify the hook as `BothDiverged` so the executor
+    /// can route into `resolve_conflicts` and prompt the user. Before
+    /// the fix, this returned `LocalEdit` silently — the push driver
+    /// then PATCHed local-over-remote.
+    #[test]
+    fn from_catalog_scan_lockfile_classifies_hook_as_both_diverged_when_both_sides_changed() {
+        // --- arrange ------------------------------------------------------
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+
+        // Base state: what the lockfile recorded on the most recent pull.
+        let base_hook = mk_hook(
+            42,
+            "ap-reject-if-no-doc-id",
+            "def base():\n    return 1\n",
+            "2026-05-14T08:00:00Z",
+        );
+        let base_hash = pull_driver_hash(&base_hook, None);
+
+        // Local state on disk: the user edited the .py sidecar AND tweaked
+        // the .json (e.g., events list). The scan must therefore observe a
+        // changed local hash.
+        let slug = "ap-reject-if-no-doc-id";
+        let local_json_path = paths.hooks_dir().join(format!("{slug}.json"));
+        let local_py_path = paths.hooks_dir().join(format!("{slug}.py"));
+        let local_json_bytes = serde_json::to_vec_pretty(&json!({
+            "id": 42,
+            "url": "https://x.invalid/api/v1/hooks/42",
+            "name": "ap-reject-if-no-doc-id",
+            "type": "function",
+            "queues": [],
+            "events": ["annotation_content"],
+            "config": { "runtime": "python3.12" }
+        }))
+        .unwrap();
+        let mut local_json_with_newline = local_json_bytes.clone();
+        local_json_with_newline.push(b'\n');
+        std::fs::write(&local_json_path, &local_json_with_newline).unwrap();
+        std::fs::write(&local_py_path, b"def local_edit():\n    return 2\n").unwrap();
+
+        // Remote state: user also edited via the Rossum UI — different code,
+        // newer modified_at.
+        let remote_hook = mk_hook(
+            42,
+            "ap-reject-if-no-doc-id",
+            "def remote_edit():\n    return 3\n",
+            "2026-05-14T10:00:00Z",
+        );
+
+        // Lockfile: records the BASE hash (so a re-sync sees both sides
+        // diverged).
+        let mut lockfile = Lockfile::default();
+        lockfile.upsert(
+            "hooks",
+            slug,
+            ObjectEntry {
+                id: 42,
+                url: Some("https://x.invalid/api/v1/hooks/42".to_string()),
+                modified_at: Some("2026-05-14T08:00:00Z".to_string()),
+                content_hash: Some(base_hash.clone()),
+            },
+        );
+
+        // Run the push scanner so the test feeds the adapter the same
+        // ChangeList the production code would. This also confirms the
+        // scanner correctly flags the local edit.
+        let (_scanned, changes, tombstones) =
+            crate::cli::push::scan::scan(&paths, &lockfile).unwrap();
+        assert!(
+            changes.hooks.contains_key(slug),
+            "scan must flag the locally-edited hook"
+        );
+
+        let catalog = catalog_with_hooks(vec![remote_hook]);
+
+        // --- act ----------------------------------------------------------
+        let classified =
+            from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile, None);
+
+        // --- assert -------------------------------------------------------
+        let item = classified
+            .iter()
+            .find(|c| c.kind == "hooks" && c.slug == slug)
+            .expect("hook must appear in classification");
+        assert_eq!(
+            item.class,
+            SyncClass::BothDiverged,
+            "hook with diverged local AND remote bytes must classify as BothDiverged; \
+             got {:?} (local_hash={:?}, remote_hash={:?}, base_hash={:?})",
+            item.class,
+            item.local_hash,
+            item.remote_hash,
+            item.base_hash,
+        );
+    }
+
+    /// Regression for hypothesis A (overlay-strip parity): when the env has
+    /// an overlay configured for the hook, the pull driver hashes the
+    /// post-strip bytes and the lockfile records that hash. The adapter
+    /// recomputes the remote hash WITHOUT applying the same strip, so for
+    /// an UNCHANGED remote the two hashes don't match → the classifier
+    /// emits a false-positive RemoteEdit (or, with a local edit on top, a
+    /// silent BothDiverged that should have been LocalEdit — or vice
+    /// versa: a real BothDiverged silently downgraded because the adapter's
+    /// "is the remote at the lockfile?" answer is wrong).
+    ///
+    /// Concretely: with an overlay-stripped field whose value DIFFERS
+    /// between the lockfile base and the recomputed remote, an UNCHANGED
+    /// remote already mis-classifies. With a local edit on top the same
+    /// false-positive arises. This test pins the parity at the adapter.
+    ///
+    /// Setup:
+    /// - Overlay: `[hooks.<slug>] "config.runtime" = "python3.12-secure"`
+    /// - Base hook (pull-time): `runtime: "python3.12"`, code A. Lockfile
+    ///   recorded `hash(strip(serialize(base)) + A)`.
+    /// - Remote (now): IDENTICAL to base — nobody changed remote.
+    /// - Local: IDENTICAL to base — nobody changed local.
+    /// - Expected: `Clean` (everything matches the lockfile).
+    /// - Bug at HEAD: adapter recomputes `hash(serialize(remote) + A)`
+    ///   without stripping `config.runtime`. The serialize output still
+    ///   contains `"runtime": "python3.12"` (matching the pull-time bytes
+    ///   pre-strip), so the hashes happen to match here. This test
+    ///   confirms parity in the no-divergence case; a sibling test
+    ///   below covers the divergent case where the bug bites.
+    #[test]
+    fn from_catalog_scan_lockfile_overlay_parity_clean_when_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+        std::fs::create_dir_all(paths.env_root()).unwrap();
+
+        // Overlay drops `config.runtime` from canonical form on pull and
+        // re-applies it on push. The lockfile thus records hash WITHOUT
+        // `config.runtime`.
+        std::fs::write(
+            paths.overlay_file(),
+            r#"version = 1
+
+[hooks.ap-reject-if-no-doc-id]
+"config.runtime" = "python3.12-secure"
+"#,
+        )
+        .unwrap();
+
+        let slug = "ap-reject-if-no-doc-id";
+        let base_hook = mk_hook(
+            42,
+            slug,
+            "def base():\n    return 1\n",
+            "2026-05-14T08:00:00Z",
+        );
+
+        // Compute the pull-driver base hash (post-strip) so the lockfile
+        // matches what production would have written.
+        let overlay = crate::overlay::Overlay::load(&paths.overlay_file()).unwrap();
+        let overlay_paths = overlay.as_ref().and_then(|o| o.hook(slug));
+        let base_hash = pull_driver_hash(&base_hook, overlay_paths);
+
+        // Local file: the disk form is the post-strip canonical (matches
+        // what pull would have written).
+        let (base_json_full, base_code) = serialize_hook(&base_hook).unwrap();
+        let base_json_stripped =
+            crate::cli::pull::common::maybe_strip_overlay(base_json_full, overlay_paths).unwrap();
+        let local_json_path = paths.hooks_dir().join(format!("{slug}.json"));
+        let local_py_path = paths.hooks_dir().join(format!("{slug}.py"));
+        std::fs::write(&local_json_path, &base_json_stripped).unwrap();
+        std::fs::write(&local_py_path, base_code.as_ref().unwrap().as_bytes()).unwrap();
+
+        // Lockfile: records post-strip base hash.
+        let mut lockfile = Lockfile::default();
+        lockfile.upsert(
+            "hooks",
+            slug,
+            ObjectEntry {
+                id: 42,
+                url: Some("https://x.invalid/api/v1/hooks/42".to_string()),
+                modified_at: Some("2026-05-14T08:00:00Z".to_string()),
+                content_hash: Some(base_hash.clone()),
+            },
+        );
+
+        // Remote: identical to base — no changes on either side.
+        let (_scanned, changes, tombstones) =
+            crate::cli::push::scan::scan(&paths, &lockfile).unwrap();
+        // Scan must NOT flag this hook — local matches lockfile-recorded
+        // post-strip hash, since `read(local) == base_json_stripped`.
+        assert!(
+            !changes.hooks.contains_key(slug),
+            "scanner shouldn't flag an unchanged local hook"
+        );
+
+        let catalog = catalog_with_hooks(vec![base_hook.clone()]);
+        let classified = from_catalog_scan_lockfile(
+            &catalog,
+            &changes,
+            &tombstones,
+            &lockfile,
+            overlay.as_ref(),
+        );
+        let item = classified
+            .iter()
+            .find(|c| c.kind == "hooks" && c.slug == slug)
+            .expect("hook must appear in classification");
+        assert_eq!(
+            item.class,
+            SyncClass::Clean,
+            "no-op env must classify as Clean; got {:?} (local_hash={:?}, remote_hash={:?}, base_hash={:?})",
+            item.class, item.local_hash, item.remote_hash, item.base_hash,
+        );
+    }
+
+    /// The pointed regression: env has an overlay configured for the
+    /// hook AND both local and remote have diverged. Without overlay
+    /// parity, the adapter mis-classifies and the conflict prompt is
+    /// silently bypassed.
+    ///
+    /// Concretely:
+    /// - Overlay strips `config.runtime` from canonical form.
+    /// - Base hook: `runtime: "python3.12"`, code = "base".
+    ///   Lockfile records `hash(strip(serialize(base)) + "base")`.
+    /// - Remote NOW: `runtime: "python3.12"`, code = "REMOTE_EDIT" (user
+    ///   modified via UI).
+    /// - Local NOW: `runtime: "python3.12"`, code = "LOCAL_EDIT" (user
+    ///   modified the .py sidecar).
+    /// - Expected: `BothDiverged` → conflict prompt.
+    /// - HEAD bug: adapter hashes remote via `hash(serialize(remote) +
+    ///   "REMOTE_EDIT")` without stripping; the lockfile's recorded base
+    ///   hash was computed AFTER strip. So the comparison shape is fine
+    ///   for runtime (it just gets dropped or kept consistently) — BUT
+    ///   the comparison's correctness depends on `strip(serialize(h))`
+    ///   producing identical bytes to `serialize(h)`. Without the strip,
+    ///   the field is included; with it, it's removed. If the overlay
+    ///   strip removes a field that's present in serialize, the two
+    ///   diverge. This test makes that divergence concrete by using a
+    ///   field whose absence (post-strip) the lockfile recorded, but
+    ///   whose presence the adapter measures.
+    #[test]
+    fn from_catalog_scan_lockfile_overlay_both_diverged_with_overlay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+        std::fs::create_dir_all(paths.env_root()).unwrap();
+
+        std::fs::write(
+            paths.overlay_file(),
+            r#"version = 1
+
+[hooks.ap-reject-if-no-doc-id]
+"config.runtime" = "python3.12-secure"
+"#,
+        )
+        .unwrap();
+
+        let slug = "ap-reject-if-no-doc-id";
+        let base_hook = mk_hook(
+            42,
+            slug,
+            "def base():\n    return 1\n",
+            "2026-05-14T08:00:00Z",
+        );
+        let overlay = crate::overlay::Overlay::load(&paths.overlay_file()).unwrap();
+        let overlay_paths = overlay.as_ref().and_then(|o| o.hook(slug));
+        let base_hash = pull_driver_hash(&base_hook, overlay_paths);
+
+        // Local edited the .py sidecar — different code from base. Disk
+        // bytes for JSON are the post-strip form (unchanged); .py was
+        // touched.
+        let (base_json_full, _base_code) = serialize_hook(&base_hook).unwrap();
+        let base_json_stripped =
+            crate::cli::pull::common::maybe_strip_overlay(base_json_full, overlay_paths).unwrap();
+        let local_json_path = paths.hooks_dir().join(format!("{slug}.json"));
+        let local_py_path = paths.hooks_dir().join(format!("{slug}.py"));
+        std::fs::write(&local_json_path, &base_json_stripped).unwrap();
+        std::fs::write(&local_py_path, b"def local_edit():\n    return 2\n").unwrap();
+
+        // Remote: also edited (via Rossum UI). The remote payload still
+        // carries `config.runtime` (Rossum always returns it); the
+        // overlay's job is to strip it post-pull.
+        let remote_hook = mk_hook(
+            42,
+            slug,
+            "def remote_edit():\n    return 3\n",
+            "2026-05-14T10:00:00Z",
+        );
+
+        let mut lockfile = Lockfile::default();
+        lockfile.upsert(
+            "hooks",
+            slug,
+            ObjectEntry {
+                id: 42,
+                url: Some("https://x.invalid/api/v1/hooks/42".to_string()),
+                modified_at: Some("2026-05-14T08:00:00Z".to_string()),
+                content_hash: Some(base_hash.clone()),
+            },
+        );
+
+        let (_scanned, changes, tombstones) =
+            crate::cli::push::scan::scan(&paths, &lockfile).unwrap();
+        assert!(
+            changes.hooks.contains_key(slug),
+            "scanner must flag the locally-edited .py sidecar"
+        );
+
+        let catalog = catalog_with_hooks(vec![remote_hook]);
+        let classified = from_catalog_scan_lockfile(
+            &catalog,
+            &changes,
+            &tombstones,
+            &lockfile,
+            overlay.as_ref(),
+        );
+        let item = classified
+            .iter()
+            .find(|c| c.kind == "hooks" && c.slug == slug)
+            .expect("hook must appear in classification");
+        assert_eq!(
+            item.class,
+            SyncClass::BothDiverged,
+            "with overlay configured and both sides edited, must classify as BothDiverged; \
+             got {:?} (local_hash={:?}, remote_hash={:?}, base_hash={:?})",
+            item.class, item.local_hash, item.remote_hash, item.base_hash,
+        );
+    }
 }
