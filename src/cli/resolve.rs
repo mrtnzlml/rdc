@@ -40,6 +40,13 @@ pub enum Resolution {
     KeepRemote,
     /// Use these (user-edited) bytes. Lockfile records hash of these bytes.
     Edit(Vec<u8>),
+    /// Like `Edit`, but the user explicitly opted into a partial resolution
+    /// via `[h]unk-by-hunk → [s]kip` on one or more hunks. The bytes will
+    /// contain unresolved `<<<<<<<` / `=======` / `>>>>>>>` markers and the
+    /// caller MUST skip marker-leakage validation when writing them. The
+    /// committed bytes are still recorded in the lockfile by hash, so a
+    /// follow-up pull sees the partial resolution as the new base.
+    EditWithMarkers(Vec<u8>),
     /// Treat this as the legacy shadow-file behavior — write
     /// `<file>.<env>`, keep local. Lockfile records local hash.
     Skip,
@@ -141,16 +148,28 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
         return Ok(Resolution::KeepLocal);
     }
 
-    writeln!(output)?;
-    let header = format!("[{index}/{total}]  {} — conflict", local_path.display());
-    writeln!(output, "{}", colorize_header(&header, mode))?;
-    writeln!(output)?;
-
     // Pretty-print JSON inputs so each field lands on its own line — without
     // this, the entire compact JSON object renders as a single diff line and
     // the actual change gets buried.
     let local_display = prettify_json_for_diff(&local_canonical);
     let remote_display = prettify_json_for_diff(&remote_canonical);
+
+    // Count conflict hunks up-front so the header can advertise them and
+    // the action list can offer `[h]` only when multi-hunk.
+    let hunk_count = count_conflict_hunks(&local_display, &remote_display);
+
+    writeln!(output)?;
+    let header = if hunk_count >= 2 {
+        format!(
+            "[{index}/{total}]  {} — conflict ({hunk_count} hunks)",
+            local_path.display()
+        )
+    } else {
+        format!("[{index}/{total}]  {} — conflict", local_path.display())
+    };
+    writeln!(output, "{}", colorize_header(&header, mode))?;
+    writeln!(output)?;
+
     let diff = unified_diff("local", &local_display, env, &remote_display);
     if diff.is_empty() {
         return Ok(Resolution::KeepLocal);
@@ -161,9 +180,15 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
     writeln!(output)?;
 
     loop {
-        let prompt_text = format!(
-            "[k] keep local  [r] use {env}  [e] edit  [s] skip (shadow file)  [a] abort > "
-        );
+        let prompt_text = if hunk_count >= 2 {
+            format!(
+                "[k] keep local  [r] use {env}  [e] edit  [h] hunk-by-hunk  [s] skip (shadow file)  [a] abort > "
+            )
+        } else {
+            format!(
+                "[k] keep local  [r] use {env}  [e] edit  [s] skip (shadow file)  [a] abort > "
+            )
+        };
         write!(output, "{}", colorize_prompt(&prompt_text, mode))?;
         output.flush().ok();
         let mut line = String::new();
@@ -186,15 +211,55 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
                     mode,
                 )? {
                     EditOutcome::Edited(edited) => return Ok(Resolution::Edit(edited)),
+                    EditOutcome::EditedWithMarkers(edited) => {
+                        return Ok(Resolution::EditWithMarkers(edited));
+                    }
+                    EditOutcome::Aborted => continue,
+                }
+            }
+            Some('h') | Some('H') if hunk_count >= 2 => {
+                match prompt_hunk_by_hunk(
+                    &mut input,
+                    &mut output,
+                    &local_display,
+                    &remote_display,
+                    local_path,
+                    env,
+                    mode,
+                )? {
+                    EditOutcome::Edited(edited) => return Ok(Resolution::Edit(edited)),
+                    EditOutcome::EditedWithMarkers(edited) => {
+                        return Ok(Resolution::EditWithMarkers(edited));
+                    }
                     EditOutcome::Aborted => continue,
                 }
             }
             _ => {
-                writeln!(output, "  (unrecognized — pick one of k/r/e/s/a)")?;
+                let hint = if hunk_count >= 2 {
+                    "  (unrecognized — pick one of k/r/e/h/s/a)"
+                } else {
+                    "  (unrecognized — pick one of k/r/e/s/a)"
+                };
+                writeln!(output, "{hint}")?;
                 continue;
             }
         }
     }
+}
+
+/// Count the number of conflict hunks (contiguous non-Equal regions) in
+/// the line-level diff between `local` and `remote`. Equal regions don't
+/// count; a `Replace` (delete + insert pair) is one hunk; isolated
+/// `Delete`s or `Insert`s are each one hunk.
+fn count_conflict_hunks(local: &[u8], remote: &[u8]) -> usize {
+    use similar::DiffTag;
+    let local_str = String::from_utf8_lossy(local);
+    let remote_str = String::from_utf8_lossy(remote);
+    let diff = TextDiff::from_lines(local_str.as_ref(), remote_str.as_ref());
+    diff.ops()
+        .iter()
+        .filter(|op| op.tag() != DiffTag::Equal)
+        .count()
 }
 
 /// Top-level entry point for the remote-deleted prompt. Auto-detects color
@@ -282,8 +347,14 @@ pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
 /// Result of the editor loop. `Aborted` means the user backed out of the
 /// edit without producing usable bytes; the resolver falls back to the
 /// main prompt so they can pick keep-local/remote/skip/abort instead.
+///
+/// `EditedWithMarkers` is only produced by the hunk-by-hunk walker when
+/// at least one hunk was resolved via `[s]kip`; it tells the caller to
+/// bypass marker-leakage validation when writing the bytes.
+#[derive(Debug)]
 enum EditOutcome {
     Edited(Vec<u8>),
+    EditedWithMarkers(Vec<u8>),
     Aborted,
 }
 
@@ -456,6 +527,333 @@ fn validate_edited(bytes: &[u8], local_path: &Path) -> std::result::Result<(), S
     Ok(())
 }
 
+/// Walk each conflict hunk in order, asking the user for a per-hunk
+/// decision. Equal regions pass through unchanged; non-Equal regions are
+/// resolved per the user's choice (`[k]`/`[r]`/`[e]`/`[b]`/`[s]`/`[a]`).
+///
+/// `local` and `remote` are the already-prettified byte slices (same form
+/// used by the main resolver's diff display) so per-field JSON lands on
+/// its own line.
+///
+/// Returns:
+/// - `EditOutcome::Edited(bytes)` — all hunks resolved cleanly; bytes
+///   contain no marker leakage.
+/// - `EditOutcome::EditedWithMarkers(bytes)` — at least one hunk was
+///   resolved via `[s]kip`, so the output retains `<<<<<<< local /
+///   ======= / >>>>>>> {env}` markers around that hunk. Caller MUST
+///   skip the marker-leakage check when writing.
+/// - `EditOutcome::Aborted` — user picked `[a]` at some hunk; caller
+///   falls back to the main prompt.
+fn prompt_hunk_by_hunk<R: BufRead, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    local: &[u8],
+    remote: &[u8],
+    local_path: &Path,
+    env: &str,
+    mode: ColorMode,
+) -> Result<EditOutcome> {
+    use similar::DiffTag;
+
+    let local_str = String::from_utf8_lossy(local);
+    let remote_str = String::from_utf8_lossy(remote);
+    let diff = TextDiff::from_lines(local_str.as_ref(), remote_str.as_ref());
+
+    // Index lines by their position in each side so we can slice them
+    // out by `old_range()` / `new_range()` from each DiffOp.
+    let local_lines: Vec<&str> = diff.iter_old_slices().collect();
+    let remote_lines: Vec<&str> = diff.iter_new_slices().collect();
+
+    let ops: Vec<_> = diff.ops().to_vec();
+    let conflict_total = ops.iter().filter(|op| op.tag() != DiffTag::Equal).count();
+
+    // Defensive: caller already short-circuits when there are no conflict
+    // hunks (e.g. local == remote). If somehow reached, return local bytes.
+    if conflict_total == 0 {
+        return Ok(EditOutcome::Edited(local.to_vec()));
+    }
+
+    let mut merged = String::new();
+    let mut any_skipped = false;
+    let mut hunk_idx = 0usize; // 1-based index reported to the user, incremented when entering a hunk
+
+    for op in &ops {
+        match op.tag() {
+            DiffTag::Equal => {
+                for line in &local_lines[op.old_range()] {
+                    merged.push_str(line);
+                    if !line.ends_with('\n') {
+                        merged.push('\n');
+                    }
+                }
+            }
+            _ => {
+                hunk_idx += 1;
+                let local_slice = &local_lines[op.old_range()];
+                let remote_slice = &remote_lines[op.new_range()];
+
+                let outcome = prompt_single_hunk(
+                    input,
+                    output,
+                    hunk_idx,
+                    conflict_total,
+                    local_slice,
+                    remote_slice,
+                    op.old_range(),
+                    local_path,
+                    env,
+                    mode,
+                )?;
+
+                match outcome {
+                    HunkOutcome::Keep => append_lines(&mut merged, local_slice),
+                    HunkOutcome::Remote => append_lines(&mut merged, remote_slice),
+                    HunkOutcome::Both => {
+                        append_lines(&mut merged, local_slice);
+                        append_lines(&mut merged, remote_slice);
+                    }
+                    HunkOutcome::Edit(bytes) => {
+                        let s = String::from_utf8_lossy(&bytes);
+                        merged.push_str(&s);
+                        if !s.ends_with('\n') && !s.is_empty() {
+                            merged.push('\n');
+                        }
+                    }
+                    HunkOutcome::Skip => {
+                        any_skipped = true;
+                        merged.push_str("<<<<<<< local\n");
+                        append_lines(&mut merged, local_slice);
+                        merged.push_str("=======\n");
+                        append_lines(&mut merged, remote_slice);
+                        merged.push_str(">>>>>>> ");
+                        merged.push_str(env);
+                        merged.push('\n');
+                    }
+                    HunkOutcome::Abort => return Ok(EditOutcome::Aborted),
+                }
+            }
+        }
+    }
+
+    let bytes = merged.into_bytes();
+    if any_skipped {
+        Ok(EditOutcome::EditedWithMarkers(bytes))
+    } else {
+        Ok(EditOutcome::Edited(bytes))
+    }
+}
+
+/// Per-hunk decision returned by [`prompt_single_hunk`].
+enum HunkOutcome {
+    /// Emit the local lines as-is.
+    Keep,
+    /// Emit the remote lines as-is.
+    Remote,
+    /// Emit local lines followed by remote lines (no markers).
+    Both,
+    /// Emit these user-edited bytes in place of the hunk.
+    Edit(Vec<u8>),
+    /// Wrap the hunk in conflict markers so the user can resolve later.
+    Skip,
+    /// Bubble abort to the walker.
+    Abort,
+}
+
+/// Append a list of line slices to `out`, ensuring each ends in `\n`.
+fn append_lines(out: &mut String, lines: &[&str]) {
+    for line in lines {
+        out.push_str(line);
+        if !line.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+}
+
+/// Render the per-hunk prompt and read the user's decision for a single
+/// hunk. The user can pick keep / remote / both / edit / skip / abort.
+#[allow(clippy::too_many_arguments)]
+fn prompt_single_hunk<R: BufRead, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    hunk_idx: usize,
+    hunk_total: usize,
+    local_slice: &[&str],
+    remote_slice: &[&str],
+    local_range: std::ops::Range<usize>,
+    local_path: &Path,
+    env: &str,
+    mode: ColorMode,
+) -> Result<HunkOutcome> {
+    writeln!(output)?;
+    // Line numbers are 1-based and inclusive. An empty range (pure Insert
+    // on the local side) still has start == end; show "after line N" instead.
+    let line_range = if local_range.is_empty() {
+        format!("after line {}", local_range.start)
+    } else {
+        let start = local_range.start + 1;
+        let end = local_range.end;
+        if start == end {
+            format!("line {start}")
+        } else {
+            format!("lines {start}-{end}")
+        }
+    };
+    let header = format!(
+        "[hunk {hunk_idx}/{hunk_total}]  {}  ({line_range})",
+        local_path.display()
+    );
+    writeln!(output, "{}", colorize_header(&header, mode))?;
+
+    for line in local_slice {
+        let stripped = line.strip_suffix('\n').unwrap_or(line);
+        let formatted = format!("-{stripped}");
+        writeln!(output, "{}", colorize_diff_line(&formatted, mode))?;
+    }
+    for line in remote_slice {
+        let stripped = line.strip_suffix('\n').unwrap_or(line);
+        let formatted = format!("+{stripped}");
+        writeln!(output, "{}", colorize_diff_line(&formatted, mode))?;
+    }
+    writeln!(output)?;
+
+    loop {
+        let prompt_text = format!(
+            "[k] keep local  [r] use {env}  [e] edit  [b] both  [s] skip  [a] abort > "
+        );
+        write!(output, "{}", colorize_prompt(&prompt_text, mode))?;
+        output.flush().ok();
+        let mut line = String::new();
+        if input.read_line(&mut line)? == 0 {
+            // EOF mid-walk → treat like skip so the partial result is
+            // still preserved with markers; safer than silently keeping
+            // local on a half-typed answer.
+            return Ok(HunkOutcome::Skip);
+        }
+        match line.trim().chars().next() {
+            Some('k') | Some('K') => return Ok(HunkOutcome::Keep),
+            Some('r') | Some('R') => return Ok(HunkOutcome::Remote),
+            Some('b') | Some('B') => return Ok(HunkOutcome::Both),
+            Some('s') | Some('S') => return Ok(HunkOutcome::Skip),
+            Some('a') | Some('A') => return Ok(HunkOutcome::Abort),
+            Some('e') | Some('E') => {
+                match run_single_hunk_editor(
+                    input,
+                    output,
+                    local_slice,
+                    remote_slice,
+                    local_path,
+                    env,
+                    mode,
+                )? {
+                    Some(bytes) => return Ok(HunkOutcome::Edit(bytes)),
+                    None => continue,
+                }
+            }
+            _ => {
+                writeln!(output, "  (unrecognized — pick one of k/r/e/b/s/a)")?;
+                continue;
+            }
+        }
+    }
+}
+
+/// Open `$EDITOR` on a temp file containing just this hunk's local
+/// section, `=======`, and remote section (with `<<<<<<< local` /
+/// `>>>>>>> {env}` markers). Validates that the saved bytes don't
+/// reintroduce conflict markers. JSON validation is *not* applied here
+/// because a single hunk usually isn't a full JSON document.
+///
+/// Returns `Some(bytes)` on a successful edit, or `None` if the user
+/// aborted the editor sub-loop (in which case the walker re-prompts for
+/// this hunk).
+fn run_single_hunk_editor<R: BufRead, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    local_slice: &[&str],
+    remote_slice: &[&str],
+    local_path: &Path,
+    env: &str,
+    mode: ColorMode,
+) -> Result<Option<Vec<u8>>> {
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+
+    let ext = local_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("tmp");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("rdc-hunk-{stamp}.{ext}"));
+
+    let mut buf = String::new();
+    buf.push_str("<<<<<<< local\n");
+    append_lines(&mut buf, local_slice);
+    buf.push_str("=======\n");
+    append_lines(&mut buf, remote_slice);
+    buf.push_str(">>>>>>> ");
+    buf.push_str(env);
+    buf.push('\n');
+
+    std::fs::write(&path, buf.as_bytes())
+        .with_context(|| format!("writing temp hunk file {}", path.display()))?;
+
+    let result = (|| -> Result<Option<Vec<u8>>> {
+        loop {
+            let status = Command::new(&editor)
+                .arg(&path)
+                .status()
+                .with_context(|| format!("spawning editor '{editor}'"))?;
+            if !status.success() {
+                anyhow::bail!("editor '{editor}' exited with non-zero status");
+            }
+            let edited = std::fs::read(&path)
+                .with_context(|| format!("reading edited hunk file {}", path.display()))?;
+            match validate_edited_markers_only(&edited) {
+                Ok(()) => return Ok(Some(edited)),
+                Err(reason) => {
+                    writeln!(output)?;
+                    writeln!(output, "  ✗ {reason}")?;
+                    write!(
+                        output,
+                        "{}",
+                        colorize_prompt("  [e]dit again  [a]bort edit > ", mode)
+                    )?;
+                    output.flush().ok();
+                    let mut line = String::new();
+                    if input.read_line(&mut line)? == 0 {
+                        return Ok(None);
+                    }
+                    match line.trim().chars().next() {
+                        Some('e') | Some('E') => continue,
+                        _ => return Ok(None),
+                    }
+                }
+            }
+        }
+    })();
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+/// Subset of [`validate_edited`] that only checks for marker leakage; the
+/// JSON-syntax check is intentionally skipped because per-hunk edits
+/// don't carry a full JSON document context.
+fn validate_edited_markers_only(bytes: &[u8]) -> std::result::Result<(), String> {
+    let s = std::str::from_utf8(bytes)
+        .map_err(|_| "edited hunk is not valid UTF-8".to_string())?;
+    for marker in ["<<<<<<<", "=======", ">>>>>>>"] {
+        if s.lines().any(|l| l.starts_with(marker)) {
+            return Err(format!(
+                "edited hunk still has the `{marker}` conflict marker — \
+                 remove the markers and one of the two sides, then save"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a single sub-file within a combined-hash entity (hook
 /// `.json`/`.py`, schema `schema.json`/formulas/`<id>.py`). Spec §8.3.
 ///
@@ -526,6 +924,20 @@ pub fn resolve_combined_file(
                     "refusing to overwrite {} with invalid edit ({}); local file left untouched",
                     local_path.display(),
                     reason
+                );
+            }
+            write_atomic(local_path, &edited)?;
+            Ok(edited)
+        }
+        Resolution::EditWithMarkers(edited) => {
+            // User explicitly chose `[h]unk-by-hunk → [s]kip` on at
+            // least one hunk; the bytes contain unresolved markers by
+            // design. Skip the marker-leakage check but still validate
+            // UTF-8 so the lockfile hash is over decodable bytes.
+            if std::str::from_utf8(&edited).is_err() {
+                anyhow::bail!(
+                    "refusing to overwrite {} with non-UTF-8 hunk-walk result; local file left untouched",
+                    local_path.display(),
                 );
             }
             write_atomic(local_path, &edited)?;
@@ -613,6 +1025,13 @@ pub fn resolve_push_drift(
         Resolution::KeepLocal => Ok(PushDriftOutcome::Patch { payload_override: None }),
         Resolution::KeepRemote => Ok(PushDriftOutcome::Adopt),
         Resolution::Edit(edited) => Ok(PushDriftOutcome::Patch { payload_override: Some(edited) }),
+        // Hunk-walk-with-skipped-markers is meaningful on a pull (local
+        // file ends up with markers, lockfile records the hash of those
+        // bytes), but on push the override would be PATCHed straight to
+        // the API and the server would reject the marker text. Force a
+        // Skip so the local file stays put; the user can re-run with a
+        // cleaner resolution.
+        Resolution::EditWithMarkers(_) => Ok(PushDriftOutcome::Skip),
         Resolution::Skip => Ok(PushDriftOutcome::Skip),
         Resolution::Abort => Err(anyhow::Error::new(PullAborted)),
     }
@@ -1380,5 +1799,176 @@ mod tests {
             input, &mut out, &local, "test", ColorMode::Plain,
         ).unwrap();
         assert!(matches!(res, Resolution::Abort));
+    }
+
+    /// Three differing hunks separated by equal context. Caller-friendly
+    /// fixture used by all `prompt_hunk_by_hunk_*` tests.
+    fn three_hunk_fixture() -> (Vec<u8>, Vec<u8>) {
+        let local = b"a\nFOO\nb\nBAR\nc\nBAZ\nd\n".to_vec();
+        let remote = b"a\nfoo\nb\nbar\nc\nbaz\nd\n".to_vec();
+        (local, remote)
+    }
+
+    #[test]
+    fn prompt_hunk_by_hunk_keep_all_local_yields_local_bytes() {
+        let (local, remote) = three_hunk_fixture();
+        let mut output: Vec<u8> = Vec::new();
+        let mut input = Cursor::new(b"k\nk\nk\n".to_vec());
+        let path = std::path::Path::new("x.py");
+        let outcome = prompt_hunk_by_hunk(
+            &mut input, &mut output, &local, &remote, path, "production", ColorMode::Plain,
+        ).unwrap();
+        match outcome {
+            EditOutcome::Edited(bytes) => assert_eq!(bytes, local),
+            other => panic!("expected Edited(local), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_hunk_by_hunk_use_all_remote_yields_remote_bytes() {
+        let (local, remote) = three_hunk_fixture();
+        let mut output: Vec<u8> = Vec::new();
+        let mut input = Cursor::new(b"r\nr\nr\n".to_vec());
+        let path = std::path::Path::new("x.py");
+        let outcome = prompt_hunk_by_hunk(
+            &mut input, &mut output, &local, &remote, path, "production", ColorMode::Plain,
+        ).unwrap();
+        match outcome {
+            EditOutcome::Edited(bytes) => assert_eq!(bytes, remote),
+            other => panic!("expected Edited(remote), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_hunk_by_hunk_mixed_decisions_yields_correct_merge() {
+        let (local, remote) = three_hunk_fixture();
+        let mut output: Vec<u8> = Vec::new();
+        // keep, remote, keep
+        let mut input = Cursor::new(b"k\nr\nk\n".to_vec());
+        let path = std::path::Path::new("x.py");
+        let outcome = prompt_hunk_by_hunk(
+            &mut input, &mut output, &local, &remote, path, "production", ColorMode::Plain,
+        ).unwrap();
+        let bytes = match outcome {
+            EditOutcome::Edited(b) => b,
+            other => panic!("expected Edited, got {other:?}"),
+        };
+        // Hunk 1 = local (FOO), hunk 2 = remote (bar), hunk 3 = local (BAZ).
+        // Equal lines (a, b, c, d) preserved.
+        let expected = b"a\nFOO\nb\nbar\nc\nBAZ\nd\n".to_vec();
+        assert_eq!(
+            bytes,
+            expected,
+            "got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    #[test]
+    fn prompt_hunk_by_hunk_both_emits_local_then_remote() {
+        // Single-hunk fixture so the only decision needed is one `b`.
+        let local = b"a\nLOCAL\nb\n".to_vec();
+        let remote = b"a\nREMOTE\nb\n".to_vec();
+        let mut output: Vec<u8> = Vec::new();
+        let mut input = Cursor::new(b"b\n".to_vec());
+        let path = std::path::Path::new("x.py");
+        let outcome = prompt_hunk_by_hunk(
+            &mut input, &mut output, &local, &remote, path, "production", ColorMode::Plain,
+        ).unwrap();
+        let bytes = match outcome {
+            EditOutcome::Edited(b) => b,
+            other => panic!("expected Edited, got {other:?}"),
+        };
+        // Local lines first, then remote lines, no markers.
+        let expected = b"a\nLOCAL\nREMOTE\nb\n".to_vec();
+        assert_eq!(
+            bytes,
+            expected,
+            "got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(!s.contains("<<<<<<<"), "no markers on `[b]oth`: {s}");
+    }
+
+    #[test]
+    fn prompt_hunk_by_hunk_skip_preserves_markers() {
+        let local = b"a\nLOCAL\nb\n".to_vec();
+        let remote = b"a\nREMOTE\nb\n".to_vec();
+        let mut output: Vec<u8> = Vec::new();
+        let mut input = Cursor::new(b"s\n".to_vec());
+        let path = std::path::Path::new("x.py");
+        let outcome = prompt_hunk_by_hunk(
+            &mut input, &mut output, &local, &remote, path, "production", ColorMode::Plain,
+        ).unwrap();
+        let bytes = match outcome {
+            EditOutcome::EditedWithMarkers(b) => b,
+            other => panic!("expected EditedWithMarkers, got {other:?}"),
+        };
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains("<<<<<<< local\nLOCAL\n=======\nREMOTE\n>>>>>>> production\n"),
+            "expected wrapped hunk: {s}"
+        );
+    }
+
+    #[test]
+    fn prompt_hunk_by_hunk_abort_returns_aborted() {
+        let (local, remote) = three_hunk_fixture();
+        let mut output: Vec<u8> = Vec::new();
+        let mut input = Cursor::new(b"a\n".to_vec());
+        let path = std::path::Path::new("x.py");
+        let outcome = prompt_hunk_by_hunk(
+            &mut input, &mut output, &local, &remote, path, "production", ColorMode::Plain,
+        ).unwrap();
+        assert!(matches!(outcome, EditOutcome::Aborted), "got {outcome:?}");
+    }
+
+    #[test]
+    fn prompt_resolve_shows_h_only_for_multi_hunk() {
+        // Single-hunk case — `[h]` must not appear, header must not say "(N hunks)".
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.py");
+        std::fs::write(&path, b"a\nLOCAL\nb\n").unwrap();
+        let mut output: Vec<u8> = Vec::new();
+        let input = Cursor::new(b"s\n");
+        let _ = prompt_resolve_with_color(
+            input,
+            &mut output,
+            1,
+            1,
+            &path,
+            b"a\nREMOTE\nb\n",
+            "production",
+            ColorMode::Plain,
+        ).unwrap();
+        let s = String::from_utf8(output).unwrap();
+        assert!(!s.contains("[h]"), "single-hunk prompt must not offer [h]: {s}");
+        assert!(!s.contains("hunks)"), "single-hunk header must not advertise count: {s}");
+
+        // Three-hunk case — `[h] hunk-by-hunk` must appear, header must say "(3 hunks)".
+        let path3 = dir.path().join("y.py");
+        std::fs::write(&path3, b"a\nFOO\nb\nBAR\nc\nBAZ\nd\n").unwrap();
+        let mut output3: Vec<u8> = Vec::new();
+        let input3 = Cursor::new(b"s\n");
+        let _ = prompt_resolve_with_color(
+            input3,
+            &mut output3,
+            1,
+            1,
+            &path3,
+            b"a\nfoo\nb\nbar\nc\nbaz\nd\n",
+            "production",
+            ColorMode::Plain,
+        ).unwrap();
+        let s3 = String::from_utf8(output3).unwrap();
+        assert!(
+            s3.contains("[h] hunk-by-hunk"),
+            "multi-hunk prompt must offer [h] hunk-by-hunk: {s3}"
+        );
+        assert!(
+            s3.contains("(3 hunks)"),
+            "multi-hunk header must advertise count: {s3}"
+        );
     }
 }

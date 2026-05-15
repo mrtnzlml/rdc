@@ -478,6 +478,15 @@ fn resolve_conflict_interactive(
             write_atomic(local_path, &edited)?;
             Ok(content_hash(&edited))
         }
+        Resolution::EditWithMarkers(edited) => {
+            // Hunk-by-hunk walker with at least one skipped hunk — bytes
+            // intentionally retain `<<<<<<<` / `=======` / `>>>>>>>`
+            // markers. The lockfile hash is over the marker-bearing
+            // content, so the next pull sees the partial resolution as
+            // the new base.
+            write_atomic(local_path, &edited)?;
+            Ok(content_hash(&edited))
+        }
         Resolution::Skip => shadow_file_conflict(local_path, remote_bytes, progress, env),
         Resolution::Abort => Err(anyhow::Error::new(PullAborted)),
     }

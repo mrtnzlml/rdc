@@ -642,7 +642,12 @@ fn resolve_one_conflict<R: BufRead>(
                 Some(remote_hash),
             );
         }
-        Resolution::Edit(edited) => {
+        Resolution::Edit(edited) | Resolution::EditWithMarkers(edited) => {
+            // Both variants write the user's bytes to disk. The
+            // EditWithMarkers variant means the hunk walker produced a
+            // result with unresolved markers (user explicitly skipped
+            // some hunks); the write still happens but the user knows
+            // the file is intentionally in a partially-resolved state.
             if let Some(parent) = local_path.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
@@ -1383,10 +1388,13 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             marker.display(),
                         ));
                     }
-                    // The remote-delete prompt never offers `[e]`; the
-                    // helper's contract documents `Resolution::Edit` as
-                    // unreachable here. Fall through to Abort defensively.
-                    Resolution::Edit(_) | Resolution::Abort => {
+                    // The remote-delete prompt never offers `[e]` or
+                    // `[h]`; the helper's contract documents those
+                    // variants as unreachable here. Fall through to
+                    // Abort defensively.
+                    Resolution::Edit(_)
+                    | Resolution::EditWithMarkers(_)
+                    | Resolution::Abort => {
                         return Err(anyhow::Error::new(PullAborted));
                     }
                 }
