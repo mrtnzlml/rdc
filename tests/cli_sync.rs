@@ -2342,3 +2342,90 @@ async fn sync_clean_queue_tree_no_writes() {
     assert_eq!(inbox_mtime, inbox_mtime_after, "inbox.json must not be rewritten");
     assert_eq!(tpl_mtime, tpl_mtime_after, "email template must not be rewritten");
 }
+
+/// Watch-mode initial reconcile (Task 6): on `run_watch` startup, before the
+/// ctrl-c block, one full `run_cycle` runs with
+/// `auto_confirm_non_destructive=true`. This brings the env to a known state
+/// before watching kicks in. Mirrors the setup of
+/// `sync_remote_create_writes_local_label` — a remote-only label that the
+/// initial reconcile must pull to disk.
+#[tokio::test]
+async fn sync_watch_initial_reconcile_pulls_remote_creates() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let labels_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 21,
+                "url": format!("{}/api/v1/labels/21", server.uri()),
+                "name": "Audit Hold",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "color": "#00ff00",
+                "modified_at": "2026-05-01T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(labels_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/labels"]).await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // `run_watch` blocks on `tokio::signal::ctrl_c` *after* the initial
+    // reconcile completes. The reconcile future is `!Send` (the execute
+    // pipeline holds a `StdinLock` across an await) so we can't
+    // `tokio::spawn` it — instead we run it inline under `timeout`, which
+    // cancels the future once the initial reconcile has had time to land.
+    // The env lock inside `run_watch` is dropped after the reconcile and
+    // before the ctrl_c await, so canceling at that point is safe.
+    let res = tokio::time::timeout(
+        std::time::Duration::from_millis(800),
+        rdc::cli::sync::watch::run_watch(
+            "dev", /* interactive = */ false, /* allow_deletes = */ false,
+            /* no_push = */ false, /* no_pull = */ false,
+            /* poll_interval = */ None, /* verbose = */ false,
+        ),
+    )
+    .await;
+    // We expect the timeout to fire (Err) — `run_watch` would otherwise
+    // block on ctrl_c forever.
+    assert!(res.is_err(), "watch should still be blocked on ctrl_c, got {:?}", res);
+
+    let label_path = project.path().join("envs/dev/labels/audit-hold.json");
+    let exists = label_path.exists();
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    assert!(
+        exists,
+        "initial reconcile should have pulled the label at {}",
+        label_path.display()
+    );
+}
