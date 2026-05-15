@@ -509,8 +509,12 @@ fn run_editor_loop<R: BufRead, W: Write>(
 fn validate_edited(bytes: &[u8], local_path: &Path) -> std::result::Result<(), String> {
     let s = std::str::from_utf8(bytes)
         .map_err(|_| "edited file is not valid UTF-8".to_string())?;
+    // Markers are caught even when indented — leading whitespace on a
+    // marker line is almost never legitimate content in `.py` or `.json`
+    // files, and a sneakily-indented `    <<<<<<<` would otherwise slip
+    // through into the lockfile/snapshot.
     for marker in ["<<<<<<<", "=======", ">>>>>>>"] {
-        if s.lines().any(|l| l.starts_with(marker)) {
+        if s.lines().any(|l| l.trim_start().starts_with(marker)) {
             return Err(format!(
                 "edited file still has the `{marker}` conflict marker — \
                  remove the markers and one of the two sides, then save"
@@ -843,8 +847,11 @@ fn run_single_hunk_editor<R: BufRead, W: Write>(
 fn validate_edited_markers_only(bytes: &[u8]) -> std::result::Result<(), String> {
     let s = std::str::from_utf8(bytes)
         .map_err(|_| "edited hunk is not valid UTF-8".to_string())?;
+    // Match `validate_edited`: catch indented markers too. A user could
+    // otherwise leave `    <<<<<<<` inside a per-hunk edit and quietly
+    // commit it.
     for marker in ["<<<<<<<", "=======", ">>>>>>>"] {
-        if s.lines().any(|l| l.starts_with(marker)) {
+        if s.lines().any(|l| l.trim_start().starts_with(marker)) {
             return Err(format!(
                 "edited hunk still has the `{marker}` conflict marker — \
                  remove the markers and one of the two sides, then save"
@@ -1970,5 +1977,593 @@ mod tests {
             s3.contains("(3 hunks)"),
             "multi-hunk header must advertise count: {s3}"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Adversarial example tests + property tests.
+    //
+    // Group A targets `build_conflict_buffer` edge cases (markers in
+    // content, empty sides, unicode, CR-LF, many hunks).
+    // Group B exercises `prompt_hunk_by_hunk` under unusual inputs (EOF
+    // mid-walk, unknown actions, immediate abort, mixed decisions,
+    // identical inputs).
+    // Group C pins behavior of the two validators on each `.json` /
+    // `.py` path and across every marker/UTF-8/JSON failure mode.
+    // Group D pins the top-level resolver UI rendering.
+    // ---------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    /// Count non-Equal diff ops between two byte slices. Mirrors the
+    /// counting `prompt_hunk_by_hunk` does internally so the property
+    /// tests can pre-compute exactly how many decisions to feed on
+    /// stdin.
+    fn count_hunk_ops(local: &[u8], remote: &[u8]) -> usize {
+        use similar::DiffTag;
+        let local_str = String::from_utf8_lossy(local);
+        let remote_str = String::from_utf8_lossy(remote);
+        let diff = similar::TextDiff::from_lines(local_str.as_ref(), remote_str.as_ref());
+        diff.ops()
+            .iter()
+            .filter(|op| op.tag() != DiffTag::Equal)
+            .count()
+    }
+
+    // === Invariant 1: identical inputs emit no markers ==========
+    //
+    // build_conflict_buffer always appends a defensive trailing `\n`
+    // when the output is non-empty (so the editor buffer is properly
+    // line-terminated). The "exactly equal" check therefore only holds
+    // for inputs that already end in `\n` (or are empty). Production
+    // callers normalize through `prettify_json_for_diff` first, which
+    // always produces newline-terminated bytes.
+    proptest! {
+        #[test]
+        fn build_conflict_buffer_identical_inputs_emit_no_markers(s in "[a-zA-Z0-9 \n]{0,500}") {
+            let buf = build_conflict_buffer(s.as_bytes(), s.as_bytes(), "test");
+            let out = String::from_utf8(buf).unwrap();
+            prop_assert!(!out.contains("<<<<<<<"));
+            prop_assert!(!out.contains("======="));
+            prop_assert!(!out.contains(">>>>>>>"));
+            // The buffer always equals the input modulo a possible
+            // trailing-newline normalization.
+            if s.is_empty() || s.ends_with('\n') {
+                prop_assert_eq!(&out, &s);
+            } else {
+                prop_assert_eq!(out, format!("{s}\n"));
+            }
+        }
+    }
+
+    // === Invariant 2: differing inputs always emit a marker block ===
+    proptest! {
+        #[test]
+        fn build_conflict_buffer_differing_inputs_emit_at_least_one_marker_block(
+            a in "[a-zA-Z0-9 \n]{1,200}",
+            b in "[a-zA-Z0-9 \n]{1,200}",
+        ) {
+            prop_assume!(a != b);
+            let buf = build_conflict_buffer(a.as_bytes(), b.as_bytes(), "test");
+            let out = String::from_utf8(buf).unwrap();
+            prop_assert!(out.contains("<<<<<<< local"));
+            prop_assert!(out.contains("======="));
+            prop_assert!(out.contains(">>>>>>> test"));
+        }
+    }
+
+    // === Invariant 3: validate_edited rejects any buffer output for differing inputs ===
+    proptest! {
+        #[test]
+        fn validate_edited_always_rejects_buffer_output(
+            a in "[a-zA-Z0-9 \n]{1,200}",
+            b in "[a-zA-Z0-9 \n]{1,200}",
+        ) {
+            prop_assume!(a != b);
+            let buf = build_conflict_buffer(a.as_bytes(), b.as_bytes(), "test");
+            let result = validate_edited(&buf, std::path::Path::new("x.py"));
+            prop_assert!(result.is_err(), "validate_edited should reject buffer with markers");
+        }
+    }
+
+    // === Invariant 4: hunk walker, all-keep-local yields local ===
+    //
+    // prompt_hunk_by_hunk normalizes every line in its merged output to
+    // end with `\n` (so subsequent lines never glue together). The
+    // "exactly equal" check therefore requires the input to be
+    // newline-terminated — which matches production callers, who only
+    // ever pass pretty-printed JSON or .py files (both newline-terminated).
+    // The regex forces a final `\n` so we don't waste cases on the
+    // (separately tested) trailing-newline normalization branch.
+    proptest! {
+        #[test]
+        fn hunk_by_hunk_all_keep_local_yields_local(
+            local in "[a-zA-Z0-9 \n]{0,299}\n",
+            remote in "[a-zA-Z0-9 \n]{0,299}\n",
+        ) {
+            prop_assume!(local != remote);
+            let k = count_hunk_ops(local.as_bytes(), remote.as_bytes());
+            prop_assume!(k > 0);
+
+            let input_str: String = "k\n".repeat(k);
+            let input = std::io::Cursor::new(input_str);
+            let mut output: Vec<u8> = Vec::new();
+            let outcome = prompt_hunk_by_hunk(
+                &mut std::io::BufReader::new(input),
+                &mut output,
+                local.as_bytes(),
+                remote.as_bytes(),
+                std::path::Path::new("x.py"),
+                "test",
+                ColorMode::Plain,
+            ).unwrap();
+            match outcome {
+                EditOutcome::Edited(bytes) => {
+                    let result = String::from_utf8(bytes).unwrap();
+                    prop_assert_eq!(&result, &local);
+                }
+                EditOutcome::EditedWithMarkers(_) =>
+                    prop_assert!(false, "no [s] picked, should not have markers"),
+                EditOutcome::Aborted => prop_assert!(false, "should not abort"),
+            }
+        }
+    }
+
+    // === Invariant 5: hunk walker, all-use-remote yields remote ===
+    proptest! {
+        #[test]
+        fn hunk_by_hunk_all_use_remote_yields_remote(
+            local in "[a-zA-Z0-9 \n]{0,299}\n",
+            remote in "[a-zA-Z0-9 \n]{0,299}\n",
+        ) {
+            prop_assume!(local != remote);
+            let k = count_hunk_ops(local.as_bytes(), remote.as_bytes());
+            prop_assume!(k > 0);
+
+            let input_str: String = "r\n".repeat(k);
+            let input = std::io::Cursor::new(input_str);
+            let mut output: Vec<u8> = Vec::new();
+            let outcome = prompt_hunk_by_hunk(
+                &mut std::io::BufReader::new(input),
+                &mut output,
+                local.as_bytes(),
+                remote.as_bytes(),
+                std::path::Path::new("x.py"),
+                "test",
+                ColorMode::Plain,
+            ).unwrap();
+            match outcome {
+                EditOutcome::Edited(bytes) => {
+                    let result = String::from_utf8(bytes).unwrap();
+                    prop_assert_eq!(&result, &remote);
+                }
+                EditOutcome::EditedWithMarkers(_) =>
+                    prop_assert!(false, "no [s] picked, should not have markers"),
+                EditOutcome::Aborted => prop_assert!(false, "should not abort"),
+            }
+        }
+    }
+
+    // === Invariant 6: validate_markers_only accepts clean content ===
+    proptest! {
+        #[test]
+        fn validate_markers_only_accepts_clean_content(s in "[a-zA-Z0-9 \n]{0,500}") {
+            // Markers are caught even when indented (post-fix), so
+            // filter out content where any line's trim-start begins
+            // with one of the three marker tokens.
+            prop_assume!(!s.lines().any(|l| {
+                let t = l.trim_start();
+                t.starts_with("<<<<<<<") || t.starts_with("=======") || t.starts_with(">>>>>>>")
+            }));
+            let result = validate_edited_markers_only(s.as_bytes());
+            prop_assert!(result.is_ok(), "should accept marker-free content");
+        }
+    }
+
+    // === Invariant 7: validate_markers_only rejects any marker on any line ===
+    proptest! {
+        #[test]
+        fn validate_markers_only_rejects_any_marker(
+            prefix in "[a-zA-Z0-9 \n]{0,200}",
+            suffix in "[a-zA-Z0-9 \n]{0,200}",
+            which in 0u8..3u8,
+        ) {
+            let marker = match which { 0 => "<<<<<<<", 1 => "=======", _ => ">>>>>>>" };
+            let s = format!("{prefix}\n{marker} blah\n{suffix}");
+            let result = validate_edited_markers_only(s.as_bytes());
+            prop_assert!(result.is_err());
+        }
+    }
+
+    // ============================================================
+    // Group A — build_conflict_buffer adversarial examples.
+    // ============================================================
+
+    #[test]
+    fn build_conflict_buffer_handles_literal_marker_in_identical_content() {
+        // A line that *looks* like a marker is content, not a real marker;
+        // when local == remote it must pass through unchanged.
+        let s = b"<<<<<<< this looks like a marker but isn't\nfoo\n";
+        let buf = build_conflict_buffer(s, s, "test");
+        assert_eq!(
+            buf,
+            s.to_vec(),
+            "identical content with marker-like line should pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn build_conflict_buffer_handles_marker_in_local_diff() {
+        // local has a marker-like banner; remote has a comment-banner.
+        // Both share a "foo" context line. The marker line should appear
+        // inside the local section of the conflict block. Note: this
+        // produces a buffer where a marker-like line is INSIDE a
+        // `<<<<<<< local` block — validate_edited will still reject it
+        // because of the OUTER markers, which is correct behavior.
+        let local = b"<<<<<<< banner\nfoo\n";
+        let remote = b"# banner\nfoo\n";
+        let buf = build_conflict_buffer(local, remote, "test");
+        let s = String::from_utf8(buf).unwrap();
+        // Outer markers present.
+        assert!(s.contains("<<<<<<< local\n"), "{s}");
+        assert!(s.contains(">>>>>>> test\n"), "{s}");
+        // Equal context preserved.
+        assert!(s.contains("foo\n"), "{s}");
+        // validate_edited rejects this — correct, because the OUTER
+        // markers are still there.
+        let err = validate_edited(s.as_bytes(), std::path::Path::new("x.py")).unwrap_err();
+        assert!(err.contains("conflict marker"), "got: {err}");
+    }
+
+    #[test]
+    fn build_conflict_buffer_handles_empty_local() {
+        let local: &[u8] = b"";
+        let remote: &[u8] = b"a\nb\n";
+        let buf = build_conflict_buffer(local, remote, "test");
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "<<<<<<< local\n=======\na\nb\n>>>>>>> test\n", "{s:?}");
+    }
+
+    #[test]
+    fn build_conflict_buffer_handles_empty_remote() {
+        let local: &[u8] = b"a\nb\n";
+        let remote: &[u8] = b"";
+        let buf = build_conflict_buffer(local, remote, "test");
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "<<<<<<< local\na\nb\n=======\n>>>>>>> test\n", "{s:?}");
+    }
+
+    #[test]
+    fn build_conflict_buffer_handles_both_empty() {
+        let buf = build_conflict_buffer(b"", b"", "test");
+        assert!(buf.is_empty(), "both empty should emit no output: {buf:?}");
+    }
+
+    #[test]
+    fn build_conflict_buffer_handles_single_line_no_trailing_newline() {
+        let local = b"a";
+        let remote = b"b";
+        let buf = build_conflict_buffer(local, remote, "test");
+        let s = String::from_utf8(buf).unwrap();
+        // Marker block must be produced; the no-trailing-newline lines
+        // are normalized with synthetic newlines.
+        assert!(s.contains("<<<<<<< local\n"), "{s:?}");
+        assert!(s.contains("a\n"), "{s:?}");
+        assert!(s.contains("=======\n"), "{s:?}");
+        assert!(s.contains("b\n"), "{s:?}");
+        assert!(s.contains(">>>>>>> test\n"), "{s:?}");
+        // Defensive trailing-newline: the output must always end with
+        // a newline (or be empty).
+        assert!(s.ends_with('\n'), "{s:?}");
+    }
+
+    #[test]
+    fn build_conflict_buffer_handles_crlf_line_endings() {
+        // similar treats CR-LF as part of the line. The diff still works,
+        // and the marker block is produced for the differing line.
+        let local = b"a\r\nb\r\n";
+        let remote = b"a\r\nc\r\n";
+        let buf = build_conflict_buffer(local, remote, "test");
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("<<<<<<< local\n"), "{s:?}");
+        assert!(s.contains("b\r\n"), "{s:?}");
+        assert!(s.contains("c\r\n"), "{s:?}");
+        assert!(s.contains(">>>>>>> test\n"), "{s:?}");
+        // The equal prefix "a\r\n" is preserved verbatim.
+        assert!(s.starts_with("a\r\n"), "{s:?}");
+    }
+
+    #[test]
+    fn build_conflict_buffer_handles_unicode_content() {
+        let local = "こんにちは\n世界\n".as_bytes();
+        let remote = "こんばんは\n世界\n".as_bytes();
+        let buf = build_conflict_buffer(local, remote, "test");
+        let s = String::from_utf8(buf).unwrap();
+        // Only the first line differs; the second is equal and must
+        // sit outside any marker block.
+        assert!(s.contains("<<<<<<< local\nこんにちは\n"), "{s}");
+        assert!(s.contains("=======\nこんばんは\n"), "{s}");
+        assert!(s.contains(">>>>>>> test\n世界\n"), "{s}");
+    }
+
+    #[test]
+    fn build_conflict_buffer_handles_all_different() {
+        // No shared lines — one giant hunk.
+        let local = b"a\nb\nc\n";
+        let remote = b"x\ny\nz\n";
+        let buf = build_conflict_buffer(local, remote, "test");
+        let s = String::from_utf8(buf).unwrap();
+        let marker_count = s.matches("<<<<<<< local").count();
+        assert_eq!(marker_count, 1, "expected 1 block, got {marker_count}: {s}");
+        assert!(s.contains("<<<<<<< local\na\nb\nc\n=======\nx\ny\nz\n>>>>>>> test\n"), "{s}");
+    }
+
+    #[test]
+    fn build_conflict_buffer_handles_many_tiny_hunks() {
+        let local = b"a\nFOO\nb\nBAR\nc\nBAZ\n";
+        let remote = b"a\nfoo\nb\nbar\nc\nbaz\n";
+        let buf = build_conflict_buffer(local, remote, "test");
+        let s = String::from_utf8(buf).unwrap();
+        let marker_count = s.matches("<<<<<<< local").count();
+        assert_eq!(marker_count, 3, "expected 3 blocks, got {marker_count}: {s}");
+    }
+
+    #[test]
+    fn build_conflict_buffer_preserves_trailing_newline_consistency() {
+        // Always-trailing-newline (or empty) invariant: cover a few
+        // shapes (newline-terminated, no-trailing-newline, single line,
+        // and the all-equal short-circuit).
+        for (l, r) in [
+            (&b"a\nb\n"[..], &b"a\nc\n"[..]),
+            (&b"a"[..], &b"b"[..]),
+            (&b""[..], &b"x\n"[..]),
+            (&b"same\n"[..], &b"same\n"[..]),
+        ] {
+            let buf = build_conflict_buffer(l, r, "test");
+            let s = String::from_utf8(buf).unwrap();
+            assert!(
+                s.is_empty() || s.ends_with('\n'),
+                "expected newline-terminated or empty: {s:?}"
+            );
+        }
+    }
+
+    // ============================================================
+    // Group B — prompt_hunk_by_hunk adversarial examples.
+    // ============================================================
+
+    #[test]
+    fn hunk_by_hunk_eof_mid_walk_preserves_partial_work_with_markers() {
+        // 3 hunks; only one decision typed. Walker should resolve hunk
+        // 1 from stdin, then hit EOF mid-walk and mark hunks 2 and 3
+        // as Skip — yielding EditedWithMarkers with both hunks wrapped
+        // in markers.
+        let (local, remote) = three_hunk_fixture();
+        let mut output: Vec<u8> = Vec::new();
+        let mut input = Cursor::new(b"k\n".to_vec());
+        let path = std::path::Path::new("x.py");
+        let outcome = prompt_hunk_by_hunk(
+            &mut input, &mut output, &local, &remote, path, "production", ColorMode::Plain,
+        ).unwrap();
+        let bytes = match outcome {
+            EditOutcome::EditedWithMarkers(b) => b,
+            other => panic!("expected EditedWithMarkers, got {other:?}"),
+        };
+        let s = String::from_utf8_lossy(&bytes);
+        // Hunk 1 kept local (FOO present, foo absent).
+        assert!(s.contains("\nFOO\n"), "hunk 1 missing local: {s}");
+        // Hunk 2 and 3 wrapped in markers (BAR/bar and BAZ/baz).
+        let count = s.matches("<<<<<<< local").count();
+        assert_eq!(count, 2, "expected 2 wrapped hunks, got {count}: {s}");
+        assert!(s.contains("BAR\n=======\nbar\n"), "hunk 2 wrap: {s}");
+        assert!(s.contains("BAZ\n=======\nbaz\n"), "hunk 3 wrap: {s}");
+    }
+
+    #[test]
+    fn hunk_by_hunk_unknown_action_reprompts() {
+        // 1 hunk; user types `x\n` (unknown), then `k\n`.
+        let local = b"a\nLOCAL\nb\n".to_vec();
+        let remote = b"a\nREMOTE\nb\n".to_vec();
+        let mut output: Vec<u8> = Vec::new();
+        let mut input = Cursor::new(b"x\nk\n".to_vec());
+        let path = std::path::Path::new("x.py");
+        let outcome = prompt_hunk_by_hunk(
+            &mut input, &mut output, &local, &remote, path, "test", ColorMode::Plain,
+        ).unwrap();
+        match outcome {
+            EditOutcome::Edited(bytes) => assert_eq!(bytes, local),
+            other => panic!("expected Edited, got {other:?}"),
+        }
+        let s = String::from_utf8(output).unwrap();
+        assert!(s.contains("unrecognized"), "unknown should re-prompt: {s}");
+    }
+
+    #[test]
+    fn hunk_by_hunk_immediate_abort_returns_aborted() {
+        let (local, remote) = three_hunk_fixture();
+        let mut output: Vec<u8> = Vec::new();
+        let mut input = Cursor::new(b"a\n".to_vec());
+        let path = std::path::Path::new("x.py");
+        let outcome = prompt_hunk_by_hunk(
+            &mut input, &mut output, &local, &remote, path, "test", ColorMode::Plain,
+        ).unwrap();
+        assert!(matches!(outcome, EditOutcome::Aborted), "got {outcome:?}");
+    }
+
+    #[test]
+    fn hunk_by_hunk_mixed_options_handle_in_order() {
+        // 4-hunk fixture. Decisions: k, r, b, s.
+        let local = b"a\nFOO\nb\nBAR\nc\nBAZ\nd\nQUX\ne\n".to_vec();
+        let remote = b"a\nfoo\nb\nbar\nc\nbaz\nd\nqux\ne\n".to_vec();
+        let mut output: Vec<u8> = Vec::new();
+        let mut input = Cursor::new(b"k\nr\nb\ns\n".to_vec());
+        let path = std::path::Path::new("x.py");
+        let outcome = prompt_hunk_by_hunk(
+            &mut input, &mut output, &local, &remote, path, "production", ColorMode::Plain,
+        ).unwrap();
+        let bytes = match outcome {
+            EditOutcome::EditedWithMarkers(b) => b,
+            other => panic!("expected EditedWithMarkers (one [s] used), got {other:?}"),
+        };
+        // Expected: equal lines (a, b, c, d, e) preserved; hunk 1 = local
+        // (FOO); hunk 2 = remote (bar); hunk 3 = both (BAZ then baz);
+        // hunk 4 = markers around QUX/qux.
+        let expected =
+            b"a\nFOO\nb\nbar\nc\nBAZ\nbaz\nd\n<<<<<<< local\nQUX\n=======\nqux\n>>>>>>> production\ne\n"
+                .to_vec();
+        assert_eq!(
+            bytes,
+            expected,
+            "got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    #[test]
+    fn hunk_by_hunk_identical_inputs_short_circuits_to_local() {
+        // No conflict hunks at all: walker must return Edited(local) without
+        // reading from stdin or prompting.
+        let local = b"a\nb\nc\n".to_vec();
+        let remote = local.clone();
+        let mut output: Vec<u8> = Vec::new();
+        let mut input = Cursor::new(b"".to_vec());
+        let path = std::path::Path::new("x.py");
+        let outcome = prompt_hunk_by_hunk(
+            &mut input, &mut output, &local, &remote, path, "test", ColorMode::Plain,
+        ).unwrap();
+        match outcome {
+            EditOutcome::Edited(bytes) => assert_eq!(bytes, local),
+            other => panic!("expected Edited(local), got {other:?}"),
+        }
+        // No prompt should have been rendered.
+        let s = String::from_utf8(output).unwrap();
+        assert!(s.is_empty(), "no prompt expected: {s:?}");
+    }
+
+    // ============================================================
+    // Group C — validator coverage.
+    // ============================================================
+
+    #[test]
+    fn validate_edited_catches_indented_marker() {
+        // An indented marker would otherwise sneak into the lockfile.
+        // We catch it via trim_start().
+        let s = b"def x():\n    <<<<<<< sneaky\n    pass\n";
+        let err = validate_edited(s, std::path::Path::new("x.py")).unwrap_err();
+        assert!(err.contains("conflict marker"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_edited_catches_marker_at_end_of_file() {
+        // Last line is a marker without trailing newline.
+        let s = b"foo\n>>>>>>> remote";
+        let err = validate_edited(s, std::path::Path::new("x.py")).unwrap_err();
+        assert!(err.contains("conflict marker"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_edited_json_path_rejects_invalid_json() {
+        let err = validate_edited(b"{not json", std::path::Path::new("x.json")).unwrap_err();
+        assert!(err.contains("not valid JSON"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_edited_json_path_accepts_valid_json() {
+        validate_edited(b"{\"a\":1}", std::path::Path::new("x.json")).unwrap();
+    }
+
+    #[test]
+    fn validate_edited_py_path_skips_json_validation() {
+        // Same bytes that fail-as-JSON pass as `.py` content.
+        validate_edited(b"def x(): pass\n", std::path::Path::new("x.py")).unwrap();
+    }
+
+    #[test]
+    fn validate_edited_rejects_non_utf8() {
+        let s: &[u8] = &[b'a', 0xFF, b'b'];
+        let err = validate_edited(s, std::path::Path::new("x.py")).unwrap_err();
+        assert!(err.contains("UTF-8"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_markers_only_catches_indented_marker() {
+        // Same indented-marker fix applies to the per-hunk validator.
+        let s = b"def x():\n    ======= sneaky\n";
+        let err = validate_edited_markers_only(s).unwrap_err();
+        assert!(err.contains("conflict marker"), "got: {err}");
+    }
+
+    // ============================================================
+    // Group D — resolver UI / prompt_resolve_with_color.
+    // ============================================================
+
+    #[test]
+    fn prompt_resolve_header_includes_hunk_count_for_multi_hunk() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.py");
+        std::fs::write(&path, b"a\nFOO\nb\nBAR\nc\nBAZ\nd\n").unwrap();
+        let mut output: Vec<u8> = Vec::new();
+        let input = Cursor::new(b"s\n");
+        prompt_resolve_with_color(
+            input,
+            &mut output,
+            1,
+            1,
+            &path,
+            b"a\nfoo\nb\nbar\nc\nbaz\nd\n",
+            "test",
+            ColorMode::Plain,
+        )
+        .unwrap();
+        let s = String::from_utf8(output).unwrap();
+        assert!(s.contains("(3 hunks)"), "header should advertise hunk count: {s}");
+    }
+
+    #[test]
+    fn prompt_resolve_header_omits_hunk_count_for_single_hunk() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.py");
+        std::fs::write(&path, b"a\nLOCAL\nb\n").unwrap();
+        let mut output: Vec<u8> = Vec::new();
+        let input = Cursor::new(b"s\n");
+        prompt_resolve_with_color(
+            input,
+            &mut output,
+            1,
+            1,
+            &path,
+            b"a\nREMOTE\nb\n",
+            "test",
+            ColorMode::Plain,
+        )
+        .unwrap();
+        let s = String::from_utf8(output).unwrap();
+        assert!(!s.contains("hunks)"), "single-hunk header must omit count: {s}");
+    }
+
+    #[test]
+    fn prompt_resolve_unknown_key_reprompts_includes_h_for_multi_hunk() {
+        // 3-hunk conflict; stdin `z\n` (unrecognized) then `s\n`.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.py");
+        std::fs::write(&path, b"a\nFOO\nb\nBAR\nc\nBAZ\nd\n").unwrap();
+        let mut output: Vec<u8> = Vec::new();
+        let input = Cursor::new(b"z\ns\n");
+        let r = prompt_resolve_with_color(
+            input,
+            &mut output,
+            1,
+            1,
+            &path,
+            b"a\nfoo\nb\nbar\nc\nbaz\nd\n",
+            "test",
+            ColorMode::Plain,
+        )
+        .unwrap();
+        assert!(matches!(r, Resolution::Skip));
+        let s = String::from_utf8(output).unwrap();
+        assert!(s.contains("unrecognized"), "should print unrecognized: {s}");
+        let prompts = s.matches("[k] keep local").count();
+        assert!(prompts >= 2, "should have re-prompted at least twice: count={prompts}, output={s}");
+        assert!(s.contains("[h] hunk-by-hunk"), "multi-hunk re-prompt should include [h]: {s}");
     }
 }
