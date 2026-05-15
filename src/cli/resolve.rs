@@ -182,6 +182,7 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
                     &local_bytes,
                     remote_bytes,
                     local_path,
+                    env,
                     mode,
                 )? {
                     EditOutcome::Edited(edited) => return Ok(Resolution::Edit(edited)),
@@ -286,6 +287,74 @@ enum EditOutcome {
     Aborted,
 }
 
+/// Build a git-style merge-conflict buffer for `$EDITOR`. Only differing
+/// hunks are wrapped in `<<<<<<< local / ======= / >>>>>>> {env}` markers;
+/// identical lines pass through unchanged.
+///
+/// Operates on already-prettified bytes (pretty-printed JSON or raw `.py`).
+fn build_conflict_buffer(local: &[u8], remote: &[u8], env: &str) -> Vec<u8> {
+    use similar::ChangeTag;
+
+    let local_str = String::from_utf8_lossy(local);
+    let remote_str = String::from_utf8_lossy(remote);
+    let diff = TextDiff::from_lines(local_str.as_ref(), remote_str.as_ref());
+
+    let mut out = String::new();
+    let mut local_chunk: Vec<&str> = Vec::new();
+    let mut remote_chunk: Vec<&str> = Vec::new();
+
+    fn flush<'a>(
+        out: &mut String,
+        local: &mut Vec<&'a str>,
+        remote: &mut Vec<&'a str>,
+        env: &str,
+    ) {
+        if local.is_empty() && remote.is_empty() {
+            return;
+        }
+        out.push_str("<<<<<<< local\n");
+        for l in local.drain(..) {
+            out.push_str(l);
+            if !l.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        out.push_str("=======\n");
+        for r in remote.drain(..) {
+            out.push_str(r);
+            if !r.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        out.push_str(">>>>>>> ");
+        out.push_str(env);
+        out.push('\n');
+    }
+
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Equal => {
+                flush(&mut out, &mut local_chunk, &mut remote_chunk, env);
+                out.push_str(change.value());
+            }
+            ChangeTag::Delete => {
+                local_chunk.push(change.value());
+            }
+            ChangeTag::Insert => {
+                remote_chunk.push(change.value());
+            }
+        }
+    }
+    flush(&mut out, &mut local_chunk, &mut remote_chunk, env);
+
+    // Defensive: ensure trailing newline (matches what the editor expects).
+    if !out.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+
+    out.into_bytes()
+}
+
 /// Open `$EDITOR` on a temp file pre-populated with git-style conflict
 /// markers (pretty-printed JSON between them, so each field lands on
 /// its own line). After every save:
@@ -301,6 +370,7 @@ fn run_editor_loop<R: BufRead, W: Write>(
     local: &[u8],
     remote: &[u8],
     local_path: &Path,
+    env: &str,
     mode: ColorMode,
 ) -> Result<EditOutcome> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
@@ -319,18 +389,7 @@ fn run_editor_loop<R: BufRead, W: Write>(
     let local_view = prettify_json_for_diff(local);
     let remote_view = prettify_json_for_diff(remote);
 
-    let mut buf: Vec<u8> = Vec::new();
-    buf.extend_from_slice(b"<<<<<<< local\n");
-    buf.extend_from_slice(&local_view);
-    if !local_view.ends_with(b"\n") {
-        buf.push(b'\n');
-    }
-    buf.extend_from_slice(b"=======\n");
-    buf.extend_from_slice(&remote_view);
-    if !remote_view.ends_with(b"\n") {
-        buf.push(b'\n');
-    }
-    buf.extend_from_slice(b">>>>>>> remote\n");
+    let buf = build_conflict_buffer(&local_view, &remote_view, env);
 
     std::fs::write(&path, &buf)
         .with_context(|| format!("writing temp conflict file {}", path.display()))?;
@@ -852,6 +911,76 @@ mod tests {
     fn validate_edited_skips_json_check_for_py_path() {
         let body = b"def main():\n    pass\n";
         validate_edited(body, std::path::Path::new("x.py")).unwrap();
+    }
+
+    #[test]
+    fn build_conflict_buffer_marks_only_differing_hunks() {
+        let local = b"a\nb\nc\nd\ne\n";
+        let remote = b"a\nb\nXXX\nd\ne\n";
+        let buf = build_conflict_buffer(local, remote, "production");
+        let s = String::from_utf8(buf).unwrap();
+
+        // The equal prefix and suffix should be present without markers.
+        assert!(s.contains("a\nb\n"), "equal prefix missing: {s}");
+        assert!(s.contains("d\ne\n"), "equal suffix missing: {s}");
+        // Only the differing hunk should be wrapped.
+        assert!(
+            s.contains("<<<<<<< local\nc\n=======\nXXX\n>>>>>>> production\n"),
+            "{s}"
+        );
+        // The whole-file form should NOT appear.
+        assert!(
+            !s.contains("<<<<<<< local\na\nb\nc\nd\ne\n"),
+            "whole-file marker leaked: {s}"
+        );
+    }
+
+    #[test]
+    fn build_conflict_buffer_identical_files_produces_no_markers() {
+        let local = b"a\nb\nc\n";
+        let remote = b"a\nb\nc\n";
+        let buf = build_conflict_buffer(local, remote, "production");
+        let s = String::from_utf8(buf).unwrap();
+        assert!(!s.contains("<<<<<<<"), "no markers expected: {s}");
+        assert!(!s.contains("======="), "no markers expected: {s}");
+        assert!(!s.contains(">>>>>>>"), "no markers expected: {s}");
+        assert_eq!(s, "a\nb\nc\n");
+    }
+
+    #[test]
+    fn build_conflict_buffer_uses_env_name_in_marker() {
+        let local = b"x\n";
+        let remote = b"y\n";
+        let buf = build_conflict_buffer(local, remote, "staging");
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains(">>>>>>> staging\n"), "{s}");
+        assert!(
+            !s.contains(">>>>>>> remote"),
+            "literal 'remote' should not appear: {s}"
+        );
+    }
+
+    #[test]
+    fn build_conflict_buffer_handles_multiple_hunks() {
+        let local = b"a\nFOO\nb\nBAR\nc\n";
+        let remote = b"a\nfoo\nb\nbar\nc\n";
+        let buf = build_conflict_buffer(local, remote, "production");
+        let s = String::from_utf8(buf).unwrap();
+        // Two separate marker blocks.
+        let marker_count = s.matches("<<<<<<< local").count();
+        assert_eq!(marker_count, 2, "expected 2 conflict blocks, got {marker_count}: {s}");
+    }
+
+    #[test]
+    fn build_conflict_buffer_empty_local_emits_remote_only_block() {
+        let local = b"";
+        let remote = b"x\ny\n";
+        let buf = build_conflict_buffer(local, remote, "production");
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            s.contains("<<<<<<< local\n=======\nx\ny\n>>>>>>> production\n"),
+            "{s}"
+        );
     }
 
     #[test]
