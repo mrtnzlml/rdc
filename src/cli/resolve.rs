@@ -877,22 +877,64 @@ fn validate_edited_markers_only(bytes: &[u8]) -> std::result::Result<(), String>
     Ok(())
 }
 
+/// Outcome of [`resolve_combined_file`] for a single sub-file within a
+/// combined-hash entity. Distinguishes "resolved" outcomes (the caller
+/// computes a fresh combined hash from the bytes on disk and records it
+/// in the lockfile) from "preserve-base" outcomes (the user chose `[s]`
+/// or hunk-walk `[s]`, so the lockfile entry for the *whole entity* must
+/// not advance — the conflict has to re-surface on the next pull/sync).
+#[derive(Debug)]
+pub enum CombinedFileOutcome {
+    /// Final bytes are on disk; caller may advance the combined hash.
+    Resolved(Vec<u8>),
+    /// Bytes are on disk (either kept-as-local for `[s]kip`, or marker-
+    /// bearing for `[h] → [s]`), but the conflict is *not* resolved.
+    /// The caller MUST preserve the prior lockfile base for this entity
+    /// so the next pull/sync re-classifies it as a conflict.
+    PreserveBase(Vec<u8>),
+}
+
+impl CombinedFileOutcome {
+    /// Borrow the bytes (used by callers to feed the combined-hash
+    /// helper) without consuming the outcome.
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            CombinedFileOutcome::Resolved(b) | CombinedFileOutcome::PreserveBase(b) => b,
+        }
+    }
+    /// Consume and return the bytes.
+    pub fn into_bytes(self) -> Vec<u8> {
+        match self {
+            CombinedFileOutcome::Resolved(b) | CombinedFileOutcome::PreserveBase(b) => b,
+        }
+    }
+    /// True when at least one sub-file in the entity asked the caller to
+    /// preserve the prior lockfile base.
+    pub fn is_preserve_base(&self) -> bool {
+        matches!(self, CombinedFileOutcome::PreserveBase(_))
+    }
+}
+
 /// Resolve a single sub-file within a combined-hash entity (hook
 /// `.json`/`.py`, schema `schema.json`/formulas/`<id>.py`). Spec §8.3.
 ///
 /// The caller passes the in-memory bytes for both sides. Behavior:
 ///
 /// - `local_bytes == remote_bytes` → no-op (no prompt, no write); returns
-///   `local_bytes`.
+///   `Resolved(local_bytes)`.
 /// - `interactive == false` → legacy shadow-file: writes
-///   `<local_path>.<env>`, keeps local on disk, returns `local_bytes`.
+///   `<local_path>.<env>`, keeps local on disk, returns
+///   `PreserveBase(local_bytes)` — the caller must NOT advance the
+///   combined-hash lockfile entry because the conflict is unresolved.
 /// - `interactive == true && bytes differ` → prompt the user via
-///   [`prompt_resolve`] with `[label_index/label_total]`. On Skip / Keep
-///   semantics match [`apply_pull_action`]. On Abort: propagate
-///   [`PullAborted`] so the caller bubbles up.
+///   [`prompt_resolve`] with `[label_index/label_total]`. On `[k]eep`,
+///   `[r]emote`, `[e]dit`: returns `Resolved(bytes)`. On `[s]kip` or
+///   hunk-walk `[s]`: returns `PreserveBase(bytes)`. On `[a]bort`:
+///   propagates [`PullAborted`].
 ///
-/// Returns the bytes that are now on disk for `local_path`. The caller
-/// uses these to compute the entity's combined hash.
+/// The returned bytes are what now sits on disk for `local_path` (so the
+/// caller can include them when computing the entity's combined hash if
+/// it chooses to advance the lockfile).
 pub fn resolve_combined_file(
     label_index: usize,
     label_total: usize,
@@ -901,22 +943,22 @@ pub fn resolve_combined_file(
     remote_bytes: &[u8],
     interactive: bool,
     env: &str,
-) -> Result<Vec<u8>> {
+) -> Result<CombinedFileOutcome> {
     use crate::snapshot::writer::write_atomic;
 
     if local_bytes == remote_bytes {
-        return Ok(local_bytes.to_vec());
+        return Ok(CombinedFileOutcome::Resolved(local_bytes.to_vec()));
     }
 
     if !interactive {
         let conflict_path = crate::paths::shadow_path_for(local_path, env);
         write_atomic(&conflict_path, remote_bytes)?;
         eprintln!(
-            "warning: {} conflict — local preserved, remote at {}",
+            "warning: {} conflict — local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
             local_path.display(),
             conflict_path.display()
         );
-        return Ok(local_bytes.to_vec());
+        return Ok(CombinedFileOutcome::PreserveBase(local_bytes.to_vec()));
     }
 
     let stdin = std::io::stdin();
@@ -931,10 +973,10 @@ pub fn resolve_combined_file(
         env,
     )?;
     match resolution {
-        Resolution::KeepLocal => Ok(local_bytes.to_vec()),
+        Resolution::KeepLocal => Ok(CombinedFileOutcome::Resolved(local_bytes.to_vec())),
         Resolution::KeepRemote => {
             write_atomic(local_path, remote_bytes)?;
-            Ok(remote_bytes.to_vec())
+            Ok(CombinedFileOutcome::Resolved(remote_bytes.to_vec()))
         }
         Resolution::Edit(edited) => {
             // Defense in depth — the editor loop already validates, but a
@@ -950,13 +992,16 @@ pub fn resolve_combined_file(
                 );
             }
             write_atomic(local_path, &edited)?;
-            Ok(edited)
+            Ok(CombinedFileOutcome::Resolved(edited))
         }
         Resolution::EditWithMarkers(edited) => {
             // User explicitly chose `[h]unk-by-hunk → [s]kip` on at
             // least one hunk; the bytes contain unresolved markers by
             // design. Skip the marker-leakage check but still validate
-            // UTF-8 so the lockfile hash is over decodable bytes.
+            // UTF-8 so the lockfile hash is over decodable bytes. The
+            // marker-bearing content is intentionally on disk, but the
+            // lockfile MUST NOT advance — the conflict needs to keep
+            // re-surfacing until the user fully resolves it.
             if std::str::from_utf8(&edited).is_err() {
                 anyhow::bail!(
                     "refusing to overwrite {} with non-UTF-8 hunk-walk result; local file left untouched",
@@ -964,17 +1009,17 @@ pub fn resolve_combined_file(
                 );
             }
             write_atomic(local_path, &edited)?;
-            Ok(edited)
+            Ok(CombinedFileOutcome::PreserveBase(edited))
         }
         Resolution::Skip => {
             let conflict_path = crate::paths::shadow_path_for(local_path, env);
             write_atomic(&conflict_path, remote_bytes)?;
             eprintln!(
-                "warning: {} conflict — local preserved, remote at {}",
+                "warning: {} conflict — local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
                 local_path.display(),
                 conflict_path.display()
             );
-            Ok(local_bytes.to_vec())
+            Ok(CombinedFileOutcome::PreserveBase(local_bytes.to_vec()))
         }
         Resolution::Abort => Err(anyhow::Error::new(PullAborted)),
     }
@@ -1564,7 +1609,9 @@ mod tests {
         let path = dir.path().join("a.py");
         std::fs::write(&path, b"same\n").unwrap();
         let out = resolve_combined_file(1, 2, &path, b"same\n", b"same\n", true, "test").unwrap();
-        assert_eq!(out, b"same\n");
+        assert_eq!(out.bytes(), b"same\n");
+        // Bytes-equal sides are a "Resolved" outcome — caller may advance.
+        assert!(!out.is_preserve_base(), "equal bytes must not preserve base");
         // No shadow file written.
         assert!(!dir.path().join("a.py.test").exists());
     }
@@ -1575,7 +1622,13 @@ mod tests {
         let path = dir.path().join("a.py");
         std::fs::write(&path, b"local\n").unwrap();
         let out = resolve_combined_file(1, 1, &path, b"local\n", b"remote\n", false, "test").unwrap();
-        assert_eq!(out, b"local\n");
+        assert_eq!(out.bytes(), b"local\n");
+        // Non-interactive shadow-skip MUST signal preserve-base so the
+        // caller does not advance the entity's combined hash.
+        assert!(
+            out.is_preserve_base(),
+            "non-interactive shadow-fallback must signal preserve-base"
+        );
         assert_eq!(std::fs::read(dir.path().join("a.py.test")).unwrap(), b"remote\n");
         // Local file untouched.
         assert_eq!(std::fs::read(&path).unwrap(), b"local\n");

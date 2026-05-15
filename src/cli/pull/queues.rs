@@ -116,7 +116,7 @@ pub async fn process(
         if q_action == PullAction::Conflict {
             counts.conflicts += 1;
         }
-        let q_recorded = apply_pull_action(q_action, &queue_path, &queue_proposed, q_remote_hash, ctx.interactive, progress, ctx.paths.env())?;
+        let q_recorded = apply_pull_action(q_action, &queue_path, &queue_proposed, q_remote_hash, ctx.interactive, progress, ctx.paths.env(), queue_base.as_deref())?;
         record_object(
             ctx.lockfile,
             "queues",
@@ -277,7 +277,7 @@ fn write_schema_for_queue(
 
             if ctx.interactive && symmetric {
                 let total = 1 + remote_formulas.len();
-                let resolved_json = crate::cli::resolve::resolve_combined_file(
+                let json_outcome = crate::cli::resolve::resolve_combined_file(
                     1, total,
                     &schema_path,
                     local_json,
@@ -285,6 +285,8 @@ fn write_schema_for_queue(
                     ctx.interactive,
                     ctx.paths.env(),
                 )?;
+                let mut preserve_base = json_outcome.is_preserve_base();
+                let resolved_json = json_outcome.into_bytes();
                 let mut resolved_formulas: Vec<(String, Vec<u8>)> =
                     Vec::with_capacity(remote_formulas.len());
                 let local_by_id: std::collections::BTreeMap<&str, &Vec<u8>> =
@@ -293,7 +295,7 @@ fn write_schema_for_queue(
                     let local_bytes = local_by_id.get(field_id.as_str()).copied()
                         .cloned().unwrap_or_default();
                     let formula_path = queue_dir.join("formulas").join(format!("{field_id}.py"));
-                    let bytes = crate::cli::resolve::resolve_combined_file(
+                    let outcome = crate::cli::resolve::resolve_combined_file(
                         i + 2, total,
                         &formula_path,
                         &local_bytes,
@@ -301,11 +303,24 @@ fn write_schema_for_queue(
                         ctx.interactive,
                         ctx.paths.env(),
                     )?;
-                    resolved_formulas.push((field_id.clone(), bytes));
+                    preserve_base |= outcome.is_preserve_base();
+                    resolved_formulas.push((field_id.clone(), outcome.into_bytes()));
                 }
-                crate::state::schema_combined_hash(&resolved_json, &resolved_formulas)
+                if preserve_base {
+                    match schema_base.as_deref() {
+                        Some(prior) => prior.to_string(),
+                        None => crate::state::schema_combined_hash(
+                            &resolved_json,
+                            &resolved_formulas,
+                        ),
+                    }
+                } else {
+                    crate::state::schema_combined_hash(&resolved_json, &resolved_formulas)
+                }
             } else {
-                // Legacy shadow-file flow.
+                // Legacy shadow-file flow — unresolved by construction.
+                // Preserve the prior lockfile base so the next pull/sync
+                // re-classifies this schema as a conflict.
                 let env = ctx.paths.env();
                 let remote_path = crate::paths::shadow_path_for(&schema_path, env);
                 let remote_formulas_dir = queue_dir.join(format!("formulas.{env}"));
@@ -319,12 +334,15 @@ fn write_schema_for_queue(
                     }
                 }
                 phase.line(format!(
-                    "⚠ {} conflict — local preserved, remote at {} (formulas at {})",
+                    "⚠ {} conflict — local preserved, remote at {} (formulas at {}); lockfile base preserved",
                     schema_path.display(),
                     remote_path.display(),
                     remote_formulas_dir.display(),
                 ));
-                crate::state::schema_combined_hash(local_json, &pre_local_formulas)
+                match schema_base.as_deref() {
+                    Some(prior) => prior.to_string(),
+                    None => crate::state::schema_combined_hash(local_json, &pre_local_formulas),
+                }
             }
         }
     };
@@ -366,7 +384,7 @@ fn write_inbox_for_queue(
     if i_action == PullAction::Conflict {
         counts.conflicts += 1;
     }
-    let i_recorded = apply_pull_action(i_action, &inbox_path, &inbox_proposed, i_remote_hash, ctx.interactive, progress, ctx.paths.env())?;
+    let i_recorded = apply_pull_action(i_action, &inbox_path, &inbox_proposed, i_remote_hash, ctx.interactive, progress, ctx.paths.env(), inbox_base.as_deref())?;
     record_object(
         ctx.lockfile,
         "inboxes",

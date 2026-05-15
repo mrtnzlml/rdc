@@ -366,8 +366,17 @@ pub fn decide_pull_action(
 /// On [`PullAction::Conflict`] with `interactive == true`, the function
 /// invokes the spec §8.3 resolver TUI. With `interactive == false` (CI,
 /// non-TTY, or `--yes`), it preserves the legacy shadow-file behavior:
-/// writes `<file>.<env>` next to the local file, keeps local, returns
-/// the local hash.
+/// writes `<file>.<env>` next to the local file, keeps local, and returns
+/// the *prior base hash* (`base_hash`) so the caller's `record_object` is
+/// a no-op for the lockfile entry — the conflict re-surfaces on the next
+/// pull. If `base_hash` is `None` (defensive — a conflict presupposes a
+/// prior base), the function falls back to today's behavior and returns
+/// the local hash so the lockfile still gets a sensible entry.
+///
+/// The same preserve-base rule applies to a
+/// [`crate::cli::resolve::Resolution::EditWithMarkers`] outcome: the
+/// merged bytes contain unresolved markers, so the lockfile must not
+/// advance.
 pub fn apply_pull_action(
     action: PullAction,
     local_path: &Path,
@@ -376,6 +385,7 @@ pub fn apply_pull_action(
     interactive: bool,
     progress: &Arc<ProgressLog>,
     env: &str,
+    base_hash: Option<&str>,
 ) -> Result<String> {
     use crate::snapshot::writer::write_atomic;
     match action {
@@ -395,32 +405,53 @@ pub fn apply_pull_action(
         }
         PullAction::Conflict => {
             if interactive {
-                resolve_conflict_interactive(local_path, remote_bytes, &remote_hash, progress, env)
+                resolve_conflict_interactive(
+                    local_path,
+                    remote_bytes,
+                    &remote_hash,
+                    progress,
+                    env,
+                    base_hash,
+                )
             } else {
-                shadow_file_conflict(local_path, remote_bytes, progress, env)
+                shadow_file_conflict(local_path, remote_bytes, progress, env, base_hash)
             }
         }
     }
 }
 
 /// The legacy shadow-file behavior for a conflict: write
-/// `<file>.<env>`, keep local on disk, return the local hash. Used when
-/// `interactive == false` (CI/non-TTY/--yes) and as a fallback from the
-/// resolver when the user picks `[s]kip`.
+/// `<file>.<env>`, keep local on disk. Used when `interactive == false`
+/// (CI/non-TTY/--yes) and as a fallback from the resolver when the user
+/// picks `[s]kip`.
+///
+/// Returns the *prior* base hash (`base_hash`) so the caller's
+/// `record_object` is a no-op — the lockfile entry must not advance on a
+/// shadow-skip, otherwise the next pull misclassifies the slug as clean
+/// and the conflict is silently swallowed. Falls back to the local hash
+/// only when `base_hash` is `None` (defensive — conflicts presuppose a
+/// prior base).
 fn shadow_file_conflict(
     local_path: &Path,
     remote_bytes: &[u8],
     progress: &Arc<ProgressLog>,
     env: &str,
+    base_hash: Option<&str>,
 ) -> Result<String> {
     use crate::snapshot::writer::write_atomic;
     let conflict_path = crate::paths::shadow_path_for(local_path, env);
     write_atomic(&conflict_path, remote_bytes)?;
     progress.println(format!(
-        "⚠ {} conflict — local preserved, remote at {}",
+        "⚠ {} conflict — local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
         local_path.display(),
         conflict_path.display(),
     ));
+    if let Some(prior) = base_hash {
+        return Ok(prior.to_string());
+    }
+    // Defensive fallback: no prior base recorded (shouldn't happen for a
+    // real conflict; conflicts presuppose `(local != base, remote != base)`).
+    // Use local hash so the lockfile still gets a sensible entry.
     let local_bytes = std::fs::read(local_path)
         .with_context(|| format!("reading {}", local_path.display()))?;
     Ok(content_hash(&local_bytes))
@@ -436,6 +467,7 @@ fn resolve_conflict_interactive(
     remote_hash: &str,
     progress: &Arc<ProgressLog>,
     env: &str,
+    base_hash: Option<&str>,
 ) -> Result<String> {
     use crate::cli::resolve::{prompt_resolve, PullAborted, Resolution};
     use crate::snapshot::writer::write_atomic;
@@ -469,13 +501,25 @@ fn resolve_conflict_interactive(
         Resolution::EditWithMarkers(edited) => {
             // Hunk-by-hunk walker with at least one skipped hunk — bytes
             // intentionally retain `<<<<<<<` / `=======` / `>>>>>>>`
-            // markers. The lockfile hash is over the marker-bearing
-            // content, so the next pull sees the partial resolution as
-            // the new base.
+            // markers. Writing those bytes is fine, but the lockfile
+            // base MUST NOT advance: the next pull/sync needs to see the
+            // marker-bearing state as still-conflicting so the user keeps
+            // getting nudged. Return the prior base (same rule as
+            // shadow-skip); fall back to local hash when no prior base.
             write_atomic(local_path, &edited)?;
-            Ok(content_hash(&edited))
+            if let Some(prior) = base_hash {
+                progress.println(format!(
+                    "⚠ {} partially resolved (markers retained); lockfile base preserved — re-run to resolve",
+                    local_path.display(),
+                ));
+                Ok(prior.to_string())
+            } else {
+                Ok(content_hash(&edited))
+            }
         }
-        Resolution::Skip => shadow_file_conflict(local_path, remote_bytes, progress, env),
+        Resolution::Skip => {
+            shadow_file_conflict(local_path, remote_bytes, progress, env, base_hash)
+        }
         Resolution::Abort => Err(anyhow::Error::new(PullAborted)),
     }
 }
@@ -554,7 +598,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         let p = crate::progress::ProgressLog::start("test");
-        let h = apply_pull_action(PullAction::Write, &path, b"hello", "h".repeat(64), false, &p, "test").unwrap();
+        let h = apply_pull_action(PullAction::Write, &path, b"hello", "h".repeat(64), false, &p, "test", None).unwrap();
         p.finish("test");
         assert_eq!(h, "h".repeat(64));
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
@@ -567,7 +611,7 @@ mod tests {
         std::fs::write(&path, b"local").unwrap();
         // interactive=false → legacy shadow-file behavior.
         let p = crate::progress::ProgressLog::start("test");
-        let _ = apply_pull_action(PullAction::Conflict, &path, b"remote", "h".repeat(64), false, &p, "test").unwrap();
+        let _ = apply_pull_action(PullAction::Conflict, &path, b"remote", "h".repeat(64), false, &p, "test", None).unwrap();
         p.finish("test");
         assert_eq!(std::fs::read(&path).unwrap(), b"local");
         assert_eq!(
@@ -637,11 +681,113 @@ mod tests {
             false,
             &p,
             "test",
+            None,
         )
         .unwrap();
         p.finish("test");
         assert_eq!(h, "h".repeat(64));
         // Local file unchanged byte-for-byte.
         assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+    }
+
+    /// A non-interactive (CI / non-TTY / `--yes`) conflict pull writes a
+    /// shadow file, keeps local on disk, and — critically — returns the
+    /// *prior base hash* so the caller's `record_object` is a no-op. This
+    /// ensures the next pull/sync re-classifies the slug as a conflict
+    /// instead of silently swallowing it.
+    #[test]
+    fn shadow_file_skip_does_not_advance_lockfile_base() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        let local_before = b"{\"local\":true}";
+        std::fs::write(&path, local_before).unwrap();
+        let remote = b"{\"remote\":true}";
+        let prior_base = "BASE_HASH_64_chars_".to_string() + &"0".repeat(45);
+        assert_eq!(prior_base.len(), 64);
+        let p = crate::progress::ProgressLog::start("test");
+        let recorded = apply_pull_action(
+            PullAction::Conflict,
+            &path,
+            remote,
+            content_hash(remote),
+            false, // non-interactive → shadow_file_conflict
+            &p,
+            "test",
+            Some(&prior_base),
+        )
+        .unwrap();
+        p.finish("test");
+        // Lockfile must NOT advance — recorded hash equals prior base.
+        assert_eq!(recorded, prior_base, "shadow-skip must preserve lockfile base");
+        // Shadow file carries remote bytes.
+        let shadow = dir.path().join("x.json.test");
+        assert!(shadow.exists(), "shadow file should be written");
+        assert_eq!(std::fs::read(&shadow).unwrap(), remote);
+        // Local file unchanged.
+        assert_eq!(std::fs::read(&path).unwrap(), local_before);
+    }
+
+    /// Defensive: a conflict can only happen after a prior base exists, but
+    /// if `base_hash` is `None` (paranoia, never seen in practice) we fall
+    /// back to the local hash so the lockfile still gets a sensible entry.
+    /// Documents the fallback contract.
+    #[test]
+    fn shadow_file_skip_with_no_prior_base_falls_back_to_local_hash() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        let local = b"{\"local\":true}";
+        std::fs::write(&path, local).unwrap();
+        let remote = b"{\"remote\":true}";
+        let p = crate::progress::ProgressLog::start("test");
+        let recorded = apply_pull_action(
+            PullAction::Conflict,
+            &path,
+            remote,
+            content_hash(remote),
+            false,
+            &p,
+            "test",
+            None, // no prior base
+        )
+        .unwrap();
+        p.finish("test");
+        assert_eq!(recorded, content_hash(local));
+    }
+
+    /// Re-running the same conflict pull twice with shadow-skip must keep
+    /// surfacing the conflict — the lockfile entry never advances, so the
+    /// classifier sees `(local != base, remote != base)` both times.
+    #[test]
+    fn two_consecutive_pulls_with_shadow_skip_keep_re_prompting() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        let local = b"{\"local\":true}";
+        std::fs::write(&path, local).unwrap();
+        let remote = b"{\"remote\":true}";
+        let base_hash = "B".repeat(64);
+        let p = crate::progress::ProgressLog::start("test");
+
+        // First pull → conflict → shadow-skip.
+        let (action1, remote_hash1) =
+            decide_pull_action(&path, Some(&base_hash), remote).unwrap();
+        assert_eq!(action1, PullAction::Conflict);
+        let recorded1 = apply_pull_action(
+            action1,
+            &path,
+            remote,
+            remote_hash1,
+            false,
+            &p,
+            "test",
+            Some(&base_hash),
+        )
+        .unwrap();
+        assert_eq!(recorded1, base_hash, "first pull preserves base");
+
+        // Local and remote unchanged → second pull must still see a
+        // conflict because the lockfile base never moved.
+        let (action2, _) = decide_pull_action(&path, Some(&recorded1), remote).unwrap();
+        assert_eq!(action2, PullAction::Conflict, "second pull must re-prompt");
+        p.finish("test");
     }
 }

@@ -125,7 +125,7 @@ pub async fn process(
             PullAction::Write => {
                 // The `interactive` flag is irrelevant on Write (no resolver
                 // path); pass `ctx.interactive` for consistency.
-                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone(), ctx.interactive, progress, ctx.paths.env())?;
+                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone(), ctx.interactive, progress, ctx.paths.env(), base_hash.as_deref())?;
                 if let Some(code) = &proposed_code {
                     write_hook_code(&ctx.paths.hooks_dir(), &slug, code, ext)
                         .with_context(|| format!("writing hook code for '{}'", hook.name))?;
@@ -162,7 +162,7 @@ pub async fn process(
                     || matches!((&pre_local_code, &proposed_code), (None, None));
                 let total = if symmetric && pre_local_code.is_some() { 2 } else { 1 };
 
-                let resolved_json = crate::cli::resolve::resolve_combined_file(
+                let json_outcome = crate::cli::resolve::resolve_combined_file(
                     1, total,
                     &local_path,
                     local_json,
@@ -171,9 +171,19 @@ pub async fn process(
                     ctx.paths.env(),
                 )?;
 
-                let resolved_code = if symmetric {
-                    if let (Some(loc), Some(rem)) = (&pre_local_code, &proposed_code) {
-                        let bytes = crate::cli::resolve::resolve_combined_file(
+                // Track preserve-base intent across both sub-files of the
+                // combined-hash entity — if either side asks for it, the
+                // whole entity's lockfile entry must stay pinned to the
+                // prior base (or fall back to the local combined hash
+                // when no prior base exists, mirroring `shadow_file_conflict`).
+                let mut preserve_base = json_outcome.is_preserve_base();
+
+                let (resolved_json, resolved_code) = if symmetric {
+                    let resolved_json = json_outcome.into_bytes();
+                    let resolved_code = if let (Some(loc), Some(rem)) =
+                        (&pre_local_code, &proposed_code)
+                    {
+                        let code_outcome = crate::cli::resolve::resolve_combined_file(
                             2, total,
                             &code_path,
                             loc.as_bytes(),
@@ -181,15 +191,23 @@ pub async fn process(
                             ctx.interactive,
                             ctx.paths.env(),
                         )?;
+                        preserve_base |= code_outcome.is_preserve_base();
+                        let bytes = code_outcome.into_bytes();
                         Some(String::from_utf8(bytes)
                             .with_context(|| format!("hook code resolved bytes for '{}' are not UTF-8", hook.name))?)
                     } else {
                         None
-                    }
+                    };
+                    (resolved_json, resolved_code)
                 } else {
                     // Asymmetric — fall back to shadow for the sidecar side.
                     // Shadow uses the runtime-derived extension so the editor
                     // gets the right syntax highlighting on a `.js` vs `.py`.
+                    // The JSON side already got the non-interactive shadow
+                    // treatment (see the `ctx.interactive && symmetric`
+                    // argument to `resolve_combined_file`); the sidecar
+                    // side mirrors that here. Either way the conflict is
+                    // unresolved → preserve the prior lockfile base.
                     if let Some(remote_code_str) = &proposed_code {
                         let env = ctx.paths.env();
                         let code_remote_path = ctx
@@ -198,10 +216,24 @@ pub async fn process(
                             .join(format!("{slug}.{ext}.{env}"));
                         crate::snapshot::writer::write_atomic(&code_remote_path, remote_code_str.as_bytes())?;
                     }
-                    pre_local_code.clone()
+                    preserve_base = true;
+                    (json_outcome.into_bytes(), pre_local_code.clone())
                 };
 
-                hook_combined_hash(&resolved_json, &resolved_code)
+                if preserve_base {
+                    // At least one sub-file asked for preserve-base —
+                    // pin the lockfile to the prior base so the next
+                    // pull/sync re-classifies as a conflict. Fall back
+                    // to the freshly-computed combined hash only when no
+                    // prior base exists (defensive — conflicts presuppose
+                    // a prior base).
+                    match base_hash.as_deref() {
+                        Some(prior) => prior.to_string(),
+                        None => hook_combined_hash(&resolved_json, &resolved_code),
+                    }
+                } else {
+                    hook_combined_hash(&resolved_json, &resolved_code)
+                }
             }
         };
 

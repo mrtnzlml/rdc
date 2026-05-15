@@ -35,7 +35,7 @@ pub async fn process(ctx: &mut PullCtx<'_>, org: Organization, progress: &Arc<Pr
 
     let (action, remote_hash) = decide_pull_action(&path, base_hash.as_deref(), &proposed)?;
     let conflicts = if action == PullAction::Conflict { 1 } else { 0 };
-    let recorded_hash = apply_pull_action(action, &path, &proposed, remote_hash, ctx.interactive, progress, ctx.paths.env())?;
+    let recorded_hash = apply_pull_action(action, &path, &proposed, remote_hash, ctx.interactive, progress, ctx.paths.env(), base_hash.as_deref())?;
 
     record_object(
         ctx.lockfile,

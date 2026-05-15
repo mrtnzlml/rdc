@@ -548,24 +548,35 @@ fn resolve_one_conflict<R: BufRead>(
     if !interactive {
         // Non-TTY/--yes: fall back to legacy shadow-file behavior so the
         // run still completes without blocking on stdin. The local file
-        // stays as-is and the lockfile records the local hash.
+        // stays as-is and the lockfile is pinned to the prior base —
+        // advancing it would let the conflict silently disappear on
+        // subsequent runs. Defensive fallback: when there is no prior
+        // base (a conflict without a base is unusual), use the local
+        // hash so the lockfile still gets a sensible entry.
         let conflict_path = crate::paths::shadow_path_for(&local_path, env);
         write_atomic(&conflict_path, &remote_bytes)?;
         progress.println(format!(
-            "warning: {} conflict — local preserved, remote at {}",
+            "warning: {} conflict — local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
             local_path.display(),
             conflict_path.display(),
         ));
-        let local_bytes = std::fs::read(&local_path)
-            .with_context(|| format!("reading {}", local_path.display()))?;
-        let local_code = if matches!(hash_strategy, HashStrategy::Hook | HashStrategy::Rule)
-            && code_path.exists()
-        {
-            std::fs::read_to_string(&code_path).ok()
-        } else {
-            None
+        let preserved_hash = match it.base_hash.as_deref() {
+            Some(prior) => prior.to_string(),
+            None => {
+                let local_bytes = std::fs::read(&local_path)
+                    .with_context(|| format!("reading {}", local_path.display()))?;
+                let local_code = if matches!(
+                    hash_strategy,
+                    HashStrategy::Hook | HashStrategy::Rule
+                ) && code_path.exists()
+                {
+                    std::fs::read_to_string(&code_path).ok()
+                } else {
+                    None
+                };
+                hash_strategy.hash(&local_bytes, &local_code)
+            }
         };
-        let local_hash = hash_strategy.hash(&local_bytes, &local_code);
         crate::cli::pull::common::record_object(
             ctx.lockfile,
             &it.kind,
@@ -573,7 +584,7 @@ fn resolve_one_conflict<R: BufRead>(
             id,
             url,
             modified_at,
-            Some(local_hash),
+            Some(preserved_hash),
         );
         return Ok(());
     }
@@ -659,18 +670,14 @@ fn resolve_one_conflict<R: BufRead>(
                 Some(remote_hash),
             );
         }
-        Resolution::Edit(edited) | Resolution::EditWithMarkers(edited) => {
-            // Both variants write the user's bytes to disk. The
-            // EditWithMarkers variant means the hunk walker produced a
-            // result with unresolved markers (user explicitly skipped
-            // some hunks); the write still happens but the user knows
-            // the file is intentionally in a partially-resolved state.
+        Resolution::Edit(edited) => {
+            // Fully-resolved edit — write bytes to disk and align base to
+            // remote so push drift detection succeeds, then promote the
+            // item to the push pipeline.
             if let Some(parent) = local_path.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
             write_atomic(&local_path, &edited)?;
-            // Same rationale as KeepLocal: align base to remote so push
-            // drift detection succeeds, then PATCH the edited bytes.
             let remote_hash = hash_strategy.hash(&remote_bytes, &remote_code);
             crate::cli::pull::common::record_object(
                 ctx.lockfile,
@@ -685,24 +692,25 @@ fn resolve_one_conflict<R: BufRead>(
                 .promoted_to_push
                 .push((it.kind.clone(), it.slug.clone(), local_path));
         }
-        Resolution::Skip => {
-            let conflict_path = crate::paths::shadow_path_for(&local_path, env);
-            write_atomic(&conflict_path, &remote_bytes)?;
+        Resolution::EditWithMarkers(edited) => {
+            // Hunk walker with `[s]kipped` hunks: the bytes intentionally
+            // retain conflict markers. Writing them is fine, but the
+            // lockfile MUST stay pinned to the prior base so the next
+            // pull/sync re-classifies the slug as a conflict — otherwise
+            // the markers get silently baked in as the new base.
+            // No push promotion either (the API would reject markers).
+            if let Some(parent) = local_path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            write_atomic(&local_path, &edited)?;
             progress.println(format!(
-                "warning: {} conflict — local preserved, remote at {}",
+                "warning: {} partially resolved (markers retained); lockfile base preserved — re-run to resolve",
                 local_path.display(),
-                conflict_path.display(),
             ));
-            let local_bytes = std::fs::read(&local_path)
-                .with_context(|| format!("reading {}", local_path.display()))?;
-            let local_code = if matches!(hash_strategy, HashStrategy::Hook | HashStrategy::Rule)
-                && code_path.exists()
-            {
-                std::fs::read_to_string(&code_path).ok()
-            } else {
-                None
+            let preserved_hash = match it.base_hash.as_deref() {
+                Some(prior) => prior.to_string(),
+                None => hash_strategy.hash(&edited, &remote_code),
             };
-            let local_hash = hash_strategy.hash(&local_bytes, &local_code);
             crate::cli::pull::common::record_object(
                 ctx.lockfile,
                 &it.kind,
@@ -710,7 +718,46 @@ fn resolve_one_conflict<R: BufRead>(
                 id,
                 url,
                 modified_at,
-                Some(local_hash),
+                Some(preserved_hash),
+            );
+        }
+        Resolution::Skip => {
+            // Shadow-file fallback. Write `<file>.<env>` with the remote
+            // bytes, keep local on disk, pin the lockfile to the prior
+            // base so subsequent runs re-prompt. Defensive fallback (no
+            // prior base) uses the local hash to keep a sensible entry.
+            let conflict_path = crate::paths::shadow_path_for(&local_path, env);
+            write_atomic(&conflict_path, &remote_bytes)?;
+            progress.println(format!(
+                "warning: {} conflict — local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
+                local_path.display(),
+                conflict_path.display(),
+            ));
+            let preserved_hash = match it.base_hash.as_deref() {
+                Some(prior) => prior.to_string(),
+                None => {
+                    let local_bytes = std::fs::read(&local_path)
+                        .with_context(|| format!("reading {}", local_path.display()))?;
+                    let local_code = if matches!(
+                        hash_strategy,
+                        HashStrategy::Hook | HashStrategy::Rule
+                    ) && code_path.exists()
+                    {
+                        std::fs::read_to_string(&code_path).ok()
+                    } else {
+                        None
+                    };
+                    hash_strategy.hash(&local_bytes, &local_code)
+                }
+            };
+            crate::cli::pull::common::record_object(
+                ctx.lockfile,
+                &it.kind,
+                &it.slug,
+                id,
+                url,
+                modified_at,
+                Some(preserved_hash),
             );
         }
         Resolution::Abort => {
@@ -2042,11 +2089,20 @@ mod tests {
     }
 
     /// Scripted `s\n` ([s]kip): the resolver writes a shadow file next
-    /// to the local one, keeps the local file untouched, and records
-    /// the local hash in the lockfile. No push promotion.
+    /// to the local one, keeps the local file untouched, and pins the
+    /// lockfile to the prior base hash so the next pull/sync
+    /// re-classifies the slug as a conflict (otherwise the conflict
+    /// gets silently swallowed). No push promotion.
     #[tokio::test]
-    async fn resolve_conflicts_skip_writes_shadow_and_keeps_local() {
+    async fn resolve_conflicts_skip_writes_shadow_and_preserves_base() {
         let mut fixture = setup_conflict_fixture();
+        let prior_base = fixture
+            .lockfile
+            .objects
+            .get("labels")
+            .and_then(|m| m.get("audit-hold"))
+            .and_then(|e| e.content_hash.clone())
+            .expect("fixture must seed a prior base hash");
         let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
         let classified = classified_for(&fixture);
         let progress = ProgressLog::start("test");
@@ -2087,8 +2143,8 @@ mod tests {
         let local_after = std::fs::read(&fixture.local_path).unwrap();
         assert_eq!(local_after, local_before, "local file must not be modified by [s]");
 
-        // Lockfile records the LOCAL hash (skip means we keep our state).
-        let local_hash = content_hash(&local_before);
+        // Lockfile entry MUST be pinned to the prior base — advancing it
+        // would silently swallow the conflict on the next pull/sync.
         let recorded = fixture
             .lockfile
             .objects
@@ -2096,7 +2152,74 @@ mod tests {
             .and_then(|m| m.get("audit-hold"))
             .and_then(|e| e.content_hash.clone())
             .unwrap();
-        assert_eq!(recorded, local_hash);
+        assert_eq!(
+            recorded, prior_base,
+            "shadow-skip must preserve the prior lockfile base hash"
+        );
+    }
+
+    /// Non-interactive (CI / non-TTY) shadow-fallback for a conflict must
+    /// also preserve the prior lockfile base. Mirrors the interactive
+    /// `[s]` path — the user wasn't even given a chance to resolve, so
+    /// the next run must re-surface the conflict.
+    #[tokio::test]
+    async fn resolve_conflicts_non_interactive_preserves_base() {
+        let mut fixture = setup_conflict_fixture();
+        let prior_base = fixture
+            .lockfile
+            .objects
+            .get("labels")
+            .and_then(|m| m.get("audit-hold"))
+            .and_then(|e| e.content_hash.clone())
+            .expect("fixture must seed a prior base hash");
+        let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
+        let classified = classified_for(&fixture);
+        let progress = ProgressLog::start("test");
+
+        let local_before = std::fs::read(&fixture.local_path).unwrap();
+
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: false,
+            };
+            // Empty stdin — non-interactive path must not block on read.
+            resolve_conflicts(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b""),
+                false,
+                &progress,
+            )
+            .await
+            .expect("non-interactive resolver must succeed")
+        };
+        progress.finish("");
+
+        assert!(outcome.promoted_to_push.is_empty());
+
+        let shadow = crate::paths::shadow_path_for(&fixture.local_path, "test");
+        assert!(shadow.exists(), "non-tty fallback must write a shadow file");
+
+        let local_after = std::fs::read(&fixture.local_path).unwrap();
+        assert_eq!(local_after, local_before);
+
+        let recorded = fixture
+            .lockfile
+            .objects
+            .get("labels")
+            .and_then(|m| m.get("audit-hold"))
+            .and_then(|e| e.content_hash.clone())
+            .unwrap();
+        assert_eq!(
+            recorded, prior_base,
+            "non-interactive shadow-fallback must preserve the prior base hash"
+        );
     }
 
     /// Scripted `a\n` ([a]bort): the resolver returns a `PullAborted`

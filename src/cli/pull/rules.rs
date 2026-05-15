@@ -108,7 +108,7 @@ pub async fn process(
 
         let recorded_hash = match action {
             PullAction::Write => {
-                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone(), ctx.interactive, progress, ctx.paths.env())?;
+                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone(), ctx.interactive, progress, ctx.paths.env(), base_hash.as_deref())?;
                 if let Some(code) = &proposed_code {
                     write_rule_code(&ctx.paths.rules_dir(), &slug, code)
                         .with_context(|| format!("writing rule code for '{}'", r.name))?;
@@ -129,7 +129,7 @@ pub async fn process(
                     || matches!((&pre_local_code, &proposed_code), (None, None));
                 let total = if symmetric && pre_local_code.is_some() { 2 } else { 1 };
 
-                let resolved_json = crate::cli::resolve::resolve_combined_file(
+                let json_outcome = crate::cli::resolve::resolve_combined_file(
                     1, total,
                     &local_path,
                     local_json,
@@ -138,9 +138,15 @@ pub async fn process(
                     ctx.paths.env(),
                 )?;
 
-                let resolved_code = if symmetric {
-                    if let (Some(loc), Some(rem)) = (&pre_local_code, &proposed_code) {
-                        let bytes = crate::cli::resolve::resolve_combined_file(
+                // Same preserve-base intent tracking as `pull::hooks`.
+                let mut preserve_base = json_outcome.is_preserve_base();
+
+                let (resolved_json, resolved_code) = if symmetric {
+                    let resolved_json = json_outcome.into_bytes();
+                    let resolved_code = if let (Some(loc), Some(rem)) =
+                        (&pre_local_code, &proposed_code)
+                    {
+                        let code_outcome = crate::cli::resolve::resolve_combined_file(
                             2, total,
                             &py_path,
                             loc.as_bytes(),
@@ -148,22 +154,34 @@ pub async fn process(
                             ctx.interactive,
                             ctx.paths.env(),
                         )?;
+                        preserve_base |= code_outcome.is_preserve_base();
+                        let bytes = code_outcome.into_bytes();
                         Some(String::from_utf8(bytes)
                             .with_context(|| format!("rule code resolved bytes for '{}' are not UTF-8", r.name))?)
                     } else {
                         None
-                    }
+                    };
+                    (resolved_json, resolved_code)
                 } else {
                     // Asymmetric — fall back to shadow for the .py side.
+                    // Unresolved → preserve the prior lockfile base.
                     if let Some(remote_code_str) = &proposed_code {
                         let env = ctx.paths.env();
                         let py_remote_path = ctx.paths.rules_dir().join(format!("{slug}.py.{env}"));
                         crate::snapshot::writer::write_atomic(&py_remote_path, remote_code_str.as_bytes())?;
                     }
-                    pre_local_code.clone()
+                    preserve_base = true;
+                    (json_outcome.into_bytes(), pre_local_code.clone())
                 };
 
-                rule_combined_hash(&resolved_json, &resolved_code)
+                if preserve_base {
+                    match base_hash.as_deref() {
+                        Some(prior) => prior.to_string(),
+                        None => rule_combined_hash(&resolved_json, &resolved_code),
+                    }
+                } else {
+                    rule_combined_hash(&resolved_json, &resolved_code)
+                }
             }
         };
 
