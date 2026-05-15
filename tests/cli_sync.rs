@@ -1836,6 +1836,137 @@ async fn sync_remote_create_writes_local_hook() {
     );
 }
 
+/// Pull-side RemoteCreate for a Node.js hook. The env exposes a function
+/// hook whose `config.runtime` is `"nodejs20.x"`; sync must write
+/// `<slug>.json` (with `code` stripped) AND a sibling `<slug>.js` (not
+/// `<slug>.py`) carrying the extracted code. No `.py` should appear on
+/// disk. The JSON itself must not contain the code.
+#[tokio::test]
+async fn sync_remote_create_writes_local_js_hook() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let hooks_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 601,
+                "url": format!("{}/api/v1/hooks/601", server.uri()),
+                "name": "Validator: invoices JS",
+                "type": "function",
+                "queues": [],
+                "events": ["annotation_content"],
+                "config": {
+                    "runtime": "nodejs20.x",
+                    "code": "module.exports = (input) => input;\n"
+                },
+                "modified_at": "2026-05-01T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(hooks_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/hooks"]).await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* diff = */ false, /* allow_deletes = */ false,
+        /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    result.expect("sync should succeed when remote has a new JS hook");
+
+    // No mutating API calls — pull-side only.
+    for req in server.received_requests().await.unwrap_or_default() {
+        let p = req.url.path();
+        if p.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "unexpected mutating request: {} {}",
+            req.method,
+            p
+        );
+    }
+
+    let json_path = project.path().join("envs/dev/hooks/validator-invoices-js.json");
+    let js_path = project.path().join("envs/dev/hooks/validator-invoices-js.js");
+    let py_path = project.path().join("envs/dev/hooks/validator-invoices-js.py");
+    assert!(
+        json_path.exists(),
+        "hook JSON should be written at {}",
+        json_path.display()
+    );
+    assert!(
+        js_path.exists(),
+        "Node.js hook .js sidecar should be written at {}",
+        js_path.display()
+    );
+    assert!(
+        !py_path.exists(),
+        "Node.js hook must not produce a .py sidecar at {}",
+        py_path.display()
+    );
+
+    let json_body = std::fs::read_to_string(&json_path).unwrap();
+    assert!(
+        json_body.contains("Validator: invoices JS"),
+        "hook JSON content: {json_body}"
+    );
+    assert!(
+        json_body.contains("nodejs20.x"),
+        "JSON should preserve runtime: {json_body}"
+    );
+    assert!(
+        !json_body.contains("module.exports"),
+        "extracted code must not be in JSON: {json_body}"
+    );
+    let js_body = std::fs::read_to_string(&js_path).unwrap();
+    assert_eq!(
+        js_body, "module.exports = (input) => input;\n",
+        "JS sidecar should carry the exact code bytes"
+    );
+
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    assert!(
+        lf_raw.contains("validator-invoices-js"),
+        "lockfile must record JS-hook slug: {lf_raw}"
+    );
+}
+
 /// Pull-side RemoteCreate for a rule. The env exposes a rule with
 /// `trigger_condition` set; sync must write `<slug>.json` (with the
 /// condition stripped) AND a sibling `<slug>.py` carrying the extracted

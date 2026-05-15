@@ -432,8 +432,17 @@ fn emit_hooks(md: &mut String, ctx: &IndexCtx<'_>) {
     md.push_str("## hooks\n\n");
     for (slug, entry) in entries.iter() {
         let path = ctx.paths.hooks_dir().join(format!("{slug}.json"));
-        let py_path = ctx.paths.hooks_dir().join(format!("{slug}.py"));
         let v = read_json(&path);
+        // Derive the sidecar extension from the JSON's runtime so the
+        // index reflects `.js` for Node.js hooks.
+        let code_ext = v
+            .as_ref()
+            .map(crate::snapshot::hook::hook_code_extension_from_value)
+            .unwrap_or("py");
+        let code_path = ctx
+            .paths
+            .hooks_dir()
+            .join(format!("{slug}.{code_ext}"));
         write_header(md, slug, entry.id);
         write_name(md, v.as_ref());
         if let Some(v) = v.as_ref() {
@@ -455,8 +464,10 @@ fn emit_hooks(md: &mut String, ctx: &IndexCtx<'_>) {
                 _ => {}
             }
         }
-        if py_path.exists() {
-            md.push_str(&format!("  - path: hooks/{slug}.json (+ hooks/{slug}.py)\n"));
+        if code_path.exists() {
+            md.push_str(&format!(
+                "  - path: hooks/{slug}.json (+ hooks/{slug}.{code_ext})\n"
+            ));
         } else {
             md.push_str(&format!("  - path: hooks/{slug}.json\n"));
         }

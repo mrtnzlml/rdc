@@ -341,7 +341,7 @@ envs/<env>/
       formulas/<field_id>.py              extracted from schema content
       inbox.json
       email-templates/<slug>.json
-  hooks/<slug>.json                       + sibling <slug>.py for function hooks
+  hooks/<slug>.json                       + sibling <slug>.py or <slug>.js for function hooks
   rules/<slug>.json                       + sibling <slug>.py for trigger_condition
   labels/<slug>.json
   engines/<engine_slug>/
@@ -360,7 +360,7 @@ envs/<env>/
 
 | To change… | Edit | Then run |
 |---|---|---|
-| Hook code | `envs/<env>/hooks/<slug>.py` | `rdc sync <env>` |
+| Hook code (Python or Node.js) | `envs/<env>/hooks/<slug>.py` or `…/<slug>.js` | `rdc sync <env>` |
 | Hook config (events, queues, name) | `envs/<env>/hooks/<slug>.json` | `rdc sync <env>` |
 | Schema fields | `envs/<env>/workspaces/<ws>/queues/<q>/schema.json` | `rdc sync <env>` |
 | A formula | `envs/<env>/workspaces/<ws>/queues/<q>/formulas/<field>.py` | `rdc sync <env>` |

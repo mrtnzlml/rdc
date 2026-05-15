@@ -423,6 +423,7 @@ fn scan_hooks(
     lockfile: &Lockfile,
     out: &mut BTreeMap<String, std::path::PathBuf>,
 ) -> Result<usize> {
+    use crate::snapshot::hook::hook_code_extension_from_value;
     use crate::state::hook_combined_hash;
     let dir = paths.hooks_dir();
     if !dir.exists() {
@@ -442,9 +443,23 @@ fn scan_hooks(
         }
         let Some(slug) = path.file_stem().and_then(|s| s.to_str()) else { continue };
         let json_bytes = std::fs::read(&path)?;
-        let py_path = path.with_extension("py");
-        let code = if py_path.exists() {
-            Some(std::fs::read_to_string(&py_path)?)
+        // Sidecar extension derives from the JSON's `config.runtime`:
+        // `.js` for Node.js runtimes, `.py` otherwise. Fall back to the
+        // other extension if the runtime-derived one is missing
+        // (defensive — handles runtime-changed-but-sidecar-stale).
+        let value: serde_json::Value = match serde_json::from_slice(&json_bytes) {
+            Ok(v) => v,
+            // If the JSON doesn't parse we leave `ext` at the default
+            // and let downstream errors surface elsewhere.
+            Err(_) => serde_json::Value::Null,
+        };
+        let ext = hook_code_extension_from_value(&value);
+        let primary = path.with_extension(ext);
+        let fallback = path.with_extension(if ext == "py" { "js" } else { "py" });
+        let code = if primary.exists() {
+            Some(std::fs::read_to_string(&primary)?)
+        } else if fallback.exists() {
+            Some(std::fs::read_to_string(&fallback)?)
         } else {
             None
         };

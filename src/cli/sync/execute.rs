@@ -537,11 +537,13 @@ fn resolve_one_conflict<R: BufRead>(
         hash_strategy,
     } = refs;
 
-    // For split-file kinds, the `.py` sidecar lives next to the JSON.
-    // The resolver writes it on `[r]` (adopt remote) and the local
-    // hash on `[s]`/non-tty paths includes whatever code currently
-    // sits on disk.
-    let py_path = local_path.with_extension("py");
+    // For split-file kinds, the sidecar lives next to the JSON. For
+    // hooks the extension depends on `config.runtime` (`.py` or `.js`);
+    // for rules it is always `.py` (Python is the only valid trigger
+    // language). The resolver writes the sidecar on `[r]` (adopt
+    // remote) and the local hash on `[s]`/non-tty paths includes
+    // whatever code currently sits on disk.
+    let code_path = sidecar_path_for_conflict(&local_path, hash_strategy);
 
     if !interactive {
         // Non-TTY/--yes: fall back to legacy shadow-file behavior so the
@@ -557,9 +559,9 @@ fn resolve_one_conflict<R: BufRead>(
         let local_bytes = std::fs::read(&local_path)
             .with_context(|| format!("reading {}", local_path.display()))?;
         let local_code = if matches!(hash_strategy, HashStrategy::Hook | HashStrategy::Rule)
-            && py_path.exists()
+            && code_path.exists()
         {
-            std::fs::read_to_string(&py_path).ok()
+            std::fs::read_to_string(&code_path).ok()
         } else {
             None
         };
@@ -619,15 +621,30 @@ fn resolve_one_conflict<R: BufRead>(
                 std::fs::create_dir_all(parent).ok();
             }
             write_atomic(&local_path, &remote_bytes)?;
-            // Adopt the remote `.py` sidecar too (or delete a stale one
-            // when the remote has no code). Mirrors `pull::hooks`'s
-            // `PullAction::Write` arm.
+            // Adopt the remote sidecar too (or delete a stale one when
+            // the remote has no code). Mirrors `pull::hooks`'s
+            // `PullAction::Write` arm. For hooks we also recompute the
+            // canonical sidecar path from the *remote* bytes, since the
+            // remote runtime may have shifted between Python and
+            // Node.js — sweep the now-stale opposite-extension file.
             if matches!(hash_strategy, HashStrategy::Hook | HashStrategy::Rule) {
+                let canonical_code_path = if matches!(hash_strategy, HashStrategy::Hook) {
+                    sidecar_path_for_remote(&local_path, &remote_bytes)
+                } else {
+                    code_path.clone()
+                };
                 if let Some(code) = &remote_code {
-                    write_atomic(&py_path, code.as_bytes())?;
-                } else if py_path.exists() {
-                    std::fs::remove_file(&py_path).with_context(|| {
-                        format!("removing stale {}", py_path.display())
+                    write_atomic(&canonical_code_path, code.as_bytes())?;
+                } else if canonical_code_path.exists() {
+                    std::fs::remove_file(&canonical_code_path).with_context(|| {
+                        format!("removing stale {}", canonical_code_path.display())
+                    })?;
+                }
+                // If the previous-runtime sidecar still sits on disk
+                // (hook just flipped runtimes), drop it.
+                if canonical_code_path != code_path && code_path.exists() {
+                    std::fs::remove_file(&code_path).with_context(|| {
+                        format!("removing stale {}", code_path.display())
                     })?;
                 }
             }
@@ -679,9 +696,9 @@ fn resolve_one_conflict<R: BufRead>(
             let local_bytes = std::fs::read(&local_path)
                 .with_context(|| format!("reading {}", local_path.display()))?;
             let local_code = if matches!(hash_strategy, HashStrategy::Hook | HashStrategy::Rule)
-                && py_path.exists()
+                && code_path.exists()
             {
-                std::fs::read_to_string(&py_path).ok()
+                std::fs::read_to_string(&code_path).ok()
             } else {
                 None
             };
@@ -702,6 +719,40 @@ fn resolve_one_conflict<R: BufRead>(
     }
 
     Ok(())
+}
+
+/// Compute the sidecar path for a conflict's `local_path`, given the
+/// hash strategy. For hooks we peek at the on-disk JSON's `config.runtime`
+/// to decide `.py` vs `.js`; for rules (and the Flat fallback) we always
+/// return `<json>.py`. The lookup never fails — a missing or unparseable
+/// local file just falls back to `.py`, so the caller's `.exists()`
+/// guard determines whether the sidecar contributes at all.
+fn sidecar_path_for_conflict(local_path: &Path, strategy: HashStrategy) -> PathBuf {
+    match strategy {
+        HashStrategy::Hook => {
+            if let Ok(bytes) = std::fs::read(local_path) {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    let ext = crate::snapshot::hook::hook_code_extension_from_value(&v);
+                    return local_path.with_extension(ext);
+                }
+            }
+            local_path.with_extension("py")
+        }
+        // Rules and Flat — `trigger_condition` is always Python.
+        HashStrategy::Rule | HashStrategy::Flat => local_path.with_extension("py"),
+    }
+}
+
+/// Compute the canonical sidecar path for a hook conflict using *remote*
+/// JSON bytes — used on `[r]` (adopt remote) so the sidecar lands at the
+/// extension matching the incoming runtime, regardless of what the
+/// local-side runtime declared. Unparseable bytes default to `.py`.
+fn sidecar_path_for_remote(local_path: &Path, remote_bytes: &[u8]) -> PathBuf {
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(remote_bytes) {
+        let ext = crate::snapshot::hook::hook_code_extension_from_value(&v);
+        return local_path.with_extension(ext);
+    }
+    local_path.with_extension("py")
 }
 
 /// Compute the `<file>.<env>-deleted` marker path for `local_path`.
@@ -1219,7 +1270,6 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                 };
                 let Some(refs) = refs_opt else { continue };
                 let local_path = refs.local_path.clone();
-                let py_path = local_path.with_extension("py");
 
                 // For LocalDeleteRemoteEdit the local file is tombstoned
                 // — restore it from the env-side bytes so the user has
@@ -1233,14 +1283,22 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                                 std::fs::create_dir_all(parent).ok();
                             }
                             write_atomic(&local_path, bytes)?;
-                            // Restore the `.py` sidecar too for split-file
+                            // Restore the sidecar too for split-file
                             // kinds, so the local restore is byte-complete.
+                            // For hooks, the sidecar extension is
+                            // derived from the restored JSON's runtime.
                             if matches!(
                                 refs.hash_strategy,
                                 HashStrategy::Hook | HashStrategy::Rule
                             ) {
                                 if let Some(code) = refs.restore_code.as_ref() {
-                                    write_atomic(&py_path, code.as_bytes())?;
+                                    let restored_code_path =
+                                        if matches!(refs.hash_strategy, HashStrategy::Hook) {
+                                            sidecar_path_for_remote(&local_path, bytes)
+                                        } else {
+                                            local_path.with_extension("py")
+                                        };
+                                    write_atomic(&restored_code_path, code.as_bytes())?;
                                 }
                             }
                         }
@@ -1363,17 +1421,38 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             // Mirror the env's deletion: remove local +
                             // drop lockfile entry. No push action — env
                             // already doesn't have it. For split-file
-                            // kinds, drop the `.py` sidecar too.
+                            // kinds, drop the sidecar too — pick the
+                            // extension from the local JSON's runtime
+                            // before deleting the JSON itself. Also
+                            // sweep a stale-other-extension sidecar.
+                            let sidecar = sidecar_path_for_conflict(
+                                &local_path,
+                                refs.hash_strategy,
+                            );
+                            let other_sidecar = if sidecar.extension().and_then(|s| s.to_str())
+                                == Some("js")
+                            {
+                                local_path.with_extension("py")
+                            } else {
+                                local_path.with_extension("js")
+                            };
                             std::fs::remove_file(&local_path).with_context(|| {
                                 format!("removing {}", local_path.display())
                             })?;
                             if matches!(
                                 refs.hash_strategy,
                                 HashStrategy::Hook | HashStrategy::Rule
-                            ) && py_path.exists()
+                            ) && sidecar.exists()
                             {
-                                std::fs::remove_file(&py_path).with_context(|| {
-                                    format!("removing {}", py_path.display())
+                                std::fs::remove_file(&sidecar).with_context(|| {
+                                    format!("removing {}", sidecar.display())
+                                })?;
+                            }
+                            if matches!(refs.hash_strategy, HashStrategy::Hook)
+                                && other_sidecar.exists()
+                            {
+                                std::fs::remove_file(&other_sidecar).with_context(|| {
+                                    format!("removing {}", other_sidecar.display())
                                 })?;
                             }
                             drop_lockfile_entry(ctx, &it.kind, &it.slug);

@@ -4,7 +4,10 @@ use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
 use crate::progress::OverallProgress;
 use crate::snapshot::create::strip_for_create;
-use crate::snapshot::hook::{read_hook_value, serialize_hook, write_hook_code};
+use crate::snapshot::hook::{
+    hook_code_extension, hook_code_extension_from_value, read_hook_value, serialize_hook,
+    write_hook_code,
+};
 use crate::snapshot::writer::write_atomic;
 use crate::state::{hook_combined_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
@@ -34,7 +37,6 @@ pub async fn push(
     let mut remote_hooks: Option<Vec<crate::model::Hook>> = None;
 
     for (slug, local_json_path) in changes {
-        let local_py_path = hooks_dir.join(format!("{slug}.py"));
         let overlay_paths = overlay.as_ref().and_then(|ov| ov.hook(slug));
 
         // Missing lockfile entry = new hook → POST. Local file becomes the
@@ -108,15 +110,27 @@ pub async fn push(
                     .with_context(|| format!("POST /hooks (creating '{slug}')"))?
             };
 
-            // Disk + lockfile write — same for both paths.
+            // Disk + lockfile write — same for both paths. The sidecar
+            // extension is derived from the server's response runtime so
+            // it stays canonical even if the local JSON declared a
+            // different runtime.
             let (created_json_full, created_code) = serialize_hook(&created)?;
             let created_json_stripped = maybe_strip_overlay(created_json_full, overlay_paths)?;
             let created_hash = hook_combined_hash(&created_json_stripped, &created_code);
+            let created_ext = hook_code_extension(&created);
             write_atomic(local_json_path, &created_json_stripped)
                 .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
             if let Some(code) = &created_code {
-                write_hook_code(&hooks_dir, slug, code)
+                write_hook_code(&hooks_dir, slug, code, created_ext)
                     .with_context(|| format!("writing hook code for '{slug}'"))?;
+            }
+            // Sweep any stale sidecar with the *other* extension that may
+            // have been left over from a previous runtime.
+            let other_created_ext = if created_ext == "py" { "js" } else { "py" };
+            let stale_created = hooks_dir.join(format!("{slug}.{other_created_ext}"));
+            if stale_created.exists() {
+                std::fs::remove_file(&stale_created)
+                    .with_context(|| format!("removing stale {}", stale_created.display()))?;
             }
             lockfile.upsert(
                 "hooks",
@@ -146,10 +160,15 @@ pub async fn push(
 
         let id = entry.id;
 
-        // Read raw Value (with .py spliced in) so overlay can re-add fields
-        // stripped by pull (spec §9.3) BEFORE typed deserialize.
+        // Read raw Value (with the sidecar code spliced in) so overlay
+        // can re-add fields stripped by pull (spec §9.3) BEFORE typed
+        // deserialize.
         let mut payload = read_hook_value(&hooks_dir, slug)
             .with_context(|| format!("reading local hook '{slug}'"))?;
+        // Derive the local sidecar extension *before* applying overlay,
+        // since overlay may mutate `config.runtime`. The on-disk sidecar
+        // is whatever the local JSON declared.
+        let local_ext = hook_code_extension_from_value(&payload);
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }
@@ -192,13 +211,28 @@ pub async fn push(
                 PushDriftOutcome::Adopt => {
                     write_atomic(local_json_path, &remote_json_stripped)
                         .with_context(|| format!("adopting remote into {}", local_json_path.display()))?;
+                    // Adopt uses the remote runtime to decide the
+                    // sidecar extension — the remote is now the source
+                    // of truth. Sweep any sidecar of the other
+                    // extension so disk stays canonical.
+                    let remote_ext = hook_code_extension(remote_hook);
                     if let Some(code) = &remote_code {
-                        write_hook_code(&hooks_dir, slug, code)
+                        write_hook_code(&hooks_dir, slug, code, remote_ext)
                             .with_context(|| format!("adopting remote hook code for '{slug}'"))?;
-                    } else if local_py_path.exists() {
-                        std::fs::remove_file(&local_py_path)
-                            .with_context(|| format!("removing stale {}", local_py_path.display()))?;
+                    } else {
+                        let primary = hooks_dir.join(format!("{slug}.{remote_ext}"));
+                        if primary.exists() {
+                            std::fs::remove_file(&primary)
+                                .with_context(|| format!("removing stale {}", primary.display()))?;
+                        }
                     }
+                    let other_remote_ext = if remote_ext == "py" { "js" } else { "py" };
+                    let stale = hooks_dir.join(format!("{slug}.{other_remote_ext}"));
+                    if stale.exists() {
+                        std::fs::remove_file(&stale)
+                            .with_context(|| format!("removing stale {}", stale.display()))?;
+                    }
+                    let _ = local_ext; // unused on adopt path; the remote ext drives layout
                     lockfile.upsert(
                         "hooks",
                         slug,
@@ -230,12 +264,22 @@ pub async fn push(
         let (updated_json_full, updated_code) = serialize_hook(&updated)?;
         let updated_json_stripped = maybe_strip_overlay(updated_json_full, overlay_paths)?;
         let updated_hash = hook_combined_hash(&updated_json_stripped, &updated_code);
+        let updated_ext = hook_code_extension(&updated);
         write_atomic(local_json_path, &updated_json_stripped)
             .with_context(|| format!("writing post-push canonical form for '{slug}'"))?;
         if let Some(code) = &updated_code {
-            write_hook_code(&hooks_dir, slug, code)
+            write_hook_code(&hooks_dir, slug, code, updated_ext)
                 .with_context(|| format!("writing hook code for '{slug}'"))?;
         }
+        // Sweep a stale sidecar if the post-PATCH runtime differs from
+        // what the local disk still carries.
+        let other_updated_ext = if updated_ext == "py" { "js" } else { "py" };
+        let stale_updated = hooks_dir.join(format!("{slug}.{other_updated_ext}"));
+        if stale_updated.exists() {
+            std::fs::remove_file(&stale_updated)
+                .with_context(|| format!("removing stale {}", stale_updated.display()))?;
+        }
+        let _ = local_ext; // PATCH path: post-PATCH ext drives layout
 
         lockfile.upsert(
             "hooks",

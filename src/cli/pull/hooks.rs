@@ -5,7 +5,7 @@ use super::common::{
 use crate::model::Hook;
 use crate::progress::OverallProgress;
 use crate::slug::slugify_unique;
-use crate::snapshot::hook::{serialize_hook, write_hook_code};
+use crate::snapshot::hook::{hook_code_extension, serialize_hook, write_hook_code};
 use crate::state::hook_combined_hash;
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashSet};
@@ -61,17 +61,33 @@ pub async fn process(
             ctx.overlay.as_ref().and_then(|o| o.hook(&slug)),
         )?;
 
+        // Derive the sidecar extension from the hook's runtime — Node.js
+        // hooks land in `<slug>.js`, Python (and any unknown runtime) in
+        // `<slug>.py`. The detection is centralized in
+        // `snapshot::hook::hook_code_extension`.
+        let ext = hook_code_extension(hook);
         let local_path = ctx.paths.hooks_dir().join(format!("{slug}.json"));
-        let py_path = ctx.paths.hooks_dir().join(format!("{slug}.py"));
+        let code_path = ctx.paths.hooks_dir().join(format!("{slug}.{ext}"));
+        let stale_code_path = ctx
+            .paths
+            .hooks_dir()
+            .join(format!("{slug}.{}", if ext == "py" { "js" } else { "py" }));
         let pre_local_json = if local_path.exists() {
             Some(std::fs::read(&local_path)
                 .with_context(|| format!("reading {}", local_path.display()))?)
         } else {
             None
         };
-        let pre_local_code = if py_path.exists() {
-            Some(std::fs::read_to_string(&py_path)
-                .with_context(|| format!("reading {}", py_path.display()))?)
+        // Read whichever sidecar happens to exist on disk for the local
+        // hash. The runtime-derived one wins if present; otherwise the
+        // other extension still contributes — same defensive fallback as
+        // `read_hook_value`.
+        let pre_local_code = if code_path.exists() {
+            Some(std::fs::read_to_string(&code_path)
+                .with_context(|| format!("reading {}", code_path.display()))?)
+        } else if stale_code_path.exists() {
+            Some(std::fs::read_to_string(&stale_code_path)
+                .with_context(|| format!("reading {}", stale_code_path.display()))?)
         } else {
             None
         };
@@ -109,11 +125,17 @@ pub async fn process(
                 // path); pass `ctx.interactive` for consistency.
                 apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone(), ctx.interactive, progress, ctx.paths.env())?;
                 if let Some(code) = &proposed_code {
-                    write_hook_code(&ctx.paths.hooks_dir(), &slug, code)
+                    write_hook_code(&ctx.paths.hooks_dir(), &slug, code, ext)
                         .with_context(|| format!("writing hook code for '{}'", hook.name))?;
-                } else if py_path.exists() {
-                    std::fs::remove_file(&py_path)
-                        .with_context(|| format!("removing stale {}", py_path.display()))?;
+                } else if code_path.exists() {
+                    std::fs::remove_file(&code_path)
+                        .with_context(|| format!("removing stale {}", code_path.display()))?;
+                }
+                // Always sweep a sidecar with the other extension —
+                // runtime may have just changed, leaving a stale file.
+                if stale_code_path.exists() {
+                    std::fs::remove_file(&stale_code_path)
+                        .with_context(|| format!("removing stale {}", stale_code_path.display()))?;
                 }
                 remote_combined_hash
             }
@@ -151,7 +173,7 @@ pub async fn process(
                     if let (Some(loc), Some(rem)) = (&pre_local_code, &proposed_code) {
                         let bytes = crate::cli::resolve::resolve_combined_file(
                             2, total,
-                            &py_path,
+                            &code_path,
                             loc.as_bytes(),
                             rem.as_bytes(),
                             ctx.interactive,
@@ -163,11 +185,16 @@ pub async fn process(
                         None
                     }
                 } else {
-                    // Asymmetric — fall back to shadow for the .py side.
+                    // Asymmetric — fall back to shadow for the sidecar side.
+                    // Shadow uses the runtime-derived extension so the editor
+                    // gets the right syntax highlighting on a `.js` vs `.py`.
                     if let Some(remote_code_str) = &proposed_code {
                         let env = ctx.paths.env();
-                        let py_remote_path = ctx.paths.hooks_dir().join(format!("{slug}.py.{env}"));
-                        crate::snapshot::writer::write_atomic(&py_remote_path, remote_code_str.as_bytes())?;
+                        let code_remote_path = ctx
+                            .paths
+                            .hooks_dir()
+                            .join(format!("{slug}.{ext}.{env}"));
+                        crate::snapshot::writer::write_atomic(&code_remote_path, remote_code_str.as_bytes())?;
                     }
                     pre_local_code.clone()
                 };

@@ -204,8 +204,12 @@ pub(crate) async fn run(
                 &remote_json_full,
             );
             if payload_code != remote_code {
+                // Sidecar extension follows the payload's runtime — same
+                // file the user will see on disk after the sync. `.js`
+                // for Node.js hooks, `.py` otherwise.
+                let ext = crate::snapshot::hook::hook_code_extension(&payload_hook);
                 print_update_diff(
-                    &format!("hooks/{tgt_slug}.py"),
+                    &format!("hooks/{tgt_slug}.{ext}"),
                     payload_code.clone().unwrap_or_default().as_bytes(),
                     remote_code.clone().unwrap_or_default().as_bytes(),
                 );

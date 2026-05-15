@@ -191,13 +191,16 @@ Every command that writes to the remote (`sync`, `deploy`) takes `--dry-run` to 
 
 Most files are plain JSON; open them in your editor and save. After any edit, `rdc status <env>` lists the changed files and `rdc sync <env>` sends them.
 
-For objects with extracted code, the on-disk layout splits one logical object into two files. The JSON describes the object; the `.py` carries the code. **Always edit the `.py`** — sync strips the inlined field on the pull-side write and splices it back in for the push-side write.
+For objects with extracted code, the on-disk layout splits one logical object into two files. The JSON describes the object; the sidecar carries the code. **Always edit the sidecar** — sync strips the inlined field on the pull-side write and splices it back in for the push-side write.
 
 | Kind | On-disk files |
 |---|---|
 | Hook with Python | `hooks/<slug>.json` + `hooks/<slug>.py` |
+| Hook with Node.js | `hooks/<slug>.json` + `hooks/<slug>.js` |
 | Rule with trigger | `rules/<slug>.json` + `rules/<slug>.py` |
 | Schema with formulas | `workspaces/<ws>/queues/<q>/schema.json` + `…/formulas/<field-id>.py` |
+
+The hook sidecar extension follows `config.runtime` in the JSON — `.js` when the runtime starts with `node` (e.g. `nodejs18.x`, `nodejs20.x`), `.py` otherwise (e.g. `python3.12`, `python3.12-secure`). Change the runtime in JSON and the next pull renames the sidecar automatically; rules and schema formulas are always Python.
 
 ### Create a new object
 

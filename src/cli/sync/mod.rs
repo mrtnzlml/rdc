@@ -602,9 +602,18 @@ pub fn from_catalog_scan_lockfile(
             Ok(b) => b,
             Err(_) => continue,
         };
-        let py_path = json_path.with_extension("py");
-        let code = if py_path.exists() {
-            std::fs::read_to_string(&py_path).ok()
+        // Hook sidecar extension comes from `config.runtime`: `.js` for
+        // Node.js, `.py` otherwise. Fall back to the other extension if
+        // the runtime-derived sidecar isn't on disk.
+        let value: serde_json::Value =
+            serde_json::from_slice(&json_bytes).unwrap_or(serde_json::Value::Null);
+        let ext = crate::snapshot::hook::hook_code_extension_from_value(&value);
+        let primary = json_path.with_extension(ext);
+        let fallback = json_path.with_extension(if ext == "py" { "js" } else { "py" });
+        let code = if primary.exists() {
+            std::fs::read_to_string(&primary).ok()
+        } else if fallback.exists() {
+            std::fs::read_to_string(&fallback).ok()
         } else {
             None
         };

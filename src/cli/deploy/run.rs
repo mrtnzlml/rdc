@@ -818,7 +818,11 @@ fn remove_local_file(paths: &Paths, kind: &str, slug: &str) {
     match kind {
         "hooks" => {
             let _ = std::fs::remove_file(paths.hooks_dir().join(format!("{slug}.json")));
+            // The sidecar may be `.py` (Python hook) or `.js` (Node.js
+            // hook); best-effort remove both since this is a wholesale
+            // local cleanup and the wrong one is just absent.
             let _ = std::fs::remove_file(paths.hooks_dir().join(format!("{slug}.py")));
+            let _ = std::fs::remove_file(paths.hooks_dir().join(format!("{slug}.js")));
         }
         "rules" => {
             let _ = std::fs::remove_file(paths.rules_dir().join(format!("{slug}.json")));
@@ -939,13 +943,26 @@ fn read_src_for_preview(
         }
         "hooks" => {
             let json_p = src_paths.hooks_dir().join(format!("{slug}.json"));
-            let py_p = src_paths.hooks_dir().join(format!("{slug}.py"));
-            let py = if py_p.exists() {
-                Some(std::fs::read_to_string(&py_p)?)
+            let json_bytes = std::fs::read(&json_p)?;
+            // Hook sidecar may be `.py` (Python) or `.js` (Node.js)
+            // depending on the JSON's `config.runtime`. Pick the
+            // runtime-matching path; fall back to the other extension
+            // if the runtime-matched file is missing (defensive).
+            let value: serde_json::Value =
+                serde_json::from_slice(&json_bytes).unwrap_or(serde_json::Value::Null);
+            let ext = crate::snapshot::hook::hook_code_extension_from_value(&value);
+            let primary = src_paths.hooks_dir().join(format!("{slug}.{ext}"));
+            let fallback = src_paths
+                .hooks_dir()
+                .join(format!("{slug}.{}", if ext == "py" { "js" } else { "py" }));
+            let code = if primary.exists() {
+                Some(std::fs::read_to_string(&primary)?)
+            } else if fallback.exists() {
+                Some(std::fs::read_to_string(&fallback)?)
             } else {
                 None
             };
-            Ok((std::fs::read(&json_p)?, py))
+            Ok((json_bytes, code))
         }
         "rules" => {
             let json_p = src_paths.rules_dir().join(format!("{slug}.json"));

@@ -451,9 +451,16 @@ fn apply_one(
     match p {
         PendingRename::Hook { old, new } => {
             move_file(&paths.hooks_dir().join(format!("{old}.json")), &paths.hooks_dir().join(format!("{new}.json")))?;
+            // Sidecar may be `.py` (Python) or `.js` (Node.js) — move
+            // whichever happens to exist. Both extensions are a no-op
+            // when absent thanks to `move_optional`.
             move_optional(
                 &paths.hooks_dir().join(format!("{old}.py")),
                 &paths.hooks_dir().join(format!("{new}.py")),
+            )?;
+            move_optional(
+                &paths.hooks_dir().join(format!("{old}.js")),
+                &paths.hooks_dir().join(format!("{new}.js")),
             )?;
             rename_lockfile_key(lockfile, "hooks", old, new);
             collect_orphans(paths, "hooks", old, &mut orphans);

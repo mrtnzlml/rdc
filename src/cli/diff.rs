@@ -84,12 +84,17 @@ pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) ->
                           &format!("hooks/{slug}.json (remote)"),
                           &lj, &rj, &mut diffs_printed);
 
-            // Code (.py) — present only if the hook has code.
+            // Code (.py or .js depending on runtime) — present only if
+            // the hook has code. Use the *local* runtime for the label
+            // since the user reads the on-disk filename; if local and
+            // remote runtimes disagree the JSON diff itself surfaces
+            // that change.
             let lc = local_code.unwrap_or_default();
             let rc = remote_code.unwrap_or_default();
             if lc != rc {
-                print_unified(&format!("hooks/{slug}.py (local)"),
-                              &format!("hooks/{slug}.py (remote)"),
+                let ext = crate::snapshot::hook::hook_code_extension(&local);
+                print_unified(&format!("hooks/{slug}.{ext} (local)"),
+                              &format!("hooks/{slug}.{ext} (remote)"),
                               &lc, &rc, &mut diffs_printed);
             }
         }
