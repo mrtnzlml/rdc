@@ -2475,10 +2475,9 @@ async fn sync_clean_queue_tree_no_writes() {
     assert_eq!(tpl_mtime, tpl_mtime_after, "email template must not be rewritten");
 }
 
-/// Watch-mode initial reconcile (Task 6): on `run_watch` startup, before the
-/// ctrl-c block, one full `run_cycle` runs with
-/// `auto_confirm_non_destructive=true`. This brings the env to a known state
-/// before watching kicks in. Mirrors the setup of
+/// Watch-mode initial reconcile: on `run_watch` startup, before the
+/// ctrl-c block, one full `run_cycle` runs. This brings the env to a
+/// known state before watching kicks in. Mirrors the setup of
 /// `sync_remote_create_writes_local_label` — a remote-only label that the
 /// initial reconcile must pull to disk.
 #[tokio::test]
@@ -2562,25 +2561,21 @@ async fn sync_watch_initial_reconcile_pulls_remote_creates() {
     );
 }
 
-/// Watch-mode auto-confirm for non-destructive cycles (Task 13). The
-/// initial reconcile in `run_watch` runs `run_cycle` with
-/// `auto_confirm_non_destructive=true`. For a plan that contains only
-/// non-destructive actions (here: a single `RemoteCreate` for a label
-/// that exists upstream but not locally), the prompt must be skipped —
-/// `confirm()` would otherwise read stdin, and in a non-tty test
-/// process that read would block forever (or, on a closed stdin,
-/// return an error and abort the cycle before the pull lands).
+/// Regression guard: `run_cycle` must not block on a meta-confirmation
+/// prompt for any plan, destructive or otherwise. The plan is printed
+/// for preview only; per-item gates (conflict resolver, destructive
+/// delete gate, remote-delete prompt, auth refresh) handle their own
+/// confirmations.
 ///
-/// We run `run_watch` with `interactive=true` under a short timeout. If
-/// the auto-confirm path works, the cycle completes, the label is
-/// written to disk, and `run_watch` then blocks on `ctrl_c` — so the
-/// timeout fires (Err). If the auto-confirm path is broken,
-/// `run_watch` either errors out of `confirm()` (Ok result) or hangs
-/// inside the prompt without ever pulling the label (label file
-/// missing). Both failure modes are caught by the two assertions
-/// below.
+/// We run `run_watch` with `interactive=true` under a short timeout for
+/// a plan that contains a single `RemoteCreate` for a label that exists
+/// upstream but not locally. If a meta-confirmation prompt were
+/// reintroduced, it would read stdin — in a non-tty test process that
+/// read would either block forever (timeout fires but the label is
+/// never pulled) or fail on a closed stdin (run_watch returns Ok/Err
+/// early). Both failure modes are caught by the two assertions below.
 #[tokio::test]
-async fn sync_watch_non_destructive_cycle_skips_confirm() {
+async fn sync_does_not_show_meta_confirmation_prompt() {
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
@@ -2630,10 +2625,10 @@ async fn sync_watch_non_destructive_cycle_skips_confirm() {
     std::env::set_current_dir(project.path()).unwrap();
 
     // The key difference from `sync_watch_initial_reconcile_pulls_remote_creates`:
-    // `interactive = true`. Without the auto-confirm path set up in Task 2,
-    // the non-destructive plan would still hit the confirm prompt and the
-    // pull would never reach disk (or the cycle would error and `run_watch`
-    // would return Ok/Err immediately instead of blocking on ctrl_c).
+    // `interactive = true`. If a meta-confirmation prompt were
+    // reintroduced, the plan would block on stdin and the pull would
+    // never reach disk (or the cycle would error and `run_watch` would
+    // return Ok/Err immediately instead of blocking on ctrl_c).
     let res = tokio::time::timeout(
         std::time::Duration::from_millis(800),
         rdc::cli::sync::watch::run_watch(
@@ -2643,13 +2638,13 @@ async fn sync_watch_non_destructive_cycle_skips_confirm() {
         ),
     )
     .await;
-    // If auto-confirm worked, the cycle finished and `run_watch` is now
-    // sitting on `ctrl_c` → timeout fires (Err). If it didn't, either
-    // `confirm()` returned an error (Ok(Err(_))) or it returned early
-    // success (Ok(Ok(_))) — both are wrong.
+    // If no meta-prompt fires, the cycle finishes and `run_watch` is
+    // now sitting on `ctrl_c` → timeout fires (Err). If a prompt were
+    // reintroduced, it would either error on stdin (Ok(Err(_))) or
+    // return early success (Ok(Ok(_))) — both are wrong.
     assert!(
         res.is_err(),
-        "run_watch should still be blocked on ctrl_c (auto-confirm should have skipped the prompt), got {:?}",
+        "run_watch should still be blocked on ctrl_c (no meta-confirmation prompt should fire), got {:?}",
         res
     );
 
@@ -2659,7 +2654,7 @@ async fn sync_watch_non_destructive_cycle_skips_confirm() {
 
     assert!(
         exists,
-        "label should have been pulled despite interactive=true (auto-confirm should have skipped the prompt): {}",
+        "label should have been pulled despite interactive=true (no meta-confirmation prompt should fire): {}",
         label_path.display()
     );
 }

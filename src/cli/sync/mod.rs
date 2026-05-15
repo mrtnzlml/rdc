@@ -35,9 +35,9 @@ pub struct CycleOutcome {
 /// 3. `classify` (via [`from_catalog_scan_lockfile`]) — fold the three
 ///    sources into eleven `(kind, slug)` classes.
 /// 4. `plan` — render the plan, exit early on `--dry-run`.
-/// 5. (interactive) confirm.
-/// 6. `execute` — currently a stub; subsequent tasks fill in per-class
-///    dispatch.
+/// 5. `execute` — currently a stub; subsequent tasks fill in per-class
+///    dispatch. Per-item gates (conflict resolver, destructive-delete
+///    gate, remote-delete prompts) handle their own confirmations.
 ///
 /// On success the lockfile is saved and `_index.md` regenerated, even
 /// when the executor was a no-op — re-running on a clean env stays
@@ -67,19 +67,20 @@ pub async fn run(
         allow_deletes,
         no_push,
         no_pull,
-        false,
     )
     .await?;
     Ok(())
 }
 
-/// One reconciliation pass: list remote, scan local, classify, prompt-if-needed,
-/// execute, save. Caller is responsible for holding the env lock for the
+/// One reconciliation pass: list remote, scan local, classify, execute,
+/// save. Caller is responsible for holding the env lock for the
 /// duration of this call.
 ///
-/// `auto_confirm_non_destructive`: when true (watch mode), the plan-and-confirm
-/// prompt is suppressed for cycles with zero conflicts and zero destructive
-/// items. Conflicts and destructive deletes still prompt via the inline resolver.
+/// The plan is printed before execution as an informational preview, but
+/// there is no meta-confirmation prompt — every consequential downstream
+/// action (conflict resolution, destructive deletes, remote-delete
+/// reconciliation, auth refresh) has its own gate. Ctrl-C remains the
+/// universal abort.
 pub(crate) async fn run_cycle(
     env: &str,
     interactive: bool,
@@ -88,7 +89,6 @@ pub(crate) async fn run_cycle(
     allow_deletes: bool,
     no_push: bool,
     no_pull: bool,
-    auto_confirm_non_destructive: bool,
 ) -> Result<CycleOutcome> {
     if no_push && no_pull {
         anyhow::bail!(
@@ -156,24 +156,6 @@ pub(crate) async fn run_cycle(
     // the executor is a no-op, so the flag is recorded for parity.
     let _ = allow_deletes;
 
-    let has_conflicts_or_destructive = classified.iter().any(|c| {
-        matches!(
-            c.class,
-            crate::cli::sync::classify::SyncClass::BothDiverged
-                | crate::cli::sync::classify::SyncClass::LocalEditRemoteDelete
-                | crate::cli::sync::classify::SyncClass::LocalDeleteRemoteEdit
-                | crate::cli::sync::classify::SyncClass::RemoteDelete
-                | crate::cli::sync::classify::SyncClass::LocalDelete
-        )
-    });
-    let should_confirm = interactive
-        && !classified.is_empty()
-        && !(auto_confirm_non_destructive && !has_conflicts_or_destructive);
-    if should_confirm && !confirm("Proceed?")? {
-        eprintln!("sync aborted by user.");
-        return Ok(CycleOutcome::default());
-    }
-
     // Phase 5: execute. Stub today — fills in across subsequent tasks.
     let outcome = {
         let mut ctx = crate::cli::pull::common::PullCtx {
@@ -208,18 +190,6 @@ pub(crate) async fn run_cycle(
     ));
     println!("Synced envs/{env}.");
     Ok(outcome)
-}
-
-/// y/N confirmation prompt on stdin/stdout. Returns false for any input
-/// other than "y" / "Y".
-fn confirm(prompt: &str) -> Result<bool> {
-    use std::io::{BufRead, Write};
-    print!("{prompt} [y/N] ");
-    std::io::stdout().flush().ok();
-    let stdin = std::io::stdin();
-    let mut line = String::new();
-    stdin.lock().read_line(&mut line)?;
-    Ok(matches!(line.trim().chars().next(), Some('y') | Some('Y')))
 }
 
 /// Fold the three sources (remote catalog, push scan, lockfile) into the

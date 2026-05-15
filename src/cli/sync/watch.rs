@@ -39,7 +39,6 @@ pub async fn run_watch(
             allow_deletes,
             no_push,
             no_pull,
-            true,
         )
         .await?;
     }
@@ -139,7 +138,7 @@ pub(crate) async fn event_loop(
                     std::time::Duration::from_secs(30),
                 )?;
                 let outcome = match crate::cli::sync::run_cycle(
-                    env, interactive, false, false, allow_deletes, no_push, no_pull, true,
+                    env, interactive, false, false, allow_deletes, no_push, no_pull,
                 ).await {
                     Ok(o) => o,
                     Err(e) if crate::api::anyhow_has_status(&e, 401) => {
@@ -147,7 +146,7 @@ pub(crate) async fn event_loop(
                         eprintln!("[{}] auth expired", now_hhmmss());
                         crate::cli::auth::refresh_token_interactively(env).await?;
                         crate::cli::sync::run_cycle(
-                            env, interactive, false, false, allow_deletes, no_push, no_pull, true,
+                            env, interactive, false, false, allow_deletes, no_push, no_pull,
                         ).await?
                     }
                     Err(e) if is_transient_network_error(&e) => {
