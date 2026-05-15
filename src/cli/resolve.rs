@@ -1243,6 +1243,41 @@ pub fn colorize_header(text: &str, mode: ColorMode) -> String {
     format!("{SGR_AMBER_BOLD}{text}{SGR_RESET}")
 }
 
+/// Colorize a success line (`✓ <name>`) in sage green — matches the
+/// hue used for added lines in unified diff output.
+pub fn colorize_success(text: &str, mode: ColorMode) -> String {
+    if mode == ColorMode::Plain {
+        return text.to_string();
+    }
+    format!("{SGR_ADD}{text}{SGR_RESET}")
+}
+
+/// Colorize a warning line (`⚠ <name>`) in bold amber — matches the
+/// primary accent used by clap headers and prompt brackets.
+pub fn colorize_warning(text: &str, mode: ColorMode) -> String {
+    if mode == ColorMode::Plain {
+        return text.to_string();
+    }
+    format!("{SGR_AMBER_BOLD}{text}{SGR_RESET}")
+}
+
+/// Colorize an error line (`✗ <name>`) in bold red — matches the
+/// hue used for removed file headers in unified diff output.
+pub fn colorize_error(text: &str, mode: ColorMode) -> String {
+    if mode == ColorMode::Plain {
+        return text.to_string();
+    }
+    format!("{SGR_REMOVE_BOLD}{text}{SGR_RESET}")
+}
+
+/// Colorize the final summary line (`✔ Synced …`) in bold sage green.
+pub fn colorize_final_ok(text: &str, mode: ColorMode) -> String {
+    if mode == ColorMode::Plain {
+        return text.to_string();
+    }
+    format!("{SGR_ADD_BOLD}{text}{SGR_RESET}")
+}
+
 /// Colorize the action-letter prompt line. Bracketed single-letter tokens
 /// like `[k]` are wrapped in bold amber; the rest of the prompt is unchanged.
 pub fn colorize_prompt(text: &str, mode: ColorMode) -> String {
