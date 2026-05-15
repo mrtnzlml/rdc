@@ -24,7 +24,7 @@ pub fn skip_on_permission_denied<T>(
                     .unwrap_or(false)
             });
             if is_403 {
-                progress.println(format!("⚠ skipping {kind} — token lacks permission (403)"));
+                progress.println(format!("⚠️ skipping {kind} — token lacks permission (403)"));
                 Ok(Vec::new())
             } else {
                 Err(e)
@@ -442,7 +442,7 @@ fn shadow_file_conflict(
     let conflict_path = crate::paths::shadow_path_for(local_path, env);
     write_atomic(&conflict_path, remote_bytes)?;
     progress.println(format!(
-        "⚠ {} conflict — local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
+        "⚠️ {} conflict — local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
         local_path.display(),
         conflict_path.display(),
     ));
@@ -509,7 +509,7 @@ fn resolve_conflict_interactive(
             write_atomic(local_path, &edited)?;
             if let Some(prior) = base_hash {
                 progress.println(format!(
-                    "⚠ {} partially resolved (markers retained); lockfile base preserved — re-run to resolve",
+                    "⚠️ {} partially resolved (markers retained); lockfile base preserved — re-run to resolve",
                     local_path.display(),
                 ));
                 Ok(prior.to_string())

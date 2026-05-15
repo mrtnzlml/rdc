@@ -35,7 +35,7 @@ pub async fn process(
     for s in &steps {
         let Some(workflow_slug) = ctx.lockfile.slug_for_url("workflows", &s.workflow).map(|x| x.to_string()) else {
             phase.line(format!(
-                "⚠ workflow step '{}' (id {}) has unknown workflow URL '{}'; skipping",
+                "⚠️ workflow step '{}' (id {}) has unknown workflow URL '{}'; skipping",
                 s.name, s.id, s.workflow
             ));
             continue;

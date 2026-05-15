@@ -80,7 +80,7 @@ pub fn confirm_or_refuse(
 ) -> Result<ConfirmOutcome> {
     let n = tombstones.total();
     eprintln!();
-    eprintln!("⚠  The following {n} object(s) would be DELETED from the remote:");
+    eprintln!("⚠️  The following {n} object(s) would be DELETED from the remote:");
     print_tombstone_list(tombstones);
     eprintln!();
 

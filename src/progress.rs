@@ -215,13 +215,13 @@ impl Spinner {
         }
     }
 
-    /// Resolve with a ⚠ and one-line warning.
+    /// Resolve with a ⚠️ and one-line warning.
     pub fn finish_warn(mut self, msg: impl Into<String>) {
         if self.resolved { return; }
         self.resolved = true;
         let msg: String = msg.into();
         let elapsed = self.started.elapsed();
-        let line = format_final_line("⚠", &self.name, &msg, elapsed, self.color);
+        let line = format_final_line("⚠\u{FE0F}", &self.name, &msg, elapsed, self.color);
         if self.tty {
             self.bar.finish_with_message(line);
         } else {
@@ -281,7 +281,7 @@ fn format_final_line(
     };
     match glyph {
         "✓" => crate::cli::resolve::colorize_success(&body, color),
-        "⚠" => crate::cli::resolve::colorize_warning(&body, color),
+        "⚠\u{FE0F}" => crate::cli::resolve::colorize_warning(&body, color),
         "✗" => crate::cli::resolve::colorize_error(&body, color),
         _ => body,
     }
@@ -307,7 +307,7 @@ mod log_tests {
 
     #[test]
     fn format_final_line_empty_summary_just_glyph_and_name() {
-        let line = format_final_line("⚠", "hooks/x", "", Duration::from_millis(50), ColorMode::Plain);
-        assert_eq!(line, "⚠ hooks/x");
+        let line = format_final_line("⚠\u{FE0F}", "hooks/x", "", Duration::from_millis(50), ColorMode::Plain);
+        assert_eq!(line, "⚠\u{FE0F} hooks/x");
     }
 }

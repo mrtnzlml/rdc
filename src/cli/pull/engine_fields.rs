@@ -39,7 +39,7 @@ pub async fn process(
     for f in &fields {
         let Some(engine_slug) = ctx.lockfile.slug_for_url("engines", &f.engine).map(|s| s.to_string()) else {
             phase.line(format!(
-                "⚠ engine field '{}' (id {}) has unknown engine URL '{}'; skipping",
+                "⚠️ engine field '{}' (id {}) has unknown engine URL '{}'; skipping",
                 f.name, f.id, f.engine
             ));
             continue;

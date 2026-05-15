@@ -288,7 +288,7 @@ would push
 $ rdc sync test
 ✓ sync envs/test: 261 files scanned, 0 changed, 1 to delete
 
-⚠  The following 1 object(s) would be DELETED from the remote:
+⚠️  The following 1 object(s) would be DELETED from the remote:
   - labels/audit-hold (id 10198)
 
 Proceed with deletion? [y/N] y

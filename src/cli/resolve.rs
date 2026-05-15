@@ -1297,7 +1297,7 @@ pub fn colorize_success(text: &str, mode: ColorMode) -> String {
     format!("{SGR_ADD}{text}{SGR_RESET}")
 }
 
-/// Colorize a warning line (`⚠ <name>`) in bold amber — matches the
+/// Colorize a warning line (`⚠️ <name>`) in bold amber — matches the
 /// primary accent used by clap headers and prompt brackets.
 pub fn colorize_warning(text: &str, mode: ColorMode) -> String {
     if mode == ColorMode::Plain {
