@@ -48,6 +48,7 @@ pub async fn run(env_specs: Vec<String>) -> Result<()> {
     cfg.save(&cfg_path)?;
 
     write_gitignore(&cwd)?;
+    write_gitattributes(&cwd)?;
     write_claude_md(&cwd)?;
     std::fs::create_dir_all(cwd.join("secrets"))
         .with_context(|| format!("creating {}", cwd.join("secrets").display()))?;
@@ -280,6 +281,32 @@ fn write_gitignore(root: &Path) -> Result<()> {
         let existing = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         if existing.contains("/secrets") && existing.contains("/.rdc/cache") {
+            return Ok(());
+        }
+        let mut combined = existing;
+        if !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+        combined.push_str(body);
+        write_atomic(&path, combined.as_bytes())?;
+    } else {
+        write_atomic(&path, body.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Mark rdc-owned files under `.rdc/` as generated so GitHub collapses
+/// their diffs by default and excludes them from language stats. The
+/// state lockfile (`state/<env>.lock.json`) and cross-env mappings
+/// (`map/<src>-to-<tgt>.toml`) are produced by the tool; reviewers
+/// shouldn't have to scroll past them.
+fn write_gitattributes(root: &Path) -> Result<()> {
+    let path = root.join(".gitattributes");
+    let body = ".rdc/** linguist-generated=true\n";
+    if path.exists() {
+        let existing = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if existing.contains(".rdc/** linguist-generated") {
             return Ok(());
         }
         let mut combined = existing;

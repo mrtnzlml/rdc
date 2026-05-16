@@ -31,6 +31,11 @@ fn init_creates_expected_files() {
     assert!(gitignore.contains("/secrets"));
     assert!(gitignore.contains("/.rdc/cache"));
 
+    // Generated files under .rdc/ (lockfile, mapping) are marked so
+    // GitHub collapses their diffs and excludes them from language stats.
+    let gitattributes = std::fs::read_to_string(dir.path().join(".gitattributes")).unwrap();
+    assert!(gitattributes.contains(".rdc/** linguist-generated=true"));
+
     // CLAUDE.md agent guide is created at project root.
     let claude_md = dir.path().join("CLAUDE.md");
     assert!(claude_md.exists(), "CLAUDE.md should be created on init");
@@ -39,6 +44,46 @@ fn init_creates_expected_files() {
     assert!(body.contains("`envs/<env>/_index.md`"));
     assert!(body.contains("rdc sync"));
     assert!(body.contains("Conflicts & drift"));
+}
+
+#[test]
+fn init_preserves_existing_gitattributes_and_is_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let user_attrs = "*.png binary\nMakefile text eol=lf\n";
+    std::fs::write(dir.path().join(".gitattributes"), user_attrs).unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--env", "dev=https://example.rossum.app/api/v1:285704",
+        ])
+        .assert()
+        .success();
+
+    let after = std::fs::read_to_string(dir.path().join(".gitattributes")).unwrap();
+    assert!(after.contains("*.png binary"));
+    assert!(after.contains("Makefile text eol=lf"));
+    assert!(after.contains(".rdc/** linguist-generated=true"));
+
+    // Re-running init on the same project must not duplicate the rule.
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--env", "prod=https://example.rossum.app/api/v1:285705",
+        ])
+        .assert()
+        .success();
+
+    let after_second = std::fs::read_to_string(dir.path().join(".gitattributes")).unwrap();
+    assert_eq!(
+        after_second.matches(".rdc/** linguist-generated=true").count(),
+        1,
+        "rule should be written exactly once across init runs"
+    );
 }
 
 #[test]
