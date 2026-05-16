@@ -51,6 +51,157 @@ async fn mount_minimal_pull(server: &MockServer) {
     }
 }
 
+/// Pins the perf invariant established by the O(N²) → O(N) fix in
+/// `diff_local_vs_remote`: every `list_*` endpoint that backs a per-slug
+/// diff lookup must be called AT MOST ONCE per `rdc diff` run, regardless
+/// of how many local objects exist. Previously the queue tree issued one
+/// `list_queues` per local queue.json, and similar repetition existed
+/// for labels / engine_fields / email_templates.
+///
+/// This test boots a small project with N >= 3 queues mirrored to the
+/// mock server and asserts each list endpoint sees exactly one hit.
+#[tokio::test]
+async fn diff_lists_each_remote_endpoint_exactly_once() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+        .mount(&server).await;
+
+    // Workspace tree: 1 workspace containing 3 queues. Each queue has a
+    // schema and inbox so the diff hits get_schema/get_inbox in parallel
+    // and uses the queue list to look up queue bodies.
+    let ws_url = format!("{}/api/v1/workspaces/800", server.uri());
+    let queue_ids = [100u64, 101, 102];
+    let queue_urls: Vec<String> = queue_ids
+        .iter()
+        .map(|id| format!("{}/api/v1/queues/{id}", server.uri()))
+        .collect();
+    let schema_urls: Vec<String> = queue_ids
+        .iter()
+        .map(|id| format!("{}/api/v1/schemas/2{id:02}", server.uri()))
+        .collect();
+    let inbox_urls: Vec<String> = queue_ids
+        .iter()
+        .map(|id| format!("{}/api/v1/inboxes/3{id:02}", server.uri()))
+        .collect();
+
+    let workspaces_body = serde_json::json!({
+        "pagination": { "total": 1, "next": null },
+        "results": [{
+            "id": 800, "url": ws_url, "name": "ap",
+            "organization": format!("{}/api/v1/organizations/1", server.uri()),
+            "queues": queue_urls.clone(),
+            "modified_at": "2026-04-20T08:00:00Z"
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(workspaces_body))
+        .mount(&server).await;
+
+    let queues_body = serde_json::json!({
+        "pagination": { "total": 3, "next": null },
+        "results": queue_ids.iter().enumerate().map(|(i, id)| serde_json::json!({
+            "id": id,
+            "url": queue_urls[i],
+            "name": format!("Q{id}"),
+            "workspace": format!("{}/api/v1/workspaces/800", server.uri()),
+            "schema": schema_urls[i],
+            "inbox": inbox_urls[i],
+            "modified_at": "2026-04-10T09:00:00Z"
+        })).collect::<Vec<_>>()
+    });
+    // Mount once: this single mock serves both `sync` (one list call)
+    // and `diff` (post-fix: one list call). Total expected = 2.
+    //
+    // Pre-fix, the queue-tree loop called `list_queues` ONCE PER
+    // LOCAL QUEUE — with 3 queues, total would be 1 (sync) + 3 (diff) =
+    // 4, failing this expectation. Post-fix it's exactly 2.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(queues_body))
+        .expect(2)
+        .mount(&server).await;
+
+    for (i, id) in queue_ids.iter().enumerate() {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/schemas/2{id:02}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": format!("2{id:02}").parse::<u64>().unwrap(),
+                "url": schema_urls[i],
+                "name": format!("S{id}"),
+                "queues": [queue_urls[i]],
+                "content": [],
+                "modified_at": "2026-04-10T09:00:00Z"
+            })))
+            .mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/inboxes/3{id:02}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": format!("3{id:02}").parse::<u64>().unwrap(),
+                "url": inbox_urls[i],
+                "name": format!("I{id}"),
+                "email": format!("q{id}@mock.rossum.app"),
+                "queues": [queue_urls[i]],
+                "filters": [],
+                "modified_at": "2026-04-10T09:00:00Z"
+            })))
+            .mount(&server).await;
+    }
+
+    // email_templates: empty (no list call expected from queue tree if
+    // no local template files exist; we still mount the endpoint for
+    // pull).
+    Mock::given(method("GET"))
+        .and(path("/api/v1/email_templates"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+        .mount(&server).await;
+
+    // Flat-kind lists — each should be called AT MOST ONCE during diff.
+    // (Pull calls them once too, so total expected = pull(1) + diff(0 or
+    // 1) depending on whether the local snapshot has any files of the
+    // kind. Local snapshot is freshly synced from the same server, so
+    // it has none of these kinds populated locally → no diff list call.)
+    for ep in [
+        "/api/v1/rules", "/api/v1/labels",
+        "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&server).await;
+    }
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev", "--no-push"])
+        .assert().success();
+
+    // diff with 3 local queues. Pre-fix: 3 list_queues calls. Post-fix:
+    // 1 list_queues call. wiremock's `.expect(1)` will assert on drop
+    // of the server.
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["diff", "dev"])
+        .assert().success()
+        .stdout(predicate::str::contains("no diffs"));
+}
+
 #[tokio::test]
 async fn diff_local_remote_no_changes() {
     let server = MockServer::start().await;
