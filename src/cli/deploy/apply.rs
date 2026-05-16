@@ -18,9 +18,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Emit a warning through the progress bar if active, or to stderr directly.
-/// When a progress log is active the message renders indented (matching the
-/// other phase items); the standalone branch keeps a flush-left line because
-/// no surrounding indent context exists.
+/// Both branches render the message flush-left under the active phase
+/// (or as a standalone line if no progress log is active).
 fn warn(progress: &Option<Arc<ProgressLog>>, msg: String) {
     match progress {
         Some(p) => p.warn(&msg),

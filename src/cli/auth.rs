@@ -154,20 +154,16 @@ pub async fn refresh_token_interactively(env: &str) -> Result<()> {
         };
         let trimmed = new_token.trim();
         if trimmed.is_empty() {
-            eprintln!("  empty input; paste the token, or Ctrl+C to abort.");
+            eprintln!("empty input; paste the token, or Ctrl+C to abort.");
             continue;
         }
         match validate_and_save_token(env_cfg, &secrets_path, trimmed).await {
-            Ok(org_name) => {
-                eprintln!(
-                    "[ok] Token saved to {} (validated against org '{}'). Retrying...",
-                    secrets_path.display(),
-                    org_name
-                );
+            Ok(_org_name) => {
+                eprintln!("[ok] Token saved to {}", secrets_path.display());
                 return Ok(());
             }
             Err(e) if anyhow_has_status(&e, 401) => {
-                eprintln!("  rejected by server (401); try again, or Ctrl+C to abort.");
+                eprintln!("rejected by server (401); try again, or Ctrl+C to abort.");
                 continue;
             }
             Err(e) => return Err(e),

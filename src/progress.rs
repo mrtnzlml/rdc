@@ -64,10 +64,11 @@ impl ProgressLog {
         })
     }
 
-    /// Start a labelled section. The label appears on its own line.
-    /// Subsequent `item()` calls (on the returned `Phase`) are indented
-    /// under it. Calling `phase()` again finalizes the previous section's
-    /// blank-line padding and starts a fresh one.
+    /// Start a labelled section. The label appears on its own line,
+    /// bold/colored so it reads as a section break, with a blank line
+    /// above it (except the first). Subsequent `item()` / `line()` /
+    /// `warn()` calls render flush-left under the header. Calling
+    /// `phase()` again starts a fresh section.
     pub fn phase(self: &Arc<Self>, label: impl Into<String>) -> Phase {
         let label: String = label.into();
         {
@@ -114,20 +115,18 @@ impl ProgressLog {
         }
     }
 
-    /// Emit a notice (warning, retry, conflict note) indented under the
-    /// active phase. Matches the two-space indent that [`Phase::item`] /
-    /// [`Phase::line`] use, so warnings line up with phase items instead
-    /// of breaking flush-left mid-section. Routes through
+    /// Emit a notice (warning, retry, conflict note) under the active
+    /// phase. Renders flush-left, matching [`Phase::item`] / [`Phase::line`]
+    /// and the surrounding phase items. Routes through
     /// `MultiProgress::println` so any in-flight spinner is suspended for
-    /// the write; falls through to `eprintln!` in non-TTY mode (still
-    /// indented, for log-aggregator readability).
+    /// the write; falls through to `eprintln!` in non-TTY mode.
     pub fn warn(&self, msg: impl AsRef<str>) {
-        let line = format!("  {}", msg.as_ref());
+        let msg = msg.as_ref();
         let inner = self.inner.lock().unwrap();
         if inner.tty {
-            let _ = inner.mp.println(&line);
+            let _ = inner.mp.println(msg);
         } else {
-            eprintln!("{line}");
+            eprintln!("{msg}");
         }
     }
 
@@ -182,7 +181,7 @@ impl ProgressLog {
 }
 
 /// One section of the run (`listing remote`, `scanning local`, `pushing`).
-/// Items inside the section render indented; spinners attach to items.
+/// Items inside the section render flush-left; spinners attach to items.
 pub struct Phase {
     log: Arc<ProgressLog>,
     #[allow(dead_code)]
@@ -201,7 +200,7 @@ impl Phase {
         let bar = if tty {
             let bar = mp.add(ProgressBar::new_spinner());
             bar.set_style(
-                ProgressStyle::with_template("  {spinner} {msg}")
+                ProgressStyle::with_template("{spinner} {msg}")
                     .unwrap()
                     .tick_strings(&["|", "/", "-", "\\"]),
             );
@@ -225,17 +224,16 @@ impl Phase {
 
     /// One-shot summary line without a spinner. Used for steps where the
     /// work is so fast a spinner would flicker (`scanning local`,
-    /// `classifying`). Renders as `  <content>` and routes through
+    /// `classifying`). Renders flush-left and routes through
     /// `MultiProgress::println` so any active spinner is suspended for
     /// the duration of the write.
     pub fn line(&self, content: impl Into<String>) {
         let content: String = content.into();
         let inner = self.log.inner.lock().unwrap();
-        let line = format!("  {content}");
         if inner.tty {
-            let _ = inner.mp.println(&line);
+            let _ = inner.mp.println(&content);
         } else {
-            eprintln!("{line}");
+            eprintln!("{content}");
         }
     }
 }
@@ -270,9 +268,9 @@ impl Spinner {
             // animation frame is left behind), then commit a permanent
             // line above the active draw region.
             self.bar.finish_and_clear();
-            self.bar.println(format!("  {line}"));
+            self.bar.println(line);
         } else {
-            eprintln!("  {line}");
+            eprintln!("{line}");
         }
     }
 
@@ -285,9 +283,9 @@ impl Spinner {
         let line = format_final_line("!", &self.name, &msg, elapsed, self.color);
         if self.tty {
             self.bar.finish_and_clear();
-            self.bar.println(format!("  {line}"));
+            self.bar.println(line);
         } else {
-            eprintln!("  {line}");
+            eprintln!("{line}");
         }
     }
 
@@ -301,9 +299,9 @@ impl Spinner {
         let line = format_final_line("[fail]", &self.name, &msg, elapsed, self.color);
         if self.tty {
             self.bar.finish_and_clear();
-            self.bar.println(format!("  {line}"));
+            self.bar.println(line);
         } else {
-            eprintln!("  {line}");
+            eprintln!("{line}");
         }
     }
 }
@@ -317,9 +315,9 @@ impl Drop for Spinner {
         let line = format!("(cancelled) {}", self.name);
         if self.tty {
             self.bar.finish_and_clear();
-            self.bar.println(format!("  {line}"));
+            self.bar.println(line);
         } else {
-            eprintln!("  {line}");
+            eprintln!("{line}");
         }
     }
 }
