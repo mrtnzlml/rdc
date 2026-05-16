@@ -36,8 +36,10 @@ const MAX_SLEEP_SECS: u64 = 60;
 /// (since `RequestBuilder` is consumed by `.send()`).
 ///
 /// `progress` — when `Some`, retry warnings are printed via
-/// `progress.println()` so the progress bar isn't corrupted. Pass `None`
-/// when no progress bar is active (e.g. `rdc auth`, `rdc diff`).
+/// `progress.warn()` so the line is indented under the active phase and
+/// any in-flight spinner is suspended for the write. Pass `None` when no
+/// progress bar is active (e.g. `rdc auth`, `rdc diff`); the message
+/// falls through to plain `eprintln!`.
 pub async fn send_with_retry(
     mut build: impl FnMut() -> reqwest::RequestBuilder,
     desc: &str,
@@ -63,7 +65,7 @@ pub async fn send_with_retry(
             MAX_ATTEMPTS,
         );
         match &progress {
-            Some(p) => p.println(&msg),
+            Some(p) => p.warn(&msg),
             None => eprintln!("{msg}"),
         }
         tokio::time::sleep(wait).await;

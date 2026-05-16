@@ -24,7 +24,7 @@ pub fn skip_on_permission_denied<T>(
                     .unwrap_or(false)
             });
             if is_403 {
-                progress.println(format!("! skipping {kind}: token lacks permission (403)"));
+                progress.warn(format!("! skipping {kind}: token lacks permission (403)"));
                 Ok(Vec::new())
             } else {
                 Err(e)
@@ -183,7 +183,7 @@ pub async fn list_remote(
     // A single spinner shows progress while the parallel batch runs; without
     // it the user sees nothing for several seconds during a tree of dozens.
     let (schemas_by_queue_id, inboxes_by_queue_id) =
-        prefetch_queue_children(ctx.client, &queues, &phase).await
+        prefetch_queue_children(ctx.client, &queues, &phase, progress).await
             .with_context(|| format!("prefetching schemas + inboxes for env '{env}'"))?;
 
     Ok(RemoteCatalog {
@@ -202,10 +202,14 @@ pub async fn list_remote(
 /// A single spinner ("schemas + inboxes") is held by the calling task and
 /// updates its message via `set_message` as each parallel fetch completes,
 /// so the user sees a `(N/M)` running counter while the batch is in flight.
+/// `progress` is threaded into each `get_schema` / `get_inbox` call so any
+/// 429 retry warning renders cleanly above the spinner instead of tearing
+/// the surrounding draw region.
 async fn prefetch_queue_children(
     client: &RossumClient,
     queues: &[crate::model::Queue],
     phase: &crate::progress::Phase,
+    progress: &Arc<crate::progress::ProgressLog>,
 ) -> Result<(
     std::collections::BTreeMap<u64, crate::model::Schema>,
     std::collections::BTreeMap<u64, crate::model::Inbox>,
@@ -247,7 +251,13 @@ async fn prefetch_queue_children(
     // message; the calling task holds ownership and calls finish_ok at the
     // end. `Spinner::set_message` takes `&self`, so an `Arc<Spinner>` is
     // safe to clone into each worker future.
-    let sp = Arc::new(phase.item(format!("schemas + inboxes (0/{total})")));
+    //
+    // The spinner is constructed with the bare base name "schemas + inboxes".
+    // Workers update the displayed message to `schemas + inboxes (N/total)`
+    // as fetches resolve; on finalize the bar's transient message is dropped
+    // and the `[ok]` line uses the base name + summary (see
+    // `Spinner::finish_ok`).
+    let sp = Arc::new(phase.item("schemas + inboxes"));
     let done = Arc::new(AtomicUsize::new(0));
 
     let fetched_result: Result<Vec<(u64, Option<crate::model::Schema>, Option<crate::model::Inbox>)>> =
@@ -255,11 +265,12 @@ async fn prefetch_queue_children(
             .map(|(qid, qname, sid, iid)| {
                 let sp = sp.clone();
                 let done = done.clone();
+                let progress = progress.clone();
                 async move {
                     let schema = match sid {
                         Some(id) => Some(
                             client
-                                .get_schema(id, None)
+                                .get_schema(id, Some(progress.clone()))
                                 .await
                                 .with_context(|| {
                                     format!("prefetching schema {id} for queue '{qname}'")
@@ -270,7 +281,7 @@ async fn prefetch_queue_children(
                     let inbox = match iid {
                         Some(id) => Some(
                             client
-                                .get_inbox(id, None)
+                                .get_inbox(id, Some(progress.clone()))
                                 .await
                                 .with_context(|| {
                                     format!("prefetching inbox {id} for queue '{qname}'")
@@ -513,7 +524,7 @@ fn shadow_file_conflict(
     use crate::snapshot::writer::write_atomic;
     let conflict_path = crate::paths::shadow_path_for(local_path, env);
     write_atomic(&conflict_path, remote_bytes)?;
-    progress.println(format!(
+    progress.warn(format!(
         "! {} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
         local_path.display(),
         conflict_path.display(),
@@ -580,7 +591,7 @@ fn resolve_conflict_interactive(
             // shadow-skip); fall back to local hash when no prior base.
             write_atomic(local_path, &edited)?;
             if let Some(prior) = base_hash {
-                progress.println(format!(
+                progress.warn(format!(
                     "! {} partially resolved (markers retained); lockfile base preserved; re-run to resolve",
                     local_path.display(),
                 ));

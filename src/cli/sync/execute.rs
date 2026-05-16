@@ -438,7 +438,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 })
             }
             other => {
-                progress.println(format!(
+                progress.warn(format!(
                     "warning: conflict resolver not yet wired for kind '{}' (slug '{}'); skipping",
                     other, it.slug,
                 ));
@@ -446,7 +446,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
             }
         }) else {
             // No catalog entry / orphan / unwired kind — warn and move on.
-            progress.println(format!(
+            progress.warn(format!(
                 "warning: conflict for {}/{} but no matching remote object found; skipping",
                 it.kind, it.slug,
             ));
@@ -758,7 +758,7 @@ fn resolve_one_conflict<R: BufRead>(
             };
         let conflict_path = crate::paths::shadow_path_for(&shadow_anchor, env);
         write_atomic(&conflict_path, &shadow_bytes)?;
-        progress.println(format!(
+        progress.warn(format!(
             "warn: {} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
             shadow_anchor.display(),
             conflict_path.display(),
@@ -1007,7 +1007,7 @@ fn resolve_one_conflict<R: BufRead>(
                 std::fs::create_dir_all(parent).ok();
             }
             write_atomic(edit_target, &edited)?;
-            progress.println(format!(
+            progress.warn(format!(
                 "warn: {} partially resolved (markers retained); lockfile base preserved; re-run to resolve",
                 edit_target.display(),
             ));
@@ -1038,7 +1038,7 @@ fn resolve_one_conflict<R: BufRead>(
             // identical-to-local `.json`.
             let conflict_path = crate::paths::shadow_path_for(&prompt_path, env);
             write_atomic(&conflict_path, &prompt_remote_bytes)?;
-            progress.println(format!(
+            progress.warn(format!(
                 "warn: {} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
                 prompt_path.display(),
                 conflict_path.display(),
@@ -1324,7 +1324,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                 ) {
                     drop_lockfile_entry(ctx, &it.kind, &it.slug);
                 } else {
-                    progress.println(format!(
+                    progress.warn(format!(
                         "warning: BothDeleted handler not yet wired for kind '{}' (slug '{}'); skipping",
                         it.kind, it.slug,
                     ));
@@ -1617,7 +1617,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                         })
                     }
                     other => {
-                        progress.println(format!(
+                        progress.warn(format!(
                             "warning: remote-delete dispatch not yet wired for kind '{}' (slug '{}'); skipping",
                             other, it.slug,
                         ));
@@ -1659,7 +1659,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             }
                         }
                         None => {
-                            progress.println(format!(
+                            progress.warn(format!(
                                 "warning: LocalDeleteRemoteEdit for {}/{} but no matching env-side body in catalog; skipping",
                                 it.kind, it.slug,
                             ));
@@ -1677,7 +1677,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     if local_path.exists() {
                         let marker = deleted_marker_path(&local_path, &env);
                         write_atomic(&marker, b"")?;
-                        progress.println(format!(
+                        progress.warn(format!(
                             "warn: {}: env deletion deferred (non-tty); marker at {}",
                             local_path.display(),
                             marker.display(),
@@ -1691,7 +1691,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     // file: the classifier saw a tombstone-flavored
                     // state but the file isn't there. Defensive — emit
                     // a warning and move on rather than panic.
-                    progress.println(format!(
+                    progress.warn(format!(
                         "warn: {}: local file missing, cannot prompt; skipping",
                         local_path.display(),
                     ));
@@ -1730,7 +1730,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             std::fs::remove_file(&local_path).with_context(|| {
                                 format!("removing {}", local_path.display())
                             })?;
-                            progress.println(format!(
+                            progress.warn(format!(
                                 "note: {}: committing the local tombstone needs an \
                                  explicit `rdc push --allow-deletes {}` follow-up; \
                                  the lockfile entry was retained so the deletion isn't lost",
@@ -1817,7 +1817,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     Resolution::Skip => {
                         let marker = deleted_marker_path(&local_path, &env);
                         write_atomic(&marker, b"")?;
-                        progress.println(format!(
+                        progress.warn(format!(
                             "warn: {}: env deletion deferred; marker at {}",
                             local_path.display(),
                             marker.display(),

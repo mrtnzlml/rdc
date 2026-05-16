@@ -161,7 +161,11 @@ pub async fn process(
     if total == 0 {
         return Ok(counts);
     }
-    let sp = Arc::new(phase.item(format!("schemas + inboxes (0/{total})")));
+    // Bare base name; the in-flight counter rides on `set_message` and the
+    // final `[ok]` line drops it. Threading `progress` into each fetch routes
+    // any 429 retry warning through the active log so it stacks above the
+    // spinner instead of breaking it.
+    let sp = Arc::new(phase.item("schemas + inboxes"));
     let done = Arc::new(AtomicUsize::new(0));
     let fetched_vec_result: Result<Vec<(u64, Option<Schema>, Option<Inbox>)>> = futures::stream::iter(
         work.iter().map(|w| (w.q.id, w.q.name.clone(), w.schema_id, w.inbox_id))
@@ -169,14 +173,15 @@ pub async fn process(
     .map(|(qid, qname, sid_opt, iid_opt)| {
         let sp = sp.clone();
         let done = done.clone();
+        let progress = progress.clone();
         async move {
             let schema = match sid_opt {
-                Some(sid) => Some(client.get_schema(sid, None).await
+                Some(sid) => Some(client.get_schema(sid, Some(progress.clone())).await
                     .with_context(|| format!("fetching schema {sid} for queue '{qname}'"))?),
                 None => None,
             };
             let inbox = match iid_opt {
-                Some(iid) => Some(client.get_inbox(iid, None).await
+                Some(iid) => Some(client.get_inbox(iid, Some(progress.clone())).await
                     .with_context(|| format!("fetching inbox {iid} for queue '{qname}'"))?),
                 None => None,
             };

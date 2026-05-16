@@ -123,7 +123,9 @@ pub async fn process(
     if total == 0 {
         return Ok((0, conflicts));
     }
-    let sp = Arc::new(phase.item(format!("indexes (0/{total})")));
+    // Bare base name — `set_message` carries the in-flight counter; the final
+    // `[ok]` line uses the base + summary (no leftover `(N/M)`).
+    let sp = Arc::new(phase.item("indexes"));
     let done = Arc::new(AtomicUsize::new(0));
     let fetched_result: Result<Vec<(String, IndexSet)>> = futures::stream::iter(
         dataset_dirs.iter().map(|(slug, _, c)| (slug.clone(), c.name.clone()))
@@ -131,10 +133,11 @@ pub async fn process(
     .map(|(slug, name)| {
         let sp = sp.clone();
         let done = done.clone();
+        let progress = progress.clone();
         async move {
-            let regular = client_ref.list_indexes(&name, None).await
+            let regular = client_ref.list_indexes(&name, Some(progress.clone())).await
                 .with_context(|| format!("listing indexes for '{name}'"))?;
-            let search = client_ref.list_search_indexes(&name, None).await
+            let search = client_ref.list_search_indexes(&name, Some(progress.clone())).await
                 .with_context(|| format!("listing search indexes for '{name}'"))?;
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
             sp.set_message(format!("indexes ({n}/{total})"));

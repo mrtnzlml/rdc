@@ -98,10 +98,12 @@ impl ProgressLog {
     }
 
     /// Print a free-standing line that doesn't fit the spinner shape.
-    /// Used by HTTP retry warnings from the API layer: the message needs
-    /// to appear without corrupting any in-flight spinner draw. In TTY
-    /// mode this goes through `MultiProgress::println` which redraws
-    /// cleanly above the bars; otherwise it falls through to `eprintln!`.
+    /// The message is written verbatim with no extra indent. Reserve this
+    /// for full-width lines (final summaries, blank padding). Phase-scoped
+    /// notices should use [`Self::warn`] instead so they line up under the
+    /// active phase. In TTY mode this goes through `MultiProgress::println`
+    /// which redraws cleanly above the bars; otherwise it falls through to
+    /// `eprintln!`.
     pub fn println(&self, msg: impl AsRef<str>) {
         let msg = msg.as_ref();
         let inner = self.inner.lock().unwrap();
@@ -109,6 +111,23 @@ impl ProgressLog {
             let _ = inner.mp.println(msg);
         } else {
             eprintln!("{msg}");
+        }
+    }
+
+    /// Emit a notice (warning, retry, conflict note) indented under the
+    /// active phase. Matches the two-space indent that [`Phase::item`] /
+    /// [`Phase::line`] use, so warnings line up with phase items instead
+    /// of breaking flush-left mid-section. Routes through
+    /// `MultiProgress::println` so any in-flight spinner is suspended for
+    /// the write; falls through to `eprintln!` in non-TTY mode (still
+    /// indented, for log-aggregator readability).
+    pub fn warn(&self, msg: impl AsRef<str>) {
+        let line = format!("  {}", msg.as_ref());
+        let inner = self.inner.lock().unwrap();
+        if inner.tty {
+            let _ = inner.mp.println(&line);
+        } else {
+            eprintln!("{line}");
         }
     }
 
@@ -354,6 +373,28 @@ mod log_tests {
     fn format_final_line_empty_summary_just_marker_and_name() {
         let line = format_final_line("!", "hooks/x", "", Duration::from_millis(50), ColorMode::Plain);
         assert_eq!(line, "! hooks/x");
+    }
+
+    /// Regression: the final `[ok]` line is driven by the spinner's
+    /// constructor-time `name`, not by whatever transient `set_message`
+    /// was last called with. The "schemas + inboxes (N/M)" counter-bug
+    /// (M-number-suppressed: `[ok] schemas + inboxes (0/25) 25 fetched`)
+    /// was caused by passing the counter as the constructor name; the
+    /// fix is to construct with the bare base name and use `set_message`
+    /// for the in-flight counter only. This test pins the formatter
+    /// contract: given the base name + summary, the final line carries
+    /// neither a `(N/M)` artifact nor any other transient text.
+    #[test]
+    fn format_final_line_uses_base_name_not_transient_message() {
+        let line = format_final_line(
+            "[ok]",
+            "schemas + inboxes",
+            "25 fetched",
+            Duration::from_millis(1700),
+            ColorMode::Plain,
+        );
+        assert_eq!(line, "[ok] schemas + inboxes 25 fetched (1.7s)");
+        assert!(!line.contains("(0/"), "leftover counter in final line: {line:?}");
     }
 
     /// Regression: the formatter never PREFIXES the line with a spinner

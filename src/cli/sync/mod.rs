@@ -371,7 +371,6 @@ pub(crate) async fn run_cycle(
         "Synced envs/{env} ({total_changed} changed, {:.1}s)",
         elapsed.as_secs_f32()
     ));
-    println!("Synced envs/{env}.");
     Ok(outcome)
 }
 
