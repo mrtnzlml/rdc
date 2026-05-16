@@ -35,7 +35,13 @@ These are the rules `rdc` follows so you don't have to think about them:
 
 ## Install
 
-Single binary via `curl | sh` (macOS + Linux x86_64):
+Homebrew (macOS, Linux x86_64):
+
+```sh
+brew install mrtnzlml/tap/rdc
+```
+
+Or single binary via `curl | sh`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/mrtnzlml/rossum-deployment-manager-experiment/main/install.sh | sh
