@@ -14,15 +14,18 @@
 //!   env) drops the lockfile entry and promotes the item to the push
 //!   pipeline so it's POSTed; `[r]` mirrors the deletion locally; `[s]`
 //!   writes the `<file>.<env>-deleted` marker.
-//! - **Pull-side (`RemoteEdit`, `RemoteCreate`)** — grouped by kind and
-//!   handed off to the per-kind pull driver with a `(kind, slug)` subset
-//!   filter.
 //! - **Push-side (`LocalEdit`, `LocalCreate`)** — folded into a
 //!   `ChangeList` via [`crate::cli::push::scan::change_list_from_classified`]
 //!   and dispatched through the existing push pipeline. Items promoted
 //!   from the conflict and remote-delete branches are merged into the
 //!   same ChangeList so they take a single round-trip through the push
-//!   driver.
+//!   driver. Push runs BEFORE pull so resolved local edits land on the
+//!   remote as soon as the resolver finishes; pull and push touch
+//!   disjoint `(kind, slug)` sets (classifier classes are mutually
+//!   exclusive) so the order swap doesn't create races.
+//! - **Pull-side (`RemoteEdit`, `RemoteCreate`)** — grouped by kind and
+//!   handed off to the per-kind pull driver with a `(kind, slug)` subset
+//!   filter.
 //!
 //! Spec: docs/superpowers/specs/2026-05-14-unified-sync-design.md.
 
@@ -1956,6 +1959,75 @@ pub async fn run(
         resolve_remote_deletes(ctx, catalog, classified, stdin.lock(), interactive, progress)
             .await?;
 
+    // Push runs BEFORE pull so the user's local edits land on the remote as
+    // soon as the conflict resolver finishes. Pull and push touch disjoint
+    // `(kind, slug)` sets (the classifier produces mutually-exclusive
+    // classes), so swapping their order does not race them. The per-object
+    // drift check inside each push driver (`resolve_push_drift`) and the
+    // resolver passes in Phase A/A2 stay unchanged.
+    if !no_push {
+        // Fold LocalEdit / LocalCreate items into the same `ChangeList`
+        // shape `push::scan::scan` produces, then merge in the items
+        // the conflict resolver promoted (`[k]eep local` / `[e]dit`) and
+        // the remote-delete resolver's restore-on-env promotions (`[k]`
+        // on a RemoteDelete / double-conflict — push driver POSTs them
+        // because we dropped the lockfile entry).
+        let mut change_list =
+            crate::cli::push::scan::change_list_from_classified(ctx.paths, classified);
+        let promotions = conflict_outcome
+            .promoted_to_push
+            .into_iter()
+            .chain(remote_delete_outcome.promoted_to_push);
+        for (kind, slug, path) in promotions {
+            match kind.as_str() {
+                "labels" => {
+                    change_list.labels.insert(slug, path);
+                }
+                "workspaces" => {
+                    change_list.workspaces.insert(slug, path);
+                }
+                "engines" => {
+                    change_list.engines.insert(slug, path);
+                }
+                "engine_fields" => {
+                    change_list.engine_fields.insert(slug, path);
+                }
+                "hooks" => {
+                    change_list.hooks.insert(slug, path);
+                }
+                "rules" => {
+                    change_list.rules.insert(slug, path);
+                }
+                "queues" => {
+                    change_list.queues.insert(slug, path);
+                }
+                "schemas" => {
+                    change_list.schemas.insert(slug, path);
+                }
+                "inboxes" => {
+                    change_list.inboxes.insert(slug, path);
+                }
+                "email_templates" => {
+                    change_list.email_templates.insert(slug, path);
+                }
+                _ => {}
+            }
+        }
+        if !change_list.is_empty() {
+            let env = ctx.paths.env().to_string();
+            crate::cli::push::push_classified(
+                ctx.paths,
+                ctx.client,
+                ctx.lockfile,
+                &env,
+                interactive,
+                &change_list,
+                progress,
+            )
+            .await?;
+        }
+    }
+
     if !no_pull {
         // Group pull-side items by kind so each driver runs at most
         // once per sync. Slugs inside the subset filter through the
@@ -2072,69 +2144,6 @@ pub async fn run(
                 collections: catalog.mdh.collections.clone(),
             };
             crate::cli::pull::mdh::process(ctx, listed, subset, progress).await?;
-        }
-    }
-
-    if !no_push {
-        // Fold LocalEdit / LocalCreate items into the same `ChangeList`
-        // shape `push::scan::scan` produces, then merge in the items
-        // the conflict resolver promoted (`[k]eep local` / `[e]dit`) and
-        // the remote-delete resolver's restore-on-env promotions (`[k]`
-        // on a RemoteDelete / double-conflict — push driver POSTs them
-        // because we dropped the lockfile entry).
-        let mut change_list =
-            crate::cli::push::scan::change_list_from_classified(ctx.paths, classified);
-        let promotions = conflict_outcome
-            .promoted_to_push
-            .into_iter()
-            .chain(remote_delete_outcome.promoted_to_push);
-        for (kind, slug, path) in promotions {
-            match kind.as_str() {
-                "labels" => {
-                    change_list.labels.insert(slug, path);
-                }
-                "workspaces" => {
-                    change_list.workspaces.insert(slug, path);
-                }
-                "engines" => {
-                    change_list.engines.insert(slug, path);
-                }
-                "engine_fields" => {
-                    change_list.engine_fields.insert(slug, path);
-                }
-                "hooks" => {
-                    change_list.hooks.insert(slug, path);
-                }
-                "rules" => {
-                    change_list.rules.insert(slug, path);
-                }
-                "queues" => {
-                    change_list.queues.insert(slug, path);
-                }
-                "schemas" => {
-                    change_list.schemas.insert(slug, path);
-                }
-                "inboxes" => {
-                    change_list.inboxes.insert(slug, path);
-                }
-                "email_templates" => {
-                    change_list.email_templates.insert(slug, path);
-                }
-                _ => {}
-            }
-        }
-        if !change_list.is_empty() {
-            let env = ctx.paths.env().to_string();
-            crate::cli::push::push_classified(
-                ctx.paths,
-                ctx.client,
-                ctx.lockfile,
-                &env,
-                interactive,
-                &change_list,
-                progress,
-            )
-            .await?;
         }
     }
 

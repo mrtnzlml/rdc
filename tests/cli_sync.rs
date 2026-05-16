@@ -4443,3 +4443,168 @@ async fn sync_after_rebuild_lock_diverged_label_does_not_panic_and_does_not_sile
         "BothDiverged conflict path must not advance the lockfile base, got: {recorded:?}"
     );
 }
+
+/// Phase-ordering regression: with a `LocalEdit` and a `RemoteCreate` on
+/// the same sync, the executor must run the push-side block BEFORE the
+/// pull-side block so the user's local edits land on the remote as soon
+/// as the conflict resolver finishes. The "pushing" phase header must
+/// therefore precede the "pulling" phase header in the captured stderr.
+///
+/// Pull and push touch disjoint `(kind, slug)` sets (the classifier
+/// produces mutually-exclusive classes), so this is purely a sequencing
+/// contract; no race is introduced.
+#[tokio::test]
+async fn sync_pushes_local_edits_before_pulling_remote_changes() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // Two labels: id=41 will be edited locally (LocalEdit), id=42 will
+    // be created remotely after the seed sync (RemoteCreate).
+    let seed_labels = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 41,
+                "url": format!("{}/api/v1/labels/41", server.uri()),
+                "name": "Order Push Edit",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "color": "#111111",
+                "modified_at": "2026-04-15T08:00:00Z"
+            }
+        ]
+    });
+    let post_seed_labels = serde_json::json!({
+        "pagination": { "total": 2, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 41,
+                "url": format!("{}/api/v1/labels/41", server.uri()),
+                "name": "Order Push Edit",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "color": "#111111",
+                "modified_at": "2026-04-15T08:00:00Z"
+            },
+            {
+                "id": 42,
+                "url": format!("{}/api/v1/labels/42", server.uri()),
+                "name": "Order Push Create",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "color": "#222222",
+                "modified_at": "2026-04-15T08:00:00Z"
+            }
+        ]
+    });
+
+    // Seed listing — only the first label exists at the time of the
+    // initial sync. The wiremock matcher consults mocks in reverse
+    // insertion order, so install the seed mock with `.up_to_n_times(1)`
+    // and the post-seed mock unbounded afterward.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&seed_labels))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&post_seed_labels))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/labels"]).await;
+
+    // PATCH /labels/41 — the push side of the second sync.
+    let patched_color = "#abcdef";
+    let patch_response = serde_json::json!({
+        "id": 41,
+        "url": format!("{}/api/v1/labels/41", server.uri()),
+        "name": "Order Push Edit",
+        "organization": format!("{}/api/v1/organizations/1", server.uri()),
+        "color": patched_color,
+        "modified_at": "2026-04-15T09:00:00Z"
+    });
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/labels/41"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&patch_response))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // Seed: pull the first label to populate the lockfile.
+    rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* diff = */ false, /* allow_deletes = */ false,
+        /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await
+    .expect("seed sync should succeed");
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    // Edit the local file so the second sync classifies it as LocalEdit.
+    let edit_path = project.path().join("envs/dev/labels/order-push-edit.json");
+    assert!(edit_path.exists(), "seed sync must write the first label");
+    let raw = std::fs::read_to_string(&edit_path).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    v["color"] = serde_json::Value::String(patched_color.to_string());
+    std::fs::write(
+        &edit_path,
+        format!("{}\n", serde_json::to_string_pretty(&v).unwrap()),
+    )
+    .unwrap();
+
+    // Drive the second sync via the actual binary so we can capture
+    // stderr — the in-process `rdc::cli::sync::run` writes to the test
+    // runner's own stderr and is harder to inspect for log ordering.
+    let out = assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev", "--yes"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+
+    let push_idx = stderr.find("pushing labels").unwrap_or_else(|| {
+        panic!("expected 'pushing labels' phase header in stderr: {stderr}");
+    });
+    let pull_idx = stderr.find("pulling labels").unwrap_or_else(|| {
+        panic!("expected 'pulling labels' phase header in stderr: {stderr}");
+    });
+    assert!(
+        push_idx < pull_idx,
+        "push must run before pull: 'pushing labels' at byte {push_idx}, \
+         'pulling labels' at byte {pull_idx}\n--- stderr ---\n{stderr}"
+    );
+
+    // Sanity: the PATCH happened (covered by `.expect(1)` on the mock)
+    // and the RemoteCreate landed on disk.
+    let created_path = project.path().join("envs/dev/labels/order-push-create.json");
+    assert!(
+        created_path.exists(),
+        "pull-side RemoteCreate must still run after the push: {}",
+        created_path.display()
+    );
+}

@@ -96,10 +96,10 @@ A single pass with five phases:
 
 5. **Execute.** Single ordering:
 
-   1. **Pull-side writes** first. Reason: if the push phase fails partway (network, auth, drift in a conflicting object), the local snapshot has at least caught up to the latest remote state; on retry, sync resumes from up-to-date local. The lockfile is saved per-success, so partial progress isn't lost.
-   2. **Conflict resolution prompt** per conflicted object (including remote-deleted objects, which use the same resolver with delete-specific labels). The resolution determines whether the object goes through the pull-side writer, the push-side writer, or both.
-   3. **Push-side writes** in dependency order: `workspaces → schemas → queues → inboxes → email_templates → hooks → rules → labels → engines → engine_fields`.
-   4. **Push-side deletes** (local tombstones → remote DELETE) in reverse dependency order, after the destructive gate is crossed.
+   1. **Conflict resolution prompt** per conflicted object (including remote-deleted objects, which use the same resolver with delete-specific labels). The resolution determines whether the object goes through the pull-side writer, the push-side writer, or both.
+   2. **Push-side writes** in dependency order: `workspaces → schemas → queues → inboxes → email_templates → hooks → rules → labels → engines → engine_fields`. Push runs before pull so that resolved local edits land on the remote as soon as the resolver finishes — deploy local edits ASAP after conflict resolution.
+   3. **Push-side deletes** (local tombstones → remote DELETE) in reverse dependency order, after the destructive gate is crossed.
+   4. **Pull-side writes** after the push completes. Pull and push touch disjoint `(kind, slug)` sets, so this swap doesn't create races. Per-object drift checks inside each push driver (`resolve_push_drift`) and the conflict resolver in step 1 still guarantee no silent overwrite of remote-only changes.
    5. **Save lockfile, regenerate `_index.md`.**
 
 ### Conflict resolver under sync
