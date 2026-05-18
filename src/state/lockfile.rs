@@ -34,6 +34,16 @@ pub struct ObjectEntry {
     /// and pushes.
     #[serde(default)]
     pub content_hash: Option<String>,
+    /// Hex-encoded SHA-256 of the local hook-secrets map that was last
+    /// pushed to the remote for this slug. Used so a sync detects an
+    /// edit to `secrets/<env>.hook-secrets.json` alone and force-PATCHes
+    /// the affected hook, even when the hook JSON/code didn't change.
+    /// Only meaningful for `hooks/<slug>` entries today; `None` and
+    /// absent in serialized form on every other kind. The default is
+    /// `None`, so lockfiles written before this field existed still
+    /// load — and the first sync after that records a value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets_hash: Option<String>,
 }
 
 impl Default for Lockfile {
@@ -157,6 +167,20 @@ pub fn content_hash(bytes: &[u8]) -> String {
     to_hex(&hasher.finalize())
 }
 
+/// SHA-256 over a single hook's local secrets map, encoded as the
+/// canonical JSON object `{ "key1": "val1", "key2": "val2", ... }` with
+/// `BTreeMap`-sorted keys (`serde_json::to_vec` over a `BTreeMap` is
+/// stable). Empty/absent maps hash to the canonical empty-object hash
+/// so "user removed all secrets" and "user never set any" don't share
+/// the same `None` lockfile state — the recorded hash distinguishes
+/// "synced and empty" from "never seen". Hex-encoded.
+pub fn hook_secrets_hash(map: &std::collections::BTreeMap<String, String>) -> String {
+    let bytes = serde_json::to_vec(map).expect("BTreeMap<String,String> always serializes");
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    to_hex(&hasher.finalize())
+}
+
 /// Hex-encode a digest as a 64-char lowercase string. Used by every
 /// `*_hash` function to format its SHA-256 output.
 fn to_hex(digest: &[u8]) -> String {
@@ -276,6 +300,7 @@ mod tests {
                 url: Some("https://x.rossum.app/api/v1/hooks/1".to_string()),
                 modified_at: Some("2026-04-01T10:00:00Z".to_string()),
                 content_hash: Some("a".repeat(64)),
+                secrets_hash: None,
             },
         );
         lf.save(&path).unwrap();
@@ -493,7 +518,7 @@ mod tests {
         lf.upsert(
             "hooks",
             "validator-invoices",
-            ObjectEntry { id: 42, url: None, modified_at: None, content_hash: None },
+            ObjectEntry { id: 42, url: None, modified_at: None, content_hash: None, secrets_hash: None },
         );
         assert_eq!(lf.slug_for_id("hooks", 42), Some("validator-invoices"));
         assert_eq!(lf.slug_for_id("hooks", 99), None);
@@ -511,6 +536,7 @@ mod tests {
                 url: Some("https://x/api/v1/workspaces/1".to_string()),
                 modified_at: None,
                 content_hash: None,
+                secrets_hash: None,
             },
         );
         assert_eq!(

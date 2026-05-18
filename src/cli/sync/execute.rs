@@ -2131,7 +2131,12 @@ pub async fn run(
                 _ => {}
             }
         }
-        if !change_list.is_empty() {
+        // Always run the push pipeline — `hooks::push` may have
+        // secrets-only work even when no hook JSON/code changed. The
+        // per-kind drivers inside `push_classified` are individually
+        // gated on `changes.<kind>.is_empty()`, so dispatching with an
+        // empty change list is a no-op for every kind except hooks.
+        {
             let env = ctx.paths.env().to_string();
             crate::cli::push::push_classified(
                 ctx.paths,
@@ -2380,6 +2385,7 @@ mod tests {
                 url: Some(remote_label.url.clone()),
                 modified_at: None,
                 content_hash: Some(base_hash),
+                secrets_hash: None,
             },
         );
 
@@ -2790,6 +2796,7 @@ mod tests {
                 url: Some(local_label.url.clone()),
                 modified_at: None,
                 content_hash: Some(base_hash),
+                secrets_hash: None,
             },
         );
 
@@ -3068,6 +3075,7 @@ mod tests {
                 url: Some(remote_label.url.clone()),
                 modified_at: None,
                 content_hash: Some("base".to_string()),
+                secrets_hash: None,
             },
         );
 
@@ -3268,6 +3276,7 @@ mod tests {
                 url: Some("https://x.invalid/api/v1/hooks/42".to_string()),
                 modified_at: Some("2026-05-14T08:00:00Z".to_string()),
                 content_hash: Some(base_combined.clone()),
+                secrets_hash: None,
             },
         );
 
@@ -3596,6 +3605,7 @@ mod tests {
                 url: Some("https://x.invalid/api/v1/hooks/42".to_string()),
                 modified_at: Some("2026-05-14T08:00:00Z".to_string()),
                 content_hash: Some(base_combined.clone()),
+                secrets_hash: None,
             },
         );
 
@@ -3750,6 +3760,7 @@ mod tests {
                 url: Some("https://x.invalid/api/v1/hooks/42".to_string()),
                 modified_at: Some("2026-05-14T08:00:00Z".to_string()),
                 content_hash: Some(base_combined.clone()),
+                secrets_hash: None,
             },
         );
 
@@ -3897,6 +3908,7 @@ mod tests {
                 url: Some(schema_url.clone()),
                 modified_at: Some("2026-04-10T09:00:00Z".to_string()),
                 content_hash: Some(base_combined.clone()),
+                secrets_hash: None,
             },
         );
 
@@ -3955,6 +3967,7 @@ mod tests {
                 url: Some("https://x.invalid/api/v1/workspaces/800".to_string()),
                 modified_at: Some("2026-04-20T08:00:00Z".to_string()),
                 content_hash: None,
+                secrets_hash: None,
             },
         );
         lockfile.upsert(
@@ -3965,6 +3978,7 @@ mod tests {
                 url: Some(queue.url.clone()),
                 modified_at: Some("2026-04-20T08:00:00Z".to_string()),
                 content_hash: None,
+                secrets_hash: None,
             },
         );
 

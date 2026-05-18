@@ -4608,3 +4608,158 @@ async fn sync_pushes_local_edits_before_pulling_remote_changes() {
         created_path.display()
     );
 }
+
+/// Editing only `secrets/<env>.hook-secrets.json` (no change to the
+/// hook JSON or `.py` sidecar) must still surface as a force-PATCH to
+/// /hooks/<id> on the next sync, with the secrets map in the body. The
+/// lockfile entry's `secrets_hash` is updated so a second sync is a
+/// no-op.
+#[tokio::test]
+async fn sync_hook_secrets_only_edit_triggers_force_patch() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let hook_id = 4242u64;
+    let server_uri = server.uri();
+    let hook_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": hook_id,
+                "url": format!("{server_uri}/api/v1/hooks/{hook_id}"),
+                "name": "mdh-lookup",
+                "type": "webhook",
+                "queues": [],
+                "events": ["annotation_content"],
+                "config": { "url": "https://mdh.example.com/lookup" },
+                "modified_at": "2026-04-01T10:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&hook_body))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &["/api/v1/hooks"]).await;
+
+    // Capture the PATCH body so we can assert the secrets map made it
+    // onto the wire. wiremock's `Request` keeps the raw bytes; we read
+    // them out of `received_requests` after the test.
+    let server_uri = server.uri();
+    Mock::given(method("PATCH"))
+        .and(path(format!("/api/v1/hooks/{hook_id}")))
+        .respond_with(move |req: &Request| {
+            let mut body: serde_json::Value =
+                serde_json::from_slice(&req.body).unwrap_or_else(|_| serde_json::json!({}));
+            // Echo back the body (with id/url injected) so the rest of
+            // the response handlers stay happy. The test only inspects
+            // the request, not the response.
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("id".to_string(), serde_json::json!(hook_id));
+                obj.insert(
+                    "url".to_string(),
+                    serde_json::json!(format!("{server_uri}/api/v1/hooks/{hook_id}")),
+                );
+                obj.insert("type".to_string(), serde_json::json!("webhook"));
+                obj.insert("name".to_string(), serde_json::json!("mdh-lookup"));
+                obj.insert(
+                    "modified_at".to_string(),
+                    serde_json::json!("2026-04-01T11:00:00Z"),
+                );
+            }
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // Seed sync — pulls the hook, populates lockfile. No PATCH expected
+    // here (the `.expect(1)` on the PATCH mock covers the WHOLE test;
+    // the second sync below is what fires it).
+    rdc::cli::sync::run("dev", false, false, false, false, false, false)
+        .await
+        .expect("seed sync should succeed");
+
+    // User adds a secret value to the gitignored hook-secrets file.
+    std::fs::write(
+        project.path().join("secrets/dev.hook-secrets.json"),
+        r#"{ "hooks": { "mdh-lookup": { "api_key": "k-prod-abc" } } }"#,
+    )
+    .unwrap();
+
+    // Second sync — hook JSON/code is unchanged on disk and on remote;
+    // only the secrets file changed. The force-PATCH pass should fire.
+    rdc::cli::sync::run("dev", false, false, false, false, false, false)
+        .await
+        .expect("secrets-only force PATCH should succeed");
+
+    // Third sync — secrets_hash now matches; should be a no-op.
+    rdc::cli::sync::run("dev", false, false, false, false, false, false)
+        .await
+        .expect("third sync should be a no-op");
+
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    // The PATCH body must have carried `secrets.api_key = "k-prod-abc"`.
+    let patch_bodies: Vec<serde_json::Value> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| {
+            r.method == http::Method::PATCH
+                && r.url.path() == format!("/api/v1/hooks/{hook_id}")
+        })
+        .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+        .collect();
+    assert_eq!(
+        patch_bodies.len(),
+        1,
+        "expected exactly one PATCH (the secrets-only force-push); got {}",
+        patch_bodies.len()
+    );
+    let secrets_obj = patch_bodies[0]
+        .get("secrets")
+        .and_then(|v| v.as_object())
+        .expect("PATCH body must include a `secrets` object");
+    assert_eq!(
+        secrets_obj.get("api_key").and_then(|v| v.as_str()),
+        Some("k-prod-abc"),
+        "PATCH body's `secrets.api_key` must match the local file"
+    );
+
+    // Lockfile records the new secrets_hash so the third sync was a
+    // no-op (the `.expect(1)` mock would have tripped otherwise).
+    let lf = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&lf).unwrap();
+    let hash = v
+        .pointer("/objects/hooks/mdh-lookup/secrets_hash")
+        .and_then(|v| v.as_str());
+    assert!(
+        hash.is_some_and(|s| s.len() == 64),
+        "lockfile should record a 64-char hex secrets_hash; got {hash:?}"
+    );
+}

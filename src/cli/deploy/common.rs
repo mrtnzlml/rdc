@@ -198,6 +198,7 @@ mod tests {
                     url: Some(url.to_string()),
                     modified_at: None,
                     content_hash: None,
+                    secrets_hash: None,
                 },
             );
         }

@@ -87,12 +87,15 @@ pub(crate) async fn push_classified(
         (0, 0)
     };
 
-    let (n_hooks, c_hooks) = if !changes.hooks.is_empty() {
-        hooks::push(paths, client, lockfile, interactive, &changes.hooks, progress, env).await
-            .with_context(|| format!("pushing hooks for env '{env}'"))?
-    } else {
-        (0, 0)
-    };
+    // Hooks always go through `push` (no early-skip on empty `changes`)
+    // so the secrets-only pass inside it can detect changes to
+    // `secrets/<env>.hook-secrets.json` that aren't accompanied by a
+    // hook JSON/code edit. The function returns (0, 0) when neither
+    // content nor secrets have drifted.
+    let (n_hooks, c_hooks) =
+        hooks::push(paths, client, lockfile, interactive, &changes.hooks, progress, env)
+            .await
+            .with_context(|| format!("pushing hooks for env '{env}'"))?;
 
     let (n_rules, c_rules) = if !changes.rules.is_empty() {
         rules::push(paths, client, lockfile, interactive, &changes.rules, progress, env).await

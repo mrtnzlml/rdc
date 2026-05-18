@@ -63,6 +63,7 @@ pub async fn push(
                     url: Some(created.url.clone()),
                     modified_at: created.modified_at().map(|s| s.to_string()),
                     content_hash: Some(created_hash),
+                    secrets_hash: None,
                 },
             );
             sp.finish_ok(format!("POST (id {})", created.id));
@@ -130,6 +131,7 @@ pub async fn push(
                             url: Some(remote_rule.url.clone()),
                             modified_at: remote_rule.modified_at().map(|s| s.to_string()),
                             content_hash: Some(remote_combined),
+                            secrets_hash: None,
                         },
                     );
                     sp.finish_warn("adopted remote (drift)");
@@ -170,6 +172,7 @@ pub async fn push(
                 url: Some(updated.url.clone()),
                 modified_at: updated.modified_at().map(|s| s.to_string()),
                 content_hash: Some(updated_hash),
+                secrets_hash: None,
             },
         );
         sp.finish_ok("PATCH");

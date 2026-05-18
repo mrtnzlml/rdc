@@ -756,7 +756,7 @@ mod tests {
     use crate::state::ObjectEntry;
 
     fn entry(id: u64, url: &str) -> ObjectEntry {
-        ObjectEntry { id, url: Some(url.into()), modified_at: None, content_hash: None }
+        ObjectEntry { id, url: Some(url.into()), modified_at: None, content_hash: None, secrets_hash: None }
     }
 
     #[test]

@@ -364,7 +364,7 @@ pub fn record_object(
     lockfile.upsert(
         kind,
         slug,
-        ObjectEntry { id, url, modified_at, content_hash },
+        ObjectEntry { id, url, modified_at, content_hash, secrets_hash: None },
     );
 }
 

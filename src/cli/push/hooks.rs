@@ -9,10 +9,34 @@ use crate::snapshot::hook::{
     write_hook_code,
 };
 use crate::snapshot::writer::write_atomic;
-use crate::state::{hook_combined_hash, Lockfile, ObjectEntry};
+use crate::secrets::{load_hook_secrets, HookSecrets};
+use crate::state::{hook_combined_hash, hook_secrets_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+/// Splice the local hook-secrets map for `slug` into a JSON body about
+/// to be POSTed/PATCHed. Returns the hex hash of what was injected so
+/// the caller can record it in the lockfile alongside the regular
+/// `content_hash`. When no secrets are configured for the slug the
+/// body is left untouched and the hash of an empty map is returned —
+/// that's also the hash recorded for "this hook has no secrets",
+/// distinguishing it from "we never tried to sync secrets" (`None`).
+fn inject_hook_secrets(body: &mut Value, slug: &str, secrets: &HookSecrets) -> String {
+    let empty = BTreeMap::<String, String>::new();
+    let kv = secrets.for_slug(slug).unwrap_or(&empty);
+    let hash = hook_secrets_hash(kv);
+    if !kv.is_empty() {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "secrets".to_string(),
+                serde_json::to_value(kv).expect("BTreeMap<String,String> serializes"),
+            );
+        }
+    }
+    hash
+}
 
 pub async fn push(
     paths: &Paths,
@@ -29,6 +53,36 @@ pub async fn push(
     // both be compared against `lockfile.content_hash`.
     let overlay = Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
+
+    // Load hook secrets for this env (the gitignored `secrets/<env>.hook-secrets.json`).
+    // Missing file → empty map, all injection sites become no-ops.
+    let hook_secrets = load_hook_secrets(paths.root(), env)
+        .with_context(|| format!("loading hook secrets for env '{env}'"))?;
+
+    // Detect whether the secrets-only force-push pass at the bottom of
+    // this function would do any work. Used to decide whether to open
+    // the "pushing hooks" phase header at all — without this guard,
+    // a sync with no hook changes AND no secret drift would still
+    // print an empty section.
+    let secrets_pass_has_work = || -> bool {
+        let empty = BTreeMap::<String, String>::new();
+        for slug in hook_secrets.slugs() {
+            let local = hook_secrets.for_slug(slug).unwrap_or(&empty);
+            let local_hash = hook_secrets_hash(local);
+            let lf_hash = lockfile
+                .objects
+                .get("hooks")
+                .and_then(|m| m.get(slug.as_str()))
+                .and_then(|e| e.secrets_hash.as_deref());
+            if lf_hash != Some(local_hash.as_str()) {
+                return true;
+            }
+        }
+        false
+    };
+    if changes.is_empty() && !secrets_pass_has_work() {
+        return Ok((0, 0));
+    }
 
     let hooks_dir = paths.hooks_dir();
     let phase = progress.phase("pushing hooks");
@@ -58,8 +112,16 @@ pub async fn push(
                 .with_context(|| format!("deserializing hook '{slug}' for create"))?;
             crate::cli::deploy::store_extensions::check_store_extension_anomaly(&typed, slug)?;
 
+            // Compute the secrets hash now (before injection) so the
+            // lockfile entry written below carries the up-to-date value
+            // regardless of which branch creates the hook.
+            let created_secrets_hash =
+                hook_secrets_hash(hook_secrets.for_slug(slug).unwrap_or(&BTreeMap::new()));
+
             let created = if typed.is_store_extension() {
                 // Two-call create: orphan check → POST /hooks/create → PATCH.
+                // The install endpoint takes a fixed minimal body; secrets
+                // ride the subsequent PATCH instead.
                 if remote_hooks.is_none() {
                     remote_hooks = Some(
                         client.list_hooks(Some(progress.clone())).await
@@ -96,8 +158,11 @@ pub async fn push(
                         installed.id
                     }
                 };
+                let mut body = serde_json::to_value(&typed)
+                    .with_context(|| format!("serializing hook '{slug}' for store-extension PATCH"))?;
+                inject_hook_secrets(&mut body, slug, &hook_secrets);
                 client
-                    .update_hook(installed_id, &typed, Some(progress.clone()))
+                    .update_hook_value(installed_id, &body, Some(progress.clone()))
                     .await
                     .with_context(|| {
                         format!(
@@ -105,8 +170,9 @@ pub async fn push(
                         )
                     })?
             } else {
-                // Regular hook: strip server-only fields, then POST.
+                // Regular hook: strip server-only fields, inject secrets, POST.
                 strip_for_create(&mut payload, "hooks");
+                inject_hook_secrets(&mut payload, slug, &hook_secrets);
                 client
                     .create_hook(&payload, Some(progress.clone()))
                     .await
@@ -143,6 +209,7 @@ pub async fn push(
                     url: Some(created.url.clone()),
                     modified_at: created.modified_at().map(|s| s.to_string()),
                     content_hash: Some(created_hash),
+                    secrets_hash: Some(created_secrets_hash),
                 },
             );
             sp.finish_ok(format!("POST (id {})", created.id));
@@ -231,6 +298,15 @@ pub async fn push(
                             .with_context(|| format!("removing stale {}", stale.display()))?;
                     }
                     let _ = local_ext; // unused on adopt path; the remote ext drives layout
+                    // Adopt is a content-side reconciliation (remote → local).
+                    // The secrets we last pushed are unaffected; carry the
+                    // previous lockfile `secrets_hash` forward so the next
+                    // sync doesn't think they changed.
+                    let prior_secrets_hash = lockfile
+                        .objects
+                        .get("hooks")
+                        .and_then(|m| m.get(slug.as_str()))
+                        .and_then(|e| e.secrets_hash.clone());
                     lockfile.upsert(
                         "hooks",
                         slug,
@@ -239,6 +315,7 @@ pub async fn push(
                             url: Some(remote_hook.url.clone()),
                             modified_at: remote_hook.modified_at().map(|s| s.to_string()),
                             content_hash: Some(remote_combined),
+                            secrets_hash: prior_secrets_hash,
                         },
                     );
                     sp.finish_warn("adopted remote (drift)");
@@ -253,7 +330,14 @@ pub async fn push(
             }
         }
 
-        let updated = client.update_hook(id, &payload_to_send, Some(progress.clone())).await
+        // Build a Value form of the typed payload so secrets (which
+        // have no place on the typed `Hook` model) can ride this PATCH.
+        let mut body = serde_json::to_value(&payload_to_send)
+            .with_context(|| format!("serializing hook '{slug}' for PATCH"))?;
+        let updated_secrets_hash = inject_hook_secrets(&mut body, slug, &hook_secrets);
+        let updated = client
+            .update_hook_value(id, &body, Some(progress.clone()))
+            .await
             .with_context(|| format!("PATCH /hooks/{id}"))?;
 
         // Refresh local file with the post-strip canonical form (matches
@@ -286,11 +370,78 @@ pub async fn push(
                 url: Some(updated.url.clone()),
                 modified_at: updated.modified_at().map(|s| s.to_string()),
                 content_hash: Some(updated_hash),
+                secrets_hash: Some(updated_secrets_hash),
             },
         );
         sp.finish_ok("PATCH");
         pushed += 1;
     }
 
-    Ok((pushed, skipped))
+    // Secrets-only force-push: a user can edit
+    // `secrets/<env>.hook-secrets.json` without touching any hook JSON
+    // or code. The main loop above only fires for hooks whose snapshot
+    // bytes changed, so we'd miss the secrets-only edits without this
+    // second pass. For every slug declared in the local secrets file,
+    // re-hash and compare to the lockfile entry's `secrets_hash`; if
+    // they differ, PATCH with just `{"secrets": {...}}` and bring the
+    // lockfile entry up to date.
+    //
+    // Slugs that don't have a `hooks/<slug>.json` on disk are typos in
+    // the secrets file and surface as warnings, not errors — a typo
+    // shouldn't abort the sync, but it shouldn't ship secrets to the
+    // wrong slug either (we just don't have a matching id to target).
+    let mut secrets_pushed = 0usize;
+    let mut secrets_warned: Vec<String> = Vec::new();
+    let empty = BTreeMap::<String, String>::new();
+    for slug in hook_secrets.slugs() {
+        let local_kv = hook_secrets.for_slug(slug).unwrap_or(&empty);
+        let local_hash = hook_secrets_hash(local_kv);
+        let entry = lockfile.objects.get("hooks").and_then(|m| m.get(slug.as_str()));
+        let Some(entry) = entry else {
+            // No lockfile entry → either the hook hasn't been synced yet
+            // (legitimate, will sync next) or the slug is a typo. Either
+            // way we can't target a remote id, so just warn.
+            secrets_warned.push(slug.clone());
+            continue;
+        };
+        if entry.secrets_hash.as_deref() == Some(local_hash.as_str()) {
+            continue; // already in sync
+        }
+        // PATCH with just `secrets` — Rossum's PATCH /hooks/<id>
+        // accepts a partial body, so we don't need to send the whole
+        // hook just to update one secret value.
+        let sp = phase.item(format!("hooks/{slug} (secrets only)"));
+        let body = serde_json::json!({ "secrets": local_kv });
+        let updated = client
+            .update_hook_value(entry.id, &body, Some(progress.clone()))
+            .await
+            .with_context(|| format!("PATCH /hooks/{} (secrets for '{}')", entry.id, slug))?;
+        // Carry forward the existing `content_hash`; only `secrets_hash`
+        // and `modified_at` may have changed.
+        let prior_content_hash = entry.content_hash.clone();
+        lockfile.upsert(
+            "hooks",
+            slug,
+            ObjectEntry {
+                id: updated.id,
+                url: Some(updated.url.clone()),
+                modified_at: updated.modified_at().map(|s| s.to_string()),
+                content_hash: prior_content_hash,
+                secrets_hash: Some(local_hash),
+            },
+        );
+        sp.finish_ok("PATCH (secrets)");
+        secrets_pushed += 1;
+    }
+    if !secrets_warned.is_empty() {
+        // One actionable line, not one per slug — the user typed them
+        // in the same file so a list is the clear signal.
+        eprintln!(
+            "! secrets entries with no matching hook on env '{}': {}",
+            env,
+            secrets_warned.join(", ")
+        );
+    }
+
+    Ok((pushed + secrets_pushed, skipped))
 }

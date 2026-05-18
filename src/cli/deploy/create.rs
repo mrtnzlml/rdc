@@ -53,6 +53,11 @@ pub struct CreateCtx<'a> {
     pub tgt_overlay: &'a Option<Overlay>,
     pub tgt_client: &'a RossumClient,
     pub progress: Option<Arc<ProgressLog>>,
+    /// Per-slug hook-secret values to splice into outbound bodies. Built
+    /// during `run::run`'s pre-flight check. `None` for kinds other than
+    /// hooks; lookups for unknown slugs return `None` too, so non-hook
+    /// create paths are unaffected.
+    pub hook_secrets_plan: &'a crate::cli::deploy::hook_secrets::HookSecretsPlan,
 }
 
 /// Walk a src payload, rewrite cross-refs to tgt URLs, apply overlay,
@@ -115,6 +120,7 @@ pub async fn create_workspace(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()>
             url: Some(created.url.clone()),
             modified_at: created.modified_at().map(|s| s.to_string()),
             content_hash: Some(content_hash(&bytes)),
+            secrets_hash: None,
         },
     );
     ctx.mapping.workspaces.insert(slug.to_string(), slug.to_string());
@@ -158,6 +164,7 @@ pub async fn create_schema(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<
             url: Some(created.url.clone()),
             modified_at: created.modified_at().map(|s| s.to_string()),
             content_hash: Some(h),
+            secrets_hash: None,
         },
     );
     ctx.mapping.schemas.insert(queue_slug.to_string(), queue_slug.to_string());
@@ -202,6 +209,7 @@ pub async fn create_queue(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
             url: Some(created.url.clone()),
             modified_at: created.modified_at().map(|s| s.to_string()),
             content_hash: Some(content_hash(&bytes)),
+            secrets_hash: None,
         },
     );
     ctx.mapping.queues.insert(queue_slug.to_string(), queue_slug.to_string());
@@ -246,6 +254,7 @@ async fn refresh_queue_email_templates(
                 url: Some(t.url.clone()),
                 modified_at: t.modified_at().map(|s| s.to_string()),
                 content_hash: Some(content_hash(&bytes)),
+                secrets_hash: None,
             },
         );
         ctx.mapping
@@ -289,6 +298,7 @@ pub async fn create_inbox(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
             url: Some(created.url.clone()),
             modified_at: created.modified_at().map(|s| s.to_string()),
             content_hash: Some(content_hash(&bytes)),
+            secrets_hash: None,
         },
     );
     ctx.mapping.inboxes.insert(queue_slug.to_string(), queue_slug.to_string());
@@ -367,18 +377,27 @@ pub async fn create_hook(
             }
         };
 
-        // Reconcile PATCH with the full body.
-        let typed: crate::model::Hook = serde_json::from_value(body)
-            .with_context(|| format!("deserializing reconcile body for '{slug}'"))?;
+        // Reconcile PATCH with the full body. Splice in the filtered
+        // hook secrets so the just-installed store extension carries
+        // the right values from the very first PATCH (no second pass).
+        let mut reconcile_body = body;
+        if let Some(secrets) = ctx.hook_secrets_plan.for_slug(slug) {
+            if let Some(obj) = reconcile_body.as_object_mut() {
+                obj.insert(
+                    "secrets".to_string(),
+                    serde_json::to_value(secrets).expect("BTreeMap<String,String> serializes"),
+                );
+            }
+        }
         ctx.tgt_client
-            .update_hook(installed_id, &typed, None)
+            .update_hook_value(installed_id, &reconcile_body, None)
             .await
             .with_context(|| {
                 format!("PATCH /hooks/{installed_id} (reconciling store extension '{slug}')")
             })?
     } else {
         // Regular hook POST path.
-        let body = shape_create_body(
+        let mut body = shape_create_body(
             payload,
             "hooks",
             overlay_paths,
@@ -387,6 +406,18 @@ pub async fn create_hook(
             ctx.mapping,
             &explicit_subs,
         );
+        // Splice in the filtered hook secrets before POST. The plan was
+        // built with the source's `secrets_keys` as the canonical key
+        // set; extras in the target file have already been filtered out
+        // and warned about by `hook_secrets::precheck`.
+        if let Some(secrets) = ctx.hook_secrets_plan.for_slug(slug) {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "secrets".to_string(),
+                    serde_json::to_value(secrets).expect("BTreeMap<String,String> serializes"),
+                );
+            }
+        }
         ctx.tgt_client
             .create_hook(&body, None)
             .await
@@ -404,6 +435,12 @@ pub async fn create_hook(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let h = hook_combined_hash(&json_bytes, &code);
+    // Record the hash of what we just injected so a subsequent `rdc sync`
+    // on the target env sees the secrets as already synced (no spurious
+    // second PATCH).
+    let empty = std::collections::BTreeMap::<String, String>::new();
+    let injected = ctx.hook_secrets_plan.for_slug(slug).unwrap_or(&empty);
+    let injected_hash = crate::state::hook_secrets_hash(injected);
     ctx.tgt_lockfile.upsert(
         "hooks",
         slug,
@@ -412,6 +449,7 @@ pub async fn create_hook(
             url: Some(created.url.clone()),
             modified_at: created.modified_at().map(|s| s.to_string()),
             content_hash: Some(h),
+            secrets_hash: Some(injected_hash),
         },
     );
     ctx.mapping.hooks.insert(slug.to_string(), slug.to_string());
@@ -442,6 +480,7 @@ pub async fn create_rule(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
             url: Some(created.url.clone()),
             modified_at: created.modified_at().map(|s| s.to_string()),
             content_hash: Some(h),
+            secrets_hash: None,
         },
     );
     ctx.mapping.rules.insert(slug.to_string(), slug.to_string());
@@ -476,6 +515,7 @@ pub async fn create_label(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
             url: Some(created.url.clone()),
             modified_at: created.modified_at().map(|s| s.to_string()),
             content_hash: Some(content_hash(&bytes)),
+            secrets_hash: None,
         },
     );
     ctx.mapping.labels.insert(slug.to_string(), slug.to_string());

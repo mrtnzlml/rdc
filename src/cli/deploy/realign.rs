@@ -755,9 +755,9 @@ mod tests {
     fn rewrite_email_template_compound_prefix_ws_segment() {
         use crate::state::ObjectEntry;
         let mut lf = Lockfile::default();
-        lf.upsert("email_templates", "ws-old/q1/t1", ObjectEntry { id: 1, url: None, modified_at: None, content_hash: None });
-        lf.upsert("email_templates", "ws-old/q2/t2", ObjectEntry { id: 2, url: None, modified_at: None, content_hash: None });
-        lf.upsert("email_templates", "ws-other/q3/t3", ObjectEntry { id: 3, url: None, modified_at: None, content_hash: None });
+        lf.upsert("email_templates", "ws-old/q1/t1", ObjectEntry { id: 1, url: None, modified_at: None, content_hash: None, secrets_hash: None });
+        lf.upsert("email_templates", "ws-old/q2/t2", ObjectEntry { id: 2, url: None, modified_at: None, content_hash: None, secrets_hash: None });
+        lf.upsert("email_templates", "ws-other/q3/t3", ObjectEntry { id: 3, url: None, modified_at: None, content_hash: None, secrets_hash: None });
         rewrite_email_template_compound_prefix(&mut lf, 0, "ws-old", "ws-new");
         let keys: Vec<&String> = lf.objects.get("email_templates").unwrap().keys().collect();
         assert!(keys.contains(&&"ws-new/q1/t1".to_string()));
@@ -770,8 +770,8 @@ mod tests {
     fn rewrite_email_template_compound_prefix_q_segment() {
         use crate::state::ObjectEntry;
         let mut lf = Lockfile::default();
-        lf.upsert("email_templates", "ws/q-old/t1", ObjectEntry { id: 1, url: None, modified_at: None, content_hash: None });
-        lf.upsert("email_templates", "ws/q-other/t2", ObjectEntry { id: 2, url: None, modified_at: None, content_hash: None });
+        lf.upsert("email_templates", "ws/q-old/t1", ObjectEntry { id: 1, url: None, modified_at: None, content_hash: None, secrets_hash: None });
+        lf.upsert("email_templates", "ws/q-other/t2", ObjectEntry { id: 2, url: None, modified_at: None, content_hash: None, secrets_hash: None });
         rewrite_email_template_compound_prefix(&mut lf, 1, "q-old", "q-new");
         let keys: Vec<&String> = lf.objects.get("email_templates").unwrap().keys().collect();
         assert!(keys.contains(&&"ws/q-new/t1".to_string()));
@@ -782,7 +782,7 @@ mod tests {
     fn rename_lockfile_key_moves_entry() {
         use crate::state::ObjectEntry;
         let mut lf = Lockfile::default();
-        let entry = ObjectEntry { id: 42, url: None, modified_at: None, content_hash: Some("abc".into()) };
+        let entry = ObjectEntry { id: 42, url: None, modified_at: None, content_hash: Some("abc".into()), secrets_hash: None };
         lf.upsert("hooks", "old", entry.clone());
         rename_lockfile_key(&mut lf, "hooks", "old", "new");
         assert!(!lf.objects.get("hooks").unwrap().contains_key("old"));
@@ -822,7 +822,7 @@ mod tests {
         lockfile.upsert(
             "hooks",
             "validator-invoices",
-            ObjectEntry { id: 1, url: None, modified_at: None, content_hash: Some("h".into()) },
+            ObjectEntry { id: 1, url: None, modified_at: None, content_hash: Some("h".into()), secrets_hash: None },
         );
 
         let pending = detect(&paths, &lockfile);
@@ -858,19 +858,19 @@ mod tests {
         let mut lockfile = Lockfile::default();
         lockfile.upsert(
             "workspaces", "old-ws",
-            ObjectEntry { id: 1, url: None, modified_at: None, content_hash: None },
+            ObjectEntry { id: 1, url: None, modified_at: None, content_hash: None, secrets_hash: None },
         );
         lockfile.upsert(
             "email_templates", "old-ws/q1/t1",
-            ObjectEntry { id: 10, url: None, modified_at: None, content_hash: None },
+            ObjectEntry { id: 10, url: None, modified_at: None, content_hash: None, secrets_hash: None },
         );
         lockfile.upsert(
             "email_templates", "old-ws/q1/t2",
-            ObjectEntry { id: 11, url: None, modified_at: None, content_hash: None },
+            ObjectEntry { id: 11, url: None, modified_at: None, content_hash: None, secrets_hash: None },
         );
         lockfile.upsert(
             "email_templates", "other-ws/q9/t9",
-            ObjectEntry { id: 99, url: None, modified_at: None, content_hash: None },
+            ObjectEntry { id: 99, url: None, modified_at: None, content_hash: None, secrets_hash: None },
         );
 
         let pending = detect(&paths, &lockfile);
@@ -908,17 +908,17 @@ mod tests {
 
         let mut lockfile = Lockfile::default();
         lockfile.upsert("workspaces", "ws1",
-            ObjectEntry { id: 9, url: None, modified_at: None, content_hash: None });
+            ObjectEntry { id: 9, url: None, modified_at: None, content_hash: None, secrets_hash: None });
         lockfile.upsert("queues", "cost-invoices",
-            ObjectEntry { id: 1, url: None, modified_at: None, content_hash: None });
+            ObjectEntry { id: 1, url: None, modified_at: None, content_hash: None, secrets_hash: None });
         lockfile.upsert("schemas", "cost-invoices",
-            ObjectEntry { id: 2, url: None, modified_at: None, content_hash: None });
+            ObjectEntry { id: 2, url: None, modified_at: None, content_hash: None, secrets_hash: None });
         lockfile.upsert("inboxes", "cost-invoices",
-            ObjectEntry { id: 3, url: None, modified_at: None, content_hash: None });
+            ObjectEntry { id: 3, url: None, modified_at: None, content_hash: None, secrets_hash: None });
         lockfile.upsert("email_templates", "ws1/cost-invoices/welcome",
-            ObjectEntry { id: 4, url: None, modified_at: None, content_hash: None });
+            ObjectEntry { id: 4, url: None, modified_at: None, content_hash: None, secrets_hash: None });
         lockfile.upsert("email_templates", "ws1/cost-invoices/rejected",
-            ObjectEntry { id: 5, url: None, modified_at: None, content_hash: None });
+            ObjectEntry { id: 5, url: None, modified_at: None, content_hash: None, secrets_hash: None });
 
         let pending = detect(&paths, &lockfile);
         let queue_pending: Vec<_> = pending.iter()
@@ -961,9 +961,9 @@ mod tests {
         ).unwrap();
         let mut lockfile = Lockfile::default();
         lockfile.upsert("hooks", "hook-a",
-            ObjectEntry { id: 1, url: None, modified_at: None, content_hash: None });
+            ObjectEntry { id: 1, url: None, modified_at: None, content_hash: None, secrets_hash: None });
         lockfile.upsert("hooks", "hook-b",
-            ObjectEntry { id: 2, url: None, modified_at: None, content_hash: None });
+            ObjectEntry { id: 2, url: None, modified_at: None, content_hash: None, secrets_hash: None });
         let pending = detect(&paths, &lockfile);
         assert!(pending.is_empty(), "expected no rename (would collide), got {pending:?}");
     }

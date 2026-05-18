@@ -1219,6 +1219,7 @@ mod tests {
                 url: Some("https://x.invalid/api/v1/hooks/42".to_string()),
                 modified_at: Some("2026-05-14T08:00:00Z".to_string()),
                 content_hash: Some(base_hash.clone()),
+                secrets_hash: None,
             },
         );
 
@@ -1337,6 +1338,7 @@ mod tests {
                 url: Some("https://x.invalid/api/v1/hooks/42".to_string()),
                 modified_at: Some("2026-05-14T08:00:00Z".to_string()),
                 content_hash: Some(base_hash.clone()),
+                secrets_hash: None,
             },
         );
 
@@ -1453,6 +1455,7 @@ mod tests {
                 url: Some("https://x.invalid/api/v1/hooks/42".to_string()),
                 modified_at: Some("2026-05-14T08:00:00Z".to_string()),
                 content_hash: Some(base_hash.clone()),
+                secrets_hash: None,
             },
         );
 

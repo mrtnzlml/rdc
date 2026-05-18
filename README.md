@@ -458,6 +458,34 @@ Sections: `[hooks.<slug>]`, `[rules.<slug>]`, `[labels.<slug>]`, `[schemas.<queu
 
 If you add an overlay after a sync, run `rdc sync` once more to re-baseline — the lockfile's pre-strip hash won't match the new post-strip form otherwise.
 
+## Hook secrets — per-env, not versioned
+
+Hook secret values (third-party API tokens, signing keys, anything Rossum stores in the encrypted `secrets` map and exposes only via `GET /hooks/<id>/secrets_keys`) live in `secrets/<env>.hook-secrets.json` — gitignored, mode 0600 on Unix. Different env, different file: the prod values never end up on a teammate's laptop.
+
+```json
+{
+  "hooks": {
+    "master-data-hub": { "mdh_api_token": "prod-abc..." },
+    "notify-slack":    { "signing_secret": "prod-xyz..." }
+  }
+}
+```
+
+`rdc sync <env>` injects the matching K/V into every `POST /hooks/` and `PATCH /hooks/<id>` body it sends. Editing this file alone — without touching the hook JSON or `.py` — still triggers a force-PATCH on the next sync: the lockfile carries a `secrets_hash` per hook so a drift between local file and last-pushed state surfaces as `pushing hooks → hooks/<slug> (secrets only)`.
+
+`rdc deploy <src> <tgt>` runs a pre-flight check before any write:
+
+1. For every hook in the deploy plan (creates + updates), `GET /hooks/<src_id>/secrets_keys` enumerates the keys the source hook actually uses.
+2. The target's local `secrets/<tgt>.hook-secrets.json` must declare a value for every required key.
+3. Any missing → the deploy aborts with a per-hook list and no writes happen. Populate the file and retry.
+4. Extras in the target file (keys the source doesn't declare) are filtered out of the outbound body and warned about — the target hook gets exactly the shape of secrets the source has.
+
+Limits — both for transparency and to set expectations:
+
+- **Values can never be read back from the server.** Rossum's API returns key names only. Once written, your local file is the only place the value lives — back it up like any other credential.
+- **`rdc deploy` doesn't copy secrets across envs.** The local file for `<src>` and `<tgt>` are independent. This is deliberate: dev-laptop credentials should never leak to prod.
+- **Webhook signing secrets (`config.secret`) aren't handled here.** That field is inline in the hook body and currently round-trips through the snapshot like every other config value. If you need it kept out of git, declare it in `overlay.toml` for now; first-class handling is a follow-up.
+
 ## Conflicts & drift
 
 A three-way merge runs on every sync. When both local and the env have diverged since the last successful sync, an inline resolver opens on TTY. Labels are env-aware so the asymmetry is concrete — the other side is named after the env you're syncing with, never the abstract word "remote":
@@ -514,6 +542,7 @@ Sync surfaces pending renames in its summary.
 |---|---|
 | `rdc.toml` | Project config: name + per-env `api_base` and `org_id` |
 | `secrets/<env>.secrets.json` | Per-env API token. Gitignored. Mode 0600 on Unix. |
+| `secrets/<env>.hook-secrets.json` | Per-env, per-hook encrypted secret values. Gitignored. Mode 0600 on Unix. See "Hook secrets" above. |
 | `envs/<env>/_index.md` | Generated inventory of every object with names, paths, and cross-references. Don't edit. |
 | `envs/<env>/organization.json` | Org metadata (read-only on remote) |
 | `envs/<env>/overlay.toml` | Per-env overrides. Optional. |

@@ -812,6 +812,7 @@ mod classify_tests {
                     url: Some(url.to_string()),
                     modified_at: None,
                     content_hash: None,
+                    secrets_hash: None,
                 },
             );
         lf
@@ -964,6 +965,7 @@ mod classify_tests {
                 url: Some("https://test.example/api/v1/queues/1".into()),
                 modified_at: None,
                 content_hash: None,
+                secrets_hash: None,
             },
         );
         src_lf.objects.entry("queues".into()).or_default().insert(
@@ -973,6 +975,7 @@ mod classify_tests {
                 url: Some("https://test.example/api/v1/queues/2".into()),
                 modified_at: None,
                 content_hash: None,
+                secrets_hash: None,
             },
         );
         let tgt_lf = Lockfile::default();
@@ -1013,6 +1016,7 @@ mod classify_tests {
                 url: Some("https://prod.example/api/v1/queues/900".into()),
                 modified_at: None,
                 content_hash: None,
+                secrets_hash: None,
             },
         );
         let sel = Selection::default();
@@ -1125,6 +1129,7 @@ mod dep_check_tests {
                 url: Some("https://test.example/api/v1/queues/600".into()),
                 modified_at: None,
                 content_hash: None,
+                secrets_hash: None,
             },
         );
         (Paths::for_env(root, "test"), lf)
@@ -1142,6 +1147,7 @@ mod dep_check_tests {
                 url: Some("https://prod.example/api/v1/queues/900".into()),
                 modified_at: None,
                 content_hash: None,
+                secrets_hash: None,
             },
         );
 
@@ -1292,6 +1298,7 @@ mod dep_check_tests {
                 url: Some("https://test.example/api/v1/queues/600".into()),
                 modified_at: None,
                 content_hash: None,
+                secrets_hash: None,
             },
         );
         src_lf.objects.entry("workspaces".into()).or_default().insert(
@@ -1301,6 +1308,7 @@ mod dep_check_tests {
                 url: Some("https://test.example/api/v1/workspaces/3".into()),
                 modified_at: None,
                 content_hash: None,
+                secrets_hash: None,
             },
         );
 

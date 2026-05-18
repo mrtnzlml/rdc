@@ -115,6 +115,20 @@ impl RossumClient {
         self.get_json(&format!("{}/schemas/{id}", self.base_url), progress).await
     }
 
+    /// `GET /hooks/<id>/secrets_keys` — list the secret key names
+    /// configured on a hook. The Rossum API returns the keys only, never
+    /// the values (those are server-side encrypted). Used by deploy to
+    /// check that the target env has values for every key the source
+    /// hook depends on before any write hits the target.
+    ///
+    /// Path note: the Rossum endpoint is `/secrets_keys` (with `s` on
+    /// `secrets`, no hyphen) — verified against the live API and the
+    /// existing rossum-api MCP server source. The simpler-looking
+    /// variants (`/secrets`, `/secret_keys`, `/secret-keys`) all 404.
+    pub async fn get_hook_secrets_keys(&self, id: u64, progress: ProgressHandle) -> Result<Vec<String>> {
+        self.get_json(&format!("{}/hooks/{id}/secrets_keys", self.base_url), progress).await
+    }
+
     // --- create endpoints ---------------------------------------------
 
     pub async fn create_hook(&self, body: &serde_json::Value, progress: ProgressHandle) -> Result<Hook> {
@@ -177,6 +191,16 @@ impl RossumClient {
 
     pub async fn update_hook(&self, id: u64, hook: &Hook, progress: ProgressHandle) -> Result<Hook> {
         self.patch_json(&format!("/hooks/{id}"), hook, progress).await
+    }
+
+    /// `PATCH /hooks/<id>` with a raw JSON body. Used when the outbound
+    /// payload contains fields not represented on the `Hook` model —
+    /// notably the write-only top-level `secrets` map, which `GET /hooks`
+    /// never returns and which therefore has no place on the typed
+    /// model. The body is sent through the same retry pipeline as
+    /// `update_hook` and the response is decoded back to a `Hook`.
+    pub async fn update_hook_value(&self, id: u64, body: &serde_json::Value, progress: ProgressHandle) -> Result<Hook> {
+        self.patch_json(&format!("/hooks/{id}"), body, progress).await
     }
 
     pub async fn update_workspace(&self, id: u64, workspace: &Workspace, progress: ProgressHandle) -> Result<Workspace> {

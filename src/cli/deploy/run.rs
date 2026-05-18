@@ -217,6 +217,37 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
         }
     }
 
+    // Pre-flight hook-secrets check. Runs BEFORE the target lock is
+    // acquired so a missing-keys failure costs no contention. The
+    // GET `/hooks/<src_id>/secrets_keys` calls only hit `src_client`
+    // and are read-only.
+    //
+    // For each hook being POSTed (creates) or PATCHed (updates) on the
+    // target, we ensure the local `secrets/<tgt>.hook-secrets.json`
+    // declares a value for every key the source hook actually uses.
+    // If any are missing the deploy aborts with a per-hook report and
+    // no writes happen. Surplus keys in the target file are filtered
+    // and warned about.
+    let tgt_hook_secrets = crate::secrets::load_hook_secrets(tgt_paths.root(), tgt)
+        .with_context(|| format!("loading hook secrets for target env '{tgt}'"))?;
+    let mut hook_slugs_in_scope: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    if let Some(create_slugs) = plan.creates.get("hooks") {
+        hook_slugs_in_scope.extend(create_slugs.iter().cloned());
+    }
+    // Update list = src→tgt mapping entries that already exist on tgt
+    // (the apply phase iterates `mapping.hooks` to PATCH them).
+    hook_slugs_in_scope.extend(mapping.hooks.keys().cloned());
+    let precheck_api_calls = hook_slugs_in_scope.len();
+    let hook_secrets_plan = crate::cli::deploy::hook_secrets::precheck(
+        &src_client,
+        &src_lockfile,
+        &tgt_hook_secrets,
+        hook_slugs_in_scope.into_iter(),
+        tgt,
+    )
+    .await?;
+
     // Acquire an exclusive lock on the target env for the duration of the
     // write phase (creates + applies). Sync (one-shot or --watch) targeting
     // `tgt` will wait briefly here; deploy will wait briefly if a sync is
@@ -236,7 +267,8 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
 
     let started = Instant::now();
     let mut creates_done = 0usize;
-    let mut api_calls = 0usize;
+    // Seed with the per-hook GETs the secrets pre-flight just issued.
+    let mut api_calls = precheck_api_calls;
 
     // 4. Execute creates in dependency order. In dry-run mode we don't
     // POST — we just print what would happen. The create phase has no
@@ -279,6 +311,7 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
             tgt_overlay: &tgt_overlay,
             tgt_client: &tgt_client,
             progress: progress.clone(),
+            hook_secrets_plan: &hook_secrets_plan,
         };
         // Lazily-populated cache of tgt remote hooks for store-extension
         // orphan checks. Shared across all hooks in this bootstrap run so
@@ -365,6 +398,7 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
         progress.clone(),
         &mut tgt_lockfile,
         selection.as_ref(),
+        &hook_secrets_plan,
     )
     .await
     .with_context(|| format!(

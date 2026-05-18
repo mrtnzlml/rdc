@@ -87,6 +87,7 @@ pub(crate) async fn run(
     progress: Option<Arc<ProgressLog>>,
     tgt_lockfile: &mut Lockfile,
     selection: Option<&crate::cli::deploy::selection::Selection>,
+    hook_secrets_plan: &crate::cli::deploy::hook_secrets::HookSecretsPlan,
 ) -> Result<String> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let src_paths = Paths::for_env(&cwd, src);
@@ -220,10 +221,37 @@ pub(crate) async fn run(
                 );
             }
         }
-        // PATCH (skipped in dry-run; counter still ticks).
+        // PATCH (skipped in dry-run; counter still ticks). The body
+        // includes the filtered hook secrets so any rotated values
+        // ride along with this update — the pre-flight check in
+        // `run::run` already validated the target file has the keys
+        // the source hook declares.
         if !dry_run {
-            tgt_client.update_hook(tgt_id, &payload_hook, None).await
+            let mut body = serde_json::to_value(&payload_hook)
+                .with_context(|| format!("serializing hook '{src_slug}' for PATCH"))?;
+            if let Some(secrets) = hook_secrets_plan.for_slug(src_slug) {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert(
+                        "secrets".to_string(),
+                        serde_json::to_value(secrets)
+                            .expect("BTreeMap<String,String> serializes"),
+                    );
+                }
+            }
+            tgt_client.update_hook_value(tgt_id, &body, None).await
                 .with_context(|| format!("PATCH tgt hooks/{tgt_id} (mapped from src '{src_slug}')"))?;
+            // Record the just-injected secrets-hash so a subsequent
+            // sync on the target doesn't see drift.
+            let empty = std::collections::BTreeMap::<String, String>::new();
+            let injected = hook_secrets_plan.for_slug(src_slug).unwrap_or(&empty);
+            let injected_hash = crate::state::hook_secrets_hash(injected);
+            if let Some(entry) = tgt_lockfile
+                .objects
+                .get_mut("hooks")
+                .and_then(|m| m.get_mut(tgt_slug.as_str()))
+            {
+                entry.secrets_hash = Some(injected_hash);
+            }
         }
         applied.hooks += 1;
         if let Some(sp) = sp { sp.finish_ok(""); }

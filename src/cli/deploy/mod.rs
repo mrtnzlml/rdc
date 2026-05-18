@@ -1,6 +1,7 @@
 pub mod apply;
 pub(crate) mod common;
 pub mod create;
+pub mod hook_secrets;
 pub mod map;
 pub mod realign;
 pub mod run;
