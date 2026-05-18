@@ -1,6 +1,13 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
+use wiremock::matchers::{header, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn fixture(name: &str) -> serde_json::Value {
+    let raw = std::fs::read_to_string(format!("testdata/fixtures/{name}")).unwrap();
+    serde_json::from_str(&raw).unwrap()
+}
 
 #[test]
 fn init_creates_expected_files() {
@@ -267,4 +274,118 @@ org_id = 285704
     assert!(!cfg.contains("[project]"), "legacy [project] section should be stripped on re-save");
     assert!(cfg.contains("[envs.dev]"), "existing env must be preserved");
     assert!(cfg.contains("[envs.prod]"), "new env must be added");
+}
+
+/// `RDC_TOKEN_<UPPER>` set at init time is picked up automatically:
+/// the token is validated against the Rossum API, the secrets file
+/// is written with mode 0600, and the per-env "rdc auth" line is
+/// dropped from the next-steps output. The user gets a one-step setup.
+#[tokio::test]
+async fn init_with_env_var_runs_auth_inline() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .and(header("Authorization", "token TOKEN_FROM_ENV"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .env("RDC_TOKEN_DEV", "TOKEN_FROM_ENV")
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success()
+        // The auth phase prints its own validation banner to stderr.
+        .stderr(predicate::str::contains("Validated against org"))
+        // Next-steps drops the per-env auth line when auth succeeded.
+        .stdout(predicate::str::contains("Next steps:"))
+        .stdout(predicate::str::contains("rdc sync dev"))
+        .stdout(predicate::str::contains("rdc auth dev").not());
+
+    let secrets_path = project.path().join("secrets/dev.secrets.json");
+    assert!(
+        secrets_path.exists(),
+        "auth-on-init must write the secrets file when the token validates"
+    );
+    let body = std::fs::read_to_string(&secrets_path).unwrap();
+    assert!(body.contains("TOKEN_FROM_ENV"));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&secrets_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "secrets file should be mode 0600");
+    }
+}
+
+/// A bad token coming from `RDC_TOKEN_<UPPER>` must not abort init: the
+/// project files are still written, a clear warning is surfaced, no
+/// secrets file is written, and the next-steps output keeps the per-env
+/// auth line so the user can recover.
+#[tokio::test]
+async fn init_with_invalid_env_var_token_warns_and_continues() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "detail": "Invalid token.",
+            "code": "authentication_failed",
+        })))
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .env("RDC_TOKEN_DEV", "BAD_TOKEN")
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("failed validation"))
+        .stderr(predicate::str::contains("Re-run `rdc auth dev`"))
+        // Project files are written normally.
+        .stdout(predicate::str::contains("Initialized"))
+        // Next-steps still asks the user to set up auth.
+        .stdout(predicate::str::contains("rdc auth dev"));
+
+    assert!(
+        project.path().join("rdc.toml").exists(),
+        "init must still write rdc.toml when auth validation fails"
+    );
+    assert!(
+        !project.path().join("secrets/dev.secrets.json").exists(),
+        "no secrets file written when token is rejected"
+    );
+}
+
+/// Non-TTY init with no `RDC_TOKEN_<UPPER>` set keeps the original
+/// behavior: project files written, no API calls attempted, and the
+/// next-steps message walks the user through `rdc auth`.
+#[test]
+fn init_without_env_var_in_ci_skips_auth() {
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .env_remove("RDC_TOKEN_DEV")
+        .args(["init", "--env", "dev=https://example.rossum.app/api/v1:285704"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rdc auth dev"))
+        .stderr(predicate::str::contains("Validated against org").not());
+
+    assert!(
+        !project.path().join("secrets/dev.secrets.json").exists(),
+        "without a token source, no secrets file should be written"
+    );
 }

@@ -69,9 +69,63 @@ pub async fn run(env_specs: Vec<String>) -> Result<()> {
             println!("Added env(s): {env_list}");
         }
     }
+
+    // Auth-on-init: for each new env, try to authenticate up front so the
+    // user doesn't have to make a second pass through `rdc auth`. Token
+    // sources, in order: `RDC_TOKEN_<UPPER>` env var (non-interactive,
+    // CI-friendly), then masked TTY prompt (when stdin is a terminal).
+    // Validation goes through the same `validate_and_save_token` helper
+    // `rdc auth` uses, so the on-disk state and printed feedback match.
+    let mut auth_succeeded: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for env in &new_env_names {
+        let upper = env.to_uppercase();
+        let env_var_name = format!("RDC_TOKEN_{upper}");
+        let token_source = match std::env::var(&env_var_name) {
+            Ok(t) if !t.trim().is_empty() => Some((t.trim().to_string(), env_var_name.clone())),
+            _ => {
+                if std::io::stdin().is_terminal() {
+                    match prompt_token_for_env(env)? {
+                        Some(t) => Some((t, "interactive prompt".to_string())),
+                        None => None,
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+
+        let Some((token, source_label)) = token_source else {
+            continue;
+        };
+        let env_cfg = cfg
+            .envs
+            .get(env)
+            .expect("just inserted into cfg above");
+        let paths = Paths::for_env(&cwd, env);
+        match crate::cli::auth::validate_and_save_token(env_cfg, &paths.secrets_file(), &token)
+            .await
+        {
+            Ok(_org_name) => {
+                auth_succeeded.insert(env.clone());
+            }
+            Err(e) => {
+                // Project files stay; user can rerun `rdc auth` once
+                // they've sorted out the credential issue.
+                eprintln!(
+                    "! Token for env '{env}' (from {source_label}) failed validation: {e:#}"
+                );
+                eprintln!("  Re-run `rdc auth {env}` to retry.");
+            }
+        }
+    }
+
     println!();
     println!("Next steps:");
     for env in &new_env_names {
+        if auth_succeeded.contains(env) {
+            continue;
+        }
         let upper = env.to_uppercase();
         println!("  - Set the API token for env '{env}':");
         println!("      rdc auth {env} --token <token>     # validates + writes secrets/{env}.secrets.json");
@@ -81,6 +135,35 @@ pub async fn run(env_specs: Vec<String>) -> Result<()> {
         println!("  - Sync the snapshot:  rdc sync {env}");
     }
     Ok(())
+}
+
+/// Prompt for an API token on TTY (masked). Returns `Ok(None)` when the
+/// user cancels (Ctrl+C / Esc) or submits an empty value — both mean
+/// "don't auth right now; fall back to the next-steps message and let
+/// `rdc auth` handle it later". Hard errors (real I/O failures from the
+/// prompt library) propagate.
+fn prompt_token_for_env(env: &str) -> Result<Option<String>> {
+    use inquire::error::InquireError;
+    use inquire::{Password, PasswordDisplayMode};
+
+    println!();
+    let result = Password::new(&format!("API token for '{env}'"))
+        .with_display_mode(PasswordDisplayMode::Masked)
+        .without_confirmation()
+        .with_help_message("Esc / Ctrl+C to skip — you can run `rdc auth` later")
+        .prompt();
+    match result {
+        Ok(t) => {
+            let trimmed = t.trim().to_string();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed))
+            }
+        }
+        Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => Ok(None),
+        Err(e) => Err(anyhow!("token prompt failed: {e}")),
+    }
 }
 
 /// Resolve the list of env specs to use. When `env_specs` is empty,

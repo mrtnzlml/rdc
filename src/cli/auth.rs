@@ -63,7 +63,7 @@ pub async fn run(env: &str, token_arg: Option<String>) -> Result<()> {
 ///
 /// A short-lived ProgressLog surrounds the validation GET so the user
 /// sees a spinner while rdc is waiting on the Rossum API.
-async fn validate_and_save_token(
+pub(crate) async fn validate_and_save_token(
     env_cfg: &EnvConfig,
     secrets_path: &Path,
     token: &str,
