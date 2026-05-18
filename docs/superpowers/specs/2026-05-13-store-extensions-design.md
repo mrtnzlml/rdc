@@ -225,7 +225,7 @@ Pick the token_owner for store extension 'master-data-hub' on prod
       https://prod.rossum.app/api/v1/users/521884
   [2] svc-mdh-prod   admin
       https://prod.rossum.app/api/v1/users/621119
-  [3] martin.zlamal@rossum.ai   you, admin
+  [3] alice@example.org   you, admin
       https://prod.rossum.app/api/v1/users/200001
   [a] abort the deploy
 
