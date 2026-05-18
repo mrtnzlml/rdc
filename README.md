@@ -556,7 +556,7 @@ Sync surfaces pending renames in its summary.
 
 Token resolution per env, in priority order:
 
-1. `RDC_TOKEN_<ENV_UPPER>` environment variable (e.g. `RDC_TOKEN_TEST`). Recommended for CI.
+1. `RDC_TOKEN_<ENV_UPPER>` environment variable. Recommended for CI. The env name is uppercased and any non-alphanumeric character is normalized to `_` so the shell can export it: `test` → `RDC_TOKEN_TEST`, `dev-ap` → `RDC_TOKEN_DEV_AP`.
 2. `secrets/<env>.secrets.json` — `{"api_token": "..."}`. Recommended locally. `rdc init` adds `secrets/` to `.gitignore`.
 
 Set or rotate:

@@ -389,3 +389,77 @@ fn init_without_env_var_in_ci_skips_auth() {
         "without a token source, no secrets file should be written"
     );
 }
+
+/// Real env names contain hyphens (`dev-ap`, `prod-eu`, …). The
+/// `RDC_TOKEN_<UPPER>` convention must normalize non-alphanumerics to
+/// `_` so the shell can actually export the variable, and the
+/// next-steps hint must quote the normalized form.
+#[tokio::test]
+async fn init_with_hyphenated_env_uses_normalized_env_var() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .and(header("Authorization", "token TOKEN_FROM_ENV"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        // The motivating real-world example.
+        .env("RDC_TOKEN_DEV_AP", "TOKEN_FROM_ENV")
+        .args(["init", "--env", &format!("dev-ap={}/api/v1:1", server.uri())])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Validated against org"));
+
+    assert!(
+        project.path().join("secrets/dev-ap.secrets.json").exists(),
+        "secrets file path keeps the original env name (with hyphen)"
+    );
+}
+
+/// If `RDC_TOKEN_DEV_AP` isn't set, the printed "Next steps" must
+/// suggest the normalized var name — not the invalid hyphenated form
+/// (which is what previous versions emitted).
+#[test]
+fn init_next_steps_quotes_normalized_env_var_for_hyphenated_env() {
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .env_remove("RDC_TOKEN_DEV_AP")
+        .args(["init", "--env", "dev-ap=https://x.rossum.app/api/v1:1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("RDC_TOKEN_DEV_AP"))
+        .stdout(predicate::str::contains("RDC_TOKEN_DEV-AP").not());
+}
+
+/// Two env names that normalize to the same shell variable can't
+/// coexist — one would steal the other's token. Init refuses the
+/// second add with a clear message naming both envs and the variable.
+#[test]
+fn init_refuses_env_name_that_collides_with_existing_env_var() {
+    let project = TempDir::new().unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", "dev-ap=https://x.rossum.app/api/v1:1"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", "dev_ap=https://x.rossum.app/api/v1:2"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("RDC_TOKEN_DEV_AP"))
+        .stderr(predicate::str::contains("dev-ap"))
+        .stderr(predicate::str::contains("dev_ap"));
+}
