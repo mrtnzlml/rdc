@@ -223,8 +223,14 @@ async fn delete_one(
 
     let drifted = match (&remote_modified, &lockfile_modified) {
         (Some(r), Some(l)) => r != l,
-        // Either side missing → can't compare → conservative: treat as
-        // drifted so the user gets a prompt rather than silent destruction.
+        // Both sides agree the kind has no `modified_at` field on the
+        // wire (e.g. labels). With no timestamp to compare, there's no
+        // signal of drift — treat as clean and let the DELETE through.
+        (None, None) => false,
+        // One side has a timestamp the other doesn't — that's a real
+        // discrepancy (e.g. the lockfile pre-dates a server-side schema
+        // change). Conservative: treat as drift so the user gets a
+        // prompt rather than silent destruction.
         _ => true,
     };
 

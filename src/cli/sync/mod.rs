@@ -334,12 +334,11 @@ pub(crate) async fn run_cycle(
         return Ok(CycleOutcome::default());
     }
 
-    // Destructive-delete gate: subsequent tasks will refuse to proceed
-    // with `LocalDelete` items unless `--allow-deletes` is set. Today
-    // the executor is a no-op, so the flag is recorded for parity.
-    let _ = allow_deletes;
-
-    // Phase 5: execute. Stub today — fills in across subsequent tasks.
+    // Phase 5: execute. The destructive-delete gate (`--allow-deletes`)
+    // is enforced inside the executor's deletes phase via
+    // `cli::push::deletes::confirm_or_refuse`, which prints the full
+    // tombstone list and either prompts (TTY) or refuses (non-TTY without
+    // the flag).
     let outcome = {
         let mut ctx = crate::cli::pull::common::PullCtx {
             paths: &paths,
@@ -355,6 +354,7 @@ pub(crate) async fn run_cycle(
             &classified,
             no_push,
             no_pull,
+            allow_deletes,
             interactive,
             &progress,
         )

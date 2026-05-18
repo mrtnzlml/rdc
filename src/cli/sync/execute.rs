@@ -1909,6 +1909,7 @@ pub async fn run(
     classified: &[ClassifiedItem],
     no_push: bool,
     no_pull: bool,
+    allow_deletes: bool,
     interactive: bool,
     progress: &Arc<ProgressLog>,
 ) -> Result<crate::cli::sync::CycleOutcome> {
@@ -1958,6 +1959,123 @@ pub async fn run(
     let remote_delete_outcome =
         resolve_remote_deletes(ctx, catalog, classified, stdin.lock(), interactive, progress)
             .await?;
+
+    // Phase B: destructive deletes. Items classified as `LocalDelete`
+    // (lockfile + remote present, local file gone, remote unchanged since
+    // the recorded base) get a `DELETE /<kind>/<id>` here. The order is:
+    // build a `Tombstones` from the classified items, gate on
+    // `confirm_or_refuse` (prints the full list and prompts on TTY, or
+    // refuses non-interactively without `--allow-deletes`), then dispatch
+    // `run_deletes` which handles drift detection, cascade order
+    // (children before parents), idempotency, and lockfile cleanup.
+    //
+    // `LocalDeleteRemoteEdit` is intentionally NOT included — it already
+    // routed through the remote-delete resolver above. We only act on
+    // the clean-delete class here.
+    //
+    // Gated by `no_push`: audit-mode (`--no-push`) suppresses all
+    // outbound mutations, deletes included.
+    let mut delete_counts = crate::cli::push::deletes::DeleteCounts::default();
+    if !no_push {
+        let mut tombstones = crate::cli::push::scan::Tombstones::default();
+        for it in classified {
+            if !matches!(it.class, SyncClass::LocalDelete) {
+                continue;
+            }
+            let id = ctx
+                .lockfile
+                .objects
+                .get(&it.kind)
+                .and_then(|m| m.get(&it.slug))
+                .map(|e| e.id);
+            let Some(id) = id else {
+                // Classifier emits LocalDelete only when the lockfile
+                // entry exists; missing here is a logic bug, not a user
+                // condition. Skip with a warning rather than panicking
+                // mid-sync.
+                eprintln!(
+                    "warning: {}/{} classified as LocalDelete but lockfile entry is missing; skipping delete",
+                    it.kind, it.slug
+                );
+                continue;
+            };
+            match it.kind.as_str() {
+                "workspaces" => {
+                    tombstones.workspaces.insert(it.slug.clone(), id);
+                }
+                "hooks" => {
+                    tombstones.hooks.insert(it.slug.clone(), id);
+                }
+                "rules" => {
+                    tombstones.rules.insert(it.slug.clone(), id);
+                }
+                "labels" => {
+                    tombstones.labels.insert(it.slug.clone(), id);
+                }
+                "queues" => {
+                    tombstones.queues.insert(it.slug.clone(), id);
+                }
+                "schemas" => {
+                    tombstones.schemas.insert(it.slug.clone(), id);
+                }
+                "inboxes" => {
+                    tombstones.inboxes.insert(it.slug.clone(), id);
+                }
+                "email_templates" => {
+                    tombstones.email_templates.insert(it.slug.clone(), id);
+                }
+                "engines" => {
+                    tombstones.engines.insert(it.slug.clone(), id);
+                }
+                "engine_fields" => {
+                    tombstones.engine_fields.insert(it.slug.clone(), id);
+                }
+                other => {
+                    eprintln!(
+                        "warning: {other}/{} classified as LocalDelete but kind is not deletable via rdc sync; skipping",
+                        it.slug
+                    );
+                }
+            }
+        }
+        if !tombstones.is_empty() {
+            match crate::cli::push::deletes::confirm_or_refuse(
+                &tombstones,
+                interactive,
+                allow_deletes,
+            )? {
+                crate::cli::push::deletes::ConfirmOutcome::Aborted => {
+                    eprintln!("delete phase aborted at confirmation; remote unchanged.");
+                }
+                crate::cli::push::deletes::ConfirmOutcome::Proceed => {
+                    let phase = progress.phase("deleting");
+                    delete_counts = crate::cli::push::deletes::run_deletes(
+                        ctx.client,
+                        ctx.lockfile,
+                        &tombstones,
+                        interactive,
+                    )
+                    .await?;
+                    drop(phase);
+                }
+            }
+        }
+    }
+
+    // Reconcile `outcome.items_pushed` with what the delete phase actually
+    // did. The pre-tally above counted every `LocalDelete` item; subtract
+    // the over-count and add back only the deletes that committed (the
+    // rest were skipped by drift resolution or aborted at the prompt).
+    let local_delete_planned = classified
+        .iter()
+        .filter(|c| matches!(c.class, SyncClass::LocalDelete))
+        .count();
+    if !no_push && local_delete_planned > 0 {
+        outcome.items_pushed = outcome
+            .items_pushed
+            .saturating_sub(local_delete_planned)
+            + delete_counts.total_deleted();
+    }
 
     // Push runs BEFORE pull so the user's local edits land on the remote as
     // soon as the conflict resolver finishes. Pull and push touch disjoint
