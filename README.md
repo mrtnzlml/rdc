@@ -41,20 +41,6 @@ Homebrew (macOS, Linux x86_64):
 brew install mrtnzlml/tap/rdc
 ```
 
-Or single binary via `curl | sh`:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/mrtnzlml/rossum-deployment-manager-experiment/main/install.sh | sh
-```
-
-Downloads the matching pre-built release into `~/.local/bin/rdc`. Add that directory to your `PATH` if it isn't already.
-
-Pin to a specific version:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/mrtnzlml/rossum-deployment-manager-experiment/main/install.sh | sh -s -- v0.0.1
-```
-
 Windows (PowerShell):
 
 ```powershell
