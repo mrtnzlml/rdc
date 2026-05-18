@@ -41,6 +41,23 @@ pub async fn run(env_specs: Vec<String>) -> Result<()> {
                 cfg_path.display()
             ));
         }
+        // Reject names that normalize to the same `RDC_TOKEN_<...>`
+        // variable as an existing env. E.g. adding `dev_ap` when
+        // `dev-ap` is already defined would silently share env-var
+        // resolution; refuse rather than let one steal the other's
+        // token.
+        let candidate_var = crate::secrets::env_token_var(&env_name);
+        if let Some(clash) = cfg
+            .envs
+            .keys()
+            .find(|existing| crate::secrets::env_token_var(existing) == candidate_var)
+        {
+            return Err(anyhow!(
+                "env '{env_name}' would share API-token env var '{candidate_var}' with \
+                 existing env '{clash}' (rdc normalizes non-alphanumerics to '_' so \
+                 the shell can export it). Pick a distinct name."
+            ));
+        }
         cfg.envs.insert(env_name.clone(), env_cfg);
         new_env_names.push(env_name);
     }
@@ -79,8 +96,7 @@ pub async fn run(env_specs: Vec<String>) -> Result<()> {
     let mut auth_succeeded: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
     for env in &new_env_names {
-        let upper = env.to_uppercase();
-        let env_var_name = format!("RDC_TOKEN_{upper}");
+        let env_var_name = crate::secrets::env_token_var(env);
         let token_source = match std::env::var(&env_var_name) {
             Ok(t) if !t.trim().is_empty() => Some((t.trim().to_string(), env_var_name.clone())),
             _ => {
@@ -126,10 +142,10 @@ pub async fn run(env_specs: Vec<String>) -> Result<()> {
         if auth_succeeded.contains(env) {
             continue;
         }
-        let upper = env.to_uppercase();
+        let env_var_name = crate::secrets::env_token_var(env);
         println!("  - Set the API token for env '{env}':");
         println!("      rdc auth {env} --token <token>     # validates + writes secrets/{env}.secrets.json");
-        println!("      # or: export RDC_TOKEN_{upper}=<token>");
+        println!("      # or: export {env_var_name}=<token>");
     }
     for env in &new_env_names {
         println!("  - Sync the snapshot:  rdc sync {env}");

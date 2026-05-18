@@ -3,10 +3,44 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Compute the environment-variable name rdc looks at for an env's API
+/// token. POSIX env-var identifiers are `[A-Za-z_][A-Za-z0-9_]*`, but
+/// rdc env names accept `-` and `_` (e.g. `dev-ap`, `prod_eu`). To
+/// produce a name the shell can actually export, every non-alphanumeric
+/// character in the env name is mapped to `_` (and the whole thing
+/// uppercased). So:
+///
+/// | env name   | env-var               |
+/// |------------|-----------------------|
+/// | `dev`      | `RDC_TOKEN_DEV`       |
+/// | `dev-ap`   | `RDC_TOKEN_DEV_AP`    |
+/// | `dev_ap`   | `RDC_TOKEN_DEV_AP`    |
+/// | `prod-EU`  | `RDC_TOKEN_PROD_EU`   |
+///
+/// Note the collision in row 2 vs 3: `dev-ap` and `dev_ap` both
+/// normalize to the same variable. The `rdc init` wizard refuses to
+/// add a new env whose name would collide with an existing one's
+/// normalized form, so this can't happen by accident inside a single
+/// project — and the secrets-file path (`secrets/<env>.secrets.json`)
+/// stays exact and unambiguous either way.
+pub fn env_token_var(env: &str) -> String {
+    let mut out = String::with_capacity("RDC_TOKEN_".len() + env.len());
+    out.push_str("RDC_TOKEN_");
+    for c in env.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_uppercase());
+        } else {
+            out.push('_');
+        }
+    }
+    out
+}
+
 /// Resolve the API token for an environment.
 ///
 /// Resolution order:
-/// 1. `RDC_TOKEN_<UPPER_ENV>` environment variable.
+/// 1. The environment variable returned by [`env_token_var`] —
+///    `RDC_TOKEN_DEV` for env `dev`, `RDC_TOKEN_DEV_AP` for `dev-ap`.
 /// 2. `secrets/<env>.secrets.json` with shape `{ "api_token": "..." }`.
 ///
 /// Returns an actionable error if neither source is present.
@@ -22,7 +56,7 @@ fn resolve_token_from<F: Fn(&str) -> Option<String>>(
     env: &str,
     get_env: F,
 ) -> Result<String> {
-    let env_var = format!("RDC_TOKEN_{}", env.to_uppercase());
+    let env_var = env_token_var(env);
     if let Some(t) = get_env(&env_var) {
         if !t.is_empty() {
             return Ok(t);
@@ -194,6 +228,61 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("RDC_TOKEN_UNITTEST_C"), "should mention env var: {msg}");
         assert!(msg.contains("secrets/unittest_c.secrets.json"), "should mention file path: {msg}");
+    }
+
+    #[test]
+    fn env_token_var_uppercases_and_keeps_alphanumerics() {
+        assert_eq!(env_token_var("dev"), "RDC_TOKEN_DEV");
+        assert_eq!(env_token_var("PROD"), "RDC_TOKEN_PROD");
+        assert_eq!(env_token_var("staging42"), "RDC_TOKEN_STAGING42");
+    }
+
+    #[test]
+    fn env_token_var_maps_hyphen_to_underscore() {
+        // The motivating case: real env names like `dev-ap` need to
+        // produce a valid POSIX env-var identifier.
+        assert_eq!(env_token_var("dev-ap"), "RDC_TOKEN_DEV_AP");
+        assert_eq!(env_token_var("prod-eu-west-1"), "RDC_TOKEN_PROD_EU_WEST_1");
+    }
+
+    #[test]
+    fn env_token_var_preserves_existing_underscores() {
+        assert_eq!(env_token_var("dev_ap"), "RDC_TOKEN_DEV_AP");
+    }
+
+    #[test]
+    fn env_token_var_collision_between_hyphen_and_underscore_is_documented() {
+        // This is the known footgun; the init wizard refuses the
+        // second one of these pairs to prevent it inside a project.
+        // Documented here so a future change can't silently break it.
+        assert_eq!(env_token_var("dev-ap"), env_token_var("dev_ap"));
+    }
+
+    #[test]
+    fn resolve_token_uses_normalized_env_var_for_hyphenated_env() {
+        // `dev-ap` env must resolve via `$RDC_TOKEN_DEV_AP`, not the
+        // invalid `$RDC_TOKEN_DEV-AP` (which no shell can export).
+        let dir = TempDir::new().unwrap();
+        let token = resolve_token_from(dir.path(), "dev-ap", |k| {
+            (k == "RDC_TOKEN_DEV_AP").then(|| "from-env".to_string())
+        })
+        .unwrap();
+        assert_eq!(token, "from-env");
+    }
+
+    #[test]
+    fn resolve_token_missing_message_quotes_normalized_var_name() {
+        let dir = TempDir::new().unwrap();
+        let err = resolve_token_from(dir.path(), "dev-ap", |_| None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("RDC_TOKEN_DEV_AP"),
+            "error must point at the actual env-var name: {msg}"
+        );
+        assert!(
+            !msg.contains("RDC_TOKEN_DEV-AP"),
+            "error must NOT mention the invalid hyphenated form: {msg}"
+        );
     }
 
     #[test]
