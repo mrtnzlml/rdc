@@ -505,7 +505,7 @@ async fn list_users_paginates() {
                  "username": "system_user__a556534d", "is_active": true,
                  "groups": [format!("{}/groups/3", server.uri())]},
                 {"id": 200001, "url": format!("{}/users/200001", server.uri()),
-                 "username": "martin.zlamal@rossum.ai", "is_active": true,
+                 "username": "alice@example.org", "is_active": true,
                  "groups": [format!("{}/groups/3", server.uri())]}
             ]
         })))
