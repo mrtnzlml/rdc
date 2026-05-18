@@ -38,7 +38,7 @@ use std::time::Duration;
 const USER_AGENT: &str = concat!("rdc/", env!("CARGO_PKG_VERSION"));
 
 /// GitHub repo that hosts releases.
-const REPO: &str = "mrtnzlml/rossum-deployment-manager-experiment";
+const REPO: &str = "mrtnzlml/rdc";
 
 /// How long the version-check cache stays warm before a background
 /// refresh fires.

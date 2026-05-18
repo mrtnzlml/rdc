@@ -106,7 +106,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${TAG#v}"
-          base="https://github.com/mrtnzlml/rossum-deployment-manager-experiment/releases/download/${TAG}"
+          base="https://github.com/mrtnzlml/rdc/releases/download/${TAG}"
           sha_of() { curl -fsSL "$1" | sha256sum | awk '{ print $1 }'; }
           darwin_arm_sha=$(sha_of "$base/rdc-aarch64-apple-darwin.tar.gz")
           darwin_x86_sha=$(sha_of "$base/rdc-x86_64-apple-darwin.tar.gz")
@@ -116,7 +116,7 @@ jobs:
           cat > tap/Formula/rdc.rb <<RUBY
           class Rdc < Formula
             desc "Rossum Deployment as Code -- CLI for snapshotting and deploying Rossum.ai configurations"
-            homepage "https://github.com/mrtnzlml/rossum-deployment-manager-experiment"
+            homepage "https://github.com/mrtnzlml/rdc"
             version "${version}"
             license "WTFPL"
 

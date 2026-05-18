@@ -46,7 +46,7 @@ Windows (PowerShell):
 ```powershell
 $dest = "$env:USERPROFILE\.rdc\bin"
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
-Invoke-WebRequest -Uri "https://github.com/mrtnzlml/rossum-deployment-manager-experiment/releases/latest/download/rdc-x86_64-pc-windows-msvc.tar.gz" -OutFile "$env:TEMP\rdc.tar.gz"
+Invoke-WebRequest -Uri "https://github.com/mrtnzlml/rdc/releases/latest/download/rdc-x86_64-pc-windows-msvc.tar.gz" -OutFile "$env:TEMP\rdc.tar.gz"
 tar -xzf "$env:TEMP\rdc.tar.gz" -C $dest
 [Environment]::SetEnvironmentVariable("Path", "$env:Path;$dest", "User")
 ```
@@ -54,7 +54,7 @@ tar -xzf "$env:TEMP\rdc.tar.gz" -C $dest
 From source:
 
 ```sh
-cargo install --git https://github.com/mrtnzlml/rossum-deployment-manager-experiment
+cargo install --git https://github.com/mrtnzlml/rdc
 ```
 
 Supported pre-built platforms: macOS (Intel + Apple Silicon), Linux x86_64, Windows x86_64. For Linux aarch64 / Windows aarch64 / other, build from source.
