@@ -3,7 +3,7 @@ name = "rdc"
 version = "0.1.0"
 edition = "2024"
 description = "Rossum Deployment as Code — CLI for snapshotting and deploying Rossum.ai configurations"
-license = "Apache-2.0"
+license = "WTFPL"
 
 [[bin]]
 name = "rdc"

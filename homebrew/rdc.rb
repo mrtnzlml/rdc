@@ -2,7 +2,7 @@ class Rdc < Formula
   desc "Rossum Deployment as Code -- CLI for snapshotting and deploying Rossum.ai configurations"
   homepage "https://github.com/mrtnzlml/rossum-deployment-manager-experiment"
   version "0.1.0"
-  license "Apache-2.0"
+  license "WTFPL"
 
   on_macos do
     on_arm do
