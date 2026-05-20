@@ -69,9 +69,10 @@ pub const PULL_FANOUT: usize = 5;
 /// `list_remote` because the Rossum API has no `/schemas/` or `/inboxes/`
 /// listing — each must be fetched per-queue. Pre-fetching here lets the
 /// sync classifier compute remote hashes without having to issue an
-/// additional fetch per queue; the existing pull driver still re-fetches
-/// (we'd duplicate work but the alternative is threading the prefetch
-/// through the driver, which expands the per-kind API surface).
+/// additional fetch per queue, and the pull driver
+/// ([`crate::cli::pull::queues::process`]) consumes the same maps so a
+/// single sync cycle pays exactly one round of `get_schema` / `get_inbox`
+/// per queue.
 pub struct RemoteCatalog {
     pub organization: crate::model::Organization,
     pub workspaces: Vec<crate::model::Workspace>,
@@ -101,8 +102,26 @@ pub struct RemoteCatalog {
 /// prints once at the top; each per-kind line resolves to `[ok] <kind> <N>`
 /// after its API call returns.
 ///
-/// Listing order is fixed so cross-env diffs stay deterministic across
-/// runs.
+/// The twelve top-level list calls run **concurrently** with a bounded
+/// fan-out at [`PULL_FANOUT`] (the same cap that
+/// [`prefetch_queue_children`] uses). The bound matches the existing
+/// queue-children pattern and avoids overwhelming the wire on
+/// dense-config envs while still cutting wall-clock for a typical sync
+/// roughly in half versus the prior fully-sequential pass. `[ok]` lines
+/// commit in whatever order responses return, so the final transcript
+/// may be reordered relative to the declaration order of `Kind` below.
+/// The per-queue schema+inbox prefetch runs serially after `queues`
+/// resolves because it depends on the queue list.
+///
+/// Each list-call future explicitly yields once before issuing the
+/// request (`tokio::task::yield_now`). This matters under
+/// `current_thread` runtimes where mocked-HTTP responses can return so
+/// fast that the stream polls a batch of ready futures back-to-back
+/// without surrendering the scheduler — that starves long-lived peers
+/// such as the watch-mode poll-interval timer. The yield is harmless in
+/// production (a no-op on a runtime that already cooperates over real
+/// network I/O) and load-bearing for the test suite's watch-mode
+/// timing assertions.
 pub async fn list_remote(
     ctx: &mut PullCtx<'_>,
     env_cfg: &crate::config::EnvConfig,
@@ -110,78 +129,203 @@ pub async fn list_remote(
     token: &str,
     progress: &Arc<crate::progress::ProgressLog>,
 ) -> Result<RemoteCatalog> {
+    use futures::stream::{StreamExt, TryStreamExt};
+
     let phase = progress.phase("listing remote");
 
-    let sp = phase.item("organization");
-    let organization = crate::cli::pull::organization::list(ctx, env_cfg.org_id, progress).await
-        .with_context(|| format!("listing organization for env '{env}'"))?;
-    sp.finish_ok(organization.name.clone());
+    // Single shared immutable reborrow so each concurrent future below
+    // borrows from one place. The list drivers each take `&PullCtx`, so
+    // multiple concurrent reads coexist cleanly via this reborrow.
+    let ctx_ref: &PullCtx = &*ctx;
 
-    let sp = phase.item("workspaces");
-    let workspaces = crate::cli::pull::workspaces::list(ctx, progress).await
-        .with_context(|| format!("listing workspaces for env '{env}'"))?;
-    sp.finish_ok(workspaces.len().to_string());
+    // Tag each top-level fetch so the heterogeneous results can be
+    // re-grouped after `buffer_unordered` joins them. The variant set
+    // matches the typed bindings reconstructed below.
+    enum Listed {
+        Organization(crate::model::Organization),
+        Workspaces(Vec<crate::model::Workspace>),
+        Queues(Vec<crate::model::Queue>),
+        Hooks(Vec<crate::model::Hook>),
+        Rules(Vec<crate::model::Rule>),
+        Labels(Vec<crate::model::Label>),
+        Engines(Vec<crate::model::Engine>),
+        EngineFields(Vec<crate::model::EngineField>),
+        Workflows(Vec<crate::model::Workflow>),
+        WorkflowSteps(Vec<crate::model::WorkflowStep>),
+        EmailTemplates(Vec<crate::model::EmailTemplate>),
+        Mdh(crate::cli::pull::mdh::MdhListed),
+    }
 
-    let sp = phase.item("queues");
-    let queues = crate::cli::pull::queues::list(ctx, progress).await
-        .with_context(|| format!("listing queues for env '{env}'"))?;
-    sp.finish_ok(queues.len().to_string());
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Organization, Workspaces, Queues, Hooks, Rules, Labels,
+        Engines, EngineFields, Workflows, WorkflowSteps, EmailTemplates, Mdh,
+    }
 
-    let sp = phase.item("hooks");
-    let hooks = crate::cli::pull::hooks::list(ctx, progress).await
-        .with_context(|| format!("listing hooks for env '{env}'"))?;
-    sp.finish_ok(hooks.len().to_string());
+    let kinds = [
+        Kind::Organization, Kind::Workspaces, Kind::Queues, Kind::Hooks,
+        Kind::Rules, Kind::Labels, Kind::Engines, Kind::EngineFields,
+        Kind::Workflows, Kind::WorkflowSteps, Kind::EmailTemplates, Kind::Mdh,
+    ];
 
-    let sp = phase.item("rules");
-    let rules = crate::cli::pull::rules::list(ctx, progress).await
-        .with_context(|| format!("listing rules for env '{env}'"))?;
-    sp.finish_ok(rules.len().to_string());
+    let results: Vec<Listed> = futures::stream::iter(kinds.iter().copied())
+        .map(|kind| {
+            let phase = &phase;
+            let progress = progress;
+            async move {
+                // Force a yield BEFORE each list call so the runtime can
+                // service other tasks (e.g. the watch-mode poll timer)
+                // between in-flight requests. Without this, a fast
+                // mocked-HTTP environment can have the stream poll a
+                // batch of ready futures back-to-back without ever
+                // returning control to the runtime's scheduler.
+                tokio::task::yield_now().await;
+                match kind {
+                    Kind::Organization => {
+                        let sp = phase.item("organization");
+                        let r = crate::cli::pull::organization::list(ctx_ref, env_cfg.org_id, progress).await
+                            .with_context(|| format!("listing organization for env '{env}'"))?;
+                        sp.finish_ok(r.name.clone());
+                        anyhow::Ok(Listed::Organization(r))
+                    }
+                    Kind::Workspaces => {
+                        let sp = phase.item("workspaces");
+                        let r = crate::cli::pull::workspaces::list(ctx_ref, progress).await
+                            .with_context(|| format!("listing workspaces for env '{env}'"))?;
+                        sp.finish_ok(r.len().to_string());
+                        anyhow::Ok(Listed::Workspaces(r))
+                    }
+                    Kind::Queues => {
+                        let sp = phase.item("queues");
+                        let r = crate::cli::pull::queues::list(ctx_ref, progress).await
+                            .with_context(|| format!("listing queues for env '{env}'"))?;
+                        sp.finish_ok(r.len().to_string());
+                        anyhow::Ok(Listed::Queues(r))
+                    }
+                    Kind::Hooks => {
+                        let sp = phase.item("hooks");
+                        let r = crate::cli::pull::hooks::list(ctx_ref, progress).await
+                            .with_context(|| format!("listing hooks for env '{env}'"))?;
+                        sp.finish_ok(r.len().to_string());
+                        anyhow::Ok(Listed::Hooks(r))
+                    }
+                    Kind::Rules => {
+                        let sp = phase.item("rules");
+                        let r = crate::cli::pull::rules::list(ctx_ref, progress).await
+                            .with_context(|| format!("listing rules for env '{env}'"))?;
+                        sp.finish_ok(r.len().to_string());
+                        anyhow::Ok(Listed::Rules(r))
+                    }
+                    Kind::Labels => {
+                        let sp = phase.item("labels");
+                        let r = crate::cli::pull::labels::list(ctx_ref, progress).await
+                            .with_context(|| format!("listing labels for env '{env}'"))?;
+                        sp.finish_ok(r.len().to_string());
+                        anyhow::Ok(Listed::Labels(r))
+                    }
+                    Kind::Engines => {
+                        let sp = phase.item("engines");
+                        let r = crate::cli::pull::engines::list(ctx_ref, progress).await
+                            .with_context(|| format!("listing engines for env '{env}'"))?;
+                        sp.finish_ok(r.len().to_string());
+                        anyhow::Ok(Listed::Engines(r))
+                    }
+                    Kind::EngineFields => {
+                        let sp = phase.item("engine fields");
+                        let r = crate::cli::pull::engine_fields::list(ctx_ref, progress).await
+                            .with_context(|| format!("listing engine fields for env '{env}'"))?;
+                        sp.finish_ok(r.len().to_string());
+                        anyhow::Ok(Listed::EngineFields(r))
+                    }
+                    Kind::Workflows => {
+                        let sp = phase.item("workflows");
+                        let r = crate::cli::pull::workflows::list(ctx_ref, progress).await
+                            .with_context(|| format!("listing workflows for env '{env}'"))?;
+                        sp.finish_ok(r.len().to_string());
+                        anyhow::Ok(Listed::Workflows(r))
+                    }
+                    Kind::WorkflowSteps => {
+                        let sp = phase.item("workflow steps");
+                        let r = crate::cli::pull::workflow_steps::list(ctx_ref, progress).await
+                            .with_context(|| format!("listing workflow steps for env '{env}'"))?;
+                        sp.finish_ok(r.len().to_string());
+                        anyhow::Ok(Listed::WorkflowSteps(r))
+                    }
+                    Kind::EmailTemplates => {
+                        let sp = phase.item("email templates");
+                        let r = crate::cli::pull::email_templates::list(ctx_ref, progress).await
+                            .with_context(|| format!("listing email templates for env '{env}'"))?;
+                        sp.finish_ok(r.len().to_string());
+                        anyhow::Ok(Listed::EmailTemplates(r))
+                    }
+                    Kind::Mdh => {
+                        let sp = phase.item("mdh datasets");
+                        let r = crate::cli::pull::mdh::list(env_cfg, token, progress).await
+                            .with_context(|| format!("listing MDH datasets for env '{env}'"))?;
+                        sp.finish_ok(r.collections.len().to_string());
+                        anyhow::Ok(Listed::Mdh(r))
+                    }
+                }
+            }
+        })
+        .buffer_unordered(PULL_FANOUT)
+        .try_collect()
+        .await?;
 
-    let sp = phase.item("labels");
-    let labels = crate::cli::pull::labels::list(ctx, progress).await
-        .with_context(|| format!("listing labels for env '{env}'"))?;
-    sp.finish_ok(labels.len().to_string());
-
-    let sp = phase.item("engines");
-    let engines = crate::cli::pull::engines::list(ctx, progress).await
-        .with_context(|| format!("listing engines for env '{env}'"))?;
-    sp.finish_ok(engines.len().to_string());
-
-    let sp = phase.item("engine fields");
-    let engine_fields = crate::cli::pull::engine_fields::list(ctx, progress).await
-        .with_context(|| format!("listing engine fields for env '{env}'"))?;
-    sp.finish_ok(engine_fields.len().to_string());
-
-    let sp = phase.item("workflows");
-    let workflows = crate::cli::pull::workflows::list(ctx, progress).await
-        .with_context(|| format!("listing workflows for env '{env}'"))?;
-    sp.finish_ok(workflows.len().to_string());
-
-    let sp = phase.item("workflow steps");
-    let workflow_steps = crate::cli::pull::workflow_steps::list(ctx, progress).await
-        .with_context(|| format!("listing workflow steps for env '{env}'"))?;
-    sp.finish_ok(workflow_steps.len().to_string());
-
-    let sp = phase.item("email templates");
-    let email_templates = crate::cli::pull::email_templates::list(ctx, progress).await
-        .with_context(|| format!("listing email templates for env '{env}'"))?;
-    sp.finish_ok(email_templates.len().to_string());
-
-    let sp = phase.item("mdh datasets");
-    let mdh = crate::cli::pull::mdh::list(env_cfg, token, progress).await
-        .with_context(|| format!("listing MDH datasets for env '{env}'"))?;
-    sp.finish_ok(mdh.collections.len().to_string());
+    // Re-group the results into typed bindings. Each variant appears
+    // exactly once by construction.
+    let mut organization: Option<crate::model::Organization> = None;
+    let mut workspaces: Option<Vec<crate::model::Workspace>> = None;
+    let mut queues: Option<Vec<crate::model::Queue>> = None;
+    let mut hooks: Option<Vec<crate::model::Hook>> = None;
+    let mut rules: Option<Vec<crate::model::Rule>> = None;
+    let mut labels: Option<Vec<crate::model::Label>> = None;
+    let mut engines: Option<Vec<crate::model::Engine>> = None;
+    let mut engine_fields: Option<Vec<crate::model::EngineField>> = None;
+    let mut workflows: Option<Vec<crate::model::Workflow>> = None;
+    let mut workflow_steps: Option<Vec<crate::model::WorkflowStep>> = None;
+    let mut email_templates: Option<Vec<crate::model::EmailTemplate>> = None;
+    let mut mdh: Option<crate::cli::pull::mdh::MdhListed> = None;
+    for r in results {
+        match r {
+            Listed::Organization(v) => organization = Some(v),
+            Listed::Workspaces(v) => workspaces = Some(v),
+            Listed::Queues(v) => queues = Some(v),
+            Listed::Hooks(v) => hooks = Some(v),
+            Listed::Rules(v) => rules = Some(v),
+            Listed::Labels(v) => labels = Some(v),
+            Listed::Engines(v) => engines = Some(v),
+            Listed::EngineFields(v) => engine_fields = Some(v),
+            Listed::Workflows(v) => workflows = Some(v),
+            Listed::WorkflowSteps(v) => workflow_steps = Some(v),
+            Listed::EmailTemplates(v) => email_templates = Some(v),
+            Listed::Mdh(v) => mdh = Some(v),
+        }
+    }
+    let organization = organization.expect("organization listed");
+    let workspaces = workspaces.expect("workspaces listed");
+    let queues = queues.expect("queues listed");
+    let hooks = hooks.expect("hooks listed");
+    let rules = rules.expect("rules listed");
+    let labels = labels.expect("labels listed");
+    let engines = engines.expect("engines listed");
+    let engine_fields = engine_fields.expect("engine_fields listed");
+    let workflows = workflows.expect("workflows listed");
+    let workflow_steps = workflow_steps.expect("workflow_steps listed");
+    let email_templates = email_templates.expect("email_templates listed");
+    let mdh = mdh.expect("mdh listed");
 
     // Per-queue schema + inbox prefetch. The Rossum API has no `/schemas/`
     // or `/inboxes/` listing — each must be fetched by id. Doing it here
     // gives the sync classifier accurate remote hashes for queue-nested
-    // kinds; the pull driver still re-fetches inside its own process loop
-    // (extra work but the driver's signature stays unchanged).
+    // kinds, and the resulting maps are also handed to
+    // `pull::queues::process` so it can write the same bytes without a
+    // second fetch round.
     //
-    // Concurrency mirrors `pull::queues::process`'s sub-phase B:
-    // `buffer_unordered(PULL_FANOUT)` over (queue_id, schema_id?, inbox_id?).
-    // A single spinner shows progress while the parallel batch runs; without
-    // it the user sees nothing for several seconds during a tree of dozens.
+    // Bounded fan-out (`buffer_unordered(PULL_FANOUT)`) over
+    // (queue_id, schema_id?, inbox_id?). A single spinner shows progress
+    // while the parallel batch runs; without it the user sees nothing for
+    // several seconds during a tree of dozens.
     let (schemas_by_queue_id, inboxes_by_queue_id) =
         prefetch_queue_children(ctx.client, &queues, &phase, progress).await
             .with_context(|| format!("prefetching schemas + inboxes for env '{env}'"))?;
@@ -194,10 +338,14 @@ pub async fn list_remote(
     })
 }
 
-/// Concurrent per-queue schema + inbox fetch. Mirrors the bounded fan-out
-/// in `pull::queues::process` so the catalog's prefetch and the driver
-/// keep parity on rate and ordering. Queues with no schema / no inbox
-/// contribute nothing to the returned maps.
+/// Concurrent per-queue schema + inbox fetch. Bounded fan-out at
+/// [`PULL_FANOUT`]; the resulting maps are the single source of truth
+/// for queue-nested remote bytes within one sync cycle (the classifier
+/// hashes against them and [`crate::cli::pull::queues::process`] writes
+/// from them). Queues with no schema / no inbox — and queues whose
+/// schema/inbox URL fails to parse — contribute nothing to the returned
+/// maps, and the consuming pull driver treats absent entries as "nothing
+/// to write for that piece."
 ///
 /// A single spinner ("schemas + inboxes") is held by the calling task and
 /// updates its message via `set_message` as each parallel fetch completes,

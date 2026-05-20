@@ -1,22 +1,22 @@
 //! Queue pull driver: writes queue.json + schema.json (with formula
 //! sidecars) + inbox.json under `envs/<env>/workspaces/<ws>/queues/<q>/`.
 //!
-//! Schema + inbox fetches are pipelined via `buffer_unordered(N)` (per
-//! spec §16, default N=5) so a queue tree of 25+ queues doesn't take 50
-//! sequential round-trips. The per-queue write decisions stay sequential
-//! because they touch shared state (lockfile, queue_locations, conflict
-//! counts).
+//! Schema + inbox remote bytes are supplied by the caller via the
+//! `schemas_by_queue_id` / `inboxes_by_queue_id` maps that
+//! [`crate::cli::pull::common::prefetch_queue_children`] populates during
+//! Phase 1 of sync. There is only one fetch round per cycle; the per-queue
+//! write decisions stay sequential because they touch shared state
+//! (lockfile, queue_locations, conflict counts).
 
 use super::common::{
-    apply_pull_action, decide_pull_action, maybe_strip_overlay, parse_id_from_url,
+    apply_pull_action, decide_pull_action, maybe_strip_overlay,
     record_object, skip_on_permission_denied, PullAction, PullCtx,
 };
 use crate::model::{Inbox, Queue, Schema};
 use crate::progress::{Phase, ProgressLog};
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
-use futures::stream::{StreamExt, TryStreamExt};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Counts of objects pulled by the queues driver.
@@ -27,14 +27,15 @@ pub struct QueueCounts {
     pub conflicts: usize,
 }
 
-/// Per-queue work item produced by Phase 1 (filter + slug + queue.json
-/// write) and consumed by Phase 3 (schema + inbox write decisions).
+/// Per-queue work item produced by Sub-phase A (filter + slug + queue.json
+/// write) and consumed by Sub-phase B (schema + inbox write decisions). The
+/// schema / inbox bytes themselves come from the pre-fetched maps the
+/// caller threads in — there is no separate id field here because the
+/// lookup is by `q.id`.
 struct QueueWork<'a> {
     q: &'a Queue,
     q_slug: String,
     queue_dir: std::path::PathBuf,
-    schema_id: Option<u64>,
-    inbox_id: Option<u64>,
 }
 
 /// Phase 1: list all queues from the API.
@@ -57,9 +58,21 @@ pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<ProgressLog>) -> Result<Vec<
 /// classify per kind, and if a subset asks for `schemas/x` without
 /// `queues/x` that's user error surfaced upstream. Queue-nested files
 /// always travel as a unit.
+///
+/// `schemas_by_queue_id` and `inboxes_by_queue_id` are the catalog's
+/// pre-fetched per-queue children populated by
+/// [`crate::cli::pull::common::prefetch_queue_children`] during Phase 1.
+/// A queue whose entry is missing from a given map (no schema URL, no
+/// inbox URL, or a malformed URL that the prefetch silently dropped)
+/// simply does not get the corresponding write here — the same outcome
+/// as if the fetch had returned `None`. This matches the prefetch's
+/// existing forgiving policy and removes the duplicate per-queue GET
+/// round that previously lived inside this function.
 pub async fn process(
     ctx: &mut PullCtx<'_>,
     queues: Vec<Queue>,
+    schemas_by_queue_id: &BTreeMap<u64, Schema>,
+    inboxes_by_queue_id: &BTreeMap<u64, Inbox>,
     subset: &BTreeSet<(String, String)>,
     progress: &Arc<ProgressLog>,
 ) -> Result<QueueCounts> {
@@ -128,95 +141,35 @@ pub async fn process(
         );
         counts.queues += 1;
 
-        // Resolve schema + inbox IDs upfront. Either may be missing for
-        // orphan/hidden queues; we don't fetch what isn't there.
-        let schema_id = match &q.schema {
-            Some(url) => Some(parse_id_from_url(url)
-                .with_context(|| format!("parsing schema URL '{}' for queue '{}'", url, q.name))?),
-            None => {
-                phase.line(format!(
-                    "! queue '{}' (id {}) has no schema; skipping schema + inbox",
-                    q.name, q.id,
-                ));
-                None
-            }
-        };
-        let inbox_id = match &q.inbox {
-            Some(url) => Some(parse_id_from_url(url)
-                .with_context(|| format!("parsing inbox URL '{}' for queue '{}'", url, q.name))?),
-            None => None,
-        };
+        // Preserve the legacy "no schema" notice. Inbox-absence is normal
+        // and intentionally silent. The actual schema / inbox bytes come
+        // from `schemas_by_queue_id` / `inboxes_by_queue_id` in Sub-phase
+        // B below — no URL parsing is needed here because the maps are
+        // keyed by `q.id`.
+        if q.schema.is_none() {
+            phase.line(format!(
+                "! queue '{}' (id {}) has no schema; skipping schema + inbox",
+                q.name, q.id,
+            ));
+        }
 
-        work.push(QueueWork { q, q_slug, queue_dir, schema_id, inbox_id });
+        work.push(QueueWork { q, q_slug, queue_dir });
     }
 
-    // === Sub-phase B: concurrent schema + inbox fetches ===
-    // Bounded fan-out (see common::PULL_FANOUT). A single spinner holds
-    // visible feedback across the parallel batch and updates its message as
-    // each fetch resolves, so the user sees a running `(N/M)` counter while
-    // rdc waits on the API.
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let client = ctx.client;
-    let total = work.len();
-    if total == 0 {
+    if work.is_empty() {
         return Ok(counts);
     }
-    // Bare base name; the in-flight counter rides on `set_message` and the
-    // final `[ok]` line drops it. Threading `progress` into each fetch routes
-    // any 429 retry warning through the active log so it stacks above the
-    // spinner instead of breaking it.
-    let sp = Arc::new(phase.item("schemas + inboxes"));
-    let done = Arc::new(AtomicUsize::new(0));
-    let fetched_vec_result: Result<Vec<(u64, Option<Schema>, Option<Inbox>)>> = futures::stream::iter(
-        work.iter().map(|w| (w.q.id, w.q.name.clone(), w.schema_id, w.inbox_id))
-    )
-    .map(|(qid, qname, sid_opt, iid_opt)| {
-        let sp = sp.clone();
-        let done = done.clone();
-        let progress = progress.clone();
-        async move {
-            let schema = match sid_opt {
-                Some(sid) => Some(client.get_schema(sid, Some(progress.clone())).await
-                    .with_context(|| format!("fetching schema {sid} for queue '{qname}'"))?),
-                None => None,
-            };
-            let inbox = match iid_opt {
-                Some(iid) => Some(client.get_inbox(iid, Some(progress.clone())).await
-                    .with_context(|| format!("fetching inbox {iid} for queue '{qname}'"))?),
-                None => None,
-            };
-            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            sp.set_message(format!("schemas + inboxes ({n}/{total})"));
-            Ok::<_, anyhow::Error>((qid, schema, inbox))
-        }
-    })
-    .buffer_unordered(crate::cli::pull::common::PULL_FANOUT)
-    .try_collect()
-    .await;
-    let fetched_vec = match fetched_vec_result {
-        Ok(v) => {
-            if let Ok(spinner) = Arc::try_unwrap(sp) {
-                spinner.finish_ok(format!("{total} fetched"));
-            }
-            v
-        }
-        Err(e) => {
-            drop(sp);
-            return Err(e);
-        }
-    };
-    let fetched: HashMap<u64, (Option<Schema>, Option<Inbox>)> =
-        fetched_vec.into_iter().map(|(qid, s, i)| (qid, (s, i))).collect();
 
-    // === Sub-phase C: schema + inbox write decisions (sequential, mutates lockfile) ===
+    // === Sub-phase B: schema + inbox write decisions ===
+    // No fetches here — the caller pre-populated the maps during Phase 1.
+    // Decisions mutate shared state (lockfile, conflict counts), so the
+    // loop is intentionally sequential.
     for w in &work {
-        let Some((schema_opt, inbox_opt)) = fetched.get(&w.q.id) else { continue };
-
         let sp = phase.item(&w.q.name);
-        if let Some(schema) = schema_opt {
+        if let Some(schema) = schemas_by_queue_id.get(&w.q.id) {
             write_schema_for_queue(ctx, &mut counts, w, schema, progress, &phase)?;
         }
-        if let Some(inbox) = inbox_opt {
+        if let Some(inbox) = inboxes_by_queue_id.get(&w.q.id) {
             write_inbox_for_queue(ctx, &mut counts, w, inbox, progress)?;
         }
         sp.finish_ok("");
