@@ -441,6 +441,236 @@ pub fn emit_square(color: Color, depth: ColorDepth, dim: bool) -> String {
     }
 }
 
+use std::sync::{Arc, Mutex};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle, ProgressDrawTarget};
+use crate::progress::{ResourceOp, ResourceOutcome, Severity, SyncRenderer};
+
+/// Maximum kinds we pre-allocate row slots for. The classifier emits 11
+/// SyncClass kinds (`workspaces`, `queues`, `schemas`, `inboxes`,
+/// `email_templates`, `hooks`, `rules`, `labels`, `engines`,
+/// `engine_fields`, `mdh`) plus 3 read-only (`organization`,
+/// `workflows`, `workflow_steps`). 16 is conservative.
+const MAX_KINDS: usize = 16;
+/// Max footer entries shown before "+ N more".
+const MAX_FOOTER: usize = 12;
+const MAX_BANNERS: usize = 2;
+/// Max continuation rows per kind. With ~500 squares in a 60-col-wide
+/// budget, one kind needs ≤ 30 rows worst case; 32 is safe headroom.
+const MAX_CONT_ROWS: usize = 32;
+
+pub struct GridRenderer {
+    inner: Mutex<GridInner>,
+}
+
+struct GridInner {
+    state: GridState,
+    color_depth: ColorDepth,
+    mp: MultiProgress,
+    /// Stable bar handles, allocated at construction:
+    header: ProgressBar,
+    /// Per-kind row groups. Up to MAX_KINDS, each with up to
+    /// MAX_CONT_ROWS continuation bars (used when the row wraps).
+    kind_rows: Vec<Vec<ProgressBar>>,
+    separator: ProgressBar,
+    banner_slots: Vec<ProgressBar>,
+    footer_header: ProgressBar,
+    footer_slots: Vec<ProgressBar>,
+    footer_more: ProgressBar,
+    /// Mapping kind → row group index. Populated lazily on first
+    /// observation of a kind.
+    kind_index: BTreeMap<String, usize>,
+    next_kind_slot: usize,
+    finished: bool,
+}
+
+impl GridRenderer {
+    pub fn new(env: String, is_watch: bool) -> Arc<Self> {
+        let mp = MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(8));
+        let style_plain = ProgressStyle::with_template("{msg}").unwrap();
+        let style_spinner = ProgressStyle::with_template("{spinner} {msg}")
+            .unwrap()
+            .tick_strings(&["|", "/", "-", "\\"]);
+
+        let mk_plain = |msg: &str| {
+            let bar = mp.add(ProgressBar::new(1));
+            bar.set_style(style_plain.clone());
+            bar.set_message(msg.to_string());
+            bar
+        };
+        let header = mp.add(ProgressBar::new(1));
+        header.set_style(style_spinner.clone());
+        header.enable_steady_tick(Duration::from_millis(250));
+        header.set_message(String::new());
+
+        let mut kind_rows: Vec<Vec<ProgressBar>> = Vec::with_capacity(MAX_KINDS);
+        for _ in 0..MAX_KINDS {
+            let mut group = Vec::with_capacity(MAX_CONT_ROWS);
+            for _ in 0..MAX_CONT_ROWS {
+                group.push(mk_plain(""));
+            }
+            kind_rows.push(group);
+        }
+
+        let separator = mk_plain("");
+        let banner_slots: Vec<_> = (0..MAX_BANNERS).map(|_| mk_plain("")).collect();
+        let footer_header = mk_plain("");
+        let footer_slots: Vec<_> = (0..MAX_FOOTER).map(|_| mk_plain("")).collect();
+        let footer_more = mk_plain("");
+
+        let color_depth = detect_color_depth();
+
+        Arc::new(Self {
+            inner: Mutex::new(GridInner {
+                state: GridState::new(env, is_watch),
+                color_depth,
+                mp,
+                header,
+                kind_rows,
+                separator,
+                banner_slots,
+                footer_header,
+                footer_slots,
+                footer_more,
+                kind_index: BTreeMap::new(),
+                next_kind_slot: 0,
+                finished: false,
+            }),
+        })
+    }
+}
+
+impl SyncRenderer for GridRenderer {
+    fn phase(&self, label: &str) {
+        let mut g = self.inner.lock().unwrap();
+        g.state.current_op = label.to_string();
+        // Task 8 adds repaint() here.
+    }
+
+    fn warn_line(&self, msg: &str) {
+        // Wrap as a Warn banner so it lands in the banner queue.
+        self.banner(Severity::Warn, msg);
+    }
+
+    fn resource_started(&self, kind: &str, slug: &str, op: ResourceOp) {
+        let mut g = self.inner.lock().unwrap();
+        g.state.mark_in_flight(kind, slug, Some(op));
+    }
+
+    fn resource_finished(&self, kind: &str, slug: &str, _outcome: ResourceOutcome) {
+        let mut g = self.inner.lock().unwrap();
+        g.state.mark_in_flight(kind, slug, None);
+    }
+
+    fn ingest_classification(&self, items: &[ClassifiedItem]) {
+        let mut g = self.inner.lock().unwrap();
+        g.state.ingest(items, Instant::now());
+        // Task 8 adds repaint() here.
+    }
+
+    fn banner(&self, severity: Severity, msg: &str) {
+        let mut g = self.inner.lock().unwrap();
+        // Dedup within 10 s by exact text (spec 9.3).
+        let now = Instant::now();
+        // Look for an existing banner whose body matches (ignoring any
+        // existing `(×N)` suffix) within the dedup window.
+        let body = strip_count_suffix(msg);
+        if let Some(b) = g.state.banners.iter_mut().find(|b| {
+            strip_count_suffix(&b.text) == body
+                && now.saturating_duration_since(b.posted_at) < Duration::from_secs(10)
+        }) {
+            // Append `(×N)` suffix; bump posted_at.
+            let prev_count = match b.text.rfind(" (×") {
+                Some(open) => b.text[open + " (×".len()..b.text.len() - 1].parse::<u32>().unwrap_or(1),
+                None => 1,
+            };
+            b.text = format!("{} (×{})", body, prev_count + 1);
+            b.posted_at = now;
+            b.severity = severity;
+            return;
+        }
+        g.state.banners.push_back(Banner {
+            severity,
+            text: msg.to_string(),
+            posted_at: now,
+        });
+    }
+
+    fn with_prompt(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
+        let mp_clone = {
+            let g = self.inner.lock().unwrap();
+            g.mp.clone()
+        };
+        mp_clone.set_draw_target(ProgressDrawTarget::hidden());
+        let result = f();
+        mp_clone.set_draw_target(ProgressDrawTarget::stderr_with_hz(8));
+        result
+    }
+
+    fn finish_ok(&self, summary: &str) {
+        let mut g = self.inner.lock().unwrap();
+        if g.finished { return; }
+        g.finished = true;
+        // Task 12 fills in the final-frame commit. For now, just println the summary.
+        let _ = g.mp.println(format!("DONE: {summary}"));
+    }
+
+    fn finish_err(&self, msg: &str) {
+        let mut g = self.inner.lock().unwrap();
+        if g.finished { return; }
+        g.finished = true;
+        let _ = g.mp.println(format!("FAIL: {msg}"));
+    }
+}
+
+/// Strip any trailing ` (×N)` count suffix so banner dedup compares bodies.
+fn strip_count_suffix(s: &str) -> &str {
+    if let Some(open) = s.rfind(" (×") {
+        if s.ends_with(')') {
+            // Verify the inner is a number
+            let inner = &s[open + " (×".len()..s.len() - 1];
+            if inner.parse::<u32>().is_ok() {
+                return &s[..open];
+            }
+        }
+    }
+    s
+}
+
+#[cfg(test)]
+mod grid_renderer_skeleton_tests {
+    use super::*;
+
+    #[test]
+    fn new_constructs_without_panicking() {
+        let r = GridRenderer::new("test".into(), false);
+        r.phase("listing remote");
+        r.resource_started("hooks", "foo", ResourceOp::Get);
+        r.resource_finished("hooks", "foo", ResourceOutcome::Ok);
+        r.banner(Severity::Info, "ready");
+        r.finish_ok("done");
+    }
+
+    #[test]
+    fn banner_dedup_appends_count_suffix() {
+        let r = GridRenderer::new("test".into(), false);
+        r.banner(Severity::Warn, "auth expired");
+        r.banner(Severity::Warn, "auth expired");
+        r.banner(Severity::Warn, "auth expired");
+        let g = r.inner.lock().unwrap();
+        assert_eq!(g.state.banners.len(), 1);
+        assert_eq!(g.state.banners[0].text, "auth expired (×3)");
+    }
+
+    #[test]
+    fn strip_count_suffix_handles_clean_text() {
+        assert_eq!(strip_count_suffix("auth expired"), "auth expired");
+        assert_eq!(strip_count_suffix("auth expired (×2)"), "auth expired");
+        assert_eq!(strip_count_suffix("auth expired (×42)"), "auth expired");
+        // Not a count — leave alone
+        assert_eq!(strip_count_suffix("auth expired (×abc)"), "auth expired (×abc)");
+    }
+}
+
 #[cfg(test)]
 mod emit_square_tests {
     use super::*;
