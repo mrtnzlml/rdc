@@ -3,6 +3,7 @@
 //! Spec: docs/superpowers/specs/2026-05-14-watch-mode-design.md
 
 use anyhow::Result;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +26,15 @@ pub async fn run_watch(
     let cwd = std::env::current_dir()?;
     let paths = crate::paths::Paths::for_env(&cwd, env);
 
+    // Construct the renderer ONCE so the grid's freshness clocks and
+    // entry universe persist across cycles. `is_watch=true` flips
+    // header bookkeeping (uptime, etc.).
+    let renderer = crate::progress::make_sync_renderer(
+        &format!("rdc sync --watch {env}"),
+        env,
+        true,
+    );
+
     // Initial reconcile.
     {
         let _lock = crate::cli::sync::lock::EnvLock::acquire(
@@ -39,6 +49,7 @@ pub async fn run_watch(
             allow_deletes,
             no_push,
             no_pull,
+            Some(renderer.clone()),
         )
         .await?;
     }
@@ -88,6 +99,7 @@ pub async fn run_watch(
         shutdown_rx,
         Some(watcher),
         env_root,
+        Some(renderer.clone()),
     )
     .await?;
     eprintln!("\nstopping watch.");
@@ -107,6 +119,7 @@ pub(crate) async fn event_loop(
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
     mut watcher: Option<notify::RecommendedWatcher>,
     env_root: std::path::PathBuf,
+    renderer: Option<Arc<dyn crate::progress::SyncRenderer>>,
 ) -> Result<()> {
     use notify::{RecursiveMode, Watcher};
 
@@ -132,21 +145,31 @@ pub(crate) async fn event_loop(
                     let _ = w.unwatch(&env_root);
                 }
 
-                let cycle_started = std::time::Instant::now();
+                let _cycle_started = std::time::Instant::now();
                 let _lock = crate::cli::sync::lock::EnvLock::acquire(
                     &paths.env_lock(),
                     std::time::Duration::from_secs(30),
                 )?;
-                let outcome = match crate::cli::sync::run_cycle(
+                let _outcome = match crate::cli::sync::run_cycle(
                     env, interactive, false, false, allow_deletes, no_push, no_pull,
+                    renderer.clone(),
                 ).await {
                     Ok(o) => o,
                     Err(e) if crate::api::anyhow_has_status(&e, 401) => {
-                        // Prompt for a new token inline; retry once.
-                        eprintln!("[{}] auth expired", now_hhmmss());
+                        // Prompt for a new token inline; retry once. Surface
+                        // via the renderer's banner so the grid stays visible.
+                        if let Some(r) = renderer.as_ref() {
+                            r.banner(
+                                crate::progress::Severity::Warn,
+                                &format!("[{}] auth expired — refreshing token", now_hhmmss()),
+                            );
+                        } else {
+                            eprintln!("[{}] auth expired", now_hhmmss());
+                        }
                         crate::cli::auth::refresh_token_interactively(env).await?;
                         crate::cli::sync::run_cycle(
                             env, interactive, false, false, allow_deletes, no_push, no_pull,
+                            renderer.clone(),
                         ).await?
                     }
                     Err(e) if is_transient_network_error(&e) => {
@@ -177,46 +200,17 @@ pub(crate) async fn event_loop(
                 }
                 while events.try_recv().is_ok() {}
 
-                let elapsed = cycle_started.elapsed();
-                print_cycle_summary(&outcome, elapsed, verbose);
+                // The grid renderer (when active) IS the cycle summary:
+                // counts repaint as the cycle progresses, freshness clocks
+                // bump on each ingest. The log renderer's per-cycle output
+                // also already shows the summary via `progress.finish_ok`
+                // inside `run_cycle`. `verbose` is retained on the signature
+                // for backward compatibility but has no effect today.
+                let _ = verbose;
             }
         }
     }
     Ok(())
-}
-
-fn print_cycle_summary(
-    outcome: &crate::cli::sync::CycleOutcome,
-    elapsed: std::time::Duration,
-    verbose: bool,
-) {
-    let total = outcome.items_pushed
-        + outcome.items_pulled
-        + outcome.conflicts
-        + outcome.remote_deletes_resolved;
-    if total == 0 && !verbose {
-        return; // quiet by default
-    }
-    let now = now_hhmmss();
-    let dir = if outcome.items_pulled > 0 && outcome.items_pushed == 0 {
-        "pull"
-    } else if outcome.items_pushed > 0 && outcome.items_pulled == 0 {
-        "push"
-    } else {
-        "sync"
-    };
-    if total == 0 {
-        eprintln!("[{now}] (idle)");
-    } else {
-        eprintln!(
-            "[{now}] {dir} cycle: pushed {}, pulled {}, conflicts {}, deletes {} ({:.1}s)",
-            outcome.items_pushed,
-            outcome.items_pulled,
-            outcome.conflicts,
-            outcome.remote_deletes_resolved,
-            elapsed.as_secs_f32()
-        );
-    }
 }
 
 /// UTC HH:MM:SS — small standalone formatter so we don't add a `chrono` dep.
@@ -315,7 +309,7 @@ mod tests {
         sh_tx.send(()).unwrap(); // shutdown before any event
         let result = event_loop(
             "test", false, false, false, false, false, rx, sh_rx,
-            None, std::path::PathBuf::new(),
+            None, std::path::PathBuf::new(), None,
         ).await;
 
         std::env::set_current_dir(saved_cwd).unwrap();

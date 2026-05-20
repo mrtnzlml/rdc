@@ -789,92 +789,101 @@ fn resolve_one_conflict<R: BufRead>(
     //
     // `code_conflict_only` tracks the redirect so write-back branches
     // below know to write to the sidecar (not the JSON).
-    let (resolution, code_conflict_only, prompt_local_bytes, prompt_remote_bytes, prompt_path)
-        : (Resolution, bool, Vec<u8>, Vec<u8>, PathBuf) =
-    {
-        if json_canonicalize_equal && sidecar_diverges {
-            match hash_strategy {
-                HashStrategy::Hook | HashStrategy::Rule => {
-                    let local_bytes = local_code.clone().unwrap_or_default().into_bytes();
-                    let remote_bytes_for_prompt =
-                        remote_code.clone().unwrap_or_default().into_bytes();
-                    let r = crate::cli::resolve::prompt_resolve_with_bytes(
-                        input,
-                        stderr_lock,
-                        idx_one_based,
-                        total,
-                        &code_path,
-                        &local_bytes,
-                        &remote_bytes_for_prompt,
-                        env,
-                    )?;
-                    (r, true, local_bytes, remote_bytes_for_prompt, code_path.clone())
-                }
-                HashStrategy::Schema => {
-                    // Pick the first divergent formula sidecar for the
-                    // prompt focus. The user resolves the formula; we
-                    // record the schema_combined_hash on resolution.
-                    let queue_dir = local_path.parent().unwrap_or(&local_path);
-                    let formulas_dir = queue_dir.join("formulas");
-                    let (fid, local_b, remote_b) = {
-                        let mut chosen: Option<(String, Vec<u8>, Vec<u8>)> = None;
-                        for (rid, rbytes) in &remote_formulas {
-                            let lb = local_formulas
-                                .iter()
-                                .find(|(lid, _)| lid == rid)
-                                .map(|(_, b)| b.clone());
-                            if lb.as_deref() != Some(rbytes.as_slice()) {
-                                chosen = Some((rid.clone(), lb.unwrap_or_default(), rbytes.clone()));
-                                break;
-                            }
-                        }
-                        if chosen.is_none() {
-                            // Local-only formula (remote dropped it).
-                            for (lid, lbytes) in &local_formulas {
-                                if !remote_formulas.iter().any(|(rid, _)| rid == lid) {
-                                    chosen = Some((lid.clone(), lbytes.clone(), Vec::new()));
+    // Wrap all prompt reads in `with_prompt` so the grid renderer
+    // suspends its draw region for the duration of the stdin read.
+    // For the log renderer this is a transparent no-op.
+    let prompt_out: std::cell::RefCell<
+        Option<(Resolution, bool, Vec<u8>, Vec<u8>, PathBuf)>,
+    > = std::cell::RefCell::new(None);
+    progress.with_prompt(&mut || {
+        let computed: (Resolution, bool, Vec<u8>, Vec<u8>, PathBuf) =
+            if json_canonicalize_equal && sidecar_diverges {
+                match hash_strategy {
+                    HashStrategy::Hook | HashStrategy::Rule => {
+                        let local_bytes = local_code.clone().unwrap_or_default().into_bytes();
+                        let remote_bytes_for_prompt =
+                            remote_code.clone().unwrap_or_default().into_bytes();
+                        let r = crate::cli::resolve::prompt_resolve_with_bytes(
+                            &mut *input,
+                            &mut *stderr_lock,
+                            idx_one_based,
+                            total,
+                            &code_path,
+                            &local_bytes,
+                            &remote_bytes_for_prompt,
+                            env,
+                        )?;
+                        (r, true, local_bytes, remote_bytes_for_prompt, code_path.clone())
+                    }
+                    HashStrategy::Schema => {
+                        // Pick the first divergent formula sidecar for the
+                        // prompt focus. The user resolves the formula; we
+                        // record the schema_combined_hash on resolution.
+                        let queue_dir = local_path.parent().unwrap_or(&local_path);
+                        let formulas_dir = queue_dir.join("formulas");
+                        let (fid, local_b, remote_b) = {
+                            let mut chosen: Option<(String, Vec<u8>, Vec<u8>)> = None;
+                            for (rid, rbytes) in &remote_formulas {
+                                let lb = local_formulas
+                                    .iter()
+                                    .find(|(lid, _)| lid == rid)
+                                    .map(|(_, b)| b.clone());
+                                if lb.as_deref() != Some(rbytes.as_slice()) {
+                                    chosen = Some((rid.clone(), lb.unwrap_or_default(), rbytes.clone()));
                                     break;
                                 }
                             }
-                        }
-                        chosen.unwrap_or_else(|| ("unknown".to_string(), Vec::new(), Vec::new()))
-                    };
-                    let formula_path = formulas_dir.join(format!("{fid}.py"));
-                    let r = crate::cli::resolve::prompt_resolve_with_bytes(
-                        input,
-                        stderr_lock,
-                        idx_one_based,
-                        total,
-                        &formula_path,
-                        &local_b,
-                        &remote_b,
-                        env,
-                    )?;
-                    // For schemas we don't write the sidecar from the
-                    // resolver — the `[r]` path adopts the whole
-                    // schema including all formulas (handled below).
-                    // `code_conflict_only` remains false because the
-                    // KeepLocal/KeepRemote/Edit branches need to
-                    // handle the whole schema, not just one formula.
-                    (r, false, local_b, remote_b, formula_path)
+                            if chosen.is_none() {
+                                // Local-only formula (remote dropped it).
+                                for (lid, lbytes) in &local_formulas {
+                                    if !remote_formulas.iter().any(|(rid, _)| rid == lid) {
+                                        chosen = Some((lid.clone(), lbytes.clone(), Vec::new()));
+                                        break;
+                                    }
+                                }
+                            }
+                            chosen.unwrap_or_else(|| ("unknown".to_string(), Vec::new(), Vec::new()))
+                        };
+                        let formula_path = formulas_dir.join(format!("{fid}.py"));
+                        let r = crate::cli::resolve::prompt_resolve_with_bytes(
+                            &mut *input,
+                            &mut *stderr_lock,
+                            idx_one_based,
+                            total,
+                            &formula_path,
+                            &local_b,
+                            &remote_b,
+                            env,
+                        )?;
+                        // For schemas we don't write the sidecar from the
+                        // resolver — the `[r]` path adopts the whole
+                        // schema including all formulas (handled below).
+                        // `code_conflict_only` remains false because the
+                        // KeepLocal/KeepRemote/Edit branches need to
+                        // handle the whole schema, not just one formula.
+                        (r, false, local_b, remote_b, formula_path)
+                    }
+                    HashStrategy::Flat => unreachable!(),
                 }
-                HashStrategy::Flat => unreachable!(),
-            }
-        } else {
-            // Standard JSON-based prompt (path-driven; reads
-            // `local_path` for local bytes).
-            let r = prompt_resolve(
-                input,
-                stderr_lock,
-                idx_one_based,
-                total,
-                &local_path,
-                &remote_bytes,
-                env,
-            )?;
-            (r, false, local_json_bytes.clone(), remote_bytes.clone(), local_path.clone())
-        }
-    };
+            } else {
+                // Standard JSON-based prompt (path-driven; reads
+                // `local_path` for local bytes).
+                let r = prompt_resolve(
+                    &mut *input,
+                    &mut *stderr_lock,
+                    idx_one_based,
+                    total,
+                    &local_path,
+                    &remote_bytes,
+                    env,
+                )?;
+                (r, false, local_json_bytes.clone(), remote_bytes.clone(), local_path.clone())
+            };
+        *prompt_out.borrow_mut() = Some(computed);
+        Ok(())
+    })?;
+    let (resolution, code_conflict_only, prompt_local_bytes, prompt_remote_bytes, prompt_path) =
+        prompt_out.into_inner().expect("with_prompt must populate the resolution");
 
     // Suppress unused-warning for prompt_local_bytes when no Skip arm
     // reads it (the variable carries diagnostic value for future hooks).
@@ -1703,12 +1712,19 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     continue;
                 }
 
-                let resolution = prompt_remote_delete(
-                    &mut input,
-                    std::io::stderr().lock(),
-                    &local_path,
-                    &env,
-                )?;
+                let prompt_res: std::cell::RefCell<Option<Resolution>> =
+                    std::cell::RefCell::new(None);
+                progress.with_prompt(&mut || {
+                    let r = prompt_remote_delete(
+                        &mut input,
+                        std::io::stderr().lock(),
+                        &local_path,
+                        &env,
+                    )?;
+                    *prompt_res.borrow_mut() = Some(r);
+                    Ok(())
+                })?;
+                let resolution = prompt_res.into_inner().expect("with_prompt must populate");
 
                 // The action a given letter triggers depends on which
                 // class we're resolving (spec §"Double-conflict cases"):
@@ -2041,11 +2057,18 @@ pub async fn run(
             }
         }
         if !tombstones.is_empty() {
-            match crate::cli::push::deletes::confirm_or_refuse(
-                &tombstones,
-                interactive,
-                allow_deletes,
-            )? {
+            let confirm_out: std::cell::RefCell<Option<crate::cli::push::deletes::ConfirmOutcome>> =
+                std::cell::RefCell::new(None);
+            progress.with_prompt(&mut || {
+                let o = crate::cli::push::deletes::confirm_or_refuse(
+                    &tombstones,
+                    interactive,
+                    allow_deletes,
+                )?;
+                *confirm_out.borrow_mut() = Some(o);
+                Ok(())
+            })?;
+            match confirm_out.into_inner().expect("with_prompt must populate") {
                 crate::cli::push::deletes::ConfirmOutcome::Aborted => {
                     eprintln!("delete phase aborted at confirmation; remote unchanged.");
                 }
