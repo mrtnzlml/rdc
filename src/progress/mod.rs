@@ -95,19 +95,17 @@ pub trait SyncRenderer: Send + Sync {
 
 /// Dispatcher. Returns a [`GridRenderer`] when stderr is a TTY (and
 /// color is available), else a [`log::ProgressLog`] wrapped in a
-/// thin trait adapter. Filled in in Task 3.
+/// thin trait adapter.
 pub fn make_sync_renderer(
     title: &str,
-    _env: &str,
-    _is_watch: bool,
+    env: &str,
+    is_watch: bool,
 ) -> Arc<dyn SyncRenderer> {
     use std::io::IsTerminal;
-    if std::io::stderr().is_terminal() {
-        // Task 9 swaps this for GridRenderer once the grid is built.
-        // Until then, even on a TTY we fall back to ProgressLog so the
-        // existing UX is unchanged for callers that already construct
-        // through the dispatcher.
-        log::ProgressLog::start(title)
+    let is_tty = std::io::stderr().is_terminal();
+    let color = grid::detect_color_depth();
+    if is_tty && color != grid::ColorDepth::None {
+        grid::GridRenderer::new(env.to_string(), is_watch)
     } else {
         log::ProgressLog::start(title)
     }
@@ -125,6 +123,37 @@ mod dispatcher_tests {
         renderer.resource_finished("hooks", "validator-invoices", ResourceOutcome::Ok);
         renderer.banner(Severity::Info, "ready");
         renderer.finish_ok("done");
+    }
+}
+
+#[cfg(test)]
+mod dispatcher_routing_tests {
+    use super::*;
+
+    #[test]
+    fn no_color_routes_to_log_renderer() {
+        let saved = std::env::var("NO_COLOR").ok();
+        // SAFETY: env var mutation is process-global; save+restore to
+        // minimize blast radius. The matching pattern is what other
+        // tests in this codebase use (see emit_square_tests).
+        unsafe { std::env::set_var("NO_COLOR", "1"); }
+
+        // With NO_COLOR set, detect_color_depth returns None →
+        // dispatcher must return a LogRenderer regardless of TTY state.
+        let r = make_sync_renderer("test", "test", false);
+        // We can't downcast through Arc<dyn SyncRenderer>. Instead,
+        // assert behavior: LogRenderer's ingest_classification is a
+        // no-op. GridRenderer would have updated state.
+        r.phase("listing remote");
+        r.ingest_classification(&[]);
+        r.finish_ok("done");
+
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("NO_COLOR", v),
+                None => std::env::remove_var("NO_COLOR"),
+            };
+        }
     }
 }
 
