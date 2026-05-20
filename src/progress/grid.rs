@@ -612,9 +612,12 @@ impl GridRenderer {
 
     pub fn new(env: String, is_watch: bool) -> Arc<Self> {
         let mp = MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(8));
+        // Four-frame filling-bar spinner used as the "alive" indicator on
+        // the header line. Cycles ▱▱▱ → ▰▱▱ → ▰▰▱ → ▰▰▰ → ▱▱▱ … at the
+        // 250 ms steady tick below, one full sweep per second.
         let style_spinner = ProgressStyle::with_template("{spinner} {msg}")
             .unwrap()
-            .tick_strings(&["|", "/", "-", "\\"]);
+            .tick_strings(&["▱▱▱", "▰▱▱", "▰▰▱", "▰▰▰"]);
         let main_bar = mp.add(ProgressBar::new(1));
         main_bar.set_style(style_spinner);
         main_bar.enable_steady_tick(Duration::from_millis(250));
