@@ -13,7 +13,7 @@ use super::common::{
     record_object, skip_on_permission_denied, PullAction, PullCtx,
 };
 use crate::model::{Inbox, Queue, Schema};
-use crate::progress::SyncRenderer;
+use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -104,6 +104,9 @@ pub async fn process(
             continue;
         }
 
+        progress.resource_started("queues", &q_slug, ResourceOp::Get);
+        let queue_result: Result<()> = (|| {
+
         let queue_dir = ctx.paths.queue_dir(&ws_slug, &q_slug);
         std::fs::create_dir_all(&queue_dir)
             .with_context(|| format!("creating {}", queue_dir.display()))?;
@@ -153,7 +156,15 @@ pub async fn process(
             ));
         }
 
-        work.push(QueueWork { q, q_slug, queue_dir });
+        work.push(QueueWork { q, q_slug: q_slug.clone(), queue_dir });
+        Ok(())
+        })();
+        let queue_outcome = match &queue_result {
+            Ok(()) => ResourceOutcome::Ok,
+            Err(e) => ResourceOutcome::Failed(e.to_string()),
+        };
+        progress.resource_finished("queues", &q_slug, queue_outcome);
+        queue_result?;
     }
 
     if work.is_empty() {
@@ -166,10 +177,24 @@ pub async fn process(
     // loop is intentionally sequential.
     for w in &work {
         if let Some(schema) = schemas_by_queue_id.get(&w.q.id) {
-            write_schema_for_queue(ctx, &mut counts, w, schema, progress)?;
+            progress.resource_started("schemas", &w.q_slug, ResourceOp::Get);
+            let schema_result = write_schema_for_queue(ctx, &mut counts, w, schema, progress);
+            let schema_outcome = match &schema_result {
+                Ok(()) => ResourceOutcome::Ok,
+                Err(e) => ResourceOutcome::Failed(e.to_string()),
+            };
+            progress.resource_finished("schemas", &w.q_slug, schema_outcome);
+            schema_result?;
         }
         if let Some(inbox) = inboxes_by_queue_id.get(&w.q.id) {
-            write_inbox_for_queue(ctx, &mut counts, w, inbox, progress)?;
+            progress.resource_started("inboxes", &w.q_slug, ResourceOp::Get);
+            let inbox_result = write_inbox_for_queue(ctx, &mut counts, w, inbox, progress);
+            let inbox_outcome = match &inbox_result {
+                Ok(()) => ResourceOutcome::Ok,
+                Err(e) => ResourceOutcome::Failed(e.to_string()),
+            };
+            progress.resource_finished("inboxes", &w.q_slug, inbox_outcome);
+            inbox_result?;
         }
     }
 

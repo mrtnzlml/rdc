@@ -3,7 +3,7 @@ use super::common::{
     PullAction, PullCtx,
 };
 use crate::model::Rule;
-use crate::progress::SyncRenderer;
+use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::slug::slugify_unique;
 use crate::snapshot::rule::{serialize_rule, write_rule_code};
 use crate::state::rule_combined_hash;
@@ -49,6 +49,9 @@ pub async fn process(
         if !subset.contains(&("rules".to_string(), slug.clone())) {
             continue;
         }
+
+        progress.resource_started("rules", &slug, ResourceOp::Get);
+        let result: Result<()> = (|| {
 
         if !dir_created {
             std::fs::create_dir_all(ctx.paths.rules_dir())
@@ -193,6 +196,14 @@ pub async fn process(
             Some(recorded_hash),
         );
         written += 1;
+        Ok(())
+        })();
+        let outcome = match &result {
+            Ok(()) => ResourceOutcome::Ok,
+            Err(e) => ResourceOutcome::Failed(e.to_string()),
+        };
+        progress.resource_finished("rules", &slug, outcome);
+        result?;
     }
 
     if written > 0 {

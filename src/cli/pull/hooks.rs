@@ -3,7 +3,7 @@ use super::common::{
     PullAction, PullCtx,
 };
 use crate::model::Hook;
-use crate::progress::SyncRenderer;
+use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::slug::slugify_unique;
 use crate::snapshot::hook::{hook_code_extension, serialize_hook, write_hook_code};
 use crate::state::hook_combined_hash;
@@ -45,6 +45,9 @@ pub async fn process(
         if !subset.contains(&("hooks".to_string(), slug.clone())) {
             continue;
         }
+
+        progress.resource_started("hooks", &slug, ResourceOp::Get);
+        let result: Result<()> = (|| {
 
         if !dir_created {
             std::fs::create_dir_all(ctx.paths.hooks_dir())
@@ -245,6 +248,14 @@ pub async fn process(
             Some(recorded_hash),
         );
         written += 1;
+        Ok(())
+        })();
+        let outcome = match &result {
+            Ok(()) => ResourceOutcome::Ok,
+            Err(e) => ResourceOutcome::Failed(e.to_string()),
+        };
+        progress.resource_finished("hooks", &slug, outcome);
+        result?;
     }
 
     if written > 0 {

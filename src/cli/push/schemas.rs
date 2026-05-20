@@ -2,7 +2,7 @@ use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::SyncRenderer;
+use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::schema::{read_schema_value, serialize_schema, write_schema_bytes};
 use crate::state::{schema_combined_hash, Lockfile, ObjectEntry};
@@ -47,8 +47,15 @@ pub async fn push(
                 apply_overrides(&mut payload, p);
             }
             strip_for_create(&mut payload, "schemas");
-            let created = client.create_schema(&payload, Some(progress.clone())).await
-                .with_context(|| format!("POST /schemas (creating for queue '{q_slug}')"))?;
+            progress.resource_started("schemas", q_slug, ResourceOp::Post);
+            let create_result = client.create_schema(&payload, Some(progress.clone())).await
+                .with_context(|| format!("POST /schemas (creating for queue '{q_slug}')"));
+            let create_outcome = match &create_result {
+                Ok(_) => ResourceOutcome::Ok,
+                Err(e) => ResourceOutcome::Failed(e.to_string()),
+            };
+            progress.resource_finished("schemas", q_slug, create_outcome);
+            let created = create_result?;
             let (created_json, created_formulas) = serialize_schema(&created)?;
             let created_json = maybe_strip_overlay(created_json, overlay_paths)?;
             let created_hash = schema_combined_hash(&created_json, &created_formulas);
@@ -138,8 +145,15 @@ pub async fn push(
             }
         }
 
-        let updated = client.update_schema(id, &payload_to_send, Some(progress.clone())).await
-            .with_context(|| format!("PATCH /schemas/{id}"))?;
+        progress.resource_started("schemas", q_slug, ResourceOp::Patch);
+        let patch_result = client.update_schema(id, &payload_to_send, Some(progress.clone())).await
+            .with_context(|| format!("PATCH /schemas/{id}"));
+        let patch_outcome = match &patch_result {
+            Ok(_) => ResourceOutcome::Ok,
+            Err(e) => ResourceOutcome::Failed(e.to_string()),
+        };
+        progress.resource_finished("schemas", q_slug, patch_outcome);
+        let updated = patch_result?;
 
         let (updated_json, updated_formulas) = serialize_schema(&updated)?;
         let updated_json = maybe_strip_overlay(updated_json, overlay_paths)?;

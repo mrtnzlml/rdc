@@ -2,7 +2,7 @@ use super::common::{apply_pull_action, decide_pull_action, record_object, PullAc
 use crate::api::{anyhow_has_status, DataStorageClient};
 use crate::config::EnvConfig;
 use crate::model::{Collection, IndexSet};
-use crate::progress::SyncRenderer;
+use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use futures::stream::{StreamExt, TryStreamExt};
@@ -76,6 +76,9 @@ pub async fn process(
             continue;
         }
 
+        progress.resource_started("mdh", &slug, ResourceOp::Get);
+        let coll_result: Result<()> = (|| {
+
         if !dir_created {
             std::fs::create_dir_all(ctx.paths.mdh_dir())
                 .with_context(|| format!("creating {}", ctx.paths.mdh_dir().display()))?;
@@ -111,7 +114,15 @@ pub async fn process(
             Some(c_recorded),
         );
 
-        dataset_dirs.push((slug, dataset_dir, c));
+        dataset_dirs.push((slug.clone(), dataset_dir, c));
+        Ok(())
+        })();
+        let coll_outcome = match &coll_result {
+            Ok(()) => ResourceOutcome::Ok,
+            Err(e) => ResourceOutcome::Failed(e.to_string()),
+        };
+        progress.resource_finished("mdh", &slug, coll_outcome);
+        coll_result?;
     }
 
     // === Sub-phase B: concurrent index fetches per collection (regular +
@@ -147,6 +158,9 @@ pub async fn process(
     for (slug, dataset_dir, _c) in &dataset_dirs {
         let Some(index_set) = by_slug.get(slug) else { continue };
 
+        progress.resource_started("mdh", slug, ResourceOp::Get);
+        let ix_result: Result<()> = (|| {
+
         let ix_path = dataset_dir.join("indexes.json");
         let mut ix_proposed = serde_json::to_vec_pretty(index_set).context("serializing index set")?;
         ix_proposed.push(b'\n');
@@ -171,6 +185,14 @@ pub async fn process(
             None,
             Some(i_recorded),
         );
+        Ok(())
+        })();
+        let ix_outcome = match &ix_result {
+            Ok(()) => ResourceOutcome::Ok,
+            Err(e) => ResourceOutcome::Failed(e.to_string()),
+        };
+        progress.resource_finished("mdh", slug, ix_outcome);
+        ix_result?;
     }
 
     if !dataset_dirs.is_empty() {

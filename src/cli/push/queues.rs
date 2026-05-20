@@ -2,7 +2,7 @@ use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::SyncRenderer;
+use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
@@ -43,8 +43,15 @@ pub async fn push(
                 apply_overrides(&mut payload, p);
             }
             strip_for_create(&mut payload, "queues");
-            let created = client.create_queue(&payload, Some(progress.clone())).await
-                .with_context(|| format!("POST /queues (creating '{q_slug}')"))?;
+            progress.resource_started("queues", q_slug, ResourceOp::Post);
+            let create_result = client.create_queue(&payload, Some(progress.clone())).await
+                .with_context(|| format!("POST /queues (creating '{q_slug}')"));
+            let create_outcome = match &create_result {
+                Ok(_) => ResourceOutcome::Ok,
+                Err(e) => ResourceOutcome::Failed(e.to_string()),
+            };
+            progress.resource_finished("queues", q_slug, create_outcome);
+            let created = create_result?;
             let mut created_bytes = serde_json::to_vec_pretty(&created)
                 .context("serializing created queue")?;
             created_bytes.push(b'\n');
@@ -140,8 +147,15 @@ pub async fn push(
             }
         }
 
-        let updated = client.update_queue(id, &payload_to_send, Some(progress.clone())).await
-            .with_context(|| format!("PATCH /queues/{id}"))?;
+        progress.resource_started("queues", q_slug, ResourceOp::Patch);
+        let patch_result = client.update_queue(id, &payload_to_send, Some(progress.clone())).await
+            .with_context(|| format!("PATCH /queues/{id}"));
+        let patch_outcome = match &patch_result {
+            Ok(_) => ResourceOutcome::Ok,
+            Err(e) => ResourceOutcome::Failed(e.to_string()),
+        };
+        progress.resource_finished("queues", q_slug, patch_outcome);
+        let updated = patch_result?;
 
         let mut updated_bytes = serde_json::to_vec_pretty(&updated)
             .context("serializing updated queue")?;

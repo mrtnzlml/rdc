@@ -2,7 +2,7 @@ use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::SyncRenderer;
+use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
@@ -41,8 +41,15 @@ pub async fn push(
                 apply_overrides(&mut payload, p);
             }
             strip_for_create(&mut payload, "labels");
-            let created = client.create_label(&payload, Some(progress.clone())).await
-                .with_context(|| format!("POST /labels (creating '{slug}')"))?;
+            progress.resource_started("labels", slug, ResourceOp::Post);
+            let result = client.create_label(&payload, Some(progress.clone())).await
+                .with_context(|| format!("POST /labels (creating '{slug}')"));
+            let outcome = match &result {
+                Ok(_) => ResourceOutcome::Ok,
+                Err(e) => ResourceOutcome::Failed(e.to_string()),
+            };
+            progress.resource_finished("labels", slug, outcome);
+            let created = result?;
             let mut created_bytes = serde_json::to_vec_pretty(&created)
                 .context("serializing created label")?;
             created_bytes.push(b'\n');
@@ -140,8 +147,15 @@ pub async fn push(
             }
         }
 
-        let updated = client.update_label(id, &payload_to_send, Some(progress.clone())).await
-            .with_context(|| format!("PATCH /labels/{id}"))?;
+        progress.resource_started("labels", slug, ResourceOp::Patch);
+        let result = client.update_label(id, &payload_to_send, Some(progress.clone())).await
+            .with_context(|| format!("PATCH /labels/{id}"));
+        let outcome = match &result {
+            Ok(_) => ResourceOutcome::Ok,
+            Err(e) => ResourceOutcome::Failed(e.to_string()),
+        };
+        progress.resource_finished("labels", slug, outcome);
+        let updated = result?;
 
         let mut updated_bytes = serde_json::to_vec_pretty(&updated)
             .context("serializing updated label")?;
