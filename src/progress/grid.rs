@@ -464,10 +464,13 @@ const MAX_BANNERS: usize = 2;
 /// the square budget; continuation rows pad to this width so squares
 /// vertically align with the first row.
 const LABEL_WIDTH: usize = 23;
-/// Upper bound on squares per row regardless of terminal width. On a
-/// 400-col terminal a single row of 188 squares is unreadable; cap so
-/// wide layouts wrap into multiple visually-balanced rows.
-const MAX_CELLS_PER_LINE: usize = 60;
+/// Maximum total visible width of a grid row including the label
+/// prefix. 72 chars matches the classic email/gitcommit/markdown line
+/// width — keeps the grid compact on wide terminals instead of
+/// stretching squares across the full screen. Terminals narrower than
+/// 72 cols still use their natural (smaller) budget; this cap only
+/// kicks in once the screen is wider than 72.
+const MAX_GRID_WIDTH: usize = 72;
 
 pub struct GridRenderer {
     inner: Mutex<GridInner>,
@@ -486,13 +489,14 @@ struct GridInner {
 
 impl GridRenderer {
     /// Width budget for square cells (after the 23-char label prefix).
-    /// Falls back to 80-column if crossterm can't read the size, and caps
-    /// at MAX_CELLS_PER_LINE so very wide terminals still wrap.
+    /// Falls back to 80-column if crossterm can't read the size, and
+    /// clamps the effective terminal width to MAX_GRID_WIDTH so wide
+    /// terminals don't stretch squares across the screen.
     fn cells_per_line(&self) -> usize {
         let cols = crossterm::terminal::size().map(|(c, _)| c as usize).unwrap_or(80);
-        let budget = cols.saturating_sub(LABEL_WIDTH);
-        let raw = (budget / 2).max(1); // each square is 1 glyph + 1 gap = 2 cells
-        raw.min(MAX_CELLS_PER_LINE)
+        let effective_cols = cols.min(MAX_GRID_WIDTH);
+        let budget = effective_cols.saturating_sub(LABEL_WIDTH);
+        (budget / 2).max(1) // each square is 1 glyph + 1 gap = 2 cells
     }
 
     fn repaint(&self) {
