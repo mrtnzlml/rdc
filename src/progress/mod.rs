@@ -97,11 +97,35 @@ pub trait SyncRenderer: Send + Sync {
 /// color is available), else a [`log::ProgressLog`] wrapped in a
 /// thin trait adapter. Filled in in Task 3.
 pub fn make_sync_renderer(
-    _title: &str,
+    title: &str,
     _env: &str,
     _is_watch: bool,
 ) -> Arc<dyn SyncRenderer> {
-    unimplemented!("replaced in Task 3")
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal() {
+        // Task 9 swaps this for GridRenderer once the grid is built.
+        // Until then, even on a TTY we fall back to ProgressLog so the
+        // existing UX is unchanged for callers that already construct
+        // through the dispatcher.
+        log::ProgressLog::start(title)
+    } else {
+        log::ProgressLog::start(title)
+    }
+}
+
+#[cfg(test)]
+mod dispatcher_tests {
+    use super::*;
+
+    #[test]
+    fn make_sync_renderer_returns_a_trait_object() {
+        let renderer: Arc<dyn SyncRenderer> = make_sync_renderer("test", "test", false);
+        renderer.phase("listing remote");
+        renderer.resource_started("hooks", "validator-invoices", ResourceOp::Patch);
+        renderer.resource_finished("hooks", "validator-invoices", ResourceOutcome::Ok);
+        renderer.banner(Severity::Info, "ready");
+        renderer.finish_ok("done");
+    }
 }
 
 #[cfg(test)]

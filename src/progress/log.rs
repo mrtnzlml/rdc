@@ -40,6 +40,9 @@ struct LogInner {
     current_phase: Option<String>,
     /// Whether `finish` / `finish_err` has been called.
     finished: bool,
+    /// Weak self-reference so `&self` trait methods can re-acquire the
+    /// Arc<ProgressLog> needed by the existing `phase` / `finish` methods.
+    self_weak: std::sync::Weak<ProgressLog>,
 }
 
 impl ProgressLog {
@@ -52,7 +55,7 @@ impl ProgressLog {
         let tty = std::io::stderr().is_terminal();
         let color = crate::cli::resolve::detect_color_mode(false);
         let mp = indicatif::MultiProgress::new();
-        Arc::new(Self {
+        Arc::new_cyclic(|weak| Self {
             inner: Mutex::new(LogInner {
                 title,
                 mp,
@@ -60,8 +63,18 @@ impl ProgressLog {
                 color,
                 current_phase: None,
                 finished: false,
+                self_weak: weak.clone(),
             }),
         })
+    }
+
+    /// Re-acquire `Arc<Self>` from inside a `&self` trait method. Panics
+    /// if called after the last external `Arc<Self>` has been dropped —
+    /// in practice, all trait calls happen while the dispatcher holds
+    /// an `Arc<dyn SyncRenderer>`, so this is safe.
+    fn clone_arc(&self) -> Arc<Self> {
+        self.inner.lock().unwrap().self_weak.upgrade()
+            .expect("ProgressLog dropped while trait method was running")
     }
 
     /// Start a labelled section. The label appears on its own line,
@@ -346,6 +359,63 @@ fn format_final_line(
         "!" => crate::cli::resolve::colorize_warning(&body, color),
         "[fail]" => crate::cli::resolve::colorize_error(&body, color),
         _ => body,
+    }
+}
+
+use crate::progress::{ResourceOp, ResourceOutcome, Severity, SyncRenderer};
+use crate::cli::sync::classify::ClassifiedItem;
+
+impl SyncRenderer for ProgressLog {
+    fn phase(&self, label: &str) {
+        // The existing `phase(self: &Arc<Self>, ...)` returns a `Phase`
+        // handle. For the trait surface, we re-acquire the Arc, emit
+        // the header line, and drop the handle. Items inside the
+        // section come through subsequent `warn_line` calls.
+        let arc = self.clone_arc();
+        let _phase = arc.phase(label.to_string());
+    }
+
+    fn warn_line(&self, msg: &str) {
+        self.warn(msg);
+    }
+
+    fn resource_started(&self, _kind: &str, _slug: &str, _op: ResourceOp) {
+        // No-op for the line-based log. Per-resource events are a
+        // grid-only concern.
+    }
+
+    fn resource_finished(&self, _kind: &str, _slug: &str, _outcome: ResourceOutcome) {
+        // No-op for the line-based log.
+    }
+
+    fn ingest_classification(&self, _items: &[ClassifiedItem]) {
+        // No-op for the line-based log. The dry-run plan enumeration
+        // and the per-driver `[ok] <kind> <count>` lines already give
+        // the log-mode user a full picture.
+    }
+
+    fn banner(&self, severity: Severity, msg: &str) {
+        match severity {
+            Severity::Info => self.println(msg),
+            Severity::Warn | Severity::Error => self.warn(msg),
+        }
+    }
+
+    fn with_prompt(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
+        // `MultiProgress::println` already suspends any in-flight
+        // spinner cleanly. Inline prompt reads via `eprint!` /
+        // `read_line` don't need extra coordination.
+        f()
+    }
+
+    fn finish_ok(&self, summary: &str) {
+        let arc = self.clone_arc();
+        arc.finish(summary.to_string());
+    }
+
+    fn finish_err(&self, msg: &str) {
+        let arc = self.clone_arc();
+        arc.finish_err(msg.to_string());
     }
 }
 
