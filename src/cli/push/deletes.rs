@@ -29,10 +29,12 @@
 
 use crate::api::{anyhow_has_status, RossumClient};
 use crate::cli::push::scan::Tombstones;
+use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::state::Lockfile;
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub enum ConfirmOutcome {
@@ -167,6 +169,7 @@ pub async fn run_deletes(
     lockfile: &mut Lockfile,
     tombstones: &Tombstones,
     interactive: bool,
+    progress: &Arc<dyn SyncRenderer>,
 ) -> Result<DeleteCounts> {
     let mut counts = DeleteCounts::default();
 
@@ -175,7 +178,15 @@ pub async fn run_deletes(
         // (we'd hold a borrow of the map otherwise).
         let entries: Vec<(String, u64)> = map.iter().map(|(s, i)| (s.clone(), *i)).collect();
         for (slug, id) in entries {
-            let outcome = delete_one(client, kind, &slug, id, lockfile, interactive).await?;
+            progress.resource_started(kind, &slug, ResourceOp::Delete);
+            let delete_result = delete_one(client, kind, &slug, id, lockfile, interactive).await;
+            let res_outcome = match &delete_result {
+                Ok(DeleteOutcome::Deleted) | Ok(DeleteOutcome::AlreadyGone) => ResourceOutcome::Ok,
+                Ok(DeleteOutcome::Skipped) => ResourceOutcome::Skipped,
+                Err(e) => ResourceOutcome::Failed(e.to_string()),
+            };
+            progress.resource_finished(kind, &slug, res_outcome);
+            let outcome = delete_result?;
             apply_outcome(&mut counts, kind, outcome);
         }
     }

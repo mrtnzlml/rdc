@@ -2,7 +2,7 @@ use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::SyncRenderer;
+use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::hook::{
     hook_code_extension, hook_code_extension_from_value, read_hook_value, serialize_hook,
@@ -128,6 +128,8 @@ pub async fn push(
             let created_secrets_hash =
                 hook_secrets_hash(hook_secrets.for_slug(slug).unwrap_or(&BTreeMap::new()));
 
+            progress.resource_started("hooks", slug, ResourceOp::Post);
+            let post_result: Result<crate::model::Hook> = async {
             let created = if typed.is_store_extension() {
                 // Two-call create: orphan check → POST /hooks/create → PATCH.
                 // The install endpoint takes a fixed minimal body; secrets
@@ -187,6 +189,14 @@ pub async fn push(
                     .await
                     .with_context(|| format!("POST /hooks (creating '{slug}')"))?
             };
+            Ok(created)
+            }.await;
+            let post_outcome = match &post_result {
+                Ok(_) => ResourceOutcome::Ok,
+                Err(e) => ResourceOutcome::Failed(e.to_string()),
+            };
+            progress.resource_finished("hooks", slug, post_outcome);
+            let created = post_result?;
 
             // Disk + lockfile write — same for both paths. The sidecar
             // extension is derived from the server's response runtime so
@@ -346,10 +356,17 @@ pub async fn push(
         let mut body = serde_json::to_value(&payload_to_send)
             .with_context(|| format!("serializing hook '{slug}' for PATCH"))?;
         let updated_secrets_hash = inject_hook_secrets(&mut body, slug, &hook_secrets);
-        let updated = client
+        progress.resource_started("hooks", slug, ResourceOp::Patch);
+        let patch_result = client
             .update_hook_value(id, &body, Some(progress.clone()))
             .await
-            .with_context(|| format!("PATCH /hooks/{id}"))?;
+            .with_context(|| format!("PATCH /hooks/{id}"));
+        let patch_outcome = match &patch_result {
+            Ok(_) => ResourceOutcome::Ok,
+            Err(e) => ResourceOutcome::Failed(e.to_string()),
+        };
+        progress.resource_finished("hooks", slug, patch_outcome);
+        let updated = patch_result?;
 
         // Refresh local file with the post-strip canonical form (matches
         // what next pull would write) and update lockfile to match.
@@ -422,10 +439,17 @@ pub async fn push(
         // accepts a partial body, so we don't need to send the whole
         // hook just to update one secret value.
         let body = serde_json::json!({ "secrets": local_kv });
-        let updated = client
+        progress.resource_started("hooks", slug, ResourceOp::Patch);
+        let secrets_result = client
             .update_hook_value(entry.id, &body, Some(progress.clone()))
             .await
-            .with_context(|| format!("PATCH /hooks/{} (secrets for '{}')", entry.id, slug))?;
+            .with_context(|| format!("PATCH /hooks/{} (secrets for '{}')", entry.id, slug));
+        let secrets_outcome = match &secrets_result {
+            Ok(_) => ResourceOutcome::Ok,
+            Err(e) => ResourceOutcome::Failed(e.to_string()),
+        };
+        progress.resource_finished("hooks", slug, secrets_outcome);
+        let updated = secrets_result?;
         // Carry forward the existing `content_hash`; only `secrets_hash`
         // and `modified_at` may have changed.
         let prior_content_hash = entry.content_hash.clone();

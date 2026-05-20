@@ -2056,6 +2056,7 @@ pub async fn run(
                         ctx.lockfile,
                         &tombstones,
                         interactive,
+                        progress,
                     )
                     .await?;
                 }

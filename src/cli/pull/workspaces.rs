@@ -1,6 +1,6 @@
 use super::common::{record_object, skip_on_permission_denied, PullCtx};
 use crate::model::Workspace;
-use crate::progress::SyncRenderer;
+use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::slug::slugify_unique;
 use crate::snapshot::workspace::write_workspace;
 use crate::state::content_hash;
@@ -42,6 +42,9 @@ pub async fn process(
             continue;
         }
 
+        progress.resource_started("workspaces", &slug, ResourceOp::Get);
+        let result: Result<()> = (|| {
+
         if !dir_created {
             std::fs::create_dir_all(ctx.paths.workspaces_dir())
                 .with_context(|| format!("creating {}", ctx.paths.workspaces_dir().display()))?;
@@ -67,6 +70,14 @@ pub async fn process(
         );
 
         count += 1;
+        Ok(())
+        })();
+        let outcome = match &result {
+            Ok(()) => ResourceOutcome::Ok,
+            Err(e) => ResourceOutcome::Failed(e.to_string()),
+        };
+        progress.resource_finished("workspaces", &slug, outcome);
+        result?;
     }
 
     if count > 0 {

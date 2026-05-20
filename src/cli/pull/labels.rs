@@ -3,7 +3,7 @@ use super::common::{
     skip_on_permission_denied, PullAction, PullCtx,
 };
 use crate::model::Label;
-use crate::progress::SyncRenderer;
+use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashSet};
@@ -46,6 +46,9 @@ pub async fn process(
             continue;
         }
 
+        progress.resource_started("labels", &slug, ResourceOp::Get);
+        let result: Result<()> = (|| {
+
         if !dir_created {
             std::fs::create_dir_all(ctx.paths.labels_dir())
                 .with_context(|| format!("creating {}", ctx.paths.labels_dir().display()))?;
@@ -84,6 +87,14 @@ pub async fn process(
             Some(recorded_hash),
         );
         written += 1;
+        Ok(())
+        })();
+        let outcome = match &result {
+            Ok(()) => ResourceOutcome::Ok,
+            Err(e) => ResourceOutcome::Failed(e.to_string()),
+        };
+        progress.resource_finished("labels", &slug, outcome);
+        result?;
     }
 
     if written > 0 {

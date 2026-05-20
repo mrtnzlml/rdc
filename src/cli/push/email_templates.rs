@@ -2,7 +2,7 @@ use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::SyncRenderer;
+use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
@@ -42,8 +42,15 @@ pub async fn push(
                 apply_overrides(&mut payload, p);
             }
             strip_for_create(&mut payload, "email_templates");
-            let created = client.create_email_template(&payload, Some(progress.clone())).await
-                .with_context(|| format!("POST /email_templates (creating '{lockfile_key}')"))?;
+            progress.resource_started("email_templates", lockfile_key, ResourceOp::Post);
+            let create_result = client.create_email_template(&payload, Some(progress.clone())).await
+                .with_context(|| format!("POST /email_templates (creating '{lockfile_key}')"));
+            let create_outcome = match &create_result {
+                Ok(_) => ResourceOutcome::Ok,
+                Err(e) => ResourceOutcome::Failed(e.to_string()),
+            };
+            progress.resource_finished("email_templates", lockfile_key, create_outcome);
+            let created = create_result?;
             let mut created_bytes = serde_json::to_vec_pretty(&created)
                 .context("serializing created email template")?;
             created_bytes.push(b'\n');
@@ -139,8 +146,15 @@ pub async fn push(
             }
         }
 
-        let updated = client.update_email_template(id, &payload_to_send, Some(progress.clone())).await
-            .with_context(|| format!("PATCH /email_templates/{id}"))?;
+        progress.resource_started("email_templates", lockfile_key, ResourceOp::Patch);
+        let patch_result = client.update_email_template(id, &payload_to_send, Some(progress.clone())).await
+            .with_context(|| format!("PATCH /email_templates/{id}"));
+        let patch_outcome = match &patch_result {
+            Ok(_) => ResourceOutcome::Ok,
+            Err(e) => ResourceOutcome::Failed(e.to_string()),
+        };
+        progress.resource_finished("email_templates", lockfile_key, patch_outcome);
+        let updated = patch_result?;
 
         let mut updated_bytes = serde_json::to_vec_pretty(&updated)
             .context("serializing updated email template")?;

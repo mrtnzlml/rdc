@@ -3,7 +3,7 @@ use super::common::{
     skip_on_permission_denied, PullAction, PullCtx,
 };
 use crate::model::Engine;
-use crate::progress::SyncRenderer;
+use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashSet};
@@ -43,6 +43,9 @@ pub async fn process(
             continue;
         }
 
+        progress.resource_started("engines", &slug, ResourceOp::Get);
+        let result: Result<()> = (|| {
+
         // Each engine owns a directory: `engines/<slug>/`. The engine's
         // JSON lives at `engine.json` inside it, alongside `fields/`.
         let engine_dir = ctx.paths.engine_dir(&slug);
@@ -81,6 +84,14 @@ pub async fn process(
             Some(recorded_hash),
         );
         written += 1;
+        Ok(())
+        })();
+        let outcome = match &result {
+            Ok(()) => ResourceOutcome::Ok,
+            Err(e) => ResourceOutcome::Failed(e.to_string()),
+        };
+        progress.resource_finished("engines", &slug, outcome);
+        result?;
     }
 
     if written > 0 {

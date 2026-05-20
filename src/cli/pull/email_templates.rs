@@ -3,7 +3,7 @@ use super::common::{
     skip_on_permission_denied, PullAction, PullCtx,
 };
 use crate::model::EmailTemplate;
-use crate::progress::SyncRenderer;
+use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -82,6 +82,9 @@ pub async fn process(
             continue;
         }
 
+        progress.resource_started("email_templates", &lockfile_key, ResourceOp::Get);
+        let result: Result<()> = (|| {
+
         let dir = ctx.paths.queue_email_templates_dir(&ws_slug, &q_slug);
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating {}", dir.display()))?;
@@ -118,6 +121,14 @@ pub async fn process(
             Some(recorded_hash),
         );
         count += 1;
+        Ok(())
+        })();
+        let outcome = match &result {
+            Ok(()) => ResourceOutcome::Ok,
+            Err(e) => ResourceOutcome::Failed(e.to_string()),
+        };
+        progress.resource_finished("email_templates", &lockfile_key, outcome);
+        result?;
     }
 
     if count > 0 {

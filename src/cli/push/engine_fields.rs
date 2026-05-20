@@ -2,7 +2,7 @@ use crate::api::{anyhow_has_status, RossumClient};
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::SyncRenderer;
+use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
@@ -40,8 +40,15 @@ pub async fn push(
                 apply_overrides(&mut payload, p);
             }
             strip_for_create(&mut payload, "engine_fields");
-            let created = client.create_engine_field(&payload, Some(progress.clone())).await
-                .with_context(|| format!("POST /engine_fields (creating '{slug}')"))?;
+            progress.resource_started("engine_fields", slug, ResourceOp::Post);
+            let create_result = client.create_engine_field(&payload, Some(progress.clone())).await
+                .with_context(|| format!("POST /engine_fields (creating '{slug}')"));
+            let create_outcome = match &create_result {
+                Ok(_) => ResourceOutcome::Ok,
+                Err(e) => ResourceOutcome::Failed(e.to_string()),
+            };
+            progress.resource_finished("engine_fields", slug, create_outcome);
+            let created = create_result?;
             let mut created_bytes = serde_json::to_vec_pretty(&created)
                 .context("serializing created engine field")?;
             created_bytes.push(b'\n');
@@ -134,16 +141,24 @@ pub async fn push(
             }
         }
 
-        let updated = match client.update_engine_field(id, &payload_to_send, Some(progress.clone())).await
-            .with_context(|| format!("PATCH /engine_fields/{id}"))
-        {
-            Ok(u) => u,
+        progress.resource_started("engine_fields", slug, ResourceOp::Patch);
+        let patch_result = client.update_engine_field(id, &payload_to_send, Some(progress.clone())).await
+            .with_context(|| format!("PATCH /engine_fields/{id}"));
+        let updated = match patch_result {
+            Ok(u) => {
+                progress.resource_finished("engine_fields", slug, ResourceOutcome::Ok);
+                u
+            }
             Err(e) if anyhow_has_status(&e, 405) => {
+                progress.resource_finished("engine_fields", slug, ResourceOutcome::Skipped);
                 progress.warn_line(&format!("! engine_fields/{slug} engine fields are not writable via PATCH on this Rossum org/plan (405 Method Not Allowed). Skipping all engine field pushes."));
                 skipped += 1;
                 break;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                progress.resource_finished("engine_fields", slug, ResourceOutcome::Failed(e.to_string()));
+                return Err(e);
+            }
         };
 
         let mut updated_bytes = serde_json::to_vec_pretty(&updated)

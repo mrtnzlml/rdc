@@ -1,6 +1,6 @@
 use super::common::{apply_pull_action, decide_pull_action, record_object, skip_on_permission_denied, PullAction, PullCtx};
 use crate::model::Workflow;
-use crate::progress::SyncRenderer;
+use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashSet};
@@ -40,6 +40,9 @@ pub async fn process(
             continue;
         }
 
+        progress.resource_started("workflows", &slug, ResourceOp::Get);
+        let result: Result<()> = (|| {
+
         // Each workflow owns a directory: `workflows/<slug>/`. The
         // workflow's JSON lives at `workflow.json` inside it, alongside
         // `steps/`.
@@ -75,6 +78,14 @@ pub async fn process(
             Some(recorded_hash),
         );
         written += 1;
+        Ok(())
+        })();
+        let outcome = match &result {
+            Ok(()) => ResourceOutcome::Ok,
+            Err(e) => ResourceOutcome::Failed(e.to_string()),
+        };
+        progress.resource_finished("workflows", &slug, outcome);
+        result?;
     }
 
     if written > 0 {
