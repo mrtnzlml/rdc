@@ -484,6 +484,152 @@ struct GridInner {
 }
 
 impl GridRenderer {
+    /// Width budget for square cells (after the 18-char label prefix
+    /// and one space separator). Falls back to 80-column if crossterm
+    /// can't read the size.
+    fn cells_per_line(&self) -> usize {
+        let cols = crossterm::terminal::size().map(|(c, _)| c as usize).unwrap_or(80);
+        let budget = cols.saturating_sub(18 + 1);
+        (budget / 3).max(1)
+    }
+
+    fn repaint(&self) {
+        let mut g = self.inner.lock().unwrap();
+        let now = Instant::now();
+        let cells_per_line = self.cells_per_line();
+
+        // ---- Header ----
+        let (clean, pending, conflict) = count_buckets(&g.state);
+        let uptime = if g.state.is_watch {
+            format!(" · uptime {}", fmt_uptime(now.saturating_duration_since(g.state.started_at)))
+        } else {
+            String::new()
+        };
+        let watch = if g.state.is_watch { " --watch" } else { "" };
+        let env = g.state.env.clone();
+        let op = if g.state.current_op.is_empty() { "idle".to_string() } else { g.state.current_op.clone() };
+        let header_msg = format!(
+            "rdc sync{watch} {env} · {clean} clean · {pending} pending · {conflict} conflict · {op}{uptime}"
+        );
+        g.header.set_message(header_msg);
+
+        // ---- Kind rows ----
+        // Assign kind → row group slots in first-seen order.
+        let kinds: Vec<String> = g.state.order.keys().cloned().collect();
+        for kind in &kinds {
+            if !g.kind_index.contains_key(kind) {
+                let slot = g.next_kind_slot;
+                if slot >= MAX_KINDS {
+                    continue; // pathological — more kinds than allocated
+                }
+                g.kind_index.insert(kind.clone(), slot);
+                g.next_kind_slot += 1;
+            }
+        }
+        // Snapshot kind→slot mapping for iteration (we'll mutate kind_rows below).
+        let kind_map: Vec<(String, usize)> = g.kind_index.iter().map(|(k, &v)| (k.clone(), v)).collect();
+        for (kind, slot) in kind_map {
+            let slugs = match g.state.order.get(&kind) { Some(v) => v.clone(), None => continue };
+            let count = slugs.len();
+            let label = format!("{:<16} ({:>2}) ", kind, count);
+            let mut squares = String::new();
+            let mut line_idx = 0usize;
+            for (i, slug) in slugs.iter().enumerate() {
+                let entry = match g.state.entries.get(&(kind.clone(), slug.clone())) { Some(e) => e, None => continue };
+                let color = color_for(entry, now);
+                let dim = entry.in_flight.is_some()
+                    && (now.elapsed().subsec_millis() / 125) % 2 == 1;
+                squares.push_str(&emit_square(color, g.color_depth, dim));
+                if (i + 1) % cells_per_line == 0 {
+                    let line_msg = if line_idx == 0 {
+                        format!("{}{}", label, squares)
+                    } else {
+                        format!("{:<19}{}", " ", squares)
+                    };
+                    if line_idx < MAX_CONT_ROWS {
+                        g.kind_rows[slot][line_idx].set_message(line_msg);
+                    }
+                    line_idx += 1;
+                    squares.clear();
+                }
+            }
+            if !squares.is_empty() && line_idx < MAX_CONT_ROWS {
+                let line_msg = if line_idx == 0 {
+                    format!("{}{}", label, squares)
+                } else {
+                    format!("{:<19}{}", " ", squares)
+                };
+                g.kind_rows[slot][line_idx].set_message(line_msg);
+                line_idx += 1;
+            }
+            // Clear unused continuation rows for this kind.
+            for r in line_idx..MAX_CONT_ROWS {
+                g.kind_rows[slot][r].set_message(String::new());
+            }
+        }
+        // Clear rows for kind slots we don't have anymore.
+        let next_slot = g.next_kind_slot;
+        for kind_slot in next_slot..MAX_KINDS {
+            for r in 0..MAX_CONT_ROWS {
+                g.kind_rows[kind_slot][r].set_message(String::new());
+            }
+        }
+
+        // ---- Banners ----
+        for i in 0..MAX_BANNERS {
+            if let Some(b) = g.state.banners.get(i) {
+                let prefix = match b.severity {
+                    Severity::Info  => "·",
+                    Severity::Warn  => "!",
+                    Severity::Error => "✖",
+                };
+                let msg = format!("{prefix} {}", b.text);
+                g.banner_slots[i].set_message(msg);
+            } else {
+                g.banner_slots[i].set_message(String::new());
+            }
+        }
+
+        // ---- Footer ----
+        let mut non_clean: Vec<((String, String), Entry)> = g.state.entries.iter()
+            .filter(|(_, e)| !matches!(e.class, SyncClass::Clean))
+            .map(|(k, e)| (k.clone(), e.clone()))
+            .collect();
+        non_clean.sort_by_key(|(k, e)| (severity_rank(e.class.clone()), k.0.clone(), k.1.clone()));
+
+        let total = g.state.entries.len();
+        let problem_count = non_clean.len();
+
+        if problem_count == 0 {
+            g.footer_header.set_message(format!("all clean ({total})"));
+        } else {
+            g.footer_header.set_message("current state:".to_string());
+        }
+        for i in 0..MAX_FOOTER {
+            if let Some(((kind, slug), entry)) = non_clean.get(i) {
+                let tag = match entry.class {
+                    SyncClass::BothDiverged
+                    | SyncClass::LocalEditRemoteDelete
+                    | SyncClass::LocalDeleteRemoteEdit => "conflict",
+                    SyncClass::LocalEdit | SyncClass::LocalCreate | SyncClass::LocalDelete => "edit    ",
+                    SyncClass::RemoteEdit | SyncClass::RemoteCreate | SyncClass::RemoteDelete => "pending ",
+                    SyncClass::Clean | SyncClass::BothDeleted => "        ",
+                };
+                g.footer_slots[i].set_message(format!("  {tag}  {kind}/{slug}"));
+            } else {
+                g.footer_slots[i].set_message(String::new());
+            }
+        }
+        if problem_count > MAX_FOOTER {
+            g.footer_more.set_message(format!(
+                "  + {} more (run `rdc sync --dry-run` for full list)",
+                problem_count - MAX_FOOTER
+            ));
+        } else {
+            g.footer_more.set_message(String::new());
+        }
+    }
+
     pub fn new(env: String, is_watch: bool) -> Arc<Self> {
         let mp = MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(8));
         let style_plain = ProgressStyle::with_template("{msg}").unwrap();
@@ -541,9 +687,11 @@ impl GridRenderer {
 
 impl SyncRenderer for GridRenderer {
     fn phase(&self, label: &str) {
-        let mut g = self.inner.lock().unwrap();
-        g.state.current_op = label.to_string();
-        // Task 8 adds repaint() here.
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.state.current_op = label.to_string();
+        }
+        self.repaint();
     }
 
     fn warn_line(&self, msg: &str) {
@@ -552,47 +700,58 @@ impl SyncRenderer for GridRenderer {
     }
 
     fn resource_started(&self, kind: &str, slug: &str, op: ResourceOp) {
-        let mut g = self.inner.lock().unwrap();
-        g.state.mark_in_flight(kind, slug, Some(op));
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.state.mark_in_flight(kind, slug, Some(op));
+        }
+        self.repaint();
     }
 
     fn resource_finished(&self, kind: &str, slug: &str, _outcome: ResourceOutcome) {
-        let mut g = self.inner.lock().unwrap();
-        g.state.mark_in_flight(kind, slug, None);
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.state.mark_in_flight(kind, slug, None);
+        }
+        self.repaint();
     }
 
     fn ingest_classification(&self, items: &[ClassifiedItem]) {
-        let mut g = self.inner.lock().unwrap();
-        g.state.ingest(items, Instant::now());
-        // Task 8 adds repaint() here.
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.state.ingest(items, Instant::now());
+        }
+        self.repaint();
     }
 
     fn banner(&self, severity: Severity, msg: &str) {
-        let mut g = self.inner.lock().unwrap();
-        // Dedup within 10 s by exact text (spec 9.3).
-        let now = Instant::now();
-        // Look for an existing banner whose body matches (ignoring any
-        // existing `(×N)` suffix) within the dedup window.
-        let body = strip_count_suffix(msg);
-        if let Some(b) = g.state.banners.iter_mut().find(|b| {
-            strip_count_suffix(&b.text) == body
-                && now.saturating_duration_since(b.posted_at) < Duration::from_secs(10)
-        }) {
-            // Append `(×N)` suffix; bump posted_at.
-            let prev_count = match b.text.rfind(" (×") {
-                Some(open) => b.text[open + " (×".len()..b.text.len() - 1].parse::<u32>().unwrap_or(1),
-                None => 1,
-            };
-            b.text = format!("{} (×{})", body, prev_count + 1);
-            b.posted_at = now;
-            b.severity = severity;
-            return;
+        {
+            let mut g = self.inner.lock().unwrap();
+            // Dedup within 10 s by exact text (spec 9.3).
+            let now = Instant::now();
+            // Look for an existing banner whose body matches (ignoring any
+            // existing `(×N)` suffix) within the dedup window.
+            let body = strip_count_suffix(msg);
+            if let Some(b) = g.state.banners.iter_mut().find(|b| {
+                strip_count_suffix(&b.text) == body
+                    && now.saturating_duration_since(b.posted_at) < Duration::from_secs(10)
+            }) {
+                // Append `(×N)` suffix; bump posted_at.
+                let prev_count = match b.text.rfind(" (×") {
+                    Some(open) => b.text[open + " (×".len()..b.text.len() - 1].parse::<u32>().unwrap_or(1),
+                    None => 1,
+                };
+                b.text = format!("{} (×{})", body, prev_count + 1);
+                b.posted_at = now;
+                b.severity = severity;
+                return;
+            }
+            g.state.banners.push_back(Banner {
+                severity,
+                text: msg.to_string(),
+                posted_at: now,
+            });
         }
-        g.state.banners.push_back(Banner {
-            severity,
-            text: msg.to_string(),
-            posted_at: now,
-        });
+        self.repaint();
     }
 
     fn with_prompt(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
@@ -619,6 +778,43 @@ impl SyncRenderer for GridRenderer {
         if g.finished { return; }
         g.finished = true;
         let _ = g.mp.println(format!("FAIL: {msg}"));
+    }
+}
+
+fn count_buckets(state: &GridState) -> (usize, usize, usize) {
+    let mut clean = 0;
+    let mut pending = 0;
+    let mut conflict = 0;
+    for e in state.entries.values() {
+        match e.class {
+            SyncClass::Clean => clean += 1,
+            SyncClass::LocalEdit | SyncClass::LocalCreate | SyncClass::LocalDelete
+            | SyncClass::RemoteEdit | SyncClass::RemoteCreate | SyncClass::RemoteDelete => pending += 1,
+            SyncClass::BothDiverged
+            | SyncClass::LocalEditRemoteDelete
+            | SyncClass::LocalDeleteRemoteEdit => conflict += 1,
+            SyncClass::BothDeleted => {}
+        }
+    }
+    (clean, pending, conflict)
+}
+
+fn fmt_uptime(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 { format!("{}s", secs) }
+    else if secs < 3600 { format!("{}m", secs / 60) }
+    else { format!("{}h{}m", secs / 3600, (secs % 3600) / 60) }
+}
+
+fn severity_rank(c: SyncClass) -> u8 {
+    match c {
+        SyncClass::BothDiverged
+        | SyncClass::LocalEditRemoteDelete
+        | SyncClass::LocalDeleteRemoteEdit => 0,
+        SyncClass::LocalEdit | SyncClass::LocalCreate | SyncClass::LocalDelete => 1,
+        SyncClass::RemoteEdit | SyncClass::RemoteCreate | SyncClass::RemoteDelete => 2,
+        SyncClass::Clean => 3,
+        SyncClass::BothDeleted => 4,
     }
 }
 
@@ -716,5 +912,66 @@ mod emit_square_tests {
                 None => std::env::remove_var("NO_COLOR"),
             };
         }
+    }
+}
+
+#[cfg(test)]
+mod repaint_tests {
+    use super::*;
+    use crate::cli::sync::classify::ClassifiedItem;
+
+    fn item(kind: &str, slug: &str, class: SyncClass) -> ClassifiedItem {
+        ClassifiedItem {
+            kind: kind.to_string(), slug: slug.to_string(), class,
+            local_hash: None, remote_hash: None, base_hash: None,
+        }
+    }
+
+    #[test]
+    fn header_includes_counts_and_current_op() {
+        let r = GridRenderer::new("test".into(), true);
+        r.phase("listing remote");
+        r.ingest_classification(&[
+            item("labels", "a", SyncClass::Clean),
+            item("labels", "b", SyncClass::LocalEdit),
+            item("hooks",  "x", SyncClass::BothDiverged),
+        ]);
+        let g = r.inner.lock().unwrap();
+        let msg = g.header.message();
+        assert!(msg.contains("test"), "{msg}");
+        assert!(msg.contains("1 clean"), "{msg}");
+        assert!(msg.contains("1 pending"), "{msg}");
+        assert!(msg.contains("1 conflict"), "{msg}");
+        assert!(msg.contains("listing remote"), "{msg}");
+    }
+
+    #[test]
+    fn footer_lists_non_clean_resources_by_severity() {
+        let r = GridRenderer::new("test".into(), false);
+        r.ingest_classification(&[
+            item("labels", "a", SyncClass::Clean),
+            item("labels", "b", SyncClass::LocalEdit),
+            item("hooks",  "x", SyncClass::BothDiverged),
+            item("queues", "q", SyncClass::RemoteEdit),
+        ]);
+        let g = r.inner.lock().unwrap();
+        assert_eq!(g.footer_header.message(), "current state:");
+        // Severity rank: conflict (0) < edit (1) < pending (2).
+        assert!(g.footer_slots[0].message().contains("conflict"), "{:?}", g.footer_slots[0].message());
+        assert!(g.footer_slots[1].message().contains("edit"), "{:?}", g.footer_slots[1].message());
+        assert!(g.footer_slots[2].message().contains("pending"), "{:?}", g.footer_slots[2].message());
+    }
+
+    #[test]
+    fn footer_collapses_when_all_clean_but_kind_rows_persist() {
+        let r = GridRenderer::new("test".into(), false);
+        r.ingest_classification(&[
+            item("labels", "a", SyncClass::Clean),
+            item("hooks",  "x", SyncClass::Clean),
+        ]);
+        let g = r.inner.lock().unwrap();
+        assert!(g.footer_header.message().starts_with("all clean ("), "{:?}", g.footer_header.message());
+        let labels_slot = *g.kind_index.get("labels").unwrap();
+        assert!(!g.kind_rows[labels_slot][0].message().is_empty(), "{:?}", g.kind_rows[labels_slot][0].message());
     }
 }

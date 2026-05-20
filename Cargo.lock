@@ -1565,6 +1565,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "clap",
+ "crossterm",
  "flate2",
  "fs4",
  "futures",
