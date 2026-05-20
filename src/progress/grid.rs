@@ -455,24 +455,19 @@ use std::sync::{Arc, Mutex};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle, ProgressDrawTarget};
 use crate::progress::{ResourceOp, ResourceOutcome, Severity, SyncRenderer};
 
-/// Maximum kinds we pre-allocate row slots for. The classifier emits 11
-/// SyncClass kinds (`workspaces`, `queues`, `schemas`, `inboxes`,
-/// `email_templates`, `hooks`, `rules`, `labels`, `engines`,
-/// `engine_fields`, `mdh`) plus 3 read-only (`organization`,
-/// `workflows`, `workflow_steps`). 16 is conservative.
-const MAX_KINDS: usize = 16;
 /// Max footer entries shown before "+ N more".
 const MAX_FOOTER: usize = 12;
 const MAX_BANNERS: usize = 2;
-/// Max continuation rows per kind. With ~500 squares in a 60-col-wide
-/// budget, one kind needs ≤ 30 rows worst case; 32 is safe headroom.
-const MAX_CONT_ROWS: usize = 32;
 /// Width of the kind-row label area: `{:<16} ({:>3}) ` =
 /// 16 kind + 1 space + 1 `(` + 3 count + 1 `)` + 1 trailing space.
 /// `cells_per_line` subtracts this from the terminal width to compute
 /// the square budget; continuation rows pad to this width so squares
 /// vertically align with the first row.
 const LABEL_WIDTH: usize = 23;
+/// Upper bound on squares per row regardless of terminal width. On a
+/// 400-col terminal a single row of 188 squares is unreadable; cap so
+/// wide layouts wrap into multiple visually-balanced rows.
+const MAX_CELLS_PER_LINE: usize = 60;
 
 pub struct GridRenderer {
     inner: Mutex<GridInner>,
@@ -482,42 +477,32 @@ struct GridInner {
     state: GridState,
     color_depth: ColorDepth,
     mp: MultiProgress,
-    /// Stable bar handles, allocated at construction:
-    header: ProgressBar,
-    /// Per-kind row groups. Up to MAX_KINDS, each with up to
-    /// MAX_CONT_ROWS continuation bars (used when the row wraps).
-    kind_rows: Vec<Vec<ProgressBar>>,
-    separator: ProgressBar,
-    banner_slots: Vec<ProgressBar>,
-    footer_header: ProgressBar,
-    footer_slots: Vec<ProgressBar>,
-    footer_more: ProgressBar,
-    /// Mapping kind → row group index. Populated lazily on first
-    /// observation of a kind.
-    kind_index: BTreeMap<String, usize>,
-    next_kind_slot: usize,
+    /// Single bar that holds the entire rendered grid as a multi-line
+    /// message. indicatif's `set_message` redraws the full region in
+    /// place — no scrollback ghost frames as kinds populate one by one.
+    main_bar: ProgressBar,
     finished: bool,
 }
 
 impl GridRenderer {
-    /// Width budget for square cells (after the 18-char label prefix
-    /// and one space separator). Falls back to 80-column if crossterm
-    /// can't read the size.
+    /// Width budget for square cells (after the 23-char label prefix).
+    /// Falls back to 80-column if crossterm can't read the size, and caps
+    /// at MAX_CELLS_PER_LINE so very wide terminals still wrap.
     fn cells_per_line(&self) -> usize {
         let cols = crossterm::terminal::size().map(|(c, _)| c as usize).unwrap_or(80);
-        // Label area is exactly 23 chars: `{:<16} ({:>3}) ` =
-        // 16 kind + 1 space + 1 `(` + 3 count + 1 `)` + 1 trailing space.
-        // Must stay in sync with `LABEL_WIDTH` below.
         let budget = cols.saturating_sub(LABEL_WIDTH);
-        (budget / 2).max(1)  // was: budget / 3 — each square now 1 glyph + 1 gap = 2 cells
+        let raw = (budget / 2).max(1); // each square is 1 glyph + 1 gap = 2 cells
+        raw.min(MAX_CELLS_PER_LINE)
     }
 
     fn repaint(&self) {
-        let mut g = self.inner.lock().unwrap();
+        let g = self.inner.lock().unwrap();
         let now = Instant::now();
         let cells_per_line = self.cells_per_line();
 
-        // ---- Header ----
+        let mut out = String::new();
+
+        // ---- Header line (gets the `{spinner} ` template prefix). ----
         let (clean, pending, conflict) = count_buckets(&g.state);
         let uptime = if g.state.is_watch {
             format!(" · uptime {}", fmt_uptime(now.saturating_duration_since(g.state.started_at)))
@@ -527,89 +512,60 @@ impl GridRenderer {
         let watch = if g.state.is_watch { " --watch" } else { "" };
         let env = g.state.env.clone();
         let op = if g.state.current_op.is_empty() { "idle".to_string() } else { g.state.current_op.clone() };
-        let header_msg = format!(
+        out.push_str(&format!(
             "rdc sync{watch} {env} · {clean} clean · {pending} pending · {conflict} conflict · {op}{uptime}"
-        );
-        g.header.set_message(header_msg);
+        ));
 
         // ---- Kind rows ----
-        // Assign kind → row group slots in first-seen order.
         let kinds: Vec<String> = g.state.order.keys().cloned().collect();
         for kind in &kinds {
-            if !g.kind_index.contains_key(kind) {
-                let slot = g.next_kind_slot;
-                if slot >= MAX_KINDS {
-                    continue; // pathological — more kinds than allocated
-                }
-                g.kind_index.insert(kind.clone(), slot);
-                g.next_kind_slot += 1;
-            }
-        }
-        // Snapshot kind→slot mapping for iteration (we'll mutate kind_rows below).
-        let kind_map: Vec<(String, usize)> = g.kind_index.iter().map(|(k, &v)| (k.clone(), v)).collect();
-        for (kind, slot) in kind_map {
-            let slugs = match g.state.order.get(&kind) { Some(v) => v.clone(), None => continue };
+            let slugs = match g.state.order.get(kind) { Some(v) => v.clone(), None => continue };
             let count = slugs.len();
             let label = format!("{:<16} ({:>3}) ", kind, count);
-            let mut squares = String::new();
-            let mut line_idx = 0usize;
+            let mut squares_buf = String::new();
+            let mut wrote_first_line = false;
             for (i, slug) in slugs.iter().enumerate() {
                 let entry = match g.state.entries.get(&(kind.clone(), slug.clone())) { Some(e) => e, None => continue };
                 let color = color_for(entry, now);
                 let dim = entry.in_flight.is_some()
                     && (now.elapsed().subsec_millis() / 125) % 2 == 1;
-                squares.push_str(&emit_square(color, g.color_depth, dim));
+                squares_buf.push_str(&emit_square(color, g.color_depth, dim));
                 if (i + 1) % cells_per_line == 0 {
-                    let line_msg = if line_idx == 0 {
-                        format!("{}{}", label, squares)
+                    out.push('\n');
+                    if !wrote_first_line {
+                        out.push_str(&label);
+                        wrote_first_line = true;
                     } else {
-                        format!("{:<width$}{}", " ", squares, width = LABEL_WIDTH)
-                    };
-                    if line_idx < MAX_CONT_ROWS {
-                        g.kind_rows[slot][line_idx].set_message(line_msg);
+                        out.push_str(&format!("{:<width$}", " ", width = LABEL_WIDTH));
                     }
-                    line_idx += 1;
-                    squares.clear();
+                    out.push_str(&squares_buf);
+                    squares_buf.clear();
                 }
             }
-            if !squares.is_empty() && line_idx < MAX_CONT_ROWS {
-                let line_msg = if line_idx == 0 {
-                    format!("{}{}", label, squares)
+            if !squares_buf.is_empty() {
+                out.push('\n');
+                if !wrote_first_line {
+                    out.push_str(&label);
                 } else {
-                    format!("{:<19}{}", " ", squares)
-                };
-                g.kind_rows[slot][line_idx].set_message(line_msg);
-                line_idx += 1;
-            }
-            // Clear unused continuation rows for this kind.
-            for r in line_idx..MAX_CONT_ROWS {
-                g.kind_rows[slot][r].set_message(String::new());
-            }
-        }
-        // Clear rows for kind slots we don't have anymore.
-        let next_slot = g.next_kind_slot;
-        for kind_slot in next_slot..MAX_KINDS {
-            for r in 0..MAX_CONT_ROWS {
-                g.kind_rows[kind_slot][r].set_message(String::new());
+                    out.push_str(&format!("{:<width$}", " ", width = LABEL_WIDTH));
+                }
+                out.push_str(&squares_buf);
             }
         }
 
         // ---- Banners ----
-        for i in 0..MAX_BANNERS {
-            if let Some(b) = g.state.banners.get(i) {
-                let prefix = match b.severity {
-                    Severity::Info  => "·",
-                    Severity::Warn  => "!",
-                    Severity::Error => "✖",
-                };
-                let msg = format!("{prefix} {}", b.text);
-                g.banner_slots[i].set_message(msg);
-            } else {
-                g.banner_slots[i].set_message(String::new());
-            }
+        for (i, b) in g.state.banners.iter().enumerate() {
+            if i >= MAX_BANNERS { break; }
+            let prefix = match b.severity {
+                Severity::Info  => "·",
+                Severity::Warn  => "!",
+                Severity::Error => "✖",
+            };
+            out.push('\n');
+            out.push_str(&format!("{prefix} {}", b.text));
         }
 
-        // ---- Footer ----
+        // ---- Footer (blank separator line + footer header + per-resource list + more) ----
         let mut non_clean: Vec<((String, String), Entry)> = g.state.entries.iter()
             .filter(|(_, e)| !matches!(e.class, SyncClass::Clean))
             .map(|(k, e)| (k.clone(), e.clone()))
@@ -619,13 +575,14 @@ impl GridRenderer {
         let total = g.state.entries.len();
         let problem_count = non_clean.len();
 
+        out.push('\n'); // blank separator line before footer
         if problem_count == 0 {
-            g.footer_header.set_message(format!("all clean ({total})"));
+            out.push('\n');
+            out.push_str(&format!("all clean ({total})"));
         } else {
-            g.footer_header.set_message("current state:".to_string());
-        }
-        for i in 0..MAX_FOOTER {
-            if let Some(((kind, slug), entry)) = non_clean.get(i) {
+            out.push('\n');
+            out.push_str("current state:");
+            for ((kind, slug), entry) in non_clean.iter().take(MAX_FOOTER) {
                 let tag = match entry.class {
                     SyncClass::BothDiverged
                     | SyncClass::LocalEditRemoteDelete
@@ -634,53 +591,30 @@ impl GridRenderer {
                     SyncClass::RemoteEdit | SyncClass::RemoteCreate | SyncClass::RemoteDelete => "pending ",
                     SyncClass::Clean | SyncClass::BothDeleted => "        ",
                 };
-                g.footer_slots[i].set_message(format!("  {tag}  {kind}/{slug}"));
-            } else {
-                g.footer_slots[i].set_message(String::new());
+                out.push('\n');
+                out.push_str(&format!("  {tag}  {kind}/{slug}"));
+            }
+            if problem_count > MAX_FOOTER {
+                out.push('\n');
+                out.push_str(&format!(
+                    "  + {} more (run `rdc sync --dry-run` for full list)",
+                    problem_count - MAX_FOOTER
+                ));
             }
         }
-        if problem_count > MAX_FOOTER {
-            g.footer_more.set_message(format!(
-                "  + {} more (run `rdc sync --dry-run` for full list)",
-                problem_count - MAX_FOOTER
-            ));
-        } else {
-            g.footer_more.set_message(String::new());
-        }
+
+        g.main_bar.set_message(out);
     }
 
     pub fn new(env: String, is_watch: bool) -> Arc<Self> {
         let mp = MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(8));
-        let style_plain = ProgressStyle::with_template("{msg}").unwrap();
         let style_spinner = ProgressStyle::with_template("{spinner} {msg}")
             .unwrap()
             .tick_strings(&["|", "/", "-", "\\"]);
-
-        let mk_plain = |msg: &str| {
-            let bar = mp.add(ProgressBar::new(1));
-            bar.set_style(style_plain.clone());
-            bar.set_message(msg.to_string());
-            bar
-        };
-        let header = mp.add(ProgressBar::new(1));
-        header.set_style(style_spinner.clone());
-        header.enable_steady_tick(Duration::from_millis(250));
-        header.set_message(String::new());
-
-        let mut kind_rows: Vec<Vec<ProgressBar>> = Vec::with_capacity(MAX_KINDS);
-        for _ in 0..MAX_KINDS {
-            let mut group = Vec::with_capacity(MAX_CONT_ROWS);
-            for _ in 0..MAX_CONT_ROWS {
-                group.push(mk_plain(""));
-            }
-            kind_rows.push(group);
-        }
-
-        let separator = mk_plain("");
-        let banner_slots: Vec<_> = (0..MAX_BANNERS).map(|_| mk_plain("")).collect();
-        let footer_header = mk_plain("");
-        let footer_slots: Vec<_> = (0..MAX_FOOTER).map(|_| mk_plain("")).collect();
-        let footer_more = mk_plain("");
+        let main_bar = mp.add(ProgressBar::new(1));
+        main_bar.set_style(style_spinner);
+        main_bar.enable_steady_tick(Duration::from_millis(250));
+        main_bar.set_message(String::new());
 
         let color_depth = detect_color_depth();
 
@@ -689,15 +623,7 @@ impl GridRenderer {
                 state: GridState::new(env, is_watch),
                 color_depth,
                 mp,
-                header,
-                kind_rows,
-                separator,
-                banner_slots,
-                footer_header,
-                footer_slots,
-                footer_more,
-                kind_index: BTreeMap::new(),
-                next_kind_slot: 0,
+                main_bar,
                 finished: false,
             }),
         })
@@ -791,25 +717,13 @@ impl SyncRenderer for GridRenderer {
         }
         // Repaint once more so the final state is what we commit to scrollback.
         self.repaint();
-
         let g = self.inner.lock().unwrap();
-        let commit = |bar: &ProgressBar| {
-            let msg = bar.message();
-            if !msg.is_empty() {
-                let _ = g.mp.println(msg);
-            }
-        };
-        commit(&g.header);
-        for row in &g.kind_rows {
-            for bar in row {
-                commit(bar);
-            }
-        }
-        commit(&g.separator);
-        for bar in &g.banner_slots { commit(bar); }
-        commit(&g.footer_header);
-        for bar in &g.footer_slots { commit(bar); }
-        commit(&g.footer_more);
+        // Commit the final frame as plain stderr lines so the user can
+        // scroll back to it after rdc exits. Indicatif's default behavior
+        // on drop is to clear the draw region — we explicitly println the
+        // bar's current message first so it persists.
+        let body = g.main_bar.message();
+        let _ = g.mp.println(&body);
         let _ = g.mp.println(format!("DONE: {summary}"));
         g.mp.set_draw_target(ProgressDrawTarget::hidden());
         drop(g);
@@ -822,25 +736,9 @@ impl SyncRenderer for GridRenderer {
             if g.finished { return; }
         }
         self.repaint();
-
         let g = self.inner.lock().unwrap();
-        let commit = |bar: &ProgressBar| {
-            let m = bar.message();
-            if !m.is_empty() {
-                let _ = g.mp.println(m);
-            }
-        };
-        commit(&g.header);
-        for row in &g.kind_rows {
-            for bar in row {
-                commit(bar);
-            }
-        }
-        commit(&g.separator);
-        for bar in &g.banner_slots { commit(bar); }
-        commit(&g.footer_header);
-        for bar in &g.footer_slots { commit(bar); }
-        commit(&g.footer_more);
+        let body = g.main_bar.message();
+        let _ = g.mp.println(&body);
         let _ = g.mp.println(format!("FAIL: {msg}"));
         g.mp.set_draw_target(ProgressDrawTarget::hidden());
         drop(g);
@@ -1007,7 +905,7 @@ mod repaint_tests {
             item("hooks",  "x", SyncClass::BothDiverged),
         ]);
         let g = r.inner.lock().unwrap();
-        let msg = g.header.message();
+        let msg = g.main_bar.message();
         assert!(msg.contains("test"), "{msg}");
         assert!(msg.contains("1 clean"), "{msg}");
         assert!(msg.contains("1 pending"), "{msg}");
@@ -1025,11 +923,16 @@ mod repaint_tests {
             item("queues", "q", SyncClass::RemoteEdit),
         ]);
         let g = r.inner.lock().unwrap();
-        assert_eq!(g.footer_header.message(), "current state:");
-        // Severity rank: conflict (0) < edit (1) < pending (2).
-        assert!(g.footer_slots[0].message().contains("conflict"), "{:?}", g.footer_slots[0].message());
-        assert!(g.footer_slots[1].message().contains("edit"), "{:?}", g.footer_slots[1].message());
-        assert!(g.footer_slots[2].message().contains("pending"), "{:?}", g.footer_slots[2].message());
+        let msg = g.main_bar.message();
+        let footer_start = msg.find("current state:").expect("footer header missing");
+        let footer = &msg[footer_start..];
+        // Severity rank: conflict (0) < edit (1) < pending (2). Verify the
+        // tag strings appear in ascending position within the footer block.
+        let conflict_pos = footer.find("conflict").expect("conflict tag missing");
+        let edit_pos = footer.find("edit    ").expect("edit tag missing");
+        let pending_pos = footer.find("pending ").expect("pending tag missing");
+        assert!(conflict_pos < edit_pos, "conflict ({conflict_pos}) should come before edit ({edit_pos}) in {footer:?}");
+        assert!(edit_pos < pending_pos, "edit ({edit_pos}) should come before pending ({pending_pos}) in {footer:?}");
     }
 
     #[test]
@@ -1040,8 +943,9 @@ mod repaint_tests {
             item("hooks",  "x", SyncClass::Clean),
         ]);
         let g = r.inner.lock().unwrap();
-        assert!(g.footer_header.message().starts_with("all clean ("), "{:?}", g.footer_header.message());
-        let labels_slot = *g.kind_index.get("labels").unwrap();
-        assert!(!g.kind_rows[labels_slot][0].message().is_empty(), "{:?}", g.kind_rows[labels_slot][0].message());
+        let msg = g.main_bar.message();
+        assert!(msg.contains("all clean ("), "{msg}");
+        // Kind rows are part of the message; verify "labels" label survived.
+        assert!(msg.contains("labels"), "{msg}");
     }
 }
