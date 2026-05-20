@@ -2,7 +2,7 @@ use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::ProgressLog;
+use crate::progress::SyncRenderer;
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::hook::{
     hook_code_extension, hook_code_extension_from_value, read_hook_value, serialize_hook,
@@ -52,7 +52,7 @@ pub async fn push(
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
     catalog_hooks: &[crate::model::Hook],
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<dyn SyncRenderer>,
     env: &str,
 ) -> Result<(usize, usize)> {
     // Load overlay if present. Overlay drives both the outbound payload
@@ -93,7 +93,7 @@ pub async fn push(
     }
 
     let hooks_dir = paths.hooks_dir();
-    let phase = progress.phase("pushing hooks");
+    progress.phase("pushing hooks");
     let mut pushed = 0usize;
     let mut skipped = 0usize;
 
@@ -105,8 +105,6 @@ pub async fn push(
 
     for (slug, local_json_path) in changes {
         let overlay_paths = overlay.as_ref().and_then(|ov| ov.hook(slug));
-
-        let sp = phase.item(format!("hooks/{slug}"));
 
         // Missing lockfile entry = new hook → POST. Local file becomes the
         // create payload; server response (with id/url assigned) overwrites
@@ -145,7 +143,7 @@ pub async fn push(
                     catalog_hooks, &typed.name, template_url,
                 ) {
                     Some(orphan) => {
-                        sp.set_message(format!(
+                        progress.warn_line(&format!(
                             "hooks/{slug} (adopting orphan store-extension id {})",
                             orphan.id
                         ));
@@ -162,7 +160,7 @@ pub async fn push(
                                     "POST /hooks/create (installing store extension '{slug}')"
                                 )
                             })?;
-                        sp.set_message(format!(
+                        progress.warn_line(&format!(
                             "hooks/{slug} (installed store extension id {})",
                             installed.id
                         ));
@@ -223,14 +221,14 @@ pub async fn push(
                     secrets_hash: Some(created_secrets_hash),
                 },
             );
-            sp.finish_ok(format!("POST (id {})", created.id));
+            progress.warn_line(&format!("[ok] hooks/{slug} POST (id {})", created.id));
             pushed += 1;
             continue;
         }
 
         let entry = lockfile.objects.get("hooks").and_then(|m| m.get(slug.as_str())).unwrap();
         let Some(base) = &entry.content_hash else {
-            sp.finish_warn("lockfile entry has no content_hash, skipping");
+            progress.warn_line(&format!("! hooks/{slug} lockfile entry has no content_hash, skipping"));
             skipped += 1;
             continue;
         };
@@ -265,7 +263,7 @@ pub async fn push(
         }
         let remote_list = drift_hooks.as_ref().expect("drift_hooks was just populated above");
         let Some(remote_hook) = remote_list.iter().find(|h| h.id == id) else {
-            sp.finish_warn(format!("id {id} not found on remote, skipping"));
+            progress.warn_line(&format!("! hooks/{slug} id {id} not found on remote, skipping"));
             skipped += 1;
             continue;
         };
@@ -331,12 +329,12 @@ pub async fn push(
                             secrets_hash: prior_secrets_hash,
                         },
                     );
-                    sp.finish_warn("adopted remote (drift)");
+                    progress.warn_line(&format!("! hooks/{slug} adopted remote (drift)"));
                     skipped += 1;
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    sp.finish_warn("remote has changed since last sync, skipping push (run `rdc sync` first)");
+                    progress.warn_line(&format!("! hooks/{slug} remote has changed since last sync, skipping push (run `rdc sync` first)"));
                     skipped += 1;
                     continue;
                 }
@@ -386,7 +384,7 @@ pub async fn push(
                 secrets_hash: Some(updated_secrets_hash),
             },
         );
-        sp.finish_ok("PATCH");
+        progress.warn_line(&format!("[ok] hooks/{slug} PATCH"));
         pushed += 1;
     }
 
@@ -423,7 +421,6 @@ pub async fn push(
         // PATCH with just `secrets` — Rossum's PATCH /hooks/<id>
         // accepts a partial body, so we don't need to send the whole
         // hook just to update one secret value.
-        let sp = phase.item(format!("hooks/{slug} (secrets only)"));
         let body = serde_json::json!({ "secrets": local_kv });
         let updated = client
             .update_hook_value(entry.id, &body, Some(progress.clone()))
@@ -443,7 +440,7 @@ pub async fn push(
                 secrets_hash: Some(local_hash),
             },
         );
-        sp.finish_ok("PATCH (secrets)");
+        progress.warn_line(&format!("[ok] hooks/{slug} (secrets only) PATCH (secrets)"));
         secrets_pushed += 1;
     }
     if !secrets_warned.is_empty() {

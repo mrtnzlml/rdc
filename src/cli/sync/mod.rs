@@ -111,7 +111,8 @@ pub mod watch;
 use crate::api::RossumClient;
 use crate::config::ProjectConfig;
 use crate::paths::Paths;
-use crate::progress::ProgressLog;
+use crate::progress::{ProgressLog, SyncRenderer};
+use std::sync::Arc;
 use crate::secrets::resolve_token;
 use crate::state::Lockfile;
 use anyhow::{anyhow, Context, Result};
@@ -219,7 +220,10 @@ pub(crate) async fn run_cycle(
     } else {
         format!("rdc sync {env}")
     };
-    let progress = ProgressLog::start(title);
+    // Drivers consume `&Arc<dyn SyncRenderer>`. Construct the log renderer
+    // and immediately coerce to the trait object so every call site uses
+    // the same shape regardless of which renderer was selected.
+    let progress: Arc<dyn SyncRenderer> = ProgressLog::start(title);
     let started = std::time::Instant::now();
 
     // Phase 1: list remote. Mirrors `pull::run`'s `PullCtx` construction
@@ -260,14 +264,14 @@ pub(crate) async fn run_cycle(
             .filter(|c| matches!(c.class, SyncClass::RemoteEdit | SyncClass::RemoteCreate))
             .collect();
         if !pull_items.is_empty() {
-            let phase = progress.phase("would pull");
+            progress.phase("would pull");
             for it in &pull_items {
                 let note = if matches!(it.class, SyncClass::RemoteCreate) {
                     " (new)"
                 } else {
                     ""
                 };
-                phase.line(format!("- {}/{}{}", it.kind, it.slug, note));
+                progress.warn_line(&format!("- {}/{}{}", it.kind, it.slug, note));
             }
         }
 
@@ -282,7 +286,7 @@ pub(crate) async fn run_cycle(
             })
             .collect();
         if !push_items.is_empty() {
-            let phase = progress.phase("would push");
+            progress.phase("would push");
             for it in &push_items {
                 let action = match it.class {
                     SyncClass::LocalEdit => "PATCH",
@@ -290,7 +294,7 @@ pub(crate) async fn run_cycle(
                     SyncClass::LocalDelete => "DELETE",
                     _ => "",
                 };
-                phase.line(format!("- {}/{} {}", it.kind, it.slug, action));
+                progress.warn_line(&format!("- {}/{} {}", it.kind, it.slug, action));
             }
         }
 
@@ -308,7 +312,7 @@ pub(crate) async fn run_cycle(
             })
             .collect();
         if !prompt_items.is_empty() {
-            let phase = progress.phase("would prompt");
+            progress.phase("would prompt");
             for it in &prompt_items {
                 let tag = match it.class {
                     SyncClass::BothDiverged => "both diverged",
@@ -317,7 +321,7 @@ pub(crate) async fn run_cycle(
                     SyncClass::RemoteDelete => "deleted on env",
                     _ => "",
                 };
-                phase.line(format!("- {}/{} -- {}", it.kind, it.slug, tag));
+                progress.warn_line(&format!("- {}/{} -- {}", it.kind, it.slug, tag));
             }
         }
 
@@ -325,7 +329,7 @@ pub(crate) async fn run_cycle(
         // wired; defer until per-object bodies are available.
         let _ = diff;
 
-        progress.finish(format!(
+        progress.finish_ok(&format!(
             "Dry run: {} would push, {} would pull, {} would prompt (no writes)",
             push_items.len(),
             pull_items.len(),
@@ -367,7 +371,7 @@ pub(crate) async fn run_cycle(
 
     let elapsed = started.elapsed();
     let total_changed = outcome.items_pushed + outcome.items_pulled;
-    progress.finish(format!(
+    progress.finish_ok(&format!(
         "Synced envs/{env} ({total_changed} changed, {:.1}s)",
         elapsed.as_secs_f32()
     ));

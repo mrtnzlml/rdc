@@ -2,7 +2,7 @@ use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::ProgressLog;
+use crate::progress::SyncRenderer;
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
@@ -16,13 +16,13 @@ pub async fn push(
     lockfile: &mut Lockfile,
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<dyn SyncRenderer>,
     env: &str,
 ) -> Result<(usize, usize)> {
     let overlay = Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
-    let phase = progress.phase("pushing labels");
+    progress.phase("pushing labels");
     let mut pushed = 0usize;
     let mut skipped = 0usize;
 
@@ -30,8 +30,6 @@ pub async fn push(
 
     for (slug, path) in changes {
         let overlay_paths = overlay.as_ref().and_then(|ov| ov.label(slug));
-
-        let sp = phase.item(format!("labels/{slug}"));
 
         // Missing lockfile entry → new label, POST.
         if lockfile.objects.get("labels").and_then(|m| m.get(slug.as_str())).is_none() {
@@ -63,7 +61,7 @@ pub async fn push(
                     secrets_hash: None,
                 },
             );
-            sp.finish_ok(format!("POST (id {})", created.id));
+            progress.warn_line(&format!("[ok] labels/{slug} POST (id {})", created.id));
             pushed += 1;
             continue;
         }
@@ -72,7 +70,7 @@ pub async fn push(
             .with_context(|| format!("reading {}", path.display()))?;
         let entry = lockfile.objects.get("labels").and_then(|m| m.get(slug.as_str())).unwrap();
         let Some(base) = &entry.content_hash else {
-            sp.finish_warn("lockfile entry has no content_hash, skipping");
+            progress.warn_line(&format!("! labels/{slug} lockfile entry has no content_hash, skipping"));
             skipped += 1;
             continue;
         };
@@ -94,7 +92,7 @@ pub async fn push(
         }
         let remote_list = remote_labels.as_ref().unwrap();
         let Some(remote_label) = remote_list.iter().find(|l| l.id == id) else {
-            sp.finish_warn(format!("id {id} not found on remote, skipping"));
+            progress.warn_line(&format!("! labels/{slug} id {id} not found on remote, skipping"));
             skipped += 1;
             continue;
         };
@@ -130,12 +128,12 @@ pub async fn push(
                             secrets_hash: None,
                         },
                     );
-                    sp.finish_warn("adopted remote (drift)");
+                    progress.warn_line(&format!("! labels/{slug} adopted remote (drift)"));
                     skipped += 1;
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    sp.finish_warn("remote has changed since last pull, skipping push");
+                    progress.warn_line(&format!("! labels/{slug} remote has changed since last pull, skipping push"));
                     skipped += 1;
                     continue;
                 }
@@ -164,7 +162,7 @@ pub async fn push(
                 secrets_hash: None,
             },
         );
-        sp.finish_ok("PATCH");
+        progress.warn_line(&format!("[ok] labels/{slug} PATCH"));
         pushed += 1;
     }
 

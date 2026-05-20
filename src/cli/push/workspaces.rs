@@ -7,7 +7,7 @@ use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::ProgressLog;
+use crate::progress::SyncRenderer;
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
@@ -21,13 +21,13 @@ pub async fn push(
     lockfile: &mut Lockfile,
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<dyn SyncRenderer>,
     env: &str,
 ) -> Result<(usize, usize)> {
     let overlay = Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
-    let phase = progress.phase("pushing workspaces");
+    progress.phase("pushing workspaces");
     let mut pushed = 0usize;
     let mut skipped = 0usize;
 
@@ -38,8 +38,6 @@ pub async fn push(
         // future Overlay extension; for now the payload is sent as-is.
         let overlay_paths: Option<&BTreeMap<String, serde_json::Value>> = None;
         let _ = overlay;
-
-        let sp = phase.item(format!("workspaces/{ws_slug}"));
 
         // CREATE — no lockfile entry yet.
         if lockfile.objects.get("workspaces").and_then(|m| m.get(ws_slug.as_str())).is_none() {
@@ -71,7 +69,7 @@ pub async fn push(
                     secrets_hash: None,
                 },
             );
-            sp.finish_ok(format!("POST (id {})", created.id));
+            progress.warn_line(&format!("[ok] workspaces/{ws_slug} POST (id {})", created.id));
             pushed += 1;
             continue;
         }
@@ -79,7 +77,7 @@ pub async fn push(
         // UPDATE — existing workspace, PATCH the diff with drift detection.
         let entry = lockfile.objects.get("workspaces").and_then(|m| m.get(ws_slug.as_str())).unwrap();
         let Some(base) = &entry.content_hash else {
-            sp.finish_warn("lockfile entry has no content_hash, skipping");
+            progress.warn_line(&format!("! workspaces/{ws_slug} lockfile entry has no content_hash, skipping"));
             skipped += 1;
             continue;
         };
@@ -128,12 +126,12 @@ pub async fn push(
                             secrets_hash: None,
                         },
                     );
-                    sp.finish_warn("adopted remote (drift)");
+                    progress.warn_line(&format!("! workspaces/{ws_slug} adopted remote (drift)"));
                     skipped += 1;
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    sp.finish_warn("remote has changed since last pull, skipping");
+                    progress.warn_line(&format!("! workspaces/{ws_slug} remote has changed since last pull, skipping"));
                     skipped += 1;
                     continue;
                 }
@@ -160,7 +158,7 @@ pub async fn push(
                 secrets_hash: None,
             },
         );
-        sp.finish_ok("PATCH");
+        progress.warn_line(&format!("[ok] workspaces/{ws_slug} PATCH"));
         pushed += 1;
     }
 

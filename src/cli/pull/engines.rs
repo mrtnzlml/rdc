@@ -3,14 +3,14 @@ use super::common::{
     skip_on_permission_denied, PullAction, PullCtx,
 };
 use crate::model::Engine;
-use crate::progress::ProgressLog;
+use crate::progress::SyncRenderer;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all engines from the API.
-pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<ProgressLog>) -> Result<Vec<Engine>> {
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<dyn SyncRenderer>) -> Result<Vec<Engine>> {
     skip_on_permission_denied(
         ctx.client.list_engines(Some(progress.clone())).await.context("listing engines"),
         "engines",
@@ -25,9 +25,9 @@ pub async fn process(
     ctx: &mut PullCtx<'_>,
     engines: Vec<Engine>,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<dyn SyncRenderer>,
 ) -> Result<(usize, usize)> {
-    let phase = progress.phase("pulling engines");
+    progress.phase("pulling engines");
 
     let mut used: HashSet<String> = HashSet::new();
     let mut conflicts = 0usize;
@@ -42,8 +42,6 @@ pub async fn process(
         if !subset.contains(&("engines".to_string(), slug.clone())) {
             continue;
         }
-
-        let sp = phase.item(&e.name);
 
         // Each engine owns a directory: `engines/<slug>/`. The engine's
         // JSON lives at `engine.json` inside it, alongside `fields/`.
@@ -82,8 +80,11 @@ pub async fn process(
             e.modified_at().map(|s| s.to_string()),
             Some(recorded_hash),
         );
-        sp.finish_ok("");
         written += 1;
+    }
+
+    if written > 0 {
+        progress.warn_line(&format!("[ok] engines {written} pulled"));
     }
 
     Ok((written, conflicts))

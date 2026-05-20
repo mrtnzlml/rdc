@@ -1,13 +1,13 @@
 use super::common::{apply_pull_action, decide_pull_action, record_object, skip_on_permission_denied, PullAction, PullCtx};
 use crate::model::Workflow;
-use crate::progress::ProgressLog;
+use crate::progress::SyncRenderer;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all workflows from the API.
-pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<ProgressLog>) -> Result<Vec<Workflow>> {
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<dyn SyncRenderer>) -> Result<Vec<Workflow>> {
     skip_on_permission_denied(
         ctx.client.list_workflows(Some(progress.clone())).await.context("listing workflows"),
         "workflows",
@@ -22,9 +22,9 @@ pub async fn process(
     ctx: &mut PullCtx<'_>,
     workflows: Vec<Workflow>,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<dyn SyncRenderer>,
 ) -> Result<(usize, usize)> {
-    let phase = progress.phase("pulling workflows");
+    progress.phase("pulling workflows");
 
     let mut used: HashSet<String> = HashSet::new();
     let mut conflicts = 0usize;
@@ -39,8 +39,6 @@ pub async fn process(
         if !subset.contains(&("workflows".to_string(), slug.clone())) {
             continue;
         }
-
-        let sp = phase.item(&w.name);
 
         // Each workflow owns a directory: `workflows/<slug>/`. The
         // workflow's JSON lives at `workflow.json` inside it, alongside
@@ -76,8 +74,11 @@ pub async fn process(
             w.modified_at().map(|s| s.to_string()),
             Some(recorded_hash),
         );
-        sp.finish_ok("");
         written += 1;
+    }
+
+    if written > 0 {
+        progress.warn_line(&format!("[ok] workflows {written} pulled"));
     }
 
     Ok((written, conflicts))

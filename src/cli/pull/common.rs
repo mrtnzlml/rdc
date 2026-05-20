@@ -1,6 +1,6 @@
 use crate::api::{ApiError, RossumClient};
 use crate::paths::Paths;
-use crate::progress::ProgressLog;
+use crate::progress::SyncRenderer;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
 use anyhow::{anyhow, Context, Result};
 use std::collections::BTreeMap;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 pub fn skip_on_permission_denied<T>(
     result: Result<Vec<T>>,
     kind: &str,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<dyn SyncRenderer>,
 ) -> Result<Vec<T>> {
     match result {
         Ok(v) => Ok(v),
@@ -24,7 +24,7 @@ pub fn skip_on_permission_denied<T>(
                     .unwrap_or(false)
             });
             if is_403 {
-                progress.warn(format!("! skipping {kind}: token lacks permission (403)"));
+                progress.warn_line(&format!("! skipping {kind}: token lacks permission (403)"));
                 Ok(Vec::new())
             } else {
                 Err(e)
@@ -127,11 +127,11 @@ pub async fn list_remote(
     env_cfg: &crate::config::EnvConfig,
     env: &str,
     token: &str,
-    progress: &Arc<crate::progress::ProgressLog>,
+    progress: &Arc<dyn SyncRenderer>,
 ) -> Result<RemoteCatalog> {
     use futures::stream::{StreamExt, TryStreamExt};
 
-    let phase = progress.phase("listing remote");
+    progress.phase("listing remote");
 
     // Single shared immutable reborrow so each concurrent future below
     // borrows from one place. The list drivers each take `&PullCtx`, so
@@ -170,7 +170,6 @@ pub async fn list_remote(
 
     let results: Vec<Listed> = futures::stream::iter(kinds.iter().copied())
         .map(|kind| {
-            let phase = &phase;
             let progress = progress;
             async move {
                 // Force a yield BEFORE each list call so the runtime can
@@ -182,87 +181,75 @@ pub async fn list_remote(
                 tokio::task::yield_now().await;
                 match kind {
                     Kind::Organization => {
-                        let sp = phase.item("organization");
                         let r = crate::cli::pull::organization::list(ctx_ref, env_cfg.org_id, progress).await
                             .with_context(|| format!("listing organization for env '{env}'"))?;
-                        sp.finish_ok(r.name.clone());
+                        progress.warn_line(&format!("[ok] organization {}", r.name));
                         anyhow::Ok(Listed::Organization(r))
                     }
                     Kind::Workspaces => {
-                        let sp = phase.item("workspaces");
                         let r = crate::cli::pull::workspaces::list(ctx_ref, progress).await
                             .with_context(|| format!("listing workspaces for env '{env}'"))?;
-                        sp.finish_ok(r.len().to_string());
+                        progress.warn_line(&format!("[ok] workspaces {}", r.len()));
                         anyhow::Ok(Listed::Workspaces(r))
                     }
                     Kind::Queues => {
-                        let sp = phase.item("queues");
                         let r = crate::cli::pull::queues::list(ctx_ref, progress).await
                             .with_context(|| format!("listing queues for env '{env}'"))?;
-                        sp.finish_ok(r.len().to_string());
+                        progress.warn_line(&format!("[ok] queues {}", r.len()));
                         anyhow::Ok(Listed::Queues(r))
                     }
                     Kind::Hooks => {
-                        let sp = phase.item("hooks");
                         let r = crate::cli::pull::hooks::list(ctx_ref, progress).await
                             .with_context(|| format!("listing hooks for env '{env}'"))?;
-                        sp.finish_ok(r.len().to_string());
+                        progress.warn_line(&format!("[ok] hooks {}", r.len()));
                         anyhow::Ok(Listed::Hooks(r))
                     }
                     Kind::Rules => {
-                        let sp = phase.item("rules");
                         let r = crate::cli::pull::rules::list(ctx_ref, progress).await
                             .with_context(|| format!("listing rules for env '{env}'"))?;
-                        sp.finish_ok(r.len().to_string());
+                        progress.warn_line(&format!("[ok] rules {}", r.len()));
                         anyhow::Ok(Listed::Rules(r))
                     }
                     Kind::Labels => {
-                        let sp = phase.item("labels");
                         let r = crate::cli::pull::labels::list(ctx_ref, progress).await
                             .with_context(|| format!("listing labels for env '{env}'"))?;
-                        sp.finish_ok(r.len().to_string());
+                        progress.warn_line(&format!("[ok] labels {}", r.len()));
                         anyhow::Ok(Listed::Labels(r))
                     }
                     Kind::Engines => {
-                        let sp = phase.item("engines");
                         let r = crate::cli::pull::engines::list(ctx_ref, progress).await
                             .with_context(|| format!("listing engines for env '{env}'"))?;
-                        sp.finish_ok(r.len().to_string());
+                        progress.warn_line(&format!("[ok] engines {}", r.len()));
                         anyhow::Ok(Listed::Engines(r))
                     }
                     Kind::EngineFields => {
-                        let sp = phase.item("engine fields");
                         let r = crate::cli::pull::engine_fields::list(ctx_ref, progress).await
                             .with_context(|| format!("listing engine fields for env '{env}'"))?;
-                        sp.finish_ok(r.len().to_string());
+                        progress.warn_line(&format!("[ok] engine fields {}", r.len()));
                         anyhow::Ok(Listed::EngineFields(r))
                     }
                     Kind::Workflows => {
-                        let sp = phase.item("workflows");
                         let r = crate::cli::pull::workflows::list(ctx_ref, progress).await
                             .with_context(|| format!("listing workflows for env '{env}'"))?;
-                        sp.finish_ok(r.len().to_string());
+                        progress.warn_line(&format!("[ok] workflows {}", r.len()));
                         anyhow::Ok(Listed::Workflows(r))
                     }
                     Kind::WorkflowSteps => {
-                        let sp = phase.item("workflow steps");
                         let r = crate::cli::pull::workflow_steps::list(ctx_ref, progress).await
                             .with_context(|| format!("listing workflow steps for env '{env}'"))?;
-                        sp.finish_ok(r.len().to_string());
+                        progress.warn_line(&format!("[ok] workflow steps {}", r.len()));
                         anyhow::Ok(Listed::WorkflowSteps(r))
                     }
                     Kind::EmailTemplates => {
-                        let sp = phase.item("email templates");
                         let r = crate::cli::pull::email_templates::list(ctx_ref, progress).await
                             .with_context(|| format!("listing email templates for env '{env}'"))?;
-                        sp.finish_ok(r.len().to_string());
+                        progress.warn_line(&format!("[ok] email templates {}", r.len()));
                         anyhow::Ok(Listed::EmailTemplates(r))
                     }
                     Kind::Mdh => {
-                        let sp = phase.item("mdh datasets");
                         let r = crate::cli::pull::mdh::list(env_cfg, token, progress).await
                             .with_context(|| format!("listing MDH datasets for env '{env}'"))?;
-                        sp.finish_ok(r.collections.len().to_string());
+                        progress.warn_line(&format!("[ok] mdh datasets {}", r.collections.len()));
                         anyhow::Ok(Listed::Mdh(r))
                     }
                 }
@@ -327,7 +314,7 @@ pub async fn list_remote(
     // while the parallel batch runs; without it the user sees nothing for
     // several seconds during a tree of dozens.
     let (schemas_by_queue_id, inboxes_by_queue_id) =
-        prefetch_queue_children(ctx.client, &queues, &phase, progress).await
+        prefetch_queue_children(ctx.client, &queues, progress).await
             .with_context(|| format!("prefetching schemas + inboxes for env '{env}'"))?;
 
     Ok(RemoteCatalog {
@@ -356,14 +343,12 @@ pub async fn list_remote(
 async fn prefetch_queue_children(
     client: &RossumClient,
     queues: &[crate::model::Queue],
-    phase: &crate::progress::Phase,
-    progress: &Arc<crate::progress::ProgressLog>,
+    progress: &Arc<dyn SyncRenderer>,
 ) -> Result<(
     std::collections::BTreeMap<u64, crate::model::Schema>,
     std::collections::BTreeMap<u64, crate::model::Inbox>,
 )> {
     use futures::stream::{StreamExt, TryStreamExt};
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Build (queue_id, schema_id?, inbox_id?) triples once so the future
     // body doesn't borrow `queues`.
@@ -389,30 +374,14 @@ async fn prefetch_queue_children(
         .collect();
     let total = triples.len();
 
-    // Nothing to fetch — skip the spinner entirely so the listing phase
-    // doesn't show a redundant `(0/0)` line.
+    // Nothing to fetch — emit no summary, just return empty maps.
     if total == 0 {
         return Ok((std::collections::BTreeMap::new(), std::collections::BTreeMap::new()));
     }
 
-    // Spinner shared across the parallel batch. Workers update only its
-    // message; the calling task holds ownership and calls finish_ok at the
-    // end. `Spinner::set_message` takes `&self`, so an `Arc<Spinner>` is
-    // safe to clone into each worker future.
-    //
-    // The spinner is constructed with the bare base name "schemas + inboxes".
-    // Workers update the displayed message to `schemas + inboxes (N/total)`
-    // as fetches resolve; on finalize the bar's transient message is dropped
-    // and the `[ok]` line uses the base name + summary (see
-    // `Spinner::finish_ok`).
-    let sp = Arc::new(phase.item("schemas + inboxes"));
-    let done = Arc::new(AtomicUsize::new(0));
-
     let fetched_result: Result<Vec<(u64, Option<crate::model::Schema>, Option<crate::model::Inbox>)>> =
         futures::stream::iter(triples)
             .map(|(qid, qname, sid, iid)| {
-                let sp = sp.clone();
-                let done = done.clone();
                 let progress = progress.clone();
                 async move {
                     let schema = match sid {
@@ -437,8 +406,6 @@ async fn prefetch_queue_children(
                         ),
                         None => None,
                     };
-                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    sp.set_message(format!("schemas + inboxes ({n}/{total})"));
                     Ok::<_, anyhow::Error>((qid, schema, inbox))
                 }
             })
@@ -446,24 +413,8 @@ async fn prefetch_queue_children(
             .try_collect()
             .await;
 
-    let fetched = match fetched_result {
-        Ok(v) => v,
-        Err(e) => {
-            // Spinner is in an Arc; we can't move it out to call finish_*
-            // (which consumes by value). Drop our reference; if workers
-            // already dropped theirs, Drop emits "(cancelled)". Otherwise
-            // the spinner finalizes when the last Arc is dropped.
-            drop(sp);
-            return Err(e);
-        }
-    };
-
-    // Finalize the spinner. `Arc::try_unwrap` can fail only if a worker
-    // future still holds a reference, which can't happen here (we awaited
-    // the whole stream). Fall through to drop on the unlikely path.
-    if let Ok(spinner) = Arc::try_unwrap(sp) {
-        spinner.finish_ok(format!("{total} fetched"));
-    }
+    let fetched = fetched_result?;
+    progress.warn_line(&format!("[ok] schemas + inboxes {total} fetched"));
 
     let mut schemas = std::collections::BTreeMap::new();
     let mut inboxes = std::collections::BTreeMap::new();
@@ -614,7 +565,7 @@ pub fn apply_pull_action(
     remote_bytes: &[u8],
     remote_hash: String,
     interactive: bool,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<dyn SyncRenderer>,
     env: &str,
     base_hash: Option<&str>,
 ) -> Result<String> {
@@ -665,14 +616,14 @@ pub fn apply_pull_action(
 fn shadow_file_conflict(
     local_path: &Path,
     remote_bytes: &[u8],
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<dyn SyncRenderer>,
     env: &str,
     base_hash: Option<&str>,
 ) -> Result<String> {
     use crate::snapshot::writer::write_atomic;
     let conflict_path = crate::paths::shadow_path_for(local_path, env);
     write_atomic(&conflict_path, remote_bytes)?;
-    progress.warn(format!(
+    progress.warn_line(&format!(
         "! {} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
         local_path.display(),
         conflict_path.display(),
@@ -696,7 +647,7 @@ fn resolve_conflict_interactive(
     local_path: &Path,
     remote_bytes: &[u8],
     remote_hash: &str,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<dyn SyncRenderer>,
     env: &str,
     base_hash: Option<&str>,
 ) -> Result<String> {
@@ -739,7 +690,7 @@ fn resolve_conflict_interactive(
             // shadow-skip); fall back to local hash when no prior base.
             write_atomic(local_path, &edited)?;
             if let Some(prior) = base_hash {
-                progress.warn(format!(
+                progress.warn_line(&format!(
                     "! {} partially resolved (markers retained); lockfile base preserved; re-run to resolve",
                     local_path.display(),
                 ));
@@ -828,9 +779,9 @@ mod tests {
     fn apply_write_creates_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
-        let p = crate::progress::ProgressLog::start("test");
+        let p: std::sync::Arc<dyn crate::progress::SyncRenderer> = crate::progress::ProgressLog::start("test");
         let h = apply_pull_action(PullAction::Write, &path, b"hello", "h".repeat(64), false, &p, "test", None).unwrap();
-        p.finish("test");
+        p.finish_ok("test");
         assert_eq!(h, "h".repeat(64));
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
     }
@@ -841,9 +792,9 @@ mod tests {
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"local").unwrap();
         // interactive=false → legacy shadow-file behavior.
-        let p = crate::progress::ProgressLog::start("test");
+        let p: std::sync::Arc<dyn crate::progress::SyncRenderer> = crate::progress::ProgressLog::start("test");
         let _ = apply_pull_action(PullAction::Conflict, &path, b"remote", "h".repeat(64), false, &p, "test", None).unwrap();
-        p.finish("test");
+        p.finish_ok("test");
         assert_eq!(std::fs::read(&path).unwrap(), b"local");
         assert_eq!(
             std::fs::read(dir.path().join("x.json.test")).unwrap(),
@@ -858,9 +809,9 @@ mod tests {
             status: 403,
             body: "permission_denied".into()
         }));
-        let p = crate::progress::ProgressLog::start("test");
+        let p: std::sync::Arc<dyn crate::progress::SyncRenderer> = crate::progress::ProgressLog::start("test");
         let out = skip_on_permission_denied(err, "engines", &p).unwrap();
-        p.finish("test");
+        p.finish_ok("test");
         assert!(out.is_empty());
     }
 
@@ -870,16 +821,16 @@ mod tests {
             status: 500,
             body: "boom".into()
         }));
-        let p = crate::progress::ProgressLog::start("test");
+        let p: std::sync::Arc<dyn crate::progress::SyncRenderer> = crate::progress::ProgressLog::start("test");
         assert!(skip_on_permission_denied(err, "engines", &p).is_err());
     }
 
     #[test]
     fn skip_on_permission_denied_passes_through_ok() {
         let v: Result<Vec<u32>> = Ok(vec![1, 2, 3]);
-        let p = crate::progress::ProgressLog::start("test");
+        let p: std::sync::Arc<dyn crate::progress::SyncRenderer> = crate::progress::ProgressLog::start("test");
         let out = skip_on_permission_denied(v, "engines", &p).unwrap();
-        p.finish("test");
+        p.finish_ok("test");
         assert_eq!(out, vec![1, 2, 3]);
     }
 
@@ -903,7 +854,7 @@ mod tests {
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"original").unwrap();
         let original_bytes = std::fs::read(&path).unwrap();
-        let p = crate::progress::ProgressLog::start("test");
+        let p: std::sync::Arc<dyn crate::progress::SyncRenderer> = crate::progress::ProgressLog::start("test");
         let h = apply_pull_action(
             PullAction::NoChange,
             &path,
@@ -915,7 +866,7 @@ mod tests {
             None,
         )
         .unwrap();
-        p.finish("test");
+        p.finish_ok("test");
         assert_eq!(h, "h".repeat(64));
         // Local file unchanged byte-for-byte.
         assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
@@ -935,7 +886,7 @@ mod tests {
         let remote = b"{\"remote\":true}";
         let prior_base = "BASE_HASH_64_chars_".to_string() + &"0".repeat(45);
         assert_eq!(prior_base.len(), 64);
-        let p = crate::progress::ProgressLog::start("test");
+        let p: std::sync::Arc<dyn crate::progress::SyncRenderer> = crate::progress::ProgressLog::start("test");
         let recorded = apply_pull_action(
             PullAction::Conflict,
             &path,
@@ -947,7 +898,7 @@ mod tests {
             Some(&prior_base),
         )
         .unwrap();
-        p.finish("test");
+        p.finish_ok("test");
         // Lockfile must NOT advance — recorded hash equals prior base.
         assert_eq!(recorded, prior_base, "shadow-skip must preserve lockfile base");
         // Shadow file carries remote bytes.
@@ -969,7 +920,7 @@ mod tests {
         let local = b"{\"local\":true}";
         std::fs::write(&path, local).unwrap();
         let remote = b"{\"remote\":true}";
-        let p = crate::progress::ProgressLog::start("test");
+        let p: std::sync::Arc<dyn crate::progress::SyncRenderer> = crate::progress::ProgressLog::start("test");
         let recorded = apply_pull_action(
             PullAction::Conflict,
             &path,
@@ -981,7 +932,7 @@ mod tests {
             None, // no prior base
         )
         .unwrap();
-        p.finish("test");
+        p.finish_ok("test");
         assert_eq!(recorded, content_hash(local));
     }
 
@@ -996,7 +947,7 @@ mod tests {
         std::fs::write(&path, local).unwrap();
         let remote = b"{\"remote\":true}";
         let base_hash = "B".repeat(64);
-        let p = crate::progress::ProgressLog::start("test");
+        let p: std::sync::Arc<dyn crate::progress::SyncRenderer> = crate::progress::ProgressLog::start("test");
 
         // First pull → conflict → shadow-skip.
         let (action1, remote_hash1) =
@@ -1019,6 +970,6 @@ mod tests {
         // conflict because the lockfile base never moved.
         let (action2, _) = decide_pull_action(&path, Some(&recorded1), remote).unwrap();
         assert_eq!(action2, PullAction::Conflict, "second pull must re-prompt");
-        p.finish("test");
+        p.finish_ok("test");
     }
 }

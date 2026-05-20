@@ -14,10 +14,12 @@ use std::sync::{Arc, Mutex};
 
 use indicatif::{ProgressBar, ProgressStyle};
 
-/// Optional reference to the run-wide progress log. `None` when no run
-/// is active (e.g. `rdc auth`, `rdc diff`). Threaded through API client
-/// methods so retry warnings can render above any in-flight spinner.
-pub type ProgressHandle = Option<Arc<ProgressLog>>;
+/// Optional reference to the run-wide progress renderer. `None` when no
+/// run is active (e.g. `rdc auth`, `rdc diff`). Threaded through API
+/// client methods so retry warnings (and, with the grid renderer, banner
+/// notes) can render above any in-flight progress. Uses `dyn SyncRenderer`
+/// so either the log renderer or the grid renderer can be passed.
+pub type ProgressHandle = Option<Arc<dyn crate::progress::SyncRenderer>>;
 
 /// Run-wide handle for the event-log UX. Created once at the top of a
 /// pull/push/deploy/sync run; cloneable into per-driver scopes.
