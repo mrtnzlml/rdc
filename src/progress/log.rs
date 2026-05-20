@@ -217,7 +217,7 @@ impl Phase {
             bar.set_style(
                 ProgressStyle::with_template("{spinner} {msg}")
                     .unwrap()
-                    .tick_strings(&["|", "/", "-", "\\"]),
+                    .tick_strings(&["▱▱▱", "▰▱▱", "▰▰▱", "▰▰▰"]),
             );
             bar.enable_steady_tick(std::time::Duration::from_millis(120));
             bar.set_message(name.clone());
@@ -468,12 +468,13 @@ mod log_tests {
     }
 
     /// Regression: the formatter never PREFIXES the line with a spinner
-    /// tick glyph (`|`, `/`, `-`, `\`). The fix for the "random spinner
-    /// frame leak" issue relies on `format_final_line` producing a line
-    /// whose first non-space content is the marker (`[ok]`, `!`, `[fail]`),
-    /// never a tick. Spinner glyphs are rendered by indicatif's template,
-    /// not by this formatter; if any frame ever sneaked into the final
-    /// line it would precede the marker.
+    /// tick glyph. The fix for the "random spinner frame leak" issue
+    /// relies on `format_final_line` producing a line whose first
+    /// non-space content is the marker (`[ok]`, `!`, `[fail]`), never a
+    /// tick. Spinner glyphs are rendered by indicatif's template, not
+    /// by this formatter; if any frame ever sneaked into the final line
+    /// it would precede the marker. The glyph list below covers both
+    /// the legacy `|/-\` set and the current `▱▰` filling-bar set.
     #[test]
     fn format_final_line_never_starts_with_spinner_glyph() {
         let cases = [
@@ -482,7 +483,7 @@ mod log_tests {
             ("[fail]", "queues/y", "boom", Duration::from_millis(2000)),
             ("[ok]", "workspaces", "", Duration::from_millis(40)),
         ];
-        let spinner_glyphs = ['|', '/', '-', '\\'];
+        let spinner_glyphs = ['|', '/', '-', '\\', '▱', '▰'];
         for (marker, name, summary, elapsed) in cases {
             let line = format_final_line(marker, name, summary, elapsed, ColorMode::Plain);
             let first = line.chars().next().expect("non-empty line");
