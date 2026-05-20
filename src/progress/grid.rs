@@ -572,14 +572,6 @@ impl GridRenderer {
                 g.kind_rows[slot][line_idx].set_message(line_msg);
                 line_idx += 1;
             }
-            // After the last content row, insert a blank spacer line so the
-            // next kind has visual separation. set_message(" ") produces a
-            // single blank-looking line in indicatif; set_message("") may be
-            // collapsed by the renderer.
-            if line_idx < MAX_CONT_ROWS {
-                g.kind_rows[slot][line_idx].set_message(" ".to_string());
-                line_idx += 1;
-            }
             // Clear unused continuation rows for this kind.
             for r in line_idx..MAX_CONT_ROWS {
                 g.kind_rows[slot][r].set_message(String::new());
