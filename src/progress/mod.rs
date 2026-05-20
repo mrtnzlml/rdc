@@ -26,14 +26,13 @@ pub enum ResourceOp {
     Delete,
 }
 
-/// Outcome of a per-resource operation. `ConflictPending` is the
-/// transient state while the resolver prompt is open.
-#[derive(Debug, Clone)]
+/// Outcome of a per-resource operation. The grid renderer uses this to
+/// transition the per-resource entry's in-flight state.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceOutcome {
     Ok,
     Skipped,
     Failed(String),
-    ConflictPending,
 }
 
 /// Severity of a banner. The grid renderer colors banners accordingly;
@@ -55,10 +54,10 @@ pub trait SyncRenderer: Send + Sync {
     /// updates its header bar's "current op" field.
     fn phase(&self, label: &str);
 
-    /// One free-standing line of context (warnings, retry notes, info).
-    /// The log renderer routes through `MultiProgress::println`; the
-    /// grid renderer queues this as a one-shot banner with the given
-    /// severity inferred from the caller (Warn for most uses).
+    /// One free-standing line of output not tied to a resource spinner —
+    /// success summaries (`[ok] labels 46 pulled`), retry notes, or
+    /// general info. The log renderer prints it via `MultiProgress::println`;
+    /// the grid renderer queues it as a transient banner.
     fn warn_line(&self, msg: &str);
 
     /// Per-resource lifecycle: signal an API call is starting. Only the
@@ -117,10 +116,12 @@ mod sync_renderer_types_tests {
     }
 
     #[test]
-    fn severity_ordering_unused() {
-        // Severity is a tagged set, not ordered. Pin that we didn't
-        // accidentally derive Ord.
-        let _ = Severity::Warn;
+    fn severity_variants_are_distinct() {
+        // We deliberately don't derive Ord/PartialOrd — Severity is a tagged
+        // set, not a ranking. A separate severity_rank() function in
+        // grid.rs will define ordering for footer sort.
+        assert_ne!(Severity::Info, Severity::Warn);
         assert_ne!(Severity::Warn, Severity::Error);
+        assert_ne!(Severity::Info, Severity::Error);
     }
 }
