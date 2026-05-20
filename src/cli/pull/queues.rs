@@ -13,7 +13,7 @@ use super::common::{
     record_object, skip_on_permission_denied, PullAction, PullCtx,
 };
 use crate::model::{Inbox, Queue, Schema};
-use crate::progress::{Phase, ProgressLog};
+use crate::progress::SyncRenderer;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -39,7 +39,7 @@ struct QueueWork<'a> {
 }
 
 /// Phase 1: list all queues from the API.
-pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<ProgressLog>) -> Result<Vec<Queue>> {
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<dyn SyncRenderer>) -> Result<Vec<Queue>> {
     skip_on_permission_denied(
         ctx.client.list_queues(Some(progress.clone())).await.context("listing queues"),
         "queues",
@@ -74,9 +74,9 @@ pub async fn process(
     schemas_by_queue_id: &BTreeMap<u64, Schema>,
     inboxes_by_queue_id: &BTreeMap<u64, Inbox>,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<dyn SyncRenderer>,
 ) -> Result<QueueCounts> {
-    let phase = progress.phase("pulling queues");
+    progress.phase("pulling queues");
 
     let mut per_ws_used_slugs: HashMap<String, HashSet<String>> = HashMap::new();
     let mut counts = QueueCounts { queues: 0, schemas: 0, inboxes: 0, conflicts: 0 };
@@ -147,7 +147,7 @@ pub async fn process(
         // B below — no URL parsing is needed here because the maps are
         // keyed by `q.id`.
         if q.schema.is_none() {
-            phase.line(format!(
+            progress.warn_line(&format!(
                 "! queue '{}' (id {}) has no schema; skipping schema + inbox",
                 q.name, q.id,
             ));
@@ -165,14 +165,19 @@ pub async fn process(
     // Decisions mutate shared state (lockfile, conflict counts), so the
     // loop is intentionally sequential.
     for w in &work {
-        let sp = phase.item(&w.q.name);
         if let Some(schema) = schemas_by_queue_id.get(&w.q.id) {
-            write_schema_for_queue(ctx, &mut counts, w, schema, progress, &phase)?;
+            write_schema_for_queue(ctx, &mut counts, w, schema, progress)?;
         }
         if let Some(inbox) = inboxes_by_queue_id.get(&w.q.id) {
             write_inbox_for_queue(ctx, &mut counts, w, inbox, progress)?;
         }
-        sp.finish_ok("");
+    }
+
+    if counts.queues > 0 {
+        progress.warn_line(&format!(
+            "[ok] queues {} pulled (schemas {}, inboxes {})",
+            counts.queues, counts.schemas, counts.inboxes,
+        ));
     }
 
     Ok(counts)
@@ -183,8 +188,7 @@ fn write_schema_for_queue(
     counts: &mut QueueCounts,
     w: &QueueWork<'_>,
     schema: &Schema,
-    _progress: &Arc<ProgressLog>,
-    phase: &Phase,
+    progress: &Arc<dyn SyncRenderer>,
 ) -> Result<()> {
     let queue_dir = &w.queue_dir;
     let schema_path = queue_dir.join("schema.json");
@@ -315,7 +319,7 @@ fn write_schema_for_queue(
                         crate::snapshot::writer::write_atomic(&p, bytes)?;
                     }
                 }
-                phase.line(format!(
+                progress.warn_line(&format!(
                     "! {} conflict: local preserved, remote at {} (formulas at {}); lockfile base preserved",
                     schema_path.display(),
                     remote_path.display(),
@@ -346,7 +350,7 @@ fn write_inbox_for_queue(
     counts: &mut QueueCounts,
     w: &QueueWork<'_>,
     inbox: &Inbox,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<dyn SyncRenderer>,
 ) -> Result<()> {
     let inbox_path = w.queue_dir.join("inbox.json");
     let mut inbox_proposed = serde_json::to_vec_pretty(inbox).context("serializing inbox")?;

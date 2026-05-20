@@ -32,6 +32,8 @@
 use crate::cli::pull::common::{PullCtx, RemoteCatalog};
 use crate::cli::resolve::{prompt_remote_delete, prompt_resolve, PullAborted, Resolution};
 use crate::cli::sync::classify::{ClassifiedItem, SyncClass};
+use crate::progress::SyncRenderer;
+#[cfg(test)]
 use crate::progress::ProgressLog;
 use crate::slug::slugify_unique;
 use crate::snapshot::writer::write_atomic;
@@ -75,7 +77,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
     classified: &[ClassifiedItem],
     mut input: R,
     interactive: bool,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<dyn SyncRenderer>,
 ) -> Result<ConflictOutcome> {
     let mut outcome = ConflictOutcome::default();
 
@@ -441,7 +443,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 })
             }
             other => {
-                progress.warn(format!(
+                progress.warn_line(&format!(
                     "warning: conflict resolver not yet wired for kind '{}' (slug '{}'); skipping",
                     other, it.slug,
                 ));
@@ -449,7 +451,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
             }
         }) else {
             // No catalog entry / orphan / unwired kind — warn and move on.
-            progress.warn(format!(
+            progress.warn_line(&format!(
                 "warning: conflict for {}/{} but no matching remote object found; skipping",
                 it.kind, it.slug,
             ));
@@ -590,7 +592,7 @@ fn resolve_one_conflict<R: BufRead>(
     stderr_lock: &mut std::io::StderrLock<'_>,
     interactive: bool,
     env: &str,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<dyn SyncRenderer>,
     outcome: &mut ConflictOutcome,
 ) -> Result<()> {
     let ConflictRefs {
@@ -761,7 +763,7 @@ fn resolve_one_conflict<R: BufRead>(
             };
         let conflict_path = crate::paths::shadow_path_for(&shadow_anchor, env);
         write_atomic(&conflict_path, &shadow_bytes)?;
-        progress.warn(format!(
+        progress.warn_line(&format!(
             "warn: {} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
             shadow_anchor.display(),
             conflict_path.display(),
@@ -1010,7 +1012,7 @@ fn resolve_one_conflict<R: BufRead>(
                 std::fs::create_dir_all(parent).ok();
             }
             write_atomic(edit_target, &edited)?;
-            progress.warn(format!(
+            progress.warn_line(&format!(
                 "warn: {} partially resolved (markers retained); lockfile base preserved; re-run to resolve",
                 edit_target.display(),
             ));
@@ -1041,7 +1043,7 @@ fn resolve_one_conflict<R: BufRead>(
             // identical-to-local `.json`.
             let conflict_path = crate::paths::shadow_path_for(&prompt_path, env);
             write_atomic(&conflict_path, &prompt_remote_bytes)?;
-            progress.warn(format!(
+            progress.warn_line(&format!(
                 "warn: {} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
                 prompt_path.display(),
                 conflict_path.display(),
@@ -1174,7 +1176,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
     classified: &[ClassifiedItem],
     mut input: R,
     interactive: bool,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<dyn SyncRenderer>,
 ) -> Result<ConflictOutcome> {
     let mut outcome = ConflictOutcome::default();
 
@@ -1327,7 +1329,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                 ) {
                     drop_lockfile_entry(ctx, &it.kind, &it.slug);
                 } else {
-                    progress.warn(format!(
+                    progress.warn_line(&format!(
                         "warning: BothDeleted handler not yet wired for kind '{}' (slug '{}'); skipping",
                         it.kind, it.slug,
                     ));
@@ -1620,7 +1622,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                         })
                     }
                     other => {
-                        progress.warn(format!(
+                        progress.warn_line(&format!(
                             "warning: remote-delete dispatch not yet wired for kind '{}' (slug '{}'); skipping",
                             other, it.slug,
                         ));
@@ -1662,7 +1664,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             }
                         }
                         None => {
-                            progress.warn(format!(
+                            progress.warn_line(&format!(
                                 "warning: LocalDeleteRemoteEdit for {}/{} but no matching env-side body in catalog; skipping",
                                 it.kind, it.slug,
                             ));
@@ -1680,7 +1682,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     if local_path.exists() {
                         let marker = deleted_marker_path(&local_path, &env);
                         write_atomic(&marker, b"")?;
-                        progress.warn(format!(
+                        progress.warn_line(&format!(
                             "warn: {}: env deletion deferred (non-tty); marker at {}",
                             local_path.display(),
                             marker.display(),
@@ -1694,7 +1696,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     // file: the classifier saw a tombstone-flavored
                     // state but the file isn't there. Defensive — emit
                     // a warning and move on rather than panic.
-                    progress.warn(format!(
+                    progress.warn_line(&format!(
                         "warn: {}: local file missing, cannot prompt; skipping",
                         local_path.display(),
                     ));
@@ -1733,7 +1735,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             std::fs::remove_file(&local_path).with_context(|| {
                                 format!("removing {}", local_path.display())
                             })?;
-                            progress.warn(format!(
+                            progress.warn_line(&format!(
                                 "note: {}: committing the local tombstone needs an \
                                  explicit `rdc push --allow-deletes {}` follow-up; \
                                  the lockfile entry was retained so the deletion isn't lost",
@@ -1820,7 +1822,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     Resolution::Skip => {
                         let marker = deleted_marker_path(&local_path, &env);
                         write_atomic(&marker, b"")?;
-                        progress.warn(format!(
+                        progress.warn_line(&format!(
                             "warn: {}: env deletion deferred; marker at {}",
                             local_path.display(),
                             marker.display(),
@@ -1911,7 +1913,7 @@ pub async fn run(
     no_pull: bool,
     allow_deletes: bool,
     interactive: bool,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<dyn SyncRenderer>,
 ) -> Result<crate::cli::sync::CycleOutcome> {
     // Tally cycle counters up front by inspecting the static classification.
     // The dispatch branches below may early-return on user abort or
@@ -2048,7 +2050,7 @@ pub async fn run(
                     eprintln!("delete phase aborted at confirmation; remote unchanged.");
                 }
                 crate::cli::push::deletes::ConfirmOutcome::Proceed => {
-                    let phase = progress.phase("deleting");
+                    progress.phase("deleting");
                     delete_counts = crate::cli::push::deletes::run_deletes(
                         ctx.client,
                         ctx.lockfile,
@@ -2056,7 +2058,6 @@ pub async fn run(
                         interactive,
                     )
                     .await?;
-                    drop(phase);
                 }
             }
         }
@@ -2444,7 +2445,7 @@ mod tests {
         let mut fixture = setup_conflict_fixture();
         let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
         let classified = classified_for(&fixture);
-        let progress = ProgressLog::start("test");
+        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
 
         // Snapshot local bytes so we can assert they survive.
         let local_before = std::fs::read(&fixture.local_path).unwrap();
@@ -2469,7 +2470,7 @@ mod tests {
             .await
             .expect("resolver should succeed on [k]")
         };
-        progress.finish("");
+        progress.finish_ok("");
 
         // Outcome: one entry promoted to the push pipeline, naming the
         // label slug and its on-disk path.
@@ -2505,7 +2506,7 @@ mod tests {
         let mut fixture = setup_conflict_fixture();
         let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
         let classified = classified_for(&fixture);
-        let progress = ProgressLog::start("test");
+        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
 
         let outcome = {
             let mut ctx = PullCtx {
@@ -2527,7 +2528,7 @@ mod tests {
             .await
             .expect("resolver should succeed on [r]")
         };
-        progress.finish("");
+        progress.finish_ok("");
 
         // No push-side promotion — remote wins, no PATCH needed.
         assert!(outcome.promoted_to_push.is_empty(), "no push items expected on [r]");
@@ -2565,7 +2566,7 @@ mod tests {
             .expect("fixture must seed a prior base hash");
         let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
         let classified = classified_for(&fixture);
-        let progress = ProgressLog::start("test");
+        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
 
         let local_before = std::fs::read(&fixture.local_path).unwrap();
 
@@ -2589,7 +2590,7 @@ mod tests {
             .await
             .expect("resolver should succeed on [s]")
         };
-        progress.finish("");
+        progress.finish_ok("");
 
         assert!(outcome.promoted_to_push.is_empty(), "skip never promotes to push");
 
@@ -2634,7 +2635,7 @@ mod tests {
             .expect("fixture must seed a prior base hash");
         let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
         let classified = classified_for(&fixture);
-        let progress = ProgressLog::start("test");
+        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
 
         let local_before = std::fs::read(&fixture.local_path).unwrap();
 
@@ -2659,7 +2660,7 @@ mod tests {
             .await
             .expect("non-interactive resolver must succeed")
         };
-        progress.finish("");
+        progress.finish_ok("");
 
         assert!(outcome.promoted_to_push.is_empty());
 
@@ -2689,7 +2690,7 @@ mod tests {
         let mut fixture = setup_conflict_fixture();
         let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
         let classified = classified_for(&fixture);
-        let progress = ProgressLog::start("test");
+        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
 
         let err = {
             let mut ctx = PullCtx {
@@ -2711,7 +2712,7 @@ mod tests {
             .await
             .expect_err("abort must surface as an error")
         };
-        progress.finish("");
+        progress.finish_ok("");
 
         // Sentinel type lets the outer push/pull runner suppress
         // lockfile.save() — mirrors the apply_pull_action contract.
@@ -2738,7 +2739,7 @@ mod tests {
             remote_hash: None,
             base_hash: None,
         }];
-        let progress = ProgressLog::start("test");
+        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
         let lf_before = fixture.lockfile.clone();
 
         let outcome = {
@@ -2764,7 +2765,7 @@ mod tests {
             .await
             .expect("no-op resolver must succeed")
         };
-        progress.finish("");
+        progress.finish_ok("");
 
         assert!(outcome.promoted_to_push.is_empty(), "no items to promote");
         assert_eq!(fixture.lockfile, lf_before, "lockfile must be untouched");
@@ -2844,7 +2845,7 @@ mod tests {
         let mut fixture = setup_remote_delete_fixture();
         let catalog = catalog_with_labels(vec![]);
         let classified = classified_remote_delete();
-        let progress = ProgressLog::start("test");
+        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
 
         let local_before = std::fs::read(&fixture.local_path).unwrap();
 
@@ -2868,7 +2869,7 @@ mod tests {
             .await
             .expect("resolver should succeed on [k]")
         };
-        progress.finish("");
+        progress.finish_ok("");
 
         // Outcome: one entry promoted as a restore — push pipeline will
         // POST because the lockfile entry was dropped.
@@ -2906,7 +2907,7 @@ mod tests {
         let mut fixture = setup_remote_delete_fixture();
         let catalog = catalog_with_labels(vec![]);
         let classified = classified_remote_delete();
-        let progress = ProgressLog::start("test");
+        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
 
         let outcome = {
             let mut ctx = PullCtx {
@@ -2928,7 +2929,7 @@ mod tests {
             .await
             .expect("resolver should succeed on [r]")
         };
-        progress.finish("");
+        progress.finish_ok("");
 
         assert!(
             outcome.promoted_to_push.is_empty(),
@@ -2957,7 +2958,7 @@ mod tests {
         let mut fixture = setup_remote_delete_fixture();
         let catalog = catalog_with_labels(vec![]);
         let classified = classified_remote_delete();
-        let progress = ProgressLog::start("test");
+        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
 
         let local_before = std::fs::read(&fixture.local_path).unwrap();
         let lf_before = fixture.lockfile.clone();
@@ -2982,7 +2983,7 @@ mod tests {
             .await
             .expect("resolver should succeed on [s]")
         };
-        progress.finish("");
+        progress.finish_ok("");
 
         assert!(outcome.promoted_to_push.is_empty(), "skip never promotes");
 
@@ -3014,7 +3015,7 @@ mod tests {
         let mut fixture = setup_remote_delete_fixture();
         let catalog = catalog_with_labels(vec![]);
         let classified = classified_remote_delete();
-        let progress = ProgressLog::start("test");
+        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
 
         let local_before = std::fs::read(&fixture.local_path).unwrap();
 
@@ -3040,7 +3041,7 @@ mod tests {
             .await
             .expect("non-tty resolver must succeed")
         };
-        progress.finish("");
+        progress.finish_ok("");
 
         assert!(outcome.promoted_to_push.is_empty());
 
@@ -3103,7 +3104,7 @@ mod tests {
             remote_hash: Some(content_hash(&remote_bytes)),
             base_hash: Some("base".to_string()),
         }];
-        let progress = ProgressLog::start("test");
+        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
 
         let outcome = {
             let mut ctx = PullCtx {
@@ -3125,7 +3126,7 @@ mod tests {
             .await
             .expect("LocalDeleteRemoteEdit resolver should succeed on [s]")
         };
-        progress.finish("");
+        progress.finish_ok("");
 
         assert!(outcome.promoted_to_push.is_empty());
 
@@ -3164,7 +3165,7 @@ mod tests {
             remote_hash: None,
             base_hash: Some("dummy".to_string()),
         }];
-        let progress = ProgressLog::start("test");
+        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
 
         let outcome = {
             let mut ctx = PullCtx {
@@ -3187,7 +3188,7 @@ mod tests {
             .await
             .expect("BothDeleted resolver must succeed without reading stdin")
         };
-        progress.finish("");
+        progress.finish_ok("");
 
         assert!(outcome.promoted_to_push.is_empty());
         assert!(
@@ -3335,7 +3336,7 @@ mod tests {
             "TEST".to_string(),
         )
         .unwrap();
-        let progress = ProgressLog::start("test");
+        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
 
         // Empty stdin → the resolver tries to read a response but
         // must NOT short-circuit silently. With the bug present
@@ -3365,7 +3366,7 @@ mod tests {
             .await
             .expect("resolver should succeed (even with empty stdin → Skip)")
         };
-        progress.finish("");
+        progress.finish_ok("");
 
         assert!(
             outcome.promoted_to_push.is_empty(),
@@ -3419,7 +3420,7 @@ mod tests {
             "TEST".to_string(),
         )
         .unwrap();
-        let progress = ProgressLog::start("test");
+        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
 
         let outcome = {
             let mut ctx = PullCtx {
@@ -3441,7 +3442,7 @@ mod tests {
             .await
             .expect("resolver should succeed on [k]")
         };
-        progress.finish("");
+        progress.finish_ok("");
 
         assert_eq!(
             outcome.promoted_to_push.len(),
@@ -3489,7 +3490,7 @@ mod tests {
             "TEST".to_string(),
         )
         .unwrap();
-        let progress = ProgressLog::start("test");
+        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
 
         let json_before = std::fs::read(&json_path).unwrap();
 
@@ -3513,7 +3514,7 @@ mod tests {
             .await
             .expect("resolver should succeed on [r]")
         };
-        progress.finish("");
+        progress.finish_ok("");
 
         assert!(outcome.promoted_to_push.is_empty(), "no push on [r]");
 
@@ -3654,7 +3655,7 @@ mod tests {
             "TEST".to_string(),
         )
         .unwrap();
-        let progress = ProgressLog::start("test");
+        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
 
         let outcome = {
             let mut ctx = PullCtx {
@@ -3680,7 +3681,7 @@ mod tests {
             .await
             .expect("resolver should succeed (Skip on empty stdin)")
         };
-        progress.finish("");
+        progress.finish_ok("");
 
         assert!(
             outcome.promoted_to_push.is_empty(),
@@ -3803,7 +3804,7 @@ mod tests {
             "TEST".to_string(),
         )
         .unwrap();
-        let progress = ProgressLog::start("test");
+        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
 
         let outcome = {
             let mut ctx = PullCtx {
@@ -3825,7 +3826,7 @@ mod tests {
             .await
             .expect("resolver should succeed (Skip on empty stdin)")
         };
-        progress.finish("");
+        progress.finish_ok("");
 
         assert!(
             outcome.promoted_to_push.is_empty(),
@@ -4031,7 +4032,7 @@ mod tests {
             "TEST".to_string(),
         )
         .unwrap();
-        let progress = ProgressLog::start("test");
+        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
 
         let outcome = {
             let mut ctx = PullCtx {
@@ -4053,7 +4054,7 @@ mod tests {
             .await
             .expect("resolver should succeed (Skip on empty stdin)")
         };
-        progress.finish("");
+        progress.finish_ok("");
 
         assert!(
             outcome.promoted_to_push.is_empty(),

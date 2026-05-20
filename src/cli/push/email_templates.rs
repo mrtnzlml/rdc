@@ -2,7 +2,7 @@ use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::ProgressLog;
+use crate::progress::SyncRenderer;
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
@@ -16,13 +16,13 @@ pub async fn push(
     lockfile: &mut Lockfile,
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<dyn SyncRenderer>,
     env: &str,
 ) -> Result<(usize, usize)> {
     let overlay = Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
-    let phase = progress.phase("pushing email_templates");
+    progress.phase("pushing email_templates");
     let mut pushed = 0usize;
     let mut skipped = 0usize;
     let mut remote_cache: std::collections::HashMap<u64, crate::model::EmailTemplate> =
@@ -31,8 +31,6 @@ pub async fn push(
     // slug (lockfile_key) = "ws_slug/q_slug/template_slug"
     for (lockfile_key, template_path) in changes {
         let overlay_paths = overlay.as_ref().and_then(|ov| ov.email_template(lockfile_key));
-
-        let sp = phase.item(format!("email_templates/{lockfile_key}"));
 
         // Missing lockfile entry → new email template, POST.
         if lockfile.objects.get("email_templates").and_then(|m| m.get(lockfile_key.as_str())).is_none() {
@@ -64,7 +62,7 @@ pub async fn push(
                     secrets_hash: None,
                 },
             );
-            sp.finish_ok(format!("POST (id {})", created.id));
+            progress.warn_line(&format!("[ok] email_templates/{lockfile_key} POST (id {})", created.id));
             pushed += 1;
             continue;
         }
@@ -73,7 +71,7 @@ pub async fn push(
             .with_context(|| format!("reading {}", template_path.display()))?;
         let entry = lockfile.objects.get("email_templates").and_then(|m| m.get(lockfile_key.as_str())).unwrap();
         let Some(base) = &entry.content_hash else {
-            sp.finish_warn("lockfile entry has no content_hash, skipping");
+            progress.warn_line(&format!("! email_templates/{lockfile_key} lockfile entry has no content_hash, skipping"));
             skipped += 1;
             continue;
         };
@@ -96,7 +94,7 @@ pub async fn push(
             }
         }
         let Some(remote_template) = remote_cache.get(&id).cloned() else {
-            sp.finish_warn(format!("id {id} not found on remote, skipping"));
+            progress.warn_line(&format!("! email_templates/{lockfile_key} id {id} not found on remote, skipping"));
             skipped += 1;
             continue;
         };
@@ -129,12 +127,12 @@ pub async fn push(
                             secrets_hash: None,
                         },
                     );
-                    sp.finish_warn("adopted remote (drift)");
+                    progress.warn_line(&format!("! email_templates/{lockfile_key} adopted remote (drift)"));
                     skipped += 1;
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    sp.finish_warn("remote has changed since last sync, skipping push (run `rdc sync` first)");
+                    progress.warn_line(&format!("! email_templates/{lockfile_key} remote has changed since last sync, skipping push (run `rdc sync` first)"));
                     skipped += 1;
                     continue;
                 }
@@ -163,7 +161,7 @@ pub async fn push(
                 secrets_hash: None,
             },
         );
-        sp.finish_ok("PATCH");
+        progress.warn_line(&format!("[ok] email_templates/{lockfile_key} PATCH"));
         pushed += 1;
     }
 

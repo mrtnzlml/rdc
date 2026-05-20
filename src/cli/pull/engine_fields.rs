@@ -3,14 +3,14 @@ use super::common::{
     skip_on_permission_denied, PullAction, PullCtx,
 };
 use crate::model::EngineField;
-use crate::progress::ProgressLog;
+use crate::progress::SyncRenderer;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all engine fields from the API.
-pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<ProgressLog>) -> Result<Vec<EngineField>> {
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<dyn SyncRenderer>) -> Result<Vec<EngineField>> {
     skip_on_permission_denied(
         ctx.client.list_engine_fields(Some(progress.clone())).await.context("listing engine fields"),
         "engine_fields",
@@ -29,16 +29,16 @@ pub async fn process(
     ctx: &mut PullCtx<'_>,
     fields: Vec<EngineField>,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<dyn SyncRenderer>,
 ) -> Result<(usize, usize)> {
-    let phase = progress.phase("pulling engine_fields");
+    progress.phase("pulling engine_fields");
 
     let mut used: HashSet<String> = HashSet::new();
     let mut conflicts = 0usize;
     let mut written = 0usize;
     for f in &fields {
         let Some(engine_slug) = ctx.lockfile.slug_for_url("engines", &f.engine).map(|s| s.to_string()) else {
-            phase.line(format!(
+            progress.warn_line(&format!(
                 "! engine field '{}' (id {}) has unknown engine URL '{}'; skipping",
                 f.name, f.id, f.engine
             ));
@@ -54,8 +54,6 @@ pub async fn process(
         if !subset.contains(&("engine_fields".to_string(), slug.clone())) {
             continue;
         }
-
-        let sp = phase.item(&f.name);
 
         let fields_dir = ctx.paths.engine_fields_dir(&engine_slug);
         std::fs::create_dir_all(&fields_dir)
@@ -92,8 +90,11 @@ pub async fn process(
             f.modified_at().map(|s| s.to_string()),
             Some(recorded_hash),
         );
-        sp.finish_ok("");
         written += 1;
+    }
+
+    if written > 0 {
+        progress.warn_line(&format!("[ok] engine_fields {written} pulled"));
     }
 
     Ok((written, conflicts))

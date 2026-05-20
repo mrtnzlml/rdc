@@ -1,6 +1,6 @@
 use super::common::{record_object, skip_on_permission_denied, PullCtx};
 use crate::model::Workspace;
-use crate::progress::ProgressLog;
+use crate::progress::SyncRenderer;
 use crate::slug::slugify_unique;
 use crate::snapshot::workspace::write_workspace;
 use crate::state::content_hash;
@@ -9,7 +9,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all workspaces from the API.
-pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<ProgressLog>) -> Result<Vec<Workspace>> {
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<dyn SyncRenderer>) -> Result<Vec<Workspace>> {
     skip_on_permission_denied(
         ctx.client.list_workspaces(Some(progress.clone())).await.context("listing workspaces"),
         "workspaces",
@@ -24,9 +24,9 @@ pub async fn process(
     ctx: &mut PullCtx<'_>,
     workspaces: Vec<Workspace>,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<dyn SyncRenderer>,
 ) -> Result<usize> {
-    let phase = progress.phase("pulling workspaces");
+    progress.phase("pulling workspaces");
 
     let mut used_slugs: HashSet<String> = HashSet::new();
     let mut dir_created = false;
@@ -41,8 +41,6 @@ pub async fn process(
         if !subset.contains(&("workspaces".to_string(), slug.clone())) {
             continue;
         }
-
-        let sp = phase.item(&ws.name);
 
         if !dir_created {
             std::fs::create_dir_all(ctx.paths.workspaces_dir())
@@ -69,7 +67,10 @@ pub async fn process(
         );
 
         count += 1;
-        sp.finish_ok("");
+    }
+
+    if count > 0 {
+        progress.warn_line(&format!("[ok] workspaces {count} pulled"));
     }
 
     Ok(count)

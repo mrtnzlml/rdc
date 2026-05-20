@@ -3,14 +3,14 @@ use super::common::{
     skip_on_permission_denied, PullAction, PullCtx,
 };
 use crate::model::Label;
-use crate::progress::ProgressLog;
+use crate::progress::SyncRenderer;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all labels from the API.
-pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<ProgressLog>) -> Result<Vec<Label>> {
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<dyn SyncRenderer>) -> Result<Vec<Label>> {
     skip_on_permission_denied(
         ctx.client.list_labels(Some(progress.clone())).await.context("listing labels"),
         "labels",
@@ -27,9 +27,9 @@ pub async fn process(
     ctx: &mut PullCtx<'_>,
     labels: Vec<Label>,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<dyn SyncRenderer>,
 ) -> Result<(usize, usize)> {
-    let phase = progress.phase("pulling labels");
+    progress.phase("pulling labels");
 
     let mut used: HashSet<String> = HashSet::new();
     let mut dir_created = false;
@@ -45,8 +45,6 @@ pub async fn process(
         if !subset.contains(&("labels".to_string(), slug.clone())) {
             continue;
         }
-
-        let sp = phase.item(&l.name);
 
         if !dir_created {
             std::fs::create_dir_all(ctx.paths.labels_dir())
@@ -85,8 +83,11 @@ pub async fn process(
             l.modified_at().map(|s| s.to_string()),
             Some(recorded_hash),
         );
-        sp.finish_ok("");
         written += 1;
+    }
+
+    if written > 0 {
+        progress.warn_line(&format!("[ok] labels {written} pulled"));
     }
 
     Ok((written, conflicts))
@@ -126,7 +127,7 @@ mod tests {
         )
         .unwrap();
         let mut lockfile = Lockfile::default();
-        let progress = ProgressLog::start("test");
+        let progress: Arc<dyn SyncRenderer> = crate::progress::ProgressLog::start("test");
 
         let mut ctx = PullCtx {
             paths: &paths,
@@ -142,7 +143,7 @@ mod tests {
         subset.insert(("labels".to_string(), "in-scope".to_string()));
 
         let (written, conflicts) = process(&mut ctx, labels, &subset, &progress).await.unwrap();
-        progress.finish("test");
+        progress.finish_ok("test");
 
         assert_eq!(written, 1, "only the in-subset label should be written");
         assert_eq!(conflicts, 0);

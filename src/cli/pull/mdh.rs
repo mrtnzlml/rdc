@@ -2,7 +2,7 @@ use super::common::{apply_pull_action, decide_pull_action, record_object, PullAc
 use crate::api::{anyhow_has_status, DataStorageClient};
 use crate::config::EnvConfig;
 use crate::model::{Collection, IndexSet};
-use crate::progress::ProgressLog;
+use crate::progress::SyncRenderer;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use futures::stream::{StreamExt, TryStreamExt};
@@ -19,7 +19,7 @@ pub struct MdhListed {
 
 /// Phase 1: list MDH collections (or return an empty list if MDH is not
 /// enabled on this cluster — 404 → quiet skip matching the 403 pattern).
-pub async fn list(env_cfg: &EnvConfig, token: &str, progress: &Arc<ProgressLog>) -> Result<MdhListed> {
+pub async fn list(env_cfg: &EnvConfig, token: &str, progress: &Arc<dyn SyncRenderer>) -> Result<MdhListed> {
     let base = env_cfg.data_storage_base();
     let client = DataStorageClient::new(base, token.to_string())
         .context("constructing Data Storage client")?;
@@ -50,9 +50,9 @@ pub async fn process(
     ctx: &mut PullCtx<'_>,
     listed: MdhListed,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<dyn SyncRenderer>,
 ) -> Result<(usize, usize)> {
-    let phase = progress.phase("pulling mdh");
+    progress.phase("pulling mdh");
 
     let MdhListed { client, collections } = listed;
 
@@ -117,56 +117,36 @@ pub async fn process(
     // === Sub-phase B: concurrent index fetches per collection (regular +
     //            search). Bounded fan-out (see common::PULL_FANOUT). A single
     //            spinner shows progress while the parallel batch runs.
-    use std::sync::atomic::{AtomicUsize, Ordering};
     let client_ref = &client;
     let total = dataset_dirs.len();
     if total == 0 {
         return Ok((0, conflicts));
     }
-    // Bare base name — `set_message` carries the in-flight counter; the final
-    // `[ok]` line uses the base + summary (no leftover `(N/M)`).
-    let sp = Arc::new(phase.item("indexes"));
-    let done = Arc::new(AtomicUsize::new(0));
     let fetched_result: Result<Vec<(String, IndexSet)>> = futures::stream::iter(
         dataset_dirs.iter().map(|(slug, _, c)| (slug.clone(), c.name.clone()))
     )
     .map(|(slug, name)| {
-        let sp = sp.clone();
-        let done = done.clone();
         let progress = progress.clone();
         async move {
             let regular = client_ref.list_indexes(&name, Some(progress.clone())).await
                 .with_context(|| format!("listing indexes for '{name}'"))?;
             let search = client_ref.list_search_indexes(&name, Some(progress.clone())).await
                 .with_context(|| format!("listing search indexes for '{name}'"))?;
-            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            sp.set_message(format!("indexes ({n}/{total})"));
             Ok::<_, anyhow::Error>((slug, IndexSet { regular, search }))
         }
     })
     .buffer_unordered(crate::cli::pull::common::PULL_FANOUT)
     .try_collect()
     .await;
-    let fetched = match fetched_result {
-        Ok(v) => {
-            if let Ok(spinner) = Arc::try_unwrap(sp) {
-                spinner.finish_ok(format!("{total} fetched"));
-            }
-            v
-        }
-        Err(e) => {
-            drop(sp);
-            return Err(e);
-        }
-    };
+    let fetched = fetched_result?;
+    progress.warn_line(&format!("[ok] indexes {total} fetched"));
     let by_slug: std::collections::HashMap<String, IndexSet> = fetched.into_iter().collect();
 
     // === Sub-phase C: per-collection indexes.json write decision (sequential
     //            because we mutate ctx.lockfile + counts).
-    for (slug, dataset_dir, c) in &dataset_dirs {
+    for (slug, dataset_dir, _c) in &dataset_dirs {
         let Some(index_set) = by_slug.get(slug) else { continue };
 
-        let sp = phase.item(&c.name);
         let ix_path = dataset_dir.join("indexes.json");
         let mut ix_proposed = serde_json::to_vec_pretty(index_set).context("serializing index set")?;
         ix_proposed.push(b'\n');
@@ -191,7 +171,10 @@ pub async fn process(
             None,
             Some(i_recorded),
         );
-        sp.finish_ok("");
+    }
+
+    if !dataset_dirs.is_empty() {
+        progress.warn_line(&format!("[ok] mdh {} pulled", dataset_dirs.len()));
     }
 
     Ok((dataset_dirs.len(), conflicts))
