@@ -351,3 +351,140 @@ mod color_for_tests {
         assert_eq!(color_for(&e, now), Color::ConflictOutlined);
     }
 }
+
+/// Detected terminal color depth. Drives [`emit_square`] in
+/// [`Self::TrueColor`] / [`Self::Color256`] / [`Self::Color16`] /
+/// [`Self::None`] modes per spec section 5.5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorDepth {
+    TrueColor,
+    Color256,
+    Color16,
+    None,
+}
+
+pub fn detect_color_depth() -> ColorDepth {
+    if std::env::var("NO_COLOR").is_ok() {
+        return ColorDepth::None;
+    }
+    match std::env::var("COLORTERM").as_deref() {
+        Ok("truecolor") | Ok("24bit") => ColorDepth::TrueColor,
+        _ => match std::env::var("TERM").as_deref() {
+            Ok(t) if t.contains("256color") => ColorDepth::Color256,
+            _ => ColorDepth::Color16,
+        },
+    }
+}
+
+/// Build the ANSI escape sequence for one square. Output is always two
+/// cells wide (the square) plus one gap cell. The caller appends this
+/// directly to the row string fed to `MultiProgress::set_message`.
+///
+/// `dim` reduces brightness by 30% — used by the in-flight pulse.
+pub fn emit_square(color: Color, depth: ColorDepth, dim: bool) -> String {
+    let (r, g, b) = match color {
+        Color::FreshGreen       => (0x1f, 0x6e, 0x3e),
+        Color::Green            => (0x2a, 0x8a, 0x4b),
+        Color::Yellow           => (0xc7, 0x9a, 0x2b),
+        Color::Orange           => (0xd8, 0x61, 0x2e),
+        Color::StaleRed         => (0xa5, 0x2a, 0x2a),
+        Color::PendingOrange    => (0xe8, 0x96, 0x22),
+        Color::EditRed          => (0xff, 0x3b, 0x30),
+        Color::ConflictOutlined => (0xc9, 0x30, 0x30),
+    };
+    let (r, g, b) = if dim {
+        ((r as f32 * 0.7) as u8, (g as f32 * 0.7) as u8, (b as f32 * 0.7) as u8)
+    } else {
+        (r, g, b)
+    };
+
+    let outline = matches!(color, Color::ConflictOutlined);
+
+    match depth {
+        ColorDepth::TrueColor => {
+            if outline {
+                format!("\x1b[48;2;{r};{g};{b}m\x1b[38;2;255;209;102m▏▕\x1b[0m ")
+            } else {
+                format!("\x1b[48;2;{r};{g};{b}m  \x1b[0m ")
+            }
+        }
+        ColorDepth::Color256 => {
+            // Approximate via the 6x6x6 color cube. Index = 16 + 36r' + 6g' + b'
+            // where r' = round(r/255 * 5).
+            let idx = 16u16
+                + 36 * (r as u16 * 5 / 255)
+                + 6  * (g as u16 * 5 / 255)
+                +      (b as u16 * 5 / 255);
+            if outline {
+                format!("\x1b[48;5;{idx}m\x1b[38;5;221m▏▕\x1b[0m ")
+            } else {
+                format!("\x1b[48;5;{idx}m  \x1b[0m ")
+            }
+        }
+        ColorDepth::Color16 => {
+            // Collapse to 3 buckets: green / yellow / red.
+            let ansi_bg = match color {
+                Color::FreshGreen | Color::Green => 42, // green bg
+                Color::Yellow | Color::Orange | Color::PendingOrange => 43, // yellow bg
+                Color::StaleRed | Color::EditRed | Color::ConflictOutlined => 41, // red bg
+            };
+            format!("\x1b[{ansi_bg}m  \x1b[0m ")
+        }
+        ColorDepth::None => {
+            // ASCII fallback: "· " (clean band) / "o " (aging) / "x " (stamp/conflict).
+            match color {
+                Color::FreshGreen | Color::Green => "·  ".to_string(),
+                Color::Yellow | Color::Orange | Color::PendingOrange => "o  ".to_string(),
+                Color::StaleRed | Color::EditRed | Color::ConflictOutlined => "x  ".to_string(),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod emit_square_tests {
+    use super::*;
+
+    #[test]
+    fn truecolor_edit_red_emits_known_escape() {
+        let s = emit_square(Color::EditRed, ColorDepth::TrueColor, false);
+        assert_eq!(s, "\x1b[48;2;255;59;48m  \x1b[0m ");
+    }
+
+    #[test]
+    fn truecolor_conflict_emits_outline_glyphs() {
+        let s = emit_square(Color::ConflictOutlined, ColorDepth::TrueColor, false);
+        assert!(s.contains("▏▕"), "conflict outline missing: {s:?}");
+    }
+
+    #[test]
+    fn dim_reduces_brightness() {
+        let bright = emit_square(Color::FreshGreen, ColorDepth::TrueColor, false);
+        let dim    = emit_square(Color::FreshGreen, ColorDepth::TrueColor, true);
+        assert_ne!(bright, dim);
+    }
+
+    #[test]
+    fn no_color_emits_ascii_only() {
+        assert_eq!(emit_square(Color::FreshGreen, ColorDepth::None, false), "·  ");
+        assert_eq!(emit_square(Color::EditRed, ColorDepth::None, false), "x  ");
+        assert_eq!(emit_square(Color::PendingOrange, ColorDepth::None, false), "o  ");
+    }
+
+    #[test]
+    fn detect_color_depth_respects_no_color() {
+        // SAFETY: env-var mutation is process-global; ensure tests in
+        // this file run single-threaded by gating on a serial lock if
+        // needed. For now, save+restore the env var.
+        let saved = std::env::var("NO_COLOR").ok();
+        // SAFETY: see above
+        unsafe { std::env::set_var("NO_COLOR", "1"); }
+        assert_eq!(detect_color_depth(), ColorDepth::None);
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("NO_COLOR", v),
+                None => std::env::remove_var("NO_COLOR"),
+            };
+        }
+    }
+}
