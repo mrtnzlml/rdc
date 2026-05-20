@@ -766,18 +766,66 @@ impl SyncRenderer for GridRenderer {
     }
 
     fn finish_ok(&self, summary: &str) {
-        let mut g = self.inner.lock().unwrap();
-        if g.finished { return; }
-        g.finished = true;
-        // Task 12 fills in the final-frame commit. For now, just println the summary.
+        {
+            let g = self.inner.lock().unwrap();
+            if g.finished { return; }
+        }
+        // Repaint once more so the final state is what we commit to scrollback.
+        self.repaint();
+
+        let g = self.inner.lock().unwrap();
+        let commit = |bar: &ProgressBar| {
+            let msg = bar.message();
+            if !msg.is_empty() {
+                let _ = g.mp.println(msg);
+            }
+        };
+        commit(&g.header);
+        for row in &g.kind_rows {
+            for bar in row {
+                commit(bar);
+            }
+        }
+        commit(&g.separator);
+        for bar in &g.banner_slots { commit(bar); }
+        commit(&g.footer_header);
+        for bar in &g.footer_slots { commit(bar); }
+        commit(&g.footer_more);
         let _ = g.mp.println(format!("DONE: {summary}"));
+        g.mp.set_draw_target(ProgressDrawTarget::hidden());
+        drop(g);
+        self.inner.lock().unwrap().finished = true;
     }
 
     fn finish_err(&self, msg: &str) {
-        let mut g = self.inner.lock().unwrap();
-        if g.finished { return; }
-        g.finished = true;
+        {
+            let g = self.inner.lock().unwrap();
+            if g.finished { return; }
+        }
+        self.repaint();
+
+        let g = self.inner.lock().unwrap();
+        let commit = |bar: &ProgressBar| {
+            let m = bar.message();
+            if !m.is_empty() {
+                let _ = g.mp.println(m);
+            }
+        };
+        commit(&g.header);
+        for row in &g.kind_rows {
+            for bar in row {
+                commit(bar);
+            }
+        }
+        commit(&g.separator);
+        for bar in &g.banner_slots { commit(bar); }
+        commit(&g.footer_header);
+        for bar in &g.footer_slots { commit(bar); }
+        commit(&g.footer_more);
         let _ = g.mp.println(format!("FAIL: {msg}"));
+        g.mp.set_draw_target(ProgressDrawTarget::hidden());
+        drop(g);
+        self.inner.lock().unwrap().finished = true;
     }
 }
 

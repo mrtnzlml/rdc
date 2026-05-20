@@ -111,7 +111,7 @@ pub mod watch;
 use crate::api::RossumClient;
 use crate::config::ProjectConfig;
 use crate::paths::Paths;
-use crate::progress::{ProgressLog, SyncRenderer};
+use crate::progress::SyncRenderer;
 use std::sync::Arc;
 use crate::secrets::resolve_token;
 use crate::state::Lockfile;
@@ -168,6 +168,7 @@ pub async fn run(
         allow_deletes,
         no_push,
         no_pull,
+        None,
     )
     .await?;
     Ok(())
@@ -190,6 +191,7 @@ pub(crate) async fn run_cycle(
     allow_deletes: bool,
     no_push: bool,
     no_pull: bool,
+    renderer: Option<Arc<dyn SyncRenderer>>,
 ) -> Result<CycleOutcome> {
     if no_push && no_pull {
         anyhow::bail!(
@@ -220,10 +222,14 @@ pub(crate) async fn run_cycle(
     } else {
         format!("rdc sync {env}")
     };
-    // Drivers consume `&Arc<dyn SyncRenderer>`. Construct the log renderer
-    // and immediately coerce to the trait object so every call site uses
-    // the same shape regardless of which renderer was selected.
-    let progress: Arc<dyn SyncRenderer> = ProgressLog::start(title);
+    // Drivers consume `&Arc<dyn SyncRenderer>`. Use a caller-provided
+    // renderer when present (the watch loop shares one renderer across
+    // cycles so freshness clocks persist); otherwise the dispatcher
+    // selects grid-on-tty / log-elsewhere. `is_watch=false` here is
+    // correct: the watch path supplies its own renderer constructed
+    // with `is_watch=true` upstream.
+    let progress: Arc<dyn SyncRenderer> =
+        renderer.unwrap_or_else(|| crate::progress::make_sync_renderer(&title, env, false));
     let started = std::time::Instant::now();
 
     // Phase 1: list remote. Mirrors `pull::run`'s `PullCtx` construction
@@ -249,6 +255,10 @@ pub(crate) async fn run_cycle(
     // remote hashes match what the lockfile recorded on last pull.
     let classified =
         from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile, overlay.as_ref());
+
+    // Paint the initial grid frame from the freshly-computed classification.
+    // No-op for the log renderer (parity gate).
+    progress.ingest_classification(&classified);
 
     // Phase 4: plan + confirm. `--dry-run` exits here without writing.
     // Dry-run uses the same per-item event-log surface as a regular sync,
@@ -364,6 +374,22 @@ pub(crate) async fn run_cycle(
         )
         .await?
     };
+
+    // Re-classify post-execute and re-ingest so squares whose state flipped
+    // (e.g. LocalEdit → Clean after a successful push) repaint accordingly.
+    // No-op for the log renderer.
+    let (_scanned_after, changes_after, tombstones_after) =
+        crate::cli::push::scan::scan(&paths, &lockfile)?;
+    let overlay_after = crate::overlay::Overlay::load(&paths.overlay_file())
+        .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
+    let classified_after = from_catalog_scan_lockfile(
+        &catalog,
+        &changes_after,
+        &tombstones_after,
+        &lockfile,
+        overlay_after.as_ref(),
+    );
+    progress.ingest_classification(&classified_after);
 
     lockfile.save(&paths.lockfile())?;
     crate::cli::index::generate(&paths, &lockfile)
