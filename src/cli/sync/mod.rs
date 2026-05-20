@@ -228,6 +228,13 @@ pub(crate) async fn run_cycle(
     // selects grid-on-tty / log-elsewhere. `is_watch=false` here is
     // correct: the watch path supplies its own renderer constructed
     // with `is_watch=true` upstream.
+    //
+    // `renderer_was_supplied` gates the post-cycle `finish_ok` call: when
+    // the caller supplied a persistent renderer (watch mode), we MUST NOT
+    // finalize it — `GridRenderer::finish_ok` hides the draw target and
+    // sets `finished = true`, which freezes the grid for the rest of the
+    // watch lifetime. The watch loop calls `finish_ok` itself on exit.
+    let renderer_was_supplied = renderer.is_some();
     let progress: Arc<dyn SyncRenderer> =
         renderer.unwrap_or_else(|| crate::progress::make_sync_renderer(&title, env, false));
     let started = std::time::Instant::now();
@@ -339,12 +346,14 @@ pub(crate) async fn run_cycle(
         // wired; defer until per-object bodies are available.
         let _ = diff;
 
-        progress.finish_ok(&format!(
-            "Dry run: {} would push, {} would pull, {} would prompt (no writes)",
-            push_items.len(),
-            pull_items.len(),
-            prompt_items.len(),
-        ));
+        if !renderer_was_supplied {
+            progress.finish_ok(&format!(
+                "Dry run: {} would push, {} would pull, {} would prompt (no writes)",
+                push_items.len(),
+                pull_items.len(),
+                prompt_items.len(),
+            ));
+        }
         return Ok(CycleOutcome::default());
     }
 
@@ -397,10 +406,17 @@ pub(crate) async fn run_cycle(
 
     let elapsed = started.elapsed();
     let total_changed = outcome.items_pushed + outcome.items_pulled;
-    progress.finish_ok(&format!(
-        "Synced envs/{env} ({total_changed} changed, {:.1}s)",
-        elapsed.as_secs_f32()
-    ));
+    if !renderer_was_supplied {
+        progress.finish_ok(&format!(
+            "Synced envs/{env} ({total_changed} changed, {:.1}s)",
+            elapsed.as_secs_f32()
+        ));
+    } else {
+        // Watch mode: reset the header to "idle" so the user can see the
+        // cycle completed (transitioning out of "executing" or similar
+        // is a visible signal that polling fired and finished).
+        progress.phase("idle");
+    }
     Ok(outcome)
 }
 
