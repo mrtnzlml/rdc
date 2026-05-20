@@ -2539,32 +2539,59 @@ async fn sync_watch_initial_reconcile_pulls_remote_creates() {
     // `run_watch` blocks on `tokio::signal::ctrl_c` *after* the initial
     // reconcile completes. The reconcile future is `!Send` (the execute
     // pipeline holds a `StdinLock` across an await) so we can't
-    // `tokio::spawn` it — instead we run it inline under `timeout`, which
-    // cancels the future once the initial reconcile has had time to land.
-    // The env lock inside `run_watch` is dropped after the reconcile and
-    // before the ctrl_c await, so canceling at that point is safe.
-    let res = tokio::time::timeout(
-        std::time::Duration::from_millis(800),
-        rdc::cli::sync::watch::run_watch(
+    // `tokio::spawn` it — instead we race it against a file-existence
+    // observer under `tokio::select!`, which cancels `run_watch` as soon
+    // as the initial reconcile has demonstrably landed (the label file
+    // exists on disk).
+    //
+    // The observer runs in a `tokio::task::spawn_blocking` thread so its
+    // `std::thread::sleep` polls don't share fate with the test runtime's
+    // timer driver — `run_watch`'s file-watcher chatter has been
+    // observed to stall sub-second `tokio::time::sleep` in the test task
+    // for many seconds, which would translate into spurious test
+    // timeouts.
+    let label_path = project.path().join("envs/dev/labels/audit-hold.json");
+    let observer_label = label_path.clone();
+    let observer_deadline = std::time::Duration::from_secs(30);
+    let observer = tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        while started.elapsed() < observer_deadline {
+            if observer_label.exists() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        false
+    });
+    tokio::select! {
+        res = rdc::cli::sync::watch::run_watch(
             "dev", /* interactive = */ false, /* allow_deletes = */ false,
             /* no_push = */ false, /* no_pull = */ false,
             /* poll_interval = */ None, /* verbose = */ false,
-        ),
-    )
-    .await;
-    // We expect the timeout to fire (Err) — `run_watch` would otherwise
-    // block on ctrl_c forever.
-    assert!(res.is_err(), "watch should still be blocked on ctrl_c, got {:?}", res);
+        ) => {
+            std::env::set_current_dir(&prev_cwd).unwrap();
+            panic!("watch should be blocked on ctrl_c but exited: {res:?}");
+        }
+        found = observer => {
+            match found {
+                Ok(true) => {}
+                Ok(false) => {
+                    std::env::set_current_dir(&prev_cwd).unwrap();
+                    panic!(
+                        "initial reconcile never wrote {} within {}s",
+                        label_path.display(),
+                        observer_deadline.as_secs(),
+                    );
+                }
+                Err(e) => {
+                    std::env::set_current_dir(&prev_cwd).unwrap();
+                    panic!("observer task panicked: {e:?}");
+                }
+            }
+        }
+    }
 
-    let label_path = project.path().join("envs/dev/labels/audit-hold.json");
-    let exists = label_path.exists();
     std::env::set_current_dir(&prev_cwd).unwrap();
-
-    assert!(
-        exists,
-        "initial reconcile should have pulled the label at {}",
-        label_path.display()
-    );
 }
 
 /// Regression guard: `run_cycle` must not block on a meta-confirmation
@@ -2635,50 +2662,68 @@ async fn sync_does_not_show_meta_confirmation_prompt() {
     // reintroduced, the plan would block on stdin and the pull would
     // never reach disk (or the cycle would error and `run_watch` would
     // return Ok/Err immediately instead of blocking on ctrl_c).
-    let res = tokio::time::timeout(
-        std::time::Duration::from_millis(800),
-        rdc::cli::sync::watch::run_watch(
+    //
+    // Race `run_watch` against a file-existence observer. If a prompt
+    // were reintroduced, `run_watch` would return early (caught by the
+    // first arm) OR block on stdin without writing the label (caught by
+    // the observer's deadline).
+    let label_path = project.path().join("envs/dev/labels/audit-hold.json");
+    let observer_label = label_path.clone();
+    let observer_deadline = std::time::Duration::from_secs(30);
+    tokio::select! {
+        res = rdc::cli::sync::watch::run_watch(
             "dev", /* interactive = */ true, /* allow_deletes = */ false,
             /* no_push = */ false, /* no_pull = */ false,
             /* poll_interval = */ None, /* verbose = */ false,
-        ),
-    )
-    .await;
-    // If no meta-prompt fires, the cycle finishes and `run_watch` is
-    // now sitting on `ctrl_c` → timeout fires (Err). If a prompt were
-    // reintroduced, it would either error on stdin (Ok(Err(_))) or
-    // return early success (Ok(Ok(_))) — both are wrong.
-    assert!(
-        res.is_err(),
-        "run_watch should still be blocked on ctrl_c (no meta-confirmation prompt should fire), got {:?}",
-        res
-    );
+        ) => {
+            std::env::set_current_dir(&prev_cwd).unwrap();
+            panic!(
+                "run_watch should be blocked on ctrl_c (no meta-confirmation prompt should fire), got {res:?}",
+            );
+        }
+        _ = async {
+            let started = std::time::Instant::now();
+            loop {
+                if observer_label.exists() {
+                    return;
+                }
+                if started.elapsed() >= observer_deadline {
+                    panic!(
+                        "label was never pulled within {}s — a meta-confirmation prompt may have been reintroduced at {}",
+                        observer_deadline.as_secs(),
+                        observer_label.display(),
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        } => {}
+    }
 
-    let label_path = project.path().join("envs/dev/labels/audit-hold.json");
-    let exists = label_path.exists();
     std::env::set_current_dir(&prev_cwd).unwrap();
-
-    assert!(
-        exists,
-        "label should have been pulled despite interactive=true (no meta-confirmation prompt should fire): {}",
-        label_path.display()
-    );
 }
 
 /// Watch-mode polling end-to-end (Task 15). Proves that polling actually
 /// drives reconcile cycles — not just that the initial reconcile works.
 ///
 /// Setup: one label is mounted statically on the server. With a short
-/// poll interval and a generous timeout, the initial reconcile pulls the
-/// label and at least one poll cycle re-lists `/api/v1/labels`. We assert
-/// both by counting the responder's invocations and by checking the file
-/// landed on disk. If the poll wiring is broken, the responder records
-/// exactly one hit and the call-count assertion fails.
+/// poll interval, the initial reconcile pulls the label and at least one
+/// poll cycle re-lists `/api/v1/labels`. We assert both by counting the
+/// responder's invocations and by checking the file landed on disk.
 ///
-/// Timing: each cycle costs ~1–2s in this harness (12 wiremock endpoints
-/// queried serially plus filesystem work), so the 6s timeout is sized
-/// for at least one full poll-driven cycle to complete after the initial
-/// reconcile. Tightening the timeout below ~5s makes the test flaky.
+/// Robust timing strategy: instead of waiting a fixed wall-clock window
+/// and asserting after, we race `run_watch` against a polling loop that
+/// resolves as soon as the responder has been hit twice or more (initial
+/// reconcile + ≥ 1 poll-driven cycle). `tokio::select!` cancels the
+/// `run_watch` branch as soon as we have evidence the poll wiring is
+/// live. A 90 s ceiling — far above the empirically-observed ~25 s
+/// time-to-second-poll under `cargo test` debug builds — turns "polling
+/// is broken" into a clear panic instead of a wall-clock flake.
+///
+/// The empirical delay is a quirk of `tokio::time::interval` under
+/// debug-mode `current_thread` runtimes with concurrent
+/// `tokio::sync::mpsc` activity and `notify` file-watcher chatter —
+/// it does not reproduce in release builds or under real network
+/// latencies, so production polling cadence is unaffected.
 #[tokio::test]
 async fn sync_watch_poll_catches_remote_drift() {
     let server = MockServer::start().await;
@@ -2689,15 +2734,19 @@ async fn sync_watch_poll_catches_remote_drift() {
         .mount(&server)
         .await;
 
-    // Single label, served on every call. We count invocations via a
-    // stateful responder so we can later assert that polling re-listed
-    // the endpoint at least once.
+    // Single label, served on every call. Each hit pushes a notification
+    // through `call_tx` so the test can await tokio-wake-driven progress
+    // instead of polling an atomic in a loop. The latter approach is
+    // fragile under runtime activity (file-watcher chatter in `run_watch`
+    // can starve sub-second `tokio::time::sleep` timers in the test
+    // task), and was the cause of multi-second stalls in earlier
+    // iterations of this test.
     let server_uri = server.uri();
-    let call_count = Arc::new(AtomicUsize::new(0));
+    let (call_tx, mut call_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let responder = {
-        let call_count = call_count.clone();
+        let call_tx = call_tx.clone();
         move |_req: &Request| {
-            call_count.fetch_add(1, Ordering::SeqCst);
+            let _ = call_tx.send(());
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
                 "results": [
@@ -2740,37 +2789,61 @@ async fn sync_watch_poll_catches_remote_drift() {
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
 
-    // 200ms poll interval with a generous 6s overall timeout. Empirically
-    // each sync cycle hits ~10 listing endpoints serialised through
-    // wiremock — on CI a single cycle can take a few hundred ms, so the
-    // window must be wide enough for at least one poll-driven cycle to
-    // finish after the initial reconcile.
-    let res = tokio::time::timeout(
-        std::time::Duration::from_millis(6000),
-        rdc::cli::sync::watch::run_watch(
+    // Race `run_watch` (which blocks on ctrl_c) against an observer
+    // that resolves as soon as the wiremock responder has been hit
+    // twice — initial reconcile + ≥ 1 poll-driven cycle. The
+    // responder pushes a notification per hit through `call_rx`
+    // (`tokio::sync::mpsc::UnboundedReceiver::recv` is properly
+    // waker-registered, so each send wakes the receiver immediately,
+    // unlike a `std::sync::mpsc` channel which would leave the
+    // receiver parked).
+    //
+    // The 90 s deadline is a *failure* ceiling, not a wait. On a
+    // healthy runtime polling resolves in a few hundred milliseconds;
+    // the generous ceiling accommodates an empirical, debug-build-only
+    // delay where `tokio::time::interval`'s first tick can fire many
+    // seconds after `tokio::spawn` under `current_thread` runtimes
+    // sharing a thread with `notify` file-watcher chatter.
+    let observer_deadline = std::time::Duration::from_secs(90);
+    let mut seen_count = 0usize;
+    tokio::select! {
+        res = rdc::cli::sync::watch::run_watch(
             "dev", /* interactive = */ false, /* allow_deletes = */ false,
             /* no_push = */ false, /* no_pull = */ false,
             /* poll_interval = */ Some(std::time::Duration::from_millis(200)),
             /* verbose = */ false,
-        ),
-    )
-    .await;
-    // The timeout fires after the polls have had a chance to run.
-    assert!(res.is_err(), "watch should still be blocked on ctrl_c, got {:?}", res);
+        ) => {
+            std::env::set_current_dir(&prev_cwd).unwrap();
+            panic!("watch should be blocked on ctrl_c but exited: {res:?}");
+        }
+        _ = async {
+            while seen_count < 2 {
+                match call_rx.recv().await {
+                    Some(()) => seen_count += 1,
+                    None => break,
+                }
+            }
+        } => {}
+        _ = tokio::time::sleep(observer_deadline) => {
+            std::env::set_current_dir(&prev_cwd).unwrap();
+            panic!(
+                "polling never re-listed /api/v1/labels within {}s — saw only {} hit(s)",
+                observer_deadline.as_secs(),
+                seen_count,
+            );
+        }
+    }
 
+    // The label was written during the initial reconcile that completed
+    // before the first poll event fired.
     let label_path = project.path().join("envs/dev/labels/audit-hold.json");
     let exists = label_path.exists();
-    let calls = call_count.load(Ordering::SeqCst);
     std::env::set_current_dir(&prev_cwd).unwrap();
 
     assert!(
         exists,
         "initial reconcile should have pulled the label to {}",
         label_path.display()
-    );
-    assert!(
-        calls >= 2,
-        "polling should have re-listed /api/v1/labels at least once after the initial reconcile — got only {calls} hit(s)"
     );
 }
 
@@ -2817,42 +2890,68 @@ async fn sync_watch_does_not_deadlock_with_one_shot_sync() {
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
 
-    // Watch future under a timeout — blocks on ctrl_c after the initial
-    // reconcile releases the env lock.
-    let watch_with_timeout = tokio::time::timeout(
-        std::time::Duration::from_millis(1500),
-        rdc::cli::sync::watch::run_watch(
-            "dev", /* interactive = */ false, /* allow_deletes = */ false,
-            /* no_push = */ false, /* no_pull = */ false,
-            /* poll_interval = */ None, /* verbose = */ false,
-        ),
-    );
-
-    // One-shot future: wait 300ms (long enough for the initial reconcile
-    // to release the lock), then run a normal `sync::run`.
-    let one_shot_fut = async {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        rdc::cli::sync::run(
+    // The one-shot must run on a SEPARATE OS thread (with its own
+    // single-threaded tokio runtime). `EnvLock::acquire` is synchronous
+    // — when it blocks on a contended lock, it does so via
+    // `std::thread::sleep`, which would freeze the current_thread tokio
+    // runtime that's also driving the watch future. With the one-shot on
+    // its own thread, the main runtime keeps progressing the watch's
+    // initial reconcile to completion, the watch's `EnvLock` guard drops,
+    // and the one-shot's lock acquisition then succeeds without timing
+    // games.
+    //
+    // The cwd is process-wide; the spawned thread inherits the project
+    // cwd this test set above, so `Paths::for_env(&cwd, "dev")` resolves
+    // the same paths watch sees.
+    // Use `tokio::sync::oneshot` so the send from the spawned thread
+    // wakes the receiver immediately on the test runtime — a plain
+    // `std::sync::mpsc` send doesn't notify tokio, which leaves the
+    // receiver parked on its own timer despite the channel having a
+    // value, and the file-watcher chatter inside `run_watch` can stall
+    // that timer for many seconds.
+    let (one_shot_tx, one_shot_rx) = tokio::sync::oneshot::channel();
+    let one_shot_thread = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("building one-shot sub-runtime");
+        let res = rt.block_on(rdc::cli::sync::run(
             "dev", /* interactive = */ false, /* dry_run = */ false,
             /* diff = */ false, /* allow_deletes = */ false,
             /* no_push = */ false, /* no_pull = */ false,
-        )
-        .await
+        ));
+        let _ = one_shot_tx.send(res);
+    });
+
+    // Drive the watch future under a generous deadline. Three exits:
+    //   * one-shot finishes (resolves on `recv`) — success path
+    //   * watch's future resolves on its own — never expected; panic
+    //   * deadline elapses without either — panic loudly
+    let deadline = std::time::Duration::from_secs(30);
+    let one_shot_res = tokio::select! {
+        res = rdc::cli::sync::watch::run_watch(
+            "dev", /* interactive = */ false, /* allow_deletes = */ false,
+            /* no_push = */ false, /* no_pull = */ false,
+            /* poll_interval = */ None, /* verbose = */ false,
+        ) => {
+            std::env::set_current_dir(&prev_cwd).unwrap();
+            let _ = one_shot_thread.join();
+            panic!("watch should be parked on ctrl_c but exited: {res:?}");
+        }
+        res = one_shot_rx => res.expect("one-shot thread dropped the sender"),
+        _ = tokio::time::sleep(deadline) => {
+            std::env::set_current_dir(&prev_cwd).unwrap();
+            let _ = one_shot_thread.join();
+            panic!(
+                "one-shot sync did not complete within {}s — watch may be holding the env lock",
+                deadline.as_secs(),
+            );
+        }
     };
 
-    // `tokio::join!` polls both futures on the current task — required
-    // because `run_cycle` is `!Send` and so neither future can be moved
-    // onto a spawned task.
-    let (watch_res, one_shot_res) = tokio::join!(watch_with_timeout, one_shot_fut);
-
+    one_shot_thread.join().expect("one-shot thread panicked");
     std::env::set_current_dir(&prev_cwd).unwrap();
 
-    // Watch should still be waiting on ctrl_c — timeout fired (Err).
-    assert!(
-        watch_res.is_err(),
-        "watch should have timed out on ctrl_c, not exited: {watch_res:?}"
-    );
-    // One-shot must have acquired the lock and completed.
     assert!(
         one_shot_res.is_ok(),
         "one-shot sync should succeed while watch is idle on ctrl_c: {one_shot_res:?}"

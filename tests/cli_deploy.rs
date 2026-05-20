@@ -1752,9 +1752,11 @@ async fn deploy_only_dry_run_makes_no_api_calls() {
 }
 
 /// Deploy must wait for the target env's lock before entering its write
-/// phase. A separate thread holds the prod lock for ~600ms; we then spawn
-/// `rdc deploy test prod` and assert it spent at least 400ms blocked on
-/// lock acquisition before returning.
+/// phase. A separate thread holds the prod lock for ~600 ms; we then
+/// spawn `rdc deploy test prod` and assert it spent at least 400 ms
+/// blocked on lock acquisition before returning. The blocker uses a
+/// channel to signal "lock acquired" so the main thread doesn't race
+/// the blocker's startup latency.
 #[tokio::test]
 async fn deploy_waits_for_tgt_env_lock() {
     use rdc::cli::sync::lock::EnvLock;
@@ -1763,21 +1765,30 @@ async fn deploy_waits_for_tgt_env_lock() {
     let tmp = TempDir::new().unwrap();
     let project_dir = tmp.path().to_path_buf();
 
-    // Hold the prod lock for 600ms in a background thread.
+    // Hold the prod lock for 600 ms in a background thread. The blocker
+    // sends a notification over `ready_tx` immediately after acquiring
+    // the lock; the main thread blocks on `ready_rx.recv()` so deploy
+    // only starts after the lock is provably held — no thread-startup
+    // race.
     let lock_dir = project_dir.join(".rdc/state");
     std::fs::create_dir_all(&lock_dir).unwrap();
     let lock_path = lock_dir.join("prod.lock");
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     let blocker = std::thread::spawn({
         let lock_path = lock_path.clone();
         move || {
             let l = EnvLock::acquire(&lock_path, Duration::from_secs(2)).unwrap();
+            // Signal: the prod lock is now held.
+            ready_tx.send(()).expect("ready_rx dropped before send");
             std::thread::sleep(Duration::from_millis(600));
             drop(l);
         }
     });
 
-    // Give the blocker thread time to acquire.
-    std::thread::sleep(Duration::from_millis(50));
+    // Wait deterministically until the blocker holds the prod lock.
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("blocker thread failed to acquire the prod lock within 5s");
 
     // Minimum project layout — empty snapshots, both envs point at an
     // unreachable URL. We don't need a real deploy to succeed; we only
