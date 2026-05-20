@@ -43,6 +43,10 @@ pub(crate) struct PushCounts {
 /// Each per-kind driver owns its own `Phase` from the shared
 /// `ProgressLog`; dispatch order matches the dependency graph
 /// (workspaces → schemas → queues → queue-children → org-level leaves).
+///
+/// `catalog_hooks` is the Phase-1 hook list, threaded into the hooks
+/// driver so its store-extension orphan check can avoid a redundant
+/// `list_hooks` call. Per-PATCH drift checks still re-list independently.
 pub(crate) async fn push_classified(
     paths: &Paths,
     client: &RossumClient,
@@ -50,6 +54,7 @@ pub(crate) async fn push_classified(
     env: &str,
     interactive: bool,
     changes: &scan::ChangeList,
+    catalog_hooks: &[crate::model::Hook],
     progress: &Arc<ProgressLog>,
 ) -> Result<PushCounts> {
     let (n_workspaces, c_workspaces) = if !changes.workspaces.is_empty() {
@@ -93,7 +98,7 @@ pub(crate) async fn push_classified(
     // hook JSON/code edit. The function returns (0, 0) when neither
     // content nor secrets have drifted.
     let (n_hooks, c_hooks) =
-        hooks::push(paths, client, lockfile, interactive, &changes.hooks, progress, env)
+        hooks::push(paths, client, lockfile, interactive, &changes.hooks, catalog_hooks, progress, env)
             .await
             .with_context(|| format!("pushing hooks for env '{env}'"))?;
 

@@ -38,12 +38,20 @@ fn inject_hook_secrets(body: &mut Value, slug: &str, secrets: &HookSecrets) -> S
     hash
 }
 
+/// `catalog_hooks` is the hook list the sync pipeline pulled during Phase
+/// 1 (`list_remote`). It is used **only** for the store-extension orphan
+/// check (Phase-1 freshness is sufficient: an orphan from a previously
+/// interrupted sync was already committed to the server before this
+/// cycle started, so the catalog will see it). The pre-PATCH drift
+/// check below still does its own fresh `list_hooks` to preserve the
+/// safety contract's "remote bytes at the moment of PATCH" guarantee.
 pub async fn push(
     paths: &Paths,
     client: &RossumClient,
     lockfile: &mut Lockfile,
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
+    catalog_hooks: &[crate::model::Hook],
     progress: &Arc<ProgressLog>,
     env: &str,
 ) -> Result<(usize, usize)> {
@@ -89,7 +97,11 @@ pub async fn push(
     let mut pushed = 0usize;
     let mut skipped = 0usize;
 
-    let mut remote_hooks: Option<Vec<crate::model::Hook>> = None;
+    // Lazily-fetched fresh hook list, used exclusively for the pre-PATCH
+    // drift check below. The orphan check uses `catalog_hooks` (Phase-1
+    // data) instead, so this cache is no longer shared between the
+    // create and update paths.
+    let mut drift_hooks: Option<Vec<crate::model::Hook>> = None;
 
     for (slug, local_json_path) in changes {
         let overlay_paths = overlay.as_ref().and_then(|ov| ov.hook(slug));
@@ -122,16 +134,15 @@ pub async fn push(
                 // Two-call create: orphan check → POST /hooks/create → PATCH.
                 // The install endpoint takes a fixed minimal body; secrets
                 // ride the subsequent PATCH instead.
-                if remote_hooks.is_none() {
-                    remote_hooks = Some(
-                        client.list_hooks(Some(progress.clone())).await
-                            .context("listing hooks for store-extension orphan check")?,
-                    );
-                }
-                let remote = remote_hooks.as_ref().expect("remote_hooks was just populated above");
+                //
+                // Orphan check reuses the catalog snapshot (Phase 1) rather
+                // than refetching. An orphan is the trace of a previous
+                // sync that was interrupted between POST /hooks/create and
+                // the follow-up PATCH; that committed write predates this
+                // cycle, so the Phase-1 list already saw it.
                 let template_url = typed.hook_template().expect("check_store_extension_anomaly guarantees hook_template is Some for store extensions");
                 let installed_id = match crate::cli::deploy::store_extensions::find_orphan(
-                    remote, &typed.name, template_url,
+                    catalog_hooks, &typed.name, template_url,
                 ) {
                     Some(orphan) => {
                         sp.set_message(format!(
@@ -244,13 +255,15 @@ pub async fn push(
 
         // Drift check: fetch remote, serialize, strip same overlay paths,
         // hash. Compare to base (which was recorded post-strip on pull).
-        if remote_hooks.is_none() {
-            remote_hooks = Some(
+        // The list is cached across iterations within this loop so a batch
+        // of N updates only pays one list call here.
+        if drift_hooks.is_none() {
+            drift_hooks = Some(
                 client.list_hooks(Some(progress.clone())).await
                     .context("listing hooks to verify no drift before push")?,
             );
         }
-        let remote_list = remote_hooks.as_ref().expect("remote_hooks was just populated above");
+        let remote_list = drift_hooks.as_ref().expect("drift_hooks was just populated above");
         let Some(remote_hook) = remote_list.iter().find(|h| h.id == id) else {
             sp.finish_warn(format!("id {id} not found on remote, skipping"));
             skipped += 1;

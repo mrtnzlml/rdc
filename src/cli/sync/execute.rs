@@ -2145,6 +2145,7 @@ pub async fn run(
                 &env,
                 interactive,
                 &change_list,
+                &catalog.hooks,
                 progress,
             )
             .await?;
@@ -2242,7 +2243,15 @@ pub async fn run(
             // queues::process also writes `ctx.queue_locations` which the
             // email_templates dispatch below needs. It's a side effect of
             // running the driver.
-            crate::cli::pull::queues::process(ctx, catalog.queues.clone(), &queue_subset, progress).await?;
+            crate::cli::pull::queues::process(
+                ctx,
+                catalog.queues.clone(),
+                &catalog.schemas_by_queue_id,
+                &catalog.inboxes_by_queue_id,
+                &queue_subset,
+                progress,
+            )
+            .await?;
         }
         // email_templates — flat compound slug `<ws>/<q>/<tpl>`. The
         // driver consults `ctx.queue_locations` (populated by the queues
