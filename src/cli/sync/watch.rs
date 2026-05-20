@@ -102,6 +102,10 @@ pub async fn run_watch(
         Some(renderer.clone()),
     )
     .await?;
+    // Owner-of-renderer finalization: run_cycle skips finish_ok when a
+    // persistent renderer was supplied (otherwise the grid would freeze
+    // after the first cycle), so the watch loop does it here on exit.
+    renderer.finish_ok("stopped watch");
     eprintln!("\nstopping watch.");
     Ok(())
 }

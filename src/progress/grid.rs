@@ -467,6 +467,12 @@ const MAX_BANNERS: usize = 2;
 /// Max continuation rows per kind. With ~500 squares in a 60-col-wide
 /// budget, one kind needs ≤ 30 rows worst case; 32 is safe headroom.
 const MAX_CONT_ROWS: usize = 32;
+/// Width of the kind-row label area: `{:<16} ({:>3}) ` =
+/// 16 kind + 1 space + 1 `(` + 3 count + 1 `)` + 1 trailing space.
+/// `cells_per_line` subtracts this from the terminal width to compute
+/// the square budget; continuation rows pad to this width so squares
+/// vertically align with the first row.
+const LABEL_WIDTH: usize = 23;
 
 pub struct GridRenderer {
     inner: Mutex<GridInner>,
@@ -499,7 +505,10 @@ impl GridRenderer {
     /// can't read the size.
     fn cells_per_line(&self) -> usize {
         let cols = crossterm::terminal::size().map(|(c, _)| c as usize).unwrap_or(80);
-        let budget = cols.saturating_sub(18 + 1);
+        // Label area is exactly 23 chars: `{:<16} ({:>3}) ` =
+        // 16 kind + 1 space + 1 `(` + 3 count + 1 `)` + 1 trailing space.
+        // Must stay in sync with `LABEL_WIDTH` below.
+        let budget = cols.saturating_sub(LABEL_WIDTH);
         (budget / 2).max(1)  // was: budget / 3 — each square now 1 glyph + 1 gap = 2 cells
     }
 
@@ -541,7 +550,7 @@ impl GridRenderer {
         for (kind, slot) in kind_map {
             let slugs = match g.state.order.get(&kind) { Some(v) => v.clone(), None => continue };
             let count = slugs.len();
-            let label = format!("{:<16} ({:>2}) ", kind, count);
+            let label = format!("{:<16} ({:>3}) ", kind, count);
             let mut squares = String::new();
             let mut line_idx = 0usize;
             for (i, slug) in slugs.iter().enumerate() {
@@ -554,7 +563,7 @@ impl GridRenderer {
                     let line_msg = if line_idx == 0 {
                         format!("{}{}", label, squares)
                     } else {
-                        format!("{:<19}{}", " ", squares)
+                        format!("{:<width$}{}", " ", squares, width = LABEL_WIDTH)
                     };
                     if line_idx < MAX_CONT_ROWS {
                         g.kind_rows[slot][line_idx].set_message(line_msg);
