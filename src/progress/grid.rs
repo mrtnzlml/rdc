@@ -376,9 +376,10 @@ pub fn detect_color_depth() -> ColorDepth {
     }
 }
 
-/// Build the ANSI escape sequence for one square. Output is always two
-/// cells wide (the square) plus one gap cell. The caller appends this
-/// directly to the row string fed to `MultiProgress::set_message`.
+/// Build the ANSI escape sequence for one square. Output is always 1 glyph
+/// wide plus one gap space (2 cells total). The square is rendered as a
+/// foreground-colored `■` glyph so the cell-edge padding shows through as
+/// natural background, giving a softly-rounded appearance.
 ///
 /// `dim` reduces brightness by 30% — used by the in-flight pulse.
 pub fn emit_square(color: Color, depth: ColorDepth, dim: bool) -> String {
@@ -398,44 +399,53 @@ pub fn emit_square(color: Color, depth: ColorDepth, dim: bool) -> String {
         (r, g, b)
     };
 
-    let outline = matches!(color, Color::ConflictOutlined);
+    let conflict = matches!(color, Color::ConflictOutlined);
 
     match depth {
         ColorDepth::TrueColor => {
-            if outline {
-                format!("\x1b[48;2;{r};{g};{b}m\x1b[38;2;255;209;102m▏▕\x1b[0m ")
+            if conflict {
+                // Yellow background + red foreground square => yellow padding
+                // around a red square, marking the cell as "conflict pending."
+                format!("\x1b[48;2;255;209;102m\x1b[38;2;{r};{g};{b}m■\x1b[0m ")
             } else {
-                format!("\x1b[48;2;{r};{g};{b}m  \x1b[0m ")
+                format!("\x1b[38;2;{r};{g};{b}m■\x1b[0m ")
             }
         }
         ColorDepth::Color256 => {
-            // Approximate via the 6x6x6 color cube. Index = 16 + 36r' + 6g' + b'
-            // where r' = round(r/255 * 5).
+            // Foreground via 6x6x6 color cube. Same math as before, but
+            // for fg (38;5;X) instead of bg (48;5;X).
             let idx = 16u16
                 + 36 * (r as u16 * 5 / 255)
                 + 6  * (g as u16 * 5 / 255)
                 +      (b as u16 * 5 / 255);
-            if outline {
-                format!("\x1b[48;5;{idx}m\x1b[38;5;221m▏▕\x1b[0m ")
+            if conflict {
+                // 221 ≈ yellow in 256-color palette.
+                format!("\x1b[48;5;221m\x1b[38;5;{idx}m■\x1b[0m ")
             } else {
-                format!("\x1b[48;5;{idx}m  \x1b[0m ")
+                format!("\x1b[38;5;{idx}m■\x1b[0m ")
             }
         }
         ColorDepth::Color16 => {
-            // Collapse to 3 buckets: green / yellow / red.
-            let ansi_bg = match color {
-                Color::FreshGreen | Color::Green => 42, // green bg
-                Color::Yellow | Color::Orange | Color::PendingOrange => 43, // yellow bg
-                Color::StaleRed | Color::EditRed | Color::ConflictOutlined => 41, // red bg
+            // Map to one of 8 foreground colors (codes 30-37).
+            let fg = match color {
+                Color::FreshGreen | Color::Green => 32, // green
+                Color::Yellow | Color::Orange | Color::PendingOrange => 33, // yellow
+                Color::StaleRed | Color::EditRed | Color::ConflictOutlined => 31, // red
             };
-            format!("\x1b[{ansi_bg}m  \x1b[0m ")
+            if conflict {
+                // Yellow bg (43) + red fg (31).
+                format!("\x1b[43m\x1b[{fg}m■\x1b[0m ")
+            } else {
+                format!("\x1b[{fg}m■\x1b[0m ")
+            }
         }
         ColorDepth::None => {
-            // ASCII fallback: "· " (clean band) / "o " (aging) / "x " (stamp/conflict).
+            // ASCII fallback: 1-char glyph + 1 space = 2 cells, matching
+            // the colored-mode footprint.
             match color {
-                Color::FreshGreen | Color::Green => "·  ".to_string(),
-                Color::Yellow | Color::Orange | Color::PendingOrange => "o  ".to_string(),
-                Color::StaleRed | Color::EditRed | Color::ConflictOutlined => "x  ".to_string(),
+                Color::FreshGreen | Color::Green => ". ".to_string(),
+                Color::Yellow | Color::Orange | Color::PendingOrange => "o ".to_string(),
+                Color::StaleRed | Color::EditRed | Color::ConflictOutlined => "x ".to_string(),
             }
         }
     }
@@ -490,7 +500,7 @@ impl GridRenderer {
     fn cells_per_line(&self) -> usize {
         let cols = crossterm::terminal::size().map(|(c, _)| c as usize).unwrap_or(80);
         let budget = cols.saturating_sub(18 + 1);
-        (budget / 3).max(1)
+        (budget / 2).max(1)  // was: budget / 3 — each square now 1 glyph + 1 gap = 2 cells
     }
 
     fn repaint(&self) {
@@ -560,6 +570,14 @@ impl GridRenderer {
                     format!("{:<19}{}", " ", squares)
                 };
                 g.kind_rows[slot][line_idx].set_message(line_msg);
+                line_idx += 1;
+            }
+            // After the last content row, insert a blank spacer line so the
+            // next kind has visual separation. set_message(" ") produces a
+            // single blank-looking line in indicatif; set_message("") may be
+            // collapsed by the renderer.
+            if line_idx < MAX_CONT_ROWS {
+                g.kind_rows[slot][line_idx].set_message(" ".to_string());
                 line_idx += 1;
             }
             // Clear unused continuation rows for this kind.
@@ -922,13 +940,16 @@ mod emit_square_tests {
     #[test]
     fn truecolor_edit_red_emits_known_escape() {
         let s = emit_square(Color::EditRed, ColorDepth::TrueColor, false);
-        assert_eq!(s, "\x1b[48;2;255;59;48m  \x1b[0m ");
+        assert_eq!(s, "\x1b[38;2;255;59;48m■\x1b[0m ");
     }
 
     #[test]
-    fn truecolor_conflict_emits_outline_glyphs() {
+    fn truecolor_conflict_emits_yellow_bg_red_fg() {
         let s = emit_square(Color::ConflictOutlined, ColorDepth::TrueColor, false);
-        assert!(s.contains("▏▕"), "conflict outline missing: {s:?}");
+        // Yellow bg + red fg + filled square glyph.
+        assert!(s.starts_with("\x1b[48;2;255;209;102m"), "conflict cell missing yellow bg: {s:?}");
+        assert!(s.contains("■"), "conflict cell missing square glyph: {s:?}");
+        assert!(s.ends_with("\x1b[0m "), "conflict cell missing reset+gap: {s:?}");
     }
 
     #[test]
@@ -940,9 +961,9 @@ mod emit_square_tests {
 
     #[test]
     fn no_color_emits_ascii_only() {
-        assert_eq!(emit_square(Color::FreshGreen, ColorDepth::None, false), "·  ");
-        assert_eq!(emit_square(Color::EditRed, ColorDepth::None, false), "x  ");
-        assert_eq!(emit_square(Color::PendingOrange, ColorDepth::None, false), "o  ");
+        assert_eq!(emit_square(Color::FreshGreen, ColorDepth::None, false), ". ");
+        assert_eq!(emit_square(Color::EditRed, ColorDepth::None, false), "x ");
+        assert_eq!(emit_square(Color::PendingOrange, ColorDepth::None, false), "o ");
     }
 
     #[test]
