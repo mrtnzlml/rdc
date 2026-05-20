@@ -8,7 +8,7 @@
 //!   `docs/superpowers/specs/2026-05-20-sync-grid-visualization-design.md`.
 
 pub mod log;
-// pub mod grid; — added in Task 4.
+pub mod grid;
 
 pub use log::{Phase, ProgressHandle, ProgressLog, Spinner};
 
