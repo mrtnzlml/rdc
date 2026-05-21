@@ -217,7 +217,10 @@ impl Phase {
             bar.set_style(
                 ProgressStyle::with_template("{spinner} {msg}")
                     .unwrap()
-                    .tick_strings(&["▱▱▱", "▰▱▱", "▰▰▱", "▰▰▰"]),
+                    // Last element is indicatif's "finished" frame, only
+                    // shown at exit — duplicate ▰▰▰ so it also appears
+                    // during normal rotation.
+                    .tick_strings(&["▱▱▱", "▰▱▱", "▰▰▱", "▰▰▰", "▰▰▰"]),
             );
             bar.enable_steady_tick(std::time::Duration::from_millis(120));
             bar.set_message(name.clone());
