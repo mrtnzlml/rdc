@@ -1,13 +1,13 @@
 use super::common::{apply_pull_action, decide_pull_action, record_object, skip_on_permission_denied, PullAction, PullCtx};
+use crate::log::{Action, Log};
 use crate::model::Workflow;
-use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all workflows from the API.
-pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<dyn SyncRenderer>) -> Result<Vec<Workflow>> {
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<Log>) -> Result<Vec<Workflow>> {
     skip_on_permission_denied(
         ctx.client.list_workflows(Some(progress.clone())).await.context("listing workflows"),
         "workflows",
@@ -22,10 +22,8 @@ pub async fn process(
     ctx: &mut PullCtx<'_>,
     workflows: Vec<Workflow>,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
 ) -> Result<(usize, usize)> {
-    progress.phase("pulling workflows");
-
     let mut used: HashSet<String> = HashSet::new();
     let mut conflicts = 0usize;
     let mut written = 0usize;
@@ -40,7 +38,6 @@ pub async fn process(
             continue;
         }
 
-        progress.resource_started("workflows", &slug, ResourceOp::Get);
         let result: Result<()> = (|| {
 
         // Each workflow owns a directory: `workflows/<slug>/`. The
@@ -80,16 +77,11 @@ pub async fn process(
         written += 1;
         Ok(())
         })();
-        let outcome = match &result {
-            Ok(()) => ResourceOutcome::Ok,
-            Err(e) => ResourceOutcome::Failed(e.to_string()),
-        };
-        progress.resource_finished("workflows", &slug, outcome);
         result?;
     }
 
     if written > 0 {
-        progress.warn_line(&format!("[ok] workflows {written} pulled"));
+        progress.event(Action::Pull, &format!("workflows ({written} pulled)"));
     }
 
     Ok((written, conflicts))

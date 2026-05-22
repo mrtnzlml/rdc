@@ -2,8 +2,8 @@ use super::common::{
     apply_pull_action, maybe_strip_overlay, record_object, skip_on_permission_denied,
     PullAction, PullCtx,
 };
+use crate::log::{Action, Log};
 use crate::model::Hook;
-use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::slug::slugify_unique;
 use crate::snapshot::hook::{hook_code_extension, serialize_hook, write_hook_code};
 use crate::state::hook_combined_hash;
@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all hooks from the API.
-pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<dyn SyncRenderer>) -> Result<Vec<Hook>> {
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<Log>) -> Result<Vec<Hook>> {
     skip_on_permission_denied(
         ctx.client.list_hooks(Some(progress.clone())).await.context("listing hooks"),
         "hooks",
@@ -27,10 +27,8 @@ pub async fn process(
     ctx: &mut PullCtx<'_>,
     hooks: Vec<Hook>,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
 ) -> Result<(usize, usize)> {
-    progress.phase("pulling hooks");
-
     let mut used_slugs: HashSet<String> = HashSet::new();
     let mut dir_created = false;
     let mut conflicts = 0usize;
@@ -46,7 +44,6 @@ pub async fn process(
             continue;
         }
 
-        progress.resource_started("hooks", &slug, ResourceOp::Get);
         let result: Result<()> = (|| {
 
         if !dir_created {
@@ -250,16 +247,11 @@ pub async fn process(
         written += 1;
         Ok(())
         })();
-        let outcome = match &result {
-            Ok(()) => ResourceOutcome::Ok,
-            Err(e) => ResourceOutcome::Failed(e.to_string()),
-        };
-        progress.resource_finished("hooks", &slug, outcome);
         result?;
     }
 
     if written > 0 {
-        progress.warn_line(&format!("[ok] hooks {written} pulled"));
+        progress.event(Action::Pull, &format!("hooks ({written} pulled)"));
     }
 
     Ok((written, conflicts))

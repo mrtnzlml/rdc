@@ -2,15 +2,15 @@ use super::common::{
     apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
     skip_on_permission_denied, PullAction, PullCtx,
 };
+use crate::log::{Action, Log};
 use crate::model::Label;
-use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all labels from the API.
-pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<dyn SyncRenderer>) -> Result<Vec<Label>> {
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<Log>) -> Result<Vec<Label>> {
     skip_on_permission_denied(
         ctx.client.list_labels(Some(progress.clone())).await.context("listing labels"),
         "labels",
@@ -27,10 +27,8 @@ pub async fn process(
     ctx: &mut PullCtx<'_>,
     labels: Vec<Label>,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
 ) -> Result<(usize, usize)> {
-    progress.phase("pulling labels");
-
     let mut used: HashSet<String> = HashSet::new();
     let mut dir_created = false;
     let mut conflicts = 0usize;
@@ -46,7 +44,6 @@ pub async fn process(
             continue;
         }
 
-        progress.resource_started("labels", &slug, ResourceOp::Get);
         let result: Result<()> = (|| {
 
         if !dir_created {
@@ -89,16 +86,11 @@ pub async fn process(
         written += 1;
         Ok(())
         })();
-        let outcome = match &result {
-            Ok(()) => ResourceOutcome::Ok,
-            Err(e) => ResourceOutcome::Failed(e.to_string()),
-        };
-        progress.resource_finished("labels", &slug, outcome);
         result?;
     }
 
     if written > 0 {
-        progress.warn_line(&format!("[ok] labels {written} pulled"));
+        progress.event(Action::Pull, &format!("labels ({written} pulled)"));
     }
 
     Ok((written, conflicts))
@@ -138,7 +130,7 @@ mod tests {
         )
         .unwrap();
         let mut lockfile = Lockfile::default();
-        let progress: Arc<dyn SyncRenderer> = crate::progress::ProgressLog::start("test");
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let mut ctx = PullCtx {
             paths: &paths,
@@ -154,7 +146,6 @@ mod tests {
         subset.insert(("labels".to_string(), "in-scope".to_string()));
 
         let (written, conflicts) = process(&mut ctx, labels, &subset, &progress).await.unwrap();
-        progress.finish_ok("test");
 
         assert_eq!(written, 1, "only the in-subset label should be written");
         assert_eq!(conflicts, 0);

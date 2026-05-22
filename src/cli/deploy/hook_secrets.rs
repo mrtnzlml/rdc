@@ -103,11 +103,15 @@ pub async fn precheck(
             continue;
         }
         if !diff.extras.is_empty() {
-            eprintln!(
-                "! hooks/{}: target secrets file has {} extra key(s) not declared by src — ignored: {}",
-                slug,
-                diff.extras.len(),
-                diff.extras.join(", ")
+            let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
+            log.event(
+                crate::log::Action::Warn,
+                &format!(
+                    "hook/{}: target secrets file has {} extra key(s) not declared by src — ignored: {}",
+                    slug,
+                    diff.extras.len(),
+                    diff.extras.join(", "),
+                ),
             );
         }
         plan.per_slug.insert(slug, diff.filtered);

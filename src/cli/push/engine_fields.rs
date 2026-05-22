@@ -1,8 +1,9 @@
 use crate::api::{anyhow_has_status, RossumClient};
 use crate::cli::pull::common::maybe_strip_overlay;
+use crate::log::{Action, Log};
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
+
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
@@ -16,13 +17,12 @@ pub async fn push(
     lockfile: &mut Lockfile,
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
     env: &str,
 ) -> Result<(usize, usize)> {
     let overlay = Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
-    progress.phase("pushing engine_fields");
     let mut pushed = 0usize;
     let mut skipped = 0usize;
     let mut remote_cache: Option<Vec<crate::model::EngineField>> = None;
@@ -40,14 +40,8 @@ pub async fn push(
                 apply_overrides(&mut payload, p);
             }
             strip_for_create(&mut payload, "engine_fields");
-            progress.resource_started("engine_fields", slug, ResourceOp::Post);
             let create_result = client.create_engine_field(&payload, Some(progress.clone())).await
                 .with_context(|| format!("POST /engine_fields (creating '{slug}')"));
-            let create_outcome = match &create_result {
-                Ok(_) => ResourceOutcome::Ok,
-                Err(e) => ResourceOutcome::Failed(e.to_string()),
-            };
-            progress.resource_finished("engine_fields", slug, create_outcome);
             let created = create_result?;
             let mut created_bytes = serde_json::to_vec_pretty(&created)
                 .context("serializing created engine field")?;
@@ -67,7 +61,7 @@ pub async fn push(
                     secrets_hash: None,
                 },
             );
-            progress.warn_line(&format!("[ok] engine_fields/{slug} POST (id {})", created.id));
+            progress.event(Action::Post, &format!("engine_field/{slug} id={}", created.id));
             pushed += 1;
             continue;
         }
@@ -76,7 +70,7 @@ pub async fn push(
             .with_context(|| format!("reading {}", path.display()))?;
         let entry = lockfile.objects.get("engine_fields").and_then(|m| m.get(slug.as_str())).unwrap();
         let Some(base) = &entry.content_hash else {
-            progress.warn_line(&format!("! engine_fields/{slug} lockfile has no content_hash, skipping"));
+            progress.event(Action::Skip, &format!("engine_field/{slug} (no content_hash)"));
             skipped += 1;
             continue;
         };
@@ -96,7 +90,7 @@ pub async fn push(
                 .context("listing engine fields to verify no drift before push")?);
         }
         let Some(remote_field) = remote_cache.as_ref().unwrap().iter().find(|f| f.id == id) else {
-            progress.warn_line(&format!("! engine_fields/{slug} id {id} not found on remote, skipping"));
+            progress.event(Action::Skip, &format!("engine_field/{slug} (remote id {id} missing)"));
             skipped += 1;
             continue;
         };
@@ -129,34 +123,28 @@ pub async fn push(
                             secrets_hash: None,
                         },
                     );
-                    progress.warn_line(&format!("! engine_fields/{slug} adopted remote (drift)"));
+                    progress.event(Action::Warn, &format!("engine_field/{slug} adopted remote (drift)"));
                     skipped += 1;
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    progress.warn_line(&format!("! engine_fields/{slug} remote has changed since last sync, skipping push (run `rdc sync` first)"));
+                    progress.event(Action::Skip, &format!("engine_field/{slug} (remote changed; rdc sync first)"));
                     skipped += 1;
                     continue;
                 }
             }
         }
 
-        progress.resource_started("engine_fields", slug, ResourceOp::Patch);
         let patch_result = client.update_engine_field(id, &payload_to_send, Some(progress.clone())).await
             .with_context(|| format!("PATCH /engine_fields/{id}"));
         let updated = match patch_result {
-            Ok(u) => {
-                progress.resource_finished("engine_fields", slug, ResourceOutcome::Ok);
-                u
-            }
+            Ok(u) => u,
             Err(e) if anyhow_has_status(&e, 405) => {
-                progress.resource_finished("engine_fields", slug, ResourceOutcome::Skipped);
-                progress.warn_line(&format!("! engine_fields/{slug} engine fields are not writable via PATCH on this Rossum org/plan (405 Method Not Allowed). Skipping all engine field pushes."));
+                progress.event(Action::Skip, &format!("engine_field/{slug} (PATCH 405 — engine_fields read-only on this plan)"));
                 skipped += 1;
                 break;
             }
             Err(e) => {
-                progress.resource_finished("engine_fields", slug, ResourceOutcome::Failed(e.to_string()));
                 return Err(e);
             }
         };
@@ -180,7 +168,7 @@ pub async fn push(
                 secrets_hash: None,
             },
         );
-        progress.warn_line(&format!("[ok] engine_fields/{slug} PATCH"));
+        progress.event(Action::Patch, &format!("engine_field/{slug}"));
         pushed += 1;
     }
 

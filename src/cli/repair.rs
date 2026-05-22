@@ -58,6 +58,7 @@ async fn rebuild_lock_run(env: &str) -> Result<()> {
     let paths = Paths::for_env(&cwd, env);
     let lockfile_path = paths.lockfile();
 
+    let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
     if lockfile_path.exists() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -73,10 +74,10 @@ async fn rebuild_lock_run(env: &str) -> Result<()> {
         backup.set_file_name(new_name);
         std::fs::rename(&lockfile_path, &backup)
             .with_context(|| format!("backing up lockfile to {}", backup.display()))?;
-        eprintln!("Backed up existing lockfile to {}", backup.display());
-        eprintln!("Note: rdc sync will now overwrite local snapshot files with remote contents.");
+        log.event(crate::log::Action::Repair, &format!("backed up lockfile to {}", backup.display()));
+        log.event(crate::log::Action::Info, "rdc sync will now overwrite local snapshot files with remote contents");
     } else {
-        eprintln!("No existing lockfile at {}; proceeding with fresh sync.", lockfile_path.display());
+        log.event(crate::log::Action::Info, &format!("no existing lockfile at {}; proceeding with fresh sync", lockfile_path.display()));
     }
 
     // Repair is non-interactive: with no merge base every kind's
@@ -89,7 +90,7 @@ async fn rebuild_lock_run(env: &str) -> Result<()> {
         /* allow_deletes */ false, /* no_push */ true, /* no_pull */ false,
     )
     .await?;
-    println!("Lockfile rebuilt for env '{env}'.");
+    log.event(crate::log::Action::Repair, &format!("done env '{env}' rebuilt"));
     Ok(())
 }
 

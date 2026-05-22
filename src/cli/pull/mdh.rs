@@ -1,8 +1,8 @@
 use super::common::{apply_pull_action, decide_pull_action, record_object, PullAction, PullCtx};
 use crate::api::{anyhow_has_status, DataStorageClient};
 use crate::config::EnvConfig;
+use crate::log::{Action, Log};
 use crate::model::{Collection, IndexSet};
-use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use futures::stream::{StreamExt, TryStreamExt};
@@ -19,7 +19,7 @@ pub struct MdhListed {
 
 /// Phase 1: list MDH collections (or return an empty list if MDH is not
 /// enabled on this cluster — 404 → quiet skip matching the 403 pattern).
-pub async fn list(env_cfg: &EnvConfig, token: &str, progress: &Arc<dyn SyncRenderer>) -> Result<MdhListed> {
+pub async fn list(env_cfg: &EnvConfig, token: &str, progress: &Arc<Log>) -> Result<MdhListed> {
     let base = env_cfg.data_storage_base();
     let client = DataStorageClient::new(base, token.to_string())
         .context("constructing Data Storage client")?;
@@ -50,10 +50,8 @@ pub async fn process(
     ctx: &mut PullCtx<'_>,
     listed: MdhListed,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
 ) -> Result<(usize, usize)> {
-    progress.phase("pulling mdh");
-
     let MdhListed { client, collections } = listed;
 
     if collections.is_empty() {
@@ -76,7 +74,6 @@ pub async fn process(
             continue;
         }
 
-        progress.resource_started("mdh", &slug, ResourceOp::Get);
         let coll_result: Result<()> = (|| {
 
         if !dir_created {
@@ -117,11 +114,6 @@ pub async fn process(
         dataset_dirs.push((slug.clone(), dataset_dir, c));
         Ok(())
         })();
-        let coll_outcome = match &coll_result {
-            Ok(()) => ResourceOutcome::Ok,
-            Err(e) => ResourceOutcome::Failed(e.to_string()),
-        };
-        progress.resource_finished("mdh", &slug, coll_outcome);
         coll_result?;
     }
 
@@ -150,7 +142,7 @@ pub async fn process(
     .try_collect()
     .await;
     let fetched = fetched_result?;
-    progress.warn_line(&format!("[ok] indexes {total} fetched"));
+    progress.event(Action::Pull, &format!("mdh_indexes ({total} fetched)"));
     let by_slug: std::collections::HashMap<String, IndexSet> = fetched.into_iter().collect();
 
     // === Sub-phase C: per-collection indexes.json write decision (sequential
@@ -158,7 +150,6 @@ pub async fn process(
     for (slug, dataset_dir, _c) in &dataset_dirs {
         let Some(index_set) = by_slug.get(slug) else { continue };
 
-        progress.resource_started("mdh", slug, ResourceOp::Get);
         let ix_result: Result<()> = (|| {
 
         let ix_path = dataset_dir.join("indexes.json");
@@ -187,16 +178,11 @@ pub async fn process(
         );
         Ok(())
         })();
-        let ix_outcome = match &ix_result {
-            Ok(()) => ResourceOutcome::Ok,
-            Err(e) => ResourceOutcome::Failed(e.to_string()),
-        };
-        progress.resource_finished("mdh", slug, ix_outcome);
         ix_result?;
     }
 
     if !dataset_dirs.is_empty() {
-        progress.warn_line(&format!("[ok] mdh {} pulled", dataset_dirs.len()));
+        progress.event(Action::Pull, &format!("mdh_datasets ({} pulled)", dataset_dirs.len()));
     }
 
     Ok((dataset_dirs.len(), conflicts))

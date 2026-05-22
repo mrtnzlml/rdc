@@ -14,6 +14,7 @@
 
 use crate::api::{anyhow_has_status, RossumClient};
 use crate::config::{EnvConfig, ProjectConfig};
+use crate::log::Action;
 use crate::paths::Paths;
 use crate::snapshot::writer::write_atomic;
 use anyhow::{anyhow, Context, Result};
@@ -49,10 +50,14 @@ pub async fn run(env: &str, token_arg: Option<String>) -> Result<()> {
 
     let org_name = validate_and_save_token(env_cfg, &paths.secrets_file(), &new_token).await?;
 
-    println!(
-        "Token written to {} (validated against org '{}').",
-        paths.secrets_file().display(),
-        org_name,
+    let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
+    log.event(
+        Action::Auth,
+        &format!(
+            "saved token to {} (org '{}')",
+            paths.secrets_file().display(),
+            org_name,
+        ),
     );
     Ok(())
 }
@@ -71,9 +76,8 @@ pub(crate) async fn validate_and_save_token(
     let client = RossumClient::new(env_cfg.api_base.clone(), token.to_string())
         .context("constructing Rossum API client")?;
 
-    let progress = crate::progress::ProgressLog::start("rdc auth");
-    let phase = progress.phase("validating token");
-    let sp = phase.item(format!("GET /organizations/{}", env_cfg.org_id));
+    let progress = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
+    progress.event(Action::Auth, &format!("validating token (GET /organizations/{})", env_cfg.org_id));
     let org_result = client
         .get_organization(env_cfg.org_id, Some(progress.clone()))
         .await
@@ -84,17 +88,13 @@ pub(crate) async fn validate_and_save_token(
             )
         });
     let org = match org_result {
-        Ok(o) => {
-            sp.finish_ok(o.name.clone());
-            o
-        }
+        Ok(o) => o,
         Err(e) => {
-            sp.finish_warn("rejected by server");
-            progress.finish_err("token validation failed");
+            progress.event(Action::Auth, "fail token validation");
             return Err(e);
         }
     };
-    progress.finish(format!("Validated against org '{}'", org.name));
+    progress.event(Action::Auth, &format!("done validated against org '{}'", org.name));
 
     if let Some(parent) = secrets_path.parent() {
         std::fs::create_dir_all(parent)
@@ -131,9 +131,10 @@ pub async fn refresh_token_interactively(env: &str) -> Result<()> {
     let paths = Paths::for_env(&cwd, env);
     let secrets_path = paths.secrets_file();
 
-    eprintln!();
-    eprintln!(
-        "Token for env '{env}' was rejected (401). Paste a new one below to refresh."
+    let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
+    log.event(
+        Action::Auth,
+        &format!("token for env '{env}' rejected (401); refreshing"),
     );
 
     use inquire::error::InquireError;
@@ -154,16 +155,19 @@ pub async fn refresh_token_interactively(env: &str) -> Result<()> {
         };
         let trimmed = new_token.trim();
         if trimmed.is_empty() {
-            eprintln!("empty input; paste the token, or Ctrl+C to abort.");
+            log.event(Action::Auth, "empty input; paste the token, or Ctrl+C to abort");
             continue;
         }
         match validate_and_save_token(env_cfg, &secrets_path, trimmed).await {
             Ok(_org_name) => {
-                eprintln!("[ok] Token saved to {}", secrets_path.display());
+                log.event(
+                    Action::Auth,
+                    &format!("saved token to {}", secrets_path.display()),
+                );
                 return Ok(());
             }
             Err(e) if anyhow_has_status(&e, 401) => {
-                eprintln!("rejected by server (401); try again, or Ctrl+C to abort.");
+                log.event(Action::Auth, "rejected by server (401); try again, or Ctrl+C to abort");
                 continue;
             }
             Err(e) => return Err(e),

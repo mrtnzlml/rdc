@@ -3,10 +3,10 @@ use crate::cli::deploy::common::{bytes_equal_after_strip, rewrite_urls, tgt_drif
 use crate::snapshot::create::strip_for_cross_env_patch;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::config::ProjectConfig;
+use crate::log::{Action, Log};
 use crate::mapping::Mapping;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::ProgressLog;
 use crate::secrets::resolve_token;
 use crate::snapshot::email_template::read_email_template;
 use crate::snapshot::hook::read_hook_value;
@@ -20,9 +20,9 @@ use std::sync::Arc;
 /// Emit a warning through the progress bar if active, or to stderr directly.
 /// Both branches render the message flush-left under the active phase
 /// (or as a standalone line if no progress log is active).
-fn warn(progress: &Option<Arc<ProgressLog>>, msg: String) {
+fn warn(progress: &Option<Arc<Log>>, msg: String) {
     match progress {
-        Some(p) => p.warn(&msg),
+        Some(p) => p.event(Action::Warn, &msg),
         None => eprintln!("{msg}"),
     }
 }
@@ -44,7 +44,7 @@ fn is_store_extension(payload: &Value) -> bool {
 /// deploy proceeds anyway, treating the remote-as-of-now as the new
 /// baseline that the upcoming PATCH overwrites.
 fn adopt_tgt_drift(
-    progress: &Option<Arc<ProgressLog>>,
+    progress: &Option<Arc<Log>>,
     tgt_lockfile: &mut Lockfile,
     kind: &str,
     tgt_slug: &str,
@@ -60,7 +60,7 @@ fn adopt_tgt_drift(
     let msg =
         format!("note: tgt {kind}/{tgt_slug} had out-of-band changes; adopting as new baseline");
     match progress {
-        Some(p) => p.println(&msg),
+        Some(p) => p.event(Action::Info, &msg),
         None => eprintln!("{msg}"),
     }
 }
@@ -84,7 +84,7 @@ pub(crate) async fn run(
     tgt: &str,
     dry_run: bool,
     diff: bool,
-    progress: Option<Arc<ProgressLog>>,
+    progress: Option<Arc<Log>>,
     tgt_lockfile: &mut Lockfile,
     selection: Option<&crate::cli::deploy::selection::Selection>,
     hook_secrets_plan: &crate::cli::deploy::hook_secrets::HookSecretsPlan,
@@ -112,11 +112,6 @@ pub(crate) async fn run(
     let empty_subs: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
 
     // Hooks ------------------------------------------------------------
-    let hooks_phase: Option<crate::progress::Phase> = if !mapping.hooks.is_empty() {
-        progress.as_ref().map(|p| p.phase("updating hooks"))
-    } else {
-        None
-    };
     for (src_slug, tgt_slug) in &mapping.hooks {
         if let Some(sel) = selection {
             if !sel.contains("hooks", src_slug) {
@@ -175,9 +170,6 @@ pub(crate) async fn run(
             }
         };
         let (payload_json_full, payload_code) = crate::snapshot::hook::serialize_hook(&payload_hook)?;
-        // Spinner up while the drift-check GET + (optional) PATCH run, so
-        // the user sees animation across both awaits.
-        let sp = hooks_phase.as_ref().map(|ph| ph.item(tgt_slug.clone()));
         // Drift check.
         let remote_hook = tgt_client.get_hook(tgt_id, None).await
             .with_context(|| format!("fetching tgt hook {tgt_id} for drift check"))?;
@@ -200,7 +192,6 @@ pub(crate) async fn run(
         if bytes_equal_after_strip(&payload_json_full, &remote_json_full, "hooks")?
             && payload_code == remote_code
         {
-            if let Some(sp) = sp { sp.finish_ok("up to date"); }
             continue;
         }
         if dry_run && diff {
@@ -254,18 +245,13 @@ pub(crate) async fn run(
             }
         }
         applied.hooks += 1;
-        if let Some(sp) = sp { sp.finish_ok(""); }
+        if let Some(p) = &progress { p.event(Action::Patch, &format!("hook/{tgt_slug}")); }
     }
 
     // Rules ------------------------------------------------------------
     // Rules are a combined-hash kind (json + trigger_condition .py),
     // so the drift check and idempotency check both consider the
     // extracted code, not just the JSON bytes.
-    let rules_phase: Option<crate::progress::Phase> = if !mapping.rules.is_empty() {
-        progress.as_ref().map(|p| p.phase("updating rules"))
-    } else {
-        None
-    };
     let mut remote_rules_cache: Option<Vec<crate::model::Rule>> = None;
     for (src_slug, tgt_slug) in &mapping.rules {
         if let Some(sel) = selection {
@@ -289,13 +275,11 @@ pub(crate) async fn run(
         };
         let (payload_json_full, payload_code) = crate::snapshot::rule::serialize_rule(&payload_rule)?;
 
-        let sp = rules_phase.as_ref().map(|ph| ph.item(tgt_slug.clone()));
         if remote_rules_cache.is_none() {
             remote_rules_cache = Some(tgt_client.list_rules(None).await.context("listing tgt rules for drift check")?);
         }
         let cache = remote_rules_cache.as_ref().unwrap();
         let Some(remote) = cache.iter().find(|r| r.id == tgt_id) else {
-            if let Some(sp) = sp { sp.finish_warn("not on tgt remote"); }
             warn(&progress, format!("warning: rule id {tgt_id} not found on tgt remote; skipping"));
             skipped += 1;
             continue;
@@ -318,7 +302,6 @@ pub(crate) async fn run(
         if bytes_equal_after_strip(&payload_json_full, &remote_json_full, "rules")?
             && payload_code == remote_code
         {
-            if let Some(sp) = sp { sp.finish_ok("up to date"); }
             continue;
         }
         if dry_run && diff {
@@ -340,15 +323,10 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt rules/{tgt_id}"))?;
         }
         applied.rules += 1;
-        if let Some(sp) = sp { sp.finish_ok(""); }
+        if let Some(p) = &progress { p.event(Action::Patch, &format!("rule/{tgt_slug}")); }
     }
 
     // Labels -----------------------------------------------------------
-    let labels_phase: Option<crate::progress::Phase> = if !mapping.labels.is_empty() {
-        progress.as_ref().map(|p| p.phase("updating labels"))
-    } else {
-        None
-    };
     let mut remote_labels_cache: Option<Vec<crate::model::Label>> = None;
     for (src_slug, tgt_slug) in &mapping.labels {
         if let Some(sel) = selection {
@@ -377,13 +355,11 @@ pub(crate) async fn run(
         };
         let mut payload_bytes = serde_json::to_vec_pretty(&payload_label).context("serializing payload label")?;
         payload_bytes.push(b'\n');
-        let sp = labels_phase.as_ref().map(|ph| ph.item(tgt_slug.clone()));
         if remote_labels_cache.is_none() {
             remote_labels_cache = Some(tgt_client.list_labels(None).await.context("listing tgt labels for drift check")?);
         }
         let cache = remote_labels_cache.as_ref().unwrap();
         let Some(remote) = cache.iter().find(|l| l.id == tgt_id) else {
-            if let Some(sp) = sp { sp.finish_warn("not on tgt remote"); }
             warn(&progress, format!("warning: label id {tgt_id} not found on tgt remote; skipping"));
             skipped += 1;
             continue;
@@ -396,7 +372,6 @@ pub(crate) async fn run(
             adopt_tgt_drift(&progress, tgt_lockfile, "labels", tgt_slug, remote_hash);
         }
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "labels")? {
-            if let Some(sp) = sp { sp.finish_ok("up to date"); }
             continue;
         }
         if dry_run && diff {
@@ -407,15 +382,10 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt labels/{tgt_id}"))?;
         }
         applied.labels += 1;
-        if let Some(sp) = sp { sp.finish_ok(""); }
+        if let Some(p) = &progress { p.event(Action::Patch, &format!("label/{tgt_slug}")); }
     }
 
     // Queues -----------------------------------------------------------
-    let queues_phase: Option<crate::progress::Phase> = if !mapping.queues.is_empty() {
-        progress.as_ref().map(|p| p.phase("updating queues"))
-    } else {
-        None
-    };
     let mut remote_queues_cache: Option<Vec<crate::model::Queue>> = None;
     for (src_slug, tgt_slug) in &mapping.queues {
         if let Some(sel) = selection {
@@ -456,13 +426,11 @@ pub(crate) async fn run(
         strip_for_cross_env_patch(&mut payload_for_patch, "queues");
         let mut payload_bytes = serde_json::to_vec_pretty(&payload_for_patch).context("serializing payload queue")?;
         payload_bytes.push(b'\n');
-        let sp = queues_phase.as_ref().map(|ph| ph.item(tgt_slug.clone()));
         if remote_queues_cache.is_none() {
             remote_queues_cache = Some(tgt_client.list_queues(None).await.context("listing tgt queues for drift check")?);
         }
         let cache = remote_queues_cache.as_ref().unwrap();
         let Some(remote) = cache.iter().find(|q| q.id == tgt_id) else {
-            if let Some(sp) = sp { sp.finish_warn("not on tgt remote"); }
             warn(&progress, format!("warning: queue id {tgt_id} not found on tgt remote; skipping"));
             skipped += 1;
             continue;
@@ -475,7 +443,6 @@ pub(crate) async fn run(
             adopt_tgt_drift(&progress, tgt_lockfile, "queues", tgt_slug, remote_hash);
         }
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "queues")? {
-            if let Some(sp) = sp { sp.finish_ok("up to date"); }
             continue;
         }
         if dry_run && diff {
@@ -486,15 +453,10 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt queues/{tgt_id}"))?;
         }
         applied.queues += 1;
-        if let Some(sp) = sp { sp.finish_ok(""); }
+        if let Some(p) = &progress { p.event(Action::Patch, &format!("queue/{tgt_slug}")); }
     }
 
     // Schemas ----------------------------------------------------------
-    let schemas_phase: Option<crate::progress::Phase> = if !mapping.schemas.is_empty() {
-        progress.as_ref().map(|p| p.phase("updating schemas"))
-    } else {
-        None
-    };
     for (src_slug, tgt_slug) in &mapping.schemas {
         if let Some(sel) = selection {
             if !sel.contains("schemas", src_slug) {
@@ -522,7 +484,6 @@ pub(crate) async fn run(
         };
         let (payload_json_full, payload_formulas) =
             crate::snapshot::schema::serialize_schema(&payload_schema)?;
-        let sp = schemas_phase.as_ref().map(|ph| ph.item(tgt_slug.clone()));
         let remote_schema = tgt_client.get_schema(tgt_id, None).await
             .with_context(|| format!("fetching tgt schema {tgt_id} for drift check"))?;
         let (remote_json_full, remote_formulas) =
@@ -543,7 +504,6 @@ pub(crate) async fn run(
         if bytes_equal_after_strip(&payload_json_full, &remote_json_full, "schemas")?
             && payload_formulas == remote_formulas
         {
-            if let Some(sp) = sp { sp.finish_ok("up to date"); }
             continue;
         }
         if dry_run && diff {
@@ -578,15 +538,10 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt schemas/{tgt_id}"))?;
         }
         applied.schemas += 1;
-        if let Some(sp) = sp { sp.finish_ok(""); }
+        if let Some(p) = &progress { p.event(Action::Patch, &format!("schema/{tgt_slug}")); }
     }
 
     // Inboxes ----------------------------------------------------------
-    let inboxes_phase: Option<crate::progress::Phase> = if !mapping.inboxes.is_empty() {
-        progress.as_ref().map(|p| p.phase("updating inboxes"))
-    } else {
-        None
-    };
     for (src_slug, tgt_slug) in &mapping.inboxes {
         if let Some(sel) = selection {
             if !sel.contains("inboxes", src_slug) {
@@ -619,7 +574,6 @@ pub(crate) async fn run(
         };
         let mut payload_bytes = serde_json::to_vec_pretty(&payload_inbox).context("serializing payload inbox")?;
         payload_bytes.push(b'\n');
-        let sp = inboxes_phase.as_ref().map(|ph| ph.item(tgt_slug.clone()));
         let remote_inbox = tgt_client.get_inbox(tgt_id, None).await
             .with_context(|| format!("fetching tgt inbox {tgt_id} for drift check"))?;
         let mut remote_bytes = serde_json::to_vec_pretty(&remote_inbox).context("serializing remote inbox")?;
@@ -630,7 +584,6 @@ pub(crate) async fn run(
             adopt_tgt_drift(&progress, tgt_lockfile, "inboxes", tgt_slug, remote_hash);
         }
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "inboxes")? {
-            if let Some(sp) = sp { sp.finish_ok("up to date"); }
             continue;
         }
         if dry_run && diff {
@@ -641,15 +594,10 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt inboxes/{tgt_id}"))?;
         }
         applied.inboxes += 1;
-        if let Some(sp) = sp { sp.finish_ok(""); }
+        if let Some(p) = &progress { p.event(Action::Patch, &format!("inbox/{tgt_slug}")); }
     }
 
     // Email templates --------------------------------------------------
-    let email_templates_phase: Option<crate::progress::Phase> = if !mapping.email_templates.is_empty() {
-        progress.as_ref().map(|p| p.phase("updating email_templates"))
-    } else {
-        None
-    };
     let mut remote_template_cache: Option<Vec<crate::model::EmailTemplate>> = None;
     for (src_key, tgt_key) in &mapping.email_templates {
         if let Some(sel) = selection {
@@ -686,14 +634,12 @@ pub(crate) async fn run(
         strip_for_cross_env_patch(&mut payload_for_patch, "email_templates");
         let mut payload_bytes = serde_json::to_vec_pretty(&payload_for_patch).context("serializing payload email template")?;
         payload_bytes.push(b'\n');
-        let sp = email_templates_phase.as_ref().map(|ph| ph.item(tgt_key.clone()));
         if remote_template_cache.is_none() {
             remote_template_cache = Some(tgt_client.list_email_templates(None).await
                 .context("listing tgt email templates for drift check")?);
         }
         let cache = remote_template_cache.as_ref().unwrap();
         let Some(remote_template) = cache.iter().find(|t| t.id == tgt_id) else {
-            if let Some(sp) = sp { sp.finish_warn("not on tgt remote"); }
             warn(&progress, format!("warning: email_template id {tgt_id} not found on tgt remote; skipping"));
             skipped += 1;
             continue;
@@ -706,7 +652,6 @@ pub(crate) async fn run(
             adopt_tgt_drift(&progress, tgt_lockfile, "email_templates", tgt_key, remote_hash);
         }
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "email_templates")? {
-            if let Some(sp) = sp { sp.finish_ok("up to date"); }
             continue;
         }
         if dry_run && diff {
@@ -721,15 +666,10 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt email_templates/{tgt_id}"))?;
         }
         applied.email_templates += 1;
-        if let Some(sp) = sp { sp.finish_ok(""); }
+        if let Some(p) = &progress { p.event(Action::Patch, &format!("email_template/{tgt_key}")); }
     }
 
     // Engines ----------------------------------------------------------
-    let engines_phase: Option<crate::progress::Phase> = if !mapping.engines.is_empty() {
-        progress.as_ref().map(|p| p.phase("updating engines"))
-    } else {
-        None
-    };
     for (src_slug, tgt_slug) in &mapping.engines {
         if let Some(sel) = selection {
             if !sel.contains("engines", src_slug) {
@@ -757,10 +697,8 @@ pub(crate) async fn run(
         };
         let mut payload_bytes = serde_json::to_vec_pretty(&payload_engine).context("serializing payload engine")?;
         payload_bytes.push(b'\n');
-        let sp = engines_phase.as_ref().map(|ph| ph.item(tgt_slug.clone()));
         let remotes = tgt_client.list_engines(None).await.context("listing tgt engines for drift check")?;
         let Some(remote) = remotes.iter().find(|e| e.id == tgt_id) else {
-            if let Some(sp) = sp { sp.finish_warn("not on tgt remote"); }
             warn(&progress, format!("warning: engine id {tgt_id} not found on tgt remote; skipping"));
             skipped += 1;
             continue;
@@ -773,7 +711,6 @@ pub(crate) async fn run(
             adopt_tgt_drift(&progress, tgt_lockfile, "engines", tgt_slug, remote_hash);
         }
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "engines")? {
-            if let Some(sp) = sp { sp.finish_ok("up to date"); }
             continue;
         }
         if dry_run && diff {
@@ -781,23 +718,21 @@ pub(crate) async fn run(
         }
         if dry_run {
             applied.engines += 1;
-            if let Some(sp) = sp { sp.finish_ok(""); }
+            if let Some(p) = &progress { p.event(Action::Patch, &format!("engine/{tgt_slug}")); }
         } else {
             match tgt_client.update_engine(tgt_id, &payload_engine, None).await
                 .with_context(|| format!("PATCH tgt engines/{tgt_id}"))
             {
                 Ok(_) => {
                     applied.engines += 1;
-                    if let Some(sp) = sp { sp.finish_ok(""); }
+                    if let Some(p) = &progress { p.event(Action::Patch, &format!("engine/{tgt_slug}")); }
                 }
                 Err(e) if anyhow_has_status(&e, 405) => {
-                    if let Some(sp) = sp { sp.finish_warn("405 not writable on this org/plan"); }
                     warn(&progress, format!("warning: engines are not writable via PATCH on tgt org/plan (405). Skipping all engine apply."));
                     skipped += 1;
                     break;
                 }
                 Err(e) => {
-                    drop(sp);
                     return Err(e);
                 }
             }
@@ -805,11 +740,6 @@ pub(crate) async fn run(
     }
 
     // Engine fields ----------------------------------------------------
-    let engine_fields_phase: Option<crate::progress::Phase> = if !mapping.engine_fields.is_empty() {
-        progress.as_ref().map(|p| p.phase("updating engine_fields"))
-    } else {
-        None
-    };
     for (src_slug, tgt_slug) in &mapping.engine_fields {
         if let Some(sel) = selection {
             if !sel.contains("engine_fields", src_slug) {
@@ -843,10 +773,8 @@ pub(crate) async fn run(
         };
         let mut payload_bytes = serde_json::to_vec_pretty(&payload_field).context("serializing payload engine field")?;
         payload_bytes.push(b'\n');
-        let sp = engine_fields_phase.as_ref().map(|ph| ph.item(tgt_slug.clone()));
         let remotes = tgt_client.list_engine_fields(None).await.context("listing tgt engine fields for drift check")?;
         let Some(remote) = remotes.iter().find(|f| f.id == tgt_id) else {
-            if let Some(sp) = sp { sp.finish_warn("not on tgt remote"); }
             warn(&progress, format!("warning: engine_field id {tgt_id} not found on tgt remote; skipping"));
             skipped += 1;
             continue;
@@ -859,7 +787,6 @@ pub(crate) async fn run(
             adopt_tgt_drift(&progress, tgt_lockfile, "engine_fields", tgt_slug, remote_hash);
         }
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "engine_fields")? {
-            if let Some(sp) = sp { sp.finish_ok("up to date"); }
             continue;
         }
         if dry_run && diff {
@@ -871,23 +798,21 @@ pub(crate) async fn run(
         }
         if dry_run {
             applied.engine_fields += 1;
-            if let Some(sp) = sp { sp.finish_ok(""); }
+            if let Some(p) = &progress { p.event(Action::Patch, &format!("engine_field/{tgt_slug}")); }
         } else {
             match tgt_client.update_engine_field(tgt_id, &payload_field, None).await
                 .with_context(|| format!("PATCH tgt engine_fields/{tgt_id}"))
             {
                 Ok(_) => {
                     applied.engine_fields += 1;
-                    if let Some(sp) = sp { sp.finish_ok(""); }
+                    if let Some(p) = &progress { p.event(Action::Patch, &format!("engine_field/{tgt_slug}")); }
                 }
                 Err(e) if anyhow_has_status(&e, 405) => {
-                    if let Some(sp) = sp { sp.finish_warn("405 not writable on this org/plan"); }
                     warn(&progress, format!("warning: engine fields are not writable via PATCH on tgt org/plan (405). Skipping all engine field apply."));
                     skipped += 1;
                     break;
                 }
                 Err(e) => {
-                    drop(sp);
                     return Err(e);
                 }
             }
@@ -958,7 +883,7 @@ fn lookup_tgt_id_w(
     kind: &str,
     tgt_slug: &str,
     skipped: &mut usize,
-    progress: &Option<Arc<ProgressLog>>,
+    progress: &Option<Arc<Log>>,
 ) -> Option<u64> {
     match tgt_lockfile.objects.get(kind).and_then(|m| m.get(tgt_slug)).map(|e| e.id) {
         Some(id) => Some(id),

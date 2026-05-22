@@ -4546,8 +4546,9 @@ async fn sync_after_rebuild_lock_diverged_label_does_not_panic_and_does_not_sile
 /// Phase-ordering regression: with a `LocalEdit` and a `RemoteCreate` on
 /// the same sync, the executor must run the push-side block BEFORE the
 /// pull-side block so the user's local edits land on the remote as soon
-/// as the conflict resolver finishes. The "pushing" phase header must
-/// therefore precede the "pulling" phase header in the captured stderr.
+/// as the conflict resolver finishes. Push-side activity (the PATCH on
+/// `labels/order-push-edit`) must therefore precede pull-side activity
+/// (the per-kind `labels … pulled` summary) in the captured stderr.
 ///
 /// Pull and push touch disjoint `(kind, slug)` sets (the classifier
 /// produces mutually-exclusive classes), so this is purely a sequencing
@@ -4686,16 +4687,16 @@ async fn sync_pushes_local_edits_before_pulling_remote_changes() {
         .success();
     let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
 
-    let push_idx = stderr.find("pushing labels").unwrap_or_else(|| {
-        panic!("expected 'pushing labels' phase header in stderr: {stderr}");
+    let push_idx = stderr.find("label/order-push-edit").unwrap_or_else(|| {
+        panic!("expected push-side activity ('label/order-push-edit') in stderr: {stderr}");
     });
-    let pull_idx = stderr.find("pulling labels").unwrap_or_else(|| {
-        panic!("expected 'pulling labels' phase header in stderr: {stderr}");
+    let pull_idx = stderr.find("labels (1 pulled)").unwrap_or_else(|| {
+        panic!("expected pull-side summary ('labels (1 pulled)') in stderr: {stderr}");
     });
     assert!(
         push_idx < pull_idx,
-        "push must run before pull: 'pushing labels' at byte {push_idx}, \
-         'pulling labels' at byte {pull_idx}\n--- stderr ---\n{stderr}"
+        "push must run before pull: 'label/order-push-edit' at byte {push_idx}, \
+         'labels (1 pulled)' at byte {pull_idx}\n--- stderr ---\n{stderr}"
     );
 
     // Sanity: the PATCH happened (covered by `.expect(1)` on the mock)

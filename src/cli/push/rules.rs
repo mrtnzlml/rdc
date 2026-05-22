@@ -1,8 +1,9 @@
 use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
+use crate::log::{Action, Log};
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
+
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::rule::{read_rule_value, serialize_rule, write_rule_code};
 use crate::snapshot::writer::write_atomic;
@@ -17,14 +18,13 @@ pub async fn push(
     lockfile: &mut Lockfile,
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
     env: &str,
 ) -> Result<(usize, usize)> {
     let overlay = Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
     let rules_dir = paths.rules_dir();
-    progress.phase("pushing rules");
     let mut pushed = 0usize;
     let mut skipped = 0usize;
 
@@ -42,14 +42,8 @@ pub async fn push(
                 apply_overrides(&mut payload, p);
             }
             strip_for_create(&mut payload, "rules");
-            progress.resource_started("rules", slug, ResourceOp::Post);
             let create_result = client.create_rule(&payload, Some(progress.clone())).await
                 .with_context(|| format!("POST /rules (creating '{slug}')"));
-            let create_outcome = match &create_result {
-                Ok(_) => ResourceOutcome::Ok,
-                Err(e) => ResourceOutcome::Failed(e.to_string()),
-            };
-            progress.resource_finished("rules", slug, create_outcome);
             let created = create_result?;
             let (created_json_full, created_code) = serialize_rule(&created)?;
             let created_json_stripped = maybe_strip_overlay(created_json_full, overlay_paths)?;
@@ -71,7 +65,7 @@ pub async fn push(
                     secrets_hash: None,
                 },
             );
-            progress.warn_line(&format!("[ok] rules/{slug} POST (id {})", created.id));
+            progress.event(Action::Post, &format!("rule/{slug} id={}", created.id));
             pushed += 1;
             continue;
         }
@@ -79,7 +73,7 @@ pub async fn push(
         // UPDATE — read JSON+.py, splice, drift-check, PATCH.
         let entry = lockfile.objects.get("rules").and_then(|m| m.get(slug.as_str())).unwrap();
         let Some(base) = &entry.content_hash else {
-            progress.warn_line(&format!("! rules/{slug} lockfile entry has no content_hash, skipping"));
+            progress.event(Action::Skip, &format!("rule/{slug} (no content_hash)"));
             skipped += 1;
             continue;
         };
@@ -101,7 +95,7 @@ pub async fn push(
         }
         let remote_list = remote_rules.as_ref().unwrap();
         let Some(remote_rule) = remote_list.iter().find(|r| r.id == id) else {
-            progress.warn_line(&format!("! rules/{slug} id {id} not found on remote, skipping"));
+            progress.event(Action::Skip, &format!("rule/{slug} (remote id {id} missing)"));
             skipped += 1;
             continue;
         };
@@ -139,26 +133,20 @@ pub async fn push(
                             secrets_hash: None,
                         },
                     );
-                    progress.warn_line(&format!("! rules/{slug} adopted remote (drift)"));
+                    progress.event(Action::Warn, &format!("rule/{slug} adopted remote (drift)"));
                     skipped += 1;
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    progress.warn_line(&format!("! rules/{slug} remote has changed since last sync, skipping push (run `rdc sync` first)"));
+                    progress.event(Action::Skip, &format!("rule/{slug} (remote changed; rdc sync first)"));
                     skipped += 1;
                     continue;
                 }
             }
         }
 
-        progress.resource_started("rules", slug, ResourceOp::Patch);
         let patch_result = client.update_rule(id, &payload_to_send, Some(progress.clone())).await
             .with_context(|| format!("PATCH /rules/{id}"));
-        let patch_outcome = match &patch_result {
-            Ok(_) => ResourceOutcome::Ok,
-            Err(e) => ResourceOutcome::Failed(e.to_string()),
-        };
-        progress.resource_finished("rules", slug, patch_outcome);
         let updated = patch_result?;
 
         // Refresh local file with the post-strip canonical form.
@@ -187,7 +175,7 @@ pub async fn push(
                 secrets_hash: None,
             },
         );
-        progress.warn_line(&format!("[ok] rules/{slug} PATCH"));
+        progress.event(Action::Patch, &format!("rule/{slug}"));
         pushed += 1;
     }
 

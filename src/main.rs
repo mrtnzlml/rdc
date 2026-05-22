@@ -6,7 +6,8 @@ use std::io::IsTerminal;
 async fn main() {
     let cli = parse_with_color_choice();
     if let Err(err) = run(cli).await {
-        eprintln!("error: {err:#}");
+        let log = rdc::log::Log::new(rdc::cli::resolve::detect_color_mode(false));
+        log.event(rdc::log::Action::Fail, &format!("{err:#}"));
         std::process::exit(1);
     }
 }

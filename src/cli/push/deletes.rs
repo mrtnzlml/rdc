@@ -29,7 +29,8 @@
 
 use crate::api::{anyhow_has_status, RossumClient};
 use crate::cli::push::scan::Tombstones;
-use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
+use crate::log::{Action, Log};
+
 use crate::state::Lockfile;
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
@@ -82,7 +83,7 @@ pub fn confirm_or_refuse(
 ) -> Result<ConfirmOutcome> {
     let n = tombstones.total();
     eprintln!();
-    eprintln!("! The following {n} object(s) would be DELETED from the remote:");
+    eprintln!("The following {n} object(s) would be DELETED from the remote:");
     print_tombstone_list(tombstones);
     eprintln!();
 
@@ -169,7 +170,7 @@ pub async fn run_deletes(
     lockfile: &mut Lockfile,
     tombstones: &Tombstones,
     interactive: bool,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
 ) -> Result<DeleteCounts> {
     let mut counts = DeleteCounts::default();
 
@@ -178,15 +179,7 @@ pub async fn run_deletes(
         // (we'd hold a borrow of the map otherwise).
         let entries: Vec<(String, u64)> = map.iter().map(|(s, i)| (s.clone(), *i)).collect();
         for (slug, id) in entries {
-            progress.resource_started(kind, &slug, ResourceOp::Delete);
-            let delete_result = delete_one(client, kind, &slug, id, lockfile, interactive).await;
-            let res_outcome = match &delete_result {
-                Ok(DeleteOutcome::Deleted) | Ok(DeleteOutcome::AlreadyGone) => ResourceOutcome::Ok,
-                Ok(DeleteOutcome::Skipped) => ResourceOutcome::Skipped,
-                Err(e) => ResourceOutcome::Failed(e.to_string()),
-            };
-            progress.resource_finished(kind, &slug, res_outcome);
-            let outcome = delete_result?;
+            let outcome = delete_one(client, kind, &slug, id, lockfile, interactive, progress).await?;
             apply_outcome(&mut counts, kind, outcome);
         }
     }
@@ -208,6 +201,7 @@ async fn delete_one(
     id: u64,
     lockfile: &mut Lockfile,
     interactive: bool,
+    progress: &Arc<Log>,
 ) -> Result<DeleteOutcome> {
     // Drift check: compare the remote object's modified_at against the
     // lockfile's recorded modified_at. We use modified_at rather than a
@@ -222,7 +216,7 @@ async fn delete_one(
         if let Some(m) = lockfile.objects.get_mut(kind) {
             m.remove(slug);
         }
-        eprintln!("  - {kind}/{slug}: already absent on remote, lockfile cleaned");
+        progress.event(Action::Skip, &format!("{kind}/{slug} (remote id {id} missing)"));
         return Ok(DeleteOutcome::AlreadyGone);
     }
     let remote_modified = remote.expect("checked Some");
@@ -249,14 +243,11 @@ async fn delete_one(
         match resolve_delete_drift(interactive, kind, slug)? {
             DeleteDriftChoice::KeepDelete => { /* fall through to DELETE */ }
             DeleteDriftChoice::Skip => {
-                eprintln!("  - {kind}/{slug}: skipped (drift)");
+                progress.event(Action::Skip, &format!("{kind}/{slug} (drift)"));
                 return Ok(DeleteOutcome::Skipped);
             }
             DeleteDriftChoice::Restore => {
-                eprintln!(
-                    "  - {kind}/{slug}: drift detected; restore is not automated yet; \
-                     run `rdc sync <env>` to refresh the local file, then re-edit if needed."
-                );
+                progress.event(Action::Skip, &format!("{kind}/{slug} (drift; run `rdc sync` to restore)"));
                 return Ok(DeleteOutcome::Skipped);
             }
             DeleteDriftChoice::Abort => {
@@ -273,7 +264,7 @@ async fn delete_one(
     if let Some(m) = lockfile.objects.get_mut(kind) {
         m.remove(slug);
     }
-    eprintln!("  - {kind}/{slug}: deleted");
+    progress.event(Action::Delete, &format!("{kind}/{slug}"));
     Ok(DeleteOutcome::Deleted)
 }
 

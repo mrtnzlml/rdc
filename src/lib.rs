@@ -1,11 +1,11 @@
 pub mod api;
 pub mod cli;
 pub mod config;
+pub mod log;
 pub mod mapping;
 pub mod model;
 pub mod overlay;
 pub mod paths;
-pub mod progress;
 pub mod secrets;
 pub mod slug;
 pub mod snapshot;

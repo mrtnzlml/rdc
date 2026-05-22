@@ -29,8 +29,8 @@ async fn auth_writes_validated_token_to_secrets_file() {
         .current_dir(project.path())
         .args(["auth", "dev", "--token", "GOOD_TOKEN"])
         .assert().success()
-        .stdout(predicate::str::contains("Token written"))
-        .stdout(predicate::str::contains("validated against org"));
+        .stderr(predicate::str::contains("saved token to"))
+        .stderr(predicate::str::contains("validated against org"));
 
     let secrets_path = project.path().join("secrets/dev.secrets.json");
     let body = std::fs::read_to_string(&secrets_path).unwrap();

@@ -1,8 +1,9 @@
 use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
+use crate::log::{Action, Log};
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
+
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::hook::{
     hook_code_extension, hook_code_extension_from_value, read_hook_value, serialize_hook,
@@ -52,7 +53,7 @@ pub async fn push(
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
     catalog_hooks: &[crate::model::Hook],
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
     env: &str,
 ) -> Result<(usize, usize)> {
     // Load overlay if present. Overlay drives both the outbound payload
@@ -93,7 +94,6 @@ pub async fn push(
     }
 
     let hooks_dir = paths.hooks_dir();
-    progress.phase("pushing hooks");
     let mut pushed = 0usize;
     let mut skipped = 0usize;
 
@@ -128,7 +128,6 @@ pub async fn push(
             let created_secrets_hash =
                 hook_secrets_hash(hook_secrets.for_slug(slug).unwrap_or(&BTreeMap::new()));
 
-            progress.resource_started("hooks", slug, ResourceOp::Post);
             let post_result: Result<crate::model::Hook> = async {
             let created = if typed.is_store_extension() {
                 // Two-call create: orphan check → POST /hooks/create → PATCH.
@@ -145,8 +144,8 @@ pub async fn push(
                     catalog_hooks, &typed.name, template_url,
                 ) {
                     Some(orphan) => {
-                        progress.warn_line(&format!(
-                            "hooks/{slug} (adopting orphan store-extension id {})",
+                        progress.event(Action::Info, &format!(
+                            "hook/{slug} (adopting orphan store-extension id {})",
                             orphan.id
                         ));
                         orphan.id
@@ -162,8 +161,8 @@ pub async fn push(
                                     "POST /hooks/create (installing store extension '{slug}')"
                                 )
                             })?;
-                        progress.warn_line(&format!(
-                            "hooks/{slug} (installed store extension id {})",
+                        progress.event(Action::Info, &format!(
+                            "hook/{slug} (installed store extension id {})",
                             installed.id
                         ));
                         installed.id
@@ -191,11 +190,6 @@ pub async fn push(
             };
             Ok(created)
             }.await;
-            let post_outcome = match &post_result {
-                Ok(_) => ResourceOutcome::Ok,
-                Err(e) => ResourceOutcome::Failed(e.to_string()),
-            };
-            progress.resource_finished("hooks", slug, post_outcome);
             let created = post_result?;
 
             // Disk + lockfile write — same for both paths. The sidecar
@@ -231,14 +225,14 @@ pub async fn push(
                     secrets_hash: Some(created_secrets_hash),
                 },
             );
-            progress.warn_line(&format!("[ok] hooks/{slug} POST (id {})", created.id));
+            progress.event(Action::Post, &format!("hook/{slug} id={}", created.id));
             pushed += 1;
             continue;
         }
 
         let entry = lockfile.objects.get("hooks").and_then(|m| m.get(slug.as_str())).unwrap();
         let Some(base) = &entry.content_hash else {
-            progress.warn_line(&format!("! hooks/{slug} lockfile entry has no content_hash, skipping"));
+            progress.event(Action::Skip, &format!("hook/{slug} (no content_hash)"));
             skipped += 1;
             continue;
         };
@@ -273,7 +267,7 @@ pub async fn push(
         }
         let remote_list = drift_hooks.as_ref().expect("drift_hooks was just populated above");
         let Some(remote_hook) = remote_list.iter().find(|h| h.id == id) else {
-            progress.warn_line(&format!("! hooks/{slug} id {id} not found on remote, skipping"));
+            progress.event(Action::Skip, &format!("hook/{slug} (remote id {id} missing)"));
             skipped += 1;
             continue;
         };
@@ -339,12 +333,12 @@ pub async fn push(
                             secrets_hash: prior_secrets_hash,
                         },
                     );
-                    progress.warn_line(&format!("! hooks/{slug} adopted remote (drift)"));
+                    progress.event(Action::Warn, &format!("hook/{slug} adopted remote (drift)"));
                     skipped += 1;
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    progress.warn_line(&format!("! hooks/{slug} remote has changed since last sync, skipping push (run `rdc sync` first)"));
+                    progress.event(Action::Skip, &format!("hook/{slug} (remote changed; rdc sync first)"));
                     skipped += 1;
                     continue;
                 }
@@ -356,16 +350,10 @@ pub async fn push(
         let mut body = serde_json::to_value(&payload_to_send)
             .with_context(|| format!("serializing hook '{slug}' for PATCH"))?;
         let updated_secrets_hash = inject_hook_secrets(&mut body, slug, &hook_secrets);
-        progress.resource_started("hooks", slug, ResourceOp::Patch);
         let patch_result = client
             .update_hook_value(id, &body, Some(progress.clone()))
             .await
             .with_context(|| format!("PATCH /hooks/{id}"));
-        let patch_outcome = match &patch_result {
-            Ok(_) => ResourceOutcome::Ok,
-            Err(e) => ResourceOutcome::Failed(e.to_string()),
-        };
-        progress.resource_finished("hooks", slug, patch_outcome);
         let updated = patch_result?;
 
         // Refresh local file with the post-strip canonical form (matches
@@ -401,7 +389,7 @@ pub async fn push(
                 secrets_hash: Some(updated_secrets_hash),
             },
         );
-        progress.warn_line(&format!("[ok] hooks/{slug} PATCH"));
+        progress.event(Action::Patch, &format!("hook/{slug}"));
         pushed += 1;
     }
 
@@ -439,16 +427,10 @@ pub async fn push(
         // accepts a partial body, so we don't need to send the whole
         // hook just to update one secret value.
         let body = serde_json::json!({ "secrets": local_kv });
-        progress.resource_started("hooks", slug, ResourceOp::Patch);
         let secrets_result = client
             .update_hook_value(entry.id, &body, Some(progress.clone()))
             .await
             .with_context(|| format!("PATCH /hooks/{} (secrets for '{}')", entry.id, slug));
-        let secrets_outcome = match &secrets_result {
-            Ok(_) => ResourceOutcome::Ok,
-            Err(e) => ResourceOutcome::Failed(e.to_string()),
-        };
-        progress.resource_finished("hooks", slug, secrets_outcome);
         let updated = secrets_result?;
         // Carry forward the existing `content_hash`; only `secrets_hash`
         // and `modified_at` may have changed.
@@ -464,16 +446,19 @@ pub async fn push(
                 secrets_hash: Some(local_hash),
             },
         );
-        progress.warn_line(&format!("[ok] hooks/{slug} (secrets only) PATCH (secrets)"));
+        progress.event(Action::Patch, &format!("hook/{slug} (secrets)"));
         secrets_pushed += 1;
     }
     if !secrets_warned.is_empty() {
         // One actionable line, not one per slug — the user typed them
         // in the same file so a list is the clear signal.
-        eprintln!(
-            "! secrets entries with no matching hook on env '{}': {}",
-            env,
-            secrets_warned.join(", ")
+        progress.event(
+            crate::log::Action::Warn,
+            &format!(
+                "secrets entries with no matching hook on env '{}': {}",
+                env,
+                secrets_warned.join(", "),
+            ),
         );
     }
 

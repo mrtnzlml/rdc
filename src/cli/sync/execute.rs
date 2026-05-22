@@ -32,9 +32,7 @@
 use crate::cli::pull::common::{PullCtx, RemoteCatalog};
 use crate::cli::resolve::{prompt_remote_delete, prompt_resolve, PullAborted, Resolution};
 use crate::cli::sync::classify::{ClassifiedItem, SyncClass};
-use crate::progress::SyncRenderer;
-#[cfg(test)]
-use crate::progress::ProgressLog;
+use crate::log::{Action, Log};
 use crate::slug::slugify_unique;
 use crate::snapshot::writer::write_atomic;
 use crate::state::content_hash;
@@ -77,7 +75,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
     classified: &[ClassifiedItem],
     mut input: R,
     interactive: bool,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
 ) -> Result<ConflictOutcome> {
     let mut outcome = ConflictOutcome::default();
 
@@ -443,16 +441,16 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 })
             }
             other => {
-                progress.warn_line(&format!(
-                    "warning: conflict resolver not yet wired for kind '{}' (slug '{}'); skipping",
+                progress.event(Action::Warn, &format!(
+                    "conflict resolver not wired for kind '{}' (slug '{}'); skipping",
                     other, it.slug,
                 ));
                 None
             }
         }) else {
             // No catalog entry / orphan / unwired kind — warn and move on.
-            progress.warn_line(&format!(
-                "warning: conflict for {}/{} but no matching remote object found; skipping",
+            progress.event(Action::Warn, &format!(
+                "conflict for {}/{} but no matching remote object found; skipping",
                 it.kind, it.slug,
             ));
             continue;
@@ -592,7 +590,7 @@ fn resolve_one_conflict<R: BufRead>(
     stderr_lock: &mut std::io::StderrLock<'_>,
     interactive: bool,
     env: &str,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
     outcome: &mut ConflictOutcome,
 ) -> Result<()> {
     let ConflictRefs {
@@ -763,8 +761,8 @@ fn resolve_one_conflict<R: BufRead>(
             };
         let conflict_path = crate::paths::shadow_path_for(&shadow_anchor, env);
         write_atomic(&conflict_path, &shadow_bytes)?;
-        progress.warn_line(&format!(
-            "warn: {} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
+        progress.event(Action::Warn, &format!(
+            "{} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
             shadow_anchor.display(),
             conflict_path.display(),
         ));
@@ -795,7 +793,7 @@ fn resolve_one_conflict<R: BufRead>(
     let prompt_out: std::cell::RefCell<
         Option<(Resolution, bool, Vec<u8>, Vec<u8>, PathBuf)>,
     > = std::cell::RefCell::new(None);
-    progress.with_prompt(&mut || {
+    progress.with_prompt(|| -> anyhow::Result<_> {
         let computed: (Resolution, bool, Vec<u8>, Vec<u8>, PathBuf) =
             if json_canonicalize_equal && sidecar_diverges {
                 match hash_strategy {
@@ -1021,8 +1019,8 @@ fn resolve_one_conflict<R: BufRead>(
                 std::fs::create_dir_all(parent).ok();
             }
             write_atomic(edit_target, &edited)?;
-            progress.warn_line(&format!(
-                "warn: {} partially resolved (markers retained); lockfile base preserved; re-run to resolve",
+            progress.event(Action::Warn, &format!(
+                "{} partially resolved (markers retained); lockfile base preserved; re-run to resolve",
                 edit_target.display(),
             ));
             // When base is absent (post-`rdc repair --rebuild-lock`, or any
@@ -1052,8 +1050,8 @@ fn resolve_one_conflict<R: BufRead>(
             // identical-to-local `.json`.
             let conflict_path = crate::paths::shadow_path_for(&prompt_path, env);
             write_atomic(&conflict_path, &prompt_remote_bytes)?;
-            progress.warn_line(&format!(
-                "warn: {} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
+            progress.event(Action::Warn, &format!(
+                "{} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
                 prompt_path.display(),
                 conflict_path.display(),
             ));
@@ -1185,7 +1183,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
     classified: &[ClassifiedItem],
     mut input: R,
     interactive: bool,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
 ) -> Result<ConflictOutcome> {
     let mut outcome = ConflictOutcome::default();
 
@@ -1338,8 +1336,8 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                 ) {
                     drop_lockfile_entry(ctx, &it.kind, &it.slug);
                 } else {
-                    progress.warn_line(&format!(
-                        "warning: BothDeleted handler not yet wired for kind '{}' (slug '{}'); skipping",
+                    progress.event(Action::Warn, &format!(
+                        "BothDeleted handler not yet wired for kind '{}' (slug '{}'); skipping",
                         it.kind, it.slug,
                     ));
                 }
@@ -1631,8 +1629,8 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                         })
                     }
                     other => {
-                        progress.warn_line(&format!(
-                            "warning: remote-delete dispatch not yet wired for kind '{}' (slug '{}'); skipping",
+                        progress.event(Action::Warn, &format!(
+                            "remote-delete dispatch not yet wired for kind '{}' (slug '{}'); skipping",
                             other, it.slug,
                         ));
                         None
@@ -1673,8 +1671,8 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             }
                         }
                         None => {
-                            progress.warn_line(&format!(
-                                "warning: LocalDeleteRemoteEdit for {}/{} but no matching env-side body in catalog; skipping",
+                            progress.event(Action::Warn, &format!(
+                                "LocalDeleteRemoteEdit for {}/{} but no matching env-side body in catalog; skipping",
                                 it.kind, it.slug,
                             ));
                             continue;
@@ -1691,8 +1689,8 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     if local_path.exists() {
                         let marker = deleted_marker_path(&local_path, &env);
                         write_atomic(&marker, b"")?;
-                        progress.warn_line(&format!(
-                            "warn: {}: env deletion deferred (non-tty); marker at {}",
+                        progress.event(Action::Warn, &format!(
+                            "{}: env deletion deferred (non-tty); marker at {}",
                             local_path.display(),
                             marker.display(),
                         ));
@@ -1705,8 +1703,8 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     // file: the classifier saw a tombstone-flavored
                     // state but the file isn't there. Defensive — emit
                     // a warning and move on rather than panic.
-                    progress.warn_line(&format!(
-                        "warn: {}: local file missing, cannot prompt; skipping",
+                    progress.event(Action::Warn, &format!(
+                        "{}: local file missing, cannot prompt; skipping",
                         local_path.display(),
                     ));
                     continue;
@@ -1714,7 +1712,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
 
                 let prompt_res: std::cell::RefCell<Option<Resolution>> =
                     std::cell::RefCell::new(None);
-                progress.with_prompt(&mut || {
+                progress.with_prompt(|| -> anyhow::Result<()> {
                     let r = prompt_remote_delete(
                         &mut input,
                         std::io::stderr().lock(),
@@ -1751,8 +1749,8 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             std::fs::remove_file(&local_path).with_context(|| {
                                 format!("removing {}", local_path.display())
                             })?;
-                            progress.warn_line(&format!(
-                                "note: {}: committing the local tombstone needs an \
+                            progress.event(Action::Info, &format!(
+                                "{}: committing the local tombstone needs an \
                                  explicit `rdc push --allow-deletes {}` follow-up; \
                                  the lockfile entry was retained so the deletion isn't lost",
                                 local_path.display(),
@@ -1838,8 +1836,8 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     Resolution::Skip => {
                         let marker = deleted_marker_path(&local_path, &env);
                         write_atomic(&marker, b"")?;
-                        progress.warn_line(&format!(
-                            "warn: {}: env deletion deferred; marker at {}",
+                        progress.event(Action::Warn, &format!(
+                            "{}: env deletion deferred; marker at {}",
                             local_path.display(),
                             marker.display(),
                         ));
@@ -1929,7 +1927,7 @@ pub async fn run(
     no_pull: bool,
     allow_deletes: bool,
     interactive: bool,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
 ) -> Result<crate::cli::sync::CycleOutcome> {
     // Tally cycle counters up front by inspecting the static classification.
     // The dispatch branches below may early-return on user abort or
@@ -2011,10 +2009,10 @@ pub async fn run(
                 // entry exists; missing here is a logic bug, not a user
                 // condition. Skip with a warning rather than panicking
                 // mid-sync.
-                eprintln!(
-                    "warning: {}/{} classified as LocalDelete but lockfile entry is missing; skipping delete",
+                progress.event(Action::Warn, &format!(
+                    "{}/{} classified as LocalDelete but lockfile entry is missing; skipping delete",
                     it.kind, it.slug
-                );
+                ));
                 continue;
             };
             match it.kind.as_str() {
@@ -2049,17 +2047,17 @@ pub async fn run(
                     tombstones.engine_fields.insert(it.slug.clone(), id);
                 }
                 other => {
-                    eprintln!(
-                        "warning: {other}/{} classified as LocalDelete but kind is not deletable via rdc sync; skipping",
+                    progress.event(Action::Warn, &format!(
+                        "{other}/{} classified as LocalDelete but kind is not deletable via rdc sync; skipping",
                         it.slug
-                    );
+                    ));
                 }
             }
         }
         if !tombstones.is_empty() {
             let confirm_out: std::cell::RefCell<Option<crate::cli::push::deletes::ConfirmOutcome>> =
                 std::cell::RefCell::new(None);
-            progress.with_prompt(&mut || {
+            progress.with_prompt(|| -> anyhow::Result<()> {
                 let o = crate::cli::push::deletes::confirm_or_refuse(
                     &tombstones,
                     interactive,
@@ -2070,10 +2068,9 @@ pub async fn run(
             })?;
             match confirm_out.into_inner().expect("with_prompt must populate") {
                 crate::cli::push::deletes::ConfirmOutcome::Aborted => {
-                    eprintln!("delete phase aborted at confirmation; remote unchanged.");
+                    progress.event(Action::Info, "delete phase aborted at confirmation; remote unchanged.");
                 }
                 crate::cli::push::deletes::ConfirmOutcome::Proceed => {
-                    progress.phase("deleting");
                     delete_counts = crate::cli::push::deletes::run_deletes(
                         ctx.client,
                         ctx.lockfile,
@@ -2469,7 +2466,7 @@ mod tests {
         let mut fixture = setup_conflict_fixture();
         let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
         let classified = classified_for(&fixture);
-        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
         // Snapshot local bytes so we can assert they survive.
         let local_before = std::fs::read(&fixture.local_path).unwrap();
@@ -2494,7 +2491,7 @@ mod tests {
             .await
             .expect("resolver should succeed on [k]")
         };
-        progress.finish_ok("");
+
 
         // Outcome: one entry promoted to the push pipeline, naming the
         // label slug and its on-disk path.
@@ -2530,7 +2527,7 @@ mod tests {
         let mut fixture = setup_conflict_fixture();
         let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
         let classified = classified_for(&fixture);
-        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let outcome = {
             let mut ctx = PullCtx {
@@ -2552,7 +2549,7 @@ mod tests {
             .await
             .expect("resolver should succeed on [r]")
         };
-        progress.finish_ok("");
+
 
         // No push-side promotion — remote wins, no PATCH needed.
         assert!(outcome.promoted_to_push.is_empty(), "no push items expected on [r]");
@@ -2590,7 +2587,7 @@ mod tests {
             .expect("fixture must seed a prior base hash");
         let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
         let classified = classified_for(&fixture);
-        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let local_before = std::fs::read(&fixture.local_path).unwrap();
 
@@ -2614,7 +2611,7 @@ mod tests {
             .await
             .expect("resolver should succeed on [s]")
         };
-        progress.finish_ok("");
+
 
         assert!(outcome.promoted_to_push.is_empty(), "skip never promotes to push");
 
@@ -2659,7 +2656,7 @@ mod tests {
             .expect("fixture must seed a prior base hash");
         let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
         let classified = classified_for(&fixture);
-        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let local_before = std::fs::read(&fixture.local_path).unwrap();
 
@@ -2684,7 +2681,7 @@ mod tests {
             .await
             .expect("non-interactive resolver must succeed")
         };
-        progress.finish_ok("");
+
 
         assert!(outcome.promoted_to_push.is_empty());
 
@@ -2714,7 +2711,7 @@ mod tests {
         let mut fixture = setup_conflict_fixture();
         let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
         let classified = classified_for(&fixture);
-        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let err = {
             let mut ctx = PullCtx {
@@ -2736,7 +2733,7 @@ mod tests {
             .await
             .expect_err("abort must surface as an error")
         };
-        progress.finish_ok("");
+
 
         // Sentinel type lets the outer push/pull runner suppress
         // lockfile.save() — mirrors the apply_pull_action contract.
@@ -2763,7 +2760,7 @@ mod tests {
             remote_hash: None,
             base_hash: None,
         }];
-        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
         let lf_before = fixture.lockfile.clone();
 
         let outcome = {
@@ -2789,7 +2786,7 @@ mod tests {
             .await
             .expect("no-op resolver must succeed")
         };
-        progress.finish_ok("");
+
 
         assert!(outcome.promoted_to_push.is_empty(), "no items to promote");
         assert_eq!(fixture.lockfile, lf_before, "lockfile must be untouched");
@@ -2869,7 +2866,7 @@ mod tests {
         let mut fixture = setup_remote_delete_fixture();
         let catalog = catalog_with_labels(vec![]);
         let classified = classified_remote_delete();
-        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let local_before = std::fs::read(&fixture.local_path).unwrap();
 
@@ -2893,7 +2890,7 @@ mod tests {
             .await
             .expect("resolver should succeed on [k]")
         };
-        progress.finish_ok("");
+
 
         // Outcome: one entry promoted as a restore — push pipeline will
         // POST because the lockfile entry was dropped.
@@ -2931,7 +2928,7 @@ mod tests {
         let mut fixture = setup_remote_delete_fixture();
         let catalog = catalog_with_labels(vec![]);
         let classified = classified_remote_delete();
-        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let outcome = {
             let mut ctx = PullCtx {
@@ -2953,7 +2950,7 @@ mod tests {
             .await
             .expect("resolver should succeed on [r]")
         };
-        progress.finish_ok("");
+
 
         assert!(
             outcome.promoted_to_push.is_empty(),
@@ -2982,7 +2979,7 @@ mod tests {
         let mut fixture = setup_remote_delete_fixture();
         let catalog = catalog_with_labels(vec![]);
         let classified = classified_remote_delete();
-        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let local_before = std::fs::read(&fixture.local_path).unwrap();
         let lf_before = fixture.lockfile.clone();
@@ -3007,7 +3004,7 @@ mod tests {
             .await
             .expect("resolver should succeed on [s]")
         };
-        progress.finish_ok("");
+
 
         assert!(outcome.promoted_to_push.is_empty(), "skip never promotes");
 
@@ -3039,7 +3036,7 @@ mod tests {
         let mut fixture = setup_remote_delete_fixture();
         let catalog = catalog_with_labels(vec![]);
         let classified = classified_remote_delete();
-        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let local_before = std::fs::read(&fixture.local_path).unwrap();
 
@@ -3065,7 +3062,7 @@ mod tests {
             .await
             .expect("non-tty resolver must succeed")
         };
-        progress.finish_ok("");
+
 
         assert!(outcome.promoted_to_push.is_empty());
 
@@ -3128,7 +3125,7 @@ mod tests {
             remote_hash: Some(content_hash(&remote_bytes)),
             base_hash: Some("base".to_string()),
         }];
-        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let outcome = {
             let mut ctx = PullCtx {
@@ -3150,7 +3147,7 @@ mod tests {
             .await
             .expect("LocalDeleteRemoteEdit resolver should succeed on [s]")
         };
-        progress.finish_ok("");
+
 
         assert!(outcome.promoted_to_push.is_empty());
 
@@ -3189,7 +3186,7 @@ mod tests {
             remote_hash: None,
             base_hash: Some("dummy".to_string()),
         }];
-        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let outcome = {
             let mut ctx = PullCtx {
@@ -3212,7 +3209,7 @@ mod tests {
             .await
             .expect("BothDeleted resolver must succeed without reading stdin")
         };
-        progress.finish_ok("");
+
 
         assert!(outcome.promoted_to_push.is_empty());
         assert!(
@@ -3360,7 +3357,7 @@ mod tests {
             "TEST".to_string(),
         )
         .unwrap();
-        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
         // Empty stdin → the resolver tries to read a response but
         // must NOT short-circuit silently. With the bug present
@@ -3390,7 +3387,7 @@ mod tests {
             .await
             .expect("resolver should succeed (even with empty stdin → Skip)")
         };
-        progress.finish_ok("");
+
 
         assert!(
             outcome.promoted_to_push.is_empty(),
@@ -3444,7 +3441,7 @@ mod tests {
             "TEST".to_string(),
         )
         .unwrap();
-        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let outcome = {
             let mut ctx = PullCtx {
@@ -3466,7 +3463,7 @@ mod tests {
             .await
             .expect("resolver should succeed on [k]")
         };
-        progress.finish_ok("");
+
 
         assert_eq!(
             outcome.promoted_to_push.len(),
@@ -3514,7 +3511,7 @@ mod tests {
             "TEST".to_string(),
         )
         .unwrap();
-        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let json_before = std::fs::read(&json_path).unwrap();
 
@@ -3538,7 +3535,7 @@ mod tests {
             .await
             .expect("resolver should succeed on [r]")
         };
-        progress.finish_ok("");
+
 
         assert!(outcome.promoted_to_push.is_empty(), "no push on [r]");
 
@@ -3679,7 +3676,7 @@ mod tests {
             "TEST".to_string(),
         )
         .unwrap();
-        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let outcome = {
             let mut ctx = PullCtx {
@@ -3705,7 +3702,7 @@ mod tests {
             .await
             .expect("resolver should succeed (Skip on empty stdin)")
         };
-        progress.finish_ok("");
+
 
         assert!(
             outcome.promoted_to_push.is_empty(),
@@ -3828,7 +3825,7 @@ mod tests {
             "TEST".to_string(),
         )
         .unwrap();
-        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let outcome = {
             let mut ctx = PullCtx {
@@ -3850,7 +3847,7 @@ mod tests {
             .await
             .expect("resolver should succeed (Skip on empty stdin)")
         };
-        progress.finish_ok("");
+
 
         assert!(
             outcome.promoted_to_push.is_empty(),
@@ -4056,7 +4053,7 @@ mod tests {
             "TEST".to_string(),
         )
         .unwrap();
-        let progress: Arc<dyn SyncRenderer> = ProgressLog::start("test");
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let outcome = {
             let mut ctx = PullCtx {
@@ -4078,7 +4075,7 @@ mod tests {
             .await
             .expect("resolver should succeed (Skip on empty stdin)")
         };
-        progress.finish_ok("");
+
 
         assert!(
             outcome.promoted_to_push.is_empty(),

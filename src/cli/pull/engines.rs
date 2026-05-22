@@ -2,15 +2,15 @@ use super::common::{
     apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
     skip_on_permission_denied, PullAction, PullCtx,
 };
+use crate::log::{Action, Log};
 use crate::model::Engine;
-use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all engines from the API.
-pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<dyn SyncRenderer>) -> Result<Vec<Engine>> {
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<Log>) -> Result<Vec<Engine>> {
     skip_on_permission_denied(
         ctx.client.list_engines(Some(progress.clone())).await.context("listing engines"),
         "engines",
@@ -25,10 +25,8 @@ pub async fn process(
     ctx: &mut PullCtx<'_>,
     engines: Vec<Engine>,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
 ) -> Result<(usize, usize)> {
-    progress.phase("pulling engines");
-
     let mut used: HashSet<String> = HashSet::new();
     let mut conflicts = 0usize;
     let mut written = 0usize;
@@ -43,7 +41,6 @@ pub async fn process(
             continue;
         }
 
-        progress.resource_started("engines", &slug, ResourceOp::Get);
         let result: Result<()> = (|| {
 
         // Each engine owns a directory: `engines/<slug>/`. The engine's
@@ -86,16 +83,11 @@ pub async fn process(
         written += 1;
         Ok(())
         })();
-        let outcome = match &result {
-            Ok(()) => ResourceOutcome::Ok,
-            Err(e) => ResourceOutcome::Failed(e.to_string()),
-        };
-        progress.resource_finished("engines", &slug, outcome);
         result?;
     }
 
     if written > 0 {
-        progress.warn_line(&format!("[ok] engines {written} pulled"));
+        progress.event(Action::Pull, &format!("engines ({written} pulled)"));
     }
 
     Ok((written, conflicts))

@@ -300,7 +300,7 @@ async fn init_with_env_var_runs_auth_inline() {
         .assert()
         .success()
         // The auth phase prints its own validation banner to stderr.
-        .stderr(predicate::str::contains("Validated against org"))
+        .stderr(predicate::str::contains("validated against org"))
         // Next-steps drops the per-env auth line when auth succeeded.
         .stdout(predicate::str::contains("Next steps:"))
         .stdout(predicate::str::contains("rdc sync dev"))
@@ -352,7 +352,7 @@ async fn init_with_invalid_env_var_token_warns_and_continues() {
         .assert()
         .success()
         .stderr(predicate::str::contains("failed validation"))
-        .stderr(predicate::str::contains("Re-run `rdc auth dev`"))
+        .stderr(predicate::str::contains("re-run `rdc auth dev`"))
         // Project files are written normally.
         .stdout(predicate::str::contains("Initialized"))
         // Next-steps still asks the user to set up auth.
@@ -414,7 +414,7 @@ async fn init_with_hyphenated_env_uses_normalized_env_var() {
         .args(["init", "--env", &format!("dev-ap={}/api/v1:1", server.uri())])
         .assert()
         .success()
-        .stderr(predicate::str::contains("Validated against org"));
+        .stderr(predicate::str::contains("validated against org"));
 
     assert!(
         project.path().join("secrets/dev-ap.secrets.json").exists(),

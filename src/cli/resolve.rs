@@ -1033,10 +1033,14 @@ pub fn resolve_combined_file(
     if !interactive {
         let conflict_path = crate::paths::shadow_path_for(local_path, env);
         write_atomic(&conflict_path, remote_bytes)?;
-        eprintln!(
-            "warn: {} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
-            local_path.display(),
-            conflict_path.display()
+        let log = crate::log::Log::new(detect_color_mode(false));
+        log.event(
+            crate::log::Action::Warn,
+            &format!(
+                "{} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
+                local_path.display(),
+                conflict_path.display(),
+            ),
         );
         return Ok(CombinedFileOutcome::PreserveBase(local_bytes.to_vec()));
     }
@@ -1094,10 +1098,14 @@ pub fn resolve_combined_file(
         Resolution::Skip => {
             let conflict_path = crate::paths::shadow_path_for(local_path, env);
             write_atomic(&conflict_path, remote_bytes)?;
-            eprintln!(
-                "warn: {} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
-                local_path.display(),
-                conflict_path.display()
+            let log = crate::log::Log::new(detect_color_mode(false));
+            log.event(
+                crate::log::Action::Warn,
+                &format!(
+                    "{} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
+                    local_path.display(),
+                    conflict_path.display(),
+                ),
             );
             Ok(CombinedFileOutcome::PreserveBase(local_bytes.to_vec()))
         }
@@ -1336,6 +1344,7 @@ const SGR_REMOVE: &str = "\x1b[38;2;220;80;80m";
 const SGR_REMOVE_BOLD: &str = "\x1b[1;38;2;220;80;80m";
 const SGR_ADD: &str = "\x1b[38;2;120;180;90m";
 const SGR_ADD_BOLD: &str = "\x1b[1;38;2;120;180;90m";
+const SGR_DIM: &str = "\x1b[2m";
 
 /// Apply color to a single line of unified-diff output. Returns `line`
 /// unchanged in [`ColorMode::Plain`].
@@ -1438,6 +1447,15 @@ pub fn colorize_prompt(text: &str, mode: ColorMode) -> String {
         }
     }
     out
+}
+
+/// Colorize text in dim/faint style. Used for the time prefix and
+/// low-importance action tokens (`skip`, `info`, `tick`, `idle`).
+pub fn colorize_dim(text: &str, mode: ColorMode) -> String {
+    if mode == ColorMode::Plain {
+        return text.to_string();
+    }
+    format!("{SGR_DIM}{text}{SGR_RESET}")
 }
 
 #[cfg(test)]

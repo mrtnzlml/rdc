@@ -1,8 +1,9 @@
 use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
+use crate::log::{Action, Log};
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
+
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
@@ -16,13 +17,12 @@ pub async fn push(
     lockfile: &mut Lockfile,
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
     env: &str,
 ) -> Result<(usize, usize)> {
     let overlay = Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
-    progress.phase("pushing labels");
     let mut pushed = 0usize;
     let mut skipped = 0usize;
 
@@ -41,14 +41,8 @@ pub async fn push(
                 apply_overrides(&mut payload, p);
             }
             strip_for_create(&mut payload, "labels");
-            progress.resource_started("labels", slug, ResourceOp::Post);
             let result = client.create_label(&payload, Some(progress.clone())).await
                 .with_context(|| format!("POST /labels (creating '{slug}')"));
-            let outcome = match &result {
-                Ok(_) => ResourceOutcome::Ok,
-                Err(e) => ResourceOutcome::Failed(e.to_string()),
-            };
-            progress.resource_finished("labels", slug, outcome);
             let created = result?;
             let mut created_bytes = serde_json::to_vec_pretty(&created)
                 .context("serializing created label")?;
@@ -68,7 +62,7 @@ pub async fn push(
                     secrets_hash: None,
                 },
             );
-            progress.warn_line(&format!("[ok] labels/{slug} POST (id {})", created.id));
+            progress.event(Action::Post, &format!("label/{slug} id={}", created.id));
             pushed += 1;
             continue;
         }
@@ -77,7 +71,7 @@ pub async fn push(
             .with_context(|| format!("reading {}", path.display()))?;
         let entry = lockfile.objects.get("labels").and_then(|m| m.get(slug.as_str())).unwrap();
         let Some(base) = &entry.content_hash else {
-            progress.warn_line(&format!("! labels/{slug} lockfile entry has no content_hash, skipping"));
+            progress.event(Action::Skip, &format!("label/{slug} (no content_hash)"));
             skipped += 1;
             continue;
         };
@@ -99,7 +93,7 @@ pub async fn push(
         }
         let remote_list = remote_labels.as_ref().unwrap();
         let Some(remote_label) = remote_list.iter().find(|l| l.id == id) else {
-            progress.warn_line(&format!("! labels/{slug} id {id} not found on remote, skipping"));
+            progress.event(Action::Skip, &format!("label/{slug} (remote id {id} missing)"));
             skipped += 1;
             continue;
         };
@@ -135,26 +129,20 @@ pub async fn push(
                             secrets_hash: None,
                         },
                     );
-                    progress.warn_line(&format!("! labels/{slug} adopted remote (drift)"));
+                    progress.event(Action::Warn, &format!("label/{slug} adopted remote (drift)"));
                     skipped += 1;
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    progress.warn_line(&format!("! labels/{slug} remote has changed since last pull, skipping push"));
+                    progress.event(Action::Skip, &format!("label/{slug} (remote changed; rdc sync first)"));
                     skipped += 1;
                     continue;
                 }
             }
         }
 
-        progress.resource_started("labels", slug, ResourceOp::Patch);
         let result = client.update_label(id, &payload_to_send, Some(progress.clone())).await
             .with_context(|| format!("PATCH /labels/{id}"));
-        let outcome = match &result {
-            Ok(_) => ResourceOutcome::Ok,
-            Err(e) => ResourceOutcome::Failed(e.to_string()),
-        };
-        progress.resource_finished("labels", slug, outcome);
         let updated = result?;
 
         let mut updated_bytes = serde_json::to_vec_pretty(&updated)
@@ -176,7 +164,7 @@ pub async fn push(
                 secrets_hash: None,
             },
         );
-        progress.warn_line(&format!("[ok] labels/{slug} PATCH"));
+        progress.event(Action::Patch, &format!("label/{slug}"));
         pushed += 1;
     }
 
