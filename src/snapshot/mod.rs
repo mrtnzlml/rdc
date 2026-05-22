@@ -6,6 +6,7 @@ pub mod engine_field;
 pub mod hook;
 pub mod inbox;
 pub mod index_set;
+pub mod key_order;
 pub mod label;
 pub mod noise;
 pub mod organization;

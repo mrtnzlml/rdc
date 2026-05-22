@@ -58,7 +58,36 @@ pub fn canonicalize_with_extra_strips(bytes: &[u8], extra: &[&str]) -> Vec<u8> {
     if !extra.is_empty() {
         strip_field_recursive(&mut value, extra);
     }
+    // With `preserve_order` enabled on serde_json, `Value::Object` is an
+    // IndexMap, so the bytes we serialize would reflect input order —
+    // which makes the hash sensitive to key reordering. Sort every
+    // object's keys alphabetically (recursively) so two byte streams
+    // representing the same logical content hash to the same value.
+    sort_keys_recursive(&mut value);
     serde_json::to_vec(&value).unwrap_or_else(|_| bytes.to_vec())
+}
+
+/// Recursively sort the keys of every JSON object alphabetically. Used
+/// to canonicalise for hashing so on-disk key order doesn't affect
+/// `content_hash`.
+fn sort_keys_recursive(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let taken = std::mem::take(map);
+            let mut entries: Vec<(String, serde_json::Value)> = taken.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            for (k, mut v) in entries {
+                sort_keys_recursive(&mut v);
+                map.insert(k, v);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                sort_keys_recursive(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn strip_field_recursive(value: &mut serde_json::Value, fields: &[&str]) {

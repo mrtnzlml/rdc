@@ -90,6 +90,11 @@ pub fn serialize_hook(hook: &Hook) -> Result<(Vec<u8>, Option<String>)> {
             _ => None,
         });
 
+    crate::snapshot::key_order::reorder_top_level(
+        &mut json_value,
+        crate::snapshot::key_order::HOOK_KEY_ORDER,
+    );
+
     let mut bytes = serde_json::to_vec_pretty(&json_value)
         .context("serializing hook json")?;
     bytes.push(b'\n');
@@ -338,6 +343,64 @@ mod tests {
         write_hook(dir.path(), "sample", &sample_hook()).unwrap();
         assert!(!dir.path().join("sample.js").exists(), ".js should be swept");
         assert!(dir.path().join("sample.py").exists());
+    }
+
+    #[test]
+    fn json_keys_are_ordered_by_importance() {
+        // Hook with all eight importance keys present + a few "rest"
+        // keys (typed: url, type, config; extras: metadata).
+        let v = json!({
+            "id": 856489,
+            "url": "https://example/api/v1/hooks/856489",
+            "name": "Validator: invoices",
+            "description": "Reject totals < 0",
+            "type": "function",
+            "active": true,
+            "queues": ["https://example/api/v1/queues/1"],
+            "events": ["annotation_content"],
+            "config": { "runtime": "python3.12" },
+            "settings": { "tolerance": 0.01 },
+            "run_after": [],
+            "metadata": { "owner": "ap" },
+        });
+        let hook: Hook = serde_json::from_value(v).unwrap();
+        let dir = TempDir::new().unwrap();
+        write_hook(dir.path(), "v-inv", &hook).unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join("v-inv.json")).unwrap();
+        // Find the byte offset of each key's quoted occurrence and
+        // assert the prescribed ordering. Using `find` on quoted form
+        // avoids matching the same substring inside an unrelated value.
+        let q = |k: &str| format!("\"{k}\":");
+        let pos = |k: &str| raw.find(&q(k)).unwrap_or_else(|| panic!("missing key {k} in: {raw}"));
+        let order = [
+            "id", "name", "description", "active",
+            "events", "settings", "queues", "run_after",
+            // Then unlisted-typed-fields in struct decl order,
+            // then alphabetical extras.
+            "url", "type", "config",
+            "metadata",
+        ];
+        let mut last = 0;
+        for k in order {
+            let p = pos(k);
+            assert!(
+                p >= last,
+                "key {k} appeared out of order at byte {p} (previous was at {last})\n--- json ---\n{raw}",
+            );
+            last = p;
+        }
+    }
+
+    #[test]
+    fn content_hash_invariant_under_top_level_reordering() {
+        // The two byte streams below differ only in top-level key order;
+        // canonicalize_for_hash must produce the same bytes for both.
+        let ordered = br#"{"id":1,"name":"n","events":[],"queues":[]}"#;
+        let scrambled = br#"{"queues":[],"name":"n","id":1,"events":[]}"#;
+        let h1 = crate::state::content_hash(ordered);
+        let h2 = crate::state::content_hash(scrambled);
+        assert_eq!(h1, h2, "content_hash must be invariant under key reordering");
     }
 
     #[test]
