@@ -121,6 +121,14 @@ pub fn bytes_equal_after_strip(a: &[u8], b: &[u8], kind: &str) -> Result<bool> {
 /// a hardcoded per-kind list. URLs in description / metadata fields are
 /// also rewritten if they happen to point at known objects, which is
 /// almost always what you want.
+///
+/// Special case: `kind == "organization"` is a per-env singleton with slug
+/// `"self"`, not a deployable kind, and so never appears in `mapping`. But
+/// `organization` is a REQUIRED field on workspace POST and the Rossum API
+/// rejects a cross-env body that carries the src org URL with
+/// `400 {"organization":["Invalid hyperlink - Object does not exist."]}`.
+/// Bypass the mapping lookup for this kind and substitute the tgt org URL
+/// directly from `tgt_lockfile` (the pull pipeline always captures it).
 pub fn rewrite_urls(
     value: &mut Value,
     src_lockfile: &Lockfile,
@@ -134,7 +142,12 @@ pub fn rewrite_urls(
             return;
         }
         let Some((kind, src_slug)) = src_lockfile.lookup_url(s) else { return };
-        let Some(tgt_slug) = mapping.lookup_tgt_slug(kind, src_slug) else { return };
+        let tgt_slug = if kind == "organization" {
+            src_slug
+        } else {
+            let Some(s2) = mapping.lookup_tgt_slug(kind, src_slug) else { return };
+            s2
+        };
         let Some(tgt_url) = tgt_lockfile.url_for_slug(kind, tgt_slug) else { return };
         *s = tgt_url.to_string();
     });
@@ -261,6 +274,28 @@ mod tests {
         assert_eq!(
             payload["outer"]["inner"][0].as_str().unwrap(),
             "https://prod/api/v1/queues/2"
+        );
+    }
+
+    #[test]
+    fn rewrite_urls_rewrites_organization_without_mapping_entry() {
+        // Regression: cross-env workspace deploy used to POST the src org
+        // URL because `mapping.lookup_tgt_slug("organization", "self")`
+        // returns None (organization isn't deployable, so no mapping
+        // entry). API responded with 400 "Invalid hyperlink - Object does
+        // not exist." Fix: bypass mapping for the organization kind and
+        // look up the tgt URL directly from tgt_lockfile.
+        let src = lf_with(&[("organization", "self", 1, "https://test/api/v1/organizations/1")]);
+        let tgt = lf_with(&[("organization", "self", 214757, "https://prod/api/v1/organizations/214757")]);
+        let mapping = Mapping::default();
+        let mut payload = serde_json::json!({
+            "name": "AP",
+            "organization": "https://test/api/v1/organizations/1"
+        });
+        rewrite_urls(&mut payload, &src, &tgt, &mapping, &BTreeMap::new());
+        assert_eq!(
+            payload["organization"].as_str().unwrap(),
+            "https://prod/api/v1/organizations/214757"
         );
     }
 
