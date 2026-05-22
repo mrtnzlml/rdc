@@ -4863,3 +4863,78 @@ async fn sync_hook_secrets_only_edit_triggers_force_patch() {
         "lockfile should record a 64-char hex secrets_hash; got {hash:?}"
     );
 }
+
+// Minimal mocks for a pull-only sync: organization GET plus empty
+// listings for every kind. Individual tests override specific
+// endpoints (e.g. `/api/v1/hooks`) before mounting this. Kept private
+// to the file — duplicated in `tests/cli_repair.rs` because tests
+// crates can't share helpers without a shared module, and we don't
+// want to introduce one for two callers.
+async fn mount_minimal_pull(server: &MockServer) {
+    let empty = serde_json::json!({ "pagination": { "next": null }, "results": [] });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(server).await;
+    for ep in [
+        "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/hooks", "/api/v1/rules", "/api/v1/labels",
+        "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty.clone()))
+            .mount(server).await;
+    }
+}
+
+/// Pull must surface the store-extension anomaly
+/// (`extension_source: "rossum_store"` + `hook_template: null`) at the
+/// time the file lands on disk. Without a Warn here, the user only
+/// finds out at push/deploy when the guard refuses — by which point
+/// the local snapshot already contains the broken marker.
+#[tokio::test]
+async fn pull_warns_on_anomalous_store_extension() {
+    let server = MockServer::start().await;
+    mount_minimal_pull(&server).await;
+
+    // Override /hooks with one anomalous result. Lower priority number
+    // beats the empty-list default mounted by `mount_minimal_pull`.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [{
+                "id": 42,
+                "url": format!("{}/api/v1/hooks/42", server.uri()),
+                "name": "Broken Store Hook",
+                "type": "webhook",
+                "queues": [],
+                "events": [],
+                "config": {},
+                "extension_source": "rossum_store",
+                "hook_template": null
+            }]
+        })))
+        .with_priority(1)
+        .mount(&server).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev", "--no-push"])
+        .assert().success()
+        .stderr(predicates::str::contains("broken-store-hook"))
+        .stderr(predicates::str::contains("hook_template"))
+        .stderr(predicates::str::contains("--fix-store-anomaly"));
+}

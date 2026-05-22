@@ -40,6 +40,27 @@ pub async fn process(
         };
         used_slugs.insert(slug.clone());
 
+        // Surface the store-extension anomaly at pull time. The
+        // anomaly is `extension_source: "rossum_store"` AND
+        // `hook_template: null`. The API silently accepts the marker
+        // when a client PATCHes it directly without going through
+        // /hooks/create, so customer envs sometimes carry these.
+        // Pull writes the hook as-is (round-trip fidelity); this
+        // warning means the user finds out about it now instead of
+        // when a future push or deploy refuses to proceed.
+        //
+        // Placed before the subset early-continue so every anomalous
+        // hook in the listing surfaces, even when the current cycle
+        // only writes a narrower subset.
+        if hook.is_store_extension() && hook.hook_template().is_none() {
+            progress.event(Action::Warn, &format!(
+                "hook/{slug} (id {}): extension_source=rossum_store but hook_template is null — \
+                 run `rdc repair {env} --fix-store-anomaly` to fix",
+                hook.id,
+                env = ctx.paths.env(),
+            ));
+        }
+
         if !subset.contains(&("hooks".to_string(), slug.clone())) {
             continue;
         }
