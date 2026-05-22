@@ -527,6 +527,15 @@ enum HashStrategy {
     /// the JSON portion and a formula-only divergence would
     /// silently round-trip through `KeepLocal`.
     Schema,
+    /// `mdh`: dataset-as-directory. The on-disk unit is
+    /// `<mdh>/<slug>/` containing `collection.json` + `indexes.json`;
+    /// the hash here mirrors `Flat` (collection.json content), but the
+    /// post-handler removes the whole `dataset_dir` and drops BOTH
+    /// `mdh_collections` and `mdh_indexes` lockfile entries. MDH is
+    /// pull-only: any `KeepLocal` resolution (restore-on-env or
+    /// commit-tombstone) is a no-op with a warning, since rdc has no
+    /// MDH push path.
+    Mdh,
 }
 
 impl HashStrategy {
@@ -545,6 +554,10 @@ impl HashStrategy {
             // formulas from the canonical hash — exactly the bug
             // this strategy exists to fix.
             HashStrategy::Schema => content_hash(json_bytes),
+            // MDH's hash is collection.json only; indexes.json has its
+            // own lockfile entry `mdh_indexes` tracked separately by
+            // the pull driver. Mirrors `Flat`.
+            HashStrategy::Mdh => content_hash(json_bytes),
         }
     }
 
@@ -637,7 +650,10 @@ fn resolve_one_conflict<R: BufRead>(
                     .unwrap_or_default();
                 (None, formulas)
             }
-            HashStrategy::Flat => (None, Vec::new()),
+            // MDH never reaches the BothDiverged conflict resolver
+            // (classifier marks it pull-only), but the match must be
+            // exhaustive — treat as a flat single-file kind.
+            HashStrategy::Flat | HashStrategy::Mdh => (None, Vec::new()),
         };
 
     // Decide whether the divergence is in the JSON portion or only in
@@ -660,7 +676,7 @@ fn resolve_one_conflict<R: BufRead>(
             // to remote formulas (slug-sorted by `serialize_schema`).
             local_formulas != remote_formulas
         }
-        HashStrategy::Flat => false,
+        HashStrategy::Flat | HashStrategy::Mdh => false,
     };
 
     // Compose the canonical "local combined" bytes used by the
@@ -676,7 +692,7 @@ fn resolve_one_conflict<R: BufRead>(
         HashStrategy::Hook | HashStrategy::Rule => {
             hash_strategy.hash(&local_json_bytes, &local_code)
         }
-        HashStrategy::Flat => hash_strategy.hash(&local_json_bytes, &None),
+        HashStrategy::Flat | HashStrategy::Mdh => hash_strategy.hash(&local_json_bytes, &None),
     };
 
     // Defensive sanity: if the canonical hashes already match, the
@@ -754,7 +770,7 @@ fn resolve_one_conflict<R: BufRead>(
                             .unwrap_or_else(|| (local_path.clone(), remote_bytes.clone()));
                         representative
                     }
-                    HashStrategy::Flat => (local_path.clone(), remote_bytes.clone()),
+                    HashStrategy::Flat | HashStrategy::Mdh => (local_path.clone(), remote_bytes.clone()),
                 }
             } else {
                 (local_path.clone(), remote_bytes.clone())
@@ -861,7 +877,7 @@ fn resolve_one_conflict<R: BufRead>(
                         // handle the whole schema, not just one formula.
                         (r, false, local_b, remote_b, formula_path)
                     }
-                    HashStrategy::Flat => unreachable!(),
+                    HashStrategy::Flat | HashStrategy::Mdh => unreachable!(),
                 }
             } else {
                 // Standard JSON-based prompt (path-driven; reads
@@ -1096,8 +1112,12 @@ fn sidecar_path_for_conflict(local_path: &Path, strategy: HashStrategy) -> PathB
             }
             local_path.with_extension("py")
         }
-        // Rules and Flat — `trigger_condition` is always Python.
-        HashStrategy::Rule | HashStrategy::Flat => local_path.with_extension("py"),
+        // Rules, Flat, and Mdh — `trigger_condition` is always Python
+        // (Rules); Flat/Mdh have no sidecar at all but the function
+        // contract returns `<json>.py` as a harmless fallback.
+        HashStrategy::Rule | HashStrategy::Flat | HashStrategy::Mdh => {
+            local_path.with_extension("py")
+        }
         // Schemas don't have a single sidecar — they have a
         // `formulas/<id>.py` per datapoint with a formula. The
         // resolver picks the specific formula at prompt time; this
@@ -1313,6 +1333,20 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
         map
     };
 
+    // MDH datasets — slug derivation mirrors `pull::mdh::process` (pure
+    // name-based slugify; mdh lockfile entries don't store a slug→id
+    // mapping because the slug IS the identity).
+    let mdh_collection_by_slug: BTreeMap<String, &crate::model::Collection> = {
+        let mut map: BTreeMap<String, &crate::model::Collection> = BTreeMap::new();
+        let mut used: HashSet<String> = HashSet::new();
+        for c in &catalog.mdh.collections {
+            let slug = slugify_unique(&c.name, &used);
+            used.insert(slug.clone());
+            map.insert(slug, c);
+        }
+        map
+    };
+
     let env = ctx.paths.env().to_string();
 
     for it in classified {
@@ -1335,6 +1369,11 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                         | "email_templates"
                 ) {
                     drop_lockfile_entry(ctx, &it.kind, &it.slug);
+                } else if it.kind == "mdh" {
+                    // MDH is tracked as two lockfile kinds for one
+                    // logical resource — drop both.
+                    drop_lockfile_entry(ctx, "mdh_collections", &it.slug);
+                    drop_lockfile_entry(ctx, "mdh_indexes", &it.slug);
                 } else {
                     progress.event(Action::Warn, &format!(
                         "BothDeleted handler not yet wired for kind '{}' (slug '{}'); skipping",
@@ -1628,6 +1667,33 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             hash_strategy: HashStrategy::Flat,
                         })
                     }
+                    "mdh" => {
+                        // MDH dataset: the on-disk unit is the
+                        // dataset directory containing collection.json
+                        // + indexes.json. We use collection.json as
+                        // the representative local_path for existence
+                        // checks and as the restore target; the
+                        // KeepRemote post-handler removes the parent
+                        // dataset_dir wholesale.
+                        let body = mdh_collection_by_slug.get(it.slug.as_str()).copied();
+                        let dataset_dir = ctx.paths.dataset_dir(&it.slug);
+                        let local_path = dataset_dir.join("collection.json");
+                        let restore_bytes = body
+                            .and_then(|c| serde_json::to_vec_pretty(c).ok())
+                            .map(|mut b| {
+                                b.push(b'\n');
+                                b
+                            });
+                        Some(RemoteDeleteRefs {
+                            local_path,
+                            restore_bytes,
+                            restore_code: None,
+                            id: None,
+                            url: None,
+                            modified_at: None,
+                            hash_strategy: HashStrategy::Mdh,
+                        })
+                    }
                     other => {
                         progress.event(Action::Warn, &format!(
                             "remote-delete dispatch not yet wired for kind '{}' (slug '{}'); skipping",
@@ -1734,7 +1800,50 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                 //     [r] = restore local from env (cancel the tombstone)
                 let is_local_delete_remote_edit =
                     matches!(it.class, SyncClass::LocalDeleteRemoteEdit);
+                let is_mdh = matches!(refs.hash_strategy, HashStrategy::Mdh);
                 match resolution {
+                    Resolution::KeepLocal if is_mdh => {
+                        // MDH is pull-only — no API path to restore the
+                        // dataset on env (RemoteDelete / LocalEditRemoteDelete)
+                        // nor to push a DELETE (LocalDeleteRemoteEdit).
+                        // For LocalDeleteRemoteEdit we already restored
+                        // collection.json above before prompting; remove
+                        // that partial restore so re-running the sync
+                        // doesn't surprise the user with half a dataset.
+                        if is_local_delete_remote_edit && local_path.exists() {
+                            std::fs::remove_file(&local_path).with_context(|| {
+                                format!("removing {}", local_path.display())
+                            })?;
+                        }
+                        progress.event(Action::Warn, &format!(
+                            "mdh/{}: MDH is pull-only; rdc has no push path to {} this dataset. \
+                             Use the Rossum UI to {} the dataset, then re-run sync.",
+                            it.slug,
+                            if is_local_delete_remote_edit { "delete" } else { "recreate" },
+                            if is_local_delete_remote_edit { "delete" } else { "recreate" },
+                        ));
+                    }
+                    Resolution::KeepRemote if is_mdh => {
+                        // Whether we're mirroring an env-side delete
+                        // (RemoteDelete / LocalEditRemoteDelete) or
+                        // cancelling a local tombstone
+                        // (LocalDeleteRemoteEdit with the partial
+                        // collection.json restore), the cleanest exit
+                        // is: drop the whole dataset_dir and both
+                        // lockfile entries. The next sync re-classifies
+                        // as RemoteCreate (env still has it) or stays
+                        // gone (env doesn't), and the pull driver
+                        // re-fetches collection + indexes from scratch.
+                        if let Some(dataset_dir) = local_path.parent() {
+                            if dataset_dir.exists() {
+                                std::fs::remove_dir_all(dataset_dir).with_context(|| {
+                                    format!("removing {}", dataset_dir.display())
+                                })?;
+                            }
+                        }
+                        drop_lockfile_entry(ctx, "mdh_collections", &it.slug);
+                        drop_lockfile_entry(ctx, "mdh_indexes", &it.slug);
+                    }
                     Resolution::KeepLocal => {
                         if is_local_delete_remote_edit {
                             // Spec: `[k]` = commit the local tombstone by
@@ -4100,6 +4209,263 @@ mod tests {
         assert_eq!(
             recorded, base_combined,
             "lockfile base must remain pinned on Skip (next sync re-prompts); got {recorded}"
+        );
+    }
+
+    // ----- MDH remote-delete tests ---------------------------------------
+
+    struct MdhRemoteDeleteFixture {
+        _tmp: tempfile::TempDir,
+        paths: Paths,
+        client: RossumClient,
+        lockfile: Lockfile,
+        dataset_dir: PathBuf,
+        collection_path: PathBuf,
+        indexes_path: PathBuf,
+    }
+
+    fn setup_mdh_remote_delete_fixture() -> MdhRemoteDeleteFixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        let dataset_dir = paths.dataset_dir("po-line-match-memory");
+        std::fs::create_dir_all(&dataset_dir).unwrap();
+
+        let collection_bytes = b"{\"name\":\"po-line-match-memory\"}\n".to_vec();
+        let indexes_bytes = b"{\"regular\":[],\"search\":[]}\n".to_vec();
+        let collection_path = dataset_dir.join("collection.json");
+        let indexes_path = dataset_dir.join("indexes.json");
+        std::fs::write(&collection_path, &collection_bytes).unwrap();
+        std::fs::write(&indexes_path, &indexes_bytes).unwrap();
+
+        let mut lockfile = Lockfile::default();
+        lockfile.upsert(
+            "mdh_collections",
+            "po-line-match-memory",
+            ObjectEntry {
+                id: 0,
+                url: None,
+                modified_at: None,
+                content_hash: Some(content_hash(&collection_bytes)),
+                secrets_hash: None,
+            },
+        );
+        lockfile.upsert(
+            "mdh_indexes",
+            "po-line-match-memory",
+            ObjectEntry {
+                id: 0,
+                url: None,
+                modified_at: None,
+                content_hash: Some(content_hash(&indexes_bytes)),
+                secrets_hash: None,
+            },
+        );
+
+        let client = RossumClient::new(
+            "https://unused.invalid/api/v1".to_string(),
+            "TEST".to_string(),
+        )
+        .unwrap();
+
+        MdhRemoteDeleteFixture {
+            _tmp: tmp,
+            paths,
+            client,
+            lockfile,
+            dataset_dir,
+            collection_path,
+            indexes_path,
+        }
+    }
+
+    fn classified_mdh_remote_delete() -> Vec<ClassifiedItem> {
+        vec![ClassifiedItem {
+            kind: "mdh".to_string(),
+            slug: "po-line-match-memory".to_string(),
+            class: SyncClass::RemoteDelete,
+            local_hash: None,
+            remote_hash: None,
+            base_hash: Some("dummy".to_string()),
+        }]
+    }
+
+    /// `[r]` (use env / mirror remote delete) on an MDH RemoteDelete: the
+    /// resolver must remove the entire dataset directory (both
+    /// `collection.json` and `indexes.json`) and drop BOTH lockfile
+    /// entries (`mdh_collections` + `mdh_indexes`). No push promotion —
+    /// MDH is pull-only and the env already lacks the dataset.
+    #[tokio::test]
+    async fn resolve_remote_deletes_mdh_use_env_removes_dataset_dir() {
+        let mut fixture = setup_mdh_remote_delete_fixture();
+        let catalog = catalog_with_labels(vec![]);
+        let classified = classified_mdh_remote_delete();
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: true,
+            };
+            resolve_remote_deletes(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b"r\n"),
+                true,
+                &progress,
+            )
+            .await
+            .expect("resolver should succeed on [r]")
+        };
+
+        assert!(
+            outcome.promoted_to_push.is_empty(),
+            "MDH must never be promoted to push (pull-only)"
+        );
+        assert!(
+            !fixture.dataset_dir.exists(),
+            "dataset directory must be removed: {}",
+            fixture.dataset_dir.display()
+        );
+        assert!(
+            !fixture.collection_path.exists(),
+            "collection.json must be removed"
+        );
+        assert!(
+            !fixture.indexes_path.exists(),
+            "indexes.json must be removed"
+        );
+        assert!(
+            fixture
+                .lockfile
+                .objects
+                .get("mdh_collections")
+                .and_then(|m| m.get("po-line-match-memory"))
+                .is_none(),
+            "mdh_collections lockfile entry must be dropped"
+        );
+        assert!(
+            fixture
+                .lockfile
+                .objects
+                .get("mdh_indexes")
+                .and_then(|m| m.get("po-line-match-memory"))
+                .is_none(),
+            "mdh_indexes lockfile entry must be dropped"
+        );
+    }
+
+    /// `[k]` (keep local / restore on env) on an MDH RemoteDelete: rdc has
+    /// no MDH push path, so the resolver must NOT promote to push, must
+    /// NOT touch the lockfile, and must leave the local files alone.
+    /// A warning explaining the limitation is emitted; this test asserts
+    /// the no-op outcome (the warning text itself is checked in the
+    /// integration tests).
+    #[tokio::test]
+    async fn resolve_remote_deletes_mdh_keep_local_is_a_noop_with_warning() {
+        let mut fixture = setup_mdh_remote_delete_fixture();
+        let catalog = catalog_with_labels(vec![]);
+        let classified = classified_mdh_remote_delete();
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+        let lockfile_before = fixture.lockfile.clone();
+
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: true,
+            };
+            resolve_remote_deletes(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b"k\n"),
+                true,
+                &progress,
+            )
+            .await
+            .expect("resolver should succeed on [k]")
+        };
+
+        assert!(
+            outcome.promoted_to_push.is_empty(),
+            "MDH must never be promoted to push (pull-only)"
+        );
+        assert!(
+            fixture.dataset_dir.exists() && fixture.collection_path.exists(),
+            "local dataset must be left intact on [k]"
+        );
+        assert_eq!(
+            fixture.lockfile, lockfile_before,
+            "lockfile must be untouched on [k]"
+        );
+    }
+
+    /// BothDeleted on MDH: both lockfile entries must be dropped silently,
+    /// no prompt, no other side-effects.
+    #[tokio::test]
+    async fn resolve_remote_deletes_mdh_both_deleted_drops_both_lockfile_entries() {
+        let mut fixture = setup_mdh_remote_delete_fixture();
+        // Remove the on-disk dataset to mirror the "both sides removed it" state.
+        std::fs::remove_dir_all(&fixture.dataset_dir).unwrap();
+
+        let catalog = catalog_with_labels(vec![]);
+        let classified = vec![ClassifiedItem {
+            kind: "mdh".to_string(),
+            slug: "po-line-match-memory".to_string(),
+            class: SyncClass::BothDeleted,
+            local_hash: None,
+            remote_hash: None,
+            base_hash: Some("dummy".to_string()),
+        }];
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: false,
+            };
+            resolve_remote_deletes(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b""),
+                false,
+                &progress,
+            )
+            .await
+            .expect("BothDeleted resolver must succeed")
+        };
+
+        assert!(outcome.promoted_to_push.is_empty());
+        assert!(
+            fixture
+                .lockfile
+                .objects
+                .get("mdh_collections")
+                .and_then(|m| m.get("po-line-match-memory"))
+                .is_none(),
+            "mdh_collections entry must be dropped on BothDeleted"
+        );
+        assert!(
+            fixture
+                .lockfile
+                .objects
+                .get("mdh_indexes")
+                .and_then(|m| m.get("po-line-match-memory"))
+                .is_none(),
+            "mdh_indexes entry must be dropped on BothDeleted"
         );
     }
 }
