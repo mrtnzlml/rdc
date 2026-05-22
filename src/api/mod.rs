@@ -9,7 +9,7 @@ use crate::model::{
     EmailTemplate, Engine, EngineField, Hook, HookTemplate, Inbox, Label, Organization, Queue,
     Rule, Schema, User, Workflow, WorkflowStep, Workspace,
 };
-use crate::progress::ProgressHandle;
+use crate::api::retry::ProgressHandle;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Deserialize;

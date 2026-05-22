@@ -1,13 +1,13 @@
 use super::common::{apply_pull_action, decide_pull_action, record_object, skip_on_permission_denied, PullAction, PullCtx};
+use crate::log::{Action, Log};
 use crate::model::WorkflowStep;
-use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all workflow steps from the API.
-pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<dyn SyncRenderer>) -> Result<Vec<WorkflowStep>> {
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<Log>) -> Result<Vec<WorkflowStep>> {
     skip_on_permission_denied(
         ctx.client.list_workflow_steps(Some(progress.clone())).await.context("listing workflow steps"),
         "workflow_steps",
@@ -25,17 +25,15 @@ pub async fn process(
     ctx: &mut PullCtx<'_>,
     steps: Vec<WorkflowStep>,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
 ) -> Result<(usize, usize)> {
-    progress.phase("pulling workflow_steps");
-
     let mut used: HashSet<String> = HashSet::new();
     let mut conflicts = 0usize;
     let mut written = 0usize;
     for s in &steps {
         let Some(workflow_slug) = ctx.lockfile.slug_for_url("workflows", &s.workflow).map(|x| x.to_string()) else {
-            progress.warn_line(&format!(
-                "! workflow step '{}' (id {}) has unknown workflow URL '{}'; skipping",
+            progress.event(Action::Skip, &format!(
+                "workflow step '{}' (id {}) — unknown workflow URL '{}'; skipping",
                 s.name, s.id, s.workflow
             ));
             continue;
@@ -51,7 +49,6 @@ pub async fn process(
             continue;
         }
 
-        progress.resource_started("workflow_steps", &slug, ResourceOp::Get);
         let result: Result<()> = (|| {
 
         let steps_dir = ctx.paths.workflow_steps_dir(&workflow_slug);
@@ -88,16 +85,11 @@ pub async fn process(
         written += 1;
         Ok(())
         })();
-        let outcome = match &result {
-            Ok(()) => ResourceOutcome::Ok,
-            Err(e) => ResourceOutcome::Failed(e.to_string()),
-        };
-        progress.resource_finished("workflow_steps", &slug, outcome);
         result?;
     }
 
     if written > 0 {
-        progress.warn_line(&format!("[ok] workflow_steps {written} pulled"));
+        progress.event(Action::Pull, &format!("workflow_steps ({written} pulled)"));
     }
 
     Ok((written, conflicts))

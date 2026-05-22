@@ -1,6 +1,6 @@
 use crate::api::{ApiError, RossumClient};
+use crate::log::{Action, Log};
 use crate::paths::Paths;
-use crate::progress::SyncRenderer;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
 use anyhow::{anyhow, Context, Result};
 use std::collections::BTreeMap;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 pub fn skip_on_permission_denied<T>(
     result: Result<Vec<T>>,
     kind: &str,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
 ) -> Result<Vec<T>> {
     match result {
         Ok(v) => Ok(v),
@@ -24,7 +24,7 @@ pub fn skip_on_permission_denied<T>(
                     .unwrap_or(false)
             });
             if is_403 {
-                progress.warn_line(&format!("! skipping {kind}: token lacks permission (403)"));
+                progress.event(Action::Skip, &format!("{kind} (403 — token lacks permission)"));
                 Ok(Vec::new())
             } else {
                 Err(e)
@@ -97,19 +97,18 @@ pub struct RemoteCatalog {
 /// Phase 1 of pull: list every kind from the env's API. The catalog is
 /// consumed by the sync classifier and executor.
 ///
-/// Every list call gets a spinner inside a single "listing remote" phase so
-/// the user sees animation while rdc is waiting on the API. The phase header
-/// prints once at the top; each per-kind line resolves to `[ok] <kind> <N>`
-/// after its API call returns.
+/// Each list call emits a single `list <kind> (<N>)` event line after its
+/// API call returns.
 ///
 /// The twelve top-level list calls run **concurrently** with a bounded
 /// fan-out at [`PULL_FANOUT`] (the same cap that
 /// [`prefetch_queue_children`] uses). The bound matches the existing
 /// queue-children pattern and avoids overwhelming the wire on
 /// dense-config envs while still cutting wall-clock for a typical sync
-/// roughly in half versus the prior fully-sequential pass. `[ok]` lines
-/// commit in whatever order responses return, so the final transcript
-/// may be reordered relative to the declaration order of `Kind` below.
+/// roughly in half versus the prior fully-sequential pass. The `list`
+/// lines commit in whatever order responses return, so the final
+/// transcript may be reordered relative to the declaration order of
+/// `Kind` below.
 /// The per-queue schema+inbox prefetch runs serially after `queues`
 /// resolves because it depends on the queue list.
 ///
@@ -127,11 +126,9 @@ pub async fn list_remote(
     env_cfg: &crate::config::EnvConfig,
     env: &str,
     token: &str,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
 ) -> Result<RemoteCatalog> {
     use futures::stream::{StreamExt, TryStreamExt};
-
-    progress.phase("listing remote");
 
     // Single shared immutable reborrow so each concurrent future below
     // borrows from one place. The list drivers each take `&PullCtx`, so
@@ -183,73 +180,73 @@ pub async fn list_remote(
                     Kind::Organization => {
                         let r = crate::cli::pull::organization::list(ctx_ref, env_cfg.org_id, progress).await
                             .with_context(|| format!("listing organization for env '{env}'"))?;
-                        progress.warn_line(&format!("[ok] organization {}", r.name));
+                        progress.event(Action::List, &format!("organization ({})", r.name));
                         anyhow::Ok(Listed::Organization(r))
                     }
                     Kind::Workspaces => {
                         let r = crate::cli::pull::workspaces::list(ctx_ref, progress).await
                             .with_context(|| format!("listing workspaces for env '{env}'"))?;
-                        progress.warn_line(&format!("[ok] workspaces {}", r.len()));
+                        progress.event(Action::List, &format!("workspaces ({})", r.len()));
                         anyhow::Ok(Listed::Workspaces(r))
                     }
                     Kind::Queues => {
                         let r = crate::cli::pull::queues::list(ctx_ref, progress).await
                             .with_context(|| format!("listing queues for env '{env}'"))?;
-                        progress.warn_line(&format!("[ok] queues {}", r.len()));
+                        progress.event(Action::List, &format!("queues ({})", r.len()));
                         anyhow::Ok(Listed::Queues(r))
                     }
                     Kind::Hooks => {
                         let r = crate::cli::pull::hooks::list(ctx_ref, progress).await
                             .with_context(|| format!("listing hooks for env '{env}'"))?;
-                        progress.warn_line(&format!("[ok] hooks {}", r.len()));
+                        progress.event(Action::List, &format!("hooks ({})", r.len()));
                         anyhow::Ok(Listed::Hooks(r))
                     }
                     Kind::Rules => {
                         let r = crate::cli::pull::rules::list(ctx_ref, progress).await
                             .with_context(|| format!("listing rules for env '{env}'"))?;
-                        progress.warn_line(&format!("[ok] rules {}", r.len()));
+                        progress.event(Action::List, &format!("rules ({})", r.len()));
                         anyhow::Ok(Listed::Rules(r))
                     }
                     Kind::Labels => {
                         let r = crate::cli::pull::labels::list(ctx_ref, progress).await
                             .with_context(|| format!("listing labels for env '{env}'"))?;
-                        progress.warn_line(&format!("[ok] labels {}", r.len()));
+                        progress.event(Action::List, &format!("labels ({})", r.len()));
                         anyhow::Ok(Listed::Labels(r))
                     }
                     Kind::Engines => {
                         let r = crate::cli::pull::engines::list(ctx_ref, progress).await
                             .with_context(|| format!("listing engines for env '{env}'"))?;
-                        progress.warn_line(&format!("[ok] engines {}", r.len()));
+                        progress.event(Action::List, &format!("engines ({})", r.len()));
                         anyhow::Ok(Listed::Engines(r))
                     }
                     Kind::EngineFields => {
                         let r = crate::cli::pull::engine_fields::list(ctx_ref, progress).await
                             .with_context(|| format!("listing engine fields for env '{env}'"))?;
-                        progress.warn_line(&format!("[ok] engine fields {}", r.len()));
+                        progress.event(Action::List, &format!("engine_fields ({})", r.len()));
                         anyhow::Ok(Listed::EngineFields(r))
                     }
                     Kind::Workflows => {
                         let r = crate::cli::pull::workflows::list(ctx_ref, progress).await
                             .with_context(|| format!("listing workflows for env '{env}'"))?;
-                        progress.warn_line(&format!("[ok] workflows {}", r.len()));
+                        progress.event(Action::List, &format!("workflows ({})", r.len()));
                         anyhow::Ok(Listed::Workflows(r))
                     }
                     Kind::WorkflowSteps => {
                         let r = crate::cli::pull::workflow_steps::list(ctx_ref, progress).await
                             .with_context(|| format!("listing workflow steps for env '{env}'"))?;
-                        progress.warn_line(&format!("[ok] workflow steps {}", r.len()));
+                        progress.event(Action::List, &format!("workflow_steps ({})", r.len()));
                         anyhow::Ok(Listed::WorkflowSteps(r))
                     }
                     Kind::EmailTemplates => {
                         let r = crate::cli::pull::email_templates::list(ctx_ref, progress).await
                             .with_context(|| format!("listing email templates for env '{env}'"))?;
-                        progress.warn_line(&format!("[ok] email templates {}", r.len()));
+                        progress.event(Action::List, &format!("email_templates ({})", r.len()));
                         anyhow::Ok(Listed::EmailTemplates(r))
                     }
                     Kind::Mdh => {
                         let r = crate::cli::pull::mdh::list(env_cfg, token, progress).await
                             .with_context(|| format!("listing MDH datasets for env '{env}'"))?;
-                        progress.warn_line(&format!("[ok] mdh datasets {}", r.collections.len()));
+                        progress.event(Action::List, &format!("mdh_datasets ({})", r.collections.len()));
                         anyhow::Ok(Listed::Mdh(r))
                     }
                 }
@@ -343,7 +340,7 @@ pub async fn list_remote(
 async fn prefetch_queue_children(
     client: &RossumClient,
     queues: &[crate::model::Queue],
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
 ) -> Result<(
     std::collections::BTreeMap<u64, crate::model::Schema>,
     std::collections::BTreeMap<u64, crate::model::Inbox>,
@@ -414,7 +411,7 @@ async fn prefetch_queue_children(
             .await;
 
     let fetched = fetched_result?;
-    progress.warn_line(&format!("[ok] schemas + inboxes {total} fetched"));
+    progress.event(Action::List, &format!("schemas+inboxes ({total} fetched)"));
 
     let mut schemas = std::collections::BTreeMap::new();
     let mut inboxes = std::collections::BTreeMap::new();
@@ -565,7 +562,7 @@ pub fn apply_pull_action(
     remote_bytes: &[u8],
     remote_hash: String,
     interactive: bool,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
     env: &str,
     base_hash: Option<&str>,
 ) -> Result<String> {
@@ -616,15 +613,15 @@ pub fn apply_pull_action(
 fn shadow_file_conflict(
     local_path: &Path,
     remote_bytes: &[u8],
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
     env: &str,
     base_hash: Option<&str>,
 ) -> Result<String> {
     use crate::snapshot::writer::write_atomic;
     let conflict_path = crate::paths::shadow_path_for(local_path, env);
     write_atomic(&conflict_path, remote_bytes)?;
-    progress.warn_line(&format!(
-        "! {} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
+    progress.event(Action::Warn, &format!(
+        "{} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
         local_path.display(),
         conflict_path.display(),
     ));
@@ -647,7 +644,7 @@ fn resolve_conflict_interactive(
     local_path: &Path,
     remote_bytes: &[u8],
     remote_hash: &str,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
     env: &str,
     base_hash: Option<&str>,
 ) -> Result<String> {
@@ -690,8 +687,8 @@ fn resolve_conflict_interactive(
             // shadow-skip); fall back to local hash when no prior base.
             write_atomic(local_path, &edited)?;
             if let Some(prior) = base_hash {
-                progress.warn_line(&format!(
-                    "! {} partially resolved (markers retained); lockfile base preserved; re-run to resolve",
+                progress.event(Action::Warn, &format!(
+                    "{} partially resolved (markers retained); lockfile base preserved; re-run to resolve",
                     local_path.display(),
                 ));
                 Ok(prior.to_string())
@@ -779,9 +776,8 @@ mod tests {
     fn apply_write_creates_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
-        let p: std::sync::Arc<dyn crate::progress::SyncRenderer> = crate::progress::ProgressLog::start("test");
+        let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
         let h = apply_pull_action(PullAction::Write, &path, b"hello", "h".repeat(64), false, &p, "test", None).unwrap();
-        p.finish_ok("test");
         assert_eq!(h, "h".repeat(64));
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
     }
@@ -792,9 +788,8 @@ mod tests {
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"local").unwrap();
         // interactive=false → legacy shadow-file behavior.
-        let p: std::sync::Arc<dyn crate::progress::SyncRenderer> = crate::progress::ProgressLog::start("test");
+        let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
         let _ = apply_pull_action(PullAction::Conflict, &path, b"remote", "h".repeat(64), false, &p, "test", None).unwrap();
-        p.finish_ok("test");
         assert_eq!(std::fs::read(&path).unwrap(), b"local");
         assert_eq!(
             std::fs::read(dir.path().join("x.json.test")).unwrap(),
@@ -809,9 +804,8 @@ mod tests {
             status: 403,
             body: "permission_denied".into()
         }));
-        let p: std::sync::Arc<dyn crate::progress::SyncRenderer> = crate::progress::ProgressLog::start("test");
+        let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
         let out = skip_on_permission_denied(err, "engines", &p).unwrap();
-        p.finish_ok("test");
         assert!(out.is_empty());
     }
 
@@ -821,16 +815,15 @@ mod tests {
             status: 500,
             body: "boom".into()
         }));
-        let p: std::sync::Arc<dyn crate::progress::SyncRenderer> = crate::progress::ProgressLog::start("test");
+        let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
         assert!(skip_on_permission_denied(err, "engines", &p).is_err());
     }
 
     #[test]
     fn skip_on_permission_denied_passes_through_ok() {
         let v: Result<Vec<u32>> = Ok(vec![1, 2, 3]);
-        let p: std::sync::Arc<dyn crate::progress::SyncRenderer> = crate::progress::ProgressLog::start("test");
+        let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
         let out = skip_on_permission_denied(v, "engines", &p).unwrap();
-        p.finish_ok("test");
         assert_eq!(out, vec![1, 2, 3]);
     }
 
@@ -854,7 +847,7 @@ mod tests {
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"original").unwrap();
         let original_bytes = std::fs::read(&path).unwrap();
-        let p: std::sync::Arc<dyn crate::progress::SyncRenderer> = crate::progress::ProgressLog::start("test");
+        let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
         let h = apply_pull_action(
             PullAction::NoChange,
             &path,
@@ -866,7 +859,6 @@ mod tests {
             None,
         )
         .unwrap();
-        p.finish_ok("test");
         assert_eq!(h, "h".repeat(64));
         // Local file unchanged byte-for-byte.
         assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
@@ -886,7 +878,7 @@ mod tests {
         let remote = b"{\"remote\":true}";
         let prior_base = "BASE_HASH_64_chars_".to_string() + &"0".repeat(45);
         assert_eq!(prior_base.len(), 64);
-        let p: std::sync::Arc<dyn crate::progress::SyncRenderer> = crate::progress::ProgressLog::start("test");
+        let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
         let recorded = apply_pull_action(
             PullAction::Conflict,
             &path,
@@ -898,7 +890,6 @@ mod tests {
             Some(&prior_base),
         )
         .unwrap();
-        p.finish_ok("test");
         // Lockfile must NOT advance — recorded hash equals prior base.
         assert_eq!(recorded, prior_base, "shadow-skip must preserve lockfile base");
         // Shadow file carries remote bytes.
@@ -920,7 +911,7 @@ mod tests {
         let local = b"{\"local\":true}";
         std::fs::write(&path, local).unwrap();
         let remote = b"{\"remote\":true}";
-        let p: std::sync::Arc<dyn crate::progress::SyncRenderer> = crate::progress::ProgressLog::start("test");
+        let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
         let recorded = apply_pull_action(
             PullAction::Conflict,
             &path,
@@ -932,7 +923,6 @@ mod tests {
             None, // no prior base
         )
         .unwrap();
-        p.finish_ok("test");
         assert_eq!(recorded, content_hash(local));
     }
 
@@ -947,7 +937,7 @@ mod tests {
         std::fs::write(&path, local).unwrap();
         let remote = b"{\"remote\":true}";
         let base_hash = "B".repeat(64);
-        let p: std::sync::Arc<dyn crate::progress::SyncRenderer> = crate::progress::ProgressLog::start("test");
+        let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
 
         // First pull → conflict → shadow-skip.
         let (action1, remote_hash1) =
@@ -970,6 +960,6 @@ mod tests {
         // conflict because the lockfile base never moved.
         let (action2, _) = decide_pull_action(&path, Some(&recorded1), remote).unwrap();
         assert_eq!(action2, PullAction::Conflict, "second pull must re-prompt");
-        p.finish_ok("test");
+        let _ = p; // Log dropped normally; no finish call needed.
     }
 }

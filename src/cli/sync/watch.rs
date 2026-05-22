@@ -4,7 +4,23 @@
 
 use anyhow::Result;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// Ten-segment bar showing position within the polling interval.
+fn polling_bar(elapsed: u64, total: u64) -> String {
+    const SEGMENTS: u64 = 10;
+    let filled = if total == 0 {
+        SEGMENTS
+    } else {
+        (elapsed.saturating_mul(SEGMENTS) / total).min(SEGMENTS)
+    };
+    let empty = SEGMENTS - filled;
+    let mut bar = String::with_capacity((SEGMENTS as usize) * 3);
+    for _ in 0..filled { bar.push('▰'); }
+    for _ in 0..empty  { bar.push('▱'); }
+    bar
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CycleTrigger {
@@ -26,14 +42,8 @@ pub async fn run_watch(
     let cwd = std::env::current_dir()?;
     let paths = crate::paths::Paths::for_env(&cwd, env);
 
-    // Construct the renderer ONCE so the grid's freshness clocks and
-    // entry universe persist across cycles. `is_watch=true` flips
-    // header bookkeeping (uptime, etc.).
-    let renderer = crate::progress::make_sync_renderer(
-        &format!("rdc sync --watch {env}"),
-        env,
-        true,
-    );
+    // Construct the renderer ONCE so freshness clocks persist across cycles.
+    let renderer = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
 
     // Initial reconcile.
     {
@@ -54,11 +64,11 @@ pub async fn run_watch(
         .await?;
     }
 
-    eprintln!("watching envs/{env}/ ...");
+    renderer.event(crate::log::Action::Watch, &format!("start envs/{env}"));
     if let Some(d) = poll_interval {
-        eprintln!("polling {env} every {}s ...", d.as_secs());
+        renderer.event(crate::log::Action::Watch, &format!("polling every {}s", d.as_secs()));
     } else {
-        eprintln!("polling disabled");
+        renderer.event(crate::log::Action::Watch, "polling disabled");
     }
 
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
@@ -70,16 +80,37 @@ pub async fn run_watch(
         let _ = shutdown_tx.send(());
     });
 
+    // Shared flag the ticker reads to know when to pause its in-place
+    // status drawing. The event_loop flips it true around each cycle.
+    let sync_running = Arc::new(AtomicBool::new(false));
+
     if let Some(interval_duration) = poll_interval {
         let tx = events_tx.clone();
+        let renderer_ticker = renderer.clone();
+        let sync_running_ticker = sync_running.clone();
+        let interval_secs = interval_duration.as_secs().max(1);
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval_duration);
-            // skip the immediate first tick — initial reconcile already ran
-            tick.tick().await;
+            // Tick every second so the status line counts down and the
+            // four-stage bar advances; emit a Poll trigger every
+            // `interval_secs` ticks.
+            let mut elapsed: u64 = 0;
             loop {
-                tick.tick().await;
-                if tx.send(CycleTrigger::Poll).await.is_err() {
-                    break;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                elapsed += 1;
+                if elapsed >= interval_secs {
+                    elapsed = 0;
+                    if tx.send(CycleTrigger::Poll).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                if !sync_running_ticker.load(Ordering::Relaxed) {
+                    let remaining = interval_secs - elapsed;
+                    let bar = polling_bar(elapsed, interval_secs);
+                    renderer_ticker.tick_status(
+                        crate::log::Action::Watch,
+                        &format!("next sync in {remaining}s {bar}"),
+                    );
                 }
             }
         });
@@ -100,13 +131,15 @@ pub async fn run_watch(
         Some(watcher),
         env_root,
         Some(renderer.clone()),
+        sync_running.clone(),
     )
     .await?;
-    // Owner-of-renderer finalization: run_cycle skips finish_ok when a
+    renderer.finish_status();
+    // Owner-of-renderer finalization: run_cycle skips the Done event when a
     // persistent renderer was supplied (otherwise the grid would freeze
-    // after the first cycle), so the watch loop does it here on exit.
-    renderer.finish_ok("stopped watch");
-    eprintln!("\nstopping watch.");
+    // after the first cycle), so the watch loop emits it here on exit.
+    renderer.event(crate::log::Action::Done, "stopped watch");
+    renderer.event(crate::log::Action::Watch, "stopped");
     Ok(())
 }
 
@@ -123,7 +156,8 @@ pub(crate) async fn event_loop(
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
     mut watcher: Option<notify::RecommendedWatcher>,
     env_root: std::path::PathBuf,
-    renderer: Option<Arc<dyn crate::progress::SyncRenderer>>,
+    renderer: Option<Arc<crate::log::Log>>,
+    sync_running: Arc<AtomicBool>,
 ) -> Result<()> {
     use notify::{RecursiveMode, Watcher};
 
@@ -154,6 +188,16 @@ pub(crate) async fn event_loop(
                     &paths.env_lock(),
                     std::time::Duration::from_secs(30),
                 )?;
+                // Suspend the polling-status ticker for the duration of
+                // the cycle so its in-place updates don't tear with the
+                // cycle's regular event lines. Reset on every exit path
+                // below via the RAII guard.
+                struct CycleGuard<'a>(&'a AtomicBool);
+                impl Drop for CycleGuard<'_> {
+                    fn drop(&mut self) { self.0.store(false, Ordering::Relaxed); }
+                }
+                sync_running.store(true, Ordering::Relaxed);
+                let _cycle_guard = CycleGuard(&sync_running);
                 let _outcome = match crate::cli::sync::run_cycle(
                     env, interactive, false, false, allow_deletes, no_push, no_pull,
                     renderer.clone(),
@@ -163,12 +207,9 @@ pub(crate) async fn event_loop(
                         // Prompt for a new token inline; retry once. Surface
                         // via the renderer's banner so the grid stays visible.
                         if let Some(r) = renderer.as_ref() {
-                            r.banner(
-                                crate::progress::Severity::Warn,
-                                &format!("[{}] auth expired — refreshing token", now_hhmmss()),
-                            );
+                            r.event(crate::log::Action::Auth, "token expired — refreshing");
                         } else {
-                            eprintln!("[{}] auth expired", now_hhmmss());
+                            eprintln!("auth: token expired");
                         }
                         crate::cli::auth::refresh_token_interactively(env).await?;
                         crate::cli::sync::run_cycle(
@@ -177,7 +218,11 @@ pub(crate) async fn event_loop(
                         ).await?
                     }
                     Err(e) if is_transient_network_error(&e) => {
-                        eprintln!("[{}] cycle failed (transient): {e:#}", now_hhmmss());
+                        if let Some(r) = renderer.as_ref() {
+                            r.event(crate::log::Action::Watch, &format!("cycle failed (transient): {e:#}"));
+                        } else {
+                            eprintln!("watch: cycle failed (transient): {e:#}");
+                        }
                         // Resume watcher and continue to next iteration.
                         if let Some(w) = watcher.as_mut() {
                             let _ = w.watch(&env_root, RecursiveMode::Recursive);
@@ -186,7 +231,11 @@ pub(crate) async fn event_loop(
                         continue;
                     }
                     Err(e) if is_local_parse_error(&e) => {
-                        eprintln!("[{}] cycle failed (local file error): {e:#}", now_hhmmss());
+                        if let Some(r) = renderer.as_ref() {
+                            r.event(crate::log::Action::Watch, &format!("cycle failed (local file error): {e:#}"));
+                        } else {
+                            eprintln!("watch: cycle failed (local file error): {e:#}");
+                        }
                         if let Some(w) = watcher.as_mut() {
                             let _ = w.watch(&env_root, RecursiveMode::Recursive);
                         }
@@ -215,19 +264,6 @@ pub(crate) async fn event_loop(
         }
     }
     Ok(())
-}
-
-/// UTC HH:MM:SS — small standalone formatter so we don't add a `chrono` dep.
-fn now_hhmmss() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let secs_today = secs % 86400;
-    let h = secs_today / 3600;
-    let m = (secs_today % 3600) / 60;
-    let s = secs_today % 60;
-    format!("{h:02}:{m:02}:{s:02}")
 }
 
 /// Heuristic: does this error look like a transient network failure?
@@ -296,6 +332,27 @@ mod tests {
     use super::*;
     use tokio::sync::{mpsc, oneshot};
 
+    #[test]
+    fn polling_bar_tenths() {
+        // Within a 60s interval, each segment is 6 seconds.
+        assert_eq!(polling_bar(0, 60),  "▱▱▱▱▱▱▱▱▱▱");
+        assert_eq!(polling_bar(5, 60),  "▱▱▱▱▱▱▱▱▱▱");
+        assert_eq!(polling_bar(6, 60),  "▰▱▱▱▱▱▱▱▱▱");
+        assert_eq!(polling_bar(24, 60), "▰▰▰▰▱▱▱▱▱▱");
+        assert_eq!(polling_bar(30, 60), "▰▰▰▰▰▱▱▱▱▱");
+        assert_eq!(polling_bar(54, 60), "▰▰▰▰▰▰▰▰▰▱");
+        assert_eq!(polling_bar(59, 60), "▰▰▰▰▰▰▰▰▰▱");
+    }
+
+    #[test]
+    fn polling_bar_handles_overflow_and_zero_interval() {
+        // elapsed >= total: full bar.
+        assert_eq!(polling_bar(60, 60),  "▰▰▰▰▰▰▰▰▰▰");
+        assert_eq!(polling_bar(120, 60), "▰▰▰▰▰▰▰▰▰▰");
+        // total = 0 (defensive): return the full bar instead of dividing.
+        assert_eq!(polling_bar(0, 0), "▰▰▰▰▰▰▰▰▰▰");
+    }
+
     #[tokio::test]
     async fn event_loop_exits_cleanly_on_shutdown() {
         let (_tx, rx) = mpsc::channel::<CycleTrigger>(8);
@@ -314,6 +371,7 @@ mod tests {
         let result = event_loop(
             "test", false, false, false, false, false, rx, sh_rx,
             None, std::path::PathBuf::new(), None,
+            Arc::new(AtomicBool::new(false)),
         ).await;
 
         std::env::set_current_dir(saved_cwd).unwrap();

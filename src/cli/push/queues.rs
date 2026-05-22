@@ -1,8 +1,9 @@
 use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
+use crate::log::{Action, Log};
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
-use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
+
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
@@ -16,13 +17,12 @@ pub async fn push(
     lockfile: &mut Lockfile,
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
     env: &str,
 ) -> Result<(usize, usize)> {
     let overlay = Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
-    progress.phase("pushing queues");
     let mut pushed = 0usize;
     let mut skipped = 0usize;
     let mut remote_cache: std::collections::HashMap<u64, crate::model::Queue> =
@@ -43,14 +43,8 @@ pub async fn push(
                 apply_overrides(&mut payload, p);
             }
             strip_for_create(&mut payload, "queues");
-            progress.resource_started("queues", q_slug, ResourceOp::Post);
             let create_result = client.create_queue(&payload, Some(progress.clone())).await
                 .with_context(|| format!("POST /queues (creating '{q_slug}')"));
-            let create_outcome = match &create_result {
-                Ok(_) => ResourceOutcome::Ok,
-                Err(e) => ResourceOutcome::Failed(e.to_string()),
-            };
-            progress.resource_finished("queues", q_slug, create_outcome);
             let created = create_result?;
             let mut created_bytes = serde_json::to_vec_pretty(&created)
                 .context("serializing created queue")?;
@@ -70,7 +64,7 @@ pub async fn push(
                     secrets_hash: None,
                 },
             );
-            progress.warn_line(&format!("[ok] queues/{q_slug} POST (id {})", created.id));
+            progress.event(Action::Post, &format!("queue/{q_slug} id={}", created.id));
             pushed += 1;
             continue;
         }
@@ -79,7 +73,7 @@ pub async fn push(
             .with_context(|| format!("reading {}", queue_path.display()))?;
         let entry = lockfile.objects.get("queues").and_then(|m| m.get(q_slug.as_str())).unwrap();
         let Some(base) = &entry.content_hash else {
-            progress.warn_line(&format!("! queues/{q_slug} lockfile entry has no content_hash, skipping"));
+            progress.event(Action::Skip, &format!("queue/{q_slug} (no content_hash)"));
             skipped += 1;
             continue;
         };
@@ -102,7 +96,7 @@ pub async fn push(
             }
         }
         let Some(remote_queue) = remote_cache.get(&id).cloned() else {
-            progress.warn_line(&format!("! queues/{q_slug} id {id} not found on remote, skipping"));
+            progress.event(Action::Skip, &format!("queue/{q_slug} (remote id {id} missing)"));
             skipped += 1;
             continue;
         };
@@ -135,26 +129,20 @@ pub async fn push(
                             secrets_hash: None,
                         },
                     );
-                    progress.warn_line(&format!("! queues/{q_slug} adopted remote (drift)"));
+                    progress.event(Action::Warn, &format!("queue/{q_slug} adopted remote (drift)"));
                     skipped += 1;
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    progress.warn_line(&format!("! queues/{q_slug} remote has changed since last sync, skipping push (run `rdc sync` first)"));
+                    progress.event(Action::Skip, &format!("queue/{q_slug} (remote changed; rdc sync first)"));
                     skipped += 1;
                     continue;
                 }
             }
         }
 
-        progress.resource_started("queues", q_slug, ResourceOp::Patch);
         let patch_result = client.update_queue(id, &payload_to_send, Some(progress.clone())).await
             .with_context(|| format!("PATCH /queues/{id}"));
-        let patch_outcome = match &patch_result {
-            Ok(_) => ResourceOutcome::Ok,
-            Err(e) => ResourceOutcome::Failed(e.to_string()),
-        };
-        progress.resource_finished("queues", q_slug, patch_outcome);
         let updated = patch_result?;
 
         let mut updated_bytes = serde_json::to_vec_pretty(&updated)
@@ -176,7 +164,7 @@ pub async fn push(
                 secrets_hash: None,
             },
         );
-        progress.warn_line(&format!("[ok] queues/{q_slug} PATCH"));
+        progress.event(Action::Patch, &format!("queue/{q_slug}"));
         pushed += 1;
     }
 

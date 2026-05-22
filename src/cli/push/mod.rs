@@ -1,6 +1,6 @@
 use crate::api::RossumClient;
+use crate::log::Log;
 use crate::paths::Paths;
-use crate::progress::SyncRenderer;
 use crate::state::Lockfile;
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -55,7 +55,7 @@ pub(crate) async fn push_classified(
     interactive: bool,
     changes: &scan::ChangeList,
     catalog_hooks: &[crate::model::Hook],
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
 ) -> Result<PushCounts> {
     let (n_workspaces, c_workspaces) = if !changes.workspaces.is_empty() {
         workspaces::push(paths, client, lockfile, interactive, &changes.workspaces, progress, env).await

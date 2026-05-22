@@ -55,7 +55,8 @@ pub fn pick_env_excluding(
 
     if envs.len() == 1 {
         let only = envs.into_iter().next().expect("len == 1");
-        eprintln!("Using the only defined env: {only}");
+        let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
+        log.event(crate::log::Action::Info, &format!("using only defined env: {only}"));
         return Ok(only);
     }
 

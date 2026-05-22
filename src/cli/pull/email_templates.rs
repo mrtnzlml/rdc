@@ -2,8 +2,8 @@ use super::common::{
     apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
     skip_on_permission_denied, PullAction, PullCtx,
 };
+use crate::log::{Action, Log};
 use crate::model::EmailTemplate;
-use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -12,7 +12,7 @@ use std::sync::Arc;
 /// Phase 1: list all email templates from the API.
 /// Note: the orphan-skipping logic (templates without a known queue_location)
 /// lives in `process`, where ctx.queue_locations is fully populated.
-pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<dyn SyncRenderer>) -> Result<Vec<EmailTemplate>> {
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<Log>) -> Result<Vec<EmailTemplate>> {
     skip_on_permission_denied(
         ctx.client.list_email_templates(Some(progress.clone())).await.context("listing email templates"),
         "email_templates",
@@ -45,10 +45,8 @@ pub async fn process(
     ctx: &mut PullCtx<'_>,
     templates: Vec<EmailTemplate>,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
 ) -> Result<(usize, usize)> {
-    progress.phase("pulling email_templates");
-
     let mut per_queue_used_slugs: HashMap<(String, String), HashSet<String>> = HashMap::new();
     let mut count = 0usize;
     let mut conflicts = 0usize;
@@ -82,7 +80,6 @@ pub async fn process(
             continue;
         }
 
-        progress.resource_started("email_templates", &lockfile_key, ResourceOp::Get);
         let result: Result<()> = (|| {
 
         let dir = ctx.paths.queue_email_templates_dir(&ws_slug, &q_slug);
@@ -123,16 +120,11 @@ pub async fn process(
         count += 1;
         Ok(())
         })();
-        let outcome = match &result {
-            Ok(()) => ResourceOutcome::Ok,
-            Err(e) => ResourceOutcome::Failed(e.to_string()),
-        };
-        progress.resource_finished("email_templates", &lockfile_key, outcome);
         result?;
     }
 
     if count > 0 {
-        progress.warn_line(&format!("[ok] email_templates {count} pulled"));
+        progress.event(Action::Pull, &format!("email_templates ({count} pulled)"));
     }
 
     Ok((count, conflicts))

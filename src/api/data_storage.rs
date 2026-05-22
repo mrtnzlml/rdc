@@ -17,8 +17,8 @@
 //! parent domain plus a service path (`elis.rossum.ai/svc/data-storage/api`).
 
 use crate::api::ApiError;
+use crate::api::retry::ProgressHandle;
 use crate::model::Collection;
-use crate::progress::ProgressHandle;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Deserialize;

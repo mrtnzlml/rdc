@@ -72,8 +72,8 @@ async fn repair_backs_up_lockfile_and_repulls() {
         .current_dir(project.path())
         .args(["repair", "dev", "--rebuild-lock"])
         .assert().success()
-        .stdout(predicate::str::contains("Lockfile rebuilt"))
-        .stderr(predicate::str::contains("Backed up existing lockfile"));
+        .stderr(predicate::str::contains("done env 'dev' rebuilt"))
+        .stderr(predicate::str::contains("backed up lockfile to"));
 
     assert!(lockfile_path.exists(), "lockfile re-created by sync");
 
@@ -106,8 +106,8 @@ async fn repair_works_when_lockfile_is_missing() {
         .current_dir(project.path())
         .args(["repair", "dev", "--rebuild-lock"])
         .assert().success()
-        .stdout(predicate::str::contains("Lockfile rebuilt"))
-        .stderr(predicate::str::contains("No existing lockfile"));
+        .stderr(predicate::str::contains("done env 'dev' rebuilt"))
+        .stderr(predicate::str::contains("no existing lockfile"));
 
     assert!(project.path().join(".rdc/state/dev.lock.json").exists());
 }

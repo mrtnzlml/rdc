@@ -27,10 +27,10 @@ use crate::cli::deploy::create::{
     create_workspace, locate_queue_dir, CreateCtx,
 };
 use crate::config::ProjectConfig;
+use crate::log::{Action, Log};
 use crate::mapping::Mapping;
 use crate::overlay::Overlay;
 use crate::paths::Paths;
-use crate::progress::ProgressLog;
 use crate::secrets::resolve_token;
 use crate::state::Lockfile;
 use anyhow::{anyhow, Context, Result};
@@ -40,9 +40,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// Route a warning through the progress bar (if active) or directly to stderr.
-fn warn(progress: Option<&Arc<ProgressLog>>, msg: String) {
+fn warn(progress: Option<&Arc<Log>>, msg: String) {
     match progress {
-        Some(p) => p.println(&msg),
+        Some(p) => p.event(Action::Warn, &msg),
         None => eprintln!("{msg}"),
     }
 }
@@ -259,8 +259,8 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
     )?;
 
     // Start the progress bar for the work phase (not in dry-run).
-    let progress: Option<Arc<ProgressLog>> = if !dry_run {
-        Some(ProgressLog::start(format!("deploy {src} -> {tgt}")))
+    let progress: Option<Arc<Log>> = if !dry_run {
+        Some(crate::log::Log::new(crate::cli::resolve::detect_color_mode(false)))
     } else {
         None
     };
@@ -320,14 +320,9 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
         for kind in KINDS_IN_DEP_ORDER {
             let Some(slugs) = plan.creates.get(kind) else { continue };
             if slugs.is_empty() { continue; }
-            // Start a phase for this kind (skipped if no items).
-            let create_phase: Option<crate::progress::Phase> =
-                progress.as_ref().map(|p| p.phase(format!("creating {kind}")));
             for slug in slugs {
-                // Per-item spinner so the user sees animation while the
-                // POST (and any peer fetches) are in flight. Skipped kinds
-                // resolve the spinner with a "skipped" note.
-                let sp = create_phase.as_ref().map(|ph| ph.item(slug.clone()));
+                // Singular noun mapping for the event body.
+                let singular = kind.trim_end_matches('s');
                 let result = match *kind {
                     "workspaces" => create_workspace(&mut ctx, slug).await,
                     "schemas" => create_schema(&mut ctx, slug).await,
@@ -361,9 +356,17 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
                     }
                     _ => Ok(()),
                 };
-                match &result {
-                    Ok(()) => { if let Some(sp) = sp { sp.finish_ok(""); } }
-                    Err(_) => { drop(sp); }
+                // create_schema/create_queue/create_inbox emit their own Post event.
+                // Emit Post for kinds whose create fns don't self-report.
+                if result.is_ok() {
+                    match *kind {
+                        "workspaces" | "hooks" | "rules" | "labels" | "engines" | "engine_fields" => {
+                            if let Some(p) = &progress {
+                                p.event(Action::Post, &format!("{singular}/{slug}"));
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 result?;
                 creates_done += 1;
@@ -432,14 +435,12 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
                 }
                 continue;
             }
-            // Start a delete phase for this kind.
-            let delete_phase: Option<crate::progress::Phase> =
-                progress.as_ref().map(|p| p.phase(format!("deleting {kind}")));
             for slug in slugs {
                 if let Err(e) = delete_one(&tgt_client, &mut tgt_lockfile, &tgt_paths, kind, slug).await {
                     warn(progress.as_ref(), format!("warning: failed to delete {kind}/{slug}: {e:#}"));
-                } else {
-                    delete_phase.as_ref().map(|ph| ph.line(format!("[ok] {kind}/{slug}")));
+                } else if let Some(p) = &progress {
+                    let singular = kind.trim_end_matches('s');
+                    p.event(Action::Delete, &format!("{singular}/{slug}"));
                 }
                 deletes_done += 1;
                 api_calls += 1;
@@ -455,9 +456,9 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
         let scope = selection.as_ref()
             .map(|s| format!(" (scoped, {} objects)", s.len()))
             .unwrap_or_default();
-        // Finish the progress (no-op if None).
+        // Emit a done event (no-op if None).
         if let Some(p) = &progress {
-            p.finish(format!(
+            p.event(Action::Done, &format!(
                 "Dry run ({src} -> {tgt}){scope}: {} would be created, {} would be deleted, {:.1}s",
                 plan.create_total(),
                 plan.delete_total(),
@@ -475,9 +476,9 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
         let scope = selection.as_ref()
             .map(|s| format!(" (scoped, {} objects)", s.len()))
             .unwrap_or_default();
-        // Finish the progress log so the success summary lands after all phase output.
+        // Emit a done event so the success summary lands after all phase output.
         if let Some(p) = &progress {
-            p.finish(format!(
+            p.event(Action::Done, &format!(
                 "Deployed {src} -> {tgt}{scope}: {creates_done} created, {deletes_done} deleted, {api_calls} API calls, {:.1}s",
                 elapsed.as_secs_f64()
             ));

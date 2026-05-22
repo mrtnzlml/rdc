@@ -23,8 +23,12 @@
 //!   `.send()`. Reqwest's own connect retry is not exposed; if needed in
 //!   the future, layer it on the `build()` closure side.
 
-use crate::progress::ProgressHandle;
 use anyhow::{Context, Result};
+
+/// Optional renderer handle threaded through API calls. `None` silences
+/// retry telemetry (production code passes `Some(log.clone())`; tests
+/// that don't need output pass `None`).
+pub type ProgressHandle = Option<std::sync::Arc<crate::log::Log>>;
 use reqwest::{Response, StatusCode};
 use std::time::Duration;
 

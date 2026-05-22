@@ -2,8 +2,8 @@ use super::common::{
     apply_pull_action, maybe_strip_overlay, record_object, skip_on_permission_denied,
     PullAction, PullCtx,
 };
+use crate::log::{Action, Log};
 use crate::model::Rule;
-use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::slug::slugify_unique;
 use crate::snapshot::rule::{serialize_rule, write_rule_code};
 use crate::state::rule_combined_hash;
@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all rules from the API.
-pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<dyn SyncRenderer>) -> Result<Vec<Rule>> {
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<Log>) -> Result<Vec<Rule>> {
     skip_on_permission_denied(
         ctx.client.list_rules(Some(progress.clone())).await.context("listing rules"),
         "rules",
@@ -31,10 +31,8 @@ pub async fn process(
     ctx: &mut PullCtx<'_>,
     rules: Vec<Rule>,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
 ) -> Result<(usize, usize)> {
-    progress.phase("pulling rules");
-
     let mut used_slugs: HashSet<String> = HashSet::new();
     let mut dir_created = false;
     let mut conflicts = 0usize;
@@ -50,7 +48,6 @@ pub async fn process(
             continue;
         }
 
-        progress.resource_started("rules", &slug, ResourceOp::Get);
         let result: Result<()> = (|| {
 
         if !dir_created {
@@ -198,16 +195,11 @@ pub async fn process(
         written += 1;
         Ok(())
         })();
-        let outcome = match &result {
-            Ok(()) => ResourceOutcome::Ok,
-            Err(e) => ResourceOutcome::Failed(e.to_string()),
-        };
-        progress.resource_finished("rules", &slug, outcome);
         result?;
     }
 
     if written > 0 {
-        progress.warn_line(&format!("[ok] rules {written} pulled"));
+        progress.event(Action::Pull, &format!("rules ({written} pulled)"));
     }
 
     Ok((written, conflicts))

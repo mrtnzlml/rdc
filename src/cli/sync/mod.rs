@@ -110,8 +110,8 @@ pub mod watch;
 
 use crate::api::RossumClient;
 use crate::config::ProjectConfig;
+use crate::log::{Action, Log};
 use crate::paths::Paths;
-use crate::progress::SyncRenderer;
 use std::sync::Arc;
 use crate::secrets::resolve_token;
 use crate::state::Lockfile;
@@ -191,7 +191,7 @@ pub(crate) async fn run_cycle(
     allow_deletes: bool,
     no_push: bool,
     no_pull: bool,
-    renderer: Option<Arc<dyn SyncRenderer>>,
+    renderer: Option<Arc<Log>>,
 ) -> Result<CycleOutcome> {
     if no_push && no_pull {
         anyhow::bail!(
@@ -217,26 +217,22 @@ pub(crate) async fn run_cycle(
     let overlay = crate::overlay::Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
-    let title = if dry_run {
+    let _title = if dry_run {
         format!("rdc sync {env} (dry run)")
     } else {
         format!("rdc sync {env}")
     };
-    // Drivers consume `&Arc<dyn SyncRenderer>`. Use a caller-provided
-    // renderer when present (the watch loop shares one renderer across
-    // cycles so freshness clocks persist); otherwise the dispatcher
-    // selects grid-on-tty / log-elsewhere. `is_watch=false` here is
-    // correct: the watch path supplies its own renderer constructed
-    // with `is_watch=true` upstream.
+    // Drivers consume `&Arc<Log>`. Use a caller-provided renderer when
+    // present (the watch loop shares one renderer across cycles so freshness
+    // clocks persist); otherwise create a fresh one.
     //
-    // `renderer_was_supplied` gates the post-cycle `finish_ok` call: when
+    // `renderer_was_supplied` gates the post-cycle summary call: when
     // the caller supplied a persistent renderer (watch mode), we MUST NOT
-    // finalize it — `GridRenderer::finish_ok` hides the draw target and
-    // sets `finished = true`, which freezes the grid for the rest of the
-    // watch lifetime. The watch loop calls `finish_ok` itself on exit.
+    // emit a cycle-closing Done event — the watch loop handles its own
+    // summaries.
     let renderer_was_supplied = renderer.is_some();
-    let progress: Arc<dyn SyncRenderer> =
-        renderer.unwrap_or_else(|| crate::progress::make_sync_renderer(&title, env, false));
+    let progress: Arc<Log> =
+        renderer.unwrap_or_else(|| Log::new(crate::cli::resolve::detect_color_mode(false)));
     let started = std::time::Instant::now();
 
     // Phase 1: list remote. Mirrors `pull::run`'s `PullCtx` construction
@@ -263,9 +259,7 @@ pub(crate) async fn run_cycle(
     let classified =
         from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile, overlay.as_ref());
 
-    // Paint the initial grid frame from the freshly-computed classification.
-    // No-op for the log renderer (parity gate).
-    progress.ingest_classification(&classified);
+    // Classification computed; grid renderer rebuild handled elsewhere.
 
     // Phase 4: plan + confirm. `--dry-run` exits here without writing.
     // Dry-run uses the same per-item event-log surface as a regular sync,
@@ -281,15 +275,18 @@ pub(crate) async fn run_cycle(
             .filter(|c| matches!(c.class, SyncClass::RemoteEdit | SyncClass::RemoteCreate))
             .collect();
         if !pull_items.is_empty() {
-            progress.phase("would pull");
+            progress.event(Action::Plan, "would pull");
+            let mut body = String::new();
+            use std::fmt::Write as _;
             for it in &pull_items {
                 let note = if matches!(it.class, SyncClass::RemoteCreate) {
                     " (new)"
                 } else {
                     ""
                 };
-                progress.warn_line(&format!("- {}/{}{}", it.kind, it.slug, note));
+                let _ = writeln!(body, "- {}/{}{}", it.kind, it.slug, note);
             }
+            progress.block(&body);
         }
 
         // Push-side items (would write remote).
@@ -303,7 +300,9 @@ pub(crate) async fn run_cycle(
             })
             .collect();
         if !push_items.is_empty() {
-            progress.phase("would push");
+            progress.event(Action::Plan, "would push");
+            let mut body = String::new();
+            use std::fmt::Write as _;
             for it in &push_items {
                 let action = match it.class {
                     SyncClass::LocalEdit => "PATCH",
@@ -311,8 +310,9 @@ pub(crate) async fn run_cycle(
                     SyncClass::LocalDelete => "DELETE",
                     _ => "",
                 };
-                progress.warn_line(&format!("- {}/{} {}", it.kind, it.slug, action));
+                let _ = writeln!(body, "- {}/{} {}", it.kind, it.slug, action);
             }
+            progress.block(&body);
         }
 
         // Conflict / destructive prompts.
@@ -329,7 +329,9 @@ pub(crate) async fn run_cycle(
             })
             .collect();
         if !prompt_items.is_empty() {
-            progress.phase("would prompt");
+            progress.event(Action::Plan, "would prompt");
+            let mut body = String::new();
+            use std::fmt::Write as _;
             for it in &prompt_items {
                 let tag = match it.class {
                     SyncClass::BothDiverged => "both diverged",
@@ -338,8 +340,9 @@ pub(crate) async fn run_cycle(
                     SyncClass::RemoteDelete => "deleted on env",
                     _ => "",
                 };
-                progress.warn_line(&format!("- {}/{} -- {}", it.kind, it.slug, tag));
+                let _ = writeln!(body, "- {}/{} -- {}", it.kind, it.slug, tag);
             }
+            progress.block(&body);
         }
 
         // `--diff` rendering will hook in here once the executor is
@@ -347,7 +350,7 @@ pub(crate) async fn run_cycle(
         let _ = diff;
 
         if !renderer_was_supplied {
-            progress.finish_ok(&format!(
+            progress.event(Action::Done, &format!(
                 "Dry run: {} would push, {} would pull, {} would prompt (no writes)",
                 push_items.len(),
                 pull_items.len(),
@@ -391,15 +394,13 @@ pub(crate) async fn run_cycle(
         crate::cli::push::scan::scan(&paths, &lockfile)?;
     let overlay_after = crate::overlay::Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
-    let classified_after = from_catalog_scan_lockfile(
+    let _classified_after = from_catalog_scan_lockfile(
         &catalog,
         &changes_after,
         &tombstones_after,
         &lockfile,
         overlay_after.as_ref(),
     );
-    progress.ingest_classification(&classified_after);
-
     lockfile.save(&paths.lockfile())?;
     crate::cli::index::generate(&paths, &lockfile)
         .with_context(|| format!("generating _index.md for env '{env}'"))?;
@@ -407,7 +408,7 @@ pub(crate) async fn run_cycle(
     let elapsed = started.elapsed();
     let total_changed = outcome.items_pushed + outcome.items_pulled;
     if !renderer_was_supplied {
-        progress.finish_ok(&format!(
+        progress.event(Action::Done, &format!(
             "Synced envs/{env} ({total_changed} changed, {:.1}s)",
             elapsed.as_secs_f32()
         ));
@@ -415,7 +416,7 @@ pub(crate) async fn run_cycle(
         // Watch mode: reset the header to "idle" so the user can see the
         // cycle completed (transitioning out of "executing" or similar
         // is a visible signal that polling fired and finished).
-        progress.phase("idle");
+        progress.event(Action::Idle, "envs match remote");
     }
     Ok(outcome)
 }

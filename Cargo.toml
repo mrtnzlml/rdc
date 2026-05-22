@@ -20,7 +20,6 @@ crossterm = "0.29"
 flate2 = "1"
 fs4 = "1"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
-indicatif = "0.18"
 inquire = { version = "0.9", default-features = false, features = ["crossterm"] }
 notify = "8"
 reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }

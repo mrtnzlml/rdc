@@ -12,8 +12,8 @@ use super::common::{
     apply_pull_action, decide_pull_action, maybe_strip_overlay,
     record_object, skip_on_permission_denied, PullAction, PullCtx,
 };
+use crate::log::{Action, Log};
 use crate::model::{Inbox, Queue, Schema};
-use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -39,7 +39,7 @@ struct QueueWork<'a> {
 }
 
 /// Phase 1: list all queues from the API.
-pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<dyn SyncRenderer>) -> Result<Vec<Queue>> {
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<Log>) -> Result<Vec<Queue>> {
     skip_on_permission_denied(
         ctx.client.list_queues(Some(progress.clone())).await.context("listing queues"),
         "queues",
@@ -74,10 +74,8 @@ pub async fn process(
     schemas_by_queue_id: &BTreeMap<u64, Schema>,
     inboxes_by_queue_id: &BTreeMap<u64, Inbox>,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
 ) -> Result<QueueCounts> {
-    progress.phase("pulling queues");
-
     let mut per_ws_used_slugs: HashMap<String, HashSet<String>> = HashMap::new();
     let mut counts = QueueCounts { queues: 0, schemas: 0, inboxes: 0, conflicts: 0 };
 
@@ -104,7 +102,6 @@ pub async fn process(
             continue;
         }
 
-        progress.resource_started("queues", &q_slug, ResourceOp::Get);
         let queue_result: Result<()> = (|| {
 
         let queue_dir = ctx.paths.queue_dir(&ws_slug, &q_slug);
@@ -150,8 +147,8 @@ pub async fn process(
         // B below — no URL parsing is needed here because the maps are
         // keyed by `q.id`.
         if q.schema.is_none() {
-            progress.warn_line(&format!(
-                "! queue '{}' (id {}) has no schema; skipping schema + inbox",
+            progress.event(Action::Skip, &format!(
+                "queue '{}' (id {}) has no schema; skipping schema + inbox",
                 q.name, q.id,
             ));
         }
@@ -159,11 +156,6 @@ pub async fn process(
         work.push(QueueWork { q, q_slug: q_slug.clone(), queue_dir });
         Ok(())
         })();
-        let queue_outcome = match &queue_result {
-            Ok(()) => ResourceOutcome::Ok,
-            Err(e) => ResourceOutcome::Failed(e.to_string()),
-        };
-        progress.resource_finished("queues", &q_slug, queue_outcome);
         queue_result?;
     }
 
@@ -177,30 +169,16 @@ pub async fn process(
     // loop is intentionally sequential.
     for w in &work {
         if let Some(schema) = schemas_by_queue_id.get(&w.q.id) {
-            progress.resource_started("schemas", &w.q_slug, ResourceOp::Get);
-            let schema_result = write_schema_for_queue(ctx, &mut counts, w, schema, progress);
-            let schema_outcome = match &schema_result {
-                Ok(()) => ResourceOutcome::Ok,
-                Err(e) => ResourceOutcome::Failed(e.to_string()),
-            };
-            progress.resource_finished("schemas", &w.q_slug, schema_outcome);
-            schema_result?;
+            write_schema_for_queue(ctx, &mut counts, w, schema, progress)?;
         }
         if let Some(inbox) = inboxes_by_queue_id.get(&w.q.id) {
-            progress.resource_started("inboxes", &w.q_slug, ResourceOp::Get);
-            let inbox_result = write_inbox_for_queue(ctx, &mut counts, w, inbox, progress);
-            let inbox_outcome = match &inbox_result {
-                Ok(()) => ResourceOutcome::Ok,
-                Err(e) => ResourceOutcome::Failed(e.to_string()),
-            };
-            progress.resource_finished("inboxes", &w.q_slug, inbox_outcome);
-            inbox_result?;
+            write_inbox_for_queue(ctx, &mut counts, w, inbox, progress)?;
         }
     }
 
     if counts.queues > 0 {
-        progress.warn_line(&format!(
-            "[ok] queues {} pulled (schemas {}, inboxes {})",
+        progress.event(Action::Pull, &format!(
+            "queues ({} pulled, schemas {}, inboxes {})",
             counts.queues, counts.schemas, counts.inboxes,
         ));
     }
@@ -213,7 +191,7 @@ fn write_schema_for_queue(
     counts: &mut QueueCounts,
     w: &QueueWork<'_>,
     schema: &Schema,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
 ) -> Result<()> {
     let queue_dir = &w.queue_dir;
     let schema_path = queue_dir.join("schema.json");
@@ -344,8 +322,8 @@ fn write_schema_for_queue(
                         crate::snapshot::writer::write_atomic(&p, bytes)?;
                     }
                 }
-                progress.warn_line(&format!(
-                    "! {} conflict: local preserved, remote at {} (formulas at {}); lockfile base preserved",
+                progress.event(Action::Warn, &format!(
+                    "{} conflict: local preserved, remote at {} (formulas at {}); lockfile base preserved",
                     schema_path.display(),
                     remote_path.display(),
                     remote_formulas_dir.display(),
@@ -375,7 +353,7 @@ fn write_inbox_for_queue(
     counts: &mut QueueCounts,
     w: &QueueWork<'_>,
     inbox: &Inbox,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
 ) -> Result<()> {
     let inbox_path = w.queue_dir.join("inbox.json");
     let mut inbox_proposed = serde_json::to_vec_pretty(inbox).context("serializing inbox")?;

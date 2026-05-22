@@ -6,9 +6,9 @@
 use crate::api::RossumClient;
 use crate::cli::resolve::line_diff;
 use crate::config::ProjectConfig;
+use crate::log::{Action, Log};
 use crate::mapping::Mapping;
 use crate::paths::Paths;
-use crate::progress::{Phase, ProgressLog};
 use crate::secrets::resolve_token;
 use crate::snapshot::email_template::read_email_template;
 use crate::snapshot::hook::{read_hook, serialize_hook};
@@ -70,10 +70,8 @@ pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) ->
     let client = RossumClient::new(env_cfg.api_base.clone(), token)
         .context("constructing Rossum API client")?;
 
-    // Wire a ProgressLog so every remote-API call shows a spinner. Each
-    // kind gets its own phase, with a single batch spinner per kind that
-    // updates a `(N/M)` counter as parallel fetches resolve.
-    let progress = ProgressLog::start(format!("rdc diff {env}"));
+    // Wire a Log so every remote-API call emits a timestamped event line.
+    let progress = Log::new(crate::cli::resolve::detect_color_mode(false));
 
     let mut diffs_printed = 0usize;
 
@@ -100,10 +98,10 @@ pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) ->
     }
 
     if diffs_printed == 0 {
-        progress.finish(format!("Diff envs/{env}: clean (matches remote)"));
+        progress.event(Action::Diff, &format!("done envs/{env} clean"));
         println!("no diffs (local snapshot matches remote for env '{env}')");
     } else {
-        progress.finish(format!("Diff envs/{env}: {diffs_printed} differing"));
+        progress.event(Action::Diff, &format!("done envs/{env} ({diffs_printed} differing)"));
     }
 
     Ok(())
@@ -115,25 +113,18 @@ pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) ->
 const DIFF_FANOUT: usize = 8;
 
 /// Parallel per-hook GET, then sort by slug and print diffs sequentially.
-/// One batch spinner shows `hooks (N/M)` while fetches resolve; finalizes
-/// with `M fetched` once the whole batch lands. Hooks with missing local
-/// files, missing lockfile entries, or unreadable JSON are skipped before
-/// the fan-out so they never burn a fetch slot.
+/// Hooks with missing local files, missing lockfile entries, or unreadable
+/// JSON are skipped before the fan-out so they never burn a fetch slot.
 async fn diff_hooks(
     paths: &Paths,
     lockfile: &Lockfile,
     client: &RossumClient,
     counter: &mut usize,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<Log>,
 ) -> Result<()> {
     use futures::stream::{StreamExt, TryStreamExt};
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let phase = progress.phase("diffing hooks");
-
-    // Phase A: collect work items deterministically (one local file →
-    // one fetch). Done synchronously so the parallel batch starts with
-    // a known size for the `(N/M)` counter.
+    // Collect work items deterministically (one local file → one fetch).
     let mut items: Vec<(String, crate::model::Hook, u64)> = Vec::new();
     for entry in std::fs::read_dir(paths.hooks_dir())? {
         let entry = entry?;
@@ -157,25 +148,17 @@ async fn diff_hooks(
     }
     let total = items.len();
 
-    // Phase B: parallel fetch with a single batch spinner. Pattern
-    // mirrors `pull::common::prefetch_queue_children`: a base-named
-    // spinner whose transient message carries the `(N/M)` counter and
-    // whose final `finish_ok` line uses just the base name + summary.
-    let sp = Arc::new(phase.item("hooks"));
-    let done = Arc::new(AtomicUsize::new(0));
+    // Parallel fetch phase.
+    progress.event(Action::Diff, "hooks start");
     let fetched_result: Result<Vec<(String, crate::model::Hook, crate::model::Hook)>> =
         futures::stream::iter(items)
             .map(|(slug, local, id)| {
-                let sp = sp.clone();
-                let done = done.clone();
                 let progress = progress.clone();
                 async move {
                     let remote = client
                         .get_hook(id, Some(progress.clone()))
                         .await
                         .with_context(|| format!("fetching hook {slug} for diff"))?;
-                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    sp.set_message(format!("hooks ({n}/{total})"));
                     Ok::<_, anyhow::Error>((slug, local, remote))
                 }
             })
@@ -183,19 +166,10 @@ async fn diff_hooks(
             .try_collect()
             .await;
 
-    let mut fetched = match fetched_result {
-        Ok(v) => v,
-        Err(e) => {
-            drop(sp);
-            return Err(e);
-        }
-    };
-    if let Ok(spinner) = Arc::try_unwrap(sp) {
-        spinner.finish_ok(format!("{total} fetched"));
-    }
+    let mut fetched = fetched_result?;
+    progress.event(Action::Diff, &format!("hooks ({total} fetched)"));
 
-    // Phase C: sort by slug, print diffs sequentially. The spinner UX
-    // above already covered the wait; per-item lines are not re-spun.
+    // Sort by slug, print diffs sequentially.
     fetched.sort_by(|a, b| a.0.cmp(&b.0));
     for (slug, local, remote) in fetched {
         let (local_json, local_code) = serialize_hook(&local)?;
@@ -203,6 +177,7 @@ async fn diff_hooks(
 
         let lj = String::from_utf8_lossy(&local_json);
         let rj = String::from_utf8_lossy(&remote_json);
+        let before = *counter;
         print_unified(
             &format!("hooks/{slug}.json (local)"),
             &format!("hooks/{slug}.json (remote)"),
@@ -223,6 +198,11 @@ async fn diff_hooks(
                 &lc, &rc, counter,
             );
         }
+        if *counter > before {
+            progress.event(Action::Diff, &format!("hook/{slug} differs"));
+        } else {
+            progress.event(Action::Diff, &format!("hook/{slug} clean"));
+        }
     }
     Ok(())
 }
@@ -235,20 +215,18 @@ async fn diff_labels(
     lockfile: &Lockfile,
     client: &RossumClient,
     counter: &mut usize,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<Log>,
 ) -> Result<()> {
     let dir = paths.labels_dir();
     if !dir.exists() {
         return Ok(());
     }
-    let phase = progress.phase("diffing labels");
-    let sp = phase.item("(list labels)");
     let remotes = client.list_labels(Some(progress.clone())).await?;
-    sp.finish_ok(format!("{} remote", remotes.len()));
+    progress.event(Action::Diff, &format!("labels ({} remote)", remotes.len()));
     let by_id: std::collections::BTreeMap<u64, &crate::model::Label> =
         remotes.iter().map(|l| (l.id, l)).collect();
     diff_flat_remote::<crate::model::Label>(
-        &dir, "labels", paths.env(), lockfile, counter, &phase, &by_id,
+        &dir, "label", paths.env(), lockfile, counter, progress, &by_id,
     )
 }
 
@@ -578,18 +556,16 @@ async fn diff_rules(
     lockfile: &Lockfile,
     client: &RossumClient,
     counter: &mut usize,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<Log>,
 ) -> Result<()> {
     use crate::snapshot::rule::{read_rule, serialize_rule};
     let dir = paths.rules_dir();
     if !dir.exists() {
         return Ok(());
     }
-    let phase = progress.phase("diffing rules");
 
-    let sp = phase.item("(list rules)");
     let remotes = client.list_rules(Some(progress.clone())).await?;
-    sp.finish_ok(format!("{} remote", remotes.len()));
+    progress.event(Action::Diff, &format!("rules ({} remote)", remotes.len()));
     let by_id: std::collections::BTreeMap<u64, &crate::model::Rule> =
         remotes.iter().map(|r| (r.id, r)).collect();
 
@@ -610,9 +586,8 @@ async fn diff_rules(
             Some(i) => i,
             None => continue,
         };
-        let sp = phase.item(slug.to_string());
         let Some(remote) = by_id.get(&id) else {
-            sp.finish_warn("not on remote");
+            progress.event(Action::Warn, &format!("rule/{slug} not on remote"));
             continue;
         };
         let (remote_json, remote_code) = serialize_rule(remote)?;
@@ -635,7 +610,11 @@ async fn diff_rules(
                 &lc, &rc, counter,
             );
         }
-        if *counter > before { sp.finish_ok("differs"); } else { sp.finish_ok("clean"); }
+        if *counter > before {
+            progress.event(Action::Diff, &format!("rule/{slug} differs"));
+        } else {
+            progress.event(Action::Diff, &format!("rule/{slug} clean"));
+        }
     }
     Ok(())
 }
@@ -648,17 +627,15 @@ async fn diff_engines(
     lockfile: &Lockfile,
     client: &RossumClient,
     counter: &mut usize,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<Log>,
 ) -> Result<()> {
     let engines_dir = paths.engines_dir();
     if !engines_dir.exists() {
         return Ok(());
     }
-    let phase = progress.phase("diffing engines");
 
-    let sp = phase.item("(list engines)");
     let remotes = client.list_engines(Some(progress.clone())).await?;
-    sp.finish_ok(format!("{} remote", remotes.len()));
+    progress.event(Action::Diff, &format!("engines ({} remote)", remotes.len()));
     let by_id: std::collections::BTreeMap<u64, &crate::model::Engine> =
         remotes.iter().map(|e| (e.id, e)).collect();
 
@@ -675,9 +652,8 @@ async fn diff_engines(
         let local: crate::model::Engine = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
         let local_canon = canonical_json_for_diff(&local)?;
         let Some(id) = lookup_id(lockfile, "engines", &e_slug) else { continue };
-        let sp = phase.item(e_slug.clone());
         let Some(remote) = by_id.get(&id) else {
-            sp.finish_warn("not on remote");
+            progress.event(Action::Warn, &format!("engine/{e_slug} not on remote"));
             continue;
         };
         let remote_canon = canonical_json_for_diff(remote)?;
@@ -687,7 +663,11 @@ async fn diff_engines(
             &format!("engines/{e_slug}/engine.json (remote)"),
             &local_canon, &remote_canon, counter,
         );
-        if *counter > before { sp.finish_ok("differs"); } else { sp.finish_ok("clean"); }
+        if *counter > before {
+            progress.event(Action::Diff, &format!("engine/{e_slug} differs"));
+        } else {
+            progress.event(Action::Diff, &format!("engine/{e_slug} clean"));
+        }
     }
     Ok(())
 }
@@ -700,17 +680,15 @@ async fn diff_engine_fields(
     lockfile: &Lockfile,
     client: &RossumClient,
     counter: &mut usize,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<Log>,
 ) -> Result<()> {
     let engines_dir = paths.engines_dir();
     if !engines_dir.exists() {
         return Ok(());
     }
-    let phase = progress.phase("diffing engine fields");
 
-    let sp = phase.item("(list engine fields)");
     let remotes = client.list_engine_fields(Some(progress.clone())).await?;
-    sp.finish_ok(format!("{} remote", remotes.len()));
+    progress.event(Action::Diff, &format!("engine_fields ({} remote)", remotes.len()));
     let by_id: std::collections::BTreeMap<u64, &crate::model::EngineField> =
         remotes.iter().map(|f| (f.id, f)).collect();
 
@@ -735,9 +713,8 @@ async fn diff_engine_fields(
             let local: crate::model::EngineField = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
             let local_canon = canonical_json_for_diff(&local)?;
             let Some(id) = lookup_id(lockfile, "engine_fields", f_slug) else { continue };
-            let sp = phase.item(format!("{e_slug}/{f_slug}"));
             let Some(remote) = by_id.get(&id) else {
-                sp.finish_warn("not on remote");
+                progress.event(Action::Warn, &format!("engine_field/{e_slug}/{f_slug} not on remote"));
                 continue;
             };
             let remote_canon = canonical_json_for_diff(remote)?;
@@ -747,28 +724,32 @@ async fn diff_engine_fields(
                 &format!("engines/{e_slug}/fields/{f_slug}.json (remote)"),
                 &local_canon, &remote_canon, counter,
             );
-            if *counter > before { sp.finish_ok("differs"); } else { sp.finish_ok("clean"); }
+            if *counter > before {
+                progress.event(Action::Diff, &format!("engine_field/{e_slug}/{f_slug} differs"));
+            } else {
+                progress.event(Action::Diff, &format!("engine_field/{e_slug}/{f_slug} clean"));
+            }
         }
     }
     Ok(())
 }
 
-/// Generic helper for flat-list kinds. Reads each `<kind>/<slug>.json`,
+/// Generic helper for flat-list kinds. Reads each `<kind_plural>/<slug>.json`,
 /// looks up the matching remote in the supplied `by_id` map (built from
 /// a single up-front LIST call), and prints a unified diff when the
 /// canonicalized bytes differ.
 ///
 /// The list is fetched ONCE by the caller; this helper performs no API
-/// calls of its own. Each per-slug line gets its own spinner that
-/// resolves to `[ok] <slug> clean|differs` — fast and quiet because no
-/// network is involved.
+/// calls of its own. `kind_singular` is used for per-resource event lines
+/// (e.g. `"label"`); `kind_plural` is used for directory/path resolution
+/// (e.g. `"labels"`).
 fn diff_flat_remote<T>(
     dir: &Path,
-    kind: &str,
+    kind_singular: &str,
     env: &str,
     lockfile: &Lockfile,
     counter: &mut usize,
-    phase: &Phase,
+    progress: &Arc<Log>,
     by_id: &std::collections::BTreeMap<u64, &T>,
 ) -> Result<()>
 where
@@ -777,6 +758,12 @@ where
     if !dir.exists() {
         return Ok(());
     }
+    // The lockfile and path use the plural form (e.g. "labels"); derive it
+    // from the dir name for lookups and display paths.
+    let kind_plural = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| format!("{kind_singular}s"));
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
@@ -789,23 +776,26 @@ where
         let local: T = serde_json::from_str(&raw)?;
         let local_canon = canonical_json_for_diff(&local)?;
 
-        let id = match lookup_id(lockfile, kind, slug) {
+        let id = match lookup_id(lockfile, &kind_plural, slug) {
             Some(i) => i, None => continue,
         };
-        let sp = phase.item(slug.to_string());
         let Some(remote) = by_id.get(&id) else {
-            sp.finish_warn("not on remote");
+            progress.event(Action::Warn, &format!("{kind_singular}/{slug} not on remote"));
             continue;
         };
         let remote_canon = canonical_json_for_diff(remote)?;
 
         let before = *counter;
         print_unified(
-            &format!("{kind}/{slug}.json (local)"),
-            &format!("{kind}/{slug}.json (remote)"),
+            &format!("{kind_plural}/{slug}.json (local)"),
+            &format!("{kind_plural}/{slug}.json (remote)"),
             &local_canon, &remote_canon, counter,
         );
-        if *counter > before { sp.finish_ok("differs"); } else { sp.finish_ok("clean"); }
+        if *counter > before {
+            progress.event(Action::Diff, &format!("{kind_singular}/{slug} differs"));
+        } else {
+            progress.event(Action::Diff, &format!("{kind_singular}/{slug} clean"));
+        }
     }
     Ok(())
 }
@@ -828,12 +818,10 @@ async fn diff_queue_tree(
     lockfile: &Lockfile,
     client: &RossumClient,
     counter: &mut usize,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<Log>,
 ) -> Result<()> {
-    let phase = progress.phase("diffing queues");
-
     // Phase A: walk the local tree, classify items by kind. No API
-    // calls yet — we want a deterministic count for the batch counters.
+    // calls yet.
     let mut queue_items: Vec<(String, crate::model::Queue, u64)> = Vec::new(); // q_slug, local, id
     let mut schema_items: Vec<(String, crate::model::Schema, u64)> = Vec::new(); // q_slug, local, id
     let mut inbox_items: Vec<(String, crate::model::Inbox, u64)> = Vec::new(); // q_slug, local, id
@@ -899,29 +887,25 @@ async fn diff_queue_tree(
     // Phase B: hoisted LIST calls. queues + email-templates each fetched
     // exactly once, no matter how many local queues / templates exist.
     let queues_remote: std::collections::BTreeMap<u64, crate::model::Queue> = if !queue_items.is_empty() {
-        let sp = phase.item("(list queues)");
         let list = client.list_queues(Some(progress.clone())).await?;
-        sp.finish_ok(format!("{} remote", list.len()));
+        progress.event(Action::Diff, &format!("queues ({} remote)", list.len()));
         list.into_iter().map(|q| (q.id, q)).collect()
     } else {
         std::collections::BTreeMap::new()
     };
     let templates_remote: std::collections::BTreeMap<u64, crate::model::EmailTemplate> =
         if !template_items.is_empty() {
-            let sp = phase.item("(list email templates)");
             let list = client.list_email_templates(Some(progress.clone())).await?;
-            sp.finish_ok(format!("{} remote", list.len()));
+            progress.event(Action::Diff, &format!("email_templates ({} remote)", list.len()));
             list.into_iter().map(|t| (t.id, t)).collect()
         } else {
             std::collections::BTreeMap::new()
         };
 
-    // Phase C: parallel per-queue schema GETs. One batch spinner with
-    // `(N/M)` counter. Returns a Vec<(slug, local, remote)>.
+    // Phase C: parallel per-queue schema GETs.
     let schemas_fetched = parallel_fetch_by_id(
         "schemas",
         schema_items,
-        &phase,
         progress,
         |id, prog| {
             let client = client;
@@ -930,11 +914,10 @@ async fn diff_queue_tree(
     )
     .await?;
 
-    // Phase D: parallel per-queue inbox GETs. Same pattern.
+    // Phase D: parallel per-queue inbox GETs.
     let inboxes_fetched = parallel_fetch_by_id(
         "inboxes",
         inbox_items,
-        &phase,
         progress,
         |id, prog| {
             let client = client;
@@ -948,7 +931,6 @@ async fn diff_queue_tree(
     let mut queues_sorted = queue_items;
     queues_sorted.sort_by(|a, b| a.0.cmp(&b.0));
     for (q_slug, local, id) in queues_sorted {
-        let sp = phase.item(format!("{q_slug}/queue.json"));
         let before = *counter;
         if let Some(remote) = queues_remote.get(&id) {
             let lj = canonical_json_for_diff(&local)?;
@@ -958,15 +940,21 @@ async fn diff_queue_tree(
                 &format!("queues/{q_slug}/queue.json (remote)"),
                 &lj, &rj, counter,
             );
+        } else {
+            progress.event(Action::Warn, &format!("queue/{q_slug} not on remote"));
+            continue;
         }
-        if *counter > before { sp.finish_ok("differs"); } else { sp.finish_ok("clean"); }
+        if *counter > before {
+            progress.event(Action::Diff, &format!("queue/{q_slug} differs"));
+        } else {
+            progress.event(Action::Diff, &format!("queue/{q_slug} clean"));
+        }
     }
 
     // schema.json + formulas/ — sorted by slug
     let mut schemas_sorted = schemas_fetched;
     schemas_sorted.sort_by(|a, b| a.0.cmp(&b.0));
     for (q_slug, local, remote) in schemas_sorted {
-        let sp = phase.item(format!("{q_slug}/schema.json"));
         let (lj, l_formulas) = serialize_schema(&local)?;
         let (rj, r_formulas) = serialize_schema(&remote)?;
         let ljs = String::from_utf8_lossy(&lj);
@@ -978,14 +966,17 @@ async fn diff_queue_tree(
             &ljs, &rjs, counter,
         );
         diff_formulas(&q_slug, &l_formulas, &r_formulas, counter);
-        if *counter > before { sp.finish_ok("differs"); } else { sp.finish_ok("clean"); }
+        if *counter > before {
+            progress.event(Action::Diff, &format!("schema/{q_slug} differs"));
+        } else {
+            progress.event(Action::Diff, &format!("schema/{q_slug} clean"));
+        }
     }
 
     // inbox.json — sorted by slug
     let mut inboxes_sorted = inboxes_fetched;
     inboxes_sorted.sort_by(|a, b| a.0.cmp(&b.0));
     for (q_slug, local, remote) in inboxes_sorted {
-        let sp = phase.item(format!("{q_slug}/inbox.json"));
         let lj = canonical_json_for_diff(&local)?;
         let rj = canonical_json_for_diff(&remote)?;
         let before = *counter;
@@ -994,14 +985,17 @@ async fn diff_queue_tree(
             &format!("inboxes/{q_slug}/inbox.json (remote)"),
             &lj, &rj, counter,
         );
-        if *counter > before { sp.finish_ok("differs"); } else { sp.finish_ok("clean"); }
+        if *counter > before {
+            progress.event(Action::Diff, &format!("inbox/{q_slug} differs"));
+        } else {
+            progress.event(Action::Diff, &format!("inbox/{q_slug} clean"));
+        }
     }
 
     // email-templates — sorted by composite key (ws/q/template)
     let mut templates_sorted = template_items;
     templates_sorted.sort_by(|a, b| a.0.cmp(&b.0));
     for (key, local, id) in templates_sorted {
-        let sp = phase.item(format!("{key} (template)"));
         let before = *counter;
         if let Some(remote) = templates_remote.get(&id) {
             let lj = canonical_json_for_diff(&local)?;
@@ -1011,59 +1005,51 @@ async fn diff_queue_tree(
                 &format!("email_templates/{key}.json (remote)"),
                 &lj, &rj, counter,
             );
+        } else {
+            progress.event(Action::Warn, &format!("email_template/{key} not on remote"));
+            continue;
         }
-        if *counter > before { sp.finish_ok("differs"); } else { sp.finish_ok("clean"); }
+        if *counter > before {
+            progress.event(Action::Diff, &format!("email_template/{key} differs"));
+        } else {
+            progress.event(Action::Diff, &format!("email_template/{key} clean"));
+        }
     }
 
     Ok(())
 }
 
 /// Generic parallel batch fetch for one kind. Spawns up to `DIFF_FANOUT`
-/// in-flight GETs, updates a single `(N/M)` batch spinner as fetches
-/// resolve, finalizes with `M fetched`, and returns the fetched results
-/// for the caller to sort and print.
-///
-/// `kind_label` is the bare spinner name (e.g. `"schemas"`); the
-/// transient `(N/M)` counter is written via `set_message` so the final
-/// `[ok]` line uses only `kind_label` + the supplied summary — the
-/// established pattern that the `prefetch_queue_children` formatter
-/// regression test pins.
+/// in-flight GETs and returns the fetched results for the caller to sort
+/// and print.
 async fn parallel_fetch_by_id<T, F, Fut>(
     kind_label: &str,
     items: Vec<(String, T, u64)>,
-    phase: &Phase,
-    progress: &Arc<ProgressLog>,
+    progress: &Arc<Log>,
     fetch: F,
 ) -> Result<Vec<(String, T, T)>>
 where
     T: Send + 'static,
-    F: Fn(u64, Arc<ProgressLog>) -> Fut + Sync,
+    F: Fn(u64, Arc<Log>) -> Fut + Sync,
     Fut: std::future::Future<Output = Result<T>> + Send,
 {
     use futures::stream::{StreamExt, TryStreamExt};
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     if items.is_empty() {
         return Ok(Vec::new());
     }
     let total = items.len();
-    let sp = Arc::new(phase.item(kind_label.to_string()));
-    let done = Arc::new(AtomicUsize::new(0));
-    let kind_label_owned = kind_label.to_string();
+    progress.event(Action::Diff, &format!("{kind_label} start"));
 
     let fetched_result: Result<Vec<(String, T, T)>> = futures::stream::iter(items)
         .map(|(slug, local, id)| {
-            let sp = sp.clone();
-            let done = done.clone();
             let progress = progress.clone();
             let fetch = &fetch;
-            let kind_label = &kind_label_owned;
+            let kind_label = kind_label;
             async move {
                 let remote = fetch(id, progress.clone())
                     .await
                     .with_context(|| format!("fetching {kind_label} for {slug}"))?;
-                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                sp.set_message(format!("{kind_label} ({n}/{total})"));
                 Ok::<_, anyhow::Error>((slug, local, remote))
             }
         })
@@ -1071,15 +1057,7 @@ where
         .try_collect()
         .await;
 
-    let fetched = match fetched_result {
-        Ok(v) => v,
-        Err(e) => {
-            drop(sp);
-            return Err(e);
-        }
-    };
-    if let Ok(spinner) = Arc::try_unwrap(sp) {
-        spinner.finish_ok(format!("{total} fetched"));
-    }
+    let fetched = fetched_result?;
+    progress.event(Action::Diff, &format!("{kind_label} ({total} fetched)"));
     Ok(fetched)
 }

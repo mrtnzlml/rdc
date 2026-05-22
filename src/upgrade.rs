@@ -346,7 +346,8 @@ pub async fn refresh_cache_if_stale() {
 /// Called once per command, just before the dispatch.
 pub fn emit_nudge_if_available() {
     if let Some(latest) = cached_upgrade_available() {
-        eprintln!("note: rdc v{latest} is available; run `rdc upgrade` to install");
+        let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
+        log.event(crate::log::Action::Info, &format!("rdc v{latest} is available; run `rdc upgrade` to install"));
     }
 }
 
@@ -382,13 +383,17 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
     }
 
     let install = classify_install()?;
+    let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
     let target_path = match &install {
         InstallLocation::Cargo(path) => {
-            eprintln!(
-                "rdc was installed via cargo (binary at {}).\n\
-                 To upgrade, run:\n\n  \
-                 cargo install --git https://github.com/{REPO} --force\n",
-                path.display()
+            log.event(
+                crate::log::Action::Warn,
+                &format!(
+                    "rdc was installed via cargo (binary at {}).\n\
+                     To upgrade, run:\n\n  \
+                     cargo install --git https://github.com/{REPO} --force\n",
+                    path.display()
+                ),
             );
             anyhow::bail!("cannot self-replace a cargo-installed binary");
         }
@@ -397,24 +402,30 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
             let url = asset_download_url(&latest, &asset);
             let bin = binary_filename();
             #[cfg(windows)]
-            eprintln!(
-                "rdc binary at {} is not in a writable directory.\n\
-                 To upgrade manually (PowerShell):\n\n  \
-                 Invoke-WebRequest -Uri \"{url}\" -OutFile \"$env:TEMP\\{asset}\"\n  \
-                 tar -xzf \"$env:TEMP\\{asset}\" -C \"$env:TEMP\"\n  \
-                 Move-Item -Force \"$env:TEMP\\{bin}\" \"{}\"\n",
-                path.display(),
-                path.display(),
+            log.event(
+                crate::log::Action::Warn,
+                &format!(
+                    "rdc binary at {} is not in a writable directory.\n\
+                     To upgrade manually (PowerShell):\n\n  \
+                     Invoke-WebRequest -Uri \"{url}\" -OutFile \"$env:TEMP\\{asset}\"\n  \
+                     tar -xzf \"$env:TEMP\\{asset}\" -C \"$env:TEMP\"\n  \
+                     Move-Item -Force \"$env:TEMP\\{bin}\" \"{}\"\n",
+                    path.display(),
+                    path.display(),
+                ),
             );
             #[cfg(not(windows))]
-            eprintln!(
-                "rdc binary at {} is not in a writable directory.\n\
-                 To upgrade manually:\n\n  \
-                 curl -fsSL {url} -o /tmp/{asset}\n  \
-                 tar xzf /tmp/{asset} -C /tmp\n  \
-                 mv /tmp/{bin} {}\n",
-                path.display(),
-                path.display(),
+            log.event(
+                crate::log::Action::Warn,
+                &format!(
+                    "rdc binary at {} is not in a writable directory.\n\
+                     To upgrade manually:\n\n  \
+                     curl -fsSL {url} -o /tmp/{asset}\n  \
+                     tar xzf /tmp/{asset} -C /tmp\n  \
+                     mv /tmp/{bin} {}\n",
+                    path.display(),
+                    path.display(),
+                ),
             );
             anyhow::bail!("install location not writable");
         }
@@ -427,9 +438,8 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
     // Wrap the download in a spinner so the user sees activity while
     // multi-megabyte tarball bytes are streaming. Spinner only — no
     // per-byte progress bar (per the progress UX spec).
-    let progress = crate::progress::ProgressLog::start(format!("rdc upgrade -> v{latest}"));
-    let phase = progress.phase("downloading");
-    let sp = phase.item(asset_name.clone());
+    let progress = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
+    progress.event(crate::log::Action::Upgr, &format!("downloading {asset_name}"));
     let bytes_result = async {
         http_client(UPGRADE_TIMEOUT)?
             .get(&url)
@@ -445,12 +455,11 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
     .await;
     let bytes = match bytes_result {
         Ok(b) => {
-            sp.finish_ok(format!("{} bytes", b.len()));
+            progress.event(crate::log::Action::Upgr, &format!("downloaded {} bytes", b.len()));
             b
         }
         Err(e) => {
-            sp.finish_warn("download failed");
-            progress.finish_err("upgrade aborted");
+            progress.event(crate::log::Action::Upgr, "fail download");
             return Err(e);
         }
     };
@@ -609,7 +618,7 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
         latest: latest.to_string(),
     });
 
-    progress.finish(format!("Upgraded v{current_v} -> v{latest}"));
+    progress.event(crate::log::Action::Upgr, &format!("done v{current_v} -> v{latest}"));
     println!(
         "upgraded rdc v{current_v} -> v{latest}\nprevious binary at {} (delete when ready)",
         backup_path.display()

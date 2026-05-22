@@ -13,7 +13,7 @@ use crate::api::RossumClient;
 use crate::mapping::Mapping;
 use crate::model::{Hook, HookTemplate};
 use crate::overlay::{write_store_extension_token_owner, Overlay};
-use crate::progress::ProgressHandle;
+use crate::api::retry::ProgressHandle;
 use crate::state::Lockfile;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};

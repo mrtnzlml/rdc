@@ -2,15 +2,15 @@ use super::common::{
     apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
     skip_on_permission_denied, PullAction, PullCtx,
 };
+use crate::log::{Action, Log};
 use crate::model::EngineField;
-use crate::progress::{ResourceOp, ResourceOutcome, SyncRenderer};
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all engine fields from the API.
-pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<dyn SyncRenderer>) -> Result<Vec<EngineField>> {
+pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<Log>) -> Result<Vec<EngineField>> {
     skip_on_permission_denied(
         ctx.client.list_engine_fields(Some(progress.clone())).await.context("listing engine fields"),
         "engine_fields",
@@ -29,17 +29,15 @@ pub async fn process(
     ctx: &mut PullCtx<'_>,
     fields: Vec<EngineField>,
     subset: &BTreeSet<(String, String)>,
-    progress: &Arc<dyn SyncRenderer>,
+    progress: &Arc<Log>,
 ) -> Result<(usize, usize)> {
-    progress.phase("pulling engine_fields");
-
     let mut used: HashSet<String> = HashSet::new();
     let mut conflicts = 0usize;
     let mut written = 0usize;
     for f in &fields {
         let Some(engine_slug) = ctx.lockfile.slug_for_url("engines", &f.engine).map(|s| s.to_string()) else {
-            progress.warn_line(&format!(
-                "! engine field '{}' (id {}) has unknown engine URL '{}'; skipping",
+            progress.event(Action::Skip, &format!(
+                "engine field '{}' (id {}) — unknown engine URL '{}'; skipping",
                 f.name, f.id, f.engine
             ));
             continue;
@@ -55,7 +53,6 @@ pub async fn process(
             continue;
         }
 
-        progress.resource_started("engine_fields", &slug, ResourceOp::Get);
         let result: Result<()> = (|| {
 
         let fields_dir = ctx.paths.engine_fields_dir(&engine_slug);
@@ -96,16 +93,11 @@ pub async fn process(
         written += 1;
         Ok(())
         })();
-        let outcome = match &result {
-            Ok(()) => ResourceOutcome::Ok,
-            Err(e) => ResourceOutcome::Failed(e.to_string()),
-        };
-        progress.resource_finished("engine_fields", &slug, outcome);
         result?;
     }
 
     if written > 0 {
-        progress.warn_line(&format!("[ok] engine_fields {written} pulled"));
+        progress.event(Action::Pull, &format!("engine_fields ({written} pulled)"));
     }
 
     Ok((written, conflicts))

@@ -128,10 +128,11 @@ pub async fn run(env_specs: Vec<String>) -> Result<()> {
             Err(e) => {
                 // Project files stay; user can rerun `rdc auth` once
                 // they've sorted out the credential issue.
-                eprintln!(
-                    "! Token for env '{env}' (from {source_label}) failed validation: {e:#}"
+                let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
+                log.event(
+                    crate::log::Action::Warn,
+                    &format!("token for env '{env}' (from {source_label}) failed validation: {e:#}; re-run `rdc auth {env}` to retry"),
                 );
-                eprintln!("  Re-run `rdc auth {env}` to retry.");
             }
         }
     }

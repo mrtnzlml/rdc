@@ -283,7 +283,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         None => {
             use clap::CommandFactory;
             Cli::command().print_help()?;
-            println!();
             Ok(())
         }
     }
