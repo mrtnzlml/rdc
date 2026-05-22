@@ -1832,3 +1832,126 @@ org_id = 1
         String::from_utf8_lossy(&out.stderr),
     );
 }
+
+/// Regression: `rdc deploy` from one env to another used to POST the src
+/// `organization` URL on workspace create, which the API rejected with
+/// `400 {"organization":["Invalid hyperlink - Object does not exist."]}`
+/// because the src org URL doesn't resolve in the tgt env. The fix rewrites
+/// `organization` URLs via the tgt lockfile's `organization/self` entry
+/// (organization isn't a deployable kind, so no mapping entry exists for it).
+///
+/// This test uses distinct src/tgt org IDs so the rewrite has work to do.
+#[tokio::test]
+async fn deploy_rewrites_organization_url_on_workspace_create() {
+    use std::sync::{Arc, Mutex};
+
+    let dev_server = MockServer::start().await;
+    let test_server = MockServer::start().await;
+
+    // --- DEV env: org_id 111, one workspace ---
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/111"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 111,
+            "url": format!("{}/api/v1/organizations/111", dev_server.uri()),
+            "name": "Dev Org",
+            "modified_at": "2026-05-22T08:00:00Z",
+            "settings": {},
+            "users": [],
+        })))
+        .mount(&dev_server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [{
+                "id": 500,
+                "url": format!("{}/api/v1/workspaces/500", dev_server.uri()),
+                "name": "Ferguson",
+                "organization": format!("{}/api/v1/organizations/111", dev_server.uri()),
+                "queues": []
+            }]
+        })))
+        .mount(&dev_server).await;
+    for ep in [
+        "/api/v1/queues", "/api/v1/hooks", "/api/v1/rules", "/api/v1/labels",
+        "/api/v1/engines", "/api/v1/engine_fields", "/api/v1/workflows",
+        "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&dev_server).await;
+    }
+
+    // --- TEST env: org_id 222, empty, distinct org URL ---
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/222"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 222,
+            "url": format!("{}/api/v1/organizations/222", test_server.uri()),
+            "name": "Test Org",
+            "modified_at": "2026-05-22T08:00:00Z",
+            "settings": {},
+            "users": [],
+        })))
+        .mount(&test_server).await;
+    for ep in [
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/hooks",
+        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&test_server).await;
+    }
+
+    // --- TEST env workspace POST: capture body, assert org URL is rewritten ---
+    let captured_ws_body: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let cap = captured_ws_body.clone();
+    let test_uri = test_server.uri();
+    Mock::given(method("POST"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            *cap.lock().unwrap() = Some(body.clone());
+            let mut resp = body;
+            resp["id"] = serde_json::json!(900);
+            resp["url"] = serde_json::json!(format!("{test_uri}/api/v1/workspaces/900"));
+            ResponseTemplate::new(201).set_body_json(resp)
+        })
+        .mount(&test_server).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args([
+            "init",
+            "--env", &format!("dev={}/api/v1:111", dev_server.uri()),
+            "--env", &format!("test={}/api/v1:222", test_server.uri()),
+        ])
+        .assert().success();
+    std::fs::write(project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"DEV"}"#).unwrap();
+    std::fs::write(project.path().join("secrets/test.secrets.json"),
+        r#"{"api_token":"TEST"}"#).unwrap();
+
+    Command::cargo_bin("rdc").unwrap().current_dir(project.path())
+        .args(["sync", "dev", "--no-push"]).assert().success();
+    Command::cargo_bin("rdc").unwrap().current_dir(project.path())
+        .args(["sync", "test", "--no-push"]).assert().success();
+
+    Command::cargo_bin("rdc").unwrap().current_dir(project.path())
+        .args(["deploy", "dev", "test", "--yes"])
+        .assert().success();
+
+    let body = captured_ws_body.lock().unwrap().clone()
+        .expect("workspace POST body captured");
+    assert_eq!(
+        body["organization"].as_str().unwrap(),
+        format!("{}/api/v1/organizations/222", test_server.uri()),
+        "workspace POST body must carry the TEST org URL, not the DEV one"
+    );
+    assert_eq!(body["name"].as_str().unwrap(), "Ferguson");
+}
