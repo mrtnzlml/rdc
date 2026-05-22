@@ -7,10 +7,8 @@ use std::path::Path;
 /// (The file path is fixed to `<env_root>/organization.json` by the caller;
 /// this codec is path-agnostic.)
 pub fn write_organization(path: &Path, org: &Organization) -> Result<Vec<u8>> {
-    let bytes = serde_json::to_vec_pretty(org)
+    let bytes = crate::snapshot::key_order::serialize_for_disk(org)
         .context("serializing organization")?;
-    let mut bytes = bytes;
-    bytes.push(b'\n');
     write_atomic(path, &bytes)?;
     Ok(bytes)
 }
@@ -34,8 +32,7 @@ mod tests {
         let v = json!({
             "id": 1,
             "url": "https://x/api/v1/organizations/1",
-            "name": "Acme",
-            "modified_at": "2026-03-01T08:00:00Z"
+            "name": "Acme"
         });
         serde_json::from_value(v).unwrap()
     }
@@ -48,6 +45,22 @@ mod tests {
         write_organization(&path, &original).unwrap();
         let read = read_organization(&path).unwrap();
         assert_eq!(original, read);
+    }
+
+    #[test]
+    fn modified_at_is_stripped_from_disk() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("organization.json");
+        let v = json!({
+            "id": 1,
+            "url": "https://x/api/v1/organizations/1",
+            "name": "Acme",
+            "modified_at": "2026-03-01T08:00:00Z"
+        });
+        let org: Organization = serde_json::from_value(v).unwrap();
+        write_organization(&path, &org).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("modified_at"), "modified_at must not appear on disk: {raw}");
     }
 
     #[test]

@@ -6,10 +6,8 @@ use std::path::Path;
 /// Write an inbox's JSON to `<queue_dir>/inbox.json`. Returns the bytes written.
 pub fn write_inbox(queue_dir: &Path, inbox: &Inbox) -> Result<Vec<u8>> {
     let path = queue_dir.join("inbox.json");
-    let bytes = serde_json::to_vec_pretty(inbox)
+    let bytes = crate::snapshot::key_order::serialize_for_disk(inbox)
         .context("serializing inbox")?;
-    let mut bytes = bytes;
-    bytes.push(b'\n');
     write_atomic(&path, &bytes)?;
     Ok(bytes)
 }

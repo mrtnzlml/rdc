@@ -7,10 +7,8 @@ use std::path::Path;
 /// The caller is responsible for `workspace_dir` existing.
 pub fn write_workspace(workspace_dir: &Path, ws: &Workspace) -> Result<Vec<u8>> {
     let path = workspace_dir.join("workspace.json");
-    let bytes = serde_json::to_vec_pretty(ws)
+    let bytes = crate::snapshot::key_order::serialize_for_disk(ws)
         .context("serializing workspace")?;
-    let mut bytes = bytes;
-    bytes.push(b'\n');
     write_atomic(&path, &bytes)?;
     Ok(bytes)
 }

@@ -8,10 +8,8 @@ use std::path::Path;
 /// written.
 pub fn write_engine_field(dir: &Path, slug: &str, f: &EngineField) -> Result<Vec<u8>> {
     let path = dir.join(format!("{slug}.json"));
-    let bytes = serde_json::to_vec_pretty(f)
+    let bytes = crate::snapshot::key_order::serialize_for_disk(f)
         .context("serializing engine field")?;
-    let mut bytes = bytes;
-    bytes.push(b'\n');
     write_atomic(&path, &bytes)?;
     Ok(bytes)
 }

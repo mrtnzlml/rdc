@@ -520,8 +520,14 @@ pub fn decide_pull_action(
     let local_hash = content_hash(&local_bytes);
 
     // Short-circuit: canonicalized local == canonicalized remote means
-    // any difference is noise (modified_at etc.). Don't rewrite the file.
+    // any difference is noise (modifier etc.). Don't rewrite the file —
+    // unless the on-disk format is stale (still carries a field that
+    // the current serializer strips, e.g. `modified_at`). In that case
+    // force a one-time rewrite so the on-disk layout catches up.
     if local_hash == remote_hash {
+        if crate::snapshot::key_order::contains_hidden_fields(&local_bytes) {
+            return Ok((PullAction::Write, remote_hash));
+        }
         return Ok((PullAction::NoChange, remote_hash));
     }
 
@@ -828,14 +834,32 @@ mod tests {
     }
 
     #[test]
-    fn decide_returns_nochange_when_canonical_local_equals_canonical_remote() {
+    fn decide_forces_write_when_local_still_carries_modified_at() {
+        // Migration: local on-disk JSON is in the legacy format (carries
+        // `modified_at`). The new serializer strips it, so even though
+        // canonical hashes still match, we must rewrite once to bring
+        // the on-disk file in line.
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
-        // Local has modified_at = t1
         std::fs::write(&path, b"{\"name\":\"x\",\"modified_at\":\"t1\"}").unwrap();
         // Remote has modified_at = t2 (newer); same other content
         let remote = b"{\"name\":\"x\",\"modified_at\":\"t2\"}";
         // Base hash matches both (canonical strips modified_at)
+        let base = content_hash(remote);
+        let (action, _hash) = decide_pull_action(&path, Some(&base), remote).unwrap();
+        assert_eq!(action, PullAction::Write);
+    }
+
+    #[test]
+    fn decide_returns_nochange_when_canonical_matches_and_no_hidden_fields_on_disk() {
+        // Steady state: on-disk already lacks modified_at (e.g. after
+        // the migration write happened on a prior pull). Canonical
+        // hashes still match because content_hash strips noise.
+        // No rewrite needed.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        std::fs::write(&path, b"{\"name\":\"x\"}").unwrap();
+        let remote = b"{\"name\":\"x\",\"modified_at\":\"t2\"}";
         let base = content_hash(remote);
         let (action, _hash) = decide_pull_action(&path, Some(&base), remote).unwrap();
         assert_eq!(action, PullAction::NoChange);

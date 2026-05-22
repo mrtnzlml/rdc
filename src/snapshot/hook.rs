@@ -90,6 +90,7 @@ pub fn serialize_hook(hook: &Hook) -> Result<(Vec<u8>, Option<String>)> {
             _ => None,
         });
 
+    crate::snapshot::key_order::strip_hidden_fields_recursive(&mut json_value);
     crate::snapshot::key_order::reorder_top_level(
         &mut json_value,
         crate::snapshot::key_order::HOOK_KEY_ORDER,
@@ -343,6 +344,28 @@ mod tests {
         write_hook(dir.path(), "sample", &sample_hook()).unwrap();
         assert!(!dir.path().join("sample.js").exists(), ".js should be swept");
         assert!(dir.path().join("sample.py").exists());
+    }
+
+    #[test]
+    fn modified_at_is_stripped_from_disk() {
+        let dir = TempDir::new().unwrap();
+        let v = json!({
+            "id": 1,
+            "url": "u",
+            "name": "n",
+            "type": "function",
+            "queues": [],
+            "events": [],
+            "config": { "runtime": "python3.12" },
+            "modified_at": "2026-05-22T08:42:15Z",
+            "modifier": "https://x/api/v1/users/4",
+        });
+        let hook: Hook = serde_json::from_value(v).unwrap();
+        write_hook(dir.path(), "h", &hook).unwrap();
+        let raw = std::fs::read_to_string(dir.path().join("h.json")).unwrap();
+        assert!(!raw.contains("modified_at"), "modified_at must not appear on disk: {raw}");
+        // modifier stays — only modified_at is in HIDDEN_FIELDS today.
+        assert!(raw.contains("modifier"), "modifier must still appear on disk: {raw}");
     }
 
     #[test]

@@ -7,9 +7,8 @@ use std::path::Path;
 /// Returns the bytes written.
 pub fn write_collection(dataset_dir: &Path, c: &Collection) -> Result<Vec<u8>> {
     let path = dataset_dir.join("collection.json");
-    let bytes = serde_json::to_vec_pretty(c).context("serializing collection")?;
-    let mut bytes = bytes;
-    bytes.push(b'\n');
+    let bytes = crate::snapshot::key_order::serialize_for_disk(c)
+        .context("serializing collection")?;
     write_atomic(&path, &bytes)?;
     Ok(bytes)
 }

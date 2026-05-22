@@ -8,9 +8,8 @@ use std::path::Path;
 /// written.
 pub fn write_workflow_step(dir: &Path, slug: &str, s: &WorkflowStep) -> Result<Vec<u8>> {
     let path = dir.join(format!("{slug}.json"));
-    let bytes = serde_json::to_vec_pretty(s).context("serializing workflow step")?;
-    let mut bytes = bytes;
-    bytes.push(b'\n');
+    let bytes = crate::snapshot::key_order::serialize_for_disk(s)
+        .context("serializing workflow step")?;
     write_atomic(&path, &bytes)?;
     Ok(bytes)
 }

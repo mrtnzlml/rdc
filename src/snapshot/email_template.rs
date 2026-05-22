@@ -6,9 +6,8 @@ use std::path::Path;
 /// Write an email template as `<dir>/<slug>.json`. Returns the bytes written.
 pub fn write_email_template(dir: &Path, slug: &str, t: &EmailTemplate) -> Result<Vec<u8>> {
     let path = dir.join(format!("{slug}.json"));
-    let bytes = serde_json::to_vec_pretty(t).context("serializing email template")?;
-    let mut bytes = bytes;
-    bytes.push(b'\n');
+    let bytes = crate::snapshot::key_order::serialize_for_disk(t)
+        .context("serializing email template")?;
     write_atomic(&path, &bytes)?;
     Ok(bytes)
 }

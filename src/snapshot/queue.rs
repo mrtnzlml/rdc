@@ -7,10 +7,8 @@ use std::path::Path;
 /// (for content_hash). The caller is responsible for `queue_dir` existing.
 pub fn write_queue(queue_dir: &Path, q: &Queue) -> Result<Vec<u8>> {
     let path = queue_dir.join("queue.json");
-    let bytes = serde_json::to_vec_pretty(q)
+    let bytes = crate::snapshot::key_order::serialize_for_disk(q)
         .context("serializing queue")?;
-    let mut bytes = bytes;
-    bytes.push(b'\n');
     write_atomic(&path, &bytes)?;
     Ok(bytes)
 }

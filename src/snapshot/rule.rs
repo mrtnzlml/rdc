@@ -53,6 +53,8 @@ pub fn serialize_rule(r: &Rule) -> Result<(Vec<u8>, Option<String>)> {
         None
     };
 
+    crate::snapshot::key_order::strip_hidden_fields_recursive(&mut json_value);
+
     let mut bytes = serde_json::to_vec_pretty(&json_value).context("serializing rule json")?;
     bytes.push(b'\n');
     Ok((bytes, code))

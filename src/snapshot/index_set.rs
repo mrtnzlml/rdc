@@ -7,9 +7,8 @@ use std::path::Path;
 /// Returns the bytes written.
 pub fn write_index_set(dataset_dir: &Path, s: &IndexSet) -> Result<Vec<u8>> {
     let path = dataset_dir.join("indexes.json");
-    let bytes = serde_json::to_vec_pretty(s).context("serializing index set")?;
-    let mut bytes = bytes;
-    bytes.push(b'\n');
+    let bytes = crate::snapshot::key_order::serialize_for_disk(s)
+        .context("serializing index set")?;
     write_atomic(&path, &bytes)?;
     Ok(bytes)
 }
