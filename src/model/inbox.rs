@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use indexmap::IndexMap;
 
 /// Rossum inbox. Each inbox is attached to one queue (1:1) and provides an
 /// email-ingestion endpoint.
@@ -16,7 +16,7 @@ pub struct Inbox {
     /// URL of the queue this inbox is attached to.
     pub queues: Vec<String>,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: IndexMap<String, Value>,
 }
 
 impl Inbox {

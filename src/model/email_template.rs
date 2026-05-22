@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use indexmap::IndexMap;
 
 /// Rossum email template. Each template belongs to a single queue (the live
 /// API field is singular `queue`, not `queues`). Templates are not org-wide;
@@ -17,7 +17,7 @@ pub struct EmailTemplate {
     #[serde(default)]
     pub queue: Option<String>,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: IndexMap<String, Value>,
 }
 
 impl EmailTemplate {

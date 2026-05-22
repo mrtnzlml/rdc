@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use indexmap::IndexMap;
 
 /// Rossum engine field. Defines a single extractable field on an engine.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
@@ -12,7 +12,7 @@ pub struct EngineField {
     pub name: String,
     pub engine: String,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: IndexMap<String, Value>,
 }
 
 impl EngineField {

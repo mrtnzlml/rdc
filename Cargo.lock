@@ -1533,6 +1533,7 @@ dependencies = [
  "fs4",
  "futures",
  "http",
+ "indexmap",
  "inquire",
  "notify",
  "predicates",

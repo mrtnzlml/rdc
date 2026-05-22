@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use indexmap::IndexMap;
 
 /// Rossum queue. Most queues belong to a workspace and carry one schema
 /// (and optionally one inbox). Workspace can be null for orphan/hidden
@@ -22,7 +22,7 @@ pub struct Queue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inbox: Option<String>,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: IndexMap<String, Value>,
 }
 
 impl Queue {

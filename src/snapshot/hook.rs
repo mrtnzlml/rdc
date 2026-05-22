@@ -347,6 +347,50 @@ mod tests {
     }
 
     #[test]
+    fn unlisted_extras_preserve_api_order() {
+        // The API returned extras in a non-alphabetical order:
+        // sideload, guide, extension_image_url, metadata. None of these
+        // are in HOOK_KEY_ORDER, so they should land on disk in the
+        // same order the API delivered them — NOT alphabetical.
+        let v = json!({
+            "id": 1,
+            "url": "u",
+            "name": "n",
+            "type": "function",
+            "queues": [],
+            "events": [],
+            "config": { "runtime": "python3.12" },
+            "sideload": [],
+            "guide": null,
+            "extension_image_url": null,
+            "metadata": {},
+        });
+        let hook: Hook = serde_json::from_value(v).unwrap();
+        let dir = TempDir::new().unwrap();
+        write_hook(dir.path(), "h", &hook).unwrap();
+        let raw = std::fs::read_to_string(dir.path().join("h.json")).unwrap();
+        let p = |k: &str| raw.find(&format!("\"{k}\":")).unwrap_or_else(|| panic!("missing {k}"));
+        // Listed keys: id, name, events, queues come first (in HOOK_KEY_ORDER).
+        // Then unlisted typed fields in struct decl order: url, type, config.
+        // Then unlisted extras in API order: sideload, guide,
+        // extension_image_url, metadata.
+        let order = [
+            "id", "name", "events", "queues",
+            "url", "type", "config",
+            "sideload", "guide", "extension_image_url", "metadata",
+        ];
+        let mut last = 0;
+        for k in order {
+            let pos = p(k);
+            assert!(
+                pos >= last,
+                "key {k} out of order at byte {pos} (last was {last})\n--- json ---\n{raw}",
+            );
+            last = pos;
+        }
+    }
+
+    #[test]
     fn modified_at_is_stripped_from_disk() {
         let dir = TempDir::new().unwrap();
         let v = json!({

@@ -111,7 +111,7 @@ mod tests {
             url: format!("https://example.invalid/api/v1/labels/{id}"),
             name: name.to_string(),
             organization: "https://example.invalid/api/v1/organizations/1".to_string(),
-            extra: BTreeMap::<String, Value>::new(),
+            extra: indexmap::IndexMap::<String, Value>::new(),
         }
     }
 
