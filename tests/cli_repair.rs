@@ -162,3 +162,67 @@ async fn fix_store_anomaly_lists_anomalous_hooks_then_exits_in_check_mode() {
         .stderr(predicate::str::contains("id 42"))
         .stderr(predicate::str::contains("1 anomalous hook"));
 }
+
+#[tokio::test]
+async fn fix_store_anomaly_cure_b_patches_extension_source_to_custom() {
+    let server = MockServer::start().await;
+    mount_minimal_pull(&server).await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [{
+                "id": 42, "url": format!("{}/api/v1/hooks/42", server.uri()),
+                "name": "Broken", "type": "webhook",
+                "queues": [], "events": [], "config": {},
+                "extension_source": "rossum_store", "hook_template": null
+            }]
+        })))
+        .with_priority(1)
+        .mount(&server).await;
+
+    // The PATCH the cure will issue. Capture and verify the body.
+    let patched = std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
+    let patched_clone = patched.clone();
+    let server_uri = server.uri();
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/hooks/42"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: serde_json::Value = req.body_json().unwrap();
+            *patched_clone.lock().unwrap() = body.clone();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 42, "url": format!("{}/api/v1/hooks/42", server_uri),
+                "name": "Broken", "type": "webhook",
+                "queues": [], "events": [], "config": {},
+                "extension_source": "custom", "hook_template": null,
+                "modified_at": "2026-05-22T12:00:00.000000Z"
+            }))
+        })
+        .mount(&server).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#).unwrap();
+    Command::cargo_bin("rdc").unwrap().current_dir(project.path())
+        .args(["sync", "dev", "--no-push"]).assert().success();
+
+    // Non-interactive (`--yes`): default cure is convert-to-custom.
+    Command::cargo_bin("rdc").unwrap().current_dir(project.path())
+        .args(["--yes", "repair", "dev", "--fix-store-anomaly"])
+        .assert().success()
+        .stderr(predicate::str::contains("hooks/broken (id 42) \u{2192} converted to custom"));
+
+    let body = patched.lock().unwrap().clone();
+    assert_eq!(body, serde_json::json!({"extension_source": "custom"}));
+
+    // Local snapshot reflects the change.
+    let local: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(project.path().join("envs/dev/hooks/broken.json")).unwrap()
+    ).unwrap();
+    assert_eq!(local["extension_source"], "custom");
+}
