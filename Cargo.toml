@@ -30,7 +30,7 @@ similar = "3"
 tar = { version = "0.4", default-features = false }
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["macros", "parking_lot", "rt-multi-thread", "signal"] }
 toml = "1"
 
 [dev-dependencies]
@@ -47,4 +47,4 @@ lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
-opt-level = "s"
+opt-level = 3

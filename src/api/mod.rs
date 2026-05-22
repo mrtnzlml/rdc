@@ -38,6 +38,11 @@ struct Pagination {
 impl RossumClient {
     pub fn new(base_url: String, token: String) -> Result<Self> {
         let http = Client::builder()
+            // Disable Nagle: rdc's hot path is many small JSON requests
+            // (pagination + per-resource fetches), and the ~40 ms
+            // segment-delay Nagle adds compounds noticeably across
+            // hundreds of round-trips during a full sync.
+            .tcp_nodelay(true)
             .build()
             .map_err(|e| anyhow::anyhow!("building reqwest client: {e}"))?;
         Ok(Self { base_url, token, http })

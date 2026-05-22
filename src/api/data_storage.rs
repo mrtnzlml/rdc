@@ -43,6 +43,8 @@ struct Envelope<T> {
 impl DataStorageClient {
     pub fn new(base_url: String, token: String) -> Result<Self> {
         let http = Client::builder()
+            // See RossumClient::new — same Nagle-off rationale.
+            .tcp_nodelay(true)
             .build()
             .map_err(|e| anyhow::anyhow!("building reqwest client: {e}"))?;
         Ok(Self { base_url, token, http })
