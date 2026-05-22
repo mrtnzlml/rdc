@@ -96,10 +96,18 @@ pub async fn run(env: &str, check: bool, yes: bool) -> Result<()> {
             }
             crate::cli::resolve::AnomalyCure::Convert => {
                 convert_to_custom(&client, &mut lockfile, &paths, &slug, &hook, &log).await?;
+                // Persist after each successful cure so a mid-batch
+                // failure on a later hook doesn't leave drift between
+                // the (already-mutated) on-disk + remote state for this
+                // hook and the lockfile.
+                lockfile.save(&paths.lockfile())
+                    .with_context(|| format!("saving lockfile to {}", paths.lockfile().display()))?;
                 fixed += 1;
             }
             crate::cli::resolve::AnomalyCure::Reinstall => {
                 reinstall_as_store_extension(&client, &mut lockfile, &paths, &slug, &hook, &log).await?;
+                lockfile.save(&paths.lockfile())
+                    .with_context(|| format!("saving lockfile to {}", paths.lockfile().display()))?;
                 fixed += 1;
             }
         }

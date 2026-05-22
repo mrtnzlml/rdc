@@ -1328,9 +1328,22 @@ pub fn prompt_anomaly_cure(
         "[r] Reinstall as store extension (new id, rewires dependents)",
         "[s] Skip this hook",
     ];
-    let answer = inquire::Select::new(&prompt, options)
-        .raw_prompt()
-        .map_err(|e| anyhow::anyhow!("anomaly cure prompt: {e}"))?;
+    use inquire::error::InquireError;
+    // Ctrl-C / Esc → Skip (not error). The caller's loop persists the
+    // lockfile after each successful cure, so mapping cancellation to
+    // Skip lets the operator abort mid-flight without losing
+    // bookkeeping for hooks already fixed — the current hook is left
+    // alone and the loop exits naturally on the next iteration if the
+    // user continues to cancel. Matches the cancel-handling pattern in
+    // `prompt_token_owner`, adapted from `Option<...>` to this fn's
+    // `Result<AnomalyCure>` return shape.
+    let answer = match inquire::Select::new(&prompt, options).raw_prompt() {
+        Ok(opt) => opt,
+        Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => {
+            return Ok(AnomalyCure::Skip);
+        }
+        Err(e) => return Err(anyhow::anyhow!("anomaly cure prompt: {e}")),
+    };
     Ok(match answer.index {
         0 => AnomalyCure::Convert,
         1 => AnomalyCure::Reinstall,
