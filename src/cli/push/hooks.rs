@@ -120,7 +120,7 @@ pub async fn push(
             // Anomaly guard, then dispatch on extension type.
             let typed: crate::model::Hook = serde_json::from_value(payload.clone())
                 .with_context(|| format!("deserializing hook '{slug}' for create"))?;
-            crate::cli::deploy::store_extensions::check_store_extension_anomaly(&typed, slug)?;
+            crate::cli::deploy::store_extensions::check_store_extension_anomaly(&typed, slug, env)?;
 
             // Compute the secrets hash now (before injection) so the
             // lockfile entry written below carries the up-to-date value
