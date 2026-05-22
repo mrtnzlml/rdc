@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use indexmap::IndexMap;
 
 /// Rossum workspace. Each env has 0..N workspaces, each holding queues.
 /// The workspace itself is just metadata; queues are pulled separately
@@ -16,7 +16,7 @@ pub struct Workspace {
     #[serde(default)]
     pub queues: Vec<String>,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: IndexMap<String, Value>,
 }
 
 impl Workspace {

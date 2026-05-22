@@ -1152,7 +1152,7 @@ mod tests {
                 id: 1,
                 url: "https://x.invalid/api/v1/organizations/1".to_string(),
                 name: "test".to_string(),
-                extra: BTreeMap::new(),
+                extra: indexmap::IndexMap::new(),
             },
             workspaces: vec![],
             queues: vec![],

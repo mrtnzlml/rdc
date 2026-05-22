@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use indexmap::IndexMap;
 
 /// Rossum MDH collection (dataset) metadata. Captures the structural attributes
 /// of a dataset; row data is intentionally NOT included per spec §11.
@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 pub struct Collection {
     pub name: String,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: IndexMap<String, Value>,
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use indexmap::IndexMap;
 
 /// Rossum workflow step. Belongs to a workflow; defines one stage in a
 /// queue-to-queue transition.
@@ -13,7 +13,7 @@ pub struct WorkflowStep {
     pub name: String,
     pub workflow: String,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: IndexMap<String, Value>,
 }
 
 impl WorkflowStep {

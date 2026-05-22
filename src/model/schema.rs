@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use indexmap::IndexMap;
 
 /// Rossum schema. Each queue has exactly one schema. The `content` array
 /// holds the field definitions; we keep them as opaque `Value`s so unknown
@@ -20,7 +20,7 @@ pub struct Schema {
     /// in the model; the codec walks it.
     pub content: Vec<Value>,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: IndexMap<String, Value>,
 }
 
 impl Schema {

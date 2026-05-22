@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use indexmap::IndexMap;
 
 /// Rossum organization (one per env). The pull command fetches a single
 /// organization per env (the one whose ID is in `rdc.toml`).
@@ -12,7 +12,7 @@ pub struct Organization {
     pub url: String,
     pub name: String,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: IndexMap<String, Value>,
 }
 
 impl Organization {

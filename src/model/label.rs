@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use indexmap::IndexMap;
 
 /// Rossum label. Categorizes annotations within an organization.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
@@ -12,7 +12,7 @@ pub struct Label {
     pub name: String,
     pub organization: String,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: IndexMap<String, Value>,
 }
 
 impl Label {

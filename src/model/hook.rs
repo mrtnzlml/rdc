@@ -1,6 +1,6 @@
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Hook {
@@ -19,7 +19,7 @@ pub struct Hook {
     pub config: Value,
     /// Any field we don't model explicitly is preserved here for round-trip fidelity.
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: IndexMap<String, Value>,
 }
 
 impl Hook {

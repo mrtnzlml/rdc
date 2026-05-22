@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use indexmap::IndexMap;
 
 /// Rossum workflow. Org-level orchestration for queue-to-queue transitions.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
@@ -13,7 +13,7 @@ pub struct Workflow {
     #[serde(default)]
     pub steps: Vec<String>,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: IndexMap<String, Value>,
 }
 
 impl Workflow {

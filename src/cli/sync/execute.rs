@@ -2325,7 +2325,7 @@ mod tests {
                 id: 1,
                 url: "https://x.invalid/api/v1/organizations/1".to_string(),
                 name: "test".to_string(),
-                extra: BTreeMap::new(),
+                extra: indexmap::IndexMap::new(),
             },
             workspaces: vec![],
             queues: vec![],
@@ -2351,7 +2351,7 @@ mod tests {
     }
 
     fn mk_label(id: u64, name: &str, color: &str) -> Label {
-        let mut extra: BTreeMap<String, Value> = BTreeMap::new();
+        let mut extra: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
         extra.insert("color".to_string(), Value::String(color.to_string()));
         Label {
             id,

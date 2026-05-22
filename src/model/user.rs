@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use indexmap::IndexMap;
 
 /// Rossum user. Lightweight slice sufficient for the interactive
 /// token_owner picker on `rdc deploy`; unknown fields survive via `extra`.
@@ -22,7 +22,7 @@ pub struct User {
     pub groups: Vec<String>,
     /// Forward-compat: every field not modelled survives via round-trip.
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: IndexMap<String, Value>,
 }
 
 impl User {
