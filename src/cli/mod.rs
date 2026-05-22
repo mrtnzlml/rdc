@@ -156,8 +156,9 @@ pub enum Command {
         token: Option<String>,
     },
     /// Bring the local snapshot of `<env>` back into a clean state.
-    /// Pick one of the modes — there's no implicit default because both
-    /// touch on-disk files in irreversible ways:
+    /// Pick one of the modes — there's no implicit default because they
+    /// touch on-disk files (and `--fix-store-anomaly` also touches the
+    /// remote) in irreversible ways:
     ///
     /// * `--rebuild-lock` — back up the existing lockfile and re-pull
     ///   from remote. Local snapshot files are overwritten with remote
@@ -168,19 +169,33 @@ pub enum Command {
     ///   explicit user-driven action that brings stale slugs into
     ///   alignment. Cascade-aware (queue / workspace renames move the
     ///   whole subtree). Offline — no API calls.
+    /// * `--fix-store-anomaly` — repair hooks with
+    ///   `extension_source: "rossum_store"` and `hook_template: null`
+    ///   (created when a client PATCHes the marker without going
+    ///   through `/hooks/create`). Interactive per hook: convert to
+    ///   custom (one PATCH, id preserved) or reinstall as store
+    ///   extension (new id, dependents rewired).
     Repair {
         env: Option<String>,
         /// Re-pull from remote and reconstruct the lockfile. Backs up
         /// the existing one to `<name>.bak.<unix-ts>`. Destroys local
         /// edits not present on remote.
-        #[arg(long = "rebuild-lock", conflicts_with = "rename_slugs")]
+        #[arg(long = "rebuild-lock", conflicts_with_all = ["rename_slugs", "fix_store_anomaly"])]
         rebuild_lock: bool,
         /// Rename local files whose slug no longer matches their JSON
         /// `name` field. Offline (no API calls).
-        #[arg(long = "rename-slugs")]
+        #[arg(long = "rename-slugs", conflicts_with_all = ["fix_store_anomaly"])]
         rename_slugs: bool,
-        /// With `--rename-slugs`: print pending renames and exit
-        /// without writing anything.
+        /// Repair hooks with `extension_source: "rossum_store"` and
+        /// `hook_template: null`. Interactive per hook: convert to
+        /// custom (one PATCH) or reinstall as store extension (new
+        /// hook id, dependents rewired). Non-TTY default: convert;
+        /// override with env var `RDC_REPAIR_CURE=reinstall` (or
+        /// `=skip`).
+        #[arg(long = "fix-store-anomaly")]
+        fix_store_anomaly: bool,
+        /// With `--rename-slugs` or `--fix-store-anomaly`: print the
+        /// plan and exit without writing anything.
         #[arg(long)]
         check: bool,
     },
@@ -266,10 +281,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let env = crate::cli::env_picker::pick_env("Set token for which env?", env)?;
             crate::cli::auth::run(&env, token).await
         }
-        Some(Command::Repair { env, rebuild_lock, rename_slugs, check }) => {
+        Some(Command::Repair { env, rebuild_lock, rename_slugs, fix_store_anomaly, check }) => {
             let env = crate::cli::env_picker::pick_env("Which env to repair?", env)?;
             with_401_retry(&env, || {
-                crate::cli::repair::run(&env, rebuild_lock, rename_slugs, check, cli.yes)
+                crate::cli::repair::run(&env, rebuild_lock, rename_slugs, fix_store_anomaly, check, cli.yes)
             })
             .await
         }
