@@ -1328,12 +1328,12 @@ pub fn prompt_anomaly_cure(
         "[r] Reinstall as store extension (new id, rewires dependents)",
         "[s] Skip this hook",
     ];
-    let choice = inquire::Select::new(&prompt, options)
-        .prompt()
+    let answer = inquire::Select::new(&prompt, options)
+        .raw_prompt()
         .map_err(|e| anyhow::anyhow!("anomaly cure prompt: {e}"))?;
-    Ok(match choice.chars().nth(1) {
-        Some('c') => AnomalyCure::Convert,
-        Some('r') => AnomalyCure::Reinstall,
+    Ok(match answer.index {
+        0 => AnomalyCure::Convert,
+        1 => AnomalyCure::Reinstall,
         _ => AnomalyCure::Skip,
     })
 }
