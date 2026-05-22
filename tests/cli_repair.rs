@@ -111,3 +111,54 @@ async fn repair_works_when_lockfile_is_missing() {
 
     assert!(project.path().join(".rdc/state/dev.lock.json").exists());
 }
+
+#[tokio::test]
+async fn fix_store_anomaly_lists_anomalous_hooks_then_exits_in_check_mode() {
+    let server = MockServer::start().await;
+    mount_minimal_pull(&server).await;
+
+    // Override /hooks with two hooks: one anomalous, one clean.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [
+                {
+                    "id": 42, "url": format!("{}/api/v1/hooks/42", server.uri()),
+                    "name": "Broken Store Hook", "type": "webhook",
+                    "queues": [], "events": [], "config": {},
+                    "extension_source": "rossum_store", "hook_template": null
+                },
+                {
+                    "id": 43, "url": format!("{}/api/v1/hooks/43", server.uri()),
+                    "name": "Healthy Hook", "type": "function",
+                    "queues": [], "events": [], "config": {},
+                    "extension_source": "custom", "hook_template": null
+                }
+            ]
+        })))
+        .with_priority(1)
+        .mount(&server).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev", "--no-push"])
+        .assert().success();
+
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["repair", "dev", "--fix-store-anomaly", "--check"])
+        .assert().success()
+        .stderr(predicate::str::contains("broken-store-hook"))
+        .stderr(predicate::str::contains("id 42"))
+        .stderr(predicate::str::contains("1 anomalous hook"));
+}
