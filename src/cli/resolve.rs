@@ -1282,6 +1282,62 @@ pub fn prompt_token_owner(
     Ok(Some((chosen.url.clone(), apply_all)))
 }
 
+/// Cure choice for an anomalous store-extension hook. `Convert` is
+/// the safe default (one PATCH, hook id preserved); `Reinstall` is
+/// the heavier option (new id, dependents rewired); `Skip` leaves
+/// it alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnomalyCure {
+    Convert,
+    Reinstall,
+    Skip,
+}
+
+/// Per-hook interactive prompt. Non-TTY → `Convert` is the default,
+/// unless `RDC_REPAIR_CURE` env var selects another option:
+/// `"reinstall"` → Reinstall, `"skip"` → Skip. Anything else → Convert.
+pub fn prompt_anomaly_cure(
+    slug: &str,
+    hook: &crate::model::Hook,
+    interactive: bool,
+) -> anyhow::Result<AnomalyCure> {
+    if !interactive {
+        let env_choice = std::env::var("RDC_REPAIR_CURE").unwrap_or_default();
+        return Ok(match env_choice.as_str() {
+            "reinstall" => AnomalyCure::Reinstall,
+            "skip" => AnomalyCure::Skip,
+            _ => AnomalyCure::Convert,
+        });
+    }
+    // TTY mode: use the project's existing prompt library (`inquire`,
+    // matching `prompt_token_owner` above). Show config.private and
+    // has-code signals so the operator can decide.
+    let private = hook.config.get("private").and_then(|v| v.as_bool()).unwrap_or(false);
+    let has_code = hook
+        .config
+        .get("code")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let prompt = format!(
+        "Cure for hooks/{slug} (id {}, name {:?}, type {}, config.private={private}, has config.code={has_code})?",
+        hook.id, hook.name, hook.hook_type
+    );
+    let options = vec![
+        "[c] Convert to custom (one PATCH, id preserved)",
+        "[r] Reinstall as store extension (new id, rewires dependents)",
+        "[s] Skip this hook",
+    ];
+    let choice = inquire::Select::new(&prompt, options)
+        .prompt()
+        .map_err(|e| anyhow::anyhow!("anomaly cure prompt: {e}"))?;
+    Ok(match choice.chars().nth(1) {
+        Some('c') => AnomalyCure::Convert,
+        Some('r') => AnomalyCure::Reinstall,
+        _ => AnomalyCure::Skip,
+    })
+}
+
 /// Sentinel error type signaling the user picked `[a]bort` at any
 /// resolver prompt (pull or push). The pull / push runner downcasts to
 /// this and skips lockfile.save().

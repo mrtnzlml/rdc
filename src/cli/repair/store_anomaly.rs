@@ -77,18 +77,96 @@ pub async fn run(env: &str, check: bool, yes: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Construct the client; Tasks 5/6 will use it for the cures.
     let token = resolve_token(&cwd, env)?;
-    let _client = RossumClient::new(env_cfg.api_base.clone(), token)
+    let client = RossumClient::new(env_cfg.api_base.clone(), token)
         .context("constructing API client")?;
-    let _lockfile = Lockfile::load(&paths.lockfile())
+    let mut lockfile = Lockfile::load(&paths.lockfile())
         .with_context(|| format!("loading lockfile from {}", paths.lockfile().display()))?;
-    let _ = yes; // wired in Task 5
 
-    // Task 5 implements Cure B; Task 6 implements Cure A.
-    Err(anyhow!(
-        "the per-hook prompt is implemented in the next task; for now, use --check to list anomalies"
-    ))
+    let interactive = crate::cli::resolve::is_interactive(yes);
+
+    let mut fixed = 0usize;
+    let mut skipped = 0usize;
+    for (slug, hook) in anomalies {
+        let cure = crate::cli::resolve::prompt_anomaly_cure(&slug, &hook, interactive)?;
+        match cure {
+            crate::cli::resolve::AnomalyCure::Skip => {
+                log.event(Action::Skip, &format!("hooks/{slug} (id {})", hook.id));
+                skipped += 1;
+            }
+            crate::cli::resolve::AnomalyCure::Convert => {
+                convert_to_custom(&client, &mut lockfile, &paths, &slug, &hook, &log).await?;
+                fixed += 1;
+            }
+            crate::cli::resolve::AnomalyCure::Reinstall => {
+                // Task 6 implements this.
+                return Err(anyhow!(
+                    "Reinstall (Cure A) is not yet implemented; pick [c] convert or [s] skip"
+                ));
+            }
+        }
+    }
+
+    lockfile.save(&paths.lockfile())
+        .with_context(|| format!("saving lockfile to {}", paths.lockfile().display()))?;
+
+    log.event(Action::Repair, &format!(
+        "done env '{env}': {fixed} fixed, {skipped} skipped"
+    ));
+    Ok(())
+}
+
+/// Cure B — `PATCH /hooks/<id> {"extension_source": "custom"}`,
+/// rewrite the local snapshot to match, update the lockfile entry.
+/// Hook id is preserved; no rewiring needed.
+async fn convert_to_custom(
+    client: &RossumClient,
+    lockfile: &mut Lockfile,
+    paths: &Paths,
+    slug: &str,
+    hook: &Hook,
+    log: &std::sync::Arc<Log>,
+) -> Result<()> {
+    let body = serde_json::json!({"extension_source": "custom"});
+    let updated = client
+        .update_hook_value(hook.id, &body, Some(log.clone()))
+        .await
+        .with_context(|| format!("PATCH /hooks/{} (cure B for hooks/{slug})", hook.id))?;
+
+    // Reuse the pull side's canonical serialization so disk + hash stay
+    // aligned with what a future pull would write.
+    let (json_bytes, code) = crate::snapshot::hook::serialize_hook(&updated)?;
+    let overlay = crate::overlay::Overlay::load(&paths.overlay_file())?;
+    let stripped = crate::cli::pull::common::maybe_strip_overlay(
+        json_bytes,
+        overlay.as_ref().and_then(|o| o.hook(slug)),
+    )?;
+    let hash = crate::state::hook_combined_hash(&stripped, &code);
+    let local_path = paths.hooks_dir().join(format!("{slug}.json"));
+    crate::snapshot::writer::write_atomic(&local_path, &stripped)
+        .with_context(|| format!("writing post-cure snapshot to {}", local_path.display()))?;
+
+    // The hook's `extension_source` lives in `extra` (flattened in the
+    // model), so the typed update + serialize cycle above already
+    // round-trips the new value. Lockfile entry id/url unchanged; only
+    // content_hash + modified_at move.
+    let prior = lockfile.objects.get("hooks").and_then(|m| m.get(slug)).cloned();
+    lockfile.upsert(
+        "hooks",
+        slug,
+        crate::state::ObjectEntry {
+            id: updated.id,
+            url: Some(updated.url.clone()),
+            modified_at: updated.modified_at().map(|s| s.to_string()),
+            content_hash: Some(hash),
+            secrets_hash: prior.and_then(|p| p.secrets_hash),
+        },
+    );
+    log.event(
+        Action::Repair,
+        &format!("hooks/{slug} (id {}) \u{2192} converted to custom", updated.id),
+    );
+    Ok(())
 }
 
 #[cfg(test)]
