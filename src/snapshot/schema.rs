@@ -86,6 +86,8 @@ pub fn serialize_schema(schema: &Schema) -> Result<(Vec<u8>, Vec<(String, Vec<u8
     }
     formulas.sort_by(|a, b| a.0.cmp(&b.0));
 
+    crate::snapshot::key_order::strip_hidden_fields_recursive(&mut value);
+
     let bytes = serde_json::to_vec_pretty(&value)
         .context("serializing schema json")?;
     let mut bytes = bytes;

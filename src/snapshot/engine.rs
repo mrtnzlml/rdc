@@ -9,8 +9,8 @@ use std::path::Path;
 /// `workspaces/<ws>/workspace.json` pattern.
 pub fn write_engine(engine_dir: &Path, e: &Engine) -> Result<Vec<u8>> {
     let path = engine_dir.join("engine.json");
-    let mut bytes = serde_json::to_vec_pretty(e).context("serializing engine")?;
-    bytes.push(b'\n');
+    let bytes = crate::snapshot::key_order::serialize_for_disk(e)
+        .context("serializing engine")?;
     write_atomic(&path, &bytes)?;
     Ok(bytes)
 }
