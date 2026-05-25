@@ -7,6 +7,21 @@ fn fixture(name: &str) -> serde_json::Value {
     serde_json::from_str(&raw).unwrap()
 }
 
+/// RAII guard that unsets the listed env vars on drop, so a panicking
+/// assertion in the middle of an env-var-dependent test does not leak
+/// `RDC_USER_*` / `RDC_PASS_*` into sibling tests.
+struct EnvGuard(Vec<String>);
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for k in &self.0 {
+            // SAFETY: remove_var is unsafe on Rust 2024. We only set
+            // vars with unique nanosecond-suffixed names in the same
+            // test, and reads happen on the same thread.
+            unsafe { std::env::remove_var(k); }
+        }
+    }
+}
+
 #[tokio::test]
 async fn list_hooks_paginates_until_done() {
     let server = MockServer::start().await;
@@ -610,14 +625,19 @@ async fn resolve_token_logs_in_when_creds_set_and_no_cache() {
     // Use a unique env name per test to avoid env-var collisions across
     // the test runner's parallel jobs.
     let env_name = format!("login_e2e_{}", uuid_like_suffix());
+    let user_var = format!("RDC_USER_{}", env_name.to_uppercase());
+    let pass_var = format!("RDC_PASS_{}", env_name.to_uppercase());
     // SAFETY: Rust 2024 marks env mutation unsafe due to multi-threaded
     // soundness. The env-var names embed a per-test nanosecond suffix so
     // parallel jobs don't collide, and resolve_token reads them on the
     // current thread before we touch them again.
     unsafe {
-        std::env::set_var(format!("RDC_USER_{}", env_name.to_uppercase()), "alice");
-        std::env::set_var(format!("RDC_PASS_{}", env_name.to_uppercase()), "hunter2");
+        std::env::set_var(&user_var, "alice");
+        std::env::set_var(&pass_var, "hunter2");
     }
+    // RAII cleanup so a panicking assertion below does not leak the
+    // vars into sibling tests.
+    let _guard = EnvGuard(vec![user_var, pass_var]);
 
     let api_base = format!("{}/v1", server.uri());
     let token = rdc::secrets::resolve_token(dir.path(), &env_name, &api_base)
@@ -636,13 +656,6 @@ async fn resolve_token_logs_in_when_creds_set_and_no_cache() {
         parsed["expires_at"].is_number(),
         "expires_at must be persisted, got {parsed}"
     );
-
-    // SAFETY: see set_var SAFETY note above; cleanup happens after the
-    // resolve_token call returned, so no other thread is reading these.
-    unsafe {
-        std::env::remove_var(format!("RDC_USER_{}", env_name.to_uppercase()));
-        std::env::remove_var(format!("RDC_PASS_{}", env_name.to_uppercase()));
-    }
 }
 
 #[tokio::test]

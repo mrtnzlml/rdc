@@ -16,7 +16,6 @@ use crate::api::{anyhow_has_status, RossumClient};
 use crate::config::{EnvConfig, ProjectConfig};
 use crate::log::Action;
 use crate::paths::Paths;
-use crate::snapshot::writer::write_atomic;
 use anyhow::{anyhow, Context, Result};
 use std::io::IsTerminal;
 use std::path::Path;
@@ -48,7 +47,7 @@ pub async fn run(env: &str, token_arg: Option<String>) -> Result<()> {
         }
     };
 
-    let org_name = validate_and_save_token(env_cfg, &paths.secrets_file(), &new_token).await?;
+    let org_name = validate_and_save_token(env_cfg, &cwd, env, &new_token).await?;
 
     let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
     log.event(
@@ -63,14 +62,20 @@ pub async fn run(env: &str, token_arg: Option<String>) -> Result<()> {
 }
 
 /// Validate `token` by calling `GET /organizations/<id>`. On success,
-/// write it atomically to `secrets_path` with mode 0600 (Unix) and
-/// return the organization name. On failure, propagate.
+/// write it atomically to `<project_root>/secrets/<env>.secrets.json`
+/// with mode 0600 (Unix) and return the organization name. On failure,
+/// propagate.
+///
+/// `expires_at` is recorded as `None` — opaque tokens supplied via
+/// `rdc auth` (CLI flag, stdin, or interactive prompt) carry no
+/// machine-readable expiry, so we don't fabricate one.
 ///
 /// A short-lived ProgressLog surrounds the validation GET so the user
 /// sees a spinner while rdc is waiting on the Rossum API.
 pub(crate) async fn validate_and_save_token(
     env_cfg: &EnvConfig,
-    secrets_path: &Path,
+    project_root: &Path,
+    env: &str,
     token: &str,
 ) -> Result<String> {
     let client = RossumClient::new(env_cfg.api_base.clone(), token.to_string())
@@ -96,16 +101,7 @@ pub(crate) async fn validate_and_save_token(
     };
     progress.event(Action::Auth, &format!("done validated against org '{}'", org.name));
 
-    if let Some(parent) = secrets_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let body = serde_json::json!({ "api_token": token });
-    let mut bytes = serde_json::to_vec_pretty(&body).context("serializing token JSON")?;
-    bytes.push(b'\n');
-    write_atomic(secrets_path, &bytes)
-        .with_context(|| format!("writing {}", secrets_path.display()))?;
-    set_owner_only_read(secrets_path);
+    crate::secrets::write_secrets_file(project_root, env, token, None)?;
     Ok(org.name)
 }
 
@@ -158,7 +154,7 @@ pub async fn refresh_token_interactively(env: &str) -> Result<()> {
             log.event(Action::Auth, "empty input; paste the token, or Ctrl+C to abort");
             continue;
         }
-        match validate_and_save_token(env_cfg, &secrets_path, trimmed).await {
+        match validate_and_save_token(env_cfg, &cwd, env, trimmed).await {
             Ok(_org_name) => {
                 log.event(
                     Action::Auth,
@@ -175,11 +171,3 @@ pub async fn refresh_token_interactively(env: &str) -> Result<()> {
     }
 }
 
-#[cfg(unix)]
-fn set_owner_only_read(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-}
-
-#[cfg(not(unix))]
-fn set_owner_only_read(_path: &std::path::Path) {}

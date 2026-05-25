@@ -119,8 +119,7 @@ pub async fn run(env_specs: Vec<String>) -> Result<()> {
             .envs
             .get(env)
             .expect("just inserted into cfg above");
-        let paths = Paths::for_env(&cwd, env);
-        match crate::cli::auth::validate_and_save_token(env_cfg, &paths.secrets_file(), &token)
+        match crate::cli::auth::validate_and_save_token(env_cfg, &cwd, env, &token)
             .await
         {
             Ok(_org_name) => {
