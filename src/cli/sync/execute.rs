@@ -2318,20 +2318,63 @@ pub async fn run(
             )
             .await?;
         }
-        // MDH dispatch — always runs unconditionally for every server-
-        // listed collection (classifier bypass; see catalog setup in
-        // `sync::run_cycle`). The pull driver is idempotent on no-change
-        // via per-file `decide_pull_action`, so the worst case is a few
-        // extra HTTP calls when nothing's drifted. Build the subset
-        // fresh from the catalog so slug derivation matches the driver.
+        // MDH dispatch — runs unconditionally for every server-listed
+        // collection (classifier bypass; see catalog setup in
+        // `sync::run_cycle`). Two stages:
+        //
+        // 1. Push: for any dataset whose local indexes.json has drifted
+        //    from the lockfile baseline, dispatch the push driver to
+        //    drop+create the delta on the server. Gated on `!no_push`
+        //    so audit mode (`--no-push`) stays read-only.
+        // 2. Pull: idempotent re-read of the now-aligned remote.
+        //    Per-file `decide_pull_action` keeps disk bytes stable.
         if !catalog.mdh.collections.is_empty() {
             use std::collections::HashSet as HashSetForSlugs;
-            let mut subset: BTreeSet<(String, String)> = BTreeSet::new();
+            let mut slug_to_collection: BTreeMap<String, &crate::model::Collection> =
+                BTreeMap::new();
             let mut used: HashSetForSlugs<String> = HashSetForSlugs::new();
             for c in &catalog.mdh.collections {
                 let slug = crate::slug::slugify_unique(&c.name, &used);
                 used.insert(slug.clone());
-                subset.insert(("mdh".to_string(), slug));
+                slug_to_collection.insert(slug, c);
+            }
+
+            if !no_push {
+                for (slug, collection) in &slug_to_collection {
+                    let indexes_path = ctx.paths.dataset_dir(slug).join("indexes.json");
+                    if !indexes_path.exists() {
+                        continue;
+                    }
+                    let local_bytes = match std::fs::read(&indexes_path) {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    };
+                    let local_hash = crate::state::content_hash(&local_bytes);
+                    let base = ctx
+                        .lockfile
+                        .objects
+                        .get("mdh_indexes")
+                        .and_then(|m| m.get(slug.as_str()))
+                        .and_then(|e| e.content_hash.as_deref());
+                    if Some(local_hash.as_str()) == base {
+                        continue;
+                    }
+                    crate::cli::push::mdh::push_dataset(
+                        &catalog.mdh.client,
+                        ctx.lockfile,
+                        &collection.name,
+                        slug,
+                        &indexes_path,
+                        progress,
+                    )
+                    .await
+                    .with_context(|| format!("pushing local index edits for mdh/{slug}"))?;
+                }
+            }
+
+            let mut subset: BTreeSet<(String, String)> = BTreeSet::new();
+            for slug in slug_to_collection.keys() {
+                subset.insert(("mdh".to_string(), slug.clone()));
             }
             let listed = crate::cli::pull::mdh::MdhListed {
                 client: catalog.mdh.client.clone(),
