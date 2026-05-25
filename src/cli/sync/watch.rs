@@ -210,7 +210,7 @@ pub(crate) async fn event_loop(
                         } else {
                             eprintln!("auth: token expired");
                         }
-                        crate::cli::auth::refresh_token_interactively(env).await?;
+                        crate::cli::auth::refresh_token_for_401(env).await?;
                         crate::cli::sync::run_cycle(
                             env, interactive, false, allow_deletes, no_push, no_pull,
                             renderer.clone(),

@@ -367,7 +367,7 @@ where
     let first = op().await;
     match first {
         Err(e) if crate::api::anyhow_has_status(&e, 401) => {
-            crate::cli::auth::refresh_token_interactively(env).await?;
+            crate::cli::auth::refresh_token_for_401(env).await?;
             op().await
         }
         other => other,
@@ -395,7 +395,7 @@ where
                 Some(env_from_tag) => env_from_tag,
                 None => prompt_pick_env_for_401(envs)?,
             };
-            crate::cli::auth::refresh_token_interactively(&target_env).await?;
+            crate::cli::auth::refresh_token_for_401(&target_env).await?;
             op().await
         }
         other => other,
