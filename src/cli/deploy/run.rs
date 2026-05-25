@@ -100,12 +100,12 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
         .get(tgt)
         .ok_or_else(|| anyhow!("env '{tgt}' is not defined in rdc.toml"))?;
 
-    let src_token = resolve_token(&cwd, src)?;
+    let src_token = resolve_token(&cwd, src, &src_cfg.api_base).await?;
     let src_client = RossumClient::new(src_cfg.api_base.clone(), src_token)
         .context("constructing src API client")?
         .with_env_label(src);
 
-    let tgt_token = resolve_token(&cwd, tgt)?;
+    let tgt_token = resolve_token(&cwd, tgt, &tgt_cfg.api_base).await?;
     let tgt_client = RossumClient::new(tgt_cfg.api_base.clone(), tgt_token)
         .context("constructing tgt API client")?
         .with_env_label(tgt);

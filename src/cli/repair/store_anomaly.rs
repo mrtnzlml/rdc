@@ -77,7 +77,7 @@ pub async fn run(env: &str, check: bool, yes: bool) -> Result<()> {
         return Ok(());
     }
 
-    let token = resolve_token(&cwd, env)?;
+    let token = resolve_token(&cwd, env, &env_cfg.api_base).await?;
     let client = RossumClient::new(env_cfg.api_base.clone(), token)
         .context("constructing API client")?;
     let mut lockfile = Lockfile::load(&paths.lockfile())

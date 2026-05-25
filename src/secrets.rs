@@ -188,18 +188,62 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Convenience wrapper that converts a [`TokenLookup`] back into the
-/// `Result<String>` shape the existing callers expect. **Sync at this
-/// checkpoint — becomes async in Task 5 when the login flow is wired up.**
-pub fn resolve_token(project_root: &Path, env: &str) -> Result<String> {
+/// Resolve the API token for an environment.
+///
+/// Resolution order (managed by [`resolve_token_lookup`]):
+/// 1. `RDC_TOKEN_<ENV>` env var (always wins; opaque, no expiry tracking).
+/// 2. Non-expired cached token in `secrets/<env>.secrets.json`.
+/// 3. `RDC_USER_<ENV>` + `RDC_PASS_<ENV>` -> exchange via
+///    [`crate::api::login`], write the resulting token + computed
+///    `expires_at` back to the secrets file, return the fresh token.
+/// 4. Otherwise, return an actionable error.
+///
+/// `api_base` is needed for the login call; callers pass the env's
+/// configured `api_base` (e.g. from `EnvConfig`).
+pub async fn resolve_token(project_root: &Path, env: &str, api_base: &str) -> Result<String> {
     match resolve_token_lookup(project_root, env)? {
         TokenLookup::Cached { token, .. } => Ok(token),
-        TokenLookup::NeedsLogin { .. } => Err(anyhow!(
-            "env '{env}' has credentials but rdc cannot log in synchronously here \
-             — this is a bug; report it"
-        )),
+        TokenLookup::NeedsLogin { username, password } => {
+            let token = crate::api::login(api_base, &username, &password)
+                .await
+                .with_context(|| format!("logging in to env '{env}' with RDC_USER_*/RDC_PASS_*"))?;
+            let expires_at = now_unix_secs().saturating_add(LOGIN_TOKEN_LIFETIME_SECS);
+            write_secrets_file(project_root, env, &token, Some(expires_at))?;
+            Ok(token)
+        }
         TokenLookup::Missing { message } => Err(anyhow!(message)),
     }
+}
+
+/// Write `secrets/<env>.secrets.json` atomically with mode 0600 on
+/// Unix. Used by [`resolve_token`] when caching a login-derived
+/// token, and by `cli::auth::validate_and_save_token` when the user
+/// runs `rdc auth`.
+pub fn write_secrets_file(
+    project_root: &Path,
+    env: &str,
+    token: &str,
+    expires_at: Option<u64>,
+) -> Result<PathBuf> {
+    let path = project_root.join("secrets").join(format!("{env}.secrets.json"));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let body = match expires_at {
+        Some(exp) => serde_json::json!({ "api_token": token, "expires_at": exp }),
+        None => serde_json::json!({ "api_token": token }),
+    };
+    let mut bytes = serde_json::to_vec_pretty(&body).context("serializing token JSON")?;
+    bytes.push(b'\n');
+    crate::snapshot::writer::write_atomic(&path, &bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(path)
 }
 
 /// Per-env, per-hook secret values that ship to the Rossum API in the
