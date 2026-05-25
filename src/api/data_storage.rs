@@ -80,6 +80,10 @@ impl DataStorageClient {
         progress: ProgressHandle,
     ) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
+        // Data Storage is a separate service from the core API and is not
+        // subject to the `default.core_api` 10 req/s policy that
+        // [`RossumClient`] paces itself against — no client-side limiter
+        // here.
         let resp = crate::api::retry::send_with_retry(
             || self.http
                 .post(&url)
@@ -87,11 +91,12 @@ impl DataStorageClient {
                 .json(&body),
             &format!("POST {url}"),
             progress,
+            None,
         ).await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status: status.as_u16(), body }.into());
+            return Err(ApiError::Status { status: status.as_u16(), body, env: None }.into());
         }
         // Decode the envelope as untyped first so we can surface a useful
         // error when code != "ok" without `result` being a parseable T.
@@ -103,6 +108,7 @@ impl DataStorageClient {
             return Err(ApiError::Status {
                 status: status.as_u16(),
                 body: format!("Data Storage API returned code='{}', message='{}'", env.code, env.message),
+                env: None,
             }.into());
         }
         let typed: T = serde_json::from_value(env.result)
