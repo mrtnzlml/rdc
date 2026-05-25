@@ -156,6 +156,13 @@ pub enum Command {
         /// calls are suppressed.
         #[arg(long = "dry-run")]
         dry_run: bool,
+        /// Auto-overwrite target objects that have been edited out-of-band
+        /// since the last `rdc sync <tgt>`. Without this flag, the deploy
+        /// prompts per-object [k]/[o]/[s]/[a] on TTY, or refuses on
+        /// non-TTY / `--yes` to prevent a CI script from silently blowing
+        /// away ad-hoc edits made via the Rossum UI.
+        #[arg(long = "force-overwrite-drift")]
+        force_overwrite_drift: bool,
         /// Limit the deploy to the given `<kind>/<slug>` selectors. Repeatable.
         /// Globs: `*` matches within the slug segment (e.g. `hooks/*`,
         /// `schemas/cost-*`). Cross-kind: `*/cost-invoices` matches any kind.
@@ -295,7 +302,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 .await
             }
         }
-        Some(Command::Deploy { src, tgt, mirror, dry_run, only }) => {
+        Some(Command::Deploy { src, tgt, mirror, dry_run, force_overwrite_drift, only }) => {
             let src = crate::cli::env_picker::pick_env("Deploy from which env (source)?", src)?;
             let tgt = crate::cli::env_picker::pick_env_excluding(
                 "Deploy to which env (target)?",
@@ -305,7 +312,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
             with_401_retry_envs(&[&src, &tgt], || {
                 let only = only.clone();
-                crate::cli::deploy::run::run(&src, &tgt, mirror, interactive, dry_run, only)
+                crate::cli::deploy::run::run(&src, &tgt, mirror, interactive, dry_run, force_overwrite_drift, only)
             })
             .await
         }

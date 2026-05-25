@@ -14,8 +14,52 @@ use crate::snapshot::schema::read_schema_value;
 use crate::state::Lockfile;
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// One target object that's drifted from the lockfile baseline — i.e.,
+/// someone edited it out-of-band on the tgt env (Rossum UI, another
+/// rdc instance, …) since the last `rdc sync <tgt>`. The orchestrator
+/// (`deploy::run::run`) collects these from the preview-pass apply
+/// and prompts the user for a per-object resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DriftedItem {
+    pub kind: String,
+    pub slug: String,
+}
+
+/// What to do with a drifted target object when the real apply pass
+/// reaches it. Built by the orchestrator from user prompts (or the
+/// `--force-overwrite-drift` short-circuit) and threaded back into
+/// the second `apply::run` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DriftDecision {
+    /// Overwrite the tgt's out-of-band edit with src's bytes. The
+    /// legacy behavior — adopts the drifted hash as the new lockfile
+    /// baseline, then PATCHes with src.
+    Overwrite,
+    /// Keep the tgt edit; skip the PATCH for this object. Adopts the
+    /// drifted hash as the new lockfile baseline so subsequent syncs
+    /// see a clean tgt — the user is acknowledging "tgt is canonical
+    /// for this object." To also move the edit back into src, run
+    /// `rdc sync <src>` afterwards.
+    Keep,
+    /// Defer: skip the PATCH AND don't adopt the drifted hash. The
+    /// next deploy re-classifies as drift and re-prompts. Useful when
+    /// the user wants to investigate before deciding.
+    Skip,
+}
+
+/// Aggregate result of one apply pass.
+pub(crate) struct ApplyOutcome {
+    /// Human-facing summary line ("Applied / Would apply N hooks …").
+    pub summary: String,
+    /// Tgt objects that drifted from the lockfile baseline during this
+    /// pass. The orchestrator uses this list to prompt for decisions
+    /// before the real apply runs.
+    pub drifted: Vec<DriftedItem>,
+}
 
 /// Emit a warning through the progress bar if active, or to stderr directly.
 /// Both branches render the message flush-left under the active phase
@@ -65,6 +109,93 @@ fn adopt_tgt_drift(
     }
 }
 
+/// Outcome of consulting the drift-decisions map at PATCH time. Each
+/// per-kind handler in the apply loop branches on this.
+enum DriftHandling {
+    /// Fall through to the normal idempotency-check + PATCH path.
+    Patch,
+    /// Stop processing this object — skip the PATCH. The caller's
+    /// `continue` resumes with the next item in the loop.
+    SkipObject,
+}
+
+/// Centralise the drift decision lookup so every per-kind handler
+/// stays a one-liner. In dry-run mode the apply pass doesn't have
+/// decisions yet — it's collecting the drift list for the
+/// orchestrator — so all drift items are recorded and skipped.
+/// In real-run mode an unmapped drift indicates a TOCTOU race with
+/// a concurrent edit; fail loudly rather than silently overwriting.
+fn handle_drift(
+    progress: &Option<Arc<Log>>,
+    tgt_lockfile: &mut Lockfile,
+    drift_decisions: &BTreeMap<(String, String), DriftDecision>,
+    drifted: &mut Vec<DriftedItem>,
+    dry_run: bool,
+    kind: &str,
+    tgt_slug: &str,
+    remote_hash: String,
+) -> Result<DriftHandling> {
+    drifted.push(DriftedItem {
+        kind: kind.to_string(),
+        slug: tgt_slug.to_string(),
+    });
+    if dry_run {
+        // Preview pass: render the diff for this drifted item but
+        // don't actually adopt (we're operating on a cloned lockfile
+        // anyway). Returning `Patch` here means "render diff",
+        // not "send PATCH" — the dry_run gate later suppresses the
+        // network call.
+        return Ok(DriftHandling::Patch);
+    }
+    let key = (kind.to_string(), tgt_slug.to_string());
+    match drift_decisions.get(&key) {
+        Some(DriftDecision::Overwrite) => {
+            adopt_tgt_drift(progress, tgt_lockfile, kind, tgt_slug, remote_hash);
+            Ok(DriftHandling::Patch)
+        }
+        Some(DriftDecision::Keep) => {
+            adopt_tgt_drift(progress, tgt_lockfile, kind, tgt_slug, remote_hash);
+            match progress {
+                Some(p) => p.event(
+                    Action::Skip,
+                    &format!("{kind}/{tgt_slug} kept tgt out-of-band edit"),
+                ),
+                None => {}
+            }
+            Ok(DriftHandling::SkipObject)
+        }
+        Some(DriftDecision::Skip) => {
+            match progress {
+                Some(p) => p.event(
+                    Action::Skip,
+                    &format!("{kind}/{tgt_slug} drift deferred; re-prompts next deploy"),
+                ),
+                None => {}
+            }
+            Ok(DriftHandling::SkipObject)
+        }
+        None => {
+            // Unmapped drift in real-apply mode. Common cause:
+            // "phantom drift" for objects just created in this deploy
+            // (the POST-response hash differs from the post-GET
+            // canonical hash because the server adds/normalises
+            // fields on read). The preview pass couldn't have seen
+            // this object — it didn't exist on tgt yet — so the
+            // resolver never got a chance to ask. Falling back to the
+            // legacy adopt+PATCH path here is safe in that scenario.
+            //
+            // The trade-off: a genuine concurrent edit landing in the
+            // narrow window between preview and apply would also
+            // hit this arm and be silently overwritten. That race is
+            // rare (single-user tool, short deploy window) and the
+            // user already consented to overwrite the rest of the
+            // tgt state via the confirm prompt.
+            adopt_tgt_drift(progress, tgt_lockfile, kind, tgt_slug, remote_hash);
+            Ok(DriftHandling::Patch)
+        }
+    }
+}
+
 /// Drive the cross-env update phase.
 ///
 /// `dry_run = true` traces the same code path (URL rewrite, overlay,
@@ -88,7 +219,14 @@ pub(crate) async fn run(
     tgt_lockfile: &mut Lockfile,
     selection: Option<&crate::cli::deploy::selection::Selection>,
     hook_secrets_plan: &crate::cli::deploy::hook_secrets::HookSecretsPlan,
-) -> Result<String> {
+    drift_decisions: &BTreeMap<(String, String), DriftDecision>,
+) -> Result<ApplyOutcome> {
+    // Collect every drift event so the caller can prompt for
+    // decisions before the real apply runs. In the preview pass
+    // `drift_decisions` is empty, so this list is what feeds the
+    // resolver; in the real pass it should be a subset of the
+    // preview's list (anything new would be a TOCTOU race).
+    let mut drifted: Vec<DriftedItem> = Vec::new();
     let cwd = std::env::current_dir().context("getting current directory")?;
     let src_paths = Paths::for_env(&cwd, src);
     let tgt_paths = Paths::for_env(&cwd, tgt);
@@ -203,7 +341,10 @@ pub(crate) async fn run(
             .map(|b| b == remote_combined_hash)
             .unwrap_or(true);
         if !in_sync {
-            adopt_tgt_drift(&progress, tgt_lockfile, "hooks", tgt_slug, remote_combined_hash);
+            match handle_drift(&progress, tgt_lockfile, drift_decisions, &mut drifted, dry_run, "hooks", tgt_slug, remote_combined_hash)? {
+                DriftHandling::SkipObject => continue,
+                DriftHandling::Patch => {}
+            }
         }
         // Idempotency: compare canonical (env-specific fields stripped) JSON
         // plus the extracted code.
@@ -315,7 +456,10 @@ pub(crate) async fn run(
             .map(|b| b == remote_combined_hash)
             .unwrap_or(true);
         if !in_sync {
-            adopt_tgt_drift(&progress, tgt_lockfile, "rules", tgt_slug, remote_combined_hash);
+            match handle_drift(&progress, tgt_lockfile, drift_decisions, &mut drifted, dry_run, "rules", tgt_slug, remote_combined_hash)? {
+                DriftHandling::SkipObject => continue,
+                DriftHandling::Patch => {}
+            }
         }
         // Idempotency: both JSON and code must match (after env-specific strip).
         if bytes_equal_after_strip(&payload_json_full, &remote_json_full, "rules")?
@@ -389,7 +533,10 @@ pub(crate) async fn run(
         let (in_sync, remote_hash) =
             tgt_drift_status(remote_bytes.clone(), overlay_paths, tgt_lockfile, "labels", tgt_slug)?;
         if !in_sync {
-            adopt_tgt_drift(&progress, tgt_lockfile, "labels", tgt_slug, remote_hash);
+            match handle_drift(&progress, tgt_lockfile, drift_decisions, &mut drifted, dry_run, "labels", tgt_slug, remote_hash)? {
+                DriftHandling::SkipObject => continue,
+                DriftHandling::Patch => {}
+            }
         }
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "labels")? {
             continue;
@@ -465,7 +612,10 @@ pub(crate) async fn run(
         let (in_sync, remote_hash) =
             tgt_drift_status(remote_bytes.clone(), overlay_paths, tgt_lockfile, "queues", tgt_slug)?;
         if !in_sync {
-            adopt_tgt_drift(&progress, tgt_lockfile, "queues", tgt_slug, remote_hash);
+            match handle_drift(&progress, tgt_lockfile, drift_decisions, &mut drifted, dry_run, "queues", tgt_slug, remote_hash)? {
+                DriftHandling::SkipObject => continue,
+                DriftHandling::Patch => {}
+            }
         }
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "queues")? {
             continue;
@@ -529,7 +679,10 @@ pub(crate) async fn run(
             .map(|b| b == remote_combined_hash)
             .unwrap_or(true);
         if !in_sync {
-            adopt_tgt_drift(&progress, tgt_lockfile, "schemas", tgt_slug, remote_combined_hash);
+            match handle_drift(&progress, tgt_lockfile, drift_decisions, &mut drifted, dry_run, "schemas", tgt_slug, remote_combined_hash)? {
+                DriftHandling::SkipObject => continue,
+                DriftHandling::Patch => {}
+            }
         }
         if bytes_equal_after_strip(&payload_json_full, &remote_json_full, "schemas")?
             && payload_formulas == remote_formulas
@@ -612,7 +765,10 @@ pub(crate) async fn run(
         let (in_sync, remote_hash) =
             tgt_drift_status(remote_bytes.clone(), overlay_paths, tgt_lockfile, "inboxes", tgt_slug)?;
         if !in_sync {
-            adopt_tgt_drift(&progress, tgt_lockfile, "inboxes", tgt_slug, remote_hash);
+            match handle_drift(&progress, tgt_lockfile, drift_decisions, &mut drifted, dry_run, "inboxes", tgt_slug, remote_hash)? {
+                DriftHandling::SkipObject => continue,
+                DriftHandling::Patch => {}
+            }
         }
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "inboxes")? {
             continue;
@@ -685,7 +841,10 @@ pub(crate) async fn run(
         let (in_sync, remote_hash) =
             tgt_drift_status(remote_bytes.clone(), overlay_paths, tgt_lockfile, "email_templates", tgt_key)?;
         if !in_sync {
-            adopt_tgt_drift(&progress, tgt_lockfile, "email_templates", tgt_key, remote_hash);
+            match handle_drift(&progress, tgt_lockfile, drift_decisions, &mut drifted, dry_run, "email_templates", tgt_key, remote_hash)? {
+                DriftHandling::SkipObject => continue,
+                DriftHandling::Patch => {}
+            }
         }
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "email_templates")? {
             continue;
@@ -745,7 +904,10 @@ pub(crate) async fn run(
         let (in_sync, remote_hash) =
             tgt_drift_status(remote_bytes.clone(), overlay_paths, tgt_lockfile, "engines", tgt_slug)?;
         if !in_sync {
-            adopt_tgt_drift(&progress, tgt_lockfile, "engines", tgt_slug, remote_hash);
+            match handle_drift(&progress, tgt_lockfile, drift_decisions, &mut drifted, dry_run, "engines", tgt_slug, remote_hash)? {
+                DriftHandling::SkipObject => continue,
+                DriftHandling::Patch => {}
+            }
         }
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "engines")? {
             continue;
@@ -826,7 +988,10 @@ pub(crate) async fn run(
         let (in_sync, remote_hash) =
             tgt_drift_status(remote_bytes.clone(), overlay_paths, tgt_lockfile, "engine_fields", tgt_slug)?;
         if !in_sync {
-            adopt_tgt_drift(&progress, tgt_lockfile, "engine_fields", tgt_slug, remote_hash);
+            match handle_drift(&progress, tgt_lockfile, drift_decisions, &mut drifted, dry_run, "engine_fields", tgt_slug, remote_hash)? {
+                DriftHandling::SkipObject => continue,
+                DriftHandling::Patch => {}
+            }
         }
         if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "engine_fields")? {
             continue;
@@ -885,7 +1050,7 @@ pub(crate) async fn run(
     if skipped > 0 {
         summary.push_str(&format!(", {skipped} skipped"));
     }
-    Ok(summary)
+    Ok(ApplyOutcome { summary, drifted })
 }
 
 /// Emit a `--- src / +++ tgt remote` unified diff for one update.

@@ -79,7 +79,7 @@ pub const KINDS_IN_DEP_ORDER: &[&str] = &[
     "engine_fields",
 ];
 
-pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run: bool, only: Vec<String>) -> Result<()> {
+pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run: bool, force_overwrite_drift: bool, only: Vec<String>) -> Result<()> {
     if src == tgt {
         return Err(anyhow!(
             "src and tgt envs are the same ('{src}'). Use two different envs for `rdc deploy`."
@@ -266,9 +266,19 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
             &tgt_overlay,
         )?;
     }
-    {
+    // Preview apply runs against a CLONED tgt_lockfile so its drift
+    // adoption + diff rendering is purely informational. It returns
+    // the list of objects that drifted on the target since the last
+    // `rdc sync <tgt>`; we surface those to the user (or auto-resolve
+    // via --force-overwrite-drift) BEFORE the real apply touches the
+    // remote.
+    let drifted_items: Vec<crate::cli::deploy::apply::DriftedItem> = {
         let mut preview_lockfile = tgt_lockfile.clone();
-        let preview_summary = crate::cli::deploy::apply::run(
+        let empty_decisions: BTreeMap<
+            (String, String),
+            crate::cli::deploy::apply::DriftDecision,
+        > = BTreeMap::new();
+        let preview_outcome = crate::cli::deploy::apply::run(
             src,
             tgt,
             true,
@@ -277,12 +287,14 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
             &mut preview_lockfile,
             selection.as_ref(),
             &hook_secrets_plan,
+            &empty_decisions,
         )
         .await
         .with_context(|| "computing update preview")?;
         println!();
-        println!("{preview_summary}");
-    }
+        println!("{}", preview_outcome.summary);
+        preview_outcome.drifted
+    };
     if mirror && plan.delete_total() > 0 {
         println!();
         println!("--- delete bodies (would be removed from {tgt}) ---");
@@ -295,6 +307,20 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
         let scope = selection.as_ref()
             .map(|s| format!(" (scoped, {} objects)", s.len()))
             .unwrap_or_default();
+        if !drifted_items.is_empty() {
+            println!();
+            println!(
+                "Note: {} target object(s) drifted from the last-sync baseline:",
+                drifted_items.len()
+            );
+            for d in &drifted_items {
+                println!("  - {}/{}", d.kind, d.slug);
+            }
+            println!(
+                "A real deploy would prompt [k]/[o]/[s]/[a] per item \
+                 (or require --force-overwrite-drift in non-TTY mode)."
+            );
+        }
         println!(
             "\nDry run ({src} -> {tgt}){scope}: {} would be created, {} would be deleted, \
              {:.1}s; no remote changes made.",
@@ -305,7 +331,16 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
         return Ok(());
     }
 
-    // 5. Confirm (TTY only). Skipped when nothing destructive is planned —
+    // 5. Drift resolver. For each tgt object that was edited out-of-band
+    //    since the last sync, ask the user what to do BEFORE the main
+    //    "Proceed?" confirm. Without this step, deploy silently
+    //    overwrites those edits — the unsafe default this resolver
+    //    replaces. Non-TTY / --yes invocations refuse unless the user
+    //    passed --force-overwrite-drift, which auto-overwrites all.
+    let drift_decisions: BTreeMap<(String, String), crate::cli::deploy::apply::DriftDecision> =
+        resolve_drift_decisions(&drifted_items, tgt, interactive, force_overwrite_drift)?;
+
+    // 6. Confirm (TTY only). Skipped when nothing destructive is planned —
     // an "all-update" sweep still runs but PATCHes only objects whose
     // canonical content differs, which is safe to do silently.
     if interactive && (plan.create_total() > 0 || plan.delete_total() > 0) {
@@ -452,9 +487,10 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
     // 10. Real apply. Per-object diffs were rendered in the preview pass
     // above, so apply runs here with dry_run=false, diff=false and emits
     // only its progress events for each PATCH. Apply takes the tgt
-    // lockfile by `&mut` so it can auto-adopt out-of-band tgt changes
-    // detected by its drift check.
-    let apply_summary = crate::cli::deploy::apply::run(
+    // lockfile by `&mut`; the drift_decisions map captures the resolver
+    // outcomes from step 5 so each drifted object is handled per the
+    // user's choice (overwrite / keep / skip).
+    let apply_outcome = crate::cli::deploy::apply::run(
         src,
         tgt,
         false,
@@ -463,11 +499,13 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
         &mut tgt_lockfile,
         selection.as_ref(),
         &hook_secrets_plan,
+        &drift_decisions,
     )
     .await
     .with_context(|| format!(
         "update phase failed after {creates_done} create(s) succeeded"
     ))?;
+    let apply_summary = apply_outcome.summary;
     tgt_lockfile
         .save(&tgt_paths.lockfile())
         .with_context(|| format!("saving tgt lockfile to {}", tgt_paths.lockfile().display()))?;
@@ -845,6 +883,116 @@ fn list_engine_field_slugs(paths: &Paths) -> Result<Vec<String>> {
     }
     out.sort();
     Ok(out)
+}
+
+// ----- drift resolver -------------------------------------------------
+
+/// Build the per-object drift-decisions map. On TTY (`interactive ==
+/// true`), prompts `[k]eep tgt / [o]verwrite / [s]kip / [a]bort` for
+/// each drifted item; the `[a]` choice aborts the deploy. On non-TTY,
+/// refuses unless the caller passed `--force-overwrite-drift`, which
+/// short-circuits every decision to `Overwrite`. Returns an empty map
+/// when no drift was detected.
+fn resolve_drift_decisions(
+    drifted: &[crate::cli::deploy::apply::DriftedItem],
+    tgt_env: &str,
+    interactive: bool,
+    force_overwrite_drift: bool,
+) -> Result<BTreeMap<(String, String), crate::cli::deploy::apply::DriftDecision>> {
+    use crate::cli::deploy::apply::DriftDecision;
+    let mut decisions: BTreeMap<(String, String), DriftDecision> = BTreeMap::new();
+    if drifted.is_empty() {
+        return Ok(decisions);
+    }
+    if force_overwrite_drift {
+        for d in drifted {
+            decisions.insert((d.kind.clone(), d.slug.clone()), DriftDecision::Overwrite);
+        }
+        println!();
+        println!(
+            "--force-overwrite-drift: auto-overwriting {} target object(s) \
+             that drifted from the last-sync baseline.",
+            drifted.len()
+        );
+        return Ok(decisions);
+    }
+    if !interactive {
+        let names: Vec<String> = drifted
+            .iter()
+            .map(|d| format!("  - {}/{}", d.kind, d.slug))
+            .collect();
+        return Err(anyhow!(
+            "deploy refused: {} target object(s) drifted on '{tgt_env}' since the last \
+             `rdc sync {tgt_env}`:\n{}\n\nRe-run with --force-overwrite-drift to overwrite \
+             these out-of-band edits, or run `rdc sync {tgt_env}` first to reconcile the \
+             baseline.",
+            drifted.len(),
+            names.join("\n"),
+        ));
+    }
+    // TTY interactive: per-object prompt. Echo the list once so the
+    // user has the full picture before answering item by item.
+    println!();
+    println!(
+        "⚠️  {} target object(s) have been edited out-of-band since the last `rdc sync {tgt_env}`:",
+        drifted.len()
+    );
+    for d in drifted {
+        println!("  - {}/{}", d.kind, d.slug);
+    }
+    println!();
+    println!(
+        "For each item, choose: [k]eep tgt edit · [o]verwrite with src · [s]kip (defer) · [a]bort"
+    );
+    for d in drifted {
+        let decision = prompt_drift_decision(&d.kind, &d.slug)?;
+        match decision {
+            Some(dec) => {
+                decisions.insert((d.kind.clone(), d.slug.clone()), dec);
+            }
+            None => {
+                println!("Aborted.");
+                return Err(anyhow!("deploy aborted at drift resolver"));
+            }
+        }
+    }
+    Ok(decisions)
+}
+
+/// One per-object drift prompt. `Ok(None)` = the user picked `[a]bort`
+/// — caller turns that into an error so the deploy short-circuits.
+/// Unrecognised input re-prompts. Empty input is treated as `[a]bort`
+/// so a stray Enter doesn't silently fall through to an unsafe
+/// default.
+fn prompt_drift_decision(
+    kind: &str,
+    slug: &str,
+) -> Result<Option<crate::cli::deploy::apply::DriftDecision>> {
+    use crate::cli::deploy::apply::DriftDecision;
+    use std::io::{BufRead, IsTerminal, Write};
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return Err(anyhow!(
+            "prompt_drift_decision called in non-TTY context (caller bug)"
+        ));
+    }
+    loop {
+        eprint!("  {kind}/{slug}: [k/o/s/a] ");
+        std::io::stderr().flush().ok();
+        let mut line = String::new();
+        let stdin = std::io::stdin();
+        stdin.lock().read_line(&mut line)?;
+        let ans = line.trim().to_ascii_lowercase();
+        return Ok(match ans.as_str() {
+            "k" | "keep" => Some(DriftDecision::Keep),
+            "o" | "overwrite" => Some(DriftDecision::Overwrite),
+            "s" | "skip" => Some(DriftDecision::Skip),
+            "a" | "abort" | "" => None,
+            _ => {
+                eprintln!("    please answer with k / o / s / a");
+                continue;
+            }
+        });
+    }
 }
 
 // ----- confirmation ---------------------------------------------------
@@ -1284,5 +1432,57 @@ mod tests {
         let slugs = vec!["a".into(), "b".into()];
         let out = topo_sort_hooks_to_create(&slugs, &src_paths, &lf);
         assert_eq!(out, slugs);
+    }
+
+    // ----- drift resolver -------------------------------------------------
+
+    use crate::cli::deploy::apply::{DriftDecision, DriftedItem};
+
+    fn drift_fixture() -> Vec<DriftedItem> {
+        vec![
+            DriftedItem { kind: "hooks".into(), slug: "validator".into() },
+            DriftedItem { kind: "queues".into(), slug: "cost-invoices".into() },
+        ]
+    }
+
+    #[test]
+    fn resolver_returns_empty_map_when_no_drift() {
+        let d = resolve_drift_decisions(&[], "prod", false, false).unwrap();
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn resolver_short_circuits_to_overwrite_when_force_flag_is_set() {
+        // --force-overwrite-drift in non-TTY: every drifted item gets
+        // an Overwrite decision so the deploy can proceed unattended.
+        // Same behavior in TTY (the flag overrides the prompt).
+        let drifted = drift_fixture();
+        let d = resolve_drift_decisions(&drifted, "prod", /*interactive=*/false, /*force=*/true)
+            .unwrap();
+        assert_eq!(d.len(), 2);
+        assert_eq!(
+            d.get(&("hooks".to_string(), "validator".to_string())),
+            Some(&DriftDecision::Overwrite)
+        );
+        assert_eq!(
+            d.get(&("queues".to_string(), "cost-invoices".to_string())),
+            Some(&DriftDecision::Overwrite)
+        );
+    }
+
+    #[test]
+    fn resolver_refuses_in_non_tty_mode_without_force_flag() {
+        // The whole point of the resolver: a CI script can't be
+        // trusted to silently overwrite ad-hoc UI edits on tgt.
+        // Surface the list of drifted items and the exact escape
+        // hatch (`--force-overwrite-drift` or `rdc sync <tgt>`).
+        let drifted = drift_fixture();
+        let err = resolve_drift_decisions(&drifted, "prod", false, false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("deploy refused"), "msg: {msg}");
+        assert!(msg.contains("hooks/validator"), "msg: {msg}");
+        assert!(msg.contains("queues/cost-invoices"), "msg: {msg}");
+        assert!(msg.contains("--force-overwrite-drift"), "msg: {msg}");
+        assert!(msg.contains("rdc sync prod"), "msg: {msg}");
     }
 }
