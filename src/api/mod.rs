@@ -49,16 +49,25 @@ struct Pagination {
     next: Option<String>,
 }
 
+/// Construct the shared reqwest Client used by every rdc HTTP path.
+///
+/// Single source of truth so a future change (timeout, user-agent, TLS
+/// tweak, proxy config) lands in one place instead of three.
+///
+/// Nagle is disabled: rdc's hot path is many small JSON requests
+/// (pagination + per-resource fetches), and the ~40 ms segment-delay
+/// Nagle adds compounds noticeably across hundreds of round-trips
+/// during a full sync.
+pub(crate) fn build_http_client() -> Result<Client> {
+    Client::builder()
+        .tcp_nodelay(true)
+        .build()
+        .map_err(|e| anyhow::anyhow!("building reqwest client: {e}"))
+}
+
 impl RossumClient {
     pub fn new(base_url: String, token: String) -> Result<Self> {
-        let http = Client::builder()
-            // Disable Nagle: rdc's hot path is many small JSON requests
-            // (pagination + per-resource fetches), and the ~40 ms
-            // segment-delay Nagle adds compounds noticeably across
-            // hundreds of round-trips during a full sync.
-            .tcp_nodelay(true)
-            .build()
-            .map_err(|e| anyhow::anyhow!("building reqwest client: {e}"))?;
+        let http = build_http_client()?;
         Ok(Self {
             base_url,
             token,
@@ -443,10 +452,7 @@ impl RossumClient {
 /// Retries on transient 429/502/503/504 via [`retry::send_with_retry`].
 /// 401 is **not** retried (a bad password isn't going to fix itself).
 pub async fn login(api_base: &str, username: &str, password: &str) -> Result<String> {
-    let http = Client::builder()
-        .tcp_nodelay(true)
-        .build()
-        .map_err(|e| anyhow::anyhow!("building reqwest client: {e}"))?;
+    let http = build_http_client()?;
     let url = format!("{api_base}/auth/login");
     let body = serde_json::json!({
         "username": username,
