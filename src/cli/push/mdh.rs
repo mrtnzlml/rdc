@@ -25,9 +25,23 @@ use crate::model::IndexSet;
 use crate::state::{content_hash, Lockfile, ObjectEntry};
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Poll cadence for index-drop wait loops.
+const DROP_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Maximum time to wait for a regular index drop to complete. Regular
+/// (b-tree / hashed) drops on MongoDB are nearly instant; the wrapper
+/// API returns 202 but the underlying op is fast. 10s is generous.
+const REGULAR_DROP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum time to wait for an Atlas Search index drop to complete.
+/// Search-index teardown runs in Atlas's background and can take
+/// several seconds for non-trivial mappings; 60s leaves headroom.
+const SEARCH_DROP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Push local index edits for one MDH dataset to the remote. Drops
 /// first (avoiding name collisions when a definition has changed),
@@ -70,6 +84,15 @@ pub async fn push_dataset(
     );
 
     let mut ops = 0usize;
+    // Track which names we just dropped so creates that reuse the same
+    // name know to wait for the async drop to complete before issuing
+    // the create. Without this gate the drop-then-create-same-name
+    // sequence races: the drop is queued, the create either fails on
+    // "already exists" or — worse for Atlas Search — succeeds and is
+    // then clobbered when the queued drop finally fires. Cross-name
+    // drop+create pairs don't race (different namespaces).
+    let mut dropped_regular: BTreeSet<String> = BTreeSet::new();
+    let mut dropped_search: BTreeSet<String> = BTreeSet::new();
     for name in &plan.drop_regular {
         client
             .drop_index(collection_name, name, Some(progress.clone()))
@@ -79,6 +102,7 @@ pub async fn push_dataset(
             Action::Delete,
             &format!("mdh/{slug} regular index '{name}'"),
         );
+        dropped_regular.insert(name.clone());
         ops += 1;
     }
     for name in &plan.drop_search {
@@ -92,6 +116,7 @@ pub async fn push_dataset(
             Action::Delete,
             &format!("mdh/{slug} search index '{name}'"),
         );
+        dropped_search.insert(name.clone());
         ops += 1;
     }
     for def in &plan.create_regular {
@@ -99,6 +124,9 @@ pub async fn push_dataset(
             .get("name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("regular index def missing `name` field: {def}"))?;
+        if dropped_regular.contains(name) {
+            wait_for_regular_drop(client, collection_name, name, progress).await?;
+        }
         let keys = def
             .get("key")
             .ok_or_else(|| anyhow!("regular index '{name}' missing `key` field"))?;
@@ -120,6 +148,9 @@ pub async fn push_dataset(
             .get("name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("search index def missing `name` field: {def}"))?;
+        if dropped_search.contains(name) {
+            wait_for_search_drop(client, collection_name, name, progress).await?;
+        }
         let mappings = def
             .get("mappings")
             .ok_or_else(|| anyhow!("search index '{name}' missing `mappings` field"))?;
@@ -169,6 +200,76 @@ pub async fn push_dataset(
     }
 
     Ok(ops)
+}
+
+/// Poll `list_indexes` until the named regular index is gone (or the
+/// timeout expires). Used after `drop_index` when the next step is a
+/// `create_index` for the same name — without this gate the drop is
+/// still pending when create runs, and the API rejects "already
+/// exists" or silently clobbers the just-created definition.
+async fn wait_for_regular_drop(
+    client: &DataStorageClient,
+    collection: &str,
+    index_name: &str,
+    progress: &Arc<Log>,
+) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        let list = client
+            .list_indexes(collection, Some(progress.clone()))
+            .await
+            .with_context(|| format!("polling list_indexes for '{collection}'"))?;
+        let still_there = list
+            .iter()
+            .any(|ix| ix.get("name").and_then(|n| n.as_str()) == Some(index_name));
+        if !still_there {
+            return Ok(());
+        }
+        if start.elapsed() >= REGULAR_DROP_TIMEOUT {
+            return Err(anyhow!(
+                "timed out after {:?} waiting for regular index '{}' on '{}' to drop",
+                REGULAR_DROP_TIMEOUT,
+                index_name,
+                collection
+            ));
+        }
+        tokio::time::sleep(DROP_POLL_INTERVAL).await;
+    }
+}
+
+/// Poll `list_search_indexes` until the named search index is gone
+/// (or the longer Atlas-Search timeout expires). Atlas tears down the
+/// underlying index asynchronously in the background, so a drop +
+/// recreate of the same name MUST wait or the queued drop will
+/// clobber the just-created index.
+async fn wait_for_search_drop(
+    client: &DataStorageClient,
+    collection: &str,
+    index_name: &str,
+    progress: &Arc<Log>,
+) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        let list = client
+            .list_search_indexes(collection, Some(progress.clone()))
+            .await
+            .with_context(|| format!("polling list_search_indexes for '{collection}'"))?;
+        let still_there = list
+            .iter()
+            .any(|ix| ix.get("name").and_then(|n| n.as_str()) == Some(index_name));
+        if !still_there {
+            return Ok(());
+        }
+        if start.elapsed() >= SEARCH_DROP_TIMEOUT {
+            return Err(anyhow!(
+                "timed out after {:?} waiting for search index '{}' on '{}' to drop",
+                SEARCH_DROP_TIMEOUT,
+                index_name,
+                collection
+            ));
+        }
+        tokio::time::sleep(DROP_POLL_INTERVAL).await;
+    }
 }
 
 /// Pure index-set diff: which named entries should be dropped from
