@@ -102,9 +102,6 @@ pub enum Command {
         /// Print the plan and exit without making any changes.
         #[arg(long = "dry-run")]
         dry_run: bool,
-        /// With `--dry-run`, print per-object unified diffs.
-        #[arg(long = "diff", requires = "dry_run")]
-        diff: bool,
         /// Permit local-tombstone → remote DELETE without per-object prompts.
         #[arg(long = "allow-deletes")]
         allow_deletes: bool,
@@ -115,7 +112,7 @@ pub enum Command {
         #[arg(long = "no-pull", conflicts_with = "no_push")]
         no_pull: bool,
         /// Watch local files + poll the env continuously; reconcile on each event.
-        #[arg(long = "watch", conflicts_with_all = ["dry_run", "diff"])]
+        #[arg(long = "watch", conflicts_with_all = ["dry_run"])]
         watch: bool,
         /// Poll cadence for remote drift in watch mode. Accepts human durations
         /// (`30s`, `2m`, `5m`). Default `60s`.
@@ -263,7 +260,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Sync {
             env,
             dry_run,
-            diff,
             allow_deletes,
             no_push,
             no_pull,
@@ -294,7 +290,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 .await
             } else {
                 with_401_retry(&env, || {
-                    crate::cli::sync::run(&env, interactive, dry_run, diff, allow_deletes, no_push, no_pull)
+                    crate::cli::sync::run(&env, interactive, dry_run, allow_deletes, no_push, no_pull)
                 })
                 .await
             }

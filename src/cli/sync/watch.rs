@@ -55,7 +55,6 @@ pub async fn run_watch(
             env,
             interactive,
             false,
-            false,
             allow_deletes,
             no_push,
             no_pull,
@@ -199,7 +198,7 @@ pub(crate) async fn event_loop(
                 sync_running.store(true, Ordering::Relaxed);
                 let _cycle_guard = CycleGuard(&sync_running);
                 let _outcome = match crate::cli::sync::run_cycle(
-                    env, interactive, false, false, allow_deletes, no_push, no_pull,
+                    env, interactive, false, allow_deletes, no_push, no_pull,
                     renderer.clone(),
                 ).await {
                     Ok(o) => o,
@@ -213,7 +212,7 @@ pub(crate) async fn event_loop(
                         }
                         crate::cli::auth::refresh_token_interactively(env).await?;
                         crate::cli::sync::run_cycle(
-                            env, interactive, false, false, allow_deletes, no_push, no_pull,
+                            env, interactive, false, allow_deletes, no_push, no_pull,
                             renderer.clone(),
                         ).await?
                     }

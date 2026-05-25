@@ -49,3 +49,9 @@ codegen-units = 1
 strip = true
 panic = "abort"
 opt-level = 3
+
+# Compile-time guard against dead code accumulating in the tree. Any
+# unused function, struct, enum variant, etc. is a hard error rather
+# than a silent warning. Applies to lib, bin, tests, and examples.
+[lints.rust]
+dead_code = "deny"
