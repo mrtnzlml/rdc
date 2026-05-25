@@ -33,7 +33,7 @@ archive:
     - git config user.name  "rdc-archive[bot]"
     - git config user.email "rdc-archive@noreply"
   script:
-    - rdc sync "$RDC_ENV" --no-push --yes --force-overwrite-drift
+    - rdc sync "$RDC_ENV" --no-push --yes
     - |
       git add -A "envs/$RDC_ENV" ".rdc/state/$RDC_ENV.lock.json"
       if git diff --staged --quiet; then

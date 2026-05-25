@@ -668,7 +668,7 @@ Setup:
 The job:
 
 - Downloads a pinned `rdc` release tarball from GitHub (`RDC_VERSION` variable in the template).
-- Runs `rdc sync "$RDC_ENV" --no-push --yes --force-overwrite-drift`. `--no-push` keeps the sync pull-only; `--force-overwrite-drift` makes the snapshot reflect any out-of-band remote edits silently (archival semantics — the remote is canonical).
+- Runs `rdc sync "$RDC_ENV" --no-push --yes`. `--no-push` keeps the sync pull-only — no local edits are ever sent. If both local and remote have diverged since the last archive (i.e., a human pushed an edit to the archive branch between runs), the non-TTY drift resolver falls back to skip-with-warning: local stays on disk, the remote's bytes land at `<file>.<env-name>` shadow files for review. For a strict 'remote is canonical' archive, don't push human edits to the archive branch — let the CI job be the only writer.
 - Commits `envs/<env>/` + `.rdc/state/<env>.lock.json` to the default branch when there's a diff. The `rules:` block restricts the job to `schedule` and `web` triggers, so the self-commit doesn't recursively trigger the archive.
 
 Smoke test after setup:

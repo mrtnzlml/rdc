@@ -147,7 +147,8 @@ archive:
 |---|---|
 | `--no-push` | Audit mode. Pull-only — never sends local edits to the remote. The README already documents this as the CI audit pattern. |
 | `--yes` | Non-interactive: skip the destructive-section confirm and any other TTY prompt. |
-| `--force-overwrite-drift` | Archival semantics: the remote is canonical, so out-of-band remote edits are silently adopted into the snapshot. Without this, sync's drift resolver refuses on non-TTY (current README behavior). |
+
+**Note on `--force-overwrite-drift`:** Originally specified for `sync` to achieve archival semantics (remote is canonical, out-of-band edits silently adopted), but that flag is currently `deploy`-only. Spec relaxed to accept skip-with-warning shadow files in the rare case of human-edited archive branch. If the archive branch is write-protected and only the CI job commits to it, skips are unreachable.
 
 ### Auth at runtime
 
