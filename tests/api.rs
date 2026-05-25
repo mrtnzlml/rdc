@@ -540,3 +540,50 @@ async fn list_users_paginates() {
     assert_eq!(users.len(), 2);
     assert!(users.iter().any(|u| u.is_system_user()));
 }
+
+#[tokio::test]
+async fn login_posts_credentials_and_returns_key() {
+    use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/auth/login"))
+        .and(matchers::body_json(serde_json::json!({
+            "username": "alice@example.com",
+            "password": "hunter2",
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "key": "fresh-token-abc",
+            "domain": "example",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api_base = format!("{}/v1", server.uri());
+    let token = rdc::api::login(&api_base, "alice@example.com", "hunter2")
+        .await
+        .expect("login should succeed");
+    assert_eq!(token, "fresh-token-abc");
+}
+
+#[tokio::test]
+async fn login_propagates_401_on_bad_credentials() {
+    use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/auth/login"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "detail": "Invalid username/password.",
+        })))
+        .mount(&server)
+        .await;
+
+    let api_base = format!("{}/v1", server.uri());
+    let err = rdc::api::login(&api_base, "alice@example.com", "wrong")
+        .await
+        .expect_err("login should fail on 401");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("401"), "error should mention status: {msg}");
+}

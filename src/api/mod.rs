@@ -430,3 +430,53 @@ impl RossumClient {
             .with_context(|| format!("decoding POST response from {url}"))
     }
 }
+
+/// Exchange username/password for an API token via
+/// `POST /v1/auth/login`. Returns the issued `key`.
+///
+/// This is a free function rather than a method on [`RossumClient`]
+/// because login doesn't take a token (it produces one). Used by
+/// `secrets::resolve_token` to obtain a fresh token when the cache is
+/// missing/expired and `RDC_USER_<ENV>` + `RDC_PASS_<ENV>` are set,
+/// and by `cli::auth::run` to handle `rdc auth <env> --username <u>`.
+///
+/// Retries on transient 429/502/503/504 via [`retry::send_with_retry`].
+/// 401 is **not** retried (a bad password isn't going to fix itself).
+pub async fn login(api_base: &str, username: &str, password: &str) -> Result<String> {
+    let http = Client::builder()
+        .tcp_nodelay(true)
+        .build()
+        .map_err(|e| anyhow::anyhow!("building reqwest client: {e}"))?;
+    let url = format!("{api_base}/auth/login");
+    let body = serde_json::json!({
+        "username": username,
+        "password": password,
+    });
+    let progress: ProgressHandle = None;
+    let resp = retry::send_with_retry(
+        || http.post(&url).json(&body),
+        &format!("POST {url}"),
+        progress.clone(),
+        None, // no rate limiter — login is rare
+    )
+    .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp.text().await.unwrap_or_default();
+        return Err(ApiError::Status {
+            status: status.as_u16(),
+            body: body_text,
+            env: None,
+        }
+        .into());
+    }
+    #[derive(Deserialize)]
+    struct LoginResponse {
+        key: String,
+    }
+    let parsed: LoginResponse = resp
+        .json()
+        .await
+        .with_context(|| format!("decoding login response from {url}"))?;
+    Ok(parsed.key)
+}
