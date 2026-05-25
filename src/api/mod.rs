@@ -1,9 +1,11 @@
 pub mod data_storage;
 pub mod error;
+pub mod rate_limit;
 pub mod retry;
 
 pub use data_storage::DataStorageClient;
-pub use error::{anyhow_has_status, ApiError};
+pub use error::{anyhow_has_status, anyhow_status_env, ApiError};
+pub use rate_limit::RateLimiter;
 
 use crate::model::{
     EmailTemplate, Engine, EngineField, Hook, HookTemplate, Inbox, Label, Organization, Queue,
@@ -13,6 +15,7 @@ use crate::api::retry::ProgressHandle;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
+use std::sync::Arc;
 
 /// Rossum API client. Holds a base URL (e.g. `https://X.rossum.app/api/v1`)
 /// and a static API token. Pagination is followed transparently for `list_*`
@@ -22,6 +25,17 @@ pub struct RossumClient {
     base_url: String,
     token: String,
     http: Client,
+    /// Env name (e.g. `"dev-mtr"`) attached to errors via [`EnvTag`] so a
+    /// caller juggling multiple clients (notably `rdc deploy`, which holds
+    /// src+tgt) can attribute a 401 back to the right env and refresh its
+    /// token. `None` means errors are not env-tagged.
+    env: Option<String>,
+    /// Per-token client-side rate limiter. Defaults to the
+    /// `default.core_api` policy Rossum enforces server-side (10 req/s,
+    /// burst 10). `Arc` so all in-flight calls share one bucket; two
+    /// clients (e.g. deploy's src + tgt) get independent buckets which
+    /// matches the server's per-token scope.
+    limiter: Arc<RateLimiter>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,7 +59,23 @@ impl RossumClient {
             .tcp_nodelay(true)
             .build()
             .map_err(|e| anyhow::anyhow!("building reqwest client: {e}"))?;
-        Ok(Self { base_url, token, http })
+        Ok(Self {
+            base_url,
+            token,
+            http,
+            env: None,
+            limiter: Arc::new(RateLimiter::rossum_core_api()),
+        })
+    }
+
+    /// Attach an env label so any non-2xx error this client produces
+    /// carries the env name in its `ApiError::Status { env, .. }`. Used by
+    /// `rdc deploy`, which holds two clients (src + tgt); the retry
+    /// wrapper inspects the tag to know which env's token to refresh on a
+    /// 401.
+    pub fn with_env_label(mut self, env: impl Into<String>) -> Self {
+        self.env = Some(env.into());
+        self
     }
 
     // --- list endpoints (paginated) -----------------------------------
@@ -260,13 +290,14 @@ impl RossumClient {
                 .header("Authorization", format!("token {}", self.token)),
             &format!("DELETE {url}"),
             progress,
+            Some(&self.limiter),
         ).await?;
         let status = resp.status();
         if status.is_success() || status.as_u16() == 404 {
             return Ok(());
         }
         let body = resp.text().await.unwrap_or_default();
-        Err(ApiError::Status { status: status.as_u16(), body }.into())
+        Err(ApiError::Status { status: status.as_u16(), body, env: self.env.clone() }.into())
     }
 
     pub async fn delete_hook(&self, id: u64, progress: ProgressHandle) -> Result<()> {
@@ -327,12 +358,13 @@ impl RossumClient {
             || self.http.get(url).header("Authorization", format!("token {}", self.token)),
             &format!("GET {url}"),
             progress,
+            Some(&self.limiter),
         ).await?;
 
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status: status.as_u16(), body }.into());
+            return Err(ApiError::Status { status: status.as_u16(), body, env: self.env.clone() }.into());
         }
         resp.json::<T>().await
             .with_context(|| format!("decoding response from {url}"))
@@ -361,11 +393,12 @@ impl RossumClient {
                 .json(body),
             &format!("PATCH {url}"),
             progress,
+            Some(&self.limiter),
         ).await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status: status.as_u16(), body }.into());
+            return Err(ApiError::Status { status: status.as_u16(), body, env: self.env.clone() }.into());
         }
         resp.json::<TResp>().await
             .with_context(|| format!("decoding PATCH response from {url}"))
@@ -386,11 +419,12 @@ impl RossumClient {
                 .json(body),
             &format!("POST {url}"),
             progress,
+            Some(&self.limiter),
         ).await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status: status.as_u16(), body }.into());
+            return Err(ApiError::Status { status: status.as_u16(), body, env: self.env.clone() }.into());
         }
         resp.json::<TResp>().await
             .with_context(|| format!("decoding POST response from {url}"))

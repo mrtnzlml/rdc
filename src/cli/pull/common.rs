@@ -808,7 +808,8 @@ mod tests {
     fn skip_on_permission_denied_returns_empty_for_403() {
         let err: Result<Vec<u32>> = Err(anyhow!(ApiError::Status {
             status: 403,
-            body: "permission_denied".into()
+            body: "permission_denied".into(),
+            env: None,
         }));
         let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
         let out = skip_on_permission_denied(err, "engines", &p).unwrap();
@@ -819,7 +820,8 @@ mod tests {
     fn skip_on_permission_denied_propagates_other_errors() {
         let err: Result<Vec<u32>> = Err(anyhow!(ApiError::Status {
             status: 500,
-            body: "boom".into()
+            body: "boom".into(),
+            env: None,
         }));
         let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
         assert!(skip_on_permission_denied(err, "engines", &p).is_err());

@@ -274,7 +274,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 &[&src],
             )?;
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
-            crate::cli::deploy::run::run(&src, &tgt, mirror, interactive, dry_run, diff, only).await
+            with_401_retry_envs(&[&src, &tgt], || {
+                let only = only.clone();
+                crate::cli::deploy::run::run(&src, &tgt, mirror, interactive, dry_run, diff, only)
+            })
+            .await
         }
         Some(Command::Diff { left, right }) => crate::cli::diff::run(left, right).await,
         Some(Command::Auth { env, token }) => {
@@ -323,6 +327,62 @@ where
         }
         other => other,
     }
+}
+
+/// Like [`with_401_retry`] but for commands that juggle more than one env
+/// (notably `rdc deploy`, which holds clients for both src and tgt).
+///
+/// On a 401 we use the [`EnvTag`](crate::api::EnvTag) that the failing
+/// client attached to the error chain to refresh the right env's token,
+/// then retry the operation once. If no tag is present (a 401 from an
+/// untagged code path), we fall back to prompting the user which env to
+/// refresh — that keeps the "never fail with a raw 401" promise even for
+/// callers that haven't opted into env-tagging yet.
+async fn with_401_retry_envs<F, Fut>(envs: &[&str], op: F) -> anyhow::Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let first = op().await;
+    match first {
+        Err(e) if crate::api::anyhow_has_status(&e, 401) => {
+            let target_env = match crate::api::anyhow_status_env(&e, 401) {
+                Some(env_from_tag) => env_from_tag,
+                None => prompt_pick_env_for_401(envs)?,
+            };
+            crate::cli::auth::refresh_token_interactively(&target_env).await?;
+            op().await
+        }
+        other => other,
+    }
+}
+
+/// Interactive fallback when a 401 isn't tagged with an env. Lets the
+/// user pick which env's token to refresh. Bails (with the original 401
+/// hint) on non-TTY contexts.
+fn prompt_pick_env_for_401(envs: &[&str]) -> anyhow::Result<String> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "Rossum API returned 401 for one of: {}. \
+             Re-run on a TTY to refresh interactively, or run \
+             `rdc auth <env> --token <new-token>` for the affected env.",
+            envs.join(", ")
+        );
+    }
+    if envs.len() == 1 {
+        return Ok(envs[0].to_string());
+    }
+    let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
+    log.event(
+        crate::log::Action::Auth,
+        "token rejected (401); which env's token needs refreshing?",
+    );
+    let choices: Vec<String> = envs.iter().map(|s| s.to_string()).collect();
+    let picked = inquire::Select::new("Refresh token for which env?", choices)
+        .prompt()
+        .map_err(|e| anyhow::anyhow!("env prompt failed: {e}"))?;
+    Ok(picked)
 }
 
 /// Parse a human-friendly duration string (`30s`, `2m`, `5m`, `1h`) into
