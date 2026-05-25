@@ -581,22 +581,48 @@ Sync surfaces pending renames in its summary.
 
 ## Authentication
 
-Token resolution per env, in priority order:
+Per-env credential resolution, in priority order:
 
-1. `RDC_TOKEN_<ENV_UPPER>` environment variable. Recommended for CI. The env name is uppercased and any non-alphanumeric character is normalized to `_` so the shell can export it: `test` → `RDC_TOKEN_TEST`, `dev-ap` → `RDC_TOKEN_DEV_AP`.
-2. `secrets/<env>.secrets.json` — `{"api_token": "..."}`. Recommended locally. `rdc init` adds `secrets/` to `.gitignore`.
+1. `RDC_TOKEN_<ENV>` env var — used as-is (opaque, no expiry tracking).
+2. `secrets/<env>.secrets.json` — cached token from a previous `rdc auth` or auto-login; reused until `expires_at` (if recorded).
+3. `RDC_USER_<ENV>` + `RDC_PASS_<ENV>` env vars — rdc calls `POST /v1/auth/login` and caches the result in (2).
 
-Set or rotate:
+`<ENV>` is the env name from `rdc.toml`, uppercased, with non-alphanumerics replaced by `_`. So `test` → `RDC_TOKEN_TEST`, `dev-ap` → `RDC_USER_DEV_AP`.
+
+### Env vars rdc reads
+
+| Var | Purpose |
+|---|---|
+| `RDC_TOKEN_<ENV>` | API token override. Highest priority. Use for CI when a long-lived token exists. |
+| `RDC_USER_<ENV>` | System username. Paired with `RDC_PASS_<ENV>`. Used when tokens are too short-lived (e.g. support-team accounts) — rdc calls `POST /v1/auth/login` to exchange for a fresh token, cached in `secrets/<env>.secrets.json` with a computed expiry. |
+| `RDC_PASS_<ENV>` | System password. Paired with `RDC_USER_<ENV>`. Both must be set together. |
+| `RDC_REPAIR_CURE` | Non-TTY cure selection for `rdc repair --fix-store-anomaly`: `reinstall`, `skip`, or default `convert`. |
+| `EDITOR` | Editor opened for `[e]` in the conflict resolver. Defaults to `vi`. Standard OS env var. |
+| `NO_COLOR` | When non-empty, disables ANSI color output. Honors [no-color.org](https://no-color.org). |
+
+### Set or rotate
+
+By token (CI-friendly, validates against `GET /organizations/{org_id}` before writing):
 
 ```sh
 rdc auth test --token <new-token>
 ```
 
-Validates against `GET /organizations/{org_id}` before writing the file (mode 0600 on Unix). For pipe input that keeps the token out of shell history:
+By username + password (calls `POST /v1/auth/login`, validates, caches the result with computed expiry):
+
+```sh
+rdc auth test --username alice@example.com
+# password is prompted on TTY (masked), or piped on stdin:
+echo "$RDC_PASS_TEST" | rdc auth test --username alice@example.com
+```
+
+For pipe input that keeps a token out of shell history:
 
 ```sh
 read -s T && echo "$T" | rdc auth test
 ```
+
+When `secrets/<env>.secrets.json` contains an `expires_at` and the cache is past expiry, rdc auto-refreshes by calling `/v1/auth/login` again — provided `RDC_USER_<ENV>` + `RDC_PASS_<ENV>` are set. Otherwise the next command surfaces an actionable error pointing at the three options.
 
 Master Data Hub is pulled automatically when the cluster has it enabled. The Data Storage URL is derived from `api_base`; no extra config to set. On clusters without MDH, the lookup returns 404 and `rdc` skips silently.
 
@@ -626,6 +652,32 @@ Every Rossum and Data Storage HTTP call retries automatically on:
 - `502` / `503` / `504` — transient infrastructure.
 
 Up to 5 attempts with exponential backoff (1s, 2s, 4s, 8s, 16s, capped at 60s). A stderr line marks each retry so the tool never sits silent. `500 Internal Server Error` is **not** retried — treating it as transient masks real server bugs.
+
+## Daily archive in GitLab CI
+
+For an automated daily snapshot of a Rossum env (pull-only, committed to the repo so the git history *is* the archive), copy `templates/gitlab-ci-archival.yml` into a Rossum project repo as `.gitlab-ci.yml`.
+
+Setup:
+
+1. Set CI variables (Settings → CI/CD → Variables, masked + protected):
+   - `RDC_USER_<ENV>` — system username for the env.
+   - `RDC_PASS_<ENV>` — system password for the env.
+2. Add a schedule (Settings → CI/CD → Schedules), e.g. `0 2 * * *` UTC.
+3. In Settings → CI/CD → Token Permissions, allow the project's `CI_JOB_TOKEN` to push to the repo (or replace the push command in the template with a personal access token).
+
+The job:
+
+- Downloads a pinned `rdc` release tarball from GitHub (`RDC_VERSION` variable in the template).
+- Runs `rdc sync "$RDC_ENV" --no-push --yes --force-overwrite-drift`. `--no-push` keeps the sync pull-only; `--force-overwrite-drift` makes the snapshot reflect any out-of-band remote edits silently (archival semantics — the remote is canonical).
+- Commits `envs/<env>/` + `.rdc/state/<env>.lock.json` to the default branch when there's a diff. The `rules:` block restricts the job to `schedule` and `web` triggers, so the self-commit doesn't recursively trigger the archive.
+
+Smoke test after setup:
+
+1. Trigger via Settings → CI/CD → Schedules → "Play".
+2. Check the job log for `rdc sync`'s summary line.
+3. Confirm a commit appears on the default branch (or "No changes in `<env>`; nothing to archive." if the remote hasn't drifted).
+
+Deliberately out of scope: tagging, per-day branches, artifact uploads, retry-on-transient-login-failure beyond rdc's built-in 429/502/503/504 retry. Layer those on as needed.
 
 ## Upgrade
 
