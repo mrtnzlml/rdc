@@ -90,6 +90,8 @@ pub fn serialize_hook(hook: &Hook) -> Result<(Vec<u8>, Option<String>)> {
             _ => None,
         });
 
+    sort_queues(&mut json_value);
+
     crate::snapshot::key_order::strip_hidden_fields_recursive(&mut json_value);
     crate::snapshot::key_order::reorder_top_level(
         &mut json_value,
@@ -100,6 +102,32 @@ pub fn serialize_hook(hook: &Hook) -> Result<(Vec<u8>, Option<String>)> {
         .context("serializing hook json")?;
     bytes.push(b'\n');
     Ok((bytes, code))
+}
+
+/// Sort the top-level `queues` URL array in place.
+///
+/// The Rossum API returns a hook's queue membership in the server's
+/// internal numeric-id order, which is arbitrary from rdc's perspective
+/// and not stable across pulls (a queue rebuilt or re-attached can
+/// shift positions). Without normalising at serialize time, the on-disk
+/// JSON would churn every time the server reshuffles, producing false
+/// drift on sync and noisy git diffs. Hook→queue membership is a set,
+/// not a list — order carries no meaning — so a deterministic
+/// lexicographic sort is safe.
+///
+/// Defensive: only sorts when every element is a string. Mixed arrays
+/// (which shouldn't happen for `queues` but might if someone hand-edits
+/// the file) pass through untouched rather than panicking.
+fn sort_queues(value: &mut Value) {
+    let Some(obj) = value.as_object_mut() else { return };
+    let Some(Value::Array(queues)) = obj.get_mut("queues") else { return };
+    if !queues.iter().all(|v| matches!(v, Value::String(_))) {
+        return;
+    }
+    queues.sort_by(|a, b| match (a, b) {
+        (Value::String(s1), Value::String(s2)) => s1.cmp(s2),
+        _ => std::cmp::Ordering::Equal,
+    });
 }
 
 /// Write only the hook's sidecar code file (extracted from `config.code`).
@@ -646,5 +674,108 @@ mod tests {
             .and_then(|s| s.as_str())
             .unwrap_or("");
         assert_eq!(code, "// canonical\n");
+    }
+
+    fn hook_with_queues(urls: &[&str]) -> Hook {
+        let v = json!({
+            "id": 99,
+            "url": "https://example/api/v1/hooks/99",
+            "name": "QueuedHook",
+            "type": "function",
+            "queues": urls,
+            "events": [],
+            "config": { "runtime": "python3.12" }
+        });
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn queues_array(bytes: &[u8]) -> Vec<String> {
+        let v: Value = serde_json::from_slice(bytes).unwrap();
+        v.get("queues")
+            .and_then(|q| q.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|x| x.as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn serialize_hook_sorts_queues_lexicographically() {
+        // Server returned this set in id-order which happens to be
+        // reverse-lex. After serialize, on-disk order must be sorted.
+        let h = hook_with_queues(&[
+            "https://example/api/v1/queues/30",
+            "https://example/api/v1/queues/10",
+            "https://example/api/v1/queues/20",
+        ]);
+        let (bytes, _) = serialize_hook(&h).unwrap();
+        assert_eq!(
+            queues_array(&bytes),
+            vec![
+                "https://example/api/v1/queues/10".to_string(),
+                "https://example/api/v1/queues/20".to_string(),
+                "https://example/api/v1/queues/30".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn serialize_hook_two_orderings_produce_identical_bytes() {
+        // The whole point of the sort: two pulls returning the same set
+        // of queues in different orders must produce byte-equal on-disk
+        // JSON, so sync sees no drift and git stays quiet.
+        let a = hook_with_queues(&[
+            "https://example/api/v1/queues/2",
+            "https://example/api/v1/queues/1",
+            "https://example/api/v1/queues/3",
+        ]);
+        let b = hook_with_queues(&[
+            "https://example/api/v1/queues/3",
+            "https://example/api/v1/queues/2",
+            "https://example/api/v1/queues/1",
+        ]);
+        let (bytes_a, _) = serialize_hook(&a).unwrap();
+        let (bytes_b, _) = serialize_hook(&b).unwrap();
+        assert_eq!(bytes_a, bytes_b);
+    }
+
+    #[test]
+    fn serialize_hook_handles_empty_and_single_queue() {
+        let empty = hook_with_queues(&[]);
+        let (bytes, _) = serialize_hook(&empty).unwrap();
+        assert_eq!(queues_array(&bytes), Vec::<String>::new());
+
+        let single = hook_with_queues(&["https://example/api/v1/queues/42"]);
+        let (bytes, _) = serialize_hook(&single).unwrap();
+        assert_eq!(
+            queues_array(&bytes),
+            vec!["https://example/api/v1/queues/42".to_string()]
+        );
+    }
+
+    #[test]
+    fn serialize_hook_queue_sort_round_trips_through_read() {
+        // After a write→read cycle, the in-memory Hook reflects the
+        // sorted on-disk order — so push/diff downstream see stable
+        // membership regardless of what order the server first
+        // returned.
+        let dir = TempDir::new().unwrap();
+        let h = hook_with_queues(&[
+            "https://example/api/v1/queues/9",
+            "https://example/api/v1/queues/1",
+            "https://example/api/v1/queues/5",
+        ]);
+        write_hook(dir.path(), "qh", &h).unwrap();
+        let read = read_hook(dir.path(), "qh").unwrap();
+        assert_eq!(
+            read.queues,
+            vec![
+                "https://example/api/v1/queues/1".to_string(),
+                "https://example/api/v1/queues/5".to_string(),
+                "https://example/api/v1/queues/9".to_string(),
+            ]
+        );
     }
 }
