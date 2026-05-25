@@ -170,9 +170,126 @@ pub async fn plan_store_extension_bootstrap(
     Ok(plans)
 }
 
-/// Resolve the effective `token_owner` URL for a store extension on a
-/// given environment. Order: per-hook overlay `token_owner` → overlay
-/// `[defaults] store_extension_token_owner` → `None`.
+/// Resolve token_owner URLs for non-store-extension hooks-to-be-created.
+///
+/// Regular webhook/function hooks also carry a `token_owner` (a user URL).
+/// On a cross-env deploy the src snapshot's user URL doesn't exist on tgt,
+/// so a raw POST yields `400 {"token_owner":["Invalid hyperlink - Object
+/// does not exist."]}`. This pre-pass mirrors `plan_store_extension_bootstrap`
+/// for regular hooks: per-hook overlay → `[defaults]
+/// store_extension_token_owner` → interactive picker → write back to overlay.
+///
+/// Walks src hooks/, skips store extensions (handled by the dedicated
+/// store-extension pre-pass) and hooks already present on tgt (those are
+/// PATCH-targets, not creates). Hooks whose src snapshot has no
+/// `token_owner` (or where it's `null`) are omitted from the result — the
+/// create path will simply strip the field and let the server pick a
+/// sensible default. The returned map is keyed by tgt slug.
+pub async fn plan_regular_hook_token_owners(
+    src_paths: &crate::paths::Paths,
+    tgt_client: &RossumClient,
+    tgt_lockfile: &Lockfile,
+    mapping: &Mapping,
+    tgt_overlay_path: &Path,
+    interactive: bool,
+    self_user_id: Option<u64>,
+    tgt_env_label: &str,
+    progress: ProgressHandle,
+) -> Result<BTreeMap<String, String>> {
+    let hooks_dir = src_paths.hooks_dir();
+    if !hooks_dir.exists() {
+        return Ok(BTreeMap::new());
+    }
+
+    // Walk src hooks dir, keep only non-store-ext hooks that don't yet
+    // exist on tgt AND whose src body carries a (non-null) token_owner.
+    let mut needed: Vec<(String, Value)> = Vec::new();
+    for entry in std::fs::read_dir(&hooks_dir)
+        .with_context(|| format!("reading {}", hooks_dir.display()))?
+    {
+        let path = entry?.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let slug = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        let hook = crate::snapshot::hook::read_hook(&hooks_dir, &slug)?;
+        if hook.is_store_extension() {
+            continue;
+        }
+        let tgt_slug = mapping.lookup_tgt_slug("hooks", &slug)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| slug.clone());
+        if tgt_lockfile.objects.get("hooks").and_then(|m| m.get(&tgt_slug)).is_some() {
+            continue;
+        }
+        let body = serde_json::to_value(&hook)
+            .with_context(|| format!("serializing src hook '{slug}' for token_owner check"))?;
+        let has_token_owner = body
+            .get("token_owner")
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
+        if !has_token_owner {
+            continue;
+        }
+        needed.push((tgt_slug, body));
+    }
+    if needed.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut overlay = Overlay::load(tgt_overlay_path)?;
+    let mut tgt_users: Option<Vec<crate::model::User>> = None;
+    let mut default_url: Option<String> = overlay.as_ref()
+        .and_then(|ov| ov.defaults.store_extension_token_owner.clone());
+
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for (tgt_slug, _body) in &needed {
+        let resolved = effective_token_owner(overlay.as_ref(), tgt_slug)
+            .map(|s| s.to_string())
+            .or_else(|| default_url.clone());
+
+        let token_owner_url = match resolved {
+            Some(u) => u,
+            None => {
+                if !interactive {
+                    return Err(anyhow!(
+                        "deploy needs token_owner for hook '{tgt_slug}' on {tgt_env_label}, \
+                         but {} has no [hooks.{tgt_slug}] token_owner and no [defaults] \
+                         store_extension_token_owner.\nRun 'rdc deploy <src> {tgt_env_label}' \
+                         on a TTY once to pick interactively, or edit the overlay directly. \
+                         Aborting before any remote writes.",
+                        tgt_overlay_path.display()
+                    ));
+                }
+                if tgt_users.is_none() {
+                    tgt_users = Some(tgt_client.list_users(progress.clone()).await
+                        .context("listing tgt users for token_owner picker")?);
+                }
+                let users = tgt_users.as_ref().expect("tgt_users was just populated above");
+                let (chosen, apply_all) = match prompt_token_owner(tgt_slug, tgt_env_label, users, self_user_id)? {
+                    Some(pair) => pair,
+                    None => return Err(anyhow!("deploy aborted at token_owner picker")),
+                };
+                if apply_all {
+                    write_store_extension_token_owner(tgt_overlay_path, None, &chosen)?;
+                    default_url = Some(chosen.clone());
+                } else {
+                    write_store_extension_token_owner(tgt_overlay_path, Some(tgt_slug), &chosen)?;
+                }
+                overlay = Overlay::load(tgt_overlay_path)?;
+                chosen
+            }
+        };
+        out.insert(tgt_slug.clone(), token_owner_url);
+    }
+    Ok(out)
+}
+
+/// Resolve the effective `token_owner` URL for a hook on a given
+/// environment. Order: per-hook overlay `token_owner` → overlay
+/// `[defaults] store_extension_token_owner` → `None`. Originally written
+/// for store extensions only; now also used for regular hook deploys (see
+/// [`plan_regular_hook_token_owners`]).
 pub fn effective_token_owner<'a>(overlay: Option<&'a Overlay>, slug: &str) -> Option<&'a str> {
     let overlay = overlay?;
     if let Some(per_hook) = overlay.hook(slug)

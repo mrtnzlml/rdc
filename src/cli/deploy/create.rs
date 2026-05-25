@@ -58,6 +58,13 @@ pub struct CreateCtx<'a> {
     /// hooks; lookups for unknown slugs return `None` too, so non-hook
     /// create paths are unaffected.
     pub hook_secrets_plan: &'a crate::cli::deploy::hook_secrets::HookSecretsPlan,
+    /// Per-slug `token_owner` URL for non-store-extension hooks. Built by
+    /// `plan_regular_hook_token_owners` so the create body pins a tgt-env
+    /// user URL instead of carrying the src-env user URL through (which
+    /// the Rossum API rejects with "Invalid hyperlink"). Slugs absent
+    /// from the map either have no `token_owner` in src or are store
+    /// extensions (which carry their own plan).
+    pub regular_hook_token_owners: &'a std::collections::BTreeMap<String, String>,
 }
 
 /// Walk a src payload, rewrite cross-refs to tgt URLs, apply overlay,
@@ -406,6 +413,23 @@ pub async fn create_hook(
             ctx.mapping,
             &explicit_subs,
         );
+        // `token_owner` is a user URL: the src snapshot carries a src-env
+        // user, which the tgt API rejects as "Invalid hyperlink" since
+        // users aren't a deployable kind (no cross-env mapping exists).
+        // The pre-pass resolved the right tgt-env user URL for hooks that
+        // have one; inject it here. For hooks not in the map (no
+        // token_owner in src to begin with), strip the field so the body
+        // doesn't ship a stale URL.
+        if let Some(obj) = body.as_object_mut() {
+            match ctx.regular_hook_token_owners.get(slug) {
+                Some(url) => {
+                    obj.insert("token_owner".into(), serde_json::Value::String(url.clone()));
+                }
+                None => {
+                    obj.remove("token_owner");
+                }
+            }
+        }
         // Splice in the filtered hook secrets before POST. The plan was
         // built with the source's `secrets_keys` as the canonical key
         // set; extras in the target file have already been filtered out
