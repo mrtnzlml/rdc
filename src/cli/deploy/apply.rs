@@ -213,11 +213,12 @@ pub(crate) async fn run(
             continue;
         }
         if dry_run && diff {
-            print_update_diff(
+            print_update_diff_normalized(
                 &format!("hooks/{tgt_slug}.json"),
                 &payload_json_full,
                 &remote_json_full,
-            );
+                "hooks",
+            )?;
             if payload_code != remote_code {
                 // Sidecar extension follows the payload's runtime — same
                 // file the user will see on disk after the sync. `.js`
@@ -323,11 +324,12 @@ pub(crate) async fn run(
             continue;
         }
         if dry_run && diff {
-            print_update_diff(
+            print_update_diff_normalized(
                 &format!("rules/{tgt_slug}.json"),
                 &payload_json_full,
                 &remote_json_full,
-            );
+                "rules",
+            )?;
             if payload_code != remote_code {
                 print_update_diff(
                     &format!("rules/{tgt_slug}.py"),
@@ -393,7 +395,12 @@ pub(crate) async fn run(
             continue;
         }
         if dry_run && diff {
-            print_update_diff(&format!("labels/{tgt_slug}.json"), &payload_bytes, &remote_bytes);
+            print_update_diff_normalized(
+                &format!("labels/{tgt_slug}.json"),
+                &payload_bytes,
+                &remote_bytes,
+                "labels",
+            )?;
         }
         if !dry_run {
             tgt_client.update_label(tgt_id, &payload_label, None).await
@@ -464,7 +471,12 @@ pub(crate) async fn run(
             continue;
         }
         if dry_run && diff {
-            print_update_diff(&format!("queues/{tgt_slug}.json"), &payload_bytes, &remote_bytes);
+            print_update_diff_normalized(
+                &format!("queues/{tgt_slug}.json"),
+                &payload_bytes,
+                &remote_bytes,
+                "queues",
+            )?;
         }
         if !dry_run {
             tgt_client.patch_value(&format!("/queues/{tgt_id}"), &payload_for_patch, None).await
@@ -525,11 +537,12 @@ pub(crate) async fn run(
             continue;
         }
         if dry_run && diff {
-            print_update_diff(
+            print_update_diff_normalized(
                 &format!("schemas/{tgt_slug}/schema.json"),
                 &payload_json_full,
                 &remote_json_full,
-            );
+                "schemas",
+            )?;
             // Diff each formula sidecar that differs. Set-of-formulas
             // mismatch (one side has a field the other doesn't) shows
             // as new-file or deleted-file diff.
@@ -605,7 +618,12 @@ pub(crate) async fn run(
             continue;
         }
         if dry_run && diff {
-            print_update_diff(&format!("inboxes/{tgt_slug}.json"), &payload_bytes, &remote_bytes);
+            print_update_diff_normalized(
+                &format!("inboxes/{tgt_slug}.json"),
+                &payload_bytes,
+                &remote_bytes,
+                "inboxes",
+            )?;
         }
         if !dry_run {
             tgt_client.update_inbox(tgt_id, &payload_inbox, None).await
@@ -673,11 +691,12 @@ pub(crate) async fn run(
             continue;
         }
         if dry_run && diff {
-            print_update_diff(
+            print_update_diff_normalized(
                 &format!("email_templates/{tgt_key}.json"),
                 &payload_bytes,
                 &remote_bytes,
-            );
+                "email_templates",
+            )?;
         }
         if !dry_run {
             tgt_client.patch_value(&format!("/email_templates/{tgt_id}"), &payload_for_patch, None).await
@@ -732,7 +751,12 @@ pub(crate) async fn run(
             continue;
         }
         if dry_run && diff {
-            print_update_diff(&format!("engines/{tgt_slug}.json"), &payload_bytes, &remote_bytes);
+            print_update_diff_normalized(
+                &format!("engines/{tgt_slug}.json"),
+                &payload_bytes,
+                &remote_bytes,
+                "engines",
+            )?;
         }
         if dry_run {
             applied.engines += 1;
@@ -808,11 +832,12 @@ pub(crate) async fn run(
             continue;
         }
         if dry_run && diff {
-            print_update_diff(
+            print_update_diff_normalized(
                 &format!("engine_fields/{tgt_slug}.json"),
                 &payload_bytes,
                 &remote_bytes,
-            );
+                "engine_fields",
+            )?;
         }
         if dry_run {
             applied.engine_fields += 1;
@@ -865,6 +890,11 @@ pub(crate) async fn run(
 
 /// Emit a `--- src / +++ tgt remote` unified diff for one update.
 /// Skipped silently when bytes are equal (matches `print_unified`).
+///
+/// Used for non-JSON sidecars (hook `.py` / `.js`, rule `.py`, schema
+/// formulas) where there's nothing to normalise — the rendered diff is
+/// the raw byte delta. JSON updates use [`print_update_diff_normalized`]
+/// so server-only fields and key-order jitter don't pollute the view.
 fn print_update_diff(label: &str, src: &[u8], tgt_remote: &[u8]) {
     let l = String::from_utf8_lossy(src);
     let r = String::from_utf8_lossy(tgt_remote);
@@ -875,6 +905,34 @@ fn print_update_diff(label: &str, src: &[u8], tgt_remote: &[u8]) {
         &r,
         &mut 0,
     );
+}
+
+/// Emit a `--- src / +++ tgt remote` unified diff for one JSON update,
+/// piping both sides through [`normalize_for_cross_env_compare`] first.
+///
+/// Why: the idempotency check (`bytes_equal_after_strip`) compares
+/// normalised bytes — server-only fields (`id`, `url`, `organization`,
+/// `modified_at`, `modifier`, kind-specific server-managed fields like
+/// `triggers` on email_templates) stripped, keys sorted recursively,
+/// URL arrays sorted. Until this helper existed, the diff renderer
+/// printed the *raw* `payload_bytes` and `remote_bytes`, so dry-run
+/// previews padded every PATCH with ~10 lines of fields the deploy
+/// already knew it was ignoring. Normalising before rendering makes
+/// the diff match what the comparison actually saw — the visible
+/// delta is exactly what the PATCH would change.
+fn print_update_diff_normalized(
+    label: &str,
+    src: &[u8],
+    tgt_remote: &[u8],
+    kind: &str,
+) -> Result<()> {
+    let src_norm = crate::cli::deploy::common::normalize_for_cross_env_compare(src, kind)
+        .with_context(|| format!("normalising src bytes for {kind} diff render"))?;
+    let tgt_norm =
+        crate::cli::deploy::common::normalize_for_cross_env_compare(tgt_remote, kind)
+            .with_context(|| format!("normalising tgt bytes for {kind} diff render"))?;
+    print_update_diff(label, &src_norm, &tgt_norm);
+    Ok(())
 }
 
 #[derive(Default)]

@@ -110,6 +110,57 @@ mod normalize_tests {
     }
 
     #[test]
+    fn normalize_collapses_real_world_email_template_noise() {
+        // Regression: the deploy update-diff used to render raw
+        // `payload_bytes` vs `remote_bytes`, so dry-run previews padded
+        // every email_template PATCH with ~14 lines of server-only
+        // fields (`id`/`url`/`organization`/`modified_at`/`modified_by`/
+        // `triggers`) plus key-reordering jitter — the comparison
+        // already ignored all of it. This test pins the contract that
+        // a src snapshot lacking those fields and a tgt remote carrying
+        // them produce byte-identical normalised forms, so the diff
+        // (which now goes through this same normaliser) collapses to
+        // empty when the content really hasn't changed.
+        let src = br#"{
+          "name": "Annotation status change - received",
+          "subject": "Documents received: {{ parent_email_subject }}",
+          "queue": "https://ferguson-test.rossum.app/api/v1/queues/2860442",
+          "automate": false,
+          "bcc": [],
+          "cc": [],
+          "enabled": false,
+          "message": "<p>Hi</p>",
+          "to": [{"email": "{{sender_email}}"}],
+          "type": "custom"
+        }"#;
+        let tgt = br#"{
+          "id": 14081418,
+          "url": "https://ferguson-test.rossum.app/api/v1/email_templates/14081418",
+          "name": "Annotation status change - received",
+          "subject": "Documents received: {{ parent_email_subject }}",
+          "queue": "https://ferguson-test.rossum.app/api/v1/queues/2860442",
+          "organization": "https://ferguson-test.rossum.app/api/v1/organizations/418976",
+          "message": "<p>Hi</p>",
+          "type": "custom",
+          "enabled": false,
+          "automate": false,
+          "triggers": ["https://ferguson-test.rossum.app/api/v1/triggers/11157520"],
+          "to": [{"email": "{{sender_email}}"}],
+          "cc": [],
+          "bcc": [],
+          "modified_by": null,
+          "modified_at": null
+        }"#;
+        let ns = normalize_for_cross_env_compare(src, "email_templates").unwrap();
+        let nt = normalize_for_cross_env_compare(tgt, "email_templates").unwrap();
+        assert_eq!(
+            std::str::from_utf8(&ns).unwrap(),
+            std::str::from_utf8(&nt).unwrap(),
+            "src vs tgt with server-only fields must normalise to the same bytes",
+        );
+    }
+
+    #[test]
     fn normalize_is_key_order_insensitive() {
         // Two JSON bodies with the same content but different key order
         // (the Rossum API doesn't guarantee stable key order, and on-disk
