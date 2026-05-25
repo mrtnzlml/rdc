@@ -1571,13 +1571,15 @@ async fn sync_remote_create_writes_local_engine_field() {
     );
 }
 
-/// Pull-side RemoteCreate for an MDH dataset: the Data Storage service
-/// returns one collection with an index set, and `sync` must write both
-/// `collection.json` and `indexes.json` under `envs/dev/mdh/<slug>/`.
-/// MDH is pull-only (no push pipeline), so this exercises only the
-/// pull-side branch of the executor.
+/// Pull-side for an MDH dataset: the Data Storage service returns one
+/// collection plus its indexes, and `sync` must write `indexes.json`
+/// (stripped of the implicit `_id_` index and the server-set `v`
+/// field) under `envs/dev/mdh/<slug>/`. No `collection.json` is
+/// written — collection metadata is server-managed and offers no
+/// editable surface. MDH is pull-only at this stage, so this only
+/// exercises the pull-side branch of the executor.
 #[tokio::test]
-async fn sync_remote_create_writes_local_mdh_dataset() {
+async fn sync_writes_local_mdh_indexes_without_collection_json() {
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
@@ -1687,25 +1689,40 @@ async fn sync_remote_create_writes_local_mdh_dataset() {
         );
     }
 
+    // collection.json was removed in the MDH cleanup pass: it carried
+    // only server-managed metadata (uuid, options, idIndex) that the
+    // user can't edit, so there's no value in writing it to disk.
     let collection_path = project.path().join("envs/dev/mdh/vendors/collection.json");
-    let indexes_path = project.path().join("envs/dev/mdh/vendors/indexes.json");
     assert!(
-        collection_path.exists(),
-        "collection JSON should be written at {}",
-        collection_path.display()
+        !collection_path.exists(),
+        "collection.json must NOT be written; it's pure server metadata"
     );
+    let indexes_path = project.path().join("envs/dev/mdh/vendors/indexes.json");
     assert!(
         indexes_path.exists(),
         "indexes JSON should be written at {}",
         indexes_path.display()
     );
-    let body = std::fs::read_to_string(&collection_path).unwrap();
-    assert!(body.contains("vendors"), "collection content: {body}");
+
+    // indexes.json strips the implicit `_id_` regular index and the
+    // server-set `v` field on every index, leaving only the
+    // user-editable surface. For this fresh dataset (only `_id_`
+    // server-side), that means an empty regular array.
+    let body = std::fs::read_to_string(&indexes_path).unwrap();
+    assert!(
+        !body.contains("_id_"),
+        "implicit `_id_` index must be stripped from indexes.json: {body}"
+    );
+    assert!(
+        !body.contains("\"v\""),
+        "server-set `v` field must be stripped from index defs: {body}"
+    );
 
     let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    // `mdh_collections` is no longer recorded — collection.json is gone.
     assert!(
-        lf_raw.contains("\"mdh_collections\""),
-        "lockfile must record mdh_collections: {lf_raw}"
+        !lf_raw.contains("\"mdh_collections\""),
+        "lockfile must NOT record mdh_collections: {lf_raw}"
     );
     assert!(
         lf_raw.contains("\"mdh_indexes\""),
