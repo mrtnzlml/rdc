@@ -577,6 +577,7 @@ async fn login_propagates_401_on_bad_credentials() {
         .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
             "detail": "Invalid username/password.",
         })))
+        .expect(1)
         .mount(&server)
         .await;
 
