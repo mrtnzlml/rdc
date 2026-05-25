@@ -183,13 +183,22 @@ pub enum Command {
     },
     /// Set or refresh an env's API token. Validates the token before
     /// writing to `secrets/<env>.secrets.json` (mode 0600 on Unix).
-    /// Provide the token via `--token` or pipe it on stdin. Without
-    /// `<env>`, picks interactively from envs defined in `rdc.toml`.
+    ///
+    /// Provide credentials via one of:
+    /// * `--token <T>` — explicit token (CI-friendly).
+    /// * `--username <U>` — exchanges <U> + password (stdin or TTY
+    ///   prompt) for a token via POST /v1/auth/login; the token and
+    ///   computed expiry (162h from now) are written to the secrets file.
+    /// * Neither — read a token from stdin (back-compat with today).
+    ///
+    /// Without `<env>`, picks interactively from envs defined in `rdc.toml`.
     Auth {
         #[arg(add = ArgValueCandidates::new(env_name_candidates))]
         env: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "username")]
         token: Option<String>,
+        #[arg(long, conflicts_with = "token")]
+        username: Option<String>,
     },
     /// Bring the local snapshot of `<env>` back into a clean state.
     /// Pick one of the modes — there's no implicit default because they
@@ -317,9 +326,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             .await
         }
         Some(Command::Diff { left, right }) => crate::cli::diff::run(left, right).await,
-        Some(Command::Auth { env, token }) => {
+        Some(Command::Auth { env, token, username }) => {
             let env = crate::cli::env_picker::pick_env("Set token for which env?", env)?;
-            crate::cli::auth::run(&env, token).await
+            crate::cli::auth::run(&env, token, username).await
         }
         Some(Command::Repair { env, rebuild_lock, rename_slugs, fix_store_anomaly, check }) => {
             let env = crate::cli::env_picker::pick_env("Which env to repair?", env)?;
