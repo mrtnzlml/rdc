@@ -376,6 +376,15 @@ async fn init_with_env_var_runs_auth_inline() {
             & 0o777;
         assert_eq!(mode, 0o600, "secrets file should be mode 0600");
     }
+
+    // The sync-on-init prompt is TTY-gated; assert_cmd runs the child
+    // non-TTY so no implicit sync should have happened. Lockfile absence
+    // proves it — `rdc sync` would have created `.rdc/state/dev.lock.json`
+    // as part of its baseline write.
+    assert!(
+        !project.path().join(".rdc/state/dev.lock.json").exists(),
+        "init must NOT auto-sync in non-TTY mode (sync prompt is TTY-gated)"
+    );
 }
 
 /// A bad token coming from `RDC_TOKEN_<UPPER>` must not abort init: the
