@@ -41,7 +41,7 @@ pub fn env_var_for(env: &str, suffix: &str) -> String {
 /// configuration (env vars + on-disk secrets file). The async
 /// [`resolve_token`] consumes this enum and performs I/O (HTTP login,
 /// cache write) when needed.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub enum TokenLookup {
     /// A token is ready to use.
     Cached {
@@ -55,6 +55,30 @@ pub enum TokenLookup {
     /// Nothing is configured. `message` is the actionable error to
     /// surface, naming all three options.
     Missing { message: String },
+}
+
+impl std::fmt::Debug for TokenLookup {
+    /// Custom Debug that redacts token/password values so a stray
+    /// `tracing::debug!("{lookup:?}")` (or test-panic message) doesn't
+    /// leak secrets into logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cached { token: _, expires_at } => f
+                .debug_struct("Cached")
+                .field("token", &"<redacted>")
+                .field("expires_at", expires_at)
+                .finish(),
+            Self::NeedsLogin { username, password: _ } => f
+                .debug_struct("NeedsLogin")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+            Self::Missing { message } => f
+                .debug_struct("Missing")
+                .field("message", message)
+                .finish(),
+        }
+    }
 }
 
 /// Treat a cached token as expired if it expires within this window.
@@ -917,5 +941,44 @@ mod tests {
         assert_eq!(alpha.get("k2").map(String::as_str), Some(""));
         let beta = loaded.for_slug("beta").expect("beta entry");
         assert_eq!(beta.get("bk").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn debug_redacts_token_and_password() {
+        let cached = TokenLookup::Cached {
+            token: "secret-token-abc".to_string(),
+            expires_at: Some(123),
+        };
+        let s = format!("{cached:?}");
+        assert!(
+            !s.contains("secret-token-abc"),
+            "Debug must not leak token: {s}"
+        );
+        assert!(s.contains("<redacted>"), "Debug should mark redaction: {s}");
+        assert!(s.contains("123"), "Debug should keep expires_at: {s}");
+
+        let needs = TokenLookup::NeedsLogin {
+            username: "alice".to_string(),
+            password: "hunter2".to_string(),
+        };
+        let s = format!("{needs:?}");
+        assert!(
+            !s.contains("hunter2"),
+            "Debug must not leak password: {s}"
+        );
+        assert!(
+            s.contains("alice"),
+            "username is not a secret, may appear: {s}"
+        );
+        assert!(s.contains("<redacted>"), "Debug should mark redaction: {s}");
+
+        let missing = TokenLookup::Missing {
+            message: "no token set".to_string(),
+        };
+        let s = format!("{missing:?}");
+        assert!(
+            s.contains("no token set"),
+            "Debug should keep error message: {s}"
+        );
     }
 }
