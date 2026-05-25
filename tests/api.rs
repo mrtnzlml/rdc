@@ -3,8 +3,26 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn fixture(name: &str) -> serde_json::Value {
-    let raw = std::fs::read_to_string(format!("testdata/fixtures/{name}")).unwrap();
+    // Resolve via `CARGO_MANIFEST_DIR` rather than the current working
+    // directory: some tests in this binary `set_current_dir` into a
+    // tempdir (e.g. `refresh_token_silent_relogin_on_non_tty_with_creds`),
+    // and because cargo runs integration tests in parallel within one
+    // binary a relative path here would race.
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let raw = std::fs::read_to_string(format!("{manifest_dir}/testdata/fixtures/{name}")).unwrap();
     serde_json::from_str(&raw).unwrap()
+}
+
+/// Global lock serializing tests that mutate process-global state
+/// (specifically `std::env::set_current_dir`). Cargo runs tests within a
+/// binary in parallel; without serialization here, two tests can change
+/// CWD concurrently and one will read the wrong path.
+fn cwd_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// RAII guard that unsets the listed env vars on drop, so a panicking
@@ -698,4 +716,74 @@ fn uuid_like_suffix() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{nanos:x}")
+}
+
+#[tokio::test]
+async fn refresh_token_silent_relogin_on_non_tty_with_creds() {
+    use tempfile::TempDir;
+    use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/auth/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "key": "relogin-fresh",
+            "domain": "example",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(matchers::method("GET"))
+        .and(matchers::path("/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 1,
+            "name": "Example Org",
+            "url": format!("{}/v1/organizations/1", server.uri()),
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = TempDir::new().unwrap();
+    let env_suffix = uuid_like_suffix();
+    let env_name = format!("relogin_{env_suffix}");
+    std::fs::write(
+        dir.path().join("rdc.toml"),
+        format!(
+            r#"
+name = "fixture"
+[envs.{env_name}]
+api_base = "{}/v1"
+org_id = 1
+"#,
+            server.uri()
+        ),
+    )
+    .unwrap();
+    let user_var = format!("RDC_USER_{}", env_name.to_uppercase());
+    let pass_var = format!("RDC_PASS_{}", env_name.to_uppercase());
+    unsafe {
+        std::env::set_var(&user_var, "alice");
+        std::env::set_var(&pass_var, "hunter2");
+    }
+    let _guard = EnvGuard(vec![user_var, pass_var]);
+
+    // Force "non-TTY" by chdir-ing into the temp dir and calling the
+    // function. Since the current test process's stdin is typically
+    // piped (not a TTY) under cargo test, refresh_token_interactively's
+    // IsTerminal check naturally returns false. Hold `cwd_lock` so we
+    // don't race sibling tests that read fixtures via relative paths.
+    let _cwd_guard = cwd_lock();
+    let cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(dir.path()).unwrap();
+    let result = rdc::cli::auth::refresh_token_interactively(&env_name).await;
+    std::env::set_current_dir(&cwd).unwrap();
+
+    result.expect("silent relogin should succeed");
+    let raw = std::fs::read_to_string(
+        dir.path().join("secrets").join(format!("{env_name}.secrets.json")),
+    )
+    .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(parsed["api_token"], "relogin-fresh");
+    assert!(parsed["expires_at"].is_number());
 }

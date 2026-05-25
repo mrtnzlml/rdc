@@ -188,10 +188,37 @@ pub(crate) async fn validate_and_save_token(
 /// `rdc auth <env>` instead of blocking.
 pub async fn refresh_token_interactively(env: &str) -> Result<()> {
     if !std::io::stdin().is_terminal() {
+        // Non-TTY: try silent re-login from RDC_USER_<ENV> + RDC_PASS_<ENV>
+        // before erroring. This is the CI / cron path.
+        let user_var = crate::secrets::env_var_for(env, "USER");
+        let pass_var = crate::secrets::env_var_for(env, "PASS");
+        let user_opt = std::env::var(&user_var).ok().filter(|s| !s.is_empty());
+        let pass_opt = std::env::var(&pass_var).ok().filter(|s| !s.is_empty());
+        if let (Some(username), Some(password)) = (user_opt, pass_opt) {
+            let cwd = std::env::current_dir().context("getting current directory")?;
+            let cfg = ProjectConfig::load(&cwd.join("rdc.toml"))?;
+            let env_cfg = cfg
+                .envs
+                .get(env)
+                .ok_or_else(|| anyhow!("env '{env}' is not defined in rdc.toml"))?;
+            let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
+            log.event(
+                Action::Auth,
+                &format!("token for env '{env}' rejected (401); silent re-login from ${user_var}"),
+            );
+            let token = crate::api::login(&env_cfg.api_base, &username, &password)
+                .await
+                .with_context(|| format!("silent re-login for env '{env}'"))?;
+            let expires_at = crate::secrets::now_unix_secs()
+                .saturating_add(crate::secrets::LOGIN_TOKEN_LIFETIME_SECS);
+            crate::secrets::write_secrets_file(&cwd, env, &token, Some(expires_at))?;
+            log.event(Action::Auth, &format!("silent re-login OK for env '{env}'"));
+            return Ok(());
+        }
         return Err(anyhow!(
             "token for env '{env}' was rejected (401). \
-             Re-run on a TTY to refresh interactively, or run \
-             `rdc auth {env} --token <new-token>`."
+             Re-run on a TTY to refresh interactively, set ${user_var} + ${pass_var} \
+             for silent re-login, or run `rdc auth {env} --token <new-token>`."
         ));
     }
 
