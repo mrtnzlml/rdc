@@ -129,6 +129,14 @@ impl HookSecrets {
         self.by_slug.keys()
     }
 
+    /// Full slug → K/V map. Exposed so callers can produce merged
+    /// outputs (e.g. the deploy template writer that pre-populates the
+    /// file with empty placeholders for missing keys) without
+    /// re-reading from disk.
+    pub fn entries(&self) -> &BTreeMap<String, BTreeMap<String, String>> {
+        &self.by_slug
+    }
+
     /// True if the file existed on disk (even if it had no hooks).
     pub fn was_loaded(&self) -> bool {
         self.source.is_some()
@@ -172,6 +180,55 @@ pub fn load_hook_secrets(project_root: &Path, env: &str) -> Result<HookSecrets> 
         by_slug: f.hooks,
         source: Some(path),
     })
+}
+
+/// Write `secrets/<env>.hook-secrets.json` so every hook in
+/// `required_per_slug` has an entry with every required key declared —
+/// values already filled in by the user are preserved, anything else
+/// becomes an empty-string placeholder. Slugs already present in
+/// `existing` but not in `required_per_slug` are passed through
+/// unchanged so unrelated hooks aren't clobbered.
+///
+/// Used by `rdc deploy`'s pre-flight when the target's local file lacks
+/// values: instead of asking the user to figure out the JSON shape, rdc
+/// hands them a fill-in-the-blanks form. Returns the absolute path
+/// written so callers can quote it in the actionable error message.
+///
+/// Pretty-printed with sorted keys (BTreeMap iteration order) so the
+/// file is human-editable and re-runs produce stable diffs. The atomic
+/// write skips the rename when bytes are unchanged, preserving mtime
+/// when nothing needed merging. Mode 0600 on Unix to match the existing
+/// `secrets/<env>.secrets.json` convention.
+pub fn write_hook_secrets_template(
+    project_root: &Path,
+    env: &str,
+    required_per_slug: &BTreeMap<String, Vec<String>>,
+    existing: &HookSecrets,
+) -> Result<PathBuf> {
+    let mut merged: BTreeMap<String, BTreeMap<String, String>> = existing.entries().clone();
+    for (slug, required) in required_per_slug {
+        let entry = merged.entry(slug.clone()).or_default();
+        for key in required {
+            entry.entry(key.clone()).or_insert_with(String::new);
+        }
+    }
+
+    let body = serde_json::json!({ "hooks": merged });
+    let mut bytes = serde_json::to_vec_pretty(&body)
+        .context("serializing hook-secrets template")?;
+    bytes.push(b'\n');
+
+    let path = hook_secrets_path(project_root, env);
+    crate::snapshot::writer::write_atomic(&path, &bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -368,5 +425,137 @@ mod tests {
             p,
             dir.path().join("secrets").join("prod.hook-secrets.json")
         );
+    }
+
+    fn required(pairs: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(slug, keys)| {
+                (
+                    (*slug).to_string(),
+                    keys.iter().map(|k| (*k).to_string()).collect::<Vec<_>>(),
+                )
+            })
+            .collect()
+    }
+
+    fn read_template(dir: &Path, env: &str) -> serde_json::Value {
+        let raw = std::fs::read_to_string(hook_secrets_path(dir, env)).unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    #[test]
+    fn write_template_creates_file_with_empty_placeholders() {
+        // First-deploy case: no local file yet, no prior values. The
+        // template must materialize the full required shape so the user
+        // can just fill in values without reverse-engineering the JSON.
+        let dir = TempDir::new().unwrap();
+        let req = required(&[
+            ("master-data-hub", &["mdh_api_token", "mdh_endpoint"]),
+            ("notify-slack", &["signing_secret"]),
+        ]);
+        let existing = HookSecrets::default();
+        let path = write_hook_secrets_template(dir.path(), "test-mtr", &req, &existing).unwrap();
+        assert_eq!(path, hook_secrets_path(dir.path(), "test-mtr"));
+
+        let v = read_template(dir.path(), "test-mtr");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "hooks": {
+                    "master-data-hub": { "mdh_api_token": "", "mdh_endpoint": "" },
+                    "notify-slack":    { "signing_secret": "" }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn write_template_preserves_existing_values() {
+        // User has already filled in some keys for a previous deploy;
+        // re-running for a new hook must NOT wipe what they typed.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        std::fs::write(
+            dir.path().join("secrets/test-mtr.hook-secrets.json"),
+            r#"{ "hooks": { "master-data-hub": { "mdh_api_token": "kept-by-user" } } }"#,
+        )
+        .unwrap();
+        let existing = load_hook_secrets(dir.path(), "test-mtr").unwrap();
+        let req = required(&[
+            ("master-data-hub", &["mdh_api_token", "mdh_endpoint"]),
+            ("notify-slack", &["signing_secret"]),
+        ]);
+        write_hook_secrets_template(dir.path(), "test-mtr", &req, &existing).unwrap();
+
+        let v = read_template(dir.path(), "test-mtr");
+        assert_eq!(v["hooks"]["master-data-hub"]["mdh_api_token"], "kept-by-user");
+        assert_eq!(v["hooks"]["master-data-hub"]["mdh_endpoint"], "");
+        assert_eq!(v["hooks"]["notify-slack"]["signing_secret"], "");
+    }
+
+    #[test]
+    fn write_template_passes_through_unrelated_slugs() {
+        // A slug already in the file but outside this deploy's scope
+        // belongs to another deploy / another hook; never wipe it.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        std::fs::write(
+            dir.path().join("secrets/test-mtr.hook-secrets.json"),
+            r#"{ "hooks": { "old-hook": { "legacy_token": "still-here" } } }"#,
+        )
+        .unwrap();
+        let existing = load_hook_secrets(dir.path(), "test-mtr").unwrap();
+        let req = required(&[("new-hook", &["new_key"])]);
+        write_hook_secrets_template(dir.path(), "test-mtr", &req, &existing).unwrap();
+
+        let v = read_template(dir.path(), "test-mtr");
+        assert_eq!(v["hooks"]["old-hook"]["legacy_token"], "still-here");
+        assert_eq!(v["hooks"]["new-hook"]["new_key"], "");
+    }
+
+    #[test]
+    fn write_template_creates_secrets_dir_when_missing() {
+        // Fresh `rdc init` projects have `secrets/` but a paranoid test
+        // wipes it; the writer must reconstruct the parent itself rather
+        // than 500ing on a missing directory.
+        let dir = TempDir::new().unwrap();
+        let req = required(&[("h", &["k"])]);
+        let existing = HookSecrets::default();
+        write_hook_secrets_template(dir.path(), "test-mtr", &req, &existing).unwrap();
+        assert!(hook_secrets_path(dir.path(), "test-mtr").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_template_chmods_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let req = required(&[("h", &["k"])]);
+        let existing = HookSecrets::default();
+        let path = write_hook_secrets_template(dir.path(), "test-mtr", &req, &existing).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "hook-secrets template must be owner-only");
+    }
+
+    #[test]
+    fn write_template_load_round_trip_is_lossless() {
+        // The reader and writer must agree on the JSON shape — write a
+        // template, load it back, and verify every slug+key the writer
+        // wrote appears in the loaded view.
+        let dir = TempDir::new().unwrap();
+        let req = required(&[
+            ("alpha", &["k1", "k2"]),
+            ("beta", &["bk"]),
+        ]);
+        let existing = HookSecrets::default();
+        write_hook_secrets_template(dir.path(), "test-mtr", &req, &existing).unwrap();
+        let loaded = load_hook_secrets(dir.path(), "test-mtr").unwrap();
+        assert!(loaded.was_loaded());
+        let alpha = loaded.for_slug("alpha").expect("alpha entry");
+        assert_eq!(alpha.get("k1").map(String::as_str), Some(""));
+        assert_eq!(alpha.get("k2").map(String::as_str), Some(""));
+        let beta = loaded.for_slug("beta").expect("beta entry");
+        assert_eq!(beta.get("bk").map(String::as_str), Some(""));
     }
 }

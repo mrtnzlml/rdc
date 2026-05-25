@@ -6,11 +6,14 @@
 //!    the target, GET `secrets_keys` on each source hook in the deploy
 //!    plan and confirm the target's local `secrets/<tgt>.hook-secrets.json`
 //!    declares a value for every key. Missing values abort the deploy
-//!    with a per-hook table; the user populates the file and reruns.
-//!    Keys present in the target file but not in source's `secrets_keys`
-//!    are surfaced as warnings — the deploy proceeds, those keys are
-//!    filtered out of the outbound body so the target hook gets the same
-//!    shape of secrets as the source has.
+//!    with a per-hook table — and crucially, the precheck first
+//!    pre-populates the file with empty placeholders for every required
+//!    key (preserving anything the user already filled in), so the
+//!    rerun is a fill-in-the-blanks loop instead of a JSON-shape
+//!    scavenger hunt. Keys present in the target file but not in
+//!    source's `secrets_keys` are surfaced as warnings — the deploy
+//!    proceeds, those keys are filtered out of the outbound body so the
+//!    target hook gets the same shape of secrets as the source has.
 //!
 //! 2. **Inject** (the returned [`HookSecretsPlan`]). The plan carries
 //!    one filtered K/V map per slug — exactly the bytes to splice into
@@ -23,10 +26,11 @@
 //! warning lines reference key names only.
 
 use crate::api::{anyhow_has_status, RossumClient};
-use crate::secrets::HookSecrets;
+use crate::secrets::{write_hook_secrets_template, HookSecrets};
 use crate::state::Lockfile;
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 /// Per-slug filtered secrets ready to inject. The key set matches the
 /// source hook's `secrets_keys` — extras in the target file are dropped.
@@ -45,8 +49,10 @@ impl HookSecretsPlan {
 
 /// Pre-flight check. For each source slug, fetch `secrets_keys` and
 /// validate the target's local secrets file has every required value.
-/// Returns the filtered injection plan on success; aborts with an
-/// actionable per-hook report on missing values.
+/// Returns the filtered injection plan on success; on missing values it
+/// pre-populates `secrets/<tgt_env>.hook-secrets.json` with empty
+/// placeholders (preserving anything the user already filled in) and
+/// aborts with an actionable per-hook report pointing at the file.
 ///
 /// Hooks not yet POSTed to the source (no lockfile entry, no `id`) are
 /// silently skipped — there's nothing to GET. The downstream create
@@ -57,11 +63,18 @@ pub async fn precheck(
     tgt_secrets: &HookSecrets,
     src_slugs: impl IntoIterator<Item = String>,
     tgt_env: &str,
+    tgt_root: &Path,
 ) -> Result<HookSecretsPlan> {
     let mut plan = HookSecretsPlan::default();
     // (slug, sorted missing key names). Collected so the abort message
     // can render every gap in one shot rather than failing on the first.
     let mut missing: Vec<(String, Vec<String>)> = Vec::new();
+    // Full required-key list for every slug whose src hook declares any
+    // secrets — used to pre-populate the target's hook-secrets file
+    // when the abort fires. We collect even for slugs that pass the
+    // diff so the template stays a complete inventory of what's in
+    // scope.
+    let mut required_per_slug: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for slug in src_slugs {
         let Some(entry) = src_lockfile
@@ -94,6 +107,11 @@ pub async fn precheck(
             continue;
         }
 
+        // Record the full required-key list so a later template-write
+        // can render the complete shape, not just the missing-key
+        // subset.
+        required_per_slug.insert(slug.clone(), required.clone());
+
         let empty = BTreeMap::<String, String>::new();
         let tgt_kv = tgt_secrets.for_slug(&slug).unwrap_or(&empty);
         let diff = diff_for_slug(&required, tgt_kv);
@@ -118,7 +136,20 @@ pub async fn precheck(
     }
 
     if !missing.is_empty() {
-        bail!("{}", format_missing_keys_message(tgt_env, &missing));
+        // Pre-populate the target's hook-secrets file with every required
+        // key the user still needs to fill in — existing values stay put
+        // (`write_hook_secrets_template` merges, never wipes). The deploy
+        // still aborts, but the user gets a fill-in-the-blanks form
+        // instead of a blank page.
+        let template_path =
+            write_hook_secrets_template(tgt_root, tgt_env, &required_per_slug, tgt_secrets)
+                .with_context(|| {
+                    format!("pre-populating hook-secrets template for env '{tgt_env}'")
+                })?;
+        bail!(
+            "{}",
+            format_missing_keys_message(tgt_env, &missing, Some(&template_path.display().to_string()))
+        );
     }
 
     Ok(plan)
@@ -127,7 +158,17 @@ pub async fn precheck(
 /// The user-facing message printed when one or more target hooks lack
 /// values for keys declared on the source. Extracted so the format can
 /// be asserted in unit tests without spinning up a mock HTTP server.
-pub fn format_missing_keys_message(tgt_env: &str, missing: &[(String, Vec<String>)]) -> String {
+///
+/// `template_path` is `Some(path)` when the precheck pre-populated the
+/// target's hook-secrets file with empty placeholders for the missing
+/// keys — the trailing line then points the user at that file instead
+/// of asking them to invent the JSON shape from scratch. `None` is
+/// reserved for callers that haven't done the template write (tests).
+pub fn format_missing_keys_message(
+    tgt_env: &str,
+    missing: &[(String, Vec<String>)],
+    template_path: Option<&str>,
+) -> String {
     let mut lines = Vec::with_capacity(missing.len() + 2);
     lines.push(format!(
         "deploy refused: target env '{tgt_env}' is missing secret values for:"
@@ -135,9 +176,14 @@ pub fn format_missing_keys_message(tgt_env: &str, missing: &[(String, Vec<String
     for (slug, keys) in missing {
         lines.push(format!("  - hooks/{slug:30}{}", keys.join(", ")));
     }
-    lines.push(format!(
-        "populate secrets/{tgt_env}.hook-secrets.json (mode 0600, gitignored) and retry."
-    ));
+    match template_path {
+        Some(p) => lines.push(format!(
+            "pre-populated {p} (mode 0600, gitignored) with empty placeholders — fill in the missing values and retry."
+        )),
+        None => lines.push(format!(
+            "populate secrets/{tgt_env}.hook-secrets.json (mode 0600, gitignored) and retry."
+        )),
+    }
     lines.join("\n")
 }
 
@@ -247,6 +293,7 @@ mod tests {
                     vec!["signing_secret".to_string(), "webhook_id".to_string()],
                 ),
             ],
+            Some("/proj/secrets/prod.hook-secrets.json"),
         );
         assert!(msg.contains("deploy refused"));
         assert!(msg.contains("target env 'prod'"));
@@ -255,6 +302,23 @@ mod tests {
         assert!(msg.contains("hooks/notify-slack"));
         assert!(msg.contains("signing_secret"));
         assert!(msg.contains("webhook_id"));
-        assert!(msg.contains("secrets/prod.hook-secrets.json"));
+        assert!(msg.contains("/proj/secrets/prod.hook-secrets.json"));
+        assert!(
+            msg.contains("pre-populated") && msg.contains("empty placeholders"),
+            "message must hint that the file already has the right shape: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_missing_keys_message_falls_back_when_no_template_path() {
+        // Defensive form — callers that haven't pre-populated still get a
+        // useful message pointing at the conventional path.
+        let msg = format_missing_keys_message(
+            "test-mtr",
+            &[("h".to_string(), vec!["k".to_string()])],
+            None,
+        );
+        assert!(msg.contains("secrets/test-mtr.hook-secrets.json"));
+        assert!(msg.contains("populate"));
     }
 }
