@@ -206,7 +206,13 @@ pub async fn resolve_token(project_root: &Path, env: &str, api_base: &str) -> Re
         TokenLookup::NeedsLogin { username, password } => {
             let token = crate::api::login(api_base, &username, &password)
                 .await
-                .with_context(|| format!("logging in to env '{env}' with RDC_USER_*/RDC_PASS_*"))?;
+                .with_context(|| {
+                    format!(
+                        "logging in to env '{env}' with ${} / ${}",
+                        env_var_for(env, "USER"),
+                        env_var_for(env, "PASS"),
+                    )
+                })?;
             let expires_at = now_unix_secs().saturating_add(LOGIN_TOKEN_LIFETIME_SECS);
             write_secrets_file(project_root, env, &token, Some(expires_at))?;
             Ok(token)
