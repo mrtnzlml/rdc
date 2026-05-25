@@ -370,11 +370,12 @@ Deployed test → prod: 126 created, 0 deleted, 144 API calls, 89.1s
 What's happening inside:
 
 1. **Auto-mapping.** Same-slug objects in `test` and `prod` are paired silently. Hand-curated renames in `.rdc/map/test-to-prod.toml` are preserved.
-2. **Plan.** What would be created, what would be patched, what would be deleted (`--mirror` only).
-3. **Confirm.** TTY prompts; CI passes `--yes`.
-4. **Create.** Dependency order: `workspaces → schemas → queues → inboxes → email_templates → hooks → rules → labels → engines → engine_fields`. POSTing each missing resource. Each create updates an in-memory mapping so the next kind's URL rewriter knows where the just-created peers live.
-5. **Update.** Per-kind PATCH sweep. Fetches the tgt remote for drift check, normalises both sides (strip env-specific `id` / `url` / `organization` + noise fields, sort set-like arrays), and PATCHes only when content differs. Re-running yields `0 PATCHes`.
-6. **Delete** (with `--mirror`). Reverse dependency order. Two confirmations: one for the deploy as a whole, a second specifically for the destructive section.
+2. **Full-diff preview.** Every would-be create, every per-object update diff (src after overlay+rewrite vs tgt remote), and every would-be delete (`--mirror`) is rendered before any write — so you commit with the actual delta in hand instead of a count summary.
+3. **Drift resolver.** If any tgt object was edited out-of-band since the last `rdc sync <tgt>` (Rossum UI, another rdc instance, …), the deploy stops to ask what to do per object: `[k]eep tgt edit` · `[o]verwrite with src` · `[s]kip (defer)` · `[a]bort`. See [Conflicts & drift](#conflicts--drift). Non-TTY / `--yes`: refused unless `--force-overwrite-drift` is set.
+4. **Confirm.** TTY prompts; CI passes `--yes`.
+5. **Create.** Dependency order: `workspaces → schemas → queues → inboxes → email_templates → hooks → rules → labels → engines → engine_fields`. POSTing each missing resource. Each create updates an in-memory mapping so the next kind's URL rewriter knows where the just-created peers live.
+6. **Update.** Per-kind PATCH sweep. Fetches the tgt remote, normalises both sides (strip env-specific `id` / `url` / `organization` + noise fields, sort set-like arrays), and PATCHes only when content differs. Re-running yields `0 PATCHes`.
+7. **Delete** (with `--mirror`). Reverse dependency order. Two confirmations: one for the deploy as a whole, a second specifically for the destructive section.
 
 ### Preview a deploy
 
@@ -518,6 +519,30 @@ A three-way merge runs on every sync. When both local and the env have diverged 
 When `--no-push` is active (audit mode) the `[k]` choice is hidden — nothing local can be sent. When `--no-pull` is active (deploy mode) the `[r]` choice is hidden — nothing local can be overwritten.
 
 CI / non-TTY / `--yes` falls back to `[s]`: local stays on disk, the env's bytes land at `<file>.<env-name>`, summary lists the count. Resolve by editing locally and re-running.
+
+### Deploy: out-of-band target edits
+
+`rdc deploy <src> <tgt>` runs its own drift check before any PATCH. The lockfile records what tgt looked like the last time you ran `rdc sync <tgt>`; if the live tgt object hashes to anything else, an admin (or another rdc instance, or the Rossum UI) edited it in between, and src's bytes would silently blow that edit away. To prevent that, after the full-diff preview and before the main `Proceed?` confirm, the deploy lists every drifted target and asks per object:
+
+```
+⚠️  2 target object(s) have been edited out-of-band since the last `rdc sync prod`:
+  - hooks/validator
+  - queues/cost-invoices
+
+For each item, choose: [k]eep tgt edit · [o]verwrite with src · [s]kip (defer) · [a]bort
+  hooks/validator: [k/o/s/a] _
+```
+
+| Choice | Effect |
+|---|---|
+| `k` | Keep the tgt edit. Skip the PATCH for this object; update the lockfile baseline to the drifted hash so the next deploy doesn't re-prompt. Run `rdc sync <src>` afterwards if you want the edit to also land in source. |
+| `o` | Overwrite tgt with src's bytes. Adopt the drifted hash as the new baseline, then PATCH normally. This is the legacy default before the resolver shipped. |
+| `s` | Skip. No PATCH, no baseline update. The next deploy re-classifies as drift and re-prompts. Use it when you want to investigate before deciding. |
+| `a` (or empty Enter) | Abort the whole deploy. No further writes happen. |
+
+Non-TTY / `--yes` mode refuses on drift unless you also pass `--force-overwrite-drift`, which short-circuits every decision to `o`. This is intentional — a CI script can't be trusted to silently blow away ad-hoc UI edits, and the refusal error names every drifted slug plus the exact escape hatches (`rdc sync <tgt>` to reconcile the baseline, or `--force-overwrite-drift` to confirm "yes really overwrite").
+
+Phantom drift for objects just created in the same deploy (the POST-response hash can differ from a subsequent GET's canonical hash because the server adds back some fields on read) is silently adopted — the preview couldn't have asked about it, and you already authorized creating these objects via the confirm prompt.
 
 ## Recover from drift
 
