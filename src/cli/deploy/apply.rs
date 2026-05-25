@@ -235,7 +235,7 @@ pub(crate) async fn run(
     let _src_cfg = cfg.envs.get(src).ok_or_else(|| anyhow!("env '{src}' is not defined in rdc.toml"))?;
     let tgt_cfg = cfg.envs.get(tgt).ok_or_else(|| anyhow!("env '{tgt}' is not defined in rdc.toml"))?;
 
-    let token = resolve_token(&cwd, tgt)?;
+    let token = resolve_token(&cwd, tgt, &tgt_cfg.api_base).await?;
     let tgt_client = RossumClient::new(tgt_cfg.api_base.clone(), token)
         .context("constructing tgt API client")?
         .with_env_label(tgt);

@@ -588,3 +588,101 @@ async fn login_propagates_401_on_bad_credentials() {
     let msg = format!("{err:#}");
     assert!(msg.contains("401"), "error should mention status: {msg}");
 }
+
+#[tokio::test]
+async fn resolve_token_logs_in_when_creds_set_and_no_cache() {
+    use tempfile::TempDir;
+    use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/auth/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "key": "fresh-from-login",
+            "domain": "example",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = TempDir::new().unwrap();
+    // No secrets file, no RDC_TOKEN_*. Set RDC_USER_DEV / RDC_PASS_DEV.
+    // Use a unique env name per test to avoid env-var collisions across
+    // the test runner's parallel jobs.
+    let env_name = format!("login_e2e_{}", uuid_like_suffix());
+    // SAFETY: Rust 2024 marks env mutation unsafe due to multi-threaded
+    // soundness. The env-var names embed a per-test nanosecond suffix so
+    // parallel jobs don't collide, and resolve_token reads them on the
+    // current thread before we touch them again.
+    unsafe {
+        std::env::set_var(format!("RDC_USER_{}", env_name.to_uppercase()), "alice");
+        std::env::set_var(format!("RDC_PASS_{}", env_name.to_uppercase()), "hunter2");
+    }
+
+    let api_base = format!("{}/v1", server.uri());
+    let token = rdc::secrets::resolve_token(dir.path(), &env_name, &api_base)
+        .await
+        .expect("resolve_token should login and return a fresh token");
+    assert_eq!(token, "fresh-from-login");
+
+    // The login result must be persisted with an expires_at.
+    let raw = std::fs::read_to_string(
+        dir.path().join("secrets").join(format!("{env_name}.secrets.json")),
+    )
+    .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(parsed["api_token"], "fresh-from-login");
+    assert!(
+        parsed["expires_at"].is_number(),
+        "expires_at must be persisted, got {parsed}"
+    );
+
+    // SAFETY: see set_var SAFETY note above; cleanup happens after the
+    // resolve_token call returned, so no other thread is reading these.
+    unsafe {
+        std::env::remove_var(format!("RDC_USER_{}", env_name.to_uppercase()));
+        std::env::remove_var(format!("RDC_PASS_{}", env_name.to_uppercase()));
+    }
+}
+
+#[tokio::test]
+async fn resolve_token_uses_cache_when_valid_no_login_call() {
+    use tempfile::TempDir;
+    use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/auth/login"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+    // Far-future expires_at -> cache is valid.
+    std::fs::write(
+        dir.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"cached-token","expires_at":99999999999}"#,
+    )
+    .unwrap();
+
+    let api_base = format!("{}/v1", server.uri());
+    let token = rdc::secrets::resolve_token(dir.path(), "dev", &api_base)
+        .await
+        .expect("resolve_token should use the cache");
+    assert_eq!(token, "cached-token");
+    // The wiremock expect(0) above asserts no POST was made.
+}
+
+// Small helper to produce a unique-ish env name per test invocation.
+// Doesn't need to be cryptographically unique — just enough to keep
+// parallel test jobs from stomping on each other's env vars.
+fn uuid_like_suffix() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos:x}")
+}
