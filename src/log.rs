@@ -105,7 +105,6 @@ mod action_tests {
 
 /// UTC HH:MM:SS — small standalone formatter so we don't add a `chrono`
 /// dep. Mirrors the helper that previously lived in `cli::sync::watch`.
-#[allow(dead_code)]
 pub(crate) fn now_hhmmss() -> String {
     format_hhmmss(std::time::SystemTime::now())
 }

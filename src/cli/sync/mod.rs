@@ -147,7 +147,6 @@ pub async fn run(
     env: &str,
     interactive: bool,
     dry_run: bool,
-    diff: bool,
     allow_deletes: bool,
     no_push: bool,
     no_pull: bool,
@@ -164,7 +163,6 @@ pub async fn run(
         env,
         interactive,
         dry_run,
-        diff,
         allow_deletes,
         no_push,
         no_pull,
@@ -187,7 +185,6 @@ pub(crate) async fn run_cycle(
     env: &str,
     interactive: bool,
     dry_run: bool,
-    diff: bool,
     allow_deletes: bool,
     no_push: bool,
     no_pull: bool,
@@ -344,10 +341,6 @@ pub(crate) async fn run_cycle(
             }
             progress.block(&body);
         }
-
-        // `--diff` rendering will hook in here once the executor is
-        // wired; defer until per-object bodies are available.
-        let _ = diff;
 
         if !renderer_was_supplied {
             progress.event(Action::Done, &format!(

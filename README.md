@@ -300,13 +300,7 @@ Non-TTY runs (CI) without `--allow-deletes` refuse the sync and list the tombsto
 
 Per-object drift check: if the remote's `modified_at` has changed since the last `rdc sync`, the resolver opens — `[k]` keep delete (force DELETE despite the drift), `[s]` skip (leave alone), `[a]` abort. Non-TTY drift defaults to skip-with-warning.
 
-Cascade order is reverse of creates: deleting a workspace directory removes its queues, schemas, inboxes, email templates, hooks attached to those queues, and so on before the workspace itself. The dry-run preview shows the exact sequence.
-
-```sh
-rdc sync test --dry-run --diff   # preview deletes line-by-line
-```
-
-`rdc sync --dry-run --diff` fetches each tombstone's remote and renders it as a deleted-file diff (`+++ /dev/null`) so you can audit exactly what would disappear.
+Cascade order is reverse of creates: deleting a workspace directory removes its queues, schemas, inboxes, email templates, hooks attached to those queues, and so on before the workspace itself. `rdc sync test --dry-run` shows the exact sequence.
 
 Supported kinds for delete: same as create, minus the read-only kinds (workflows, workflow steps, MDH datasets). A tombstone for those is silently ignored.
 
@@ -316,7 +310,7 @@ Supported kinds for delete: same as create, minus the read-only kinds (workflows
 rdc sync test --dry-run
 ```
 
-Lists every changed file and which kind would receive a POST/PATCH/DELETE — no API calls made by default. Add `--diff` to also fetch the current remote per object and print unified diffs (and full deleted-body / would-be-POST-body previews).
+Lists every changed file and which kind would receive a POST/PATCH/DELETE. No API writes happen.
 
 ## Watch mode
 
