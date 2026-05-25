@@ -12,6 +12,14 @@ pub struct User {
     pub url: String,
     #[serde(default)]
     pub username: String,
+    /// Display email. Distinct from `username` (which is itself an email
+    /// for human users but a synthetic identifier like
+    /// `system_user__<hash>` for auto-provisioned service accounts). The
+    /// picker surfaces both so an operator can disambiguate users with
+    /// identical first/last names by the unique email. May be absent or
+    /// blank on system/service accounts; `Option` to handle null + missing.
+    #[serde(default)]
+    pub email: Option<String>,
     #[serde(default)]
     pub first_name: String,
     #[serde(default)]
