@@ -477,7 +477,7 @@ Hook secret values (third-party API tokens, signing keys, anything Rossum stores
 
 1. For every hook in the deploy plan (creates + updates), `GET /hooks/<src_id>/secrets_keys` enumerates the keys the source hook actually uses.
 2. The target's local `secrets/<tgt>.hook-secrets.json` must declare a value for every required key.
-3. Any missing → the deploy aborts with a per-hook list and no writes happen. Populate the file and retry.
+3. Any missing → the deploy aborts with a per-hook list and no writes happen. The precheck **pre-populates the file** with an empty-string placeholder for every required key (existing values are preserved; slugs outside this deploy's scope are passed through untouched), so the rerun is fill-in-the-blanks — you never need to reverse-engineer the JSON shape from scratch.
 4. Extras in the target file (keys the source doesn't declare) are filtered out of the outbound body and warned about — the target hook gets exactly the shape of secrets the source has.
 
 Limits — both for transparency and to set expectations:
