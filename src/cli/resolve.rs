@@ -1231,7 +1231,19 @@ pub fn format_user_choices(
             } else {
                 format!("{} {}", u.first_name, u.last_name).trim().to_string()
             };
-            format!("{display}   [{tags}]   {}", u.url)
+            // Two real users can share first+last name; the email is
+            // the only field guaranteed unique per Rossum user. Render
+            // it next to the display name (`<email>`, git-author style)
+            // when present and not already what `display` collapsed to
+            // (system accounts often have email == username, no point
+            // showing the same string twice).
+            let email_suffix = u
+                .email
+                .as_deref()
+                .filter(|e| !e.is_empty() && *e != display)
+                .map(|e| format!(" <{e}>"))
+                .unwrap_or_default();
+            format!("{display}{email_suffix}   [{tags}]   {}", u.url)
         })
         .collect()
 }
@@ -1982,6 +1994,64 @@ mod tests {
         assert!(choices.iter().any(|c| c.contains("u100")), "alice should be present");
         // Active session's own user tagged.
         assert!(choices[0].contains("you"), "self user should be tagged, got {:?}", choices[0]);
+    }
+
+    #[test]
+    fn picker_includes_email_for_disambiguation() {
+        // Two real users can share first+last name; email is the unique
+        // identifier the operator can use to tell them apart.
+        use crate::model::User;
+        let users: Vec<User> = serde_json::from_value(serde_json::json!([
+            {"id": 100, "url": "u100", "username": "alice@a.com",
+             "email": "alice@a.com",
+             "first_name": "Alice", "last_name": "Smith",
+             "is_active": true, "groups": ["https://x/groups/3"]},
+            {"id": 200, "url": "u200", "username": "alice@b.com",
+             "email": "alice@b.com",
+             "first_name": "Alice", "last_name": "Smith",
+             "is_active": true, "groups": ["https://x/groups/3"]}
+        ])).unwrap();
+        let choices = format_user_choices(&users, None);
+        // Each line carries its own email so the operator can pick.
+        assert!(
+            choices.iter().any(|c| c.contains("Alice Smith <alice@a.com>")),
+            "expected '<alice@a.com>' in some line, got {:?}",
+            choices,
+        );
+        assert!(
+            choices.iter().any(|c| c.contains("Alice Smith <alice@b.com>")),
+            "expected '<alice@b.com>' in some line, got {:?}",
+            choices,
+        );
+    }
+
+    #[test]
+    fn picker_omits_email_when_absent_or_equal_to_display() {
+        // System users typically have no separate email (just the
+        // synthetic `system_user__<hash>` username). Don't render an
+        // empty `<>` or a redundant duplicate.
+        use crate::model::User;
+        let users: Vec<User> = serde_json::from_value(serde_json::json!([
+            {"id": 1, "url": "u1", "username": "system_user__abc",
+             "first_name": "SYS", "last_name": "USER",
+             "is_active": true, "groups": ["https://x/groups/3"]},
+            {"id": 2, "url": "u2", "username": "name-as-username",
+             "email": "name-as-username",
+             "first_name": "", "last_name": "",
+             "is_active": true, "groups": ["https://x/groups/3"]}
+        ])).unwrap();
+        let choices = format_user_choices(&users, None);
+        for c in &choices {
+            assert!(!c.contains("<>"), "no empty email markers: {:?}", c);
+        }
+        // For the username-only user, display == email; suppress the
+        // duplicate.
+        let same = choices.iter().find(|c| c.contains("name-as-username")).unwrap();
+        assert!(
+            !same.contains("<name-as-username>"),
+            "should suppress redundant `<email>` when it equals display, got {:?}",
+            same,
+        );
     }
 
     #[test]
