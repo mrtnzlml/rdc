@@ -10,11 +10,22 @@ use serde_json::Value;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
-/// Strip server-only fields from an index definition so the user only
-/// sees / round-trips the fields they can actually edit. Removes the
-/// implicit `_id_` regular index (server-managed, can't be dropped)
-/// and the `v` index-version field (server-assigned, not user-input).
-/// Returns a fresh [`IndexSet`] with the stripped form.
+/// Strip server-only fields from an index set so the user only sees /
+/// round-trips the fields they can actually edit. Two flavors:
+///
+/// - **Regular indexes**: drop the implicit `_id_` (server-managed,
+///   can't be dropped) and the `v` index-version field
+///   (server-assigned). Other fields (`key`, `name`, `unique`,
+///   `sparse`, …) round-trip 1:1 between list and create.
+///
+/// - **Search indexes**: the list response wraps the user-authored
+///   `mappings` / `analyzers` inside a `latest_definition` envelope
+///   and adds server-status fields (`type`, `status`, `queryable`,
+///   `analyzer`, `search_analyzer`, `synonyms`). Normalise to the
+///   shape the create body expects: `{name, mappings, analyzers?}`.
+///   Without this normalisation, push would round-trip user edits
+///   against a remote shape they never wrote, producing spurious
+///   drop+create churn on every sync.
 fn strip_server_managed(set: &IndexSet) -> IndexSet {
     let mut regular: Vec<Value> = set
         .regular
@@ -29,10 +40,41 @@ fn strip_server_managed(set: &IndexSet) -> IndexSet {
             obj.shift_remove("v");
         }
     }
-    IndexSet {
-        regular,
-        search: set.search.clone(),
+    let search: Vec<Value> = set
+        .search
+        .iter()
+        .filter_map(normalize_search_index)
+        .collect();
+    IndexSet { regular, search }
+}
+
+/// Reshape a search-index list response to the create-body shape.
+/// Returns `None` for entries that can't supply the minimum fields
+/// (`name` and `mappings`) — defensive against future API drift.
+fn normalize_search_index(remote: &Value) -> Option<Value> {
+    let obj = remote.as_object()?;
+    let name = obj.get("name")?.clone();
+    let definition = obj.get("latest_definition").and_then(|v| v.as_object());
+    let mappings = definition
+        .and_then(|d| d.get("mappings"))
+        .or_else(|| obj.get("mappings"))?
+        .clone();
+    let mut out = serde_json::Map::new();
+    out.insert("name".to_string(), name);
+    out.insert("mappings".to_string(), mappings);
+    // Only include `analyzers` when the user actually configured them
+    // (non-empty array). The default-empty case matches the create
+    // body's optional shape and keeps the on-disk JSON minimal.
+    let analyzers = definition
+        .and_then(|d| d.get("analyzers"))
+        .or_else(|| obj.get("analyzers"));
+    if let Some(a) = analyzers {
+        let non_empty = a.as_array().map(|arr| !arr.is_empty()).unwrap_or(true);
+        if non_empty {
+            out.insert("analyzers".to_string(), a.clone());
+        }
     }
+    Some(Value::Object(out))
 }
 
 /// Opaque listed state for MDH — the client handle plus the collection list.
