@@ -165,6 +165,90 @@ fn init_does_not_clobber_existing_claude_md() {
     assert_eq!(after, user_content, "init must not overwrite a pre-existing CLAUDE.md");
 }
 
+/// Fresh init must drop a README.md with the run-the-project commands —
+/// `rdc sync` for every env defined in `rdc.toml` and pointers to the
+/// other doc surfaces. Single-env projects have nothing to deploy, so
+/// the Deploy section is conditionally omitted.
+#[test]
+fn init_creates_readme_with_sync_commands_and_skips_deploy_for_single_env() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--env", "dev=https://example.rossum.app/api/v1:285704",
+        ])
+        .assert()
+        .success();
+
+    let readme_path = dir.path().join("README.md");
+    assert!(readme_path.exists(), "README.md should be created on init");
+    let body = std::fs::read_to_string(&readme_path).unwrap();
+    assert!(body.contains("## Sync each environment"), "missing sync section: {body}");
+    assert!(body.contains("rdc sync dev"), "missing dev sync command: {body}");
+    assert!(
+        !body.contains("## Deploy"),
+        "single-env project should not have a Deploy section: {body}"
+    );
+    // Cross-references to the other doc surfaces are part of why we
+    // generate this file in the first place.
+    assert!(body.contains("`CLAUDE.md`"), "missing CLAUDE.md link: {body}");
+    assert!(body.contains("_index.md"), "missing _index.md link: {body}");
+}
+
+/// Two-env project includes a Deploy section with a concrete example
+/// using the alphabetically-first pair (BTreeMap order, deterministic).
+#[test]
+fn init_readme_includes_deploy_for_multiple_envs() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--env", "dev=https://example.rossum.app/api/v1:285704",
+            "--env", "prod=https://example.rossum.app/api/v1:285705",
+        ])
+        .assert()
+        .success();
+
+    let body = std::fs::read_to_string(dir.path().join("README.md")).unwrap();
+    // Both envs listed in the sync block.
+    assert!(body.contains("rdc sync dev"));
+    assert!(body.contains("rdc sync prod"));
+    // Deploy section appears for multi-env projects.
+    assert!(body.contains("## Deploy"), "deploy section missing: {body}");
+    // The first two alphabetically: dev → prod.
+    assert!(
+        body.contains("rdc deploy dev prod"),
+        "expected deploy example with dev→prod: {body}"
+    );
+    assert!(body.contains("--dry-run"), "deploy --dry-run guidance missing: {body}");
+}
+
+/// User has authored their own README before running init — we must
+/// not touch it (same contract as CLAUDE.md).
+#[test]
+fn init_does_not_clobber_existing_readme() {
+    let dir = TempDir::new().unwrap();
+    let user_content = "# My project\n\nCustom notes — keep these.\n";
+    std::fs::write(dir.path().join("README.md"), user_content).unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--env", "dev=https://example.rossum.app/api/v1:285704",
+        ])
+        .assert()
+        .success();
+
+    let after = std::fs::read_to_string(dir.path().join("README.md")).unwrap();
+    assert_eq!(after, user_content, "init must not overwrite a pre-existing README.md");
+}
+
 #[test]
 fn init_adds_new_env_to_existing_project() {
     let dir = TempDir::new().unwrap();

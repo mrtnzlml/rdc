@@ -67,6 +67,7 @@ pub async fn run(env_specs: Vec<String>) -> Result<()> {
     write_gitignore(&cwd)?;
     write_gitattributes(&cwd)?;
     write_claude_md(&cwd)?;
+    write_readme(&cwd, &cfg)?;
     std::fs::create_dir_all(cwd.join("secrets"))
         .with_context(|| format!("creating {}", cwd.join("secrets").display()))?;
     for env in &new_env_names {
@@ -529,6 +530,87 @@ fn write_claude_md(root: &Path) -> Result<()> {
         return Ok(());
     }
     write_atomic(&path, CLAUDE_MD_TEMPLATE.as_bytes())?;
+    Ok(())
+}
+
+/// Write a human-facing `README.md` at the project root listing the
+/// run-the-project commands: one `rdc sync <env>` per env defined in
+/// `cfg`, and — when there are at least two envs — a `rdc deploy
+/// <src> <tgt>` example using the first two envs alphabetically. Same
+/// once-only contract as [`write_claude_md`]: skipped when README.md
+/// already exists, so the user's content is never clobbered.
+///
+/// Title is the project root's basename (matches the user's mental
+/// model of "what is this repo called"); falls back to a generic title
+/// when the basename isn't valid UTF-8 or is empty.
+fn write_readme(root: &Path, cfg: &ProjectConfig) -> Result<()> {
+    let path = root.join("README.md");
+    if path.exists() {
+        return Ok(());
+    }
+    let title = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| "Rossum configuration".to_string());
+
+    let mut md = String::new();
+    md.push_str(&format!("# {title}\n\n"));
+    md.push_str(
+        "Rossum.ai configuration managed by \
+         [rdc](https://github.com/mrtnzlml/rdc). Each env's live state is \
+         mirrored as files under `envs/<env>/` so it can be reviewed, edited, \
+         and deployed like code.\n\n",
+    );
+
+    if !cfg.envs.is_empty() {
+        md.push_str("## Sync each environment\n\n");
+        md.push_str(
+            "`rdc sync <env>` reconciles the local snapshot with the remote \
+             env in one pass — pulls remote edits, pushes local edits, \
+             creates new objects. Run it after cloning, after pulling new \
+             commits, and whenever you've edited files under `envs/<env>/`.\n\n",
+        );
+        md.push_str("```sh\n");
+        for env in cfg.envs.keys() {
+            md.push_str(&format!("rdc sync {env}\n"));
+        }
+        md.push_str("```\n\n");
+    }
+
+    // Deploy section only when there's something to deploy between.
+    // BTreeMap iteration is already sorted, so the first two keys give
+    // a deterministic example without an extra sort step.
+    if cfg.envs.len() >= 2 {
+        let mut iter = cfg.envs.keys();
+        let src = iter.next().expect("len >= 2");
+        let tgt = iter.next().expect("len >= 2");
+        md.push_str("## Deploy\n\n");
+        md.push_str(
+            "`rdc deploy <src> <tgt>` promotes one env to another. The full \
+             per-object diff prints before the confirmation prompt so you \
+             commit with the actual delta in hand.\n\n",
+        );
+        md.push_str("```sh\n");
+        md.push_str(&format!(
+            "rdc deploy {src} {tgt} --dry-run   # preview only, no remote writes\n"
+        ));
+        md.push_str(&format!(
+            "rdc deploy {src} {tgt}              # execute after reviewing\n"
+        ));
+        md.push_str("```\n\n");
+    }
+
+    md.push_str("## See also\n\n");
+    md.push_str(
+        "- `CLAUDE.md` — editing recipes, repo layout, common commands, \
+         conflict + deploy workflows.\n\
+         - `envs/<env>/_index.md` — auto-generated map of every object in \
+         `<env>` with paths and cross-references.\n",
+    );
+
+    write_atomic(&path, md.as_bytes())?;
     Ok(())
 }
 
