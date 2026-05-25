@@ -101,6 +101,16 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
     // uses. The maps stay scoped to this function; downstream resolution
     // looks objects up by slug.
     let mut workspace_by_slug: BTreeMap<String, &crate::model::Workspace> = BTreeMap::new();
+    // Side-map of `workspace_url → slug` populated alongside
+    // `workspace_by_slug`. Used by the queue loop below as a fallback
+    // when `ctx.lockfile.slug_for_url("workspaces", …)` misses — which
+    // it does on `repair --rebuild-lock` (lockfile starts empty) and any
+    // resume path where queues were created on remote in a prior failed
+    // run but the lockfile was never persisted. Without this, every
+    // queue silently `continue`s and the conflict resolver reports
+    // "no matching remote object found" for the queue / its schema /
+    // its inbox even though the freshly-pulled catalog has them all.
+    let mut ws_url_to_slug: BTreeMap<String, String> = BTreeMap::new();
     {
         let mut used: HashSet<String> = HashSet::new();
         for w in &catalog.workspaces {
@@ -109,6 +119,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 None => slugify_unique(&w.name, &used),
             };
             used.insert(slug.clone());
+            ws_url_to_slug.insert(w.url.clone(), slug.clone());
             workspace_by_slug.insert(slug, w);
         }
     }
@@ -173,10 +184,16 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
             std::collections::HashMap::new();
         for q in &catalog.queues {
             let Some(ws_url) = q.workspace.as_ref() else { continue };
-            let ws_slug = match ctx.lockfile.slug_for_url("workspaces", ws_url) {
-                Some(s) => s.to_string(),
-                None => continue,
-            };
+            // Prefer the lockfile slug (preserves user-customised slugs);
+            // fall back to the freshly-derived slug from `ws_url_to_slug`
+            // when the lockfile has no entry yet. Without the fallback,
+            // an empty/freshly-rebuilt lockfile loses every queue here.
+            let ws_slug = ctx
+                .lockfile
+                .slug_for_url("workspaces", ws_url)
+                .map(|s| s.to_string())
+                .or_else(|| ws_url_to_slug.get(ws_url).cloned());
+            let Some(ws_slug) = ws_slug else { continue };
             let used = per_ws.entry(ws_slug.clone()).or_default();
             let q_slug = match ctx.lockfile.slug_for_id("queues", q.id) {
                 Some(existing) => existing.to_string(),
@@ -1225,6 +1242,10 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
         }
     }
     let mut workspace_by_slug: BTreeMap<String, &crate::model::Workspace> = BTreeMap::new();
+    // Same `workspace_url → slug` side-map as the resolve_conflicts
+    // path, used below to map queue.workspace URLs to slugs when the
+    // lockfile is empty (rebuild-lock or partial-deploy resume).
+    let mut ws_url_to_slug: BTreeMap<String, String> = BTreeMap::new();
     {
         let mut used: HashSet<String> = HashSet::new();
         for w in &catalog.workspaces {
@@ -1233,6 +1254,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                 None => slugify_unique(&w.name, &used),
             };
             used.insert(slug.clone());
+            ws_url_to_slug.insert(w.url.clone(), slug.clone());
             workspace_by_slug.insert(slug, w);
         }
     }
@@ -1297,10 +1319,12 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
             std::collections::HashMap::new();
         for q in &catalog.queues {
             let Some(ws_url) = q.workspace.as_ref() else { continue };
-            let ws_slug = match ctx.lockfile.slug_for_url("workspaces", ws_url) {
-                Some(s) => s.to_string(),
-                None => continue,
-            };
+            let ws_slug = ctx
+                .lockfile
+                .slug_for_url("workspaces", ws_url)
+                .map(|s| s.to_string())
+                .or_else(|| ws_url_to_slug.get(ws_url).cloned());
+            let Some(ws_slug) = ws_slug else { continue };
             let used = per_ws.entry(ws_slug.clone()).or_default();
             let q_slug = match ctx.lockfile.slug_for_id("queues", q.id) {
                 Some(existing) => existing.to_string(),
