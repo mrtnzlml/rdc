@@ -79,16 +79,15 @@ pub const KINDS_IN_DEP_ORDER: &[&str] = &[
     "engine_fields",
 ];
 
-pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run: bool, diff: bool, only: Vec<String>) -> Result<()> {
+pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run: bool, _diff: bool, only: Vec<String>) -> Result<()> {
     if src == tgt {
         return Err(anyhow!(
             "src and tgt envs are the same ('{src}'). Use two different envs for `rdc deploy`."
         ));
     }
-    // A dry-run is for previewing changes — there's no useful brief
-    // form, so always show the full per-object diff. The `--diff` flag
-    // stays for backward compatibility but is now a no-op.
-    let diff = diff || dry_run;
+    // Note: the legacy `--diff` flag is a no-op kept for backward
+    // compatibility. Every deploy now renders the full per-object diff
+    // before the confirm prompt, so there's nothing to gate.
 
     let cwd = std::env::current_dir().context("getting current directory")?;
     let src_paths = Paths::for_env(&cwd, src);
@@ -172,6 +171,11 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
     // User-curated entries in the mapping file (cross-env renames) are
     // preserved — `auto_match` never overwrites.
     crate::cli::deploy::map::auto_match(&mut mapping, &src_paths, &tgt_paths)?;
+    // Persist immediately so the preview pass below (which calls
+    // `apply::run` that reloads the mapping from disk) sees the
+    // auto-matched entries. Without this, the preview reports "0
+    // updates" even when same-slug pairs exist in both envs.
+    mapping.save(&src_paths.mapping_file(src, tgt))?;
 
     // Resolve --only selectors against the local snapshots, then run a
     // cross-ref dep check. On TTY with missing deps, prompt to include
@@ -213,44 +217,16 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
         )?;
     }
     // 1. Compute plan — file-system level only (which slugs are missing
-    // from tgt, and in mirror mode which are tgt-only). Field-level diffs
-    // are deferred to the apply sub-step because computing them eagerly
-    // costs one GET per object across the whole snapshot.
+    // from tgt, and in mirror mode which are tgt-only). Field-level
+    // diffs are surfaced by the preview pass below.
     let plan = compute_plan(&src_paths, &tgt_paths, &src_lockfile, &tgt_lockfile, &mapping, mirror, selection.as_ref())?;
 
-    // 2. Display plan
-    print_plan(src, tgt, &plan, mirror, dry_run, &store_plans, selection.as_ref());
-
-    // 3. Confirm (TTY only) — skip the prompt when nothing destructive is
-    // planned OR when dry-run is set (no writes will happen). An
-    // "all-update" sweep still runs (PATCHes only the objects whose
-    // canonical content differs), which is safe to do silently.
-    if !dry_run
-        && interactive
-        && (plan.create_total() > 0 || plan.delete_total() > 0)
-    {
-        if !confirm_or_abort("Proceed with deploy?")? {
-            return Ok(());
-        }
-        if mirror && plan.delete_total() > 0 && !confirm_or_abort(&format!(
-            "Mirror mode will DELETE {} object(s) from {tgt}. Continue?",
-            plan.delete_total()
-        ))? {
-            return Ok(());
-        }
-    }
-
-    // Pre-flight hook-secrets check. Runs BEFORE the target lock is
-    // acquired so a missing-keys failure costs no contention. The
-    // GET `/hooks/<src_id>/secrets_keys` calls only hit `src_client`
-    // and are read-only.
-    //
-    // For each hook being POSTed (creates) or PATCHed (updates) on the
-    // target, we ensure the local `secrets/<tgt>.hook-secrets.json`
-    // declares a value for every key the source hook actually uses.
-    // If any are missing the deploy aborts with a per-hook report and
-    // no writes happen. Surplus keys in the target file are filtered
-    // and warned about.
+    // 2. Pre-flight hook-secrets check. Runs before the preview so a
+    // missing-keys failure surfaces immediately rather than after the
+    // user reads through a (potentially long) diff. The GET
+    // `/hooks/<src_id>/secrets_keys` calls hit `src_client` only and
+    // are read-only. Pre-population of the target's hook-secrets file
+    // is handled inside `precheck` on failure.
     let tgt_hook_secrets = crate::secrets::load_hook_secrets(tgt_paths.root(), tgt)
         .with_context(|| format!("loading hook secrets for target env '{tgt}'"))?;
     let mut hook_slugs_in_scope: std::collections::BTreeSet<String> =
@@ -272,183 +248,220 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
     )
     .await?;
 
-    // Acquire an exclusive lock on the target env for the duration of the
-    // write phase (creates + applies). Sync (one-shot or --watch) targeting
-    // `tgt` will wait briefly here; deploy will wait briefly if a sync is
-    // mid-cycle. Source env stays read-only — atomic-rename consistency
-    // suffices for reading its snapshot.
+    let started = Instant::now();
+
+    // 3. Full-diff preview. Runs unconditionally so dry-run AND real
+    // deploys both surface the same "what would change" view: create
+    // bodies (would-be POST), per-object update diffs (src after
+    // overlay+rewrite vs tgt remote), then — in mirror mode — delete
+    // bodies (would be removed). The update preview drives apply with
+    // dry_run+diff on a CLONED tgt_lockfile so the real apply pass
+    // below sees pristine state and re-derives drift adoption against
+    // the actual tgt remote.
+    if plan.create_total() > 0 {
+        println!("--- create bodies (would-be POST) ---");
+        preview_create_bodies(
+            &plan,
+            &src_paths,
+            &src_lockfile,
+            &tgt_lockfile,
+            &mapping,
+            &tgt_overlay,
+        )?;
+    }
+    {
+        let mut preview_lockfile = tgt_lockfile.clone();
+        let preview_summary = crate::cli::deploy::apply::run(
+            src,
+            tgt,
+            true,
+            true,
+            None,
+            &mut preview_lockfile,
+            selection.as_ref(),
+            &hook_secrets_plan,
+        )
+        .await
+        .with_context(|| "computing update preview")?;
+        println!();
+        println!("{preview_summary}");
+    }
+    if mirror && plan.delete_total() > 0 {
+        println!();
+        println!("--- delete bodies (would be removed from {tgt}) ---");
+        preview_delete_bodies(&plan, &tgt_paths)?;
+    }
+
+    // 4. Dry-run exit: preview was the deliverable, no writes follow.
+    if dry_run {
+        let elapsed = started.elapsed();
+        let scope = selection.as_ref()
+            .map(|s| format!(" (scoped, {} objects)", s.len()))
+            .unwrap_or_default();
+        println!(
+            "\nDry run ({src} -> {tgt}){scope}: {} would be created, {} would be deleted, \
+             {:.1}s; no remote changes made.",
+            plan.create_total(),
+            plan.delete_total(),
+            elapsed.as_secs_f64()
+        );
+        return Ok(());
+    }
+
+    // 5. Confirm (TTY only). Skipped when nothing destructive is planned —
+    // an "all-update" sweep still runs but PATCHes only objects whose
+    // canonical content differs, which is safe to do silently.
+    if interactive && (plan.create_total() > 0 || plan.delete_total() > 0) {
+        if !confirm_or_abort("Proceed with deploy?")? {
+            return Ok(());
+        }
+        if mirror && plan.delete_total() > 0 && !confirm_or_abort(&format!(
+            "Mirror mode will DELETE {} object(s) from {tgt}. Continue?",
+            plan.delete_total()
+        ))? {
+            return Ok(());
+        }
+    }
+
+    // 6. Acquire an exclusive lock on the target env for the duration of
+    // the write phase (creates + applies + deletes). Sync (one-shot or
+    // --watch) targeting `tgt` will wait briefly here; deploy will wait
+    // briefly if a sync is mid-cycle. Source env stays read-only —
+    // atomic-rename consistency suffices for reading its snapshot.
     let _tgt_lock = crate::cli::sync::lock::EnvLock::acquire(
         &tgt_paths.env_lock(),
         std::time::Duration::from_secs(30),
     )?;
 
-    // Start the progress bar for the work phase (not in dry-run).
-    let progress: Option<Arc<Log>> = if !dry_run {
-        Some(crate::log::Log::new(crate::cli::resolve::detect_color_mode(false)))
-    } else {
-        None
-    };
+    // 7. Start the progress bar for the work phase.
+    let progress: Option<Arc<Log>> =
+        Some(crate::log::Log::new(crate::cli::resolve::detect_color_mode(false)));
 
-    let started = Instant::now();
     let mut creates_done = 0usize;
     // Seed with the per-hook GETs the secrets pre-flight just issued.
     let mut api_calls = precheck_api_calls;
 
-    // 4. Execute creates in dependency order. In dry-run mode we don't
-    // POST — we just print what would happen. The create phase has no
-    // pre-flight comparison to do (a slug missing in tgt is a single
-    // file-system check, already done during plan computation), so
-    // "previewing" a create amounts to re-stating the plan's per-kind
-    // count line.
-    if dry_run {
-        for kind in KINDS_IN_DEP_ORDER {
-            if let Some(slugs) = plan.creates.get(kind) {
-                if !slugs.is_empty() {
-                    println!("  -> {kind:18} {} would be created", slugs.len());
+    // 8. Execute creates in dependency order.
+    let mut ctx = CreateCtx {
+        src_paths: &src_paths,
+        tgt_paths: &tgt_paths,
+        src_lockfile: &src_lockfile,
+        tgt_lockfile: &mut tgt_lockfile,
+        mapping: &mut mapping,
+        tgt_overlay: &tgt_overlay,
+        tgt_client: &tgt_client,
+        progress: progress.clone(),
+        hook_secrets_plan: &hook_secrets_plan,
+        regular_hook_token_owners: &regular_hook_token_owners,
+    };
+    // Lazily-populated cache of tgt remote hooks for store-extension
+    // orphan checks. Shared across all hooks in this bootstrap run so
+    // we list at most once.
+    let mut remote_hooks_cache: Option<Vec<crate::model::Hook>> = None;
+    // Each successful create mutates `tgt_lockfile` in memory. We
+    // persist after every per-slug success so a later failure leaves
+    // the on-disk lockfile in sync with what's actually on the remote
+    // — otherwise a re-run can't rewrite src URLs (the tgt queue URL
+    // the mapping looks up isn't in any lockfile yet), and the deploy
+    // gets stuck in an unresumeable state. Persisting after every
+    // create is cheap (atomic rename, single small file).
+    let mut create_err: Option<anyhow::Error> = None;
+    'outer: for kind in KINDS_IN_DEP_ORDER {
+        let Some(slugs) = plan.creates.get(kind) else { continue };
+        if slugs.is_empty() { continue; }
+        for slug in slugs {
+            let singular = kind.trim_end_matches('s');
+            let result = match *kind {
+                "workspaces" => create_workspace(&mut ctx, slug).await,
+                "schemas" => create_schema(&mut ctx, slug).await,
+                "queues" => {
+                    // queue create also fetches its auto-peer templates,
+                    // costing an extra LIST call per queue.
+                    api_calls += 1;
+                    create_queue(&mut ctx, slug).await
                 }
-            }
-        }
-        if diff && plan.create_total() > 0 {
-            // Surface the full POST body per would-be-created object so
-            // the user can audit exactly what `rdc deploy` would send.
-            // The body goes through the same shaping the real create path
-            // uses (URL rewrite, tgt overlay, server-field strip) so what
-            // you see here is what would land on the wire.
-            println!();
-            println!("--- create bodies (would-be POST) ---");
-            preview_create_bodies(
-                &plan,
-                &src_paths,
-                &src_lockfile,
-                &tgt_lockfile,
-                &mapping,
-                &tgt_overlay,
-            )?;
-        }
-    } else {
-        let mut ctx = CreateCtx {
-            src_paths: &src_paths,
-            tgt_paths: &tgt_paths,
-            src_lockfile: &src_lockfile,
-            tgt_lockfile: &mut tgt_lockfile,
-            mapping: &mut mapping,
-            tgt_overlay: &tgt_overlay,
-            tgt_client: &tgt_client,
-            progress: progress.clone(),
-            hook_secrets_plan: &hook_secrets_plan,
-            regular_hook_token_owners: &regular_hook_token_owners,
-        };
-        // Lazily-populated cache of tgt remote hooks for store-extension
-        // orphan checks. Shared across all hooks in this bootstrap run so
-        // we list at most once.
-        let mut remote_hooks_cache: Option<Vec<crate::model::Hook>> = None;
-        // Each successful create mutates `tgt_lockfile` in memory. We
-        // persist after every per-slug success so a later failure leaves
-        // the on-disk lockfile in sync with what's actually on the
-        // remote — otherwise a re-run can't rewrite src URLs (the tgt
-        // queue URL the mapping looks up isn't in any lockfile yet),
-        // and the deploy gets stuck in an unresumeable state. Persisting
-        // after every create is cheap (atomic rename, single small file).
-        let mut create_err: Option<anyhow::Error> = None;
-        'outer: for kind in KINDS_IN_DEP_ORDER {
-            let Some(slugs) = plan.creates.get(kind) else { continue };
-            if slugs.is_empty() { continue; }
-            for slug in slugs {
-                // Singular noun mapping for the event body.
-                let singular = kind.trim_end_matches('s');
-                let result = match *kind {
-                    "workspaces" => create_workspace(&mut ctx, slug).await,
-                    "schemas" => create_schema(&mut ctx, slug).await,
-                    "queues" => {
-                        // queue create also fetches its auto-peer templates,
-                        // costing an extra LIST call per queue.
-                        api_calls += 1;
-                        create_queue(&mut ctx, slug).await
-                    }
-                    "inboxes" => create_inbox(&mut ctx, slug).await,
-                    "email_templates" => {
-                        // Email templates with unique types are auto-created
-                        // by queue POST; here we only POST any custom (non-default)
-                        // templates the user explicitly added in src that the
-                        // queue auto-create didn't cover. The Rossum API rejects
-                        // POSTing a second template with a unique type, so we let
-                        // those flow to the update phase instead.
-                        Ok(())
-                    }
-                    "hooks" => {
-                        let plan = store_plans.iter().find(|p| p.src_slug == *slug);
-                        create_hook(&mut ctx, slug, plan, &mut remote_hooks_cache).await
-                    }
-                    "rules" => create_rule(&mut ctx, slug).await,
-                    "labels" => create_label(&mut ctx, slug).await,
-                    "engines" | "engine_fields" => {
-                        // Engines/engine_fields creation isn't exercised in
-                        // current orgs and may 403; fall through silently to
-                        // the update phase (which already has 405/403 handling).
-                        Ok(())
-                    }
-                    _ => Ok(()),
-                };
-                // create_schema/create_queue/create_inbox emit their own Post event.
-                // Emit Post for kinds whose create fns don't self-report.
-                if result.is_ok() {
-                    match *kind {
-                        "workspaces" | "hooks" | "rules" | "labels" | "engines" | "engine_fields" => {
-                            if let Some(p) = &progress {
-                                p.event(Action::Post, &format!("{singular}/{slug}"));
-                            }
+                "inboxes" => create_inbox(&mut ctx, slug).await,
+                "email_templates" => {
+                    // Email templates with unique types are auto-created
+                    // by queue POST; here we only POST any custom
+                    // (non-default) templates the user explicitly added
+                    // in src that the queue auto-create didn't cover.
+                    // The Rossum API rejects POSTing a second template
+                    // with a unique type, so we let those flow to the
+                    // update phase instead.
+                    Ok(())
+                }
+                "hooks" => {
+                    let plan = store_plans.iter().find(|p| p.src_slug == *slug);
+                    create_hook(&mut ctx, slug, plan, &mut remote_hooks_cache).await
+                }
+                "rules" => create_rule(&mut ctx, slug).await,
+                "labels" => create_label(&mut ctx, slug).await,
+                "engines" | "engine_fields" => {
+                    // Engines/engine_fields creation isn't exercised in
+                    // current orgs and may 403; fall through silently
+                    // to the update phase (which already has 405/403
+                    // handling).
+                    Ok(())
+                }
+                _ => Ok(()),
+            };
+            // create_schema/create_queue/create_inbox emit their own
+            // Post event. Emit Post for kinds whose create fns don't
+            // self-report.
+            if result.is_ok() {
+                match *kind {
+                    "workspaces" | "hooks" | "rules" | "labels" | "engines" | "engine_fields" => {
+                        if let Some(p) = &progress {
+                            p.event(Action::Post, &format!("{singular}/{slug}"));
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
-                if let Err(e) = result {
-                    create_err = Some(e);
-                    break 'outer;
-                }
-                // Flush after each successful create so a later failure
-                // can be resumed by re-running `rdc deploy` (the resume
-                // path needs the tgt URLs of just-created peers to
-                // rewrite hook/rule/etc. cross-references).
-                if let Err(e) = ctx.tgt_lockfile.save(&tgt_paths.lockfile()) {
-                    create_err = Some(e.context(format!(
-                        "saving tgt lockfile after creating {kind}/{slug}",
-                    )));
-                    break 'outer;
-                }
-                if let Err(e) = ctx.mapping.save(&src_paths.mapping_file(src, tgt)) {
-                    create_err = Some(e.context(format!(
-                        "saving src->tgt mapping after creating {kind}/{slug}",
-                    )));
-                    break 'outer;
-                }
-                creates_done += 1;
-                api_calls += 1;
             }
-        }
-        if let Some(e) = create_err {
-            return Err(e);
+            if let Err(e) = result {
+                create_err = Some(e);
+                break 'outer;
+            }
+            // Flush after each successful create so a later failure
+            // can be resumed by re-running `rdc deploy` (the resume
+            // path needs the tgt URLs of just-created peers to
+            // rewrite hook/rule/etc. cross-references).
+            if let Err(e) = ctx.tgt_lockfile.save(&tgt_paths.lockfile()) {
+                create_err = Some(e.context(format!(
+                    "saving tgt lockfile after creating {kind}/{slug}",
+                )));
+                break 'outer;
+            }
+            if let Err(e) = ctx.mapping.save(&src_paths.mapping_file(src, tgt)) {
+                create_err = Some(e.context(format!(
+                    "saving src->tgt mapping after creating {kind}/{slug}",
+                )));
+                break 'outer;
+            }
+            creates_done += 1;
+            api_calls += 1;
         }
     }
+    if let Some(e) = create_err {
+        return Err(e);
+    }
 
-    // 5. Persist the auto-matched mapping (in both dry-run and real-run).
-    // In real-run, apply re-reads this from disk and uses it. In dry-run,
-    // it leaves a clean state for a subsequent real `rdc deploy`.
+    // 9. Persist the auto-matched mapping for the apply phase to read.
     std::fs::create_dir_all(src_paths.mapping_dir())
         .with_context(|| format!("creating {}", src_paths.mapping_dir().display()))?;
     mapping.save(&src_paths.mapping_file(src, tgt))?;
 
-    // 6. Run apply for the field-level update sweep. Apply now sees the
-    // fully-populated mapping + tgt lockfile and PATCHes only the objects
-    // whose canonical content (after URL rewrite + overlay) actually
-    // differs from the tgt remote. Apply takes the tgt lockfile by `&mut`
-    // so it can auto-adopt any out-of-band tgt changes detected by its
-    // drift check (refreshing the recorded `content_hash`) without
-    // bailing out — the upcoming PATCH overwrites the drift anyway.
+    // 10. Real apply. Per-object diffs were rendered in the preview pass
+    // above, so apply runs here with dry_run=false, diff=false and emits
+    // only its progress events for each PATCH. Apply takes the tgt
+    // lockfile by `&mut` so it can auto-adopt out-of-band tgt changes
+    // detected by its drift check.
     let apply_summary = crate::cli::deploy::apply::run(
         src,
         tgt,
-        dry_run,
-        diff,
+        false,
+        false,
         progress.clone(),
         &mut tgt_lockfile,
         selection.as_ref(),
@@ -458,34 +471,18 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
     .with_context(|| format!(
         "update phase failed after {creates_done} create(s) succeeded"
     ))?;
-    if !dry_run {
-        tgt_lockfile
-            .save(&tgt_paths.lockfile())
-            .with_context(|| format!("saving tgt lockfile to {}", tgt_paths.lockfile().display()))?;
-    }
+    tgt_lockfile
+        .save(&tgt_paths.lockfile())
+        .with_context(|| format!("saving tgt lockfile to {}", tgt_paths.lockfile().display()))?;
 
-    // 7. Deletes (mirror only), reverse dependency order so children go
-    // before their parents. Dry-run reports what would be deleted but
-    // doesn't issue DELETE calls; with `--diff`, the tgt-side body of
-    // each soon-to-be-removed object is dumped first so the user can
-    // see exactly what would disappear.
+    // 11. Deletes (mirror only), reverse dependency order so children
+    // go before their parents.
     let mut deletes_done = 0usize;
-    if dry_run && diff && mirror && plan.delete_total() > 0 {
-        println!();
-        println!("--- delete bodies (would be removed from {tgt}) ---");
-        preview_delete_bodies(&plan, &tgt_paths)?;
-    }
     if mirror && plan.delete_total() > 0 {
         let mut rev = KINDS_IN_DEP_ORDER.to_vec();
         rev.reverse();
         for kind in rev {
             let Some(slugs) = plan.deletes.get(kind) else { continue };
-            if dry_run {
-                if !slugs.is_empty() {
-                    println!("  - {kind:18} {} would be deleted", slugs.len());
-                }
-                continue;
-            }
             for slug in slugs {
                 if let Err(e) = delete_one(&tgt_client, &mut tgt_lockfile, &tgt_paths, kind, slug).await {
                     warn(progress.as_ref(), format!("warning: failed to delete {kind}/{slug}: {e:#}"));
@@ -497,52 +494,27 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
                 api_calls += 1;
             }
         }
-        if !dry_run {
-            tgt_lockfile.save(&tgt_paths.lockfile())?;
-        }
+        tgt_lockfile.save(&tgt_paths.lockfile())?;
     }
 
+    // 12. Final summary.
     let elapsed = started.elapsed();
-    if dry_run {
-        let scope = selection.as_ref()
-            .map(|s| format!(" (scoped, {} objects)", s.len()))
-            .unwrap_or_default();
-        // Emit a done event (no-op if None).
-        if let Some(p) = &progress {
-            p.event(Action::Done, &format!(
-                "Dry run ({src} -> {tgt}){scope}: {} would be created, {} would be deleted, {:.1}s",
-                plan.create_total(),
-                plan.delete_total(),
-                elapsed.as_secs_f64()
-            ));
-        }
-        println!(
-            "\nDry run ({src} -> {tgt}){scope}: {} would be created, {} would be deleted, \
-             {:.1}s; no remote changes made.",
-            plan.create_total(),
-            plan.delete_total(),
+    let scope = selection.as_ref()
+        .map(|s| format!(" (scoped, {} objects)", s.len()))
+        .unwrap_or_default();
+    if let Some(p) = &progress {
+        p.event(Action::Done, &format!(
+            "Deployed {src} -> {tgt}{scope}: {creates_done} created, {deletes_done} deleted, {api_calls} API calls, {:.1}s",
             elapsed.as_secs_f64()
-        );
-    } else {
-        let scope = selection.as_ref()
-            .map(|s| format!(" (scoped, {} objects)", s.len()))
-            .unwrap_or_default();
-        // Emit a done event so the success summary lands after all phase output.
-        if let Some(p) = &progress {
-            p.event(Action::Done, &format!(
-                "Deployed {src} -> {tgt}{scope}: {creates_done} created, {deletes_done} deleted, {api_calls} API calls, {:.1}s",
-                elapsed.as_secs_f64()
-            ));
-        }
-        // Print apply summary.
-        println!("{apply_summary}");
-        println!(
-            "\nDeployed {src} -> {tgt}{scope}: {creates_done} created, {deletes_done} deleted, \
-             {} API calls, {:.1}s",
-            api_calls,
-            elapsed.as_secs_f64()
-        );
+        ));
     }
+    println!("{apply_summary}");
+    println!(
+        "\nDeployed {src} -> {tgt}{scope}: {creates_done} created, {deletes_done} deleted, \
+         {} API calls, {:.1}s",
+        api_calls,
+        elapsed.as_secs_f64()
+    );
     Ok(())
 }
 
@@ -878,83 +850,7 @@ fn list_engine_field_slugs(paths: &Paths) -> Result<Vec<String>> {
     Ok(out)
 }
 
-// ----- plan display + confirmation ------------------------------------
-
-fn print_plan(
-    src: &str,
-    tgt: &str,
-    plan: &PlanCounts,
-    mirror: bool,
-    dry_run: bool,
-    store_plans: &[crate::cli::deploy::store_extensions::StorePlan],
-    selection: Option<&crate::cli::deploy::selection::Selection>,
-) {
-    let suffix = if dry_run { "  (dry run; no remote changes)" } else { "" };
-    if let Some(sel) = selection {
-        println!("Plan: {src} -> {tgt}  (selection: {} objects via --only){suffix}", sel.len());
-        println!("  Selected:");
-        for (kind, slug) in &sel.items {
-            println!("    {kind}/{slug}");
-        }
-    } else {
-        println!("Plan: {src} -> {tgt}{suffix}");
-    }
-    if plan.create_total() == 0 {
-        println!("  + create:  (none)");
-    } else {
-        let parts: Vec<String> = KINDS_IN_DEP_ORDER
-            .iter()
-            .filter_map(|k| plan.creates.get(k).map(|v| format!("{} {}", v.len(), k)))
-            .collect();
-        println!("  + create:  {}", parts.join(", "));
-
-        // Surface store-extension subset when any of the hooks-to-create are
-        // store extensions. Print a sub-line showing count, operation shape,
-        // and a per-hook detail line with slug → template name + id.
-        if !store_plans.is_empty() {
-            let n = store_plans.len();
-            let hooks_to_create = plan.creates.get("hooks").map(|v| v.len()).unwrap_or(0);
-            if hooks_to_create > 0 && hooks_to_create >= n {
-                println!(
-                    "             > {} of the {} hooks are store extensions (POST /hooks/create + PATCH each):",
-                    n, hooks_to_create
-                );
-            } else {
-                let ext_word = if n == 1 { "store extension" } else { "store extensions" };
-                println!(
-                    "             > {} {} will be installed (POST /hooks/create + PATCH each):",
-                    n, ext_word
-                );
-            }
-            for sp in store_plans {
-                let tgt_id = sp.tgt_template_url.rsplit('/').next().unwrap_or("?");
-                println!(
-                    "                 {} -> template '{}' on {} (id {})",
-                    sp.src_slug, sp.tgt_template_name, tgt, tgt_id
-                );
-            }
-        }
-    }
-
-    // Updates are computed lazily by the update phase below. The plan
-    // summary only counts creates and deletes; the per-field diffs print
-    // inline as part of the update sweep.
-    println!("  ~ update:  field-level diffs printed below");
-
-    if mirror {
-        if plan.delete_total() == 0 {
-            println!("  - delete:  (none; tgt has no extras)");
-        } else {
-            let parts: Vec<String> = KINDS_IN_DEP_ORDER
-                .iter()
-                .rev()
-                .filter_map(|k| plan.deletes.get(k).map(|v| format!("{} {}", v.len(), k)))
-                .collect();
-            println!("  - delete:  {} (--mirror)", parts.join(", "));
-        }
-    }
-    println!();
-}
+// ----- confirmation ---------------------------------------------------
 
 fn confirm_or_abort(prompt: &str) -> Result<bool> {
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
