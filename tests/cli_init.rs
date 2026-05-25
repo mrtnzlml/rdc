@@ -37,6 +37,11 @@ fn init_creates_expected_files() {
     let gitignore = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
     assert!(gitignore.contains("/secrets"));
     assert!(gitignore.contains("/.rdc/cache"));
+    // Advisory OS lock files (`.rdc/state/<env>.lock`) are per-machine
+    // and intentionally empty; exclude them from the committable
+    // snapshot. The committable `<env>.lock.json` lockfile is NOT
+    // matched by `*.lock` (it ends in `.json`).
+    assert!(gitignore.contains("/.rdc/state/*.lock"));
 
     // Generated files under .rdc/ (lockfile, mapping) are marked so
     // GitHub collapses their diffs and excludes them from language stats.
@@ -91,6 +96,53 @@ fn init_preserves_existing_gitattributes_and_is_idempotent() {
         1,
         "rule should be written exactly once across init runs"
     );
+}
+
+#[test]
+fn init_appends_missing_gitignore_lines_without_duplicating() {
+    // Pre-existing .gitignore already has /secrets and /.rdc/cache
+    // (from an older rdc init), plus a user-authored rule. The newer
+    // template adds /.rdc/state/*.lock — that line should be appended,
+    // the old lines should NOT be duplicated, and the user-authored
+    // rule should survive.
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join(".gitignore"),
+        "/secrets\n/.rdc/cache\nmy-local-notes/\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--env", "dev=https://example.rossum.app/api/v1:285704",
+        ])
+        .assert()
+        .success();
+
+    let after = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+    assert!(after.contains("my-local-notes/"), "user rule must survive");
+    assert!(after.contains("/secrets"));
+    assert!(after.contains("/.rdc/cache"));
+    assert!(after.contains("/.rdc/state/*.lock"));
+    // No duplication of pre-existing patterns.
+    assert_eq!(after.matches("/secrets").count(), 1);
+    assert_eq!(after.matches("/.rdc/cache").count(), 1);
+
+    // Re-running init is fully idempotent — no further changes.
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--env", "prod=https://example.rossum.app/api/v1:285705",
+        ])
+        .assert()
+        .success();
+    let after_second = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+    assert_eq!(after, after_second, "second init must not touch .gitignore");
 }
 
 #[test]
