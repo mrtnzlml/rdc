@@ -79,15 +79,12 @@ pub const KINDS_IN_DEP_ORDER: &[&str] = &[
     "engine_fields",
 ];
 
-pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run: bool, _diff: bool, only: Vec<String>) -> Result<()> {
+pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run: bool, only: Vec<String>) -> Result<()> {
     if src == tgt {
         return Err(anyhow!(
             "src and tgt envs are the same ('{src}'). Use two different envs for `rdc deploy`."
         ));
     }
-    // Note: the legacy `--diff` flag is a no-op kept for backward
-    // compatibility. Every deploy now renders the full per-object diff
-    // before the confirm prompt, so there's nothing to gate.
 
     let cwd = std::env::current_dir().context("getting current directory")?;
     let src_paths = Paths::for_env(&cwd, src);
@@ -962,7 +959,7 @@ fn remove_local_file(paths: &Paths, kind: &str, slug: &str) {
     }
 }
 
-// ----- dry-run --diff body previews ----------------------------------
+// ----- preview body renderers ----------------------------------------
 
 /// For every would-be create in the plan, build the body the real deploy
 /// would POST (URL-rewritten via the auto-matched mapping, tgt overlay

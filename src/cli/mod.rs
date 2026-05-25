@@ -133,10 +133,11 @@ pub enum Command {
     /// First-class cross-env operation: bootstraps a fresh target (POSTing
     /// missing resources in dependency order, rewriting cross-references
     /// from src URLs to tgt URLs as it goes) AND patches existing ones for
-    /// field-level deltas. Plan-before-apply: a confirmation prompt summarises
-    /// what will be created / updated / deleted before any write hits the
-    /// target. Idempotent: re-running on an in-sync target performs zero
-    /// API calls. `--dry-run` always prints a per-object unified diff.
+    /// field-level deltas. Diff-before-apply: the full per-object diff
+    /// (create bodies, update diffs, delete bodies) prints before the
+    /// confirmation prompt so the user commits with the actual delta in
+    /// hand. Idempotent: re-running on an in-sync target performs zero
+    /// write API calls.
     Deploy {
         /// Source environment (e.g. `test`). Picks interactively when omitted.
         #[arg(add = ArgValueCandidates::new(env_name_candidates))]
@@ -150,7 +151,7 @@ pub enum Command {
         /// `--yes`, because the deletions are irreversible.
         #[arg(long)]
         mirror: bool,
-        /// Print the plan and exit without making any remote changes.
+        /// Print the full diff and exit without making any remote changes.
         /// Useful for previewing a promotion in CI or before promoting
         /// to a sensitive environment. The same code paths run that
         /// would run in a real deploy (URL rewriting, drift checks,
@@ -158,12 +159,6 @@ pub enum Command {
         /// calls are suppressed.
         #[arg(long = "dry-run")]
         dry_run: bool,
-        /// Deprecated — `--dry-run` always prints the full per-object
-        /// diff (would-be POST body for creates, src-vs-tgt diff for
-        /// updates, would-be-removed body for deletes when `--mirror`).
-        /// This flag is kept as a no-op for backward compatibility.
-        #[arg(long = "diff", requires = "dry_run", hide = true)]
-        diff: bool,
         /// Limit the deploy to the given `<kind>/<slug>` selectors. Repeatable.
         /// Globs: `*` matches within the slug segment (e.g. `hooks/*`,
         /// `schemas/cost-*`). Cross-kind: `*/cost-invoices` matches any kind.
@@ -304,7 +299,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 .await
             }
         }
-        Some(Command::Deploy { src, tgt, mirror, dry_run, diff, only }) => {
+        Some(Command::Deploy { src, tgt, mirror, dry_run, only }) => {
             let src = crate::cli::env_picker::pick_env("Deploy from which env (source)?", src)?;
             let tgt = crate::cli::env_picker::pick_env_excluding(
                 "Deploy to which env (target)?",
@@ -314,7 +309,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
             with_401_retry_envs(&[&src, &tgt], || {
                 let only = only.clone();
-                crate::cli::deploy::run::run(&src, &tgt, mirror, interactive, dry_run, diff, only)
+                crate::cli::deploy::run::run(&src, &tgt, mirror, interactive, dry_run, only)
             })
             .await
         }
