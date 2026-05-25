@@ -43,51 +43,70 @@ pub fn env_var_for(env: &str, suffix: &str) -> String {
 /// cache write) when needed.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TokenLookup {
-    /// A token is ready to use. `expires_at` is `Some(unix_secs)` when
-    /// the file recorded one (token came from `/v1/auth/login` and rdc
-    /// computed the expiry at issue time); `None` when the token came
-    /// from `RDC_TOKEN_<ENV>` or from a manual `rdc auth --token`
-    /// (opaque tokens; no expiry tracking).
+    /// A token is ready to use.
     Cached {
         token: String,
         expires_at: Option<u64>,
     },
+    /// `RDC_USER_<ENV>` + `RDC_PASS_<ENV>` are both set and the cache
+    /// is missing/expired. Caller (async `resolve_token`) should call
+    /// `api::login` and persist the result.
+    NeedsLogin { username: String, password: String },
     /// Nothing is configured. `message` is the actionable error to
-    /// surface to the user, naming all three options
-    /// (`$RDC_TOKEN_<ENV>`, `$RDC_USER_<ENV>+$RDC_PASS_<ENV>`,
-    /// `rdc auth <env>`).
+    /// surface, naming all three options.
     Missing { message: String },
 }
+
+/// Treat a cached token as expired if it expires within this window.
+/// Protects against using a token that the server has just expired
+/// while we were still considering it valid.
+pub const TOKEN_EXPIRY_SKEW_SECS: u64 = 60;
+
+/// Token lifetime to record in the cache after a successful login.
+/// Matches the Rossum-documented default for `POST /v1/auth/login`
+/// (162h). If the server's policy caps the actual lifetime shorter,
+/// the mid-run 401 path catches it with one wasted call + a silent
+/// re-login.
+pub const LOGIN_TOKEN_LIFETIME_SECS: u64 = 162 * 3600;
 
 /// Inspect the per-env credential state and report a [`TokenLookup`].
 ///
 /// Resolution order:
 /// 1. `RDC_TOKEN_<ENV>` env var — used as-is, opaque (no expiry tracking).
-/// 2. `secrets/<env>.secrets.json` (`{api_token, expires_at?}`) — used as-is.
+/// 2. `secrets/<env>.secrets.json` (`{api_token, expires_at?}`) — used if
+///    `expires_at` is absent or > `now + TOKEN_EXPIRY_SKEW_SECS`.
+/// 3. `RDC_USER_<ENV>` + `RDC_PASS_<ENV>` — returns `NeedsLogin` for the
+///    async caller to exchange for a token via `POST /v1/auth/login`.
 ///
-/// Returns `TokenLookup::Missing` if neither is configured.
-///
-/// **Note:** This is the sync inspection step. Expiry checks and the
-/// `RDC_USER_<ENV>` + `RDC_PASS_<ENV>` resolution branch land in Task 3.
+/// Returns `TokenLookup::Missing` if nothing is configured (or only one
+/// half of `USER`/`PASS` is set).
 pub fn resolve_token_lookup(project_root: &Path, env: &str) -> Result<TokenLookup> {
     resolve_token_lookup_from(project_root, env, |k| std::env::var(k).ok())
 }
 
-/// Inner form with an injectable env-getter. Lets tests cover the
-/// env-var branch without mutating the process-wide environment.
-fn resolve_token_lookup_from<F: Fn(&str) -> Option<String>>(
+/// Inner form with an injectable env-getter and clock. Lets tests
+/// cover branches without mutating the process-wide environment or
+/// the real clock.
+fn resolve_token_lookup_from_at<F: Fn(&str) -> Option<String>>(
     project_root: &Path,
     env: &str,
     get_env: F,
+    now_unix_secs: u64,
 ) -> Result<TokenLookup> {
     let token_var = env_var_for(env, "TOKEN");
+    let user_var = env_var_for(env, "USER");
+    let pass_var = env_var_for(env, "PASS");
+
+    // 1. RDC_TOKEN_<ENV> override always wins.
     if let Some(t) = get_env(&token_var) {
         if !t.is_empty() {
             return Ok(TokenLookup::Cached { token: t, expires_at: None });
         }
     }
 
+    // 2. Cached token in secrets/<env>.secrets.json, if still valid.
     let path = project_root.join("secrets").join(format!("{env}.secrets.json"));
+    let mut cached_token_valid: Option<TokenLookup> = None;
     if path.exists() {
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
@@ -99,23 +118,74 @@ fn resolve_token_lookup_from<F: Fn(&str) -> Option<String>>(
         }
         let f: File = serde_json::from_str(&raw)
             .with_context(|| format!("parsing {}", path.display()))?;
-        if f.api_token.is_empty() {
+        if !f.api_token.is_empty() {
+            let is_valid = match f.expires_at {
+                None => true, // no expiry tracking; treat as valid
+                Some(exp) => exp > now_unix_secs.saturating_add(TOKEN_EXPIRY_SKEW_SECS),
+            };
+            if is_valid {
+                cached_token_valid = Some(TokenLookup::Cached {
+                    token: f.api_token,
+                    expires_at: f.expires_at,
+                });
+            }
+        }
+    }
+    if let Some(lookup) = cached_token_valid {
+        return Ok(lookup);
+    }
+
+    // 3. RDC_USER_<ENV> + RDC_PASS_<ENV> creds for a fresh login.
+    let user_opt = get_env(&user_var).filter(|s| !s.is_empty());
+    let pass_opt = get_env(&pass_var).filter(|s| !s.is_empty());
+    match (user_opt, pass_opt) {
+        (Some(username), Some(password)) => {
+            return Ok(TokenLookup::NeedsLogin { username, password });
+        }
+        (Some(_), None) => {
             return Ok(TokenLookup::Missing {
                 message: format!(
-                    "{} has empty api_token; set ${token_var} or fill in the file",
-                    path.display()
+                    "only ${user_var} is set; also set ${pass_var} (both required) \
+                     or set ${token_var}, or run `rdc auth {env} --username <u>`"
                 ),
             });
         }
-        return Ok(TokenLookup::Cached { token: f.api_token, expires_at: f.expires_at });
+        (None, Some(_)) => {
+            return Ok(TokenLookup::Missing {
+                message: format!(
+                    "only ${pass_var} is set; also set ${user_var} (both required) \
+                     or set ${token_var}, or run `rdc auth {env} --username <u>`"
+                ),
+            });
+        }
+        (None, None) => {}
     }
 
+    // 4. Nothing configured.
     Ok(TokenLookup::Missing {
         message: format!(
-            "no token for env '{env}': set ${token_var} or write {}",
-            path.display()
+            "no token for env '{env}': set ${token_var}, \
+             set ${user_var} + ${pass_var}, \
+             or run `rdc auth {env}`"
         ),
     })
+}
+
+/// Production wrapper: real env-getter, real clock.
+fn resolve_token_lookup_from<F: Fn(&str) -> Option<String>>(
+    project_root: &Path,
+    env: &str,
+    get_env: F,
+) -> Result<TokenLookup> {
+    resolve_token_lookup_from_at(project_root, env, get_env, now_unix_secs())
+}
+
+fn now_unix_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Convenience wrapper that converts a [`TokenLookup`] back into the
@@ -124,6 +194,10 @@ fn resolve_token_lookup_from<F: Fn(&str) -> Option<String>>(
 pub fn resolve_token(project_root: &Path, env: &str) -> Result<String> {
     match resolve_token_lookup(project_root, env)? {
         TokenLookup::Cached { token, .. } => Ok(token),
+        TokenLookup::NeedsLogin { .. } => Err(anyhow!(
+            "env '{env}' has credentials but rdc cannot log in synchronously here \
+             — this is a bug; report it"
+        )),
         TokenLookup::Missing { message } => Err(anyhow!(message)),
     }
 }
@@ -325,7 +399,7 @@ mod tests {
         match lookup {
             TokenLookup::Missing { message } => {
                 assert!(message.contains("RDC_TOKEN_UNITTEST_C"), "should mention env var: {message}");
-                assert!(message.contains("secrets/unittest_c.secrets.json"), "should mention file path: {message}");
+                assert!(message.contains("rdc auth unittest_c"), "should mention interactive auth: {message}");
             }
             other => panic!("expected Missing, got {other:?}"),
         }
@@ -591,18 +665,21 @@ mod tests {
 
     #[test]
     fn lookup_returns_cached_with_expires_at_from_file() {
+        // Use the clock-injected variant so the recorded expiry stays
+        // in the future relative to the test clock regardless of
+        // wall-clock time.
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
         std::fs::write(
             dir.path().join("secrets/dev.secrets.json"),
-            r#"{"api_token":"abc","expires_at":1700000000}"#,
+            r#"{"api_token":"abc","expires_at":2000}"#,
         )
         .unwrap();
-        let lookup = resolve_token_lookup_from(dir.path(), "dev", |_| None).unwrap();
+        let lookup = resolve_token_lookup_from_at(dir.path(), "dev", |_| None, 1000).unwrap();
         match lookup {
             TokenLookup::Cached { token, expires_at } => {
                 assert_eq!(token, "abc");
-                assert_eq!(expires_at, Some(1700000000));
+                assert_eq!(expires_at, Some(2000));
             }
             other => panic!("expected Cached, got {other:?}"),
         }
@@ -650,10 +727,125 @@ mod tests {
         match lookup {
             TokenLookup::Missing { message } => {
                 assert!(message.contains("RDC_TOKEN_DEV"), "missing message: {message}");
-                assert!(message.contains("secrets/dev.secrets.json"), "missing message: {message}");
+                assert!(message.contains("rdc auth dev"), "missing message: {message}");
             }
             other => panic!("expected Missing, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lookup_with_non_expired_cache_returns_cached() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        std::fs::write(
+            dir.path().join("secrets/dev.secrets.json"),
+            r#"{"api_token":"abc","expires_at":2000}"#,
+        )
+        .unwrap();
+        let lookup = resolve_token_lookup_from_at(dir.path(), "dev", |_| None, 1000).unwrap();
+        assert!(matches!(lookup, TokenLookup::Cached { ref token, .. } if token == "abc"));
+    }
+
+    #[test]
+    fn lookup_with_expired_cache_falls_through_to_creds() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        std::fs::write(
+            dir.path().join("secrets/dev.secrets.json"),
+            r#"{"api_token":"stale","expires_at":1000}"#,
+        )
+        .unwrap();
+        let get_env = |k: &str| match k {
+            "RDC_USER_DEV" => Some("alice".to_string()),
+            "RDC_PASS_DEV" => Some("hunter2".to_string()),
+            _ => None,
+        };
+        let lookup = resolve_token_lookup_from_at(dir.path(), "dev", get_env, 2000).unwrap();
+        match lookup {
+            TokenLookup::NeedsLogin { username, password } => {
+                assert_eq!(username, "alice");
+                assert_eq!(password, "hunter2");
+            }
+            other => panic!("expected NeedsLogin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lookup_skew_within_60s_of_expiry_treated_as_expired() {
+        // expires_at = now + 30s -> within the 60s skew, treat as expired
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        std::fs::write(
+            dir.path().join("secrets/dev.secrets.json"),
+            r#"{"api_token":"about-to-expire","expires_at":1030}"#,
+        )
+        .unwrap();
+        let get_env = |k: &str| match k {
+            "RDC_USER_DEV" => Some("alice".to_string()),
+            "RDC_PASS_DEV" => Some("pw".to_string()),
+            _ => None,
+        };
+        let lookup = resolve_token_lookup_from_at(dir.path(), "dev", get_env, 1000).unwrap();
+        assert!(matches!(lookup, TokenLookup::NeedsLogin { .. }));
+    }
+
+    #[test]
+    fn lookup_creds_only_no_cache_returns_needs_login() {
+        let dir = TempDir::new().unwrap();
+        let get_env = |k: &str| match k {
+            "RDC_USER_DEV" => Some("alice".to_string()),
+            "RDC_PASS_DEV" => Some("pw".to_string()),
+            _ => None,
+        };
+        let lookup = resolve_token_lookup_from_at(dir.path(), "dev", get_env, 1000).unwrap();
+        assert!(matches!(lookup, TokenLookup::NeedsLogin { ref username, .. } if username == "alice"));
+    }
+
+    #[test]
+    fn lookup_creds_one_missing_errors_naming_the_missing_var() {
+        let dir = TempDir::new().unwrap();
+        let get_env_user_only = |k: &str| match k {
+            "RDC_USER_DEV" => Some("alice".to_string()),
+            _ => None,
+        };
+        let lookup = resolve_token_lookup_from_at(dir.path(), "dev", get_env_user_only, 1000).unwrap();
+        match lookup {
+            TokenLookup::Missing { message } => {
+                assert!(message.contains("RDC_PASS_DEV"), "must name the missing var: {message}");
+            }
+            other => panic!("expected Missing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lookup_missing_message_names_all_three_options() {
+        let dir = TempDir::new().unwrap();
+        let lookup = resolve_token_lookup_from_at(dir.path(), "dev", |_| None, 1000).unwrap();
+        match lookup {
+            TokenLookup::Missing { message } => {
+                assert!(message.contains("RDC_TOKEN_DEV"), "names env-var token option: {message}");
+                assert!(message.contains("RDC_USER_DEV"), "names creds option: {message}");
+                assert!(message.contains("RDC_PASS_DEV"), "names creds option: {message}");
+                assert!(message.contains("rdc auth dev"), "names interactive option: {message}");
+            }
+            other => panic!("expected Missing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn token_env_var_wins_even_if_cache_is_expired() {
+        // RDC_TOKEN_DEV is the explicit override; it always wins, no
+        // matter what the cache says.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        std::fs::write(
+            dir.path().join("secrets/dev.secrets.json"),
+            r#"{"api_token":"stale","expires_at":1000}"#,
+        )
+        .unwrap();
+        let get_env = |k: &str| (k == "RDC_TOKEN_DEV").then(|| "override".to_string());
+        let lookup = resolve_token_lookup_from_at(dir.path(), "dev", get_env, 2000).unwrap();
+        assert!(matches!(lookup, TokenLookup::Cached { ref token, .. } if token == "override"));
     }
 
     #[test]
