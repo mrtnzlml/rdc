@@ -29,7 +29,9 @@ use anyhow::{Context, Result};
 /// retry telemetry (production code passes `Some(log.clone())`; tests
 /// that don't need output pass `None`).
 pub type ProgressHandle = Option<std::sync::Arc<crate::log::Log>>;
+use crate::api::rate_limit::RateLimiter;
 use reqwest::{Response, StatusCode};
+use std::sync::Arc;
 use std::time::Duration;
 
 const MAX_ATTEMPTS: u32 = 5;
@@ -48,11 +50,21 @@ pub async fn send_with_retry(
     mut build: impl FnMut() -> reqwest::RequestBuilder,
     desc: &str,
     progress: ProgressHandle,
+    limiter: Option<&Arc<RateLimiter>>,
 ) -> Result<Response> {
     // Retries up to MAX_ATTEMPTS - 1 times; the final pass falls through
     // to the post-loop send so the function always returns from one
     // explicit `send()` call.
+    //
+    // The rate limiter acquires one token PER ATTEMPT, not just once
+    // before the loop. Retries (e.g. after a 429) sleep for
+    // `Retry-After` first, which gives the local bucket time to refill;
+    // taking a fresh token before the re-send keeps the proactive cap
+    // accurate even when several requests are mid-retry.
     for attempt in 0..MAX_ATTEMPTS - 1 {
+        if let Some(l) = limiter {
+            l.acquire().await;
+        }
         let resp = build()
             .send()
             .await
@@ -67,6 +79,9 @@ pub async fn send_with_retry(
         let _ = (reason, &progress);
         let wait = retry_after(&resp).unwrap_or_else(|| backoff(attempt));
         tokio::time::sleep(wait).await;
+    }
+    if let Some(l) = limiter {
+        l.acquire().await;
     }
     build()
         .send()
