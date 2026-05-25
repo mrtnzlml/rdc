@@ -182,11 +182,19 @@ pub(crate) async fn validate_and_save_token(
     Ok(org_name)
 }
 
-/// Interactive token refresh. Called when an API call returns 401: prompts
-/// the user for a new token, validates it, saves it to the env's secrets
-/// file, and returns. On non-TTY contexts, returns an error pointing at
-/// `rdc auth <env>` instead of blocking.
-pub async fn refresh_token_interactively(env: &str) -> Result<()> {
+/// Recover from a 401 on a token call.
+///
+/// Three paths, tried in order:
+/// - **Non-TTY with creds set:** `RDC_USER_<ENV>` + `RDC_PASS_<ENV>` are
+///   exchanged for a fresh token via `POST /v1/auth/login`. The new
+///   token and computed expiry land in `secrets/<env>.secrets.json`.
+///   Returns `Ok(())` silently — `with_401_retry` then retries the
+///   failed operation once.
+/// - **TTY:** prompts for a new token via `inquire::Password`,
+///   validates it, and saves it (same path as `rdc auth --token`).
+/// - **Non-TTY without creds:** actionable error naming the three
+///   recovery options (env vars, `rdc auth`, TTY re-run).
+pub async fn refresh_token_for_401(env: &str) -> Result<()> {
     if !std::io::stdin().is_terminal() {
         // Non-TTY: try silent re-login from RDC_USER_<ENV> + RDC_PASS_<ENV>
         // before erroring. This is the CI / cron path.
