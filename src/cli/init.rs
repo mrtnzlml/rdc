@@ -46,11 +46,11 @@ pub async fn run(env_specs: Vec<String>) -> Result<()> {
         // `dev-ap` is already defined would silently share env-var
         // resolution; refuse rather than let one steal the other's
         // token.
-        let candidate_var = crate::secrets::env_token_var(&env_name);
+        let candidate_var = crate::secrets::env_var_for(&env_name, "TOKEN");
         if let Some(clash) = cfg
             .envs
             .keys()
-            .find(|existing| crate::secrets::env_token_var(existing) == candidate_var)
+            .find(|existing| crate::secrets::env_var_for(existing, "TOKEN") == candidate_var)
         {
             return Err(anyhow!(
                 "env '{env_name}' would share API-token env var '{candidate_var}' with \
@@ -97,7 +97,7 @@ pub async fn run(env_specs: Vec<String>) -> Result<()> {
     let mut auth_succeeded: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
     for env in &new_env_names {
-        let env_var_name = crate::secrets::env_token_var(env);
+        let env_var_name = crate::secrets::env_var_for(env, "TOKEN");
         let token_source = match std::env::var(&env_var_name) {
             Ok(t) if !t.trim().is_empty() => Some((t.trim().to_string(), env_var_name.clone())),
             _ => {
@@ -205,7 +205,7 @@ pub async fn run(env_specs: Vec<String>) -> Result<()> {
             if auth_succeeded.contains(env) {
                 continue;
             }
-            let env_var_name = crate::secrets::env_token_var(env);
+            let env_var_name = crate::secrets::env_var_for(env, "TOKEN");
             println!("  - Set the API token for env '{env}':");
             println!("      rdc auth {env} --token <token>     # validates + writes secrets/{env}.secrets.json");
             println!("      # or: export {env_var_name}=<token>");

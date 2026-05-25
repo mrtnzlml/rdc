@@ -3,29 +3,30 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Compute the environment-variable name rdc looks at for an env's API
-/// token. POSIX env-var identifiers are `[A-Za-z_][A-Za-z0-9_]*`, but
-/// rdc env names accept `-` and `_` (e.g. `dev-ap`, `prod_eu`). To
-/// produce a name the shell can actually export, every non-alphanumeric
-/// character in the env name is mapped to `_` (and the whole thing
-/// uppercased). So:
+/// Compute the environment-variable name rdc looks at for a per-env
+/// credential field. `suffix` is `TOKEN`, `USER`, or `PASS`.
 ///
-/// | env name   | env-var               |
-/// |------------|-----------------------|
-/// | `dev`      | `RDC_TOKEN_DEV`       |
-/// | `dev-ap`   | `RDC_TOKEN_DEV_AP`    |
-/// | `dev_ap`   | `RDC_TOKEN_DEV_AP`    |
-/// | `prod-EU`  | `RDC_TOKEN_PROD_EU`   |
+/// POSIX env-var identifiers are `[A-Za-z_][A-Za-z0-9_]*`, but
+/// rdc env names accept `-` and `_` (e.g. `dev-ap`). To produce a
+/// name the shell can actually export, every non-alphanumeric
+/// character in the env name is mapped to `_` and the whole thing
+/// uppercased.
 ///
-/// Note the collision in row 2 vs 3: `dev-ap` and `dev_ap` both
-/// normalize to the same variable. The `rdc init` wizard refuses to
-/// add a new env whose name would collide with an existing one's
-/// normalized form, so this can't happen by accident inside a single
-/// project — and the secrets-file path (`secrets/<env>.secrets.json`)
-/// stays exact and unambiguous either way.
-pub fn env_token_var(env: &str) -> String {
-    let mut out = String::with_capacity("RDC_TOKEN_".len() + env.len());
-    out.push_str("RDC_TOKEN_");
+/// | env name   | suffix  | env-var               |
+/// |------------|---------|-----------------------|
+/// | `dev`      | `TOKEN` | `RDC_TOKEN_DEV`       |
+/// | `dev-ap`   | `USER`  | `RDC_USER_DEV_AP`     |
+/// | `prod_eu`  | `PASS`  | `RDC_PASS_PROD_EU`    |
+///
+/// The hyphen-vs-underscore collision documented for `env_token_var`
+/// still applies (e.g. `dev-ap` and `dev_ap` normalize to the same
+/// suffix). The `rdc init` wizard prevents this collision at project
+/// creation time.
+pub fn env_var_for(env: &str, suffix: &str) -> String {
+    let mut out = String::with_capacity("RDC_".len() + suffix.len() + 1 + env.len());
+    out.push_str("RDC_");
+    out.push_str(suffix);
+    out.push('_');
     for c in env.chars() {
         if c.is_ascii_alphanumeric() {
             out.push(c.to_ascii_uppercase());
@@ -39,8 +40,9 @@ pub fn env_token_var(env: &str) -> String {
 /// Resolve the API token for an environment.
 ///
 /// Resolution order:
-/// 1. The environment variable returned by [`env_token_var`] —
-///    `RDC_TOKEN_DEV` for env `dev`, `RDC_TOKEN_DEV_AP` for `dev-ap`.
+/// 1. The environment variable returned by [`env_var_for`] with suffix
+///    `TOKEN` — `RDC_TOKEN_DEV` for env `dev`, `RDC_TOKEN_DEV_AP` for
+///    `dev-ap`.
 /// 2. `secrets/<env>.secrets.json` with shape `{ "api_token": "..." }`.
 ///
 /// Returns an actionable error if neither source is present.
@@ -56,7 +58,7 @@ fn resolve_token_from<F: Fn(&str) -> Option<String>>(
     env: &str,
     get_env: F,
 ) -> Result<String> {
-    let env_var = env_token_var(env);
+    let env_var = env_var_for(env, "TOKEN");
     if let Some(t) = get_env(&env_var) {
         if !t.is_empty() {
             return Ok(t);
@@ -289,22 +291,22 @@ mod tests {
 
     #[test]
     fn env_token_var_uppercases_and_keeps_alphanumerics() {
-        assert_eq!(env_token_var("dev"), "RDC_TOKEN_DEV");
-        assert_eq!(env_token_var("PROD"), "RDC_TOKEN_PROD");
-        assert_eq!(env_token_var("staging42"), "RDC_TOKEN_STAGING42");
+        assert_eq!(env_var_for("dev", "TOKEN"), "RDC_TOKEN_DEV");
+        assert_eq!(env_var_for("PROD", "TOKEN"), "RDC_TOKEN_PROD");
+        assert_eq!(env_var_for("staging42", "TOKEN"), "RDC_TOKEN_STAGING42");
     }
 
     #[test]
     fn env_token_var_maps_hyphen_to_underscore() {
         // The motivating case: real env names like `dev-ap` need to
         // produce a valid POSIX env-var identifier.
-        assert_eq!(env_token_var("dev-ap"), "RDC_TOKEN_DEV_AP");
-        assert_eq!(env_token_var("prod-eu-west-1"), "RDC_TOKEN_PROD_EU_WEST_1");
+        assert_eq!(env_var_for("dev-ap", "TOKEN"), "RDC_TOKEN_DEV_AP");
+        assert_eq!(env_var_for("prod-eu-west-1", "TOKEN"), "RDC_TOKEN_PROD_EU_WEST_1");
     }
 
     #[test]
     fn env_token_var_preserves_existing_underscores() {
-        assert_eq!(env_token_var("dev_ap"), "RDC_TOKEN_DEV_AP");
+        assert_eq!(env_var_for("dev_ap", "TOKEN"), "RDC_TOKEN_DEV_AP");
     }
 
     #[test]
@@ -312,7 +314,16 @@ mod tests {
         // This is the known footgun; the init wizard refuses the
         // second one of these pairs to prevent it inside a project.
         // Documented here so a future change can't silently break it.
-        assert_eq!(env_token_var("dev-ap"), env_token_var("dev_ap"));
+        assert_eq!(env_var_for("dev-ap", "TOKEN"), env_var_for("dev_ap", "TOKEN"));
+    }
+
+    #[test]
+    fn env_var_for_supports_arbitrary_suffix() {
+        assert_eq!(env_var_for("dev", "TOKEN"), "RDC_TOKEN_DEV");
+        assert_eq!(env_var_for("dev", "USER"), "RDC_USER_DEV");
+        assert_eq!(env_var_for("dev", "PASS"), "RDC_PASS_DEV");
+        assert_eq!(env_var_for("dev-ap", "USER"), "RDC_USER_DEV_AP");
+        assert_eq!(env_var_for("prod-eu-west-1", "PASS"), "RDC_PASS_PROD_EU_WEST_1");
     }
 
     #[test]
