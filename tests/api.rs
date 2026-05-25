@@ -779,3 +779,53 @@ org_id = 1
     assert_eq!(parsed["api_token"], "relogin-fresh");
     assert!(parsed["expires_at"].is_number());
 }
+
+#[tokio::test]
+async fn resolve_token_propagates_login_401_when_creds_are_stale() {
+    use tempfile::TempDir;
+    use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/auth/login"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "detail": "Invalid username/password.",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = TempDir::new().unwrap();
+    let env_name = format!("stale_creds_{}", uuid_like_suffix());
+    let user_var = format!("RDC_USER_{}", env_name.to_uppercase());
+    let pass_var = format!("RDC_PASS_{}", env_name.to_uppercase());
+    // SAFETY: same justification as elsewhere in this file — per-test
+    // unique env-var suffix, reads on the same thread.
+    unsafe {
+        std::env::set_var(&user_var, "alice");
+        std::env::set_var(&pass_var, "wrong-password");
+    }
+    let _guard = EnvGuard(vec![user_var, pass_var]);
+
+    let api_base = format!("{}/v1", server.uri());
+    let err = rdc::secrets::resolve_token(dir.path(), &env_name, &api_base)
+        .await
+        .expect_err("resolve_token should propagate login failure");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("401"),
+        "error should mention the 401 status: {msg}"
+    );
+    assert!(
+        msg.contains(&env_name) || msg.contains("logging in"),
+        "error should attribute to the failed login: {msg}"
+    );
+
+    // Critically: no secrets file should have been written.
+    let secrets_path = dir.path().join("secrets").join(format!("{env_name}.secrets.json"));
+    assert!(
+        !secrets_path.exists(),
+        "no token file should be written on a 401: {} exists",
+        secrets_path.display()
+    );
+}
