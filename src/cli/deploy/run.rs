@@ -106,11 +106,13 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
 
     let src_token = resolve_token(&cwd, src)?;
     let src_client = RossumClient::new(src_cfg.api_base.clone(), src_token)
-        .context("constructing src API client")?;
+        .context("constructing src API client")?
+        .with_env_label(src);
 
     let tgt_token = resolve_token(&cwd, tgt)?;
     let tgt_client = RossumClient::new(tgt_cfg.api_base.clone(), tgt_token)
-        .context("constructing tgt API client")?;
+        .context("constructing tgt API client")?
+        .with_env_label(tgt);
 
     let src_lockfile = Lockfile::load(&src_paths.lockfile())
         .with_context(|| format!("loading src lockfile from {}", src_paths.lockfile().display()))?;
@@ -142,6 +144,27 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
     std::fs::create_dir_all(src_paths.mapping_dir())
         .with_context(|| format!("creating {}", src_paths.mapping_dir().display()))?;
     mapping.save(&src_paths.mapping_file(src, tgt))?;
+
+    // Regular-hook pre-pass: same picker, applied to non-store-extension
+    // hooks. Without this, a POST /hooks for a hook whose src snapshot
+    // carries a (src-env) `token_owner` user URL 400s with
+    // "Invalid hyperlink — Object does not exist." Runs after the
+    // store-extension pre-pass so the user is prompted at most once per
+    // hook and `[defaults] store_extension_token_owner` is honored
+    // across both pre-passes.
+    let regular_hook_token_owners =
+        crate::cli::deploy::store_extensions::plan_regular_hook_token_owners(
+            &src_paths,
+            &tgt_client,
+            &tgt_lockfile,
+            &mapping,
+            &tgt_paths.overlay_file(),
+            interactive,
+            None,
+            tgt,
+            None,
+        )
+        .await?;
 
     // 0b. Auto-populate the slug-to-slug mapping for objects that already
     // exist in both envs. Without this step the apply sub-step would
@@ -312,12 +335,21 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
             tgt_client: &tgt_client,
             progress: progress.clone(),
             hook_secrets_plan: &hook_secrets_plan,
+            regular_hook_token_owners: &regular_hook_token_owners,
         };
         // Lazily-populated cache of tgt remote hooks for store-extension
         // orphan checks. Shared across all hooks in this bootstrap run so
         // we list at most once.
         let mut remote_hooks_cache: Option<Vec<crate::model::Hook>> = None;
-        for kind in KINDS_IN_DEP_ORDER {
+        // Each successful create mutates `tgt_lockfile` in memory. We
+        // persist after every per-slug success so a later failure leaves
+        // the on-disk lockfile in sync with what's actually on the
+        // remote — otherwise a re-run can't rewrite src URLs (the tgt
+        // queue URL the mapping looks up isn't in any lockfile yet),
+        // and the deploy gets stuck in an unresumeable state. Persisting
+        // after every create is cheap (atomic rename, single small file).
+        let mut create_err: Option<anyhow::Error> = None;
+        'outer: for kind in KINDS_IN_DEP_ORDER {
             let Some(slugs) = plan.creates.get(kind) else { continue };
             if slugs.is_empty() { continue; }
             for slug in slugs {
@@ -368,15 +400,33 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
                         _ => {}
                     }
                 }
-                result?;
+                if let Err(e) = result {
+                    create_err = Some(e);
+                    break 'outer;
+                }
+                // Flush after each successful create so a later failure
+                // can be resumed by re-running `rdc deploy` (the resume
+                // path needs the tgt URLs of just-created peers to
+                // rewrite hook/rule/etc. cross-references).
+                if let Err(e) = ctx.tgt_lockfile.save(&tgt_paths.lockfile()) {
+                    create_err = Some(e.context(format!(
+                        "saving tgt lockfile after creating {kind}/{slug}",
+                    )));
+                    break 'outer;
+                }
+                if let Err(e) = ctx.mapping.save(&src_paths.mapping_file(src, tgt)) {
+                    create_err = Some(e.context(format!(
+                        "saving src->tgt mapping after creating {kind}/{slug}",
+                    )));
+                    break 'outer;
+                }
                 creates_done += 1;
                 api_calls += 1;
             }
         }
-        // Persist tgt lockfile after creates; apply re-reads from disk.
-        tgt_lockfile
-            .save(&tgt_paths.lockfile())
-            .with_context(|| format!("saving tgt lockfile to {}", tgt_paths.lockfile().display()))?;
+        if let Some(e) = create_err {
+            return Err(e);
+        }
     }
 
     // 5. Persist the auto-matched mapping (in both dry-run and real-run).
@@ -500,7 +550,7 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
 fn compute_plan(
     src_paths: &Paths,
     tgt_paths: &Paths,
-    _src_lockfile: &Lockfile,
+    src_lockfile: &Lockfile,
     _tgt_lockfile: &Lockfile,
     _mapping: &Mapping,
     mirror: bool,
@@ -524,7 +574,21 @@ fn compute_plan(
             }
         }
         if !to_create.is_empty() {
-            plan.creates.insert(*kind, to_create);
+            // Hooks carry intra-kind ordering constraints via `run_after`
+            // (a list of other hook URLs that must run before this one).
+            // The alphabetical slug order produced by `list_slugs` can
+            // place a dependent before its prerequisite, which makes the
+            // POST 400 with "Invalid hyperlink — Object does not exist."
+            // since the dependency hook hasn't been created on tgt yet.
+            // Topologically sort the create list so prerequisites land
+            // first; deps already on tgt are ignored (rewrite_urls will
+            // translate those refs to existing tgt URLs).
+            let ordered = if *kind == "hooks" {
+                topo_sort_hooks_to_create(&to_create, src_paths, src_lockfile)
+            } else {
+                to_create
+            };
+            plan.creates.insert(*kind, ordered);
         }
         if mirror {
             let src_set: std::collections::HashSet<&String> = src_slugs.iter().collect();
@@ -539,6 +603,92 @@ fn compute_plan(
         }
     }
     Ok(plan)
+}
+
+/// Topologically sort the hooks-to-create list so each hook is POSTed
+/// after the hooks listed in its `run_after`. Ties (independent hooks)
+/// resolve alphabetically — same order `list_slugs` produces — so the
+/// output is deterministic and the only re-orderings are forced by real
+/// dependencies.
+///
+/// Dependencies pointing at hooks that already exist on tgt (not in
+/// `slugs`) impose no constraint here — `rewrite_urls` will translate
+/// those URLs to existing tgt entries and the API will accept them.
+/// Unresolvable URLs (point at a hook neither tgt nor src snapshot
+/// knows) are ignored so a stale `run_after` entry doesn't break the
+/// whole deploy plan; if it's genuinely broken it'll surface as the
+/// real API error during POST instead of a confusing planner error.
+///
+/// On a cycle (Rossum normally rejects cyclic `run_after` chains at
+/// PATCH time, but defend anyway) we preserve the original alphabetical
+/// order so the cycle still surfaces as the API's own error instead of
+/// a cryptic ordering failure.
+fn topo_sort_hooks_to_create(
+    slugs: &[String],
+    src_paths: &Paths,
+    src_lockfile: &Lockfile,
+) -> Vec<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let slug_set: BTreeSet<&str> = slugs.iter().map(|s| s.as_str()).collect();
+
+    let mut deps: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for slug in slugs {
+        deps.insert(slug.clone(), BTreeSet::new());
+    }
+    for slug in slugs {
+        let path = src_paths.hooks_dir().join(format!("{slug}.json"));
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { continue };
+        let Some(run_after) = value.get("run_after").and_then(|v| v.as_array()) else { continue };
+        for url_v in run_after {
+            let Some(url) = url_v.as_str() else { continue };
+            let Some(dep_slug) = src_lockfile.slug_for_url("hooks", url) else { continue };
+            if dep_slug != slug && slug_set.contains(dep_slug) {
+                deps.get_mut(slug).expect("inserted above").insert(dep_slug.to_string());
+            }
+        }
+    }
+
+    // Kahn's algorithm: maintain a BTreeSet of ready nodes so ties pop
+    // alphabetically (deterministic, same shape as `list_slugs`).
+    let mut in_degree: BTreeMap<String, usize> =
+        slugs.iter().map(|s| (s.clone(), 0usize)).collect();
+    let mut reverse_deps: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (slug, dep_set) in &deps {
+        for dep in dep_set {
+            *in_degree.get_mut(slug).expect("in_degree pre-populated") += 1;
+            reverse_deps
+                .entry(dep.clone())
+                .or_default()
+                .insert(slug.clone());
+        }
+    }
+    let mut ready: BTreeSet<String> = in_degree
+        .iter()
+        .filter(|&(_, &d)| d == 0)
+        .map(|(s, _)| s.clone())
+        .collect();
+
+    let mut out: Vec<String> = Vec::with_capacity(slugs.len());
+    while let Some(next) = ready.iter().next().cloned() {
+        ready.remove(&next);
+        out.push(next.clone());
+        if let Some(dependents) = reverse_deps.get(&next) {
+            for dep in dependents {
+                let cnt = in_degree.get_mut(dep).expect("in_degree pre-populated");
+                *cnt = cnt.saturating_sub(1);
+                if *cnt == 0 {
+                    ready.insert(dep.clone());
+                }
+            }
+        }
+    }
+
+    if out.len() != slugs.len() {
+        return slugs.to_vec();
+    }
+    out
 }
 
 /// List slugs from the local snapshot. The layout is kind-specific; we
@@ -1111,4 +1261,134 @@ fn preview_delete_bodies(plan: &PlanCounts, tgt_paths: &Paths) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ObjectEntry;
+    use tempfile::TempDir;
+
+    fn write_hook_file(dir: &std::path::Path, slug: &str, run_after_urls: &[&str]) {
+        let body = serde_json::json!({
+            "id": 0,
+            "name": slug,
+            "type": "webhook",
+            "run_after": run_after_urls,
+        });
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{slug}.json")),
+            serde_json::to_vec_pretty(&body).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn lf_with_hooks(entries: &[(&str, u64, &str)]) -> Lockfile {
+        let mut lf = Lockfile::default();
+        for (slug, id, url) in entries {
+            lf.upsert(
+                "hooks",
+                slug,
+                ObjectEntry {
+                    id: *id,
+                    url: Some(url.to_string()),
+                    modified_at: None,
+                    content_hash: None,
+                    secrets_hash: None,
+                },
+            );
+        }
+        lf
+    }
+
+    #[test]
+    fn topo_sort_orders_dependency_before_dependent() {
+        // mtr-export-to-sftp depends on pipe-and-fitting-mtr-template and
+        // valve-mtr-template. Alphabetical order puts m < p < v so the
+        // export hook would otherwise be created before its prereqs.
+        let tmp = TempDir::new().unwrap();
+        let src_paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        let hooks_dir = src_paths.hooks_dir();
+        write_hook_file(
+            &hooks_dir,
+            "mtr-export-to-sftp",
+            &[
+                "https://x/api/v1/hooks/1147775",
+                "https://x/api/v1/hooks/1147776",
+            ],
+        );
+        write_hook_file(&hooks_dir, "pipe-and-fitting-mtr-template", &[]);
+        write_hook_file(&hooks_dir, "valve-mtr-template", &[]);
+        let lf = lf_with_hooks(&[
+            ("pipe-and-fitting-mtr-template", 1147775, "https://x/api/v1/hooks/1147775"),
+            ("valve-mtr-template", 1147776, "https://x/api/v1/hooks/1147776"),
+            ("mtr-export-to-sftp", 1147777, "https://x/api/v1/hooks/1147777"),
+        ]);
+        let slugs = vec![
+            "mtr-export-to-sftp".to_string(),
+            "pipe-and-fitting-mtr-template".to_string(),
+            "valve-mtr-template".to_string(),
+        ];
+        let out = topo_sort_hooks_to_create(&slugs, &src_paths, &lf);
+        let pos = |s: &str| out.iter().position(|x| x == s).unwrap();
+        assert!(pos("pipe-and-fitting-mtr-template") < pos("mtr-export-to-sftp"));
+        assert!(pos("valve-mtr-template") < pos("mtr-export-to-sftp"));
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn topo_sort_ignores_deps_already_on_tgt() {
+        // A run_after dep that's NOT in to_create (already exists on tgt)
+        // imposes no ordering constraint — rewrite_urls will translate
+        // those refs to existing tgt URLs.
+        let tmp = TempDir::new().unwrap();
+        let src_paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        let hooks_dir = src_paths.hooks_dir();
+        write_hook_file(
+            &hooks_dir,
+            "dependent",
+            &["https://x/api/v1/hooks/100"], // dep is "already-on-tgt"
+        );
+        let lf = lf_with_hooks(&[
+            ("already-on-tgt", 100, "https://x/api/v1/hooks/100"),
+            ("dependent", 200, "https://x/api/v1/hooks/200"),
+        ]);
+        // Only "dependent" is in to_create; "already-on-tgt" isn't.
+        let slugs = vec!["dependent".to_string()];
+        let out = topo_sort_hooks_to_create(&slugs, &src_paths, &lf);
+        assert_eq!(out, slugs);
+    }
+
+    #[test]
+    fn topo_sort_independent_hooks_keep_alphabetical_order() {
+        let tmp = TempDir::new().unwrap();
+        let src_paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        let hooks_dir = src_paths.hooks_dir();
+        write_hook_file(&hooks_dir, "a-hook", &[]);
+        write_hook_file(&hooks_dir, "b-hook", &[]);
+        write_hook_file(&hooks_dir, "c-hook", &[]);
+        let lf = lf_with_hooks(&[]);
+        let slugs = vec!["a-hook".into(), "b-hook".into(), "c-hook".into()];
+        let out = topo_sort_hooks_to_create(&slugs, &src_paths, &lf);
+        assert_eq!(out, slugs);
+    }
+
+    #[test]
+    fn topo_sort_preserves_order_on_cycle() {
+        // Pathological: a -> b -> a. The function should fall back to the
+        // input order so the API surfaces the real error.
+        let tmp = TempDir::new().unwrap();
+        let src_paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        let hooks_dir = src_paths.hooks_dir();
+        write_hook_file(&hooks_dir, "a", &["https://x/api/v1/hooks/2"]);
+        write_hook_file(&hooks_dir, "b", &["https://x/api/v1/hooks/1"]);
+        let lf = lf_with_hooks(&[
+            ("a", 1, "https://x/api/v1/hooks/1"),
+            ("b", 2, "https://x/api/v1/hooks/2"),
+        ]);
+        let slugs = vec!["a".into(), "b".into()];
+        let out = topo_sort_hooks_to_create(&slugs, &src_paths, &lf);
+        assert_eq!(out, slugs);
+    }
 }

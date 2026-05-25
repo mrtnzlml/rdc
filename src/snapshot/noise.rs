@@ -69,8 +69,13 @@ pub fn canonicalize_with_extra_strips(bytes: &[u8], extra: &[&str]) -> Vec<u8> {
 
 /// Recursively sort the keys of every JSON object alphabetically. Used
 /// to canonicalise for hashing so on-disk key order doesn't affect
-/// `content_hash`.
-fn sort_keys_recursive(value: &mut serde_json::Value) {
+/// `content_hash`. Also reused by `normalize_for_cross_env_compare` so
+/// `rdc diff <src> <tgt>` and the deploy idempotency check are equally
+/// insensitive to key order — the Rossum API doesn't guarantee stable
+/// key order across endpoints, so two byte-different bodies with the
+/// same content would otherwise diff (or trigger a spurious PATCH on
+/// re-deploy).
+pub(crate) fn sort_keys_recursive(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
             let taken = std::mem::take(map);

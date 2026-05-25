@@ -5,7 +5,7 @@
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::mapping::Mapping;
 use crate::snapshot::create::strip_for_cross_env_patch;
-use crate::snapshot::noise::strip_noise_fields;
+use crate::snapshot::noise::{sort_keys_recursive, strip_noise_fields};
 use crate::state::{content_hash, Lockfile};
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -16,18 +16,25 @@ use std::collections::BTreeMap;
 /// own `organization` URL), strip the noise fields (`modified_at`, `modifier`)
 /// that change on every server-side touch, strip the kind-specific
 /// server-computed sub-collections (`queue.hooks`, `queue.webhooks`, etc.)
-/// that mirror back-references, then re-serialise. Two normalised payloads
+/// that mirror back-references, sort URL arrays, then sort every object's
+/// keys alphabetically before re-serialising. Two normalised payloads
 /// compare equal iff they represent the same canonical resource state.
 ///
 /// Without this normalisation, byte-level equality between the src snapshot
 /// and the tgt remote would never hold and `rdc deploy` would re-PATCH on
-/// every run (`README` "Idempotency" claim).
+/// every run (`README` "Idempotency" claim). The recursive key sort also
+/// keeps `rdc diff <src> <tgt>` quiet when only the API's key emission
+/// order differs — the Rossum API doesn't guarantee stable key order
+/// across endpoints, and on-disk files written by different code paths
+/// (`pull` vs the queue-auto-create email-template capture, say) end up
+/// with their `extra` IndexMaps populated in different orders.
 pub fn normalize_for_cross_env_compare(bytes: &[u8], kind: &str) -> Result<Vec<u8>> {
     let mut value: Value = serde_json::from_slice(bytes)
         .context("parsing JSON for cross-env normalisation")?;
     strip_for_cross_env_patch(&mut value, kind);
     strip_noise_fields(&mut value);
     sort_string_arrays(&mut value);
+    sort_keys_recursive(&mut value);
     let mut out = serde_json::to_vec_pretty(&value)
         .context("re-serialising normalised JSON")?;
     out.push(b'\n');
@@ -100,6 +107,57 @@ mod normalize_tests {
         let mut v = serde_json::json!({"config": {"sideload": ["b", "a"]}});
         sort_string_arrays(&mut v);
         assert_eq!(v, serde_json::json!({"config": {"sideload": ["a", "b"]}}));
+    }
+
+    #[test]
+    fn normalize_is_key_order_insensitive() {
+        // Two JSON bodies with the same content but different key order
+        // (the Rossum API doesn't guarantee stable key order, and on-disk
+        // files written by different code paths end up with different
+        // `extra` IndexMap orders). After normalisation they must compare
+        // byte-equal so (a) `rdc diff <src> <tgt>` doesn't show spurious
+        // key-reordering churn, and (b) `bytes_equal_after_strip` doesn't
+        // PATCH on every re-deploy.
+        // The `id`/`url`/`organization` differences are stripped by
+        // `strip_for_cross_env_patch`; what's left has the same content
+        // in different key orders.
+        let a = br#"{
+          "id": 1,
+          "url": "https://src/api/v1/email_templates/1",
+          "organization": "https://src/api/v1/organizations/1",
+          "name": "T",
+          "subject": "S",
+          "queue": "https://shared/api/v1/queues/100",
+          "automate": false,
+          "bcc": [],
+          "cc": [],
+          "enabled": false,
+          "message": "Hi",
+          "to": [{"email": "{{sender_email}}"}],
+          "type": "custom"
+        }"#;
+        let b = br#"{
+          "id": 999,
+          "url": "https://tgt/api/v1/email_templates/999",
+          "organization": "https://tgt/api/v1/organizations/2",
+          "queue": "https://shared/api/v1/queues/100",
+          "cc": [],
+          "bcc": [],
+          "name": "T",
+          "subject": "S",
+          "message": "Hi",
+          "type": "custom",
+          "enabled": false,
+          "automate": false,
+          "to": [{"email": "{{sender_email}}"}]
+        }"#;
+        let na = normalize_for_cross_env_compare(a, "email_templates").unwrap();
+        let nb = normalize_for_cross_env_compare(b, "email_templates").unwrap();
+        assert_eq!(
+            std::str::from_utf8(&na).unwrap(),
+            std::str::from_utf8(&nb).unwrap(),
+            "different key order must normalise to the same bytes",
+        );
     }
 }
 

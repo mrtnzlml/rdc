@@ -99,7 +99,8 @@ pub(crate) async fn run(
 
     let token = resolve_token(&cwd, tgt)?;
     let tgt_client = RossumClient::new(tgt_cfg.api_base.clone(), token)
-        .context("constructing tgt API client")?;
+        .context("constructing tgt API client")?
+        .with_env_label(tgt);
 
     let mapping = Mapping::load(&src_paths.mapping_file(src, tgt))?;
     let src_lockfile = Lockfile::load(&src_paths.lockfile())
@@ -130,15 +131,27 @@ pub(crate) async fn run(
         }
         // `token_owner` is a tgt-env user URL; the src snapshot carries
         // the src-env user URL, which the tgt API rejects as "Invalid
-        // hyperlink". For store extensions, always pin it to the
-        // effective overlay value (per-hook → `[defaults]`) — that's
-        // the URL the user picked during bootstrap. If neither is set,
-        // refuse to PATCH and tell the user how to fix it.
-        if is_store_extension(&payload) {
-            match crate::cli::deploy::store_extensions::effective_token_owner(
+        // hyperlink" since users aren't a deployable kind (no cross-env
+        // mapping). Pin to the effective overlay value (per-hook →
+        // `[defaults] store_extension_token_owner`) when available; if
+        // the src body has a token_owner and the overlay has nothing,
+        // strip it so PATCH leaves the tgt remote's existing value alone
+        // (a token_owner-less PATCH means "don't change this field").
+        //
+        // Store extensions are stricter — they ALWAYS need a tgt user
+        // URL — so for store-ext hooks we still abort with a directive
+        // pointing the user at the bootstrap picker rather than silently
+        // skipping the field.
+        let payload_has_token_owner = payload
+            .get("token_owner")
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
+        if payload_has_token_owner {
+            let resolved = crate::cli::deploy::store_extensions::effective_token_owner(
                 tgt_overlay.as_ref(),
                 tgt_slug,
-            ) {
+            );
+            match resolved {
                 Some(url) => {
                     if let Some(obj) = payload.as_object_mut() {
                         obj.insert(
@@ -147,7 +160,7 @@ pub(crate) async fn run(
                         );
                     }
                 }
-                None => {
+                None if is_store_extension(&payload) => {
                     warn(&progress, format!(
                         "warning: hooks/{tgt_slug} is a store extension but {} has no \
                          token_owner for it (neither [hooks.{tgt_slug}] token_owner nor \
@@ -158,6 +171,11 @@ pub(crate) async fn run(
                     ));
                     skipped += 1;
                     continue;
+                }
+                None => {
+                    if let Some(obj) = payload.as_object_mut() {
+                        obj.remove("token_owner");
+                    }
                 }
             }
         }
