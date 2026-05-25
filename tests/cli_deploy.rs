@@ -1955,3 +1955,127 @@ async fn deploy_rewrites_organization_url_on_workspace_create() {
     );
     assert_eq!(body["name"].as_str().unwrap(), "Ferguson");
 }
+
+/// First deploy with hook secrets unset on the target: the precheck must
+/// abort the deploy AND write `secrets/<tgt>.hook-secrets.json` populated
+/// with every required key (empty placeholders), so the next deploy is a
+/// fill-in-the-blanks loop instead of a JSON-shape scavenger hunt.
+#[tokio::test]
+async fn deploy_pre_populates_hook_secrets_file_on_missing_keys() {
+    let src_server = MockServer::start().await;
+    let tgt_server = MockServer::start().await;
+
+    let hook_id = 4242u64;
+    let src_uri = src_server.uri();
+    let src_hooks = serde_json::json!({
+        "pagination": { "next": null },
+        "results": [{
+            "id": hook_id,
+            "url": format!("{src_uri}/api/v1/hooks/{hook_id}"),
+            "name": "MDH lookup",
+            "type": "webhook",
+            "queues": [],
+            "events": ["annotation_content"],
+            "config": { "url": "https://mdh.example.com/lookup" }
+        }]
+    });
+    mount_full_pull(&src_server, src_hooks).await;
+    mount_full_pull(&tgt_server, empty_list()).await;
+
+    // The new precheck step issues GET /hooks/<id>/secrets_keys on src.
+    // Return two keys so the rendered template covers the multi-key case.
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/hooks/{hook_id}/secrets_keys")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!(["api_key", "signing_secret"])),
+        )
+        .mount(&src_server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args([
+            "init",
+            "--env",
+            &format!("test={}/api/v1:1", src_server.uri()),
+            "--env",
+            &format!("prod={}/api/v1:1", tgt_server.uri()),
+        ])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/test.secrets.json"),
+        r#"{"api_token":"T"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("secrets/prod.secrets.json"),
+        r#"{"api_token":"P"}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "test", "--no-push"])
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "prod", "--no-push"])
+        .assert()
+        .success();
+
+    // Deploy must abort: no `secrets/prod.hook-secrets.json` yet.
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["deploy", "test", "prod", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("deploy refused"))
+        .stderr(predicate::str::contains("hooks/mdh-lookup"))
+        .stderr(predicate::str::contains("api_key"))
+        .stderr(predicate::str::contains("signing_secret"))
+        .stderr(predicate::str::contains("pre-populated"))
+        .stderr(predicate::str::contains("prod.hook-secrets.json"));
+
+    // The template file must exist on disk with both required keys
+    // present and empty — that's the whole point of the feature.
+    let secrets_path = project.path().join("secrets/prod.hook-secrets.json");
+    assert!(
+        secrets_path.exists(),
+        "precheck must pre-populate {}",
+        secrets_path.display()
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&secrets_path).unwrap()).unwrap();
+    assert_eq!(v["hooks"]["mdh-lookup"]["api_key"], "");
+    assert_eq!(v["hooks"]["mdh-lookup"]["signing_secret"], "");
+
+    // Existing values must be preserved on a re-run: pre-fill one key,
+    // re-deploy, and assert the value isn't wiped while the still-missing
+    // key remains empty.
+    std::fs::write(
+        &secrets_path,
+        r#"{ "hooks": { "mdh-lookup": { "api_key": "kept-by-user" } } }"#,
+    )
+    .unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["deploy", "test", "prod", "--yes"])
+        .assert()
+        .failure();
+    let v2: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&secrets_path).unwrap()).unwrap();
+    assert_eq!(
+        v2["hooks"]["mdh-lookup"]["api_key"], "kept-by-user",
+        "the user's typed-in value must survive a re-deploy"
+    );
+    assert_eq!(v2["hooks"]["mdh-lookup"]["signing_secret"], "");
+}
