@@ -733,15 +733,7 @@ async fn refresh_token_silent_relogin_on_non_tty_with_creds() {
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(matchers::method("GET"))
-        .and(matchers::path("/v1/organizations/1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": 1,
-            "name": "Example Org",
-            "url": format!("{}/v1/organizations/1", server.uri()),
-        })))
-        .mount(&server)
-        .await;
+    // No org-validate mock: the silent re-login path persists the fresh token without re-validation.
 
     let dir = TempDir::new().unwrap();
     let env_suffix = uuid_like_suffix();
@@ -769,13 +761,13 @@ org_id = 1
 
     // Force "non-TTY" by chdir-ing into the temp dir and calling the
     // function. Since the current test process's stdin is typically
-    // piped (not a TTY) under cargo test, refresh_token_interactively's
+    // piped (not a TTY) under cargo test, refresh_token_for_401's
     // IsTerminal check naturally returns false. Hold `cwd_lock` so we
     // don't race sibling tests that read fixtures via relative paths.
     let _cwd_guard = cwd_lock();
     let cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(dir.path()).unwrap();
-    let result = rdc::cli::auth::refresh_token_interactively(&env_name).await;
+    let result = rdc::cli::auth::refresh_token_for_401(&env_name).await;
     std::env::set_current_dir(&cwd).unwrap();
 
     result.expect("silent relogin should succeed");
