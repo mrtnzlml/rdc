@@ -37,31 +37,53 @@ pub fn env_var_for(env: &str, suffix: &str) -> String {
     out
 }
 
-/// Resolve the API token for an environment.
-///
-/// Resolution order:
-/// 1. The environment variable returned by [`env_var_for`] with suffix
-///    `TOKEN` — `RDC_TOKEN_DEV` for env `dev`, `RDC_TOKEN_DEV_AP` for
-///    `dev-ap`.
-/// 2. `secrets/<env>.secrets.json` with shape `{ "api_token": "..." }`.
-///
-/// Returns an actionable error if neither source is present.
-pub fn resolve_token(project_root: &Path, env: &str) -> Result<String> {
-    resolve_token_from(project_root, env, |k| std::env::var(k).ok())
+/// Outcome of synchronously inspecting the per-env credential
+/// configuration (env vars + on-disk secrets file). The async
+/// [`resolve_token`] consumes this enum and performs I/O (HTTP login,
+/// cache write) when needed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TokenLookup {
+    /// A token is ready to use. `expires_at` is `Some(unix_secs)` when
+    /// the file recorded one (token came from `/v1/auth/login` and rdc
+    /// computed the expiry at issue time); `None` when the token came
+    /// from `RDC_TOKEN_<ENV>` or from a manual `rdc auth --token`
+    /// (opaque tokens; no expiry tracking).
+    Cached {
+        token: String,
+        expires_at: Option<u64>,
+    },
+    /// Nothing is configured. `message` is the actionable error to
+    /// surface to the user, naming all three options
+    /// (`$RDC_TOKEN_<ENV>`, `$RDC_USER_<ENV>+$RDC_PASS_<ENV>`,
+    /// `rdc auth <env>`).
+    Missing { message: String },
 }
 
-/// Inner form with an injectable env-getter. Lets tests cover the env-var
-/// branch without mutating the process-wide environment, which is unsound
-/// to do concurrently with other tests reading env vars.
-fn resolve_token_from<F: Fn(&str) -> Option<String>>(
+/// Inspect the per-env credential state and report a [`TokenLookup`].
+///
+/// Resolution order:
+/// 1. `RDC_TOKEN_<ENV>` env var — used as-is, opaque (no expiry tracking).
+/// 2. `secrets/<env>.secrets.json` (`{api_token, expires_at?}`) — used as-is.
+///
+/// Returns `TokenLookup::Missing` if neither is configured.
+///
+/// **Note:** This is the sync inspection step. Expiry checks and the
+/// `RDC_USER_<ENV>` + `RDC_PASS_<ENV>` resolution branch land in Task 3.
+pub fn resolve_token_lookup(project_root: &Path, env: &str) -> Result<TokenLookup> {
+    resolve_token_lookup_from(project_root, env, |k| std::env::var(k).ok())
+}
+
+/// Inner form with an injectable env-getter. Lets tests cover the
+/// env-var branch without mutating the process-wide environment.
+fn resolve_token_lookup_from<F: Fn(&str) -> Option<String>>(
     project_root: &Path,
     env: &str,
     get_env: F,
-) -> Result<String> {
-    let env_var = env_var_for(env, "TOKEN");
-    if let Some(t) = get_env(&env_var) {
+) -> Result<TokenLookup> {
+    let token_var = env_var_for(env, "TOKEN");
+    if let Some(t) = get_env(&token_var) {
         if !t.is_empty() {
-            return Ok(t);
+            return Ok(TokenLookup::Cached { token: t, expires_at: None });
         }
     }
 
@@ -72,22 +94,38 @@ fn resolve_token_from<F: Fn(&str) -> Option<String>>(
         #[derive(Deserialize)]
         struct File {
             api_token: String,
+            #[serde(default)]
+            expires_at: Option<u64>,
         }
         let f: File = serde_json::from_str(&raw)
             .with_context(|| format!("parsing {}", path.display()))?;
         if f.api_token.is_empty() {
-            return Err(anyhow!(
-                "{} has empty api_token; set ${env_var} or fill in the file",
-                path.display()
-            ));
+            return Ok(TokenLookup::Missing {
+                message: format!(
+                    "{} has empty api_token; set ${token_var} or fill in the file",
+                    path.display()
+                ),
+            });
         }
-        return Ok(f.api_token);
+        return Ok(TokenLookup::Cached { token: f.api_token, expires_at: f.expires_at });
     }
 
-    Err(anyhow!(
-        "no token for env '{env}': set ${env_var} or write {}",
-        path.display()
-    ))
+    Ok(TokenLookup::Missing {
+        message: format!(
+            "no token for env '{env}': set ${token_var} or write {}",
+            path.display()
+        ),
+    })
+}
+
+/// Convenience wrapper that converts a [`TokenLookup`] back into the
+/// `Result<String>` shape the existing callers expect. **Sync at this
+/// checkpoint — becomes async in Task 5 when the login flow is wired up.**
+pub fn resolve_token(project_root: &Path, env: &str) -> Result<String> {
+    match resolve_token_lookup(project_root, env)? {
+        TokenLookup::Cached { token, .. } => Ok(token),
+        TokenLookup::Missing { message } => Err(anyhow!(message)),
+    }
 }
 
 /// Per-env, per-hook secret values that ship to the Rossum API in the
@@ -247,11 +285,11 @@ mod tests {
             r#"{"api_token":"from-file"}"#,
         )
         .unwrap();
-        let token = resolve_token_from(dir.path(), "dev", |k| {
+        let lookup = resolve_token_lookup_from(dir.path(), "dev", |k| {
             (k == "RDC_TOKEN_DEV").then(|| "from-env".to_string())
         })
         .unwrap();
-        assert_eq!(token, "from-env");
+        assert!(matches!(lookup, TokenLookup::Cached { ref token, .. } if token == "from-env"));
     }
 
     #[test]
@@ -263,8 +301,8 @@ mod tests {
             r#"{"api_token":"from-file"}"#,
         )
         .unwrap();
-        let token = resolve_token_from(dir.path(), "dev", |_| None).unwrap();
-        assert_eq!(token, "from-file");
+        let lookup = resolve_token_lookup_from(dir.path(), "dev", |_| None).unwrap();
+        assert!(matches!(lookup, TokenLookup::Cached { ref token, .. } if token == "from-file"));
     }
 
     #[test]
@@ -276,17 +314,21 @@ mod tests {
             r#"{"api_token":"from-file"}"#,
         )
         .unwrap();
-        let token = resolve_token_from(dir.path(), "dev", |_| Some(String::new())).unwrap();
-        assert_eq!(token, "from-file");
+        let lookup = resolve_token_lookup_from(dir.path(), "dev", |_| Some(String::new())).unwrap();
+        assert!(matches!(lookup, TokenLookup::Cached { ref token, .. } if token == "from-file"));
     }
 
     #[test]
     fn missing_token_errors_with_actionable_message() {
         let dir = TempDir::new().unwrap();
-        let err = resolve_token_from(dir.path(), "unittest_c", |_| None).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("RDC_TOKEN_UNITTEST_C"), "should mention env var: {msg}");
-        assert!(msg.contains("secrets/unittest_c.secrets.json"), "should mention file path: {msg}");
+        let lookup = resolve_token_lookup_from(dir.path(), "unittest_c", |_| None).unwrap();
+        match lookup {
+            TokenLookup::Missing { message } => {
+                assert!(message.contains("RDC_TOKEN_UNITTEST_C"), "should mention env var: {message}");
+                assert!(message.contains("secrets/unittest_c.secrets.json"), "should mention file path: {message}");
+            }
+            other => panic!("expected Missing, got {other:?}"),
+        }
     }
 
     #[test]
@@ -331,26 +373,24 @@ mod tests {
         // `dev-ap` env must resolve via `$RDC_TOKEN_DEV_AP`, not the
         // invalid `$RDC_TOKEN_DEV-AP` (which no shell can export).
         let dir = TempDir::new().unwrap();
-        let token = resolve_token_from(dir.path(), "dev-ap", |k| {
+        let lookup = resolve_token_lookup_from(dir.path(), "dev-ap", |k| {
             (k == "RDC_TOKEN_DEV_AP").then(|| "from-env".to_string())
         })
         .unwrap();
-        assert_eq!(token, "from-env");
+        assert!(matches!(lookup, TokenLookup::Cached { ref token, .. } if token == "from-env"));
     }
 
     #[test]
     fn resolve_token_missing_message_quotes_normalized_var_name() {
         let dir = TempDir::new().unwrap();
-        let err = resolve_token_from(dir.path(), "dev-ap", |_| None).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("RDC_TOKEN_DEV_AP"),
-            "error must point at the actual env-var name: {msg}"
-        );
-        assert!(
-            !msg.contains("RDC_TOKEN_DEV-AP"),
-            "error must NOT mention the invalid hyphenated form: {msg}"
-        );
+        let lookup = resolve_token_lookup_from(dir.path(), "dev-ap", |_| None).unwrap();
+        match lookup {
+            TokenLookup::Missing { message } => {
+                assert!(message.contains("RDC_TOKEN_DEV_AP"), "must point at actual env-var name: {message}");
+                assert!(!message.contains("RDC_TOKEN_DEV-AP"), "must not mention hyphenated form: {message}");
+            }
+            other => panic!("expected Missing, got {other:?}"),
+        }
     }
 
     #[test]
@@ -547,6 +587,73 @@ mod tests {
         let path = write_hook_secrets_template(dir.path(), "test-mtr", &req, &existing).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "hook-secrets template must be owner-only");
+    }
+
+    #[test]
+    fn lookup_returns_cached_with_expires_at_from_file() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        std::fs::write(
+            dir.path().join("secrets/dev.secrets.json"),
+            r#"{"api_token":"abc","expires_at":1700000000}"#,
+        )
+        .unwrap();
+        let lookup = resolve_token_lookup_from(dir.path(), "dev", |_| None).unwrap();
+        match lookup {
+            TokenLookup::Cached { token, expires_at } => {
+                assert_eq!(token, "abc");
+                assert_eq!(expires_at, Some(1700000000));
+            }
+            other => panic!("expected Cached, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lookup_returns_cached_without_expires_at_when_field_absent() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        std::fs::write(
+            dir.path().join("secrets/dev.secrets.json"),
+            r#"{"api_token":"abc"}"#,
+        )
+        .unwrap();
+        let lookup = resolve_token_lookup_from(dir.path(), "dev", |_| None).unwrap();
+        match lookup {
+            TokenLookup::Cached { token, expires_at } => {
+                assert_eq!(token, "abc");
+                assert_eq!(expires_at, None);
+            }
+            other => panic!("expected Cached, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lookup_returns_token_env_var_with_no_expiry() {
+        let dir = TempDir::new().unwrap();
+        let lookup = resolve_token_lookup_from(dir.path(), "dev", |k| {
+            (k == "RDC_TOKEN_DEV").then(|| "from-env".to_string())
+        })
+        .unwrap();
+        match lookup {
+            TokenLookup::Cached { token, expires_at } => {
+                assert_eq!(token, "from-env");
+                assert_eq!(expires_at, None, "env-var tokens are opaque, no expiry tracking");
+            }
+            other => panic!("expected Cached, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lookup_returns_missing_with_actionable_message_when_nothing_configured() {
+        let dir = TempDir::new().unwrap();
+        let lookup = resolve_token_lookup_from(dir.path(), "dev", |_| None).unwrap();
+        match lookup {
+            TokenLookup::Missing { message } => {
+                assert!(message.contains("RDC_TOKEN_DEV"), "missing message: {message}");
+                assert!(message.contains("secrets/dev.secrets.json"), "missing message: {message}");
+            }
+            other => panic!("expected Missing, got {other:?}"),
+        }
     }
 
     #[test]
