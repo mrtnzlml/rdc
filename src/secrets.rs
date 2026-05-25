@@ -180,7 +180,7 @@ fn resolve_token_lookup_from<F: Fn(&str) -> Option<String>>(
     resolve_token_lookup_from_at(project_root, env, get_env, now_unix_secs())
 }
 
-fn now_unix_secs() -> u64 {
+pub(crate) fn now_unix_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
