@@ -46,7 +46,7 @@ pub async fn run(env: &str) -> Result<()> {
     // old `pull` flow — every remote item lands as `RemoteCreate` and
     // the pull-side dispatcher writes it.
     crate::cli::sync::run(
-        env, /* interactive */ false, /* dry_run */ false, /* diff */ false,
+        env, /* interactive */ false, /* dry_run */ false,
         /* allow_deletes */ false, /* no_push */ true, /* no_pull */ false,
     )
     .await?;

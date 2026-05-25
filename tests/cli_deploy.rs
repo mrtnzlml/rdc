@@ -35,7 +35,6 @@ fn mdh_snapshot_body(api_base: &str) -> serde_json::Value {
 /// Same shape as `mdh_snapshot_body` but representing what the server returns
 /// immediately after `POST /hooks/create` — template defaults (un-customised
 /// `settings`), plus id/url assigned.
-#[allow(dead_code)]
 fn mdh_installed_body(api_base: &str, id: u64) -> serde_json::Value {
     let mut body = mdh_snapshot_body(api_base);
     body["id"] = serde_json::Value::from(id);
