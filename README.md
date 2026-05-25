@@ -679,6 +679,10 @@ Smoke test after setup:
 
 Deliberately out of scope: tagging, per-day branches, artifact uploads, retry-on-transient-login-failure beyond rdc's built-in 429/502/503/504 retry. Layer those on as needed.
 
+### Concurrent rdc invocations
+
+Two `rdc` invocations against the same env that both hit a 401 will each issue an independent `POST /v1/auth/login` and race to write `secrets/<env>.secrets.json`. The write goes through an atomic rename, so the file is never half-written — last writer wins. The loser's token is orphaned (server-valid until ~162h expiry) but never consumed by rdc again. This is acceptable: Rossum scopes tokens per-user, not per-job, and the server tolerates many concurrent tokens. Schedule the archive job to not overlap with other rdc-using pipelines if you want to avoid this entirely.
+
 ## Upgrade
 
 Keep `rdc` current with one command:
