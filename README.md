@@ -573,6 +573,24 @@ read -s T && echo "$T" | rdc auth test
 
 Master Data Hub is pulled automatically when the cluster has it enabled. The Data Storage URL is derived from `api_base`; no extra config to set. On clusters without MDH, the lookup returns 404 and `rdc` skips silently.
 
+## Shell autocomplete
+
+`rdc` supports dynamic shell completion: subcommands, flags, and — crucially — actual env names parsed from the current project's `rdc.toml` at completion time. Type `rdc deploy <TAB>` inside a project and you get the env names defined there, not a generic `<ENV>` placeholder.
+
+One-line install. Add to your shell init:
+
+```sh
+# zsh — append to ~/.zshrc
+source <(COMPLETE=zsh rdc)
+
+# bash — append to ~/.bashrc
+source <(COMPLETE=bash rdc)
+```
+
+Other shells (fish, elvish, powershell) are supported by `clap_complete` too — swap the value of `COMPLETE` to the shell name.
+
+The script is regenerated each time the shell starts, so upgrading `rdc` keeps completions in sync — nothing to re-export. Outside a project, completion still works for subcommands and flags; the env-name positionals just fall back to empty (no error). Set `COMPLETE=` (empty) to disable the integration without removing the line.
+
 ## Resilience
 
 Every Rossum and Data Storage HTTP call retries automatically on:

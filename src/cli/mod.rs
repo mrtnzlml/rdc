@@ -1,5 +1,36 @@
 use clap::builder::styling::{AnsiColor, Color, Effects, RgbColor, Style, Styles};
 use clap::{Parser, Subcommand};
+use clap_complete::{ArgValueCandidates, CompletionCandidate};
+
+/// Dynamic shell-completion candidates for env-name args. Reads
+/// `rdc.toml` from the current working directory and returns each
+/// defined env as a candidate. Silent fallback to an empty `Vec` when:
+///
+/// - CWD can't be resolved.
+/// - No `rdc.toml` exists (user isn't in a project — completion stays
+///   empty rather than spamming an error mid-keystroke).
+/// - `rdc.toml` is unparseable.
+///
+/// Called by clap_complete each time the shell asks for candidates,
+/// so it must be cheap and side-effect-free. Reading the small toml
+/// file is fast enough; no caching layered on top.
+fn env_name_candidates() -> Vec<CompletionCandidate> {
+    let Ok(cwd) = std::env::current_dir() else { return Vec::new() };
+    env_name_candidates_in(&cwd)
+}
+
+/// Inner form with an injected project root. Lets tests cover the
+/// rdc.toml reading branch without mutating process-wide CWD, which is
+/// unsound to do concurrently with other tests.
+fn env_name_candidates_in(project_root: &std::path::Path) -> Vec<CompletionCandidate> {
+    let Ok(cfg) = crate::config::ProjectConfig::load(&project_root.join("rdc.toml")) else {
+        return Vec::new();
+    };
+    cfg.envs
+        .keys()
+        .map(|name| CompletionCandidate::new(name))
+        .collect()
+}
 
 /// Help / error / usage palette inspired by Claude Code: warm amber
 /// accents on a clean, theme-agnostic base. Truecolor (24-bit) is used
@@ -66,6 +97,7 @@ pub enum Command {
     /// Without `<env>`, picks interactively from envs defined in `rdc.toml`
     /// (or auto-selects when only one exists).
     Sync {
+        #[arg(add = ArgValueCandidates::new(env_name_candidates))]
         env: Option<String>,
         /// Print the plan and exit without making any changes.
         #[arg(long = "dry-run")]
@@ -107,8 +139,10 @@ pub enum Command {
     /// API calls. `--dry-run` always prints a per-object unified diff.
     Deploy {
         /// Source environment (e.g. `test`). Picks interactively when omitted.
+        #[arg(add = ArgValueCandidates::new(env_name_candidates))]
         src: Option<String>,
         /// Target environment (e.g. `prod`). Picks interactively when omitted.
+        #[arg(add = ArgValueCandidates::new(env_name_candidates))]
         tgt: Option<String>,
         /// Mirror semantics: delete tgt objects that don't exist in src.
         /// Default is additive (extras in tgt are left intact). Mirror is
@@ -143,7 +177,9 @@ pub enum Command {
     /// `rdc diff <env>` — local snapshot vs remote (one GET per edited object).
     /// `rdc diff <a> <b>` — two local snapshots, no API calls.
     Diff {
+        #[arg(add = ArgValueCandidates::new(env_name_candidates))]
         left: String,
+        #[arg(add = ArgValueCandidates::new(env_name_candidates))]
         right: Option<String>,
     },
     /// Set or refresh an env's API token. Validates the token before
@@ -151,6 +187,7 @@ pub enum Command {
     /// Provide the token via `--token` or pipe it on stdin. Without
     /// `<env>`, picks interactively from envs defined in `rdc.toml`.
     Auth {
+        #[arg(add = ArgValueCandidates::new(env_name_candidates))]
         env: Option<String>,
         #[arg(long)]
         token: Option<String>,
@@ -176,6 +213,7 @@ pub enum Command {
     ///   custom (one PATCH, id preserved) or reinstall as store
     ///   extension (new id, dependents rewired).
     Repair {
+        #[arg(add = ArgValueCandidates::new(env_name_candidates))]
         env: Option<String>,
         /// Re-pull from remote and reconstruct the lockfile. Backs up
         /// the existing one to `<name>.bak.<unix-ts>`. Destroys local
@@ -416,3 +454,52 @@ pub mod push;
 pub mod repair;
 pub mod resolve;
 pub mod sync;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn env_name_candidates_returns_envs_from_rdc_toml() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("rdc.toml"),
+            r#"
+[envs.dev]
+api_base = "https://dev.example/api/v1"
+org_id = 1
+
+[envs.prod]
+api_base = "https://prod.example/api/v1"
+org_id = 2
+"#,
+        )
+        .unwrap();
+        let cands: Vec<String> = env_name_candidates_in(dir.path())
+            .into_iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect();
+        // BTreeMap iteration order is alphabetical, so dev comes before prod.
+        assert_eq!(cands, vec!["dev".to_string(), "prod".to_string()]);
+    }
+
+    #[test]
+    fn env_name_candidates_silent_when_no_rdc_toml() {
+        // Shell completion fires on every keystroke; if the user is
+        // outside a project we must NOT bubble an error — just return
+        // no candidates so the shell falls back to flags-only.
+        let dir = TempDir::new().unwrap();
+        assert!(env_name_candidates_in(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn env_name_candidates_silent_when_rdc_toml_unparseable() {
+        // Same contract: a malformed project file shouldn't make the
+        // user's TAB key feel broken. Surface zero candidates instead.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("rdc.toml"), "this is { not [valid toml")
+            .unwrap();
+        assert!(env_name_candidates_in(dir.path()).is_empty());
+    }
+}
