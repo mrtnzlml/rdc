@@ -24,10 +24,10 @@ Motivation: Rossum support-team users get short-lived tokens by policy, so a lon
 ### Secrets file schema (additive)
 
 ```json
-{ "api_token": "abc...", "expires_at": "2026-06-01T12:00:00Z" }
+{ "api_token": "abc...", "expires_at": 1762344000 }
 ```
 
-`expires_at` is an optional ISO-8601 UTC timestamp. It is set only when the token was obtained via `/v1/auth/login` (when rdc knows the expiry). Manually-set tokens (`rdc auth <env> --token …`) continue to write the same body as today — just `{api_token}` with no `expires_at` — so existing files keep working without migration. The reader treats absence of `expires_at` as "no expiry tracking, use as-is".
+`expires_at` is an optional integer: Unix epoch seconds in UTC. Format chosen to match the project's existing approach of using `std::time::SystemTime` arithmetic without adding `chrono`/`time` deps (see `src/log.rs:106` for the comment that explicitly documents this stance). It is set only when the token was obtained via `/v1/auth/login` (when rdc has computed an expiry). Manually-set tokens (`rdc auth <env> --token …`) continue to write the same body as today — just `{api_token}` with no `expires_at` — so existing files keep working without migration. The reader treats absence of `expires_at` as "no expiry tracking, use as-is".
 
 ### CLI surface
 
