@@ -185,7 +185,8 @@ version = 1
         .current_dir(project.path())
         .args(["deploy", "test", "prod", "--yes"])
         .assert().success()
-        .stdout(predicate::str::contains("Plan: test -> prod"))
+        // Preview pass emits the per-object diff header before confirm.
+        .stdout(predicate::str::contains("(src after overlay+rewrite)"))
         .stdout(predicate::str::contains("Applied 1 hooks"))
         .stdout(predicate::str::contains("(1 PATCHes)"));
 
@@ -543,7 +544,8 @@ async fn deploy_bootstraps_empty_target_with_url_rewriting() {
         .current_dir(project.path())
         .args(["deploy", "test", "prod", "--yes"])
         .assert().success()
-        .stdout(predicate::str::contains("Plan: test -> prod"))
+        // Preview emits create-body new-file diffs labeled by kind/slug.
+        .stdout(predicate::str::contains("--- create bodies (would-be POST) ---"))
         .stdout(predicate::str::contains("workspaces"))
         .stdout(predicate::str::contains("schemas"))
         .stdout(predicate::str::contains("queues"))
@@ -1144,8 +1146,22 @@ async fn deploy_only_filters_plan() {
         .env("RDC_TOKEN_PROD", "T")
         .assert().success();
     let out = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
-    assert!(out.contains("hooks"), "expected hooks in plan; got:\n{out}");
-    assert!(!out.contains("rules"), "rules must not appear under --only hooks/*; got:\n{out}");
+    // Preview should emit a create body for the in-scope hook…
+    assert!(
+        out.contains("hooks/validator.json"),
+        "expected hooks/validator.json in preview; got:\n{out}"
+    );
+    // …and never reference the rule's slug, since `--only hooks/*` excludes
+    // it. The apply summary line legitimately contains the bare word
+    // "rules" (as "0 rules"), so match the slug instead.
+    assert!(
+        !out.contains("check-totals"),
+        "rule slug must not appear under --only hooks/*; got:\n{out}"
+    );
+    assert!(
+        !out.contains("rules/"),
+        "rules/<slug> path must not appear under --only hooks/*; got:\n{out}"
+    );
 }
 
 /// `rdc deploy --only hooks/x` must POST /hooks but never POST /rules, even
@@ -1462,14 +1478,17 @@ async fn deploy_plan_lists_store_extensions_in_dry_run() {
 
     let stdout = String::from_utf8_lossy(&out.stdout);
 
-    // The plan summary must contain the store-extension sub-line.
-    assert!(
-        stdout.contains("store extension"),
-        "stdout should mention 'store extension':\n{stdout}"
-    );
+    // The preview must surface the store-extension by name + by its
+    // `extension_source: "rossum_store"` marker in the POST body. (The
+    // old plan summary spelled out "store extension" in a sub-line; now
+    // the same evidence lives directly in the rendered diff bodies.)
     assert!(
         stdout.contains("master-data-hub"),
         "stdout should name the slug 'master-data-hub':\n{stdout}"
+    );
+    assert!(
+        stdout.contains("rossum_store"),
+        "stdout should expose extension_source=rossum_store in the preview body:\n{stdout}"
     );
 
     // No mutating requests (POST/PATCH/DELETE) should have reached tgt.
