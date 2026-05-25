@@ -4,6 +4,13 @@ use std::io::IsTerminal;
 
 #[tokio::main]
 async fn main() {
+    // Handle the COMPLETE=<shell> rdc invocation that the shell makes
+    // to fetch completion candidates / emit its setup script. Must run
+    // before any other stdout writes — clap_complete's protocol assumes
+    // stdout is reserved for its output. If the env var isn't set this
+    // is a cheap no-op and falls through to the normal CLI path.
+    clap_complete::CompleteEnv::with_factory(Cli::command).complete();
+
     let cli = parse_with_color_choice();
     if let Err(err) = run(cli).await {
         let log = rdc::log::Log::new(rdc::cli::resolve::detect_color_mode(false));

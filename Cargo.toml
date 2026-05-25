@@ -16,6 +16,7 @@ path = "src/lib.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = { version = "4", features = ["unstable-dynamic"] }
 flate2 = "1"
 fs4 = "1"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
