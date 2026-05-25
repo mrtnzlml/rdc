@@ -389,8 +389,8 @@ mod log_tests {
     fn block_emits_verbatim_then_newline() {
         let buf = Buf::default();
         let log = Log::for_test(ColorMode::Plain, Box::new(buf.clone()));
-        log.block("Plan: test -> prod\n  + create:  hooks (3)");
-        assert_eq!(buf.text(), "Plan: test -> prod\n  + create:  hooks (3)\n");
+        log.block("--- preview ---\n  line one\n  line two");
+        assert_eq!(buf.text(), "--- preview ---\n  line one\n  line two\n");
     }
 
     #[test]

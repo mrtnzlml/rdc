@@ -137,10 +137,13 @@ Promote everything that's diverged from prod into prod:
 
 ```sh
 $ rdc deploy test prod
-Plan: test -> prod
-  + create:  (none)
-  ~ update:  field-level deltas
+--- hooks/validator-invoices.json (src after overlay+rewrite+normalize)
++++ hooks/validator-invoices.json (tgt remote, normalized)
+@@ ...
+-  "name": "Validator: invoices",
++  "name": "Validator (PROD)",
 
+Would apply 1 hooks (1 PATCHes) from test to prod
 Proceed? [y/N] y
 Applied 1 hooks (1 PATCHes) from test to prod
 Deployed test -> prod: 0 created, 0 deleted, 2 API calls, 1.4s
@@ -348,10 +351,15 @@ Conflicts and destructive deletes prompt inline in the watch terminal. Non-destr
 The one-line answer is `rdc deploy test prod`. The details:
 
 ```
-Plan: test → prod
-  + create:  4 workspaces, 24 schemas, 24 queues, 27 hooks, 1 rule, 46 labels
-  ~ update:  field-level deltas (resolved at execute time)
+--- create bodies (would-be POST) ---
+workspaces/ferguson-mtr.json (would create)
++ { ... }
 
+hooks/master-data-hub.json (src after overlay+rewrite+normalize)
++++ hooks/master-data-hub.json (tgt remote, normalized)
+@@ ... per-object diff ...
+
+Would apply 22 hooks, 0 rules, 0 labels, ... (22 PATCHes) from test to prod
 Proceed? [y/N] y
 
   → workspaces       4 created
