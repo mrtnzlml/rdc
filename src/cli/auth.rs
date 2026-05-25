@@ -20,7 +20,6 @@ use crate::secrets::LOGIN_TOKEN_LIFETIME_SECS;
 use anyhow::{anyhow, Context, Result};
 use std::io::IsTerminal;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub async fn run(
     env: &str,
@@ -52,7 +51,7 @@ pub async fn run(
                 format!("logging in to env '{env}' as '{username}'")
             })?;
         let org_name = validate_token(env_cfg, &token).await?;
-        let expires_at = now_unix_secs().saturating_add(LOGIN_TOKEN_LIFETIME_SECS);
+        let expires_at = crate::secrets::now_unix_secs().saturating_add(LOGIN_TOKEN_LIFETIME_SECS);
         crate::secrets::write_secrets_file(&cwd, env, &token, Some(expires_at))?;
         log.event(
             Action::Auth,
@@ -161,13 +160,6 @@ async fn validate_token(env_cfg: &EnvConfig, token: &str) -> Result<String> {
         &format!("done validated against org '{}'", org.name),
     );
     Ok(org.name)
-}
-
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// Validate `token` by calling `GET /organizations/<id>`. On success,
