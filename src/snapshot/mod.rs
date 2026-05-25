@@ -1,4 +1,3 @@
-pub mod collection;
 pub mod create;
 pub mod email_template;
 pub mod engine;

@@ -6,8 +6,34 @@ use crate::model::{Collection, IndexSet};
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use futures::stream::{StreamExt, TryStreamExt};
+use serde_json::Value;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
+
+/// Strip server-only fields from an index definition so the user only
+/// sees / round-trips the fields they can actually edit. Removes the
+/// implicit `_id_` regular index (server-managed, can't be dropped)
+/// and the `v` index-version field (server-assigned, not user-input).
+/// Returns a fresh [`IndexSet`] with the stripped form.
+fn strip_server_managed(set: &IndexSet) -> IndexSet {
+    let mut regular: Vec<Value> = set
+        .regular
+        .iter()
+        .filter(|ix| {
+            ix.get("name").and_then(|n| n.as_str()) != Some("_id_")
+        })
+        .cloned()
+        .collect();
+    for ix in regular.iter_mut() {
+        if let Value::Object(obj) = ix {
+            obj.shift_remove("v");
+        }
+    }
+    IndexSet {
+        regular,
+        search: set.search.clone(),
+    }
+}
 
 /// Opaque listed state for MDH — the client handle plus the collection list.
 /// We carry the client here because it's constructed from env_cfg + token,
@@ -63,8 +89,12 @@ pub async fn process(
 
     let mut dir_created = false;
 
-    // === Sub-phase A: assign slugs + write collection.json. Build per-collection
-    //            dataset_dir map for use in sub-phase C.
+    // === Sub-phase A: assign slugs, ensure dataset_dir exists, and run the
+    //            one-shot migration for projects that pre-date the
+    //            collection.json removal (delete the stale file, drop the
+    //            redundant `mdh_collections` lockfile entry). The
+    //            indexes.json write itself happens in sub-phase C after
+    //            the parallel fetches.
     let mut dataset_dirs: Vec<(String, std::path::PathBuf, Collection)> = Vec::new();
     for c in collections {
         let slug = slugify_unique(&c.name, &used);
@@ -73,8 +103,6 @@ pub async fn process(
         if !subset.contains(&("mdh".to_string(), slug.clone())) {
             continue;
         }
-
-        let coll_result: Result<()> = (|| {
 
         if !dir_created {
             std::fs::create_dir_all(ctx.paths.mdh_dir())
@@ -86,35 +114,40 @@ pub async fn process(
         std::fs::create_dir_all(&dataset_dir)
             .with_context(|| format!("creating {}", dataset_dir.display()))?;
 
-        let coll_path = dataset_dir.join("collection.json");
-        let mut coll_proposed = serde_json::to_vec_pretty(&c).context("serializing collection")?;
-        coll_proposed.push(b'\n');
-        let coll_base = ctx
-            .lockfile
-            .objects
-            .get("mdh_collections")
-            .and_then(|m| m.get(&slug))
-            .and_then(|e| e.content_hash.clone());
-        let (c_action, c_remote_hash) =
-            decide_pull_action(&coll_path, coll_base.as_deref(), &coll_proposed)?;
-        if c_action == PullAction::Conflict {
-            conflicts += 1;
+        // Migration: pre-2.x projects carry a `collection.json` next to
+        // `indexes.json` plus an `mdh_collections.<slug>` lockfile entry.
+        // The collection metadata is entirely server-managed (uuid,
+        // options, idIndex) and offers no user-editable surface, so we
+        // drop it. Cleanup is idempotent: subsequent syncs find nothing
+        // to remove and stay quiet.
+        let legacy_coll_path = dataset_dir.join("collection.json");
+        if legacy_coll_path.exists() {
+            std::fs::remove_file(&legacy_coll_path).with_context(|| {
+                format!("removing legacy {}", legacy_coll_path.display())
+            })?;
+            progress.event(
+                Action::Info,
+                &format!("migrated mdh/{slug}: removed obsolete collection.json"),
+            );
         }
-        let c_recorded = apply_pull_action(c_action, &coll_path, &coll_proposed, c_remote_hash, ctx.interactive, progress, ctx.paths.env(), coll_base.as_deref())?;
-        record_object(
-            ctx.lockfile,
-            "mdh_collections",
-            &slug,
-            0,
-            None,
-            None,
-            Some(c_recorded),
-        );
+        if let Some(map) = ctx.lockfile.objects.get_mut("mdh_collections") {
+            if map.remove(&slug).is_some() {
+                progress.event(
+                    Action::Info,
+                    &format!("migrated mdh/{slug}: dropped mdh_collections lockfile entry"),
+                );
+            }
+        }
 
         dataset_dirs.push((slug.clone(), dataset_dir, c));
-        Ok(())
-        })();
-        coll_result?;
+    }
+    // Clean up the lockfile's `mdh_collections` key entirely if it ended
+    // up empty after migration. Leaves the json clean for users grepping
+    // the lockfile.
+    if let Some(map) = ctx.lockfile.objects.get("mdh_collections") {
+        if map.is_empty() {
+            ctx.lockfile.objects.remove("mdh_collections");
+        }
     }
 
     // === Sub-phase B: concurrent index fetches per collection (regular +
@@ -146,14 +179,19 @@ pub async fn process(
     let by_slug: std::collections::HashMap<String, IndexSet> = fetched.into_iter().collect();
 
     // === Sub-phase C: per-collection indexes.json write decision (sequential
-    //            because we mutate ctx.lockfile + counts).
+    //            because we mutate ctx.lockfile + counts). The set is
+    //            stripped of server-managed fields (the implicit `_id_`
+    //            regular index, the `v` index-version field) before
+    //            serializing so the on-disk JSON contains only what the
+    //            user can actually edit.
     for (slug, dataset_dir, _c) in &dataset_dirs {
         let Some(index_set) = by_slug.get(slug) else { continue };
+        let trimmed = strip_server_managed(index_set);
 
         let ix_result: Result<()> = (|| {
 
         let ix_path = dataset_dir.join("indexes.json");
-        let mut ix_proposed = serde_json::to_vec_pretty(index_set).context("serializing index set")?;
+        let mut ix_proposed = serde_json::to_vec_pretty(&trimmed).context("serializing index set")?;
         ix_proposed.push(b'\n');
         let ix_base = ctx
             .lockfile

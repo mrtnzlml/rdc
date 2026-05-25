@@ -739,40 +739,14 @@ pub fn from_catalog_scan_lockfile(
     }
 
     // --- mdh ----------------------------------------------------------
-    // MDH is two kinds in the lockfile (`mdh_collections` and
-    // `mdh_indexes`) but a single dataset slug. The pull driver derives
-    // the slug from `Collection::name` only — there's no id-anchored
-    // lookup, so re-running the slugger is sufficient.
-    //
-    // Surface both kinds in `remote_hashes` / `locked` because they're
-    // tracked separately in the lockfile; the dispatcher in `execute::run`
-    // re-pulls both via `mdh::process` when either differs. The catalog
-    // doesn't carry the index set (it's fetched per-dataset inside
-    // `mdh::process`), so we only have the collection bytes available
-    // here for hashing. The index hash will land in `locked` if the
-    // lockfile recorded one; the classifier will compare it against an
-    // empty remote_hashes entry → RemoteEdit, which is fine: the executor
-    // dispatches to `mdh::process`, which fetches and writes both.
-    let mut used_mdh_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for c in &catalog.mdh.collections {
-        let slug = crate::slug::slugify_unique(&c.name, &used_mdh_slugs);
-        used_mdh_slugs.insert(slug.clone());
-
-        let mut proposed = match serde_json::to_vec_pretty(c) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        proposed.push(b'\n');
-        let hash = crate::state::content_hash(&proposed);
-        remote_hashes.insert(("mdh".to_string(), slug), hash);
-    }
-    if let Some(map) = lockfile.objects.get("mdh_collections") {
-        for (slug, entry) in map {
-            if let Some(h) = &entry.content_hash {
-                locked.insert(("mdh".to_string(), slug.clone()), h.clone());
-            }
-        }
-    }
+    // MDH datasets bypass the classifier entirely. Collection metadata
+    // is server-managed (uuid, options, idIndex) and not user-editable,
+    // and the indexes-state can't be hashed up here without an extra
+    // per-dataset round-trip. The dispatcher in `execute::run`
+    // unconditionally invokes `pull::mdh::process` for every listed
+    // collection; that driver is idempotent on no-change (per-file
+    // `decide_pull_action`) so unconditional dispatch is correct, just
+    // marginally chattier than a classifier-gated path.
 
     // --- hooks --------------------------------------------------------
     // Push-capable split-file kind: `<slug>.json` + optional `<slug>.py`
