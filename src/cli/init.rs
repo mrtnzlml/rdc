@@ -376,22 +376,54 @@ fn parse_env_spec(spec: &str) -> Result<(String, EnvConfig)> {
 
 fn write_gitignore(root: &Path) -> Result<()> {
     let path = root.join(".gitignore");
-    let body = "/target\n/secrets\n/.rdc/cache\n";
-    if path.exists() {
-        let existing = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        if existing.contains("/secrets") && existing.contains("/.rdc/cache") {
-            return Ok(());
-        }
-        let mut combined = existing;
-        if !combined.ends_with('\n') {
-            combined.push('\n');
-        }
-        combined.push_str(body);
-        write_atomic(&path, combined.as_bytes())?;
-    } else {
+    // Canonical patterns this template ensures. Each line is checked
+    // independently so re-running `rdc init` on a project that already
+    // has *some* of these (or has them with surrounding annotation)
+    // adds only the missing lines instead of dumping the whole block
+    // and creating duplicates.
+    //
+    // `/.rdc/state/*.lock` — sibling of the `<env>.lock.json` lockfile.
+    // The `.lock` file is the empty advisory lock fs4 grabs an OS-level
+    // exclusive lock on (see `cli::sync::lock::EnvLock`). The body is
+    // always empty by design and the contents are per-machine, so it
+    // shouldn't be committed. `*.lock` is narrow enough not to match
+    // `.lock.json` (that's the actual committable lockfile state).
+    const PATTERNS: &[&str] = &[
+        "/target",
+        "/secrets",
+        "/.rdc/cache",
+        "/.rdc/state/*.lock",
+    ];
+
+    if !path.exists() {
+        let body: String = PATTERNS.iter().map(|p| format!("{p}\n")).collect();
         write_atomic(&path, body.as_bytes())?;
+        return Ok(());
     }
+
+    let existing = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let existing_lines: std::collections::HashSet<&str> =
+        existing.lines().map(str::trim).collect();
+
+    let missing: Vec<&str> = PATTERNS
+        .iter()
+        .copied()
+        .filter(|p| !existing_lines.contains(p))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let mut combined = existing;
+    if !combined.ends_with('\n') {
+        combined.push('\n');
+    }
+    for p in missing {
+        combined.push_str(p);
+        combined.push('\n');
+    }
+    write_atomic(&path, combined.as_bytes())?;
     Ok(())
 }
 
