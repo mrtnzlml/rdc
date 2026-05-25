@@ -137,19 +137,84 @@ pub async fn run(env_specs: Vec<String>) -> Result<()> {
         }
     }
 
-    println!();
-    println!("Next steps:");
-    for env in &new_env_names {
-        if auth_succeeded.contains(env) {
-            continue;
+    // Sync-on-init: once auth has succeeded for one or more new envs,
+    // the very next manual step the user would run is `rdc sync <env>`.
+    // Offer to do that here so the happy path is a single command. TTY
+    // gated only, matching the rest of the init wizard. Default Yes —
+    // the user just configured the env, sync is what they came for.
+    //
+    // Each env is synced independently; one failure doesn't abort the
+    // others (or invalidate the project files already on disk). Envs
+    // whose sync failed fall back to the manual `rdc sync <env>` line
+    // in the Next steps block below.
+    let syncable: Vec<String> = new_env_names
+        .iter()
+        .filter(|e| auth_succeeded.contains(*e))
+        .cloned()
+        .collect();
+    let mut synced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if !syncable.is_empty() && std::io::stdin().is_terminal() {
+        let prompt_label = if syncable.len() == 1 {
+            format!("Sync '{}' now?", syncable[0])
+        } else {
+            format!("Sync the {} new env(s) now?", syncable.len())
+        };
+        let want_sync = match Confirm::new(&prompt_label)
+            .with_default(true)
+            .with_help_message("pulls the remote snapshot into envs/<env>/ — you can always run `rdc sync` later")
+            .prompt()
+        {
+            Ok(b) => b,
+            // Esc / Ctrl+C on the confirm = "don't sync now". Falls
+            // through to the next-steps message; project files stay.
+            Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => false,
+            Err(e) => return Err(anyhow!("prompt failed: {e}")),
+        };
+        if want_sync {
+            for env in &syncable {
+                println!();
+                match crate::cli::sync::run(env, true, false, false, false, false, false).await {
+                    Ok(()) => {
+                        synced.insert(env.clone());
+                    }
+                    Err(e) => {
+                        let log =
+                            crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
+                        log.event(
+                            crate::log::Action::Warn,
+                            &format!(
+                                "sync of env '{env}' failed: {e:#}; re-run `rdc sync {env}` later"
+                            ),
+                        );
+                    }
+                }
+            }
         }
-        let env_var_name = crate::secrets::env_token_var(env);
-        println!("  - Set the API token for env '{env}':");
-        println!("      rdc auth {env} --token <token>     # validates + writes secrets/{env}.secrets.json");
-        println!("      # or: export {env_var_name}=<token>");
     }
-    for env in &new_env_names {
-        println!("  - Sync the snapshot:  rdc sync {env}");
+
+    // Only show Next steps when there's actually something left to do.
+    // After a clean "init → auth → sync" run, every env is fully set up
+    // and a trailing empty header would feel like a dangling todo list.
+    let needs_token_step = new_env_names.iter().any(|e| !auth_succeeded.contains(e));
+    let needs_sync_step = new_env_names.iter().any(|e| !synced.contains(e));
+    if needs_token_step || needs_sync_step {
+        println!();
+        println!("Next steps:");
+        for env in &new_env_names {
+            if auth_succeeded.contains(env) {
+                continue;
+            }
+            let env_var_name = crate::secrets::env_token_var(env);
+            println!("  - Set the API token for env '{env}':");
+            println!("      rdc auth {env} --token <token>     # validates + writes secrets/{env}.secrets.json");
+            println!("      # or: export {env_var_name}=<token>");
+        }
+        for env in &new_env_names {
+            if synced.contains(env) {
+                continue;
+            }
+            println!("  - Sync the snapshot:  rdc sync {env}");
+        }
     }
     Ok(())
 }
