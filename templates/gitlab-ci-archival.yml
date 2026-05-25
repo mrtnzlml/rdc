@@ -1,0 +1,52 @@
+# Daily archival sync for a Rossum environment managed with rdc.
+#
+# Copy this file to .gitlab-ci.yml at the root of your Rossum project
+# repo (the one that holds rdc.toml + envs/). Then:
+#   1. Set CI variables in Settings -> CI/CD -> Variables (masked, protected):
+#        RDC_USER_<ENV>  - system username for the env
+#        RDC_PASS_<ENV>  - system password for the env
+#      Variable name suffix follows rdc's env-name normalization:
+#      uppercase, non-alphanumerics -> '_'. E.g. env 'prod' -> RDC_USER_PROD.
+#   2. Add a Schedule in Settings -> CI/CD -> Schedules (e.g. '0 2 * * *' UTC).
+#   3. Adjust RDC_ENV and RDC_VERSION below.
+#   4. In Settings -> CI/CD -> Token Permissions, allow the project's
+#      CI_JOB_TOKEN to push to the repo (or swap the push line for a PAT).
+
+variables:
+  RDC_ENV: "prod"
+  RDC_VERSION: "v0.1.0"  # pin to a release from
+                          # https://github.com/mrtnzlml/rdc/releases
+
+stages:
+  - archive
+
+archive:
+  stage: archive
+  image: alpine:3.20
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"  # allow manual trigger
+  before_script:
+    - apk add --no-cache curl git
+    - curl -fsSL "https://github.com/mrtnzlml/rdc/releases/download/${RDC_VERSION}/rdc-x86_64-unknown-linux-gnu.tar.gz" | tar xz -C /usr/local/bin
+    - rdc --version
+    - git config user.name  "rdc-archive[bot]"
+    - git config user.email "rdc-archive@noreply"
+  script:
+    - rdc sync "$RDC_ENV" --no-push --yes --force-overwrite-drift
+    - |
+      git add -A "envs/$RDC_ENV" ".rdc/state/$RDC_ENV.lock.json"
+      if git diff --staged --quiet; then
+        echo "No changes in $RDC_ENV; nothing to archive."
+        exit 0
+      fi
+      git commit -m "chore(archive): daily sync of $RDC_ENV ($(date -u +%Y-%m-%d))"
+      git push "https://oauth2:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "HEAD:${CI_DEFAULT_BRANCH}"
+
+# Multi-env extension: replace the single job above with parallel:matrix:.
+# Set RDC_USER_<ENV> + RDC_PASS_<ENV> CI variables for each env name.
+#
+# archive:
+#   parallel:
+#     matrix:
+#       - RDC_ENV: [test, prod]
