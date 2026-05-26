@@ -1,4 +1,5 @@
-use rossum_local::commands::AddConnectionInput;
+use rossum_local::commands::{validate_add_input_against_rossum, AddConnectionInput};
+use rossum_local::url_normalize::normalize_api_base;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -6,10 +7,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 async fn add_connection_rejects_invalid_token_with_401() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/organizations/1"))
+        .and(path("/api/v1/organizations/1"))
         .respond_with(ResponseTemplate::new(401))
         .mount(&server)
         .await;
+
+    let api_base = normalize_api_base(&server.uri()).unwrap();
 
     let input = AddConnectionInput {
         name: "X".into(),
@@ -22,7 +25,7 @@ async fn add_connection_rejects_invalid_token_with_401() {
         folder: None,
     };
 
-    let err = rossum_local::commands::validate_add_input_against_rossum(&input)
+    let err = validate_add_input_against_rossum(&input, &api_base)
         .await
         .unwrap_err();
     assert!(err.to_lowercase().contains("sign-in"));
@@ -32,12 +35,14 @@ async fn add_connection_rejects_invalid_token_with_401() {
 async fn add_connection_accepts_valid_token() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/organizations/1"))
+        .and(path("/api/v1/organizations/1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": 1, "name": "t", "url": format!("{}/organizations/1", server.uri())
+            "id": 1, "name": "t", "url": format!("{}/api/v1/organizations/1", server.uri())
         })))
         .mount(&server)
         .await;
+
+    let api_base = normalize_api_base(&server.uri()).unwrap();
 
     let input = AddConnectionInput {
         name: "X".into(),
@@ -50,7 +55,7 @@ async fn add_connection_accepts_valid_token() {
         folder: None,
     };
 
-    let token = rossum_local::commands::validate_add_input_against_rossum(&input)
+    let token = validate_add_input_against_rossum(&input, &api_base)
         .await
         .unwrap();
     assert_eq!(token, "good");
