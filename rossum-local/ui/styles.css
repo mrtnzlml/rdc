@@ -57,8 +57,8 @@ html, body { margin: 0; padding: 0; height: 100%; font-family: var(--font); colo
 .empty h1 { font-size: 22px; font-weight: 600; margin: 0; }
 .empty p { color: var(--fg-muted); margin: 0 0 16px; max-width: 360px; }
 
-.modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.4); display: flex; align-items: flex-start; justify-content: center; padding-top: 80px; z-index: 10; }
-.modal { background: var(--bg); border-radius: 10px; padding: 24px; width: 460px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); }
+.modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.4); display: flex; align-items: center; justify-content: center; padding: 20px; z-index: 10; }
+.modal { background: var(--bg); border-radius: 10px; padding: 24px; width: 460px; max-width: 100%; max-height: calc(100vh - 40px); overflow-y: auto; box-shadow: 0 10px 40px rgba(0,0,0,0.2); }
 .modal h3 { margin: 0 0 16px; font-size: 16px; font-weight: 600; }
 .field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
 .field label { font-size: 12px; color: var(--fg-muted); }

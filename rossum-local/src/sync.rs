@@ -28,6 +28,11 @@ pub async fn run_sync<K: Keychain + ?Sized>(
     let ts = resolve_token_for_sync(conn, kc).await?;
     ensure_rdc_toml(&conn.folder, &conn.api_base, conn.org_id)
         .map_err(|e| classify_io_err(e, &conn.folder))?;
+    // Scaffold init-time files (CLAUDE.md, README.md, .gitignore,
+    // .gitattributes) on first sync. Each writer skips when its target
+    // exists, so this is cheap and self-healing if a file gets deleted.
+    rdc::cli::init::write_scaffold_files(&conn.folder, "main", &conn.api_base, conn.org_id)
+        .map_err(|e| classify_io_err(e, &conn.folder))?;
 
     rdc::cli::sync::embed::sync_no_push(&conn.folder, "main", &ts.token)
         .await
