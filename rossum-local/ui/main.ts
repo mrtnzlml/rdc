@@ -187,7 +187,10 @@ function renderDetail() {
       }
     };
   }
-  // Edit / Remove buttons wired in T20.
+  const editBtn = document.getElementById("edit-creds-btn");
+  if (editBtn) editBtn.onclick = () => openEditCredentialsSheet(c);
+  const removeBtn = document.getElementById("remove-btn");
+  if (removeBtn) removeBtn.onclick = () => openRemoveSheet(c);
 }
 
 function formatLastSync(unix: number | null): string {
@@ -290,6 +293,93 @@ function openAddSheet() {
       await invoke("sync_connection", { connectionId: created.id });
     } catch (e) {
       errBox.innerHTML = `<div class="banner banner-error">${escapeHtml(String(e))}</div>`;
+    }
+  };
+}
+
+function openEditCredentialsSheet(c: ConnectionSummary) {
+  const root = document.getElementById("root")!;
+  const overlay = document.createElement("div");
+  overlay.className = "modal-backdrop";
+  overlay.innerHTML = `
+    <div class="modal">
+      <h3>Edit credentials for ${escapeHtml(c.name)}</h3>
+      <div id="edit-error"></div>
+      <div class="field">
+        <label>Sign in with</label>
+        <select id="edit-auth">
+          <option value="password" ${c.auth_kind === "password" ? "selected" : ""}>Email + password</option>
+          <option value="token" ${c.auth_kind === "token" ? "selected" : ""}>API token</option>
+        </select>
+      </div>
+      <div id="edit-fields"></div>
+      <div class="modal-actions">
+        <button class="btn" id="edit-cancel">Cancel</button>
+        <button class="btn btn-primary" id="edit-save">Save</button>
+      </div>
+    </div>
+  `;
+  root.appendChild(overlay);
+  const authSel = document.getElementById("edit-auth") as HTMLSelectElement;
+  const renderEditFields = () => {
+    const c = document.getElementById("edit-fields")!;
+    if (authSel.value === "token") {
+      c.innerHTML = `<div class="field"><label>New token</label><input id="edit-token" type="password" placeholder="Enter new token" /></div>`;
+    } else {
+      c.innerHTML = `
+        <div class="field"><label>Email</label><input id="edit-username" type="email" /></div>
+        <div class="field"><label>New password</label><input id="edit-password" type="password" placeholder="Enter new password" /></div>
+      `;
+    }
+  };
+  authSel.onchange = renderEditFields;
+  renderEditFields();
+
+  document.getElementById("edit-cancel")!.onclick = () => overlay.remove();
+  document.getElementById("edit-save")!.onclick = async () => {
+    const errBox = document.getElementById("edit-error")!;
+    errBox.innerHTML = "";
+    const input = {
+      connection_id: c.id,
+      auth_kind: authSel.value,
+      token: authSel.value === "token" ? (document.getElementById("edit-token") as HTMLInputElement).value : null,
+      username: authSel.value === "password" ? (document.getElementById("edit-username") as HTMLInputElement).value : null,
+      password: authSel.value === "password" ? (document.getElementById("edit-password") as HTMLInputElement).value : null,
+    };
+    try {
+      await invoke("edit_credentials", { input });
+      overlay.remove();
+      await load();
+    } catch (e) {
+      errBox.innerHTML = `<div class="banner banner-error">${escapeHtml(String(e))}</div>`;
+    }
+  };
+}
+
+function openRemoveSheet(c: ConnectionSummary) {
+  const root = document.getElementById("root")!;
+  const overlay = document.createElement("div");
+  overlay.className = "modal-backdrop";
+  overlay.innerHTML = `
+    <div class="modal">
+      <h3>Remove "${escapeHtml(c.name)}"?</h3>
+      <p>This will delete the local folder (<code>${escapeHtml(c.folder)}</code>) and remove the stored sign-in. Rossum data is not affected.</p>
+      <div class="modal-actions">
+        <button class="btn" id="remove-cancel">Cancel</button>
+        <button class="btn btn-destructive" id="remove-confirm">Remove</button>
+      </div>
+    </div>
+  `;
+  root.appendChild(overlay);
+  document.getElementById("remove-cancel")!.onclick = () => overlay.remove();
+  document.getElementById("remove-confirm")!.onclick = async () => {
+    try {
+      await invoke("remove_connection", { connectionId: c.id });
+      overlay.remove();
+      selectedId = null;
+      await load();
+    } catch (e) {
+      alert(String(e));
     }
   };
 }
