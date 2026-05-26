@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, listenSyncProgress, pickFolder } from "./api";
+import { startWindowDrag, toggleWindowMaximize } from "./window";
 import type { ConnectionSummary, SyncState } from "./types";
 import EmptyState from "./components/EmptyState";
 import Sidebar from "./components/Sidebar";
@@ -72,13 +73,14 @@ export default function App() {
   return (
     <>
       {/* Drag strip across the entire window header zone (48px tall).
-          With titleBarStyle: Overlay there's no system title bar, so we
-          mark this area as draggable via Tauri's data-tauri-drag-region
-          attribute (CSS app-region is Chromium-only — WKWebView ignores
-          it). The sidebar's pt-12 and the detail pane's pt-12 below
-          keep all interactive content out from under the strip. */}
+          With titleBarStyle: Overlay there's no system title bar to
+          grab, so we initiate a window drag manually from this strip's
+          onMouseDown (and toggle maximize on double-click — standard
+          macOS title-bar behavior). The sidebar's pt-12 and the detail
+          pane's pt-12 keep interactive content out from under it. */}
       <div
-        data-tauri-drag-region
+        onMouseDown={startWindowDrag}
+        onDoubleClick={toggleWindowMaximize}
         className="fixed inset-x-0 top-0 z-50 h-12 select-none"
       />
       {connections.length === 0 ? (
