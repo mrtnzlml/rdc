@@ -8,11 +8,17 @@
 
 use crate::discover;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 
 pub struct AppState {
     pub parent: PathBuf,
     pub sync_lock: Mutex<()>,
+    /// Count of in-flight sync_connection invocations. Used to set the
+    /// Dock-icon badge (`set_badge_count`) so the user sees activity
+    /// even when the app is hidden.
+    pub active_syncs: Arc<AtomicUsize>,
 }
 
 impl AppState {
@@ -22,6 +28,7 @@ impl AppState {
         Ok(Self {
             parent,
             sync_lock: Mutex::new(()),
+            active_syncs: Arc::new(AtomicUsize::new(0)),
         })
     }
 }
