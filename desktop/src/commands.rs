@@ -87,6 +87,64 @@ pub fn add_connection(
         .ok_or_else(|| "Connection not found after add".into())
 }
 
+/// Attach an existing rdc project (e.g. one created via `rdc init` in
+/// the CLI) by placing a symlink to it inside the discovery directory.
+/// The scanner then picks it up like any other Connection. The user's
+/// original folder is never moved or copied.
+#[tauri::command]
+pub fn open_existing_project(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<ConnectionSummary, String> {
+    let source = std::path::PathBuf::from(&path);
+    if !source.is_dir() {
+        return Err(format!("Not a folder: {}", source.display()));
+    }
+    let rdc_toml = source.join("rdc.toml");
+    if !rdc_toml.exists() {
+        return Err(format!(
+            "{} doesn't look like an rdc project (no rdc.toml). Run `rdc init` there first.",
+            source.display()
+        ));
+    }
+    // Confirm it has a `[envs.main]` env — the only shape the desktop
+    // app understands. Multi-env projects from the CLI use other env
+    // names; we leave those to the CLI.
+    let body = std::fs::read_to_string(&rdc_toml).map_err(|e| format!("reading rdc.toml: {e}"))?;
+    if !body.contains("[envs.main]") {
+        return Err(format!(
+            "{} has no [envs.main] section; only single-env projects named `main` are supported.",
+            rdc_toml.display()
+        ));
+    }
+
+    let name = source
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or("Folder name is not valid UTF-8")?;
+    let link = state.parent.join(name);
+    if link.exists() {
+        // If the existing entry already points at the same source, treat
+        // this as a no-op success — let the user re-open without error.
+        if let Ok(target) = std::fs::read_link(&link) {
+            if target == source {
+                return discover::find(&state.parent, name)
+                    .as_ref()
+                    .map(ConnectionSummary::from)
+                    .ok_or_else(|| "Existing entry but not discoverable".into());
+            }
+        }
+        return Err(format!(
+            "A Connection named '{name}' already exists. Rename the source folder or remove the existing Connection first."
+        ));
+    }
+    std::os::unix::fs::symlink(&source, &link).map_err(|e| format!("creating symlink: {e}"))?;
+    discover::find(&state.parent, name)
+        .as_ref()
+        .map(ConnectionSummary::from)
+        .ok_or_else(|| "Symlinked, but not discoverable afterwards".into())
+}
+
 #[derive(Serialize, Clone)]
 pub struct SyncProgress {
     pub connection_id: String,

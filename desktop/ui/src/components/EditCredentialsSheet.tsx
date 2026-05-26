@@ -1,6 +1,9 @@
 import { useState } from "react";
 import { api } from "../api";
 import type { AuthKind, ConnectionSummary } from "../types";
+import Button from "./Button";
+import Modal from "./Modal";
+import Field from "./Field";
 
 type Props = {
   connection: ConnectionSummary;
@@ -35,61 +38,58 @@ export default function EditCredentialsSheet({ connection: c, onCancel, onSaved 
   };
 
   return (
-    <div className="modal-backdrop">
-      <div className="modal">
-        <h3>Edit credentials for {c.name}</h3>
-        {error && <div className="banner banner-error">{error}</div>}
-        <div className="field">
-          <label>Sign in with</label>
-          <select
-            value={authKind}
-            onChange={(e) => setAuthKind(e.target.value as AuthKind)}
-          >
-            <option value="password">Email + password</option>
-            <option value="token">API token</option>
-          </select>
+    <Modal title={`Edit credentials for ${c.name}`}>
+      {error && (
+        <div className="mb-4 rounded-xl border border-error/30 bg-error/10 px-4 py-3 text-error">
+          {error}
         </div>
-        {authKind === "token" ? (
-          <div className="field">
-            <label>New token</label>
+      )}
+      <Field label="Sign in with">
+        <select
+          value={authKind}
+          onChange={(e) => setAuthKind(e.target.value as AuthKind)}
+        >
+          <option value="password">Email + password</option>
+          <option value="token">API token</option>
+        </select>
+      </Field>
+      {authKind === "token" ? (
+        <Field label="New token">
+          <input
+            type="password"
+            placeholder="Enter new token"
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            autoFocus
+          />
+        </Field>
+      ) : (
+        <>
+          <Field label="Email">
+            <input
+              type="email"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+            />
+          </Field>
+          <Field label="New password">
             <input
               type="password"
-              placeholder="Enter new token"
-              value={token}
-              onChange={(e) => setToken(e.target.value)}
-              autoFocus
+              placeholder="Enter new password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
             />
-          </div>
-        ) : (
-          <>
-            <div className="field">
-              <label>Email</label>
-              <input
-                type="email"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-              />
-            </div>
-            <div className="field">
-              <label>New password</label>
-              <input
-                type="password"
-                placeholder="Enter new password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-              />
-            </div>
-          </>
-        )}
-        <div className="modal-actions">
-          <button className="btn" onClick={onCancel} disabled={busy}>
-            Cancel
-          </button>
-          <button className="btn btn-primary" onClick={submit} disabled={busy}>
-            {busy ? "Saving…" : "Save"}
-          </button>
-        </div>
+          </Field>
+        </>
+      )}
+      <div className="mt-4 flex justify-end gap-2">
+        <Button onClick={onCancel} disabled={busy}>
+          Cancel
+        </Button>
+        <Button variant="primary" onClick={submit} disabled={busy}>
+          {busy ? "Saving…" : "Save"}
+        </Button>
       </div>
-    </div>
+    </Modal>
   );
 }

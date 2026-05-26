@@ -1,31 +1,51 @@
 import type { ConnectionSummary } from "../types";
+import Button from "./Button";
 
 type Props = {
   connections: ConnectionSummary[];
   selectedId: string | null;
   onSelect: (id: string) => void;
   onAdd: () => void;
+  onOpenExisting: () => void;
 };
 
-export default function Sidebar({ connections, selectedId, onSelect, onAdd }: Props) {
+export default function Sidebar({
+  connections,
+  selectedId,
+  onSelect,
+  onAdd,
+  onOpenExisting,
+}: Props) {
   return (
-    <aside className="sidebar">
-      <div className="sidebar-header">Connections</div>
-      <div className="sidebar-list">
-        {connections.map((c) => (
-          <div
-            key={c.id}
-            className={`sidebar-row${c.id === selectedId ? " selected" : ""}`}
-            onClick={() => onSelect(c.id)}
-          >
-            {c.name}
-          </div>
-        ))}
+    <aside className="flex flex-col border-r border-border-subtle bg-bg-sidebar/80 backdrop-blur-xl">
+      <div className="px-4 pb-1 pt-12 text-[11px] font-semibold uppercase tracking-wider text-fg-muted">
+        Connections
       </div>
-      <div className="sidebar-add">
-        <button className="btn" onClick={onAdd}>
+      <div className="flex-1 overflow-y-auto px-2 py-1">
+        {connections.map((c) => {
+          const selected = c.id === selectedId;
+          return (
+            <div
+              key={c.id}
+              className={`mb-0.5 cursor-pointer rounded-lg px-3 py-1.5 text-[13px] transition-colors ${
+                selected
+                  ? "bg-row-selected font-medium text-fg"
+                  : "hover:bg-row-hover"
+              }`}
+              onClick={() => onSelect(c.id)}
+            >
+              {c.name}
+            </div>
+          );
+        })}
+      </div>
+      <div className="flex flex-col gap-1.5 border-t border-border-subtle px-3 py-3">
+        <Button onClick={onAdd} className="w-full">
           + Add Connection
-        </button>
+        </Button>
+        <Button variant="link" onClick={onOpenExisting} className="self-center">
+          Open existing…
+        </Button>
       </div>
     </aside>
   );
