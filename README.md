@@ -38,6 +38,15 @@ cargo install --git https://github.com/mrtnzlml/rdc
 
 Supported pre-built platforms: macOS (Intel + Apple Silicon), Linux x86_64, Windows x86_64. For Linux aarch64 / Windows aarch64 / other, build from source.
 
+## Desktop app (macOS)
+
+For non-developers: **Rossum Local** is a signed macOS app that pulls Rossum orgs locally so [Claude](https://claude.ai) can read them — no terminal, no git.
+
+- Download: [latest release](https://github.com/mrtnzlml/rdc/releases?q=desktop&expanded=true)
+- Source: `rossum-local/` in this repo.
+
+The app is a thin GUI over the same `rdc` engine. Pull-only in v1; the folder it produces is identical to what `rdc init && rdc sync main` creates.
+
 ## Quick start
 
 ```sh
