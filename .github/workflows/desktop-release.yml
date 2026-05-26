@@ -1,0 +1,104 @@
+# Build and release the macOS desktop app on `desktop-v*` tags.
+#
+# Required GitHub repository secrets (Settings → Secrets and variables → Actions):
+#
+#   APPLE_CERTIFICATE              base64-encoded .p12 of the Developer ID Application cert
+#   APPLE_CERTIFICATE_PASSWORD     unlock password for the .p12
+#   APPLE_SIGNING_IDENTITY         e.g. "Developer ID Application: Rossum AG (TEAMID)"
+#   APPLE_ID                       Apple ID with App Store Connect access
+#   APPLE_TEAM_ID                  10-character team id
+#   APPLE_APP_SPECIFIC_PASSWORD    app-specific password for notarytool
+#   TAURI_SIGNING_PRIVATE_KEY      contents of ~/.tauri/rossum-local.key (Ed25519 updater key)
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD   passphrase for the Ed25519 key (empty if none)
+#
+# These secrets are required before the workflow can produce a notarized DMG.
+# Until they're configured, manual `desktop-v*` tags will fail the workflow.
+
+name: Desktop release
+
+on:
+  push:
+    tags:
+      - "desktop-v*"
+
+jobs:
+  build:
+    runs-on: macos-14
+    environment: desktop-release
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version "^2.0.0" --locked
+
+      - name: Install Node + TypeScript
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Import Apple Developer ID certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          echo "$APPLE_CERTIFICATE" | base64 --decode > $RUNNER_TEMP/cert.p12
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security import $RUNNER_TEMP/cert.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
+          security list-keychains -d user -s build.keychain $(security list-keychains -d user | tr -d \")
+
+      - name: Build, sign, notarize, staple
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          cd rossum-local
+          cargo tauri build --target universal-apple-darwin
+
+      - name: Generate latest.json for updater feed
+        run: |
+          VERSION=${GITHUB_REF_NAME#desktop-v}
+          DMG=$(ls rossum-local/target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          SIG=$(cat $DMG.sig)
+          cat > rossum-local-latest.json <<EOF
+          {
+            "version": "$VERSION",
+            "notes": "See https://github.com/mrtnzlml/rdc/releases/tag/$GITHUB_REF_NAME",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "darwin-aarch64": {
+                "signature": "$SIG",
+                "url": "https://github.com/mrtnzlml/rdc/releases/download/$GITHUB_REF_NAME/$(basename $DMG)"
+              },
+              "darwin-x86_64": {
+                "signature": "$SIG",
+                "url": "https://github.com/mrtnzlml/rdc/releases/download/$GITHUB_REF_NAME/$(basename $DMG)"
+              }
+            }
+          }
+          EOF
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rossum-local/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            rossum-local/target/universal-apple-darwin/release/bundle/dmg/*.dmg.sig
+            rossum-local-latest.json
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
