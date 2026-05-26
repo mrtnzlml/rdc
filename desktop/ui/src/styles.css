@@ -15,10 +15,17 @@
   --color-bg-input: #ffffff;
   --color-fg: #1d1d1f;
   --color-fg-muted: #6e6e73;
-  /* `AccentColor` / `AccentColorText` are CSS Color 4 system colors that
-     WebKit on macOS resolves from the user's System Settings → Appearance
-     → Accent color choice. Updates live when the user changes it.
-     `color-mix` produces the soft tint used for focus rings. */
+  /* `AccentColor` is a CSS Color 4 system color that WebKit on macOS
+     resolves from System Settings → Appearance → Accent color. Updates
+     live when the user changes it. `color-mix` produces the soft tint
+     used for focus rings.
+
+     `--color-accent-fg` defaults to `AccentColorText` (the system-paired
+     foreground), but WebKit's implementation is inconsistent — it often
+     returns white regardless of accent luminance, leaving white-on-yellow
+     unreadable. The :root override below uses CSS Color 5 relative-color
+     syntax to compute a true contrast: extract AccentColor's OKLCH L,
+     threshold around 0.65, output pure white or pure black. */
   --color-accent: AccentColor;
   --color-accent-soft: color-mix(in srgb, AccentColor 20%, transparent);
   --color-accent-fg: AccentColorText;
@@ -36,6 +43,15 @@
 
   --shadow-sheet: 0 20px 50px -10px rgb(0 0 0 / 0.25), 0 8px 16px -8px rgb(0 0 0 / 0.15);
   --shadow-button: 0 1px 0 rgb(0 0 0 / 0.05), 0 1px 2px rgb(0 0 0 / 0.06);
+}
+
+/* Smart contrast for button text on AccentColor. If WebKit doesn't
+   support oklch relative-color syntax (Safari < 18), this rule's value
+   parses as invalid and the @theme default (AccentColorText) is used. */
+:root {
+  --color-accent-fg: oklch(
+    from AccentColor clamp(0, (0.65 - l) * 100, 1) 0 0
+  );
 }
 
 @media (prefers-color-scheme: dark) {
