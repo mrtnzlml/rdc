@@ -92,10 +92,12 @@ pub struct AddConnectionInput {
 /// token to store (either the user-pasted token or the token issued by
 /// `/auth/login` for password mode). Errors are user-facing English
 /// messages.
+///
+/// `api_base` must already be normalized (via `normalize_api_base`).
 pub async fn validate_add_input_against_rossum(
     input: &AddConnectionInput,
+    api_base: &str,
 ) -> Result<String, String> {
-    let api_base_raw = input.api_base.trim_end_matches('/');
     let token = match input.auth_kind.as_str() {
         "token" => input
             .token
@@ -110,14 +112,14 @@ pub async fn validate_add_input_against_rossum(
                 .password
                 .clone()
                 .ok_or_else(|| "Password is required.".to_string())?;
-            auth::login(api_base_raw, &u, &p)
+            auth::login(api_base, &u, &p)
                 .await
                 .map_err(|e| e.to_string())?
         }
         other => return Err(format!("Unknown auth_kind '{other}'.")),
     };
 
-    let url = format!("{}/organizations/{}", api_base_raw, input.org_id);
+    let url = format!("{}/organizations/{}", api_base, input.org_id);
     let resp = reqwest::Client::new()
         .get(&url)
         .bearer_auth(&token)
@@ -138,7 +140,7 @@ pub async fn add_connection(
     input: AddConnectionInput,
 ) -> Result<ConnectionSummary, String> {
     let api_base = normalize_api_base(&input.api_base).map_err(|e| e.to_string())?;
-    let token = validate_add_input_against_rossum(&input).await?;
+    let token = validate_add_input_against_rossum(&input, &api_base).await?;
 
     let mut reg = state.registry.lock().await;
     let used = reg.used_slugs();
