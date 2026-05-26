@@ -6,3 +6,4 @@ pub mod rdc_toml;
 pub mod registry;
 pub mod settings;
 pub mod slug;
+pub mod sync;
