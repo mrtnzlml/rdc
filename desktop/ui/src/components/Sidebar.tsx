@@ -1,5 +1,8 @@
+import { useState } from "react";
+import { FolderOpen, KeyRound, RefreshCw, Trash2 } from "lucide-react";
 import type { ConnectionSummary } from "../types";
 import Button from "./Button";
+import ContextMenu from "./ContextMenu";
 import { startWindowDrag, toggleWindowMaximize } from "../window";
 
 type Props = {
@@ -8,7 +11,13 @@ type Props = {
   onSelect: (id: string) => void;
   onAdd: () => void;
   onOpenExisting: () => void;
+  onSyncConnection: (id: string) => void;
+  onRevealConnection: (folder: string) => void;
+  onEditConnection: (c: ConnectionSummary) => void;
+  onRemoveConnection: (c: ConnectionSummary) => void;
 };
+
+type ContextState = { connection: ConnectionSummary; x: number; y: number };
 
 export default function Sidebar({
   connections,
@@ -16,9 +25,15 @@ export default function Sidebar({
   onSelect,
   onAdd,
   onOpenExisting,
+  onSyncConnection,
+  onRevealConnection,
+  onEditConnection,
+  onRemoveConnection,
 }: Props) {
+  const [ctx, setCtx] = useState<ContextState | null>(null);
+
   return (
-    <aside className="flex flex-col border-r border-border-subtle/50">
+    <aside className="flex flex-col border-r border-border-subtle/50 bg-bg-sidebar/55">
       <div
         onMouseDown={startWindowDrag}
         onDoubleClick={toggleWindowMaximize}
@@ -38,13 +53,18 @@ export default function Sidebar({
                   : "hover:bg-row-hover"
               }`}
               onClick={() => onSelect(c.id)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                onSelect(c.id);
+                setCtx({ connection: c, x: e.clientX, y: e.clientY });
+              }}
             >
               {c.name}
             </div>
           );
         })}
       </div>
-      <div className="flex flex-col gap-1.5 border-t border-border-subtle px-3 py-3">
+      <div className="flex flex-col gap-1.5 border-t border-border-subtle/50 px-3 py-3">
         <Button onClick={onAdd} className="w-full">
           + Add Connection
         </Button>
@@ -52,6 +72,38 @@ export default function Sidebar({
           Open existing…
         </Button>
       </div>
+
+      {ctx && (
+        <ContextMenu
+          x={ctx.x}
+          y={ctx.y}
+          onClose={() => setCtx(null)}
+          items={[
+            {
+              label: "Sync now",
+              icon: <RefreshCw size={14} strokeWidth={2} />,
+              onClick: () => onSyncConnection(ctx.connection.id),
+            },
+            {
+              label: "Reveal in Finder",
+              icon: <FolderOpen size={14} strokeWidth={2} />,
+              onClick: () => onRevealConnection(ctx.connection.folder),
+            },
+            { separator: true },
+            {
+              label: "Edit credentials…",
+              icon: <KeyRound size={14} strokeWidth={2} />,
+              onClick: () => onEditConnection(ctx.connection),
+            },
+            {
+              label: "Remove…",
+              icon: <Trash2 size={14} strokeWidth={2} />,
+              onClick: () => onRemoveConnection(ctx.connection),
+              destructive: true,
+            },
+          ]}
+        />
+      )}
     </aside>
   );
 }

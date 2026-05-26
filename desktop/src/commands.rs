@@ -9,7 +9,9 @@ use crate::discover::{self, AuthKind, Connection};
 use crate::state::AppState;
 use crate::{folder, sync};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use std::sync::atomic::Ordering;
+use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_notification::NotificationExt;
 
 #[derive(Serialize)]
 pub struct ConnectionSummary {
@@ -178,6 +180,13 @@ pub async fn sync_connection(
     let folder = conn.folder.clone();
     let api_base = conn.api_base.clone();
     let org_id = conn.org_id;
+    let name = conn.name().to_string();
+    let active_syncs = state.active_syncs.clone();
+
+    // Increment the active-sync counter + update the Dock badge.
+    let count = active_syncs.fetch_add(1, Ordering::SeqCst) + 1;
+    set_dock_badge(&app, Some(count as i64));
+
     // rdc's sync graph uses `!Send` types (e.g. StdinLock held across
     // await points) so we can't await it directly on the Tauri runtime
     // worker thread. Spawn a single-threaded runtime on a blocking
@@ -188,21 +197,43 @@ pub async fn sync_connection(
             .build()
             .expect("build rt");
         let outcome = rt.block_on(sync::run_sync(&folder, &api_base, org_id));
-        let progress = match outcome {
-            Ok(file_count) => SyncProgress {
-                connection_id: id,
-                phase: "done".into(),
-                message: None,
-                file_count: Some(file_count),
-            },
-            Err(e) => SyncProgress {
-                connection_id: id,
-                phase: "error".into(),
-                message: Some(format!("{e:#}")),
-                file_count: None,
-            },
+
+        // Counter down + badge update.
+        let remaining = active_syncs.fetch_sub(1, Ordering::SeqCst).saturating_sub(1);
+        set_dock_badge(
+            &app2,
+            if remaining == 0 { None } else { Some(remaining as i64) },
+        );
+
+        let (progress, notification_title, notification_body) = match &outcome {
+            Ok(file_count) => (
+                SyncProgress {
+                    connection_id: id.clone(),
+                    phase: "done".into(),
+                    message: None,
+                    file_count: Some(*file_count),
+                },
+                "Sync complete".to_string(),
+                format!("{name} · {file_count} files"),
+            ),
+            Err(e) => (
+                SyncProgress {
+                    connection_id: id.clone(),
+                    phase: "error".into(),
+                    message: Some(format!("{e:#}")),
+                    file_count: None,
+                },
+                "Sync failed".to_string(),
+                format!("{name} · {e:#}"),
+            ),
         };
         let _ = app2.emit("sync-progress", progress);
+        let _ = app2
+            .notification()
+            .builder()
+            .title(&notification_title)
+            .body(&notification_body)
+            .show();
     });
 
     // Sync lock isn't strictly enforced here in v0.1 — rdc's env lock
@@ -213,6 +244,16 @@ pub async fn sync_connection(
     let _ = &state.sync_lock;
     Ok(())
 }
+
+#[cfg(target_os = "macos")]
+fn set_dock_badge(app: &AppHandle, count: Option<i64>) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.set_badge_count(count);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_dock_badge(_app: &AppHandle, _count: Option<i64>) {}
 
 #[derive(Deserialize)]
 pub struct EditCredentialsInput {
