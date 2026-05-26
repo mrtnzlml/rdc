@@ -38,9 +38,10 @@ cargo install --git https://github.com/mrtnzlml/rdc
 
 Supported pre-built platforms: macOS (Intel + Apple Silicon), Linux x86_64, Windows x86_64. For Linux aarch64 / Windows aarch64 / other, build from source.
 
-## Desktop app (macOS) — WIP
+## Desktop app (macOS)
 
-Work in progress. Not ready for use.
+> [!WARNING]
+> Work in progress. Not ready for use.
 
 ## Quick start
 
