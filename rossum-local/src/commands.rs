@@ -2,10 +2,11 @@ use crate::auth;
 use crate::connection::{AuthKind, Connection, ConnectionStatus};
 use crate::keychain::{Keychain, TokenEntry};
 use crate::state::AppState;
+use crate::sync::{run_sync, SyncError};
 use crate::url_normalize::normalize_api_base;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 use ulid::Ulid;
 
 #[derive(Serialize)]
@@ -212,4 +213,110 @@ fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[derive(Serialize, Clone)]
+pub struct SyncProgress {
+    pub connection_id: String,
+    pub phase: String, // "started" | "done" | "error"
+    pub message: Option<String>,
+    pub file_count: Option<u64>,
+}
+
+#[tauri::command]
+pub async fn sync_connection(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+) -> Result<(), String> {
+    let id: Ulid = connection_id
+        .parse()
+        .map_err(|_| "Bad connection id".to_string())?;
+    let conn = state
+        .registry
+        .lock()
+        .await
+        .get(id)
+        .cloned()
+        .ok_or_else(|| "Connection not found".to_string())?;
+
+    let kc = state.keychain.clone();
+    let registry_arc = state.registry.clone();
+    let registry_path = state.registry_path.clone();
+    let diag = state.diag.clone();
+
+    let _ = app.emit(
+        "sync-progress",
+        SyncProgress {
+            connection_id: id.to_string(),
+            phase: "started".into(),
+            message: None,
+            file_count: None,
+        },
+    );
+    diag.push(format!("sync start: {}", conn.name));
+
+    let app2 = app.clone();
+    let conn2 = conn.clone();
+
+    state
+        .queue
+        .submit(id, async move {
+            // run_sync is !Send (rdc internals hold StdinLock across
+            // await points). Offload to a blocking thread that runs its
+            // own mini async executor so we stay on the SyncQueue's
+            // Send + 'static contract.
+            let kc2 = kc.clone();
+            let conn3 = conn2.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build rt")
+                    .block_on(run_sync(&conn3, &*kc2))
+            })
+            .await
+            .unwrap_or_else(|e| Err(SyncError::Other(format!("task panicked: {e}"))));
+
+            // Update registry with outcome.
+            let mut reg = registry_arc.lock().await;
+            let mut new_conn = conn2.clone();
+            match &result {
+                Ok(outcome) => {
+                    new_conn.last_sync_unix = Some(now_unix());
+                    new_conn.last_status = ConnectionStatus::Ok;
+                    new_conn.file_count = outcome.file_count;
+                    diag.push(format!(
+                        "sync done: {} ({} files)",
+                        conn2.name, outcome.file_count
+                    ));
+                }
+                Err(e) => {
+                    new_conn.last_status = ConnectionStatus::Error(format!("{e}"));
+                    diag.push(format!("sync error: {}: {}", conn2.name, e));
+                }
+            }
+            reg.upsert(new_conn);
+            let _ = reg.save(&registry_path);
+            drop(reg);
+
+            let progress = match &result {
+                Ok(o) => SyncProgress {
+                    connection_id: id.to_string(),
+                    phase: "done".into(),
+                    message: None,
+                    file_count: Some(o.file_count),
+                },
+                Err(e) => SyncProgress {
+                    connection_id: id.to_string(),
+                    phase: "error".into(),
+                    message: Some(format!("{e}")),
+                    file_count: None,
+                },
+            };
+            let _ = app2.emit("sync-progress", progress);
+        })
+        .map_err(|e| format!("{e:#}"))?;
+
+    Ok(())
 }
