@@ -55,3 +55,10 @@ opt-level = 3
 # than a silent warning. Applies to lib, bin, tests, and examples.
 [lints.rust]
 dead_code = "deny"
+
+[workspace]
+members = [".", "rossum-local"]
+
+[workspace.package]
+edition = "2024"
+license = "WTFPL"
