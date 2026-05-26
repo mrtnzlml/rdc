@@ -53,16 +53,35 @@ impl Action {
 
 /// Color category for an action. Drives which `colorize_*` helper paints
 /// the action column.
+///
+/// The five buckets carry distinct semantics:
+/// - `Accent`: lifecycle / command boundaries (bold amber, the Rossum
+///   brand color).
+/// - `Read`: anything that fetches state without mutating the remote
+///   (light/sage green, non-bold).
+/// - `Write`: anything that mutates the remote (bold sage green —
+///   paired hue with `Read`, brighter weight to signal the side
+///   effect).
+/// - `Destructive`: irreversible mutations (bold red). Same hue as
+///   `Error`, but the action text — `delete` vs `fail` — makes the
+///   meaning unambiguous.
+/// - `Success` / `Warn` / `Error` / `Dim`: disposition.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum ActionColor { Accent, Success, Warn, Error, Dim }
+enum ActionColor { Accent, Read, Write, Destructive, Success, Warn, Error, Dim }
 
 impl Action {
     fn color(self) -> ActionColor {
         match self {
-            Action::Sync | Action::Deploy | Action::Pull | Action::Push
-            | Action::Diff | Action::Auth | Action::Init | Action::Repair
-            | Action::Upgr | Action::Plan | Action::List | Action::Watch
-            | Action::Post | Action::Patch | Action::Delete           => ActionColor::Accent,
+            // Lifecycle / command boundaries (bold amber).
+            Action::Sync | Action::Deploy | Action::Auth | Action::Init
+            | Action::Repair | Action::Upgr | Action::Watch              => ActionColor::Accent,
+            // Network reads + local read-only computations (light green).
+            Action::Pull | Action::List | Action::Diff | Action::Plan    => ActionColor::Read,
+            // Remote mutations: the per-resource events and the push
+            // umbrella phase that issues them (bold green).
+            Action::Push | Action::Post | Action::Patch                  => ActionColor::Write,
+            // Irreversible mutations (bold red).
+            Action::Delete                                                => ActionColor::Destructive,
             Action::Done                                                 => ActionColor::Success,
             Action::Warn | Action::Retry                                 => ActionColor::Warn,
             Action::Fail                                                 => ActionColor::Error,
@@ -87,6 +106,35 @@ mod action_tests {
         ];
         for v in variants {
             assert_eq!(v.pad().len(), 6, "{v:?} pad is not 6 chars: {:?}", v.pad());
+        }
+    }
+
+    #[test]
+    fn action_color_buckets_per_user_spec() {
+        // Lifecycle / command boundaries -> bold amber.
+        for a in [
+            Action::Sync, Action::Deploy, Action::Auth, Action::Init,
+            Action::Repair, Action::Upgr, Action::Watch,
+        ] {
+            assert_eq!(a.color(), ActionColor::Accent, "{a:?} should be Accent");
+        }
+        // Reads (network + local read-only) -> light green.
+        for a in [Action::Pull, Action::List, Action::Diff, Action::Plan] {
+            assert_eq!(a.color(), ActionColor::Read, "{a:?} should be Read");
+        }
+        // Writes -> bold green.
+        for a in [Action::Push, Action::Post, Action::Patch] {
+            assert_eq!(a.color(), ActionColor::Write, "{a:?} should be Write");
+        }
+        // Destructive -> bold red.
+        assert_eq!(Action::Delete.color(), ActionColor::Destructive);
+        // Disposition unchanged.
+        assert_eq!(Action::Done.color(), ActionColor::Success);
+        assert_eq!(Action::Warn.color(), ActionColor::Warn);
+        assert_eq!(Action::Retry.color(), ActionColor::Warn);
+        assert_eq!(Action::Fail.color(), ActionColor::Error);
+        for a in [Action::Skip, Action::Info, Action::Tick, Action::Idle] {
+            assert_eq!(a.color(), ActionColor::Dim, "{a:?} should be Dim");
         }
     }
 
@@ -242,15 +290,25 @@ impl Log {
     }
 
     fn render_line(&self, action: Action, body: &str) -> String {
-        use crate::cli::resolve::{colorize_dim, colorize_error, colorize_header, colorize_success, colorize_warning};
+        use crate::cli::resolve::{
+            colorize_dim, colorize_error, colorize_final_ok, colorize_header, colorize_success,
+            colorize_warning,
+        };
         let time = self.now_string();
         let raw_pad = action.pad();
         let action_col = match action.color() {
-            ActionColor::Accent  => colorize_header(raw_pad, self.color),
-            ActionColor::Success => colorize_success(raw_pad, self.color),
-            ActionColor::Warn    => colorize_warning(raw_pad, self.color),
-            ActionColor::Error   => colorize_error(raw_pad, self.color),
-            ActionColor::Dim     => colorize_dim(raw_pad, self.color),
+            // bold amber
+            ActionColor::Accent      => colorize_header(raw_pad, self.color),
+            // light/sage green (non-bold), shared with Success disposition
+            ActionColor::Read        => colorize_success(raw_pad, self.color),
+            // bold sage green — paired with Read but visibly louder
+            ActionColor::Write       => colorize_final_ok(raw_pad, self.color),
+            // bold red, same hue as Error (text disambiguates)
+            ActionColor::Destructive => colorize_error(raw_pad, self.color),
+            ActionColor::Success     => colorize_success(raw_pad, self.color),
+            ActionColor::Warn        => colorize_warning(raw_pad, self.color),
+            ActionColor::Error       => colorize_error(raw_pad, self.color),
+            ActionColor::Dim         => colorize_dim(raw_pad, self.color),
         };
         let time_col = colorize_dim(&time, self.color);
         format!("{time_col} {action_col} {body}")
