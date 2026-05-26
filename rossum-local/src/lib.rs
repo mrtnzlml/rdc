@@ -1,1 +1,3 @@
-// Module skeleton. Each module is filled in by subsequent tasks.
+pub mod connection;
+pub mod paths;
+pub mod registry;
