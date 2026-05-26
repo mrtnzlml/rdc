@@ -15,6 +15,7 @@ fn settings_roundtrip() {
     let loaded = Settings::load(&path).unwrap();
     assert_eq!(loaded.default_folder_parent, s.default_folder_parent);
     assert_eq!(loaded.update_channel, UpdateChannel::Stable);
+    assert_eq!(loaded.version, 1);
 }
 
 #[test]
