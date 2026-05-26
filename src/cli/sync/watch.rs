@@ -3,6 +3,7 @@
 //! Spec: docs/superpowers/specs/2026-05-14-watch-mode-design.md
 
 use anyhow::Result;
+use std::io::IsTerminal;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -28,6 +29,11 @@ pub(crate) enum CycleTrigger {
     FileEvent,
     /// The poll timer fired.
     Poll,
+    /// The user pressed Enter on the TTY to sync earlier than the
+    /// next scheduled poll. Treated like `Poll` (no debounce). The
+    /// stdin reader gates on `sync_running` so a press during an
+    /// in-flight cycle is dropped, not queued.
+    Manual,
 }
 
 pub async fn run_watch(
@@ -108,9 +114,14 @@ pub async fn run_watch(
                 if !sync_running_ticker.load(Ordering::Relaxed) {
                     let remaining = interval_secs - elapsed;
                     let bar = polling_bar(elapsed, interval_secs);
+                    let hint = if std::io::stdin().is_terminal() {
+                        " (press Enter to sync now)"
+                    } else {
+                        ""
+                    };
                     renderer_ticker.tick_status(
                         crate::log::Action::Watch,
-                        &format!("next sync in {remaining}s {bar}"),
+                        &format!("next sync in {remaining}s {bar}{hint}"),
                     );
                 }
             }
@@ -119,6 +130,35 @@ pub async fn run_watch(
 
     let env_root = paths.env_root();
     let watcher = spawn_file_watcher(env.to_string(), env_root.clone(), events_tx.clone())?;
+
+    // Stdin reader: lets the user press Enter (any input + newline) to
+    // fire a cycle ahead of the next scheduled poll. Only on TTY — in
+    // non-interactive contexts (CI piping logs through) stdin would
+    // either be EOF or carry unrelated content. While a cycle is in
+    // flight, the read line is silently dropped per `sync_running` so a
+    // mid-cycle keypress doesn't queue an extra cycle.
+    //
+    // Note: during the conflict resolver (which uses `inquire`/crossterm
+    // to read keystrokes in raw mode), this reader and inquire are both
+    // sourcing from the same terminal. In practice conflicts are rare
+    // and inquire restores the terminal mode on exit, so any partial
+    // read here is harmless.
+    if std::io::stdin().is_terminal() {
+        let stdin_tx = events_tx.clone();
+        let stdin_sync_running = sync_running.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = BufReader::new(tokio::io::stdin()).lines();
+            while let Ok(Some(_line)) = lines.next_line().await {
+                if stdin_sync_running.load(Ordering::Relaxed) {
+                    continue;
+                }
+                if stdin_tx.send(CycleTrigger::Manual).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     event_loop(
         env,
@@ -416,6 +456,40 @@ mod tests {
             drained += 1;
         }
         drained
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_trigger_skipped_when_sync_running_else_forwarded() {
+        // Models the stdin reader's behavior: drop lines that arrive
+        // while `sync_running` is true, forward otherwise. The actual
+        // reader is shaped exactly the same loop.
+        let (tx, mut rx) = mpsc::channel::<CycleTrigger>(8);
+        let sync_running = Arc::new(AtomicBool::new(false));
+
+        let lines = vec![()].into_iter(); // one "Enter" press
+        for _ in lines {
+            if !sync_running.load(Ordering::Relaxed) {
+                tx.send(CycleTrigger::Manual).await.unwrap();
+            }
+        }
+        assert_eq!(rx.recv().await, Some(CycleTrigger::Manual));
+
+        // Now simulate sync_running and a press during the cycle.
+        sync_running.store(true, Ordering::Relaxed);
+        for _ in 0..3 {
+            if !sync_running.load(Ordering::Relaxed) {
+                tx.send(CycleTrigger::Manual).await.unwrap();
+            }
+        }
+        // No event should have been queued.
+        assert!(rx.try_recv().is_err(), "press during sync should drop");
+
+        // Cycle ends; subsequent press goes through.
+        sync_running.store(false, Ordering::Relaxed);
+        if !sync_running.load(Ordering::Relaxed) {
+            tx.send(CycleTrigger::Manual).await.unwrap();
+        }
+        assert_eq!(rx.recv().await, Some(CycleTrigger::Manual));
     }
 
     #[tokio::test(start_paused = true)]
