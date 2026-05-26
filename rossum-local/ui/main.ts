@@ -1,7 +1,11 @@
 declare const __TAURI__: {
   core: { invoke: <T>(cmd: string, args?: unknown) => Promise<T> };
+  event: {
+    listen: <T>(event: string, handler: (event: { payload: T }) => void) => Promise<() => void>;
+  };
 };
 const invoke = __TAURI__.core.invoke;
+const listen = __TAURI__.event.listen;
 
 interface ConnectionSummary {
   id: string;
@@ -17,6 +21,39 @@ interface ConnectionSummary {
   file_count: number;
 }
 
+interface SyncProgressEvent {
+  connection_id: string;
+  phase: "started" | "done" | "error";
+  message: string | null;
+  file_count: number | null;
+}
+
+const syncState = new Map<string, "idle" | "running" | "error">();
+
+async function setupEventListener() {
+  await listen<SyncProgressEvent>("sync-progress", (e) => {
+    const p = e.payload;
+    if (p.phase === "started") {
+      syncState.set(p.connection_id, "running");
+    } else if (p.phase === "done") {
+      syncState.set(p.connection_id, "idle");
+      // Refresh from backend so last_sync_unix/file_count update.
+      void load();
+      return;
+    } else if (p.phase === "error") {
+      syncState.set(p.connection_id, "error");
+      const c = connections.find((c) => c.id === p.connection_id);
+      if (c) {
+        c.last_status = "error";
+        c.last_status_message = p.message ?? "Sync failed";
+      }
+    }
+    if (selectedId === p.connection_id) renderDetail();
+  });
+}
+
+let listenerAttached = false;
+
 let connections: ConnectionSummary[] = [];
 let selectedId: string | null = null;
 
@@ -24,6 +61,10 @@ async function load() {
   connections = await invoke<ConnectionSummary[]>("list_connections");
   if (connections.length > 0 && !selectedId) {
     selectedId = connections[0].id;
+  }
+  if (!listenerAttached) {
+    await setupEventListener();
+    listenerAttached = true;
   }
   render();
 }
@@ -85,19 +126,42 @@ function renderDetail() {
     detail.innerHTML = "";
     return;
   }
+  const state = syncState.get(c.id) ?? "idle";
   detail.innerHTML = `
     <h2>${escapeHtml(c.name)}</h2>
     <div class="subtitle">${escapeHtml(c.api_base)}</div>
     <div class="row"><span class="label">Last synced</span><span>${formatLastSync(c.last_sync_unix)}</span></div>
     <div class="row"><span class="label">Status</span><span class="${statusClass(c.last_status)}">${formatStatus(c)}</span></div>
-    <div class="row"><button class="btn btn-primary" id="sync-btn">Sync now</button></div>
+    ${state === "running"
+      ? `<div class="progress"><div class="progress-bar"></div></div>`
+      : `<div class="row"><button class="btn btn-primary" id="sync-btn">Sync now</button></div>`}
+    ${state === "error" && c.last_status_message
+      ? `<div class="banner banner-error">${escapeHtml(c.last_status_message)}</div>`
+      : ""}
     <div class="row"><span class="label">Folder</span><span>${escapeHtml(c.folder)}</span></div>
     <div class="row">
       <button class="btn" id="reveal-btn">Reveal in Finder</button>
       <button class="btn" id="copy-btn">Copy path</button>
     </div>
+    <div class="row" style="margin-top:32px;">
+      <button class="btn-link" id="edit-creds-btn">Edit credentials</button>
+      <span style="flex:1"></span>
+      <button class="btn btn-destructive" id="remove-btn">Remove…</button>
+    </div>
   `;
-  // Wiring of sync/reveal/copy buttons happens in Task 17/19.
+  const syncBtn = document.getElementById("sync-btn");
+  if (syncBtn) {
+    syncBtn.onclick = async () => {
+      try {
+        await invoke("sync_connection", { connectionId: c.id });
+      } catch (e) {
+        c.last_status = "error";
+        c.last_status_message = String(e);
+        renderDetail();
+      }
+    };
+  }
+  // Reveal / Copy buttons wired in T19; Edit / Remove in T20.
 }
 
 function formatLastSync(unix: number | null): string {
