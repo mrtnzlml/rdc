@@ -745,6 +745,20 @@ If the remote has been modified since the last sync, an inline
 resolver opens — `[k]eep delete` / `[s]kip` / `[a]bort` — so a
 tombstoned delete can't silently overwrite a remote update.
 
+## Redacted fields
+
+To keep git diffs quiet across syncs, rdc replaces a few server-set
+runtime fields with a sentinel string on disk. The key stays visible
+so you (and any agent reading the snapshot) see that the field exists
+in Rossum — only its value is suppressed.
+
+| Kind | Field | Why |
+|---|---|---|
+| queues | `counts` | Per-status document counts. Updates whenever a document moves through review states; the real value is always live in the Rossum UI / API. |
+
+`rdc` strips these fields from outgoing PATCH bodies automatically,
+so the sentinel never reaches the server.
+
 ## Common commands
 
 - `rdc sync <env>` — reconcile local snapshot and remote in one pass;
