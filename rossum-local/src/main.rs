@@ -13,6 +13,7 @@ async fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::list_connections,
             commands::get_settings,
+            commands::add_connection,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Rossum Local");
