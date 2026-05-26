@@ -3,13 +3,21 @@ declare const __TAURI__: {
   event: {
     listen: <T>(event: string, handler: (event: { payload: T }) => void) => Promise<() => void>;
   };
-  shell: { open: (path: string) => Promise<void> };
-  clipboardManager: { writeText: (text: string) => Promise<void> };
 };
 const invoke = __TAURI__.core.invoke;
 const listen = __TAURI__.event.listen;
-const shellOpen = __TAURI__.shell.open;
-const clipWriteText = __TAURI__.clipboardManager.writeText;
+
+// Reveal in Finder: call our own Rust command, which shells out to
+// `open <path>`. Avoids the plugin-globals trap (Tauri 2 doesn't auto-
+// expose `__TAURI__.shell.open` even with `withGlobalTauri: true`).
+async function revealInFinder(path: string): Promise<void> {
+  await invoke("reveal_folder", { path });
+}
+
+// Copy to clipboard: WebView's built-in API. No Tauri plugin needed.
+async function copyToClipboard(text: string): Promise<void> {
+  await navigator.clipboard.writeText(text);
+}
 
 interface ConnectionSummary {
   id: string;
@@ -171,7 +179,7 @@ function renderDetail() {
   if (revealBtn) {
     revealBtn.onclick = async () => {
       try {
-        await shellOpen(c.folder);
+        await revealInFinder(c.folder);
       } catch (e) {
         console.error("reveal failed", e);
       }
@@ -181,7 +189,7 @@ function renderDetail() {
   if (copyBtn) {
     copyBtn.onclick = async () => {
       try {
-        await clipWriteText(c.folder);
+        await copyToClipboard(c.folder);
         copyBtn.textContent = "Copied!";
         setTimeout(() => { copyBtn.textContent = "Copy path"; }, 1200);
       } catch (e) {
@@ -466,7 +474,7 @@ async function openDiagnosticsSheet() {
   root.appendChild(overlay);
   document.getElementById("diag-close")!.onclick = () => overlay.remove();
   document.getElementById("diag-copy")!.onclick = async () => {
-    await clipWriteText(text);
+    await copyToClipboard(text);
     (document.getElementById("diag-copy") as HTMLButtonElement).textContent = "Copied!";
   };
 }

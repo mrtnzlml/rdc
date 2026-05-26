@@ -43,3 +43,22 @@ pub fn trash_folder(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+/// Reveal the given path in the OS file manager. On macOS this opens
+/// the folder in Finder; on Linux/Windows it dispatches via the default
+/// handler. Used by the "Reveal in Finder" UI action — invoked from
+/// JS via the standard `invoke()` surface, no plugin globals required.
+pub fn reveal(path: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(target_os = "linux")]
+    let program = "xdg-open";
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+
+    Command::new(program)
+        .arg(path)
+        .spawn()
+        .with_context(|| format!("spawning {program} {}", path.display()))?;
+    Ok(())
+}
