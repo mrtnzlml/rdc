@@ -23,6 +23,24 @@ fn polling_bar(elapsed: u64, total: u64) -> String {
     bar
 }
 
+/// Paint the in-place "next sync in Ns ▰…" status line. Shared by the
+/// ticker's sleep tick AND its reset path so both paint identical-shaped
+/// lines (only the elapsed/bar differ). TTY check lives inside
+/// `Log::tick_status` so this is safe to call unconditionally on non-TTY.
+fn paint_polling_status(renderer: &crate::log::Log, interval_secs: u64, elapsed: u64) {
+    let remaining = interval_secs.saturating_sub(elapsed);
+    let bar = polling_bar(elapsed, interval_secs);
+    let hint = if std::io::stdin().is_terminal() {
+        " (press Enter to sync now)"
+    } else {
+        ""
+    };
+    renderer.tick_status(
+        crate::log::Action::Watch,
+        &format!("next sync in {remaining}s {bar}{hint}"),
+    );
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CycleTrigger {
     /// A local file changed (after debounce).
@@ -91,38 +109,48 @@ pub async fn run_watch(
     // status drawing. The event_loop flips it true around each cycle.
     let sync_running = Arc::new(AtomicBool::new(false));
 
+    // event_loop fires this after every completed cycle so the ticker's
+    // `elapsed` (and the "next sync in Ns" countdown) restarts from zero.
+    // Without it, Manual/FileEvent triggers don't touch the ticker's
+    // internal clock and the advertised "every Ns" interval drifts to a
+    // uniform-random [0, N] gap after any non-Poll cycle.
+    let timer_reset = Arc::new(tokio::sync::Notify::new());
+
     if let Some(interval_duration) = poll_interval {
         let tx = events_tx.clone();
         let renderer_ticker = renderer.clone();
         let sync_running_ticker = sync_running.clone();
+        let reset_ticker = timer_reset.clone();
         let interval_secs = interval_duration.as_secs().max(1);
         tokio::spawn(async move {
             // Tick every second so the status line counts down and the
-            // four-stage bar advances; emit a Poll trigger every
-            // `interval_secs` ticks.
+            // ten-segment bar advances; emit a Poll trigger every
+            // `interval_secs` ticks. `reset_ticker.notified()` from
+            // event_loop zeroes `elapsed` between sleep ticks so the
+            // countdown restarts at `interval_secs` after every cycle.
             let mut elapsed: u64 = 0;
             loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                elapsed += 1;
-                if elapsed >= interval_secs {
-                    elapsed = 0;
-                    if tx.send(CycleTrigger::Poll).await.is_err() {
-                        break;
+                tokio::select! {
+                    biased;
+                    _ = reset_ticker.notified() => {
+                        elapsed = 0;
+                        if !sync_running_ticker.load(Ordering::Relaxed) {
+                            paint_polling_status(&renderer_ticker, interval_secs, elapsed);
+                        }
                     }
-                    continue;
-                }
-                if !sync_running_ticker.load(Ordering::Relaxed) {
-                    let remaining = interval_secs - elapsed;
-                    let bar = polling_bar(elapsed, interval_secs);
-                    let hint = if std::io::stdin().is_terminal() {
-                        " (press Enter to sync now)"
-                    } else {
-                        ""
-                    };
-                    renderer_ticker.tick_status(
-                        crate::log::Action::Watch,
-                        &format!("next sync in {remaining}s {bar}{hint}"),
-                    );
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        elapsed += 1;
+                        if elapsed >= interval_secs {
+                            elapsed = 0;
+                            if tx.send(CycleTrigger::Poll).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        if !sync_running_ticker.load(Ordering::Relaxed) {
+                            paint_polling_status(&renderer_ticker, interval_secs, elapsed);
+                        }
+                    }
                 }
             }
         });
@@ -173,6 +201,7 @@ pub async fn run_watch(
         env_root,
         Some(renderer.clone()),
         sync_running.clone(),
+        timer_reset.clone(),
     )
     .await?;
     renderer.finish_status();
@@ -186,6 +215,11 @@ pub async fn run_watch(
 
 /// The testable inner loop: drain events, run cycles, exit on shutdown.
 /// Tests call this directly with synthetic channels.
+///
+/// `timer_reset` is notified once per completed cycle (every exit path of
+/// the cycle handler) so the polling ticker — which counts independently
+/// of when cycles fire — restarts its `interval_secs` countdown from the
+/// moment the cycle ended, not from some prior baseline.
 pub(crate) async fn event_loop(
     env: &str,
     interactive: bool,
@@ -199,6 +233,7 @@ pub(crate) async fn event_loop(
     env_root: std::path::PathBuf,
     renderer: Option<Arc<crate::log::Log>>,
     sync_running: Arc<AtomicBool>,
+    timer_reset: Arc<tokio::sync::Notify>,
 ) -> Result<()> {
     use notify::{RecursiveMode, Watcher};
 
@@ -223,6 +258,19 @@ pub(crate) async fn event_loop(
                 if let Some(w) = watcher.as_mut() {
                     let _ = w.unwatch(&env_root);
                 }
+
+                // Restart the polling countdown after the cycle ends, on
+                // every exit path (Ok / non-fatal Err continue / `?`
+                // return). Declared FIRST so it drops LAST — by the time
+                // `notify_one` fires, the CycleGuard below has already
+                // cleared `sync_running`, so the ticker's reset branch
+                // sees the cycle as complete and immediately repaints a
+                // fresh "next sync in {interval_secs}s ▱…" line.
+                struct ResetOnDrop<'a>(&'a tokio::sync::Notify);
+                impl Drop for ResetOnDrop<'_> {
+                    fn drop(&mut self) { self.0.notify_one(); }
+                }
+                let _reset_guard = ResetOnDrop(&timer_reset);
 
                 let _cycle_started = std::time::Instant::now();
                 let _lock = crate::cli::sync::lock::EnvLock::acquire(
@@ -413,6 +461,7 @@ mod tests {
             "test", false, false, false, false, false, rx, sh_rx,
             None, std::path::PathBuf::new(), None,
             Arc::new(AtomicBool::new(false)),
+            Arc::new(tokio::sync::Notify::new()),
         ).await;
 
         std::env::set_current_dir(saved_cwd).unwrap();
@@ -445,6 +494,66 @@ mod tests {
 
         // Advance another 60 s — second Poll.
         tokio::time::advance(Duration::from_secs(60)).await;
+        let evt = rx.recv().await.unwrap();
+        assert_eq!(evt, CycleTrigger::Poll);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timer_reset_via_notify_postpones_next_poll() {
+        // Spec test (mirrors the ticker loop in `run_watch`). Demonstrates
+        // that a `notify_one()` on the reset channel zeroes `elapsed` so
+        // the next Poll fires `interval_secs` after the reset — not
+        // `interval_secs - elapsed_at_reset`.
+        use std::time::Duration;
+        use tokio::sync::{Notify, mpsc};
+        let (tx, mut rx) = mpsc::channel::<CycleTrigger>(8);
+        let reset = Arc::new(Notify::new());
+        let interval_secs: u64 = 5;
+
+        let reset_ticker = reset.clone();
+        let _h = tokio::spawn(async move {
+            let mut elapsed: u64 = 0;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = reset_ticker.notified() => { elapsed = 0; }
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        elapsed += 1;
+                        if elapsed >= interval_secs {
+                            elapsed = 0;
+                            if tx.send(CycleTrigger::Poll).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // Tick to elapsed=3 (interval=5, no Poll yet).
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(rx.try_recv().is_err(), "Poll fired early");
+
+        // Reset. elapsed -> 0. Without the reset, 2s more would fire Poll.
+        reset.notify_one();
+        tokio::task::yield_now().await;
+
+        // Tick 4 more seconds: total 7s since start (would have fired
+        // twice without the reset) but only 4s since reset. No Poll yet.
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "Poll fired before {interval_secs}s elapsed after reset"
+        );
+
+        // One more tick → 5s since reset → Poll.
+        tokio::time::advance(Duration::from_secs(1)).await;
         let evt = rx.recv().await.unwrap();
         assert_eq!(evt, CycleTrigger::Poll);
     }
