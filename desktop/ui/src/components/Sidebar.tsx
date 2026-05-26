@@ -1,5 +1,6 @@
 import type { ConnectionSummary } from "../types";
 import Button from "./Button";
+import { startWindowDrag, toggleWindowMaximize } from "../window";
 
 type Props = {
   connections: ConnectionSummary[];
@@ -19,8 +20,9 @@ export default function Sidebar({
   return (
     <aside className="flex flex-col border-r border-border-subtle bg-bg-sidebar/80 backdrop-blur-xl">
       <div
-        data-tauri-drag-region
-        className="px-4 pb-1 pt-12 text-[11px] font-semibold uppercase tracking-wider text-fg-muted"
+        onMouseDown={startWindowDrag}
+        onDoubleClick={toggleWindowMaximize}
+        className="select-none px-4 pb-1 pt-12 text-[11px] font-semibold uppercase tracking-wider text-fg-muted"
       >
         Connections
       </div>
