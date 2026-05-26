@@ -131,8 +131,77 @@ function escapeHtml(s: string): string {
 }
 
 function openAddSheet() {
-  // Implemented in Task 17.
-  console.log("openAddSheet — pending Task 17");
+  const root = document.getElementById("root")!;
+  const overlay = document.createElement("div");
+  overlay.className = "modal-backdrop";
+  overlay.innerHTML = `
+    <div class="modal" role="dialog" aria-label="Add Connection">
+      <h3>Add Connection</h3>
+      <div id="add-error"></div>
+      <div class="field"><label>Name</label><input id="add-name" type="text" placeholder="Acme Corp — Production" /></div>
+      <div class="field"><label>API URL</label><input id="add-api" type="url" placeholder="https://acme.app.rossum.ai/api/v1" /></div>
+      <div class="field"><label>Org ID</label><input id="add-org" type="number" min="1" /></div>
+      <div class="field">
+        <label>Sign in with</label>
+        <select id="add-auth">
+          <option value="password">Email + password</option>
+          <option value="token">API token</option>
+        </select>
+      </div>
+      <div id="auth-fields"></div>
+      <div class="modal-actions">
+        <button class="btn" id="add-cancel">Cancel</button>
+        <button class="btn btn-primary" id="add-submit">Add &amp; Sync</button>
+      </div>
+    </div>
+  `;
+  root.appendChild(overlay);
+
+  const authSel = document.getElementById("add-auth") as HTMLSelectElement;
+  const renderAuthFields = () => {
+    const c = document.getElementById("auth-fields")!;
+    if (authSel.value === "token") {
+      c.innerHTML = `<div class="field"><label>Token</label><input id="add-token" type="password" /></div>`;
+    } else {
+      c.innerHTML = `
+        <div class="field"><label>Email</label><input id="add-username" type="email" /></div>
+        <div class="field"><label>Password</label><input id="add-password" type="password" /></div>
+      `;
+    }
+  };
+  authSel.onchange = renderAuthFields;
+  renderAuthFields();
+
+  document.getElementById("add-cancel")!.onclick = () => overlay.remove();
+  document.getElementById("add-submit")!.onclick = async () => {
+    const errBox = document.getElementById("add-error")!;
+    errBox.innerHTML = "";
+    const input = {
+      name: (document.getElementById("add-name") as HTMLInputElement).value.trim(),
+      api_base: (document.getElementById("add-api") as HTMLInputElement).value.trim(),
+      org_id: Number((document.getElementById("add-org") as HTMLInputElement).value),
+      auth_kind: authSel.value,
+      token: authSel.value === "token" ? (document.getElementById("add-token") as HTMLInputElement).value : null,
+      username: authSel.value === "password" ? (document.getElementById("add-username") as HTMLInputElement).value : null,
+      password: authSel.value === "password" ? (document.getElementById("add-password") as HTMLInputElement).value : null,
+      folder: null,
+    };
+    if (!input.name || !input.api_base || !input.org_id) {
+      errBox.innerHTML = `<div class="banner banner-error">Name, API URL, and Org ID are required.</div>`;
+      return;
+    }
+    try {
+      const created = await invoke<ConnectionSummary>("add_connection", { input });
+      connections.push(created);
+      selectedId = created.id;
+      overlay.remove();
+      render();
+      // Trigger first sync immediately.
+      await invoke("sync_connection", { connectionId: created.id });
+    } catch (e) {
+      errBox.innerHTML = `<div class="banner banner-error">${escapeHtml(String(e))}</div>`;
+    }
+  };
 }
 
 load();
