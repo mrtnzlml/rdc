@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod connection;
 pub mod keychain;
 pub mod paths;
