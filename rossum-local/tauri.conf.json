@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "ui",
     "devUrl": null,
-    "beforeBuildCommand": "cd ui && npx tsc -p tsconfig.json",
-    "beforeDevCommand": "cd ui && npx tsc -p tsconfig.json --watch"
+    "beforeBuildCommand": "cd rossum-local/ui && npx tsc -p tsconfig.json",
+    "beforeDevCommand": "cd rossum-local/ui && npx tsc -p tsconfig.json --watch"
   },
   "app": {
     "windows": [
