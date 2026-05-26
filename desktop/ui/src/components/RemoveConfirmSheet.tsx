@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { api } from "../api";
 import type { ConnectionSummary } from "../types";
+import Button from "./Button";
+import Modal from "./Modal";
 
 type Props = {
   connection: ConnectionSummary;
@@ -25,23 +27,23 @@ export default function RemoveConfirmSheet({ connection: c, onCancel, onRemoved 
   };
 
   return (
-    <div className="modal-backdrop">
-      <div className="modal">
-        <h3>Remove "{c.name}"?</h3>
-        <p>
-          This will delete the local folder (<code>{c.folder}</code>) and remove the stored sign-in.
-          Rossum data is not affected.
-        </p>
-        {error && <div className="banner banner-error">{error}</div>}
-        <div className="modal-actions">
-          <button className="btn" onClick={onCancel} disabled={busy}>
-            Cancel
-          </button>
-          <button className="btn btn-destructive" onClick={confirm} disabled={busy}>
-            {busy ? "Removing…" : "Remove"}
-          </button>
+    <Modal title={`Remove "${c.name}"?`}>
+      <p className="mb-4 text-[13px] text-fg-muted">
+        This will delete the local folder (<code className="rounded bg-bg-sidebar px-1 py-0.5 text-xs">{c.folder}</code>) and remove the stored sign-in. Rossum data is not affected.
+      </p>
+      {error && (
+        <div className="mb-4 rounded-xl border border-error/30 bg-error/10 px-4 py-3 text-error">
+          {error}
         </div>
+      )}
+      <div className="mt-4 flex justify-end gap-2">
+        <Button onClick={onCancel} disabled={busy}>
+          Cancel
+        </Button>
+        <Button variant="destructive" onClick={confirm} disabled={busy}>
+          {busy ? "Removing…" : "Remove"}
+        </Button>
       </div>
-    </div>
+    </Modal>
   );
 }

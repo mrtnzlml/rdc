@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { ConnectionSummary, SyncState } from "../types";
+import Button from "./Button";
 
 function formatLastSync(unix: number | null): string {
   if (unix === null) return "Never";
@@ -11,9 +12,9 @@ function formatLastSync(unix: number | null): string {
   return `${Math.floor(delta / 86400)} day ago`;
 }
 
-function statusClass(s: string): string {
-  if (s === "ok") return "status-ok";
-  if (s === "error") return "status-error";
+function statusColor(s: string): string {
+  if (s === "ok") return "text-success";
+  if (s === "error") return "text-error";
   return "";
 }
 
@@ -32,6 +33,9 @@ type Props = {
   onRemove: () => void;
 };
 
+const row = "my-2.5 flex items-center gap-3 text-[13px]";
+const label = "w-24 text-fg-muted";
+
 export default function Detail({
   connection: c,
   syncState,
@@ -49,50 +53,48 @@ export default function Detail({
 
   return (
     <>
-      <h2>{c.name}</h2>
-      <div className="subtitle">{c.api_base}</div>
-      <div className="row">
-        <span className="label">Last synced</span>
+      <h2 className="m-0 mb-1 text-[22px] font-semibold tracking-tight">{c.name}</h2>
+      <div className="mb-6 text-[13px] text-fg-muted">{c.api_base}</div>
+      <div className={row}>
+        <span className={label}>Last synced</span>
         <span>{formatLastSync(c.last_sync_unix)}</span>
       </div>
-      <div className="row">
-        <span className="label">Status</span>
-        <span className={statusClass(c.last_status)}>{formatStatus(c)}</span>
+      <div className={row}>
+        <span className={label}>Status</span>
+        <span className={statusColor(c.last_status)}>{formatStatus(c)}</span>
       </div>
       {syncState === "running" ? (
-        <div className="progress">
-          <div className="progress-bar" />
+        <div className="my-4 h-1 overflow-hidden rounded-full bg-border-subtle">
+          <div className="progress-bar h-full w-[30%] rounded-full bg-accent" />
         </div>
       ) : (
-        <div className="row">
-          <button className="btn btn-primary" onClick={onSync}>
+        <div className={row}>
+          <Button variant="primary" onClick={onSync}>
             Sync now
-          </button>
+          </Button>
         </div>
       )}
       {syncState === "error" && c.last_status_message && (
-        <div className="banner banner-error">{c.last_status_message}</div>
+        <div className="mb-4 rounded-xl border border-error/30 bg-error/10 px-4 py-3 text-error">
+          {c.last_status_message}
+        </div>
       )}
-      <div className="row">
-        <span className="label">Folder</span>
+      <div className={row}>
+        <span className={label}>Folder</span>
         <span>{c.folder}</span>
       </div>
-      <div className="row">
-        <button className="btn" onClick={onReveal}>
-          Reveal in Finder
-        </button>
-        <button className="btn" onClick={handleCopy}>
-          {copied ? "Copied!" : "Copy path"}
-        </button>
+      <div className={row}>
+        <Button onClick={onReveal}>Reveal in Finder</Button>
+        <Button onClick={handleCopy}>{copied ? "Copied!" : "Copy path"}</Button>
       </div>
-      <div className="row" style={{ marginTop: "32px" }}>
-        <button className="btn-link" onClick={onEdit}>
+      <div className={`${row} mt-8`}>
+        <Button variant="link" onClick={onEdit}>
           Edit credentials
-        </button>
-        <span style={{ flex: 1 }} />
-        <button className="btn btn-destructive" onClick={onRemove}>
+        </Button>
+        <span className="flex-1" />
+        <Button variant="destructive" onClick={onRemove}>
           Remove…
-        </button>
+        </Button>
       </div>
     </>
   );

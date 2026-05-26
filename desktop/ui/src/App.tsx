@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, listenSyncProgress } from "./api";
+import { api, listenSyncProgress, pickFolder } from "./api";
 import type { ConnectionSummary, SyncState } from "./types";
 import EmptyState from "./components/EmptyState";
 import Sidebar from "./components/Sidebar";
@@ -22,6 +22,18 @@ export default function App() {
     setSelectedId((cur) => cur ?? list[0]?.id ?? null);
     return list;
   }, []);
+
+  const openExisting = useCallback(async () => {
+    const path = await pickFolder("Open existing rdc project");
+    if (!path) return;
+    try {
+      const created = await api.openExistingProject(path);
+      await reload();
+      setSelectedId(created.id);
+    } catch (e) {
+      alert(String(e));
+    }
+  }, [reload]);
 
   useEffect(() => {
     void reload();
@@ -60,16 +72,20 @@ export default function App() {
   return (
     <>
       {connections.length === 0 ? (
-        <EmptyState onAdd={() => setShowAdd(true)} />
+        <EmptyState
+          onAdd={() => setShowAdd(true)}
+          onOpenExisting={openExisting}
+        />
       ) : (
-        <div className="app">
+        <div className="grid h-screen grid-cols-[240px_1fr]">
           <Sidebar
             connections={connections}
             selectedId={selectedId}
             onSelect={setSelectedId}
             onAdd={() => setShowAdd(true)}
+            onOpenExisting={openExisting}
           />
-          <main className="detail">
+          <main className="overflow-y-auto px-8 py-6">
             {selected && (
               <Detail
                 connection={selected}
