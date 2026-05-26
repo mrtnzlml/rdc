@@ -208,7 +208,7 @@ pub async fn add_connection(
     Ok((&conn).into())
 }
 
-fn now_unix() -> i64 {
+pub fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -318,5 +318,94 @@ pub async fn sync_connection(
         })
         .map_err(|e| format!("{e:#}"))?;
 
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EditCredentialsInput {
+    pub connection_id: String,
+    pub auth_kind: String, // "token" | "password"
+    pub token: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+#[tauri::command]
+pub async fn edit_credentials(
+    state: State<'_, AppState>,
+    input: EditCredentialsInput,
+) -> Result<(), String> {
+    let id: Ulid = input.connection_id.parse().map_err(|_| "Bad id".to_string())?;
+    let mut reg = state.registry.lock().await;
+    let mut conn = reg
+        .get(id)
+        .cloned()
+        .ok_or_else(|| "Connection not found".to_string())?;
+
+    let validation_input = AddConnectionInput {
+        name: conn.name.clone(),
+        api_base: conn.api_base.clone(),
+        org_id: conn.org_id,
+        auth_kind: input.auth_kind.clone(),
+        token: input.token.clone(),
+        username: input.username.clone(),
+        password: input.password.clone(),
+        folder: Some(conn.folder.display().to_string()),
+    };
+    let new_token = validate_add_input_against_rossum(&validation_input, &conn.api_base).await?;
+
+    let new_kind = match input.auth_kind.as_str() {
+        "token" => AuthKind::Token,
+        "password" => AuthKind::Password,
+        other => return Err(format!("Unknown auth_kind '{other}'.")),
+    };
+    let entry = match new_kind {
+        AuthKind::Token => TokenEntry { token: new_token, expires_at_unix: None },
+        AuthKind::Password => TokenEntry {
+            token: new_token,
+            expires_at_unix: Some(now_unix() + 162 * 3600),
+        },
+    };
+    state
+        .keychain
+        .delete_all(id)
+        .map_err(|e| format!("Clearing old credentials: {e:#}"))?;
+    state
+        .keychain
+        .put_token(id, &entry)
+        .map_err(|e| format!("Writing token: {e:#}"))?;
+    if matches!(new_kind, AuthKind::Password) {
+        state
+            .keychain
+            .put_credentials(
+                id,
+                input.username.as_deref().unwrap(),
+                input.password.as_deref().unwrap(),
+            )
+            .map_err(|e| format!("Writing credentials: {e:#}"))?;
+    }
+    conn.auth_kind = new_kind;
+    reg.upsert(conn);
+    reg.save(&state.registry_path).map_err(|e| format!("{e:#}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn remove_connection(
+    state: State<'_, AppState>,
+    connection_id: String,
+) -> Result<(), String> {
+    let id: Ulid = connection_id.parse().map_err(|_| "Bad id".to_string())?;
+    let mut reg = state.registry.lock().await;
+    let conn = reg
+        .remove(id)
+        .ok_or_else(|| "Connection not found".to_string())?;
+    state
+        .keychain
+        .delete_all(id)
+        .map_err(|e| format!("Clearing Keychain: {e:#}"))?;
+    crate::folder::trash_folder(&conn.folder)
+        .map_err(|e| format!("Moving folder to Trash: {e:#}"))?;
+    reg.save(&state.registry_path).map_err(|e| format!("{e:#}"))?;
     Ok(())
 }

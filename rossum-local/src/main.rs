@@ -15,6 +15,8 @@ async fn main() {
             commands::get_settings,
             commands::add_connection,
             commands::sync_connection,
+            commands::edit_credentials,
+            commands::remove_connection,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Rossum Local");
