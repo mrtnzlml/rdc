@@ -20,6 +20,7 @@ async fn main() {
             commands::edit_credentials,
             commands::remove_connection,
             commands::update_settings,
+            commands::get_diagnostics,
         ])
         .setup(|app| {
             let settings = MenuItemBuilder::new("Settings…")
