@@ -72,7 +72,11 @@
 @layer base {
   html,
   body {
-    @apply m-0 h-full overflow-hidden bg-bg p-0 font-sans text-[13px] text-fg antialiased;
+    @apply m-0 h-full overflow-hidden p-0 font-sans text-[13px] text-fg antialiased;
+    /* Transparent so the NSVisualEffectView vibrancy (applied to the
+       Tauri window in main.rs) shows through. Per-pane backgrounds
+       below tint it where needed. */
+    background: transparent;
     font-feature-settings: "ss01", "ss02", "cv01", "cv11";
     letter-spacing: -0.005em;
   }
@@ -106,5 +110,25 @@
   }
   100% {
     margin-left: 100%;
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes sheet-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
   }
 }
