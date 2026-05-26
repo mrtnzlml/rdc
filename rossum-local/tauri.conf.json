@@ -23,7 +23,8 @@
     ],
     "macOSPrivateApi": true,
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'",
+      "capabilities": ["default"]
     }
   },
   "bundle": {
@@ -40,5 +41,9 @@
       "entitlements": null
     }
   },
-  "plugins": {}
+  "plugins": {
+    "shell": {
+      "open": true
+    }
+  }
 }
