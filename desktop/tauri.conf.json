@@ -4,10 +4,10 @@
   "identifier": "ai.rossum.local",
   "version": "0.1.0",
   "build": {
-    "frontendDist": "ui",
-    "devUrl": null,
-    "beforeBuildCommand": "npx tsc -p tsconfig.json",
-    "beforeDevCommand": "npx tsc -p tsconfig.json --watch"
+    "frontendDist": "ui/dist",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm run build",
+    "beforeDevCommand": "npm run dev"
   },
   "app": {
     "windows": [
@@ -22,9 +22,8 @@
       }
     ],
     "macOSPrivateApi": true,
-    "withGlobalTauri": true,
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'",
+      "csp": null,
       "capabilities": ["default"]
     }
   },

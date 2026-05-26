@@ -1,16 +1,23 @@
 {
-  "name": "ui",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "name": "rossum-local-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
+  "dependencies": {
+    "@tauri-apps/api": "^2.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
   "devDependencies": {
-    "typescript": "^5.9.3"
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
   }
 }
