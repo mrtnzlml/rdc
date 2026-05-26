@@ -1,15 +1,5 @@
-pub mod auth;
 pub mod commands;
-pub mod connection;
-pub mod diagnostics;
+pub mod discover;
 pub mod folder;
-pub mod keychain;
-pub mod paths;
-pub mod rdc_toml;
-pub mod registry;
-pub mod settings;
-pub mod slug;
 pub mod state;
 pub mod sync;
-pub mod sync_queue;
-pub mod url_normalize;
