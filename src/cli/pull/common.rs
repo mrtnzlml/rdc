@@ -657,10 +657,15 @@ fn resolve_conflict_interactive(
     use crate::cli::resolve::{prompt_resolve, PullAborted, Resolution};
     use crate::snapshot::writer::write_atomic;
 
-    let stdin = std::io::stdin();
+    // Read prompt input via the stdin coordinator (not `stdin().lock()`):
+    // under `rdc sync --watch` the Enter-trigger reader owns stdin and
+    // feeds prompts through the coordinator, so locking stdin here would
+    // deadlock. Outside watch the coordinator reads stdin directly. This
+    // path is normally pre-handled by the sync conflict resolver, but a
+    // mid-cycle drift can still surface it.
     let stderr = std::io::stderr();
     let resolution = prompt_resolve(
-        stdin.lock(),
+        crate::cli::stdin_coord::CoordinatorStdin::new(),
         stderr.lock(),
         1, // No global counter yet — drivers don't share an index/total.
         1,

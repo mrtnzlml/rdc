@@ -159,25 +159,40 @@ pub async fn run_watch(
     let env_root = paths.env_root();
     let watcher = spawn_file_watcher(env.to_string(), env_root.clone(), events_tx.clone())?;
 
-    // Stdin reader: lets the user press Enter (any input + newline) to
-    // fire a cycle ahead of the next scheduled poll. Only on TTY — in
-    // non-interactive contexts (CI piping logs through) stdin would
-    // either be EOF or carry unrelated content. While a cycle is in
-    // flight, the read line is silently dropped per `sync_running` so a
-    // mid-cycle keypress doesn't queue an extra cycle.
+    // Stdin reader — the SOLE owner of the terminal's stdin while watching
+    // (see `cli::stdin_coord`). It reads lines and routes each one:
     //
-    // Note: during the conflict resolver (which uses `inquire`/crossterm
-    // to read keystrokes in raw mode), this reader and inquire are both
-    // sourcing from the same terminal. In practice conflicts are rare
-    // and inquire restores the terminal mode on exit, so any partial
-    // read here is harmless.
+    //   1. to a waiting interactive prompt (a conflict / remote-delete /
+    //      destructive-delete resolver blocked mid-cycle), if one is
+    //      registered with the coordinator; else
+    //   2. as an Enter-trigger that fires a cycle ahead of the next poll,
+    //      when idle; else
+    //   3. dropped, when a cycle is running but no prompt is waiting (a
+    //      mid-cycle keypress must not queue an extra cycle).
+    //
+    // Routing through the coordinator is what lets the cycle's prompts and
+    // this reader share stdin without fighting over the process-global
+    // stdin lock — the resolvers read via the coordinator, never the real
+    // stdin, so they can't deadlock against this reader's blocking read.
+    //
+    // TTY only: in non-interactive contexts (CI piping logs) stdin is EOF
+    // or unrelated content, and prompts are non-interactive anyway, so the
+    // coordinator is never activated and resolvers read stdin directly.
     if std::io::stdin().is_terminal() {
+        // Activate synchronously, before the first event-loop cycle can
+        // run a prompt, so the coordinator is live when a prompt registers.
+        let coord = crate::cli::stdin_coord::activate();
         let stdin_tx = events_tx.clone();
         let stdin_sync_running = sync_running.clone();
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
             let mut lines = BufReader::new(tokio::io::stdin()).lines();
-            while let Ok(Some(_line)) = lines.next_line().await {
+            while let Ok(Some(line)) = lines.next_line().await {
+                // Hand the line to a waiting prompt first; fall through
+                // only when no prompt wants it.
+                let Err(_) = coord.try_deliver(line) else {
+                    continue;
+                };
                 if stdin_sync_running.load(Ordering::Relaxed) {
                     continue;
                 }
