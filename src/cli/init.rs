@@ -613,6 +613,34 @@ fn write_readme(root: &Path, cfg: &ProjectConfig) -> Result<()> {
     Ok(())
 }
 
+/// Write the four init-time scaffold files (`.gitignore`, `.gitattributes`,
+/// `CLAUDE.md`, `README.md`) at `cwd`, given a single-env project shape.
+/// Idempotent: each underlying writer skips when the file already exists.
+///
+/// Exposed for embedders (e.g. the Rossum Local desktop app) that need
+/// a Connection folder to look identical to one produced by `rdc init`
+/// — including the agent guide that Claude Code reads.
+pub fn write_scaffold_files(
+    cwd: &Path,
+    env_name: &str,
+    api_base: &str,
+    org_id: u64,
+) -> Result<()> {
+    write_gitignore(cwd)?;
+    write_gitattributes(cwd)?;
+    write_claude_md(cwd)?;
+    let mut cfg = ProjectConfig::default();
+    cfg.envs.insert(
+        env_name.to_string(),
+        crate::config::EnvConfig {
+            api_base: api_base.to_string(),
+            org_id,
+        },
+    );
+    write_readme(cwd, &cfg)?;
+    Ok(())
+}
+
 const CLAUDE_MD_TEMPLATE: &str = r#"# Agent guide
 
 This project is managed with **rdc** (Rossum Deployment as Code). It

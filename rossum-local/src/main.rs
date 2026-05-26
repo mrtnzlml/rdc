@@ -38,7 +38,19 @@ async fn main() {
                 .separator()
                 .quit()
                 .build()?;
-            let menu = MenuBuilder::new(app).item(&app_menu).build()?;
+            // The Edit submenu wires the standard macOS Cmd-X/C/V/A
+            // shortcuts to the focused WebView input. Without it,
+            // copy/paste in form fields silently doesn't work.
+            let edit_menu = SubmenuBuilder::new(app, "Edit")
+                .undo()
+                .redo()
+                .separator()
+                .cut()
+                .copy()
+                .paste()
+                .select_all()
+                .build()?;
+            let menu = MenuBuilder::new(app).item(&app_menu).item(&edit_menu).build()?;
             app.set_menu(menu)?;
             Ok(())
         })
