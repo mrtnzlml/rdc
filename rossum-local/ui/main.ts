@@ -3,9 +3,13 @@ declare const __TAURI__: {
   event: {
     listen: <T>(event: string, handler: (event: { payload: T }) => void) => Promise<() => void>;
   };
+  shell: { open: (path: string) => Promise<void> };
+  clipboardManager: { writeText: (text: string) => Promise<void> };
 };
 const invoke = __TAURI__.core.invoke;
 const listen = __TAURI__.event.listen;
+const shellOpen = __TAURI__.shell.open;
+const clipWriteText = __TAURI__.clipboardManager.writeText;
 
 interface ConnectionSummary {
   id: string;
@@ -161,7 +165,29 @@ function renderDetail() {
       }
     };
   }
-  // Reveal / Copy buttons wired in T19; Edit / Remove in T20.
+  const revealBtn = document.getElementById("reveal-btn");
+  if (revealBtn) {
+    revealBtn.onclick = async () => {
+      try {
+        await shellOpen(c.folder);
+      } catch (e) {
+        console.error("reveal failed", e);
+      }
+    };
+  }
+  const copyBtn = document.getElementById("copy-btn");
+  if (copyBtn) {
+    copyBtn.onclick = async () => {
+      try {
+        await clipWriteText(c.folder);
+        copyBtn.textContent = "Copied!";
+        setTimeout(() => { copyBtn.textContent = "Copy path"; }, 1200);
+      } catch (e) {
+        console.error("copy failed", e);
+      }
+    };
+  }
+  // Edit / Remove buttons wired in T20.
 }
 
 function formatLastSync(unix: number | null): string {
