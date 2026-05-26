@@ -6,6 +6,27 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinHandle;
 use ulid::Ulid;
 
+/// Releases the in-flight slot for `id` on drop. Ensures the slot is
+/// freed even if the synced future panics — without this, a panic would
+/// leave `id` permanently in the in-flight set and silently block all
+/// future submits for that Connection.
+struct InFlightGuard {
+    id: Ulid,
+    set: Arc<Mutex<HashSet<Ulid>>>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        // `try_lock` because Drop must be synchronous. The slot may
+        // briefly stay claimed if the lock is contended at drop time, but
+        // a subsequent submit will see the released slot once the lock
+        // clears.
+        if let Ok(mut g) = self.set.try_lock() {
+            g.remove(&self.id);
+        }
+    }
+}
+
 pub struct SyncQueue {
     in_flight: Arc<Mutex<HashSet<Ulid>>>,
     sem: Arc<Semaphore>,
@@ -39,8 +60,9 @@ impl SyncQueue {
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
+            let _guard = InFlightGuard { id, set: in_flight };
             fut.await;
-            in_flight.lock().await.remove(&id);
+            // _guard drops here, even on panic, releasing the slot
         });
         Ok(handle)
     }

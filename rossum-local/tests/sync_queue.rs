@@ -48,3 +48,25 @@ async fn distinct_connections_run_in_parallel_up_to_limit() {
     }
     assert_eq!(counter.load(Ordering::SeqCst), 2);
 }
+
+#[tokio::test]
+async fn panic_in_fut_releases_in_flight_slot() {
+    let q = SyncQueue::new(4);
+    let id = Ulid::new();
+
+    let h = q
+        .submit(id, async move {
+            panic!("deliberate test panic");
+        })
+        .unwrap();
+
+    // Wait for the panicked task to finish.
+    let _ = h.await; // JoinError expected; ignore.
+    // Give Drop a moment to run + try_lock to release the slot.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    // A second submit for the same id MUST succeed (slot released).
+    let _h2 = q
+        .submit(id, async move {})
+        .expect("slot should be released after panic");
+}
