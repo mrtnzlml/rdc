@@ -11,3 +11,4 @@ pub mod slug;
 pub mod state;
 pub mod sync;
 pub mod sync_queue;
+pub mod url_normalize;
