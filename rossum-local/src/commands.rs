@@ -172,7 +172,7 @@ pub async fn add_connection(
         },
         AuthKind::Password => TokenEntry {
             token,
-            expires_at_unix: Some(now_unix() + 162 * 3600),
+            expires_at_unix: Some(now_unix() + crate::auth::TOKEN_LIFETIME_SECS),
         },
     };
     state
@@ -296,8 +296,13 @@ pub async fn sync_connection(
                     diag.push(format!("sync error: {}: {}", conn2.name, e));
                 }
             }
-            reg.upsert(new_conn);
-            let _ = reg.save(&registry_path);
+            // Defensive: skip the upsert if remove_connection ran while we were syncing.
+            // The registry's `remove` method clears the id; if `get` returns None, the
+            // connection was removed and we should not re-create it.
+            if reg.get(id).is_some() {
+                reg.upsert(new_conn);
+                let _ = reg.save(&registry_path);
+            }
             drop(reg);
 
             let progress = match &result {
@@ -363,7 +368,7 @@ pub async fn edit_credentials(
         AuthKind::Token => TokenEntry { token: new_token, expires_at_unix: None },
         AuthKind::Password => TokenEntry {
             token: new_token,
-            expires_at_unix: Some(now_unix() + 162 * 3600),
+            expires_at_unix: Some(now_unix() + crate::auth::TOKEN_LIFETIME_SECS),
         },
     };
     state
