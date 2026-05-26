@@ -1,5 +1,4 @@
 /target
-/dist
 /gen
 *.icns
 *.png
@@ -7,5 +6,6 @@
 !icons/icon.icns
 !icons/icon.png
 ui/node_modules/
-ui/main.js
+ui/dist/
 ui/package-lock.json
+ui/tsconfig.tsbuildinfo
