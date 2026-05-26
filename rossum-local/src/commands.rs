@@ -410,6 +410,44 @@ pub async fn remove_connection(
     Ok(())
 }
 
+#[derive(Serialize)]
+pub struct DiagnosticsResponse {
+    pub app_version: String,
+    pub rdc_version: String,
+    pub os_version: String,
+    pub connection_count: usize,
+    pub log_lines: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn get_diagnostics(state: State<'_, AppState>) -> Result<DiagnosticsResponse, String> {
+    let reg = state.registry.lock().await;
+    Ok(DiagnosticsResponse {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        rdc_version: rdc_version_string(),
+        os_version: os_version_string(),
+        connection_count: reg.connections().len(),
+        log_lines: state.diag.snapshot(),
+    })
+}
+
+fn rdc_version_string() -> String {
+    rdc::version().unwrap_or("unknown").to_string()
+}
+
+fn os_version_string() -> String {
+    match std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+    {
+        Ok(o) if o.status.success() => format!(
+            "macOS {}",
+            String::from_utf8_lossy(&o.stdout).trim()
+        ),
+        _ => "unknown".into(),
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateSettingsInput {
     pub default_folder_parent: String,

@@ -22,7 +22,6 @@ impl DiagLog {
         q.push_back(line.into());
     }
 
-    #[allow(dead_code)]
     pub fn snapshot(&self) -> Vec<String> {
         let q = self.entries.lock().unwrap();
         q.iter().cloned().collect()

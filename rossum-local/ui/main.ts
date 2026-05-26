@@ -55,6 +55,7 @@ async function setupEventListener() {
     if (selectedId === p.connection_id) renderDetail();
   });
   await listen<void>("open-settings", () => openSettingsSheet());
+  await listen<void>("open-diagnostics", () => openDiagnosticsSheet());
 }
 
 let listenerAttached = false;
@@ -428,6 +429,45 @@ async function openSettingsSheet() {
     } catch (e) {
       alert(String(e));
     }
+  };
+}
+
+async function openDiagnosticsSheet() {
+  const d = await invoke<{
+    app_version: string;
+    rdc_version: string;
+    os_version: string;
+    connection_count: number;
+    log_lines: string[];
+  }>("get_diagnostics");
+  const text = [
+    `App: Rossum Local ${d.app_version}`,
+    `rdc: ${d.rdc_version}`,
+    `OS: ${d.os_version}`,
+    `Connections: ${d.connection_count}`,
+    "",
+    "Recent log:",
+    ...d.log_lines,
+  ].join("\n");
+
+  const root = document.getElementById("root")!;
+  const overlay = document.createElement("div");
+  overlay.className = "modal-backdrop";
+  overlay.innerHTML = `
+    <div class="modal" style="width: 560px;">
+      <h3>Diagnostics</h3>
+      <pre style="max-height: 320px; overflow: auto; font-size: 11px; background: var(--bg-sidebar); padding: 12px; border-radius: 6px;">${escapeHtml(text)}</pre>
+      <div class="modal-actions">
+        <button class="btn" id="diag-close">Close</button>
+        <button class="btn btn-primary" id="diag-copy">Copy</button>
+      </div>
+    </div>
+  `;
+  root.appendChild(overlay);
+  document.getElementById("diag-close")!.onclick = () => overlay.remove();
+  document.getElementById("diag-copy")!.onclick = async () => {
+    await clipWriteText(text);
+    (document.getElementById("diag-copy") as HTMLButtonElement).textContent = "Copied!";
   };
 }
 
