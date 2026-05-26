@@ -112,7 +112,14 @@ pub async fn process(
 
         // queue.json — three-way write (local-only, no fetch).
         let queue_path = queue_dir.join("queue.json");
-        let mut queue_proposed = serde_json::to_vec_pretty(q).context("serializing queue")?;
+        // Redact noisy server-set runtime fields (e.g. `counts`) to a
+        // stable sentinel so re-pulls produce byte-identical files and
+        // git diffs stay quiet. See `snapshot::create::redact_for_disk`.
+        let mut queue_value: serde_json::Value =
+            serde_json::to_value(q).context("serializing queue")?;
+        crate::snapshot::create::redact_for_disk(&mut queue_value, "queues");
+        let mut queue_proposed =
+            serde_json::to_vec_pretty(&queue_value).context("serializing queue")?;
         queue_proposed.push(b'\n');
         let queue_proposed = maybe_strip_overlay(
             queue_proposed,
