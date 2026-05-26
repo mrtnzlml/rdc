@@ -36,7 +36,7 @@ pub async fn resolve_token_for_sync<K: Keychain + ?Sized>(
     if let Some(entry) = kc.get_token(conn.id).map_err(io_err)? {
         match entry.expires_at_unix {
             None => return Ok(TokenSource { token: entry.token, refreshed: false }),
-            Some(exp) if exp > now + EXPIRY_SKEW_SECS => {
+            Some(exp) if exp.saturating_sub(EXPIRY_SKEW_SECS) > now => {
                 return Ok(TokenSource { token: entry.token, refreshed: false });
             }
             _ => {} // expired; fall through
