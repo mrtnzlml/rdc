@@ -184,6 +184,12 @@ pub async fn run(
 /// action (conflict resolution, destructive deletes, remote-delete
 /// reconciliation, auth refresh) has its own gate. Ctrl-C remains the
 /// universal abort.
+///
+/// **Caller contract:** the env lock (see `crate::cli::sync::lock::EnvLock`)
+/// MUST be held by the caller for the entire duration of this call.
+/// All three current callers — `cli::sync::run`, `cli::sync::watch::run_watch`,
+/// and `cli::sync::embed::sync_no_push` — acquire it before invoking. New
+/// callers must do the same.
 pub(crate) async fn run_cycle(
     env: &str,
     interactive: bool,
@@ -214,7 +220,7 @@ pub(crate) async fn run_cycle(
         .get(env)
         .ok_or_else(|| anyhow!("env '{env}' is not defined in rdc.toml"))?;
 
-    let token = match token_override.clone() {
+    let token = match token_override {
         Some(t) => t,
         None => resolve_token(&cwd, env, &env_cfg.api_base).await?,
     };
