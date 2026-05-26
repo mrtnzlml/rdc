@@ -5,6 +5,9 @@ edition.workspace = true
 description = "Rossum Deployment as Code — CLI for snapshotting and deploying Rossum.ai configurations"
 license.workspace = true
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "rdc"
 path = "src/main.rs"
@@ -50,15 +53,15 @@ strip = true
 panic = "abort"
 opt-level = 3
 
-# Compile-time guard against dead code accumulating in the tree. Any
-# unused function, struct, enum variant, etc. is a hard error rather
-# than a silent warning. Applies to lib, bin, tests, and examples.
-[lints.rust]
-dead_code = "deny"
-
 [workspace]
 members = [".", "rossum-local"]
 
 [workspace.package]
 edition = "2024"
 license = "WTFPL"
+
+# Compile-time guard against dead code accumulating in the tree. Any
+# unused function, struct, enum variant, etc. is a hard error rather
+# than a silent warning. Applies to all workspace members.
+[workspace.lints.rust]
+dead_code = "deny"
