@@ -4,3 +4,6 @@
 *.icns
 *.png
 !icons/.gitkeep
+ui/node_modules/
+ui/main.js
+ui/package-lock.json
