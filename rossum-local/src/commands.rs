@@ -409,3 +409,25 @@ pub async fn remove_connection(
     reg.save(&state.registry_path).map_err(|e| format!("{e:#}"))?;
     Ok(())
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateSettingsInput {
+    pub default_folder_parent: String,
+    pub update_channel: String, // "stable" | "beta"
+}
+
+#[tauri::command]
+pub async fn update_settings(
+    state: State<'_, AppState>,
+    input: UpdateSettingsInput,
+) -> Result<(), String> {
+    let mut s = state.settings.lock().await;
+    s.default_folder_parent = std::path::PathBuf::from(&input.default_folder_parent);
+    s.update_channel = match input.update_channel.as_str() {
+        "stable" => crate::settings::UpdateChannel::Stable,
+        "beta" => crate::settings::UpdateChannel::Beta,
+        other => return Err(format!("Unknown channel '{other}'.")),
+    };
+    s.save(&state.settings_path).map_err(|e| format!("{e:#}"))?;
+    Ok(())
+}
