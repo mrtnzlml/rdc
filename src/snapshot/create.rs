@@ -61,6 +61,49 @@ pub fn strip_for_create(body: &mut Value, kind: &str) {
     }
 }
 
+/// Per-kind fields that get *redacted* on pull — the key stays visible
+/// in the on-disk JSON but the value is replaced with [`REDACTED_VALUE_SENTINEL`],
+/// so noisy server-computed runtime data doesn't pollute git diffs.
+///
+/// Different intent from `kind_specific_strip` above: that removes a
+/// key entirely from outgoing POST/PATCH bodies; this rewrites an
+/// *incoming* value into a constant so the on-disk bytes are stable
+/// across syncs. The two lists may overlap (queue's `counts` appears
+/// in both — stripped from outbound payloads because the server
+/// rejects it on PATCH, and redacted in inbound payloads because it
+/// churns every time a document changes status), but they're
+/// independent and the duplication is intentional.
+///
+/// Add a new field here when a runtime aggregate (or other server-set
+/// "live" data) shows up in `git diff` noise.
+fn redact_on_pull(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "queues" => &["counts"],
+        _ => &[],
+    }
+}
+
+/// The sentinel string that replaces redacted values on disk. Chosen
+/// to be human-readable so anyone (or any agent) opening queue.json
+/// sees both the field's existence and a one-line explanation, with
+/// no need to consult external docs.
+pub const REDACTED_VALUE_SENTINEL: &str = "<refreshed live in Rossum; not synced by rdc>";
+
+/// Mutate `body` to redact noisy server-set fields per [`redact_on_pull`].
+/// Each redacted key's value is replaced by [`REDACTED_VALUE_SENTINEL`];
+/// keys that aren't present are left alone (no insertion). Idempotent.
+pub fn redact_for_disk(body: &mut Value, kind: &str) {
+    let Some(obj) = body.as_object_mut() else { return };
+    for field in redact_on_pull(kind) {
+        if obj.contains_key(*field) {
+            obj.insert(
+                (*field).to_string(),
+                Value::String(REDACTED_VALUE_SENTINEL.to_string()),
+            );
+        }
+    }
+}
+
 /// Like `strip_for_create`, but also strips `organization` — used for
 /// **cross-env PATCH bodies and cross-env idempotency comparisons**, where
 /// the src snapshot's `organization` URL belongs to the src org and would
@@ -200,5 +243,49 @@ mod tests {
         assert!(!obj.contains_key("url"));
         // queues kept because no kind-specific rule matched
         assert!(obj.contains_key("queues"));
+    }
+
+    #[test]
+    fn redact_for_disk_replaces_queue_counts_with_sentinel() {
+        let mut v = json!({
+            "id": 1,
+            "name": "q",
+            "counts": {"importing": 5, "to_review": 2, "exported": 100},
+        });
+        redact_for_disk(&mut v, "queues");
+        assert_eq!(
+            v["counts"],
+            Value::String(REDACTED_VALUE_SENTINEL.to_string())
+        );
+        // Other fields untouched.
+        assert_eq!(v["id"], json!(1));
+        assert_eq!(v["name"], json!("q"));
+    }
+
+    #[test]
+    fn redact_for_disk_noop_when_counts_absent() {
+        let mut v = json!({"id": 1, "name": "q"});
+        let before = v.clone();
+        redact_for_disk(&mut v, "queues");
+        assert_eq!(v, before, "should not introduce a counts key");
+    }
+
+    #[test]
+    fn redact_for_disk_noop_for_other_kinds() {
+        let mut v = json!({"counts": {"importing": 5}, "name": "x"});
+        let before = v.clone();
+        redact_for_disk(&mut v, "hooks");
+        redact_for_disk(&mut v, "schemas");
+        redact_for_disk(&mut v, "workspaces");
+        assert_eq!(v, before);
+    }
+
+    #[test]
+    fn redact_for_disk_is_idempotent() {
+        let mut v = json!({"counts": {"importing": 5}, "name": "x"});
+        redact_for_disk(&mut v, "queues");
+        let after_first = v.clone();
+        redact_for_disk(&mut v, "queues");
+        assert_eq!(v, after_first);
     }
 }
