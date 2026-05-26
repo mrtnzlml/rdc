@@ -18,7 +18,10 @@ export default function Sidebar({
 }: Props) {
   return (
     <aside className="flex flex-col border-r border-border-subtle bg-bg-sidebar/80 backdrop-blur-xl">
-      <div className="px-4 pb-1 pt-12 text-[11px] font-semibold uppercase tracking-wider text-fg-muted">
+      <div
+        data-tauri-drag-region
+        className="px-4 pb-1 pt-12 text-[11px] font-semibold uppercase tracking-wider text-fg-muted"
+      >
         Connections
       </div>
       <div className="flex-1 overflow-y-auto px-2 py-1">

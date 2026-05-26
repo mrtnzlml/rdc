@@ -71,17 +71,15 @@ export default function App() {
 
   return (
     <>
-      {/* Drag strip across the top of the window. With titleBarStyle:
-          Overlay there's no system title bar to grab, so we mark a
-          ~28px strip as draggable via Tauri's data-tauri-drag-region
-          attribute (the macOS-supported approach; CSS app-region is
-          Chromium-only). Sits above all other content with select-none
-          so a drag-start gesture is captured cleanly. Nothing interactive
-          renders here — sidebar content starts at pt-12 (48px), detail
-          pane at py-6 (24px). */}
+      {/* Drag strip across the entire window header zone (48px tall).
+          With titleBarStyle: Overlay there's no system title bar, so we
+          mark this area as draggable via Tauri's data-tauri-drag-region
+          attribute (CSS app-region is Chromium-only — WKWebView ignores
+          it). The sidebar's pt-12 and the detail pane's pt-12 below
+          keep all interactive content out from under the strip. */}
       <div
         data-tauri-drag-region
-        className="fixed inset-x-0 top-0 z-50 h-7 select-none"
+        className="fixed inset-x-0 top-0 z-50 h-12 select-none"
       />
       {connections.length === 0 ? (
         <EmptyState
@@ -97,7 +95,7 @@ export default function App() {
             onAdd={() => setShowAdd(true)}
             onOpenExisting={openExisting}
           />
-          <main className="overflow-y-auto px-8 py-6">
+          <main className="overflow-y-auto px-8 pb-6 pt-12">
             {selected && (
               <Detail
                 connection={selected}
