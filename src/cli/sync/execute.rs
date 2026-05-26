@@ -36,60 +36,12 @@ use crate::log::{Action, Log};
 use crate::slug::slugify_unique;
 use crate::snapshot::writer::write_atomic;
 use crate::state::content_hash;
+use crate::cli::stdin_coord::CoordinatorStdin;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::io::{BufRead, Read};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-/// A [`BufRead`] over stdin that defers acquiring the process-global
-/// stdin lock until the first actual read.
-///
-/// The conflict / remote-delete resolvers take a generic `BufRead` but
-/// only read it when there's something to prompt the user about — a
-/// conflict-free cycle returns without reading. The old call sites
-/// passed `std::io::stdin().lock()`, which acquired the lock *eagerly*
-/// as a call argument, even for conflict-free cycles.
-///
-/// That eager lock deadlocks `rdc sync --watch`: the background
-/// Enter-trigger reader (`tokio::io::stdin`) is backed by a blocking
-/// `std::io::Stdin::read`, which holds the same global stdin lock the
-/// entire time it's parked waiting for input. With the eager lock, every
-/// cycle's execute phase blocked on that mutex until the user pressed
-/// Enter (which made the reader's read return and briefly free the
-/// lock). Deferring acquisition to the first real read means a
-/// conflict-free cycle never touches stdin, so it never contends.
-struct LazyStdin {
-    lock: Option<std::io::StdinLock<'static>>,
-}
-
-impl LazyStdin {
-    fn new() -> Self {
-        Self { lock: None }
-    }
-    fn locked(&mut self) -> &mut std::io::StdinLock<'static> {
-        self.lock.get_or_insert_with(|| std::io::stdin().lock())
-    }
-}
-
-impl Read for LazyStdin {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.locked().read(buf)
-    }
-}
-
-impl BufRead for LazyStdin {
-    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-        self.locked().fill_buf()
-    }
-    fn consume(&mut self, amt: usize) {
-        // `consume` only ever follows a `fill_buf`, which routes through
-        // `locked()`, so the lock is present by the time we get here.
-        if let Some(lock) = self.lock.as_mut() {
-            lock.consume(amt);
-        }
-    }
-}
 
 /// Items the conflict resolver promoted into the push pipeline. The caller
 /// merges these into the push-side `ChangeList` so a single PATCH round
@@ -2045,21 +1997,34 @@ pub async fn run(
     // only blocking-on-user-input call in the executor; the helper takes
     // a generic `BufRead` so tests can drive it with a `Cursor`.
     //
-    // `LazyStdin` (not `stdin().lock()`): the resolver only reads when
-    // there's a conflict to prompt, and acquiring the global stdin lock
-    // eagerly here deadlocks `rdc sync --watch` against the Enter-trigger
-    // reader. See `LazyStdin`'s docs.
-    let conflict_outcome =
-        resolve_conflicts(ctx, catalog, classified, LazyStdin::new(), interactive, progress)
-            .await?;
+    // `CoordinatorStdin` (not `stdin().lock()`): in `rdc sync --watch` the
+    // Enter-trigger reader is the sole stdin owner and hands prompt input
+    // to us through the coordinator; outside watch this reads stdin
+    // directly. Either way the read is deferred to the first prompt, so a
+    // conflict-free cycle never touches stdin. See `cli::stdin_coord`.
+    let conflict_outcome = resolve_conflicts(
+        ctx,
+        catalog,
+        classified,
+        CoordinatorStdin::new(),
+        interactive,
+        progress,
+    )
+    .await?;
 
     // Phase A2: remote-delete + double-conflict + both-deleted. Same
     // stdin source as Phase A; `BothDiverged` items have already been
     // resolved above so the dispatcher only sees the destructive-direction
     // classes here.
-    let remote_delete_outcome =
-        resolve_remote_deletes(ctx, catalog, classified, LazyStdin::new(), interactive, progress)
-            .await?;
+    let remote_delete_outcome = resolve_remote_deletes(
+        ctx,
+        catalog,
+        classified,
+        CoordinatorStdin::new(),
+        interactive,
+        progress,
+    )
+    .await?;
 
     // Phase B: destructive deletes. Items classified as `LocalDelete`
     // (lockfile + remote present, local file gone, remote unchanged since

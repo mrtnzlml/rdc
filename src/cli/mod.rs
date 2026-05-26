@@ -462,6 +462,7 @@ pub mod pull;
 pub mod push;
 pub mod repair;
 pub mod resolve;
+pub(crate) mod stdin_coord;
 pub mod sync;
 
 #[cfg(test)]

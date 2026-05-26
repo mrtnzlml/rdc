@@ -100,9 +100,13 @@ pub fn confirm_or_refuse(
     }
     eprint!("Proceed with deletion? [y/N] ");
     std::io::stderr().flush().ok();
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    let ans = input.trim().to_ascii_lowercase();
+    // Route via the stdin coordinator so this prompt cooperates with the
+    // `rdc sync --watch` Enter-trigger reader instead of fighting it for
+    // the terminal. Outside watch it reads stdin directly.
+    let ans = crate::cli::stdin_coord::read_line_coordinated()?
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
     if ans == "y" || ans == "yes" {
         Ok(ConfirmOutcome::Proceed)
     } else {
@@ -311,9 +315,10 @@ fn resolve_delete_drift(interactive: bool, kind: &str, slug: &str) -> Result<Del
     );
     eprint!("[k]eep delete  [r]estore  [s]kip  [a]bort > ");
     std::io::stderr().flush().ok();
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    let ans = input.trim().to_ascii_lowercase();
+    let ans = crate::cli::stdin_coord::read_line_coordinated()?
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
     match ans.as_str() {
         "k" | "keep" => Ok(DeleteDriftChoice::KeepDelete),
         "r" | "restore" => Ok(DeleteDriftChoice::Restore),
