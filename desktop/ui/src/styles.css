@@ -15,13 +15,17 @@
   --color-bg-input: #ffffff;
   --color-fg: #1d1d1f;
   --color-fg-muted: #6e6e73;
-  --color-accent: #ed8e47;
-  --color-accent-soft: #fdf0e3;
-  --color-accent-fg: #ffffff;
+  /* `AccentColor` / `AccentColorText` are CSS Color 4 system colors that
+     WebKit on macOS resolves from the user's System Settings → Appearance
+     → Accent color choice. Updates live when the user changes it.
+     `color-mix` produces the soft tint used for focus rings. */
+  --color-accent: AccentColor;
+  --color-accent-soft: color-mix(in srgb, AccentColor 20%, transparent);
+  --color-accent-fg: AccentColorText;
   --color-border: #d1d1d6;
   --color-border-subtle: #e5e5e7;
   --color-row-hover: #ebebed;
-  --color-row-selected: #e1d6c8;
+  --color-row-selected: color-mix(in srgb, AccentColor 22%, transparent);
   --color-success: #34c759;
   --color-warning: #ff9500;
   --color-error: #ff3b30;
@@ -42,11 +46,10 @@
     --color-bg-input: #1c1c1e;
     --color-fg: #f5f5f7;
     --color-fg-muted: #8e8e93;
-    --color-accent-soft: #3a2a1c;
     --color-border: #38383a;
     --color-border-subtle: #2c2c2e;
     --color-row-hover: #2a2a2d;
-    --color-row-selected: #4a3a26;
+    --color-row-selected: color-mix(in srgb, AccentColor 28%, transparent);
   }
 }
 
