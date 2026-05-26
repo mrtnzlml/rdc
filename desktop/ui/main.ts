@@ -22,7 +22,6 @@ async function copyToClipboard(text: string): Promise<void> {
 interface ConnectionSummary {
   id: string;
   name: string;
-  slug: string;
   api_base: string;
   org_id: number;
   folder: string;
@@ -62,8 +61,6 @@ async function setupEventListener() {
     }
     if (selectedId === p.connection_id) renderDetail();
   });
-  await listen<void>("open-settings", () => openSettingsSheet());
-  await listen<void>("open-diagnostics", () => openDiagnosticsSheet());
 }
 
 let listenerAttached = false;
@@ -391,91 +388,6 @@ function openRemoveSheet(c: ConnectionSummary) {
     } catch (e) {
       alert(String(e));
     }
-  };
-}
-
-async function openSettingsSheet() {
-  const s = await invoke<{
-    default_folder_parent: string;
-    update_channel: string;
-    app_version: string;
-  }>("get_settings");
-  const root = document.getElementById("root")!;
-  const overlay = document.createElement("div");
-  overlay.className = "modal-backdrop";
-  overlay.innerHTML = `
-    <div class="modal">
-      <h3>Settings</h3>
-      <div class="field">
-        <label>Default folder location</label>
-        <input id="setting-folder" type="text" value="${escapeHtml(s.default_folder_parent)}" />
-      </div>
-      <div class="field">
-        <label>Update channel</label>
-        <select id="setting-channel">
-          <option value="stable" ${s.update_channel === "stable" ? "selected" : ""}>Stable</option>
-          <option value="beta" ${s.update_channel === "beta" ? "selected" : ""}>Beta</option>
-        </select>
-      </div>
-      <div class="field"><label>App version</label><div>${escapeHtml(s.app_version)}</div></div>
-      <div class="modal-actions">
-        <button class="btn" id="settings-cancel">Cancel</button>
-        <button class="btn btn-primary" id="settings-save">Save</button>
-      </div>
-    </div>
-  `;
-  root.appendChild(overlay);
-  document.getElementById("settings-cancel")!.onclick = () => overlay.remove();
-  document.getElementById("settings-save")!.onclick = async () => {
-    const input = {
-      default_folder_parent: (document.getElementById("setting-folder") as HTMLInputElement).value,
-      update_channel: (document.getElementById("setting-channel") as HTMLSelectElement).value,
-    };
-    try {
-      await invoke("update_settings", { input });
-      overlay.remove();
-    } catch (e) {
-      alert(String(e));
-    }
-  };
-}
-
-async function openDiagnosticsSheet() {
-  const d = await invoke<{
-    app_version: string;
-    rdc_version: string;
-    os_version: string;
-    connection_count: number;
-    log_lines: string[];
-  }>("get_diagnostics");
-  const text = [
-    `App: Rossum Local ${d.app_version}`,
-    `rdc: ${d.rdc_version}`,
-    `OS: ${d.os_version}`,
-    `Connections: ${d.connection_count}`,
-    "",
-    "Recent log:",
-    ...d.log_lines,
-  ].join("\n");
-
-  const root = document.getElementById("root")!;
-  const overlay = document.createElement("div");
-  overlay.className = "modal-backdrop";
-  overlay.innerHTML = `
-    <div class="modal" style="width: 560px;">
-      <h3>Diagnostics</h3>
-      <pre style="max-height: 320px; overflow: auto; font-size: 11px; background: var(--bg-sidebar); padding: 12px; border-radius: 6px;">${escapeHtml(text)}</pre>
-      <div class="modal-actions">
-        <button class="btn" id="diag-close">Close</button>
-        <button class="btn btn-primary" id="diag-copy">Copy</button>
-      </div>
-    </div>
-  `;
-  root.appendChild(overlay);
-  document.getElementById("diag-close")!.onclick = () => overlay.remove();
-  document.getElementById("diag-copy")!.onclick = async () => {
-    await copyToClipboard(text);
-    (document.getElementById("diag-copy") as HTMLButtonElement).textContent = "Copied!";
   };
 }
 
