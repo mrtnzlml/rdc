@@ -59,6 +59,8 @@ pub async fn run_watch(
             no_push,
             no_pull,
             Some(renderer.clone()),
+            None,
+            None,
         )
         .await?;
     }
@@ -199,7 +201,7 @@ pub(crate) async fn event_loop(
                 let _cycle_guard = CycleGuard(&sync_running);
                 let _outcome = match crate::cli::sync::run_cycle(
                     env, interactive, false, allow_deletes, no_push, no_pull,
-                    renderer.clone(),
+                    renderer.clone(), None, None,
                 ).await {
                     Ok(o) => o,
                     Err(e) if crate::api::anyhow_has_status(&e, 401) => {
@@ -213,7 +215,7 @@ pub(crate) async fn event_loop(
                         crate::cli::auth::refresh_token_for_401(env).await?;
                         crate::cli::sync::run_cycle(
                             env, interactive, false, allow_deletes, no_push, no_pull,
-                            renderer.clone(),
+                            renderer.clone(), None, None,
                         ).await?
                     }
                     Err(e) if is_transient_network_error(&e) => {

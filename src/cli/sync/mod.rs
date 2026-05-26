@@ -104,6 +104,7 @@
 //!   accepting force-push is the only sanctioned escape hatch).
 
 pub mod classify;
+pub mod embed;
 pub mod execute;
 pub mod lock;
 pub mod watch;
@@ -167,6 +168,8 @@ pub async fn run(
         no_push,
         no_pull,
         None,
+        None,
+        None,
     )
     .await?;
     Ok(())
@@ -189,6 +192,8 @@ pub(crate) async fn run_cycle(
     no_push: bool,
     no_pull: bool,
     renderer: Option<Arc<Log>>,
+    cwd_override: Option<&std::path::Path>,
+    token_override: Option<String>,
 ) -> Result<CycleOutcome> {
     if no_push && no_pull {
         anyhow::bail!(
@@ -197,7 +202,10 @@ pub(crate) async fn run_cycle(
         );
     }
 
-    let cwd = std::env::current_dir().context("getting current directory")?;
+    let cwd = match cwd_override {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir().context("getting current directory")?,
+    };
     let paths = Paths::for_env(&cwd, env);
 
     let cfg = ProjectConfig::load(&paths.project_config())?;
@@ -206,7 +214,10 @@ pub(crate) async fn run_cycle(
         .get(env)
         .ok_or_else(|| anyhow!("env '{env}' is not defined in rdc.toml"))?;
 
-    let token = resolve_token(&cwd, env, &env_cfg.api_base).await?;
+    let token = match token_override.clone() {
+        Some(t) => t,
+        None => resolve_token(&cwd, env, &env_cfg.api_base).await?,
+    };
     let client = RossumClient::new(env_cfg.api_base.clone(), token.clone())
         .context("constructing Rossum API client")?;
 
