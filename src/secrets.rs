@@ -1,7 +1,85 @@
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// On-disk shape of `secrets/<env>.secrets.json`. All fields are
+/// optional so the file can hold a token (CLI / token-mode add),
+/// username + password (desktop app's password-mode add, ahead of any
+/// successful login), or both (after a login has cached a token while
+/// the credentials remain available for silent re-login).
+///
+/// The desktop app stores password-mode credentials here so rdc's own
+/// `resolve_token` can see them and run the same re-login flow used for
+/// the CLI's `RDC_USER` / `RDC_PASS` env-var path.
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SecretsFile {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+/// Read `secrets/<env>.secrets.json` if present. Returns an empty
+/// `SecretsFile` when the file does not exist. Errors only on
+/// malformed JSON or unreadable files.
+pub fn read_secrets_file(project_root: &Path, env: &str) -> Result<SecretsFile> {
+    let path = project_root.join("secrets").join(format!("{env}.secrets.json"));
+    if !path.exists() {
+        return Ok(SecretsFile::default());
+    }
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let parsed: SecretsFile = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    Ok(parsed)
+}
+
+fn write_secrets_file_full(
+    project_root: &Path,
+    env: &str,
+    file: &SecretsFile,
+) -> Result<PathBuf> {
+    let path = project_root.join("secrets").join(format!("{env}.secrets.json"));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut bytes = serde_json::to_vec_pretty(file).context("serializing secrets JSON")?;
+    bytes.push(b'\n');
+    crate::snapshot::writer::write_atomic(&path, &bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(path)
+}
+
+/// Persist a password-mode credential pair to `secrets/<env>.secrets.json`,
+/// preserving any existing `api_token` / `expires_at` already in the file.
+/// Used by the desktop app at Add Connection / Edit Credentials time.
+///
+/// rdc's own `resolve_token` (which `cli::sync::embed::sync_no_push`
+/// transitively calls) reads these fields and runs the standard
+/// `NeedsLogin` → `POST /v1/auth/login` → cache flow when the token is
+/// missing or expired.
+pub fn save_password_credentials(
+    project_root: &Path,
+    env: &str,
+    username: &str,
+    password: &str,
+) -> Result<PathBuf> {
+    let mut current = read_secrets_file(project_root, env).unwrap_or_default();
+    current.username = Some(username.to_string());
+    current.password = Some(password.to_string());
+    write_secrets_file_full(project_root, env, &current)
+}
 
 /// Compute the environment-variable name rdc looks at for a per-env
 /// credential field. `suffix` is `TOKEN`, `USER`, or `PASS`.
@@ -129,37 +207,34 @@ fn resolve_token_lookup_from_at<F: Fn(&str) -> Option<String>>(
     }
 
     // 2. Cached token in secrets/<env>.secrets.json, if still valid.
-    let path = project_root.join("secrets").join(format!("{env}.secrets.json"));
-    let mut cached_token_valid: Option<TokenLookup> = None;
-    if path.exists() {
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        #[derive(Deserialize)]
-        struct File {
-            api_token: String,
-            #[serde(default)]
-            expires_at: Option<u64>,
-        }
-        let f: File = serde_json::from_str(&raw)
-            .with_context(|| format!("parsing {}", path.display()))?;
-        if !f.api_token.is_empty() {
-            let is_valid = match f.expires_at {
+    let file = read_secrets_file(project_root, env)?;
+    if let Some(ref token) = file.api_token {
+        if !token.is_empty() {
+            let is_valid = match file.expires_at {
                 None => true, // no expiry tracking; treat as valid
                 Some(exp) => exp > now_unix_secs.saturating_add(TOKEN_EXPIRY_SKEW_SECS),
             };
             if is_valid {
-                cached_token_valid = Some(TokenLookup::Cached {
-                    token: f.api_token,
-                    expires_at: f.expires_at,
+                return Ok(TokenLookup::Cached {
+                    token: token.clone(),
+                    expires_at: file.expires_at,
                 });
             }
         }
     }
-    if let Some(lookup) = cached_token_valid {
-        return Ok(lookup);
+
+    // 3a. Username + password persisted in the secrets file (desktop app
+    // password-mode). Same NeedsLogin contract as the env-var path below.
+    if let (Some(u), Some(p)) = (file.username.as_deref(), file.password.as_deref()) {
+        if !u.is_empty() && !p.is_empty() {
+            return Ok(TokenLookup::NeedsLogin {
+                username: u.to_string(),
+                password: p.to_string(),
+            });
+        }
     }
 
-    // 3. RDC_USER_<ENV> + RDC_PASS_<ENV> creds for a fresh login.
+    // 3b. RDC_USER_<ENV> + RDC_PASS_<ENV> creds for a fresh login.
     let user_opt = get_env(&user_var).filter(|s| !s.is_empty());
     let pass_opt = get_env(&pass_var).filter(|s| !s.is_empty());
     match (user_opt, pass_opt) {
@@ -245,35 +320,24 @@ pub async fn resolve_token(project_root: &Path, env: &str, api_base: &str) -> Re
     }
 }
 
-/// Write `secrets/<env>.secrets.json` atomically with mode 0600 on
-/// Unix. Used by [`resolve_token`] when caching a login-derived
-/// token, and by `cli::auth::validate_and_save_token` when the user
-/// runs `rdc auth`.
+/// Write a token (and optional expiry) to `secrets/<env>.secrets.json`
+/// atomically, mode 0600 on Unix. Preserves any `username` / `password`
+/// fields already in the file — the desktop app persists those for
+/// password-mode silent re-login, and a token refresh must not clobber
+/// them.
+///
+/// Used by [`resolve_token`] when caching a login-derived token, and
+/// by `cli::auth::validate_and_save_token` when the user runs `rdc auth`.
 pub fn write_secrets_file(
     project_root: &Path,
     env: &str,
     token: &str,
     expires_at: Option<u64>,
 ) -> Result<PathBuf> {
-    let path = project_root.join("secrets").join(format!("{env}.secrets.json"));
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let body = match expires_at {
-        Some(exp) => serde_json::json!({ "api_token": token, "expires_at": exp }),
-        None => serde_json::json!({ "api_token": token }),
-    };
-    let mut bytes = serde_json::to_vec_pretty(&body).context("serializing token JSON")?;
-    bytes.push(b'\n');
-    crate::snapshot::writer::write_atomic(&path, &bytes)
-        .with_context(|| format!("writing {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(path)
+    let mut current = read_secrets_file(project_root, env).unwrap_or_default();
+    current.api_token = Some(token.to_string());
+    current.expires_at = expires_at;
+    write_secrets_file_full(project_root, env, &current)
 }
 
 /// Per-env, per-hook secret values that ship to the Rossum API in the
