@@ -18,3 +18,7 @@ export function startWindowDrag(e: MouseEvent) {
 export function toggleWindowMaximize() {
   void getCurrentWindow().toggleMaximize();
 }
+
+export function setWindowTitle(title: string) {
+  void getCurrentWindow().setTitle(title);
+}

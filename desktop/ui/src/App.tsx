@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
+import { listen, Event } from "@tauri-apps/api/event";
 import { api, listenSyncProgress, pickFolder } from "./api";
-import { startWindowDrag, toggleWindowMaximize } from "./window";
+import { setWindowTitle, startWindowDrag, toggleWindowMaximize } from "./window";
 import type { ConnectionSummary, SyncState } from "./types";
 import EmptyState from "./components/EmptyState";
 import Sidebar from "./components/Sidebar";
@@ -36,6 +37,18 @@ export default function App() {
     }
   }, [reload]);
 
+  // Listen for menu-bar events from the Rust side (Cmd+N / Cmd+O).
+  useEffect(() => {
+    const unlistenAdd = listen("menu:new-connection", () => setShowAdd(true));
+    const unlistenOpen = listen<void>("menu:open-existing", (_: Event<void>) => {
+      void openExisting();
+    });
+    return () => {
+      void unlistenAdd.then((un) => un());
+      void unlistenOpen.then((un) => un());
+    };
+  }, [openExisting]);
+
   useEffect(() => {
     void reload();
     const unlistenP = listenSyncProgress((p) => {
@@ -70,6 +83,12 @@ export default function App() {
 
   const selected = connections.find((c) => c.id === selectedId) ?? null;
 
+  // Update the macOS window title to show the selected Connection.
+  // Visible in Cmd-Tab, the Dock context menu, and Mission Control.
+  useEffect(() => {
+    setWindowTitle(selected ? `Rossum Local · ${selected.name}` : "Rossum Local");
+  }, [selected]);
+
   return (
     <>
       {/* Drag strip across the entire window header zone (48px tall).
@@ -96,8 +115,12 @@ export default function App() {
             onSelect={setSelectedId}
             onAdd={() => setShowAdd(true)}
             onOpenExisting={openExisting}
+            onSyncConnection={(id) => void api.syncConnection(id)}
+            onRevealConnection={(folder) => void api.revealFolder(folder)}
+            onEditConnection={(c) => setEditTarget(c)}
+            onRemoveConnection={(c) => setRemoveTarget(c)}
           />
-          <main className="overflow-y-auto px-8 pb-6 pt-12">
+          <main className="overflow-y-auto bg-bg px-8 pb-6 pt-12">
             {selected && (
               <Detail
                 connection={selected}
