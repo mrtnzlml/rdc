@@ -48,10 +48,36 @@ fn classify_io_err(e: anyhow::Error, folder: &std::path::Path) -> SyncError {
 
 fn classify_rdc_err(e: anyhow::Error, folder: &std::path::Path) -> SyncError {
     let msg = format!("{e:#}");
-    if msg.contains("lock") && msg.contains("contend") {
+    if msg.contains("timed out") && msg.contains("env lock") {
         SyncError::LockContended
     } else {
         classify_io_err(e, folder)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_rdc_err_recognizes_lock_timeout_message() {
+        let err = anyhow::anyhow!("timed out after 30s waiting for env lock at /tmp/foo");
+        let classified = classify_rdc_err(err, std::path::Path::new("/tmp/foo"));
+        assert!(matches!(classified, SyncError::LockContended), "got: {classified:?}");
+    }
+
+    #[test]
+    fn classify_io_err_recognizes_disk_full_message() {
+        let err = anyhow::anyhow!("No space left on device");
+        let classified = classify_io_err(err, std::path::Path::new("/tmp/foo"));
+        assert!(matches!(classified, SyncError::DiskFull(_)), "got: {classified:?}");
+    }
+
+    #[test]
+    fn classify_io_err_falls_back_to_other() {
+        let err = anyhow::anyhow!("unrelated random error");
+        let classified = classify_io_err(err, std::path::Path::new("/tmp/foo"));
+        assert!(matches!(classified, SyncError::Other(_)), "got: {classified:?}");
     }
 }
 
