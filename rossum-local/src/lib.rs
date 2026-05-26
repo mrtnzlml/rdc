@@ -7,3 +7,4 @@ pub mod registry;
 pub mod settings;
 pub mod slug;
 pub mod sync;
+pub mod sync_queue;
