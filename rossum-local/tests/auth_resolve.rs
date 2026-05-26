@@ -107,3 +107,89 @@ async fn missing_token_password_mode_logs_in() {
     let TokenSource { token, .. } = resolve_token_for_sync(&conn, &kc).await.unwrap();
     assert_eq!(token, "fresh");
 }
+
+#[tokio::test]
+async fn near_future_expiry_within_skew_falls_through_to_relogin() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/auth/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "key": "fresh", "domain": "x"
+        })))
+        .mount(&server)
+        .await;
+
+    // Token "expires in 30 seconds" — inside the 60s skew window.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let kc = InMemoryKeychain::default();
+    let id = Ulid::new();
+    kc.put_token(
+        id,
+        &TokenEntry { token: "stale".into(), expires_at_unix: Some(now + 30) },
+    )
+    .unwrap();
+    kc.put_credentials(id, "u", "p").unwrap();
+
+    let conn = make_conn(id, &server.uri(), AuthKind::Password);
+    let TokenSource { token, refreshed } = resolve_token_for_sync(&conn, &kc).await.unwrap();
+    assert_eq!(token, "fresh");
+    assert!(refreshed, "skew should force re-login");
+}
+
+#[tokio::test]
+async fn password_mode_without_creds_returns_missing() {
+    let kc = InMemoryKeychain::default();
+    let id = Ulid::new();
+    // No cached token AND no credentials.
+    let conn = make_conn(id, "http://unused", AuthKind::Password);
+    let err = resolve_token_for_sync(&conn, &kc).await.unwrap_err();
+    assert!(matches!(err, ResolveError::Missing), "got: {err:?}");
+}
+
+#[tokio::test]
+async fn login_401_returns_bad_password() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/auth/login"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+
+    let kc = InMemoryKeychain::default();
+    let id = Ulid::new();
+    kc.put_credentials(id, "u", "wrong").unwrap();
+    let conn = make_conn(id, &server.uri(), AuthKind::Password);
+    let err = resolve_token_for_sync(&conn, &kc).await.unwrap_err();
+    assert!(matches!(err, ResolveError::BadPassword), "got: {err:?}");
+}
+
+#[tokio::test]
+async fn login_500_returns_other() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/auth/login"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let kc = InMemoryKeychain::default();
+    let id = Ulid::new();
+    kc.put_credentials(id, "u", "p").unwrap();
+    let conn = make_conn(id, &server.uri(), AuthKind::Password);
+    let err = resolve_token_for_sync(&conn, &kc).await.unwrap_err();
+    assert!(matches!(err, ResolveError::Other(_)), "got: {err:?}");
+}
+
+#[tokio::test]
+async fn login_unreachable_host_returns_network_error() {
+    let kc = InMemoryKeychain::default();
+    let id = Ulid::new();
+    kc.put_credentials(id, "u", "p").unwrap();
+    // Use a refused-port URL on localhost.
+    let conn = make_conn(id, "http://127.0.0.1:1", AuthKind::Password);
+    let err = resolve_token_for_sync(&conn, &kc).await.unwrap_err();
+    assert!(matches!(err, ResolveError::Network(_)), "got: {err:?}");
+}
