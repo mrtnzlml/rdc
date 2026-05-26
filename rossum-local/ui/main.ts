@@ -54,6 +54,7 @@ async function setupEventListener() {
     }
     if (selectedId === p.connection_id) renderDetail();
   });
+  await listen<void>("open-settings", () => openSettingsSheet());
 }
 
 let listenerAttached = false;
@@ -378,6 +379,52 @@ function openRemoveSheet(c: ConnectionSummary) {
       overlay.remove();
       selectedId = null;
       await load();
+    } catch (e) {
+      alert(String(e));
+    }
+  };
+}
+
+async function openSettingsSheet() {
+  const s = await invoke<{
+    default_folder_parent: string;
+    update_channel: string;
+    app_version: string;
+  }>("get_settings");
+  const root = document.getElementById("root")!;
+  const overlay = document.createElement("div");
+  overlay.className = "modal-backdrop";
+  overlay.innerHTML = `
+    <div class="modal">
+      <h3>Settings</h3>
+      <div class="field">
+        <label>Default folder location</label>
+        <input id="setting-folder" type="text" value="${escapeHtml(s.default_folder_parent)}" />
+      </div>
+      <div class="field">
+        <label>Update channel</label>
+        <select id="setting-channel">
+          <option value="stable" ${s.update_channel === "stable" ? "selected" : ""}>Stable</option>
+          <option value="beta" ${s.update_channel === "beta" ? "selected" : ""}>Beta</option>
+        </select>
+      </div>
+      <div class="field"><label>App version</label><div>${escapeHtml(s.app_version)}</div></div>
+      <div class="modal-actions">
+        <button class="btn" id="settings-cancel">Cancel</button>
+        <button class="btn btn-primary" id="settings-save">Save</button>
+      </div>
+    </div>
+  `;
+  root.appendChild(overlay);
+  document.getElementById("settings-cancel")!.onclick = () => overlay.remove();
+  document.getElementById("settings-save")!.onclick = async () => {
+    const input = {
+      default_folder_parent: (document.getElementById("setting-folder") as HTMLInputElement).value,
+      update_channel: (document.getElementById("setting-channel") as HTMLSelectElement).value,
+    };
+    try {
+      await invoke("update_settings", { input });
+      overlay.remove();
     } catch (e) {
       alert(String(e));
     }
