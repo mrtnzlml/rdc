@@ -18,7 +18,7 @@ export default function Sidebar({
   onOpenExisting,
 }: Props) {
   return (
-    <aside className="flex flex-col border-r border-border-subtle bg-bg-sidebar/80 backdrop-blur-xl">
+    <aside className="flex flex-col border-r border-border-subtle/50">
       <div
         onMouseDown={startWindowDrag}
         onDoubleClick={toggleWindowMaximize}

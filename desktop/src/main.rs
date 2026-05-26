@@ -1,6 +1,12 @@
 use rossum_local::commands;
 use rossum_local::state::AppState;
 use tauri::menu::{MenuBuilder, SubmenuBuilder};
+use tauri::Manager;
+#[cfg(target_os = "macos")]
+use tauri::{
+    utils::config::WindowEffectsConfig,
+    window::{Effect, EffectState},
+};
 
 #[tokio::main]
 async fn main() {
@@ -19,6 +25,21 @@ async fn main() {
             commands::reveal_folder,
         ])
         .setup(|app| {
+            // Apply NSVisualEffectView vibrancy to the main window. The
+            // Tauri window was created with `transparent: true`; the
+            // Sidebar material then shows through wherever the WebView
+            // content has a transparent or low-alpha background. Mail,
+            // Music, Notes use this same material on their sidebars.
+            #[cfg(target_os = "macos")]
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.set_effects(WindowEffectsConfig {
+                    effects: vec![Effect::Sidebar],
+                    state: Some(EffectState::FollowsWindowActiveState),
+                    radius: None,
+                    color: None,
+                });
+            }
+
             let app_menu = SubmenuBuilder::new(app, "Rossum Local").quit().build()?;
             // Standard macOS Edit menu so Cmd-X/C/V/A bind to the
             // focused WebView input.
