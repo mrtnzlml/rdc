@@ -112,6 +112,8 @@ pub enum Command {
         #[arg(long = "no-pull", conflicts_with = "no_push")]
         no_pull: bool,
         /// Watch local files + poll the env continuously; reconcile on each event.
+        /// On a TTY, pressing Enter triggers a cycle immediately (ignored while
+        /// a cycle is already running).
         #[arg(long = "watch", conflicts_with_all = ["dry_run"])]
         watch: bool,
         /// Poll cadence for remote drift in watch mode. Accepts human durations
