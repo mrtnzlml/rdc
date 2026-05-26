@@ -72,11 +72,17 @@ export default function App() {
   return (
     <>
       {/* Drag strip across the top of the window. With titleBarStyle:
-          Overlay there's no system title bar to grab, so we mark the
-          ~22px under the traffic lights as `app-region: drag`. Sits
-          above all other content; nothing interactive renders here
-          (sidebar content starts at pt-12 = 48px, detail at py-6 = 24px). */}
-      <div className="fixed inset-x-0 top-0 z-50 h-[22px] [app-region:drag]" />
+          Overlay there's no system title bar to grab, so we mark a
+          ~28px strip as draggable via Tauri's data-tauri-drag-region
+          attribute (the macOS-supported approach; CSS app-region is
+          Chromium-only). Sits above all other content with select-none
+          so a drag-start gesture is captured cleanly. Nothing interactive
+          renders here — sidebar content starts at pt-12 (48px), detail
+          pane at py-6 (24px). */}
+      <div
+        data-tauri-drag-region
+        className="fixed inset-x-0 top-0 z-50 h-7 select-none"
+      />
       {connections.length === 0 ? (
         <EmptyState
           onAdd={() => setShowAdd(true)}
