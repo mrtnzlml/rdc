@@ -3,7 +3,7 @@ use crate::keychain::{Keychain, TokenEntry};
 use serde::Deserialize;
 use thiserror::Error;
 
-const TOKEN_LIFETIME_SECS: i64 = 162 * 3600;
+pub(crate) const TOKEN_LIFETIME_SECS: i64 = 162 * 3600;
 const EXPIRY_SKEW_SECS: i64 = 60;
 
 #[derive(Debug, Error)]
