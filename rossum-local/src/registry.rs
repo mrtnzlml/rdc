@@ -70,28 +70,15 @@ impl Registry {
                 reg.connections.retain(|c| seen.insert(c.id));
                 Ok(reg)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self {
-                version: REGISTRY_VERSION,
-                connections: Vec::new(),
-            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(self).context("serializing registry")?;
-        write_atomic(path, &bytes)
+        rdc::snapshot::writer::write_atomic(path, &bytes)
             .with_context(|| format!("writing {}", path.display()))?;
         Ok(())
     }
-}
-
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
 }

@@ -33,6 +33,9 @@ fn registry_roundtrips_via_json() {
     assert_eq!(loaded.connections()[0].auth_kind, AuthKind::Password);
     assert_eq!(loaded.connections()[0].last_sync_unix, Some(1763500000));
     assert_eq!(loaded.connections()[0].file_count, 287);
+    assert_eq!(loaded.connections()[0].id, conn.id);
+    assert_eq!(loaded.connections()[0].folder, conn.folder);
+    assert_eq!(loaded.connections()[0].last_status, conn.last_status);
 }
 
 #[test]
