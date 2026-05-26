@@ -37,6 +37,19 @@ export default function App() {
     }
   }, [reload]);
 
+  // Suppress the WebView's default right-click menu globally. Our
+  // sidebar rows handle their own contextmenu event with
+  // `e.preventDefault()` before bubbling, so the custom menu still
+  // opens; this listener just kills the WebView default everywhere
+  // else (including dev-mode "Reload / Inspect Element").
+  useEffect(() => {
+    // Use globalThis.Event so we don't accidentally resolve to Tauri's
+    // generic `Event<T>` (imported above).
+    const handler = (e: globalThis.Event) => e.preventDefault();
+    document.addEventListener("contextmenu", handler);
+    return () => document.removeEventListener("contextmenu", handler);
+  }, []);
+
   // Listen for menu-bar events from the Rust side (Cmd+N / Cmd+O).
   useEffect(() => {
     const unlistenAdd = listen("menu:new-connection", () => setShowAdd(true));
