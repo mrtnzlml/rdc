@@ -17,9 +17,11 @@ pub struct TokenEntry {
 }
 
 pub trait Keychain: Send + Sync {
+    /// Inserts or replaces the token entry for `id`. Last write wins.
     fn put_token(&self, id: Ulid, entry: &TokenEntry) -> Result<()>;
     fn get_token(&self, id: Ulid) -> Result<Option<TokenEntry>>;
 
+    /// Inserts or replaces the username + password for `id`. Last write wins.
     fn put_credentials(&self, id: Ulid, username: &str, password: &str) -> Result<()>;
     fn get_credentials(&self, id: Ulid) -> Result<Option<(String, String)>>;
 

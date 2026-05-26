@@ -66,13 +66,26 @@ impl Keychain for MacOsKeychain {
     }
 
     fn delete_all(&self, id: Ulid) -> Result<()> {
-        let _ = delete_generic_password(token_service(), &account(id));
-        let _ = delete_generic_password(&username_service(), &account(id));
-        let _ = delete_generic_password(&password_service(), &account(id));
+        for (service, label) in [
+            (token_service().to_string(), "token"),
+            (username_service(), "username"),
+            (password_service(), "password"),
+        ] {
+            match delete_generic_password(&service, &account(id)) {
+                Ok(()) => {}
+                Err(e) if is_not_found(&e) => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("deleting {label} from Keychain"));
+                }
+            }
+        }
         Ok(())
     }
 }
 
+// Apple's errSecItemNotFound. Not re-exported by security-framework 2.x.
+const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+
 fn is_not_found(e: &security_framework::base::Error) -> bool {
-    e.code() == -25300 // errSecItemNotFound
+    e.code() == ERR_SEC_ITEM_NOT_FOUND
 }
