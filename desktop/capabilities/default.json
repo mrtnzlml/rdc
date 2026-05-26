@@ -4,6 +4,7 @@
   "description": "Default capabilities for Rossum Local",
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "dialog:allow-open"
   ]
 }
