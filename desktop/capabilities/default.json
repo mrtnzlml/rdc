@@ -4,10 +4,6 @@
   "description": "Default capabilities for Rossum Local",
   "windows": ["main"],
   "permissions": [
-    "core:default",
-    "shell:allow-open",
-    "clipboard-manager:allow-write-text",
-    "dialog:default",
-    "updater:default"
+    "core:default"
   ]
 }
