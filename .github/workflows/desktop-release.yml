@@ -65,13 +65,13 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          cd rossum-local
+          cd desktop
           cargo tauri build --target universal-apple-darwin
 
       - name: Generate latest.json for updater feed
         run: |
           VERSION=${GITHUB_REF_NAME#desktop-v}
-          DMG=$(ls rossum-local/target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          DMG=$(ls desktop/target/universal-apple-darwin/release/bundle/dmg/*.dmg)
           SIG=$(cat $DMG.sig)
           cat > rossum-local-latest.json <<EOF
           {
@@ -95,8 +95,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            rossum-local/target/universal-apple-darwin/release/bundle/dmg/*.dmg
-            rossum-local/target/universal-apple-darwin/release/bundle/dmg/*.dmg.sig
+            desktop/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            desktop/target/universal-apple-darwin/release/bundle/dmg/*.dmg.sig
             rossum-local-latest.json
           fail_on_unmatched_files: true
           generate_release_notes: true
