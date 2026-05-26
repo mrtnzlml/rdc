@@ -5,7 +5,9 @@
   "version": "0.1.0",
   "build": {
     "frontendDist": "ui",
-    "devUrl": null
+    "devUrl": null,
+    "beforeBuildCommand": "cd ui && npx tsc -p tsconfig.json",
+    "beforeDevCommand": "cd ui && npx tsc -p tsconfig.json --watch"
   },
   "app": {
     "windows": [
