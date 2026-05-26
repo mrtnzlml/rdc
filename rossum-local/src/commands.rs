@@ -474,3 +474,11 @@ pub async fn update_settings(
     s.save(&state.settings_path).map_err(|e| format!("{e:#}"))?;
     Ok(())
 }
+
+/// Open `path` in the OS file manager (Finder on macOS). Replaces the
+/// `__TAURI__.shell.open` global lookup, which isn't auto-exposed by
+/// Tauri 2 even with `withGlobalTauri: true`.
+#[tauri::command]
+pub fn reveal_folder(path: String) -> Result<(), String> {
+    crate::folder::reveal(std::path::Path::new(&path)).map_err(|e| format!("{e:#}"))
+}
