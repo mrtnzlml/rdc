@@ -54,7 +54,7 @@ panic = "abort"
 opt-level = 3
 
 [workspace]
-members = [".", "rossum-local"]
+members = [".", "desktop"]
 
 [workspace.package]
 edition = "2024"
