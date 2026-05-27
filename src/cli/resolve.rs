@@ -1528,10 +1528,7 @@ pub fn render_styled_diff(
             s(removed)
         );
     } else {
-        let _ = writeln!(
-            out,
-            "{SGR_ADD_BOLD}\u{25cf}{SGR_RESET} {SGR_AMBER_BOLD}{verb}{SGR_RESET}({path})"
-        );
+        let _ = writeln!(out, "{SGR_AMBER_BOLD}{verb}{SGR_RESET}({path})");
         let _ = writeln!(
             out,
             "  {SGR_DIM}\u{23bf} Added {added} line{}, removed {removed} line{}{SGR_RESET}",
@@ -1542,12 +1539,17 @@ pub fn render_styled_diff(
 
     // Side legend (when both labels carry a ` (…)` annotation) so the reader
     // knows what `-` and `+` mean — e.g. `- local  + remote`, or for a deploy
-    // preview `- src after overlay+rewrite  + tgt remote`.
+    // preview `- src after overlay+rewrite  + tgt remote`. The `-`/`+` tokens
+    // are colored bold red/green to mirror the `-`/`+` row colors below, so the
+    // side mapping reads at a glance — do not dim it back.
     if let (Some(la), Some(ra)) = (left_ann, right_ann) {
         let _ = if plain {
             writeln!(out, "  - {la}   + {ra}")
         } else {
-            writeln!(out, "  {SGR_DIM}- {la}   + {ra}{SGR_RESET}")
+            writeln!(
+                out,
+                "  {SGR_REMOVE_BOLD}- {la}{SGR_RESET}   {SGR_ADD_BOLD}+ {ra}{SGR_RESET}"
+            )
         };
     }
 
@@ -2434,6 +2436,7 @@ mod tests {
         let l = "{\n  \"hidden\": true\n}\n";
         let r = "{\n  \"hidden\": false\n}\n";
         let out = render_styled_diff("q/schema.json (local)", "q/schema.json (remote)", l, r, ColorMode::Color);
+        assert!(!out.contains('\u{25cf}'), "decorative header bullet should be removed: {out:?}");
         assert!(out.contains(SGR_BG_REMOVE), "removed row needs a red background");
         assert!(out.contains(SGR_BG_ADD), "added row needs a green background");
         assert!(out.contains(SGR_EOL), "rows must fill the background to the line end");
@@ -2445,6 +2448,10 @@ mod tests {
         // Intra-line emphasis: the changed value carries the brighter bg.
         assert!(out.contains(SGR_BG_REMOVE_HI), "changed span on removed row needs brighter red");
         assert!(out.contains(SGR_BG_ADD_HI), "changed span on added row needs brighter green");
+        // Side legend tokens are color-coded (bold red/green) to mirror the
+        // -/+ rows, not dimmed.
+        assert!(out.contains(&format!("{SGR_REMOVE_BOLD}- local")), "legend '- local' should be bold red: {out:?}");
+        assert!(out.contains(&format!("{SGR_ADD_BOLD}+ remote")), "legend '+ remote' should be bold green: {out:?}");
         // Non-.json content is not JSON-highlighted (but still gets row bg).
         let py = render_styled_diff("hooks/h.py (local)", "hooks/h.py (remote)", "a = 1\n", "a = 2\n", ColorMode::Color);
         assert!(
