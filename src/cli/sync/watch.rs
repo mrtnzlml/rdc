@@ -225,7 +225,21 @@ pub async fn run_watch(
     // after the first cycle), so the watch loop emits it here on exit.
     renderer.event(crate::log::Action::Done, "stopped watch");
     renderer.event(crate::log::Action::Watch, "stopped");
-    Ok(())
+
+    // Exit the process directly instead of returning `Ok(())` and letting
+    // `main` fall into the tokio runtime's `Drop`.
+    //
+    // The stdin reader task above is parked in a `tokio::io::stdin()`
+    // blocking read, which cannot be cancelled and only returns on EOF.
+    // Dropping the multi-threaded runtime blocks until that read completes,
+    // so a returned `Ok(())` would hang the process after Ctrl-C until the
+    // user also pressed Ctrl-D (EOF) — the exact bug this fixes. We only
+    // reach this point via the event loop's shutdown branch (Ctrl-C), so a
+    // clean `exit(0)` is the right outcome. The logger flushes on every
+    // event, so the "stopped" lines above are already on screen. Error
+    // paths still propagate through `?` and are handled by `main`'s
+    // `exit(1)`, which likewise bypasses the hanging `Drop`.
+    std::process::exit(0)
 }
 
 /// The testable inner loop: drain events, run cycles, exit on shutdown.
