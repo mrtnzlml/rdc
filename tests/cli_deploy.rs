@@ -1885,7 +1885,7 @@ async fn deploy_rewrites_organization_url_on_workspace_create() {
             "results": [{
                 "id": 500,
                 "url": format!("{}/api/v1/workspaces/500", dev_server.uri()),
-                "name": "Ferguson",
+                "name": "Main Workspace",
                 "organization": format!("{}/api/v1/organizations/111", dev_server.uri()),
                 "queues": []
             }]
@@ -1971,7 +1971,7 @@ async fn deploy_rewrites_organization_url_on_workspace_create() {
         format!("{}/api/v1/organizations/222", test_server.uri()),
         "workspace POST body must carry the TEST org URL, not the DEV one"
     );
-    assert_eq!(body["name"].as_str().unwrap(), "Ferguson");
+    assert_eq!(body["name"].as_str().unwrap(), "Main Workspace");
 }
 
 /// First deploy with hook secrets unset on the target: the precheck must
