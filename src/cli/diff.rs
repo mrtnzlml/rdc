@@ -10,7 +10,7 @@ use crate::mapping::Mapping;
 use crate::paths::Paths;
 use crate::secrets::resolve_token;
 use crate::snapshot::email_template::read_email_template;
-use crate::snapshot::hook::{read_hook, serialize_hook};
+use crate::snapshot::hook::{read_hook, serialize_hook, serialize_hook_raw};
 use crate::snapshot::inbox::read_inbox;
 use crate::snapshot::queue::read_queue;
 use crate::snapshot::schema::{read_schema, serialize_schema};
@@ -44,7 +44,7 @@ pub async fn run(left: String, right: Option<String>, raw: bool) -> Result<()> {
     }
 
     match right {
-        None => diff_local_vs_remote(&cwd, &cfg, &left).await,
+        None => diff_local_vs_remote(&cwd, &cfg, &left, raw).await,
         Some(other) => {
             if !cfg.envs.contains_key(&other) {
                 return Err(anyhow!("env '{other}' is not defined in rdc.toml"));
@@ -54,7 +54,7 @@ pub async fn run(left: String, right: Option<String>, raw: bool) -> Result<()> {
     }
 }
 
-pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) -> Result<()> {
+pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str, raw: bool) -> Result<()> {
     let env_cfg = cfg.envs.get(env).expect("env present in cfg");
     let paths = Paths::for_env(cwd, env);
     let lockfile_path = paths.lockfile();
@@ -77,7 +77,7 @@ pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str) ->
     // Hooks: combined-form (.json + .py). Parallel GETs with one batch
     // spinner; output is sorted by slug so the log is deterministic.
     if paths.hooks_dir().exists() {
-        diff_hooks(&paths, &lockfile, &client, &mut diffs_printed, &progress).await?;
+        diff_hooks(&paths, &lockfile, &client, &mut diffs_printed, &progress, raw).await?;
     }
 
     // Rules: combined-form (.json + optional .py for trigger_condition).
@@ -120,6 +120,7 @@ async fn diff_hooks(
     client: &RossumClient,
     counter: &mut usize,
     progress: &Arc<Log>,
+    raw: bool,
 ) -> Result<()> {
     use futures::stream::{StreamExt, TryStreamExt};
 
@@ -171,8 +172,10 @@ async fn diff_hooks(
     // Sort by slug, print diffs sequentially.
     fetched.sort_by(|a, b| a.0.cmp(&b.0));
     for (slug, local, remote) in fetched {
-        let (local_json, local_code) = serialize_hook(&local)?;
-        let (remote_json, remote_code) = serialize_hook(&remote)?;
+        let (local_json, local_code) =
+            if raw { serialize_hook_raw(&local)? } else { serialize_hook(&local)? };
+        let (remote_json, remote_code) =
+            if raw { serialize_hook_raw(&remote)? } else { serialize_hook(&remote)? };
 
         let lj = String::from_utf8_lossy(&local_json);
         let rj = String::from_utf8_lossy(&remote_json);

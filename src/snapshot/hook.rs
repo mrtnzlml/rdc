@@ -73,6 +73,19 @@ pub fn write_hook(dir: &Path, slug: &str, hook: &Hook) -> Result<Vec<u8>> {
     Ok(json_bytes)
 }
 
+/// Remove `config.code` (a string) from a serialized hook Value and return
+/// it for the sidecar. Shared by `serialize_hook` and `serialize_hook_raw`.
+fn split_hook_code(json_value: &mut Value) -> Option<String> {
+    json_value
+        .get_mut("config")
+        .and_then(|c| c.as_object_mut())
+        .and_then(|m| m.remove("code"))
+        .and_then(|v| match v {
+            Value::String(s) => Some(s),
+            _ => None,
+        })
+}
+
 /// Serialize a hook to its on-disk byte form WITHOUT writing. Returns the JSON
 /// bytes (post-extraction, with trailing newline) and the optional extracted
 /// code string. Used by pull/push drivers to compute `hook_combined_hash`
@@ -81,14 +94,7 @@ pub fn serialize_hook(hook: &Hook) -> Result<(Vec<u8>, Option<String>)> {
     let mut json_value = serde_json::to_value(hook)
         .context("serializing hook to value")?;
 
-    let code = json_value
-        .get_mut("config")
-        .and_then(|c| c.as_object_mut())
-        .and_then(|m| m.remove("code"))
-        .and_then(|v| match v {
-            Value::String(s) => Some(s),
-            _ => None,
-        });
+    let code = split_hook_code(&mut json_value);
 
     sort_queues(&mut json_value);
 
@@ -98,6 +104,21 @@ pub fn serialize_hook(hook: &Hook) -> Result<(Vec<u8>, Option<String>)> {
         crate::snapshot::key_order::HOOK_KEY_ORDER,
     );
 
+    let mut bytes = serde_json::to_vec_pretty(&json_value)
+        .context("serializing hook json")?;
+    bytes.push(b'\n');
+    Ok((bytes, code))
+}
+
+/// Like [`serialize_hook`] but for `rdc diff --raw`: splits code to the
+/// sidecar and tidies (sort keys + string-arrays), but does NOT strip
+/// `modified_at` and does NOT apply the curated `HOOK_KEY_ORDER`. Reveals
+/// the server-managed fields a normal diff hides.
+pub fn serialize_hook_raw(hook: &Hook) -> Result<(Vec<u8>, Option<String>)> {
+    let mut json_value = serde_json::to_value(hook)
+        .context("serializing hook to value")?;
+    let code = split_hook_code(&mut json_value);
+    crate::snapshot::noise::tidy_raw(&mut json_value);
     let mut bytes = serde_json::to_vec_pretty(&json_value)
         .context("serializing hook json")?;
     bytes.push(b'\n');
@@ -562,6 +583,30 @@ mod tests {
         let s = std::str::from_utf8(&bytes).unwrap();
         assert!(!s.contains("def x"), "code should be extracted from json");
         assert_eq!(code.as_deref(), Some("def x():\n    return 1\n"));
+    }
+
+    #[test]
+    fn serialize_hook_raw_keeps_modified_at_and_splits_code() {
+        let h: Hook = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "url": "https://x/api/v1/hooks/1",
+            "name": "h",
+            "type": "function",
+            "queues": [],
+            "events": ["annotation_status"],
+            "modified_at": "2026-01-01T00:00:00Z",
+            "config": { "runtime": "python3.12", "code": "pass\n" }
+        })).unwrap();
+
+        let (json, code) = serialize_hook_raw(&h).unwrap();
+        let s = String::from_utf8(json).unwrap();
+        assert!(s.contains("modified_at"), "raw must retain modified_at: {s}");
+        assert!(!s.contains("\"code\""), "code must be split to the sidecar");
+        assert_eq!(code.as_deref(), Some("pass\n"));
+
+        // Contrast: the canonical serializer strips modified_at.
+        let (canon, _) = serialize_hook(&h).unwrap();
+        assert!(!String::from_utf8(canon).unwrap().contains("modified_at"));
     }
 
     #[test]

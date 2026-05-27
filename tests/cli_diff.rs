@@ -566,6 +566,73 @@ cost-invoices = "cost-invoices"
         .stdout(predicate::str::contains("hooks/99").not());
 }
 
+#[tokio::test]
+async fn diff_local_remote_raw_reveals_modified_at() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server).await;
+
+    // A single hook carrying modified_at (stripped from the local snapshot
+    // on pull, present on the live remote).
+    let hook_body = serde_json::json!({
+        "id": 1,
+        "url": format!("{}/api/v1/hooks/1", server.uri()),
+        "name": "validator-invoices",
+        "type": "function",
+        "queues": [],
+        "events": ["annotation_status"],
+        "modified_at": "2026-04-01T10:00:00Z",
+        "config": { "runtime": "python3.12", "code": "pass\n" }
+    });
+    Mock::given(method("GET")).and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [hook_body.clone()]
+        })))
+        .mount(&server).await;
+    Mock::given(method("GET")).and(path("/api/v1/hooks/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(hook_body.clone()))
+        .mount(&server).await;
+    for ep in [
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/rules", "/api/v1/labels",
+        "/api/v1/engines", "/api/v1/engine_fields", "/api/v1/workflows",
+        "/api/v1/workflow_steps", "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET")).and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&server).await;
+    }
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev", "--no-push"])
+        .assert().success();
+
+    // Normal diff: modified_at stripped from both sides → silent.
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["diff", "dev"])
+        .assert().success()
+        .stdout(predicate::str::contains("no diffs"));
+
+    // --raw: remote carries modified_at, local snapshot dropped it → shown.
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["diff", "dev", "--raw"])
+        .assert().success()
+        .stdout(predicate::str::contains("modified_at"));
+}
+
 #[test]
 fn diff_snapshot_vs_snapshot_raw_reveals_id_and_url() {
     // Two hooks differing ONLY in id+url. Normal diff strips them and is
