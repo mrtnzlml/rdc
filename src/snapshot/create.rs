@@ -139,6 +139,17 @@ pub fn strip_for_cross_env_patch(body: &mut Value, kind: &str) {
     strip_for_create(body, kind);
     let Some(obj) = body.as_object_mut() else { return };
     obj.remove("organization");
+    // A hook's `token_owner` is a per-env user URL: each env's hooks point at
+    // that env's users, which aren't a deployable kind in rdc (no cross-env
+    // mapping). It always differs across envs and is never meaningful cross-env
+    // drift, so strip it from cross-env comparisons/diffs — exactly like
+    // `organization`. Deploy still sets the correct target owner explicitly via
+    // `store_extension_token_owner` before PATCH (see deploy::apply), which is
+    // independent of this strip; and `rdc diff --raw` skips this path, so it
+    // still surfaces `token_owner` when you want the unadjusted view.
+    if kind == "hooks" {
+        obj.remove("token_owner");
+    }
 }
 
 #[cfg(test)]
@@ -187,6 +198,35 @@ mod tests {
         });
         strip_for_create(&mut v, "hooks");
         assert!(!v.as_object().unwrap().contains_key("test"));
+    }
+
+    #[test]
+    fn cross_env_strip_removes_hook_token_owner_but_create_keeps_it() {
+        let body = json!({
+            "id": 1, "url": "u", "name": "h", "type": "function",
+            "token_owner": "https://x/api/v1/users/9",
+        });
+        // Within-env create/push must PRESERVE token_owner.
+        let mut create = body.clone();
+        strip_for_create(&mut create, "hooks");
+        assert!(
+            create.as_object().unwrap().contains_key("token_owner"),
+            "within-env create must keep token_owner",
+        );
+        // Cross-env strip REMOVES it (per-env user URL, never cross-env drift).
+        let mut cross = body.clone();
+        strip_for_cross_env_patch(&mut cross, "hooks");
+        assert!(
+            !cross.as_object().unwrap().contains_key("token_owner"),
+            "cross-env strip must remove hook token_owner",
+        );
+        // The token_owner strip is hooks-only — other kinds are untouched.
+        let mut q = json!({ "id": 1, "url": "u", "name": "q", "token_owner": "keep-me" });
+        strip_for_cross_env_patch(&mut q, "queues");
+        assert!(
+            q.as_object().unwrap().contains_key("token_owner"),
+            "token_owner strip must be hooks-scoped",
+        );
     }
 
     #[test]
