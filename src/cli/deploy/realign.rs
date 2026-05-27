@@ -110,8 +110,8 @@ pub fn detect(paths: &Paths, lockfile: &Lockfile) -> Vec<PendingRename> {
 
     if let Some(q_map) = lockfile.objects.get("queues") {
         for slug in q_map.keys() {
-            if let Some((ws, q_path)) = locate_queue_dir(paths, lockfile, slug) {
-                if let Some(name) = read_name(&q_path.join("queue.json")) {
+            if let Some((ws, q_path)) = locate_queue_dir(paths, lockfile, slug)
+                && let Some(name) = read_name(&q_path.join("queue.json")) {
                     let proposed = slugify(&name);
                     if proposed != *slug && !q_map.contains_key(&proposed) {
                         out.push(PendingRename::Queue {
@@ -121,7 +121,6 @@ pub fn detect(paths: &Paths, lockfile: &Lockfile) -> Vec<PendingRename> {
                         });
                     }
                 }
-            }
         }
     }
 
@@ -401,11 +400,10 @@ fn cascade_pending(rest: &mut [PendingRename], applied: &PendingRename) {
         }
         PendingRename::Queue { old, new, .. } => {
             for p in rest.iter_mut() {
-                if let PendingRename::EmailTemplate { q, .. } = p {
-                    if q == old {
+                if let PendingRename::EmailTemplate { q, .. } = p
+                    && q == old {
                         *q = new.clone();
                     }
-                }
             }
         }
         _ => {}
@@ -491,11 +489,10 @@ fn apply_one(
         PendingRename::EngineField { old, new } => {
             // Find the field under whatever engine currently owns it,
             // then rename in place inside that engine's fields/ dir.
-            if let Some(old_path) = locate_engine_field_file(paths, old) {
-                if let Some(parent) = old_path.parent() {
+            if let Some(old_path) = locate_engine_field_file(paths, old)
+                && let Some(parent) = old_path.parent() {
                     move_file(&old_path, &parent.join(format!("{new}.json")))?;
                 }
-            }
             rename_lockfile_key(lockfile, "engine_fields", old, new);
             collect_orphans(paths, "engine_fields", old, &mut orphans);
         }
@@ -507,11 +504,10 @@ fn apply_one(
             collect_orphans(paths, "workflows", old, &mut orphans);
         }
         PendingRename::WorkflowStep { old, new } => {
-            if let Some(old_path) = locate_workflow_step_file(paths, old) {
-                if let Some(parent) = old_path.parent() {
+            if let Some(old_path) = locate_workflow_step_file(paths, old)
+                && let Some(parent) = old_path.parent() {
                     move_file(&old_path, &parent.join(format!("{new}.json")))?;
                 }
-            }
             rename_lockfile_key(lockfile, "workflow_steps", old, new);
         }
         PendingRename::EmailTemplate { ws, q, old, new } => {

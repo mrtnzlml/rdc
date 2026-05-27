@@ -172,25 +172,23 @@ pub async fn process(
                 &format!("migrated mdh/{slug}: removed obsolete collection.json"),
             );
         }
-        if let Some(map) = ctx.lockfile.objects.get_mut("mdh_collections") {
-            if map.remove(&slug).is_some() {
+        if let Some(map) = ctx.lockfile.objects.get_mut("mdh_collections")
+            && map.remove(&slug).is_some() {
                 progress.event(
                     Action::Info,
                     &format!("migrated mdh/{slug}: dropped mdh_collections lockfile entry"),
                 );
             }
-        }
 
         dataset_dirs.push((slug.clone(), dataset_dir, c));
     }
     // Clean up the lockfile's `mdh_collections` key entirely if it ended
     // up empty after migration. Leaves the json clean for users grepping
     // the lockfile.
-    if let Some(map) = ctx.lockfile.objects.get("mdh_collections") {
-        if map.is_empty() {
+    if let Some(map) = ctx.lockfile.objects.get("mdh_collections")
+        && map.is_empty() {
             ctx.lockfile.objects.remove("mdh_collections");
         }
-    }
 
     // === Sub-phase B: concurrent index fetches per collection (regular +
     //            search). Bounded fan-out (see common::PULL_FANOUT). A single

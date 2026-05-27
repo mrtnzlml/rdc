@@ -10,11 +10,10 @@ use std::path::Path;
 /// so a no-op `rdc pull` doesn't bump mtimes on every file (otherwise every
 /// re-pull would look like "everything changed" to mtime-aware tools).
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Ok(existing) = fs::read(path) {
-        if existing == bytes {
+    if let Ok(existing) = fs::read(path)
+        && existing == bytes {
             return Ok(());
         }
-    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating parent dir {}", parent.display()))?;

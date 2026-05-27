@@ -104,7 +104,7 @@ pub async fn push(
         let remote_bytes = maybe_strip_overlay(remote_bytes, overlay_paths)?;
         let remote_combined = content_hash(&remote_bytes);
         let mut payload_to_send = payload_workspace;
-        if &remote_combined != &base {
+        if remote_combined != base {
             use crate::cli::resolve::{resolve_push_drift, PushDriftOutcome};
             match resolve_push_drift(interactive, ws_path, &remote_bytes, env)? {
                 PushDriftOutcome::Patch { payload_override } => {

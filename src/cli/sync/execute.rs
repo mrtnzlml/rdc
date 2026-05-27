@@ -753,7 +753,8 @@ fn resolve_one_conflict<R: BufRead>(
                         // first one for visibility.
                         let queue_dir = local_path.parent().unwrap_or(&local_path);
                         let formulas_dir = queue_dir.join("formulas");
-                        let representative = remote_formulas
+                        
+                        remote_formulas
                             .iter()
                             .find(|(id, bytes)| {
                                 local_formulas
@@ -775,8 +776,7 @@ fn resolve_one_conflict<R: BufRead>(
                                     bytes.clone(),
                                 )
                             })
-                            .unwrap_or_else(|| (local_path.clone(), remote_bytes.clone()));
-                        representative
+                            .unwrap_or_else(|| (local_path.clone(), remote_bytes.clone()))
                     }
                     HashStrategy::Flat => (local_path.clone(), remote_bytes.clone()),
                 }
@@ -1112,12 +1112,11 @@ fn resolve_one_conflict<R: BufRead>(
 fn sidecar_path_for_conflict(local_path: &Path, strategy: HashStrategy) -> PathBuf {
     match strategy {
         HashStrategy::Hook => {
-            if let Ok(bytes) = std::fs::read(local_path) {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if let Ok(bytes) = std::fs::read(local_path)
+                && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                     let ext = crate::snapshot::hook::hook_code_extension_from_value(&v);
                     return local_path.with_extension(ext);
                 }
-            }
             local_path.with_extension("py")
         }
         // Rules, Flat, and Mdh — `trigger_condition` is always Python
@@ -1692,8 +1691,8 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             if matches!(
                                 refs.hash_strategy,
                                 HashStrategy::Hook | HashStrategy::Rule
-                            ) {
-                                if let Some(code) = refs.restore_code.as_ref() {
+                            )
+                                && let Some(code) = refs.restore_code.as_ref() {
                                     let restored_code_path =
                                         if matches!(refs.hash_strategy, HashStrategy::Hook) {
                                             sidecar_path_for_remote(&local_path, bytes)
@@ -1702,7 +1701,6 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                                         };
                                     write_atomic(&restored_code_path, code.as_bytes())?;
                                 }
-                            }
                         }
                         None => {
                             progress.event(Action::Warn, &format!(

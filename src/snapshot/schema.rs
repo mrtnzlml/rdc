@@ -49,13 +49,12 @@ pub fn read_schema_value(queue_dir: &Path) -> Result<Value> {
         .with_context(|| format!("parsing {}", json_path.display()))?;
 
     let formulas_dir = queue_dir.join("formulas");
-    if formulas_dir.is_dir() {
-        if let Some(content) = value.get_mut("content").and_then(|c| c.as_array_mut()) {
+    if formulas_dir.is_dir()
+        && let Some(content) = value.get_mut("content").and_then(|c| c.as_array_mut()) {
             for node in content.iter_mut() {
                 merge_formulas(node, &formulas_dir)?;
             }
         }
-    }
 
     Ok(value)
 }
@@ -152,11 +151,10 @@ fn extract_formulas(node: &mut Value, out: &mut Vec<(String, String)>) {
     let is_datapoint = obj.get("category").and_then(|c| c.as_str()) == Some("datapoint");
     if is_datapoint {
         let id = obj.get("id").and_then(|i| i.as_str()).map(|s| s.to_string());
-        if let Some(id) = id {
-            if let Some(Value::String(formula)) = obj.remove("formula") {
+        if let Some(id) = id
+            && let Some(Value::String(formula)) = obj.remove("formula") {
                 out.push((id, formula));
             }
-        }
     }
 
     match obj.get_mut("children") {

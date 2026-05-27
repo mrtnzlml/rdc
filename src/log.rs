@@ -418,7 +418,7 @@ mod log_tests {
         let log = Log::for_test_with_time(
             ColorMode::Plain,
             Box::new(buf.clone()),
-            UNIX_EPOCH + Duration::from_secs(12 * 3600 + 1 * 60 + 14), // 12:01:14
+            UNIX_EPOCH + Duration::from_secs(12 * 3600 + 60 + 14), // 12:01:14
         );
         log.event(Action::Push, "rule/finance-totals PATCH 412ms");
         assert_eq!(buf.text(), "12:01:14 push   rule/finance-totals PATCH 412ms\n");
@@ -430,7 +430,7 @@ mod log_tests {
         let log = Log::for_test_with_time(
             ColorMode::Plain,
             Box::new(buf.clone()),
-            UNIX_EPOCH + Duration::from_secs(12 * 3600 + 1 * 60 + 14),
+            UNIX_EPOCH + Duration::from_secs(12 * 3600 + 60 + 14),
         );
         for a in [Action::Sync, Action::Push, Action::Patch, Action::Delete, Action::Upgr] {
             log.event(a, "x");
@@ -472,7 +472,7 @@ mod log_tests {
         let log = Log::for_test_with_time(
             ColorMode::Plain,
             Box::new(buf.clone()),
-            UNIX_EPOCH + Duration::from_secs(12 * 3600 + 1 * 60 + 14),
+            UNIX_EPOCH + Duration::from_secs(12 * 3600 + 60 + 14),
         );
         for a in [Action::Sync, Action::Push, Action::Done, Action::Warn, Action::Fail, Action::Skip] {
             log.event(a, "x");
@@ -491,7 +491,7 @@ mod log_tests {
         let log = Log::for_test_with_time(
             ColorMode::Plain,
             Box::new(buf.clone()),
-            UNIX_EPOCH + Duration::from_secs(12 * 3600 + 1 * 60 + 14),
+            UNIX_EPOCH + Duration::from_secs(12 * 3600 + 60 + 14),
         );
         log.tick_status(Action::Watch, "next sync in 33s ▰▱▱");
         assert_eq!(buf.text(), "", "tick_status must not emit on non-TTY");
@@ -503,7 +503,7 @@ mod log_tests {
         let log = Log::for_test_tty_with_time(
             ColorMode::Plain,
             Box::new(buf.clone()),
-            UNIX_EPOCH + Duration::from_secs(12 * 3600 + 1 * 60 + 14),
+            UNIX_EPOCH + Duration::from_secs(12 * 3600 + 60 + 14),
         );
         log.tick_status(Action::Watch, "next sync in 33s ▰▱▱");
         // Carriage return, content, clear-to-EOL — no newline.
@@ -519,7 +519,7 @@ mod log_tests {
         let log = Log::for_test_tty_with_time(
             ColorMode::Plain,
             Box::new(buf.clone()),
-            UNIX_EPOCH + Duration::from_secs(12 * 3600 + 1 * 60 + 14),
+            UNIX_EPOCH + Duration::from_secs(12 * 3600 + 60 + 14),
         );
         log.tick_status(Action::Watch, "next sync in 33s ▰▱▱");
         log.event(Action::Sync, "start envs/test");
@@ -538,7 +538,7 @@ mod log_tests {
         let log = Log::for_test_tty_with_time(
             ColorMode::Plain,
             Box::new(buf.clone()),
-            UNIX_EPOCH + Duration::from_secs(12 * 3600 + 1 * 60 + 14),
+            UNIX_EPOCH + Duration::from_secs(12 * 3600 + 60 + 14),
         );
         log.tick_status(Action::Watch, "next sync in 5s ▰▰▰");
         log.finish_status();

@@ -200,16 +200,15 @@ fn resolve_token_lookup_from_at<F: Fn(&str) -> Option<String>>(
     let pass_var = env_var_for(env, "PASS");
 
     // 1. RDC_TOKEN_<ENV> override always wins.
-    if let Some(t) = get_env(&token_var) {
-        if !t.is_empty() {
+    if let Some(t) = get_env(&token_var)
+        && !t.is_empty() {
             return Ok(TokenLookup::Cached { token: t, expires_at: None });
         }
-    }
 
     // 2. Cached token in secrets/<env>.secrets.json, if still valid.
     let file = read_secrets_file(project_root, env)?;
-    if let Some(ref token) = file.api_token {
-        if !token.is_empty() {
+    if let Some(ref token) = file.api_token
+        && !token.is_empty() {
             let is_valid = match file.expires_at {
                 None => true, // no expiry tracking; treat as valid
                 Some(exp) => exp > now_unix_secs.saturating_add(TOKEN_EXPIRY_SKEW_SECS),
@@ -221,18 +220,16 @@ fn resolve_token_lookup_from_at<F: Fn(&str) -> Option<String>>(
                 });
             }
         }
-    }
 
     // 3a. Username + password persisted in the secrets file (desktop app
     // password-mode). Same NeedsLogin contract as the env-var path below.
-    if let (Some(u), Some(p)) = (file.username.as_deref(), file.password.as_deref()) {
-        if !u.is_empty() && !p.is_empty() {
+    if let (Some(u), Some(p)) = (file.username.as_deref(), file.password.as_deref())
+        && !u.is_empty() && !p.is_empty() {
             return Ok(TokenLookup::NeedsLogin {
                 username: u.to_string(),
                 password: p.to_string(),
             });
         }
-    }
 
     // 3b. RDC_USER_<ENV> + RDC_PASS_<ENV> creds for a fresh login.
     let user_opt = get_env(&user_var).filter(|s| !s.is_empty());
@@ -461,7 +458,7 @@ pub fn write_hook_secrets_template(
     for (slug, required) in required_per_slug {
         let entry = merged.entry(slug.clone()).or_default();
         for key in required {
-            entry.entry(key.clone()).or_insert_with(String::new);
+            entry.entry(key.clone()).or_default();
         }
     }
 

@@ -341,8 +341,8 @@ fn normalize_for_diff(rel: &str, bytes: &[u8], rewrite_ctx: Option<&RewriteCtx<'
         }
         return bytes.to_vec();
     }
-    if let Some(kind) = kind_from_relative_path(rel) {
-        if let Ok(normalized) =
+    if let Some(kind) = kind_from_relative_path(rel)
+        && let Ok(normalized) =
             crate::cli::deploy::common::normalize_for_cross_env_compare(bytes, kind)
         {
             // If we have a mapping context, rewrite cross-reference URLs
@@ -353,16 +353,14 @@ fn normalize_for_diff(rel: &str, bytes: &[u8], rewrite_ctx: Option<&RewriteCtx<'
             }
             return normalized;
         }
-    }
     // Fall back to pretty-print so the diff is still per-field readable.
-    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
-        if let Ok(mut pretty) = serde_json::to_vec_pretty(&value) {
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes)
+        && let Ok(mut pretty) = serde_json::to_vec_pretty(&value) {
             if !pretty.ends_with(b"\n") {
                 pretty.push(b'\n');
             }
             return pretty;
         }
-    }
     bytes.to_vec()
 }
 
@@ -880,27 +878,24 @@ async fn diff_queue_tree(
             let q_slug = q_entry.file_name().to_string_lossy().to_string();
             let queue_dir = paths.queue_dir(&ws_slug, &q_slug);
 
-            if queue_dir.join("queue.json").exists() {
-                if let (Ok(local), Some(id)) =
+            if queue_dir.join("queue.json").exists()
+                && let (Ok(local), Some(id)) =
                     (read_queue(&queue_dir), lookup_id(lockfile, "queues", &q_slug))
                 {
                     queue_items.push((q_slug.clone(), local, id));
                 }
-            }
-            if queue_dir.join("schema.json").exists() {
-                if let (Ok(local), Some(id)) =
+            if queue_dir.join("schema.json").exists()
+                && let (Ok(local), Some(id)) =
                     (read_schema(&queue_dir), lookup_id(lockfile, "schemas", &q_slug))
                 {
                     schema_items.push((q_slug.clone(), local, id));
                 }
-            }
-            if queue_dir.join("inbox.json").exists() {
-                if let (Ok(local), Some(id)) =
+            if queue_dir.join("inbox.json").exists()
+                && let (Ok(local), Some(id)) =
                     (read_inbox(&queue_dir), lookup_id(lockfile, "inboxes", &q_slug))
                 {
                     inbox_items.push((q_slug.clone(), local, id));
                 }
-            }
             let templates_dir = paths.queue_email_templates_dir(&ws_slug, &q_slug);
             if templates_dir.exists() {
                 for t_entry in std::fs::read_dir(&templates_dir)? {
