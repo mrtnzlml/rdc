@@ -4,6 +4,9 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use std::path::Path;
 
+/// `(schema JSON bytes, [(field_id, formula bytes)])` — the on-disk split form.
+type SchemaJsonAndFormulas = (Vec<u8>, Vec<(String, Vec<u8>)>);
+
 /// Write a schema to `<queue_dir>/schema.json`, extracting any formula field
 /// `formula` strings into `<queue_dir>/formulas/<field_id>.py` files.
 /// Returns the post-extraction JSON bytes (used for content_hash via
@@ -87,7 +90,7 @@ fn split_schema_formulas(value: &mut Value) -> Vec<(String, Vec<u8>)> {
 /// JSON bytes (post-extraction) and the list of `(field_id, formula_bytes)`
 /// pairs sorted by field_id. Used by the queues driver to compute
 /// `schema_combined_hash` for 3-way merge before deciding whether to write.
-pub fn serialize_schema(schema: &Schema) -> Result<(Vec<u8>, Vec<(String, Vec<u8>)>)> {
+pub fn serialize_schema(schema: &Schema) -> Result<SchemaJsonAndFormulas> {
     let mut value = serde_json::to_value(schema)
         .context("serializing schema to value")?;
 
@@ -104,7 +107,7 @@ pub fn serialize_schema(schema: &Schema) -> Result<(Vec<u8>, Vec<(String, Vec<u8
 
 /// Like [`serialize_schema`] but for `rdc diff --raw`: splits formulas to
 /// sidecars and tidies, without stripping server-managed fields.
-pub fn serialize_schema_raw(schema: &Schema) -> Result<(Vec<u8>, Vec<(String, Vec<u8>)>)> {
+pub fn serialize_schema_raw(schema: &Schema) -> Result<SchemaJsonAndFormulas> {
     let mut value = serde_json::to_value(schema).context("serializing schema to value")?;
     let formulas = split_schema_formulas(&mut value);
     crate::snapshot::noise::tidy_raw(&mut value);

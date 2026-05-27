@@ -938,7 +938,6 @@ async fn diff_queue_tree(
         schema_items,
         progress,
         |id, prog| {
-            let client = client;
             async move { client.get_schema(id, Some(prog)).await }
         },
     )
@@ -950,7 +949,6 @@ async fn diff_queue_tree(
         inbox_items,
         progress,
         |id, prog| {
-            let client = client;
             async move { client.get_inbox(id, Some(prog)).await }
         },
     )
@@ -1077,7 +1075,6 @@ where
         .map(|(slug, local, id)| {
             let progress = progress.clone();
             let fetch = &fetch;
-            let kind_label = kind_label;
             async move {
                 let remote = fetch(id, progress.clone())
                     .await

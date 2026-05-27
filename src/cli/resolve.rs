@@ -1726,10 +1726,11 @@ fn render_content(
         }
         let seg_fg = fg.iter().find(|(s, e, _)| *s <= a && a < *e).map(|(_, _, c)| *c);
         let seg_emph = emph.iter().any(|(s, e)| *s <= a && a < *e);
-        if base_bg.is_some() && seg_emph != cur_emph {
-            out.push_str(if seg_emph { hi_bg } else { base_bg.unwrap() });
-            cur_emph = seg_emph;
-        }
+        if let Some(bg) = base_bg
+            && seg_emph != cur_emph {
+                out.push_str(if seg_emph { hi_bg } else { bg });
+                cur_emph = seg_emph;
+            }
         if seg_fg != cur_fg {
             out.push_str(seg_fg.unwrap_or(SGR_FG_DEFAULT));
             cur_fg = seg_fg;

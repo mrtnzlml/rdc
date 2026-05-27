@@ -1,3 +1,7 @@
+// The cwd_lock() guard is intentionally held across .await to serialize
+// tests that mutate the process-wide current directory.
+#![allow(clippy::await_holding_lock)]
+
 //! Integration smoke test for `rdc sync` (Task 13).
 //!
 //! Exercises the clean-env happy path: API returns empty listings, local

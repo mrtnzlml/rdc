@@ -7,6 +7,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+/// `(queue_id, optional schema, optional inbox)` — one fetched queue row.
+type QueueSchemaInboxRow = (u64, Option<crate::model::Schema>, Option<crate::model::Inbox>);
+
 /// If `result` is a 403 permission_denied from the Rossum API, log a warning
 /// and return an empty list — the kind is unavailable to this token, but
 /// other kinds should still pull. Otherwise propagate the error unchanged.
@@ -167,7 +170,6 @@ pub async fn list_remote(
 
     let results: Vec<Listed> = futures::stream::iter(kinds.iter().copied())
         .map(|kind| {
-            let progress = progress;
             async move {
                 // Force a yield BEFORE each list call so the runtime can
                 // service other tasks (e.g. the watch-mode poll timer)
@@ -376,7 +378,7 @@ async fn prefetch_queue_children(
         return Ok((std::collections::BTreeMap::new(), std::collections::BTreeMap::new()));
     }
 
-    let fetched_result: Result<Vec<(u64, Option<crate::model::Schema>, Option<crate::model::Inbox>)>> =
+    let fetched_result: Result<Vec<QueueSchemaInboxRow>> =
         futures::stream::iter(triples)
             .map(|(qid, qname, sid, iid)| {
                 let progress = progress.clone();

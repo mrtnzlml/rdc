@@ -9,8 +9,8 @@
 //!    - TTY with `--allow-deletes`: prompt skipped, proceed.
 //!    - Non-TTY without `--allow-deletes`: refuse (non-zero exit). CI
 //!      pipelines must pass the flag to authorise destructive deletes.
-//!    `--yes` does NOT bypass this — two intentional acts are required
-//!    to destroy remote state.
+//!      `--yes` does NOT bypass this — two intentional acts are required
+//!      to destroy remote state.
 //!
 //! 2. **Cascade order.** Children before parents, reverse of the create
 //!    order: `engine_fields → engines → labels → rules → hooks →
