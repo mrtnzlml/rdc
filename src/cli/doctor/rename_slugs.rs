@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-/// Offline repair: rename any local file whose slug no longer matches
+/// Offline realign: rename any local file whose slug no longer matches
 /// its JSON `name` field. Delegates to the existing within-env realign
 /// flow. No API calls.
 pub async fn run(env: &str, check: bool, yes: bool) -> Result<()> {

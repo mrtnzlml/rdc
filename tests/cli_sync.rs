@@ -4256,7 +4256,7 @@ async fn sync_schema_conflict_json_and_formula_both_edited_never_silently_pushes
 }
 
 // ====================================================================
-// Regression: `rdc repair --rebuild-lock` followed by `rdc sync` must
+// Regression: `rdc doctor --rebuild-lock` followed by `rdc sync` must
 // not panic on the classifier's `(local_changed=true, local_tombstoned=
 // false, remote_present=true, locked_present=false)` cell. This used to
 // fall into the catch-all panic arm because no class covered the
@@ -4350,7 +4350,7 @@ async fn sync_after_rebuild_lock_in_sync_label_yields_clean_and_rebuilds_lockfil
     // rebuild-lock → sync round trip byte-for-byte.
     let local_before = std::fs::read(&label_path).unwrap();
 
-    // Simulate `rdc repair --rebuild-lock`: wipe the lockfile but leave
+    // Simulate `rdc doctor --rebuild-lock`: wipe the lockfile but leave
     // the local snapshot file on disk. The remote still serves the same
     // body. Classifier will see: local_changed=true (no lockfile to
     // compare), remote_present=true, locked_present=false → the
@@ -4499,7 +4499,7 @@ async fn sync_after_rebuild_lock_diverged_label_does_not_panic_and_does_not_sile
     let local_edited_bytes = format!("{}\n", serde_json::to_string_pretty(&v).unwrap());
     std::fs::write(&label_path, &local_edited_bytes).unwrap();
 
-    // Simulate `rdc repair --rebuild-lock`: wipe the lockfile. The
+    // Simulate `rdc doctor --rebuild-lock`: wipe the lockfile. The
     // local edit stays on disk. Remote still serves the original body.
     let lockfile_path = project.path().join(".rdc/state/dev.lock.json");
     std::fs::remove_file(&lockfile_path).unwrap();
@@ -4953,5 +4953,5 @@ async fn pull_warns_on_anomalous_store_extension() {
         .assert().success()
         .stderr(predicates::str::contains("broken-store-hook"))
         .stderr(predicates::str::contains("hook_template"))
-        .stderr(predicates::str::contains("--fix-store-anomaly"));
+        .stderr(predicates::str::contains("rdc doctor"));
 }

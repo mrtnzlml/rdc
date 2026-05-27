@@ -79,7 +79,7 @@ pub fn classify(
             (true,  false, false, true) => SyncClass::LocalEditRemoteDelete,
             (false, true,  true,  true) if remote_hash != base_hash => SyncClass::LocalDeleteRemoteEdit,
 
-            // Lockfile entry missing (e.g., after `rdc repair --rebuild-lock`
+            // Lockfile entry missing (e.g., after `rdc doctor --rebuild-lock`
             // or a fresh checkout where the file pre-exists), local and
             // remote both present. If they agree, treat as `Clean` — the
             // executor will record the hash, effectively rebuilding the
@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(class_of(&result, "v1"), &SyncClass::LocalDeleteRemoteEdit);
     }
 
-    /// Regression: simulates a post-`rdc repair --rebuild-lock` state where
+    /// Regression: simulates a post-`rdc doctor --rebuild-lock` state where
     /// the lockfile is empty but local and remote happen to be byte-equivalent.
     /// `scan` reports the local file as changed (no lockfile entry to compare
     /// against), the remote listing has the same hash, and the classifier

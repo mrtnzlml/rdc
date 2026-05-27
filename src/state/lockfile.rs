@@ -85,7 +85,7 @@ impl Lockfile {
             v => {
                 anyhow::bail!(
                     "lockfile {} has unknown version {} (this rdc supports version {}). \
-                    Run `rdc repair --rebuild-lock <env>` to reconstruct it.",
+                    Run `rdc doctor --rebuild-lock <env>` to reconstruct it.",
                     path.display(),
                     v,
                     LOCKFILE_VERSION
