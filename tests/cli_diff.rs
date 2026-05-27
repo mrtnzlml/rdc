@@ -684,3 +684,47 @@ fn diff_snapshot_vs_snapshot_raw_reveals_id_and_url() {
         .stdout(predicate::str::contains("hooks/99"))
         .stdout(predicate::str::contains("no diffs").not());
 }
+
+#[test]
+fn diff_snapshot_vs_snapshot_strips_hook_token_owner() {
+    // token_owner is a per-env user URL. The default cross-env diff must stay
+    // quiet on it (like id/url/organization); --raw still reveals it.
+    let project = TempDir::new().unwrap();
+    write_two_env_project(project.path());
+
+    let hook = |owner: &str| serde_json::json!({
+        "id": 1,
+        "url": "https://shared.rossum.app/api/v1/hooks/1",
+        "name": "index-doctor",
+        "type": "function",
+        "events": ["annotation_status"],
+        "queues": [],
+        "token_owner": owner,
+        "config": { "runtime": "python3.12", "code": "pass\n" }
+    });
+    std::fs::write(
+        project.path().join("envs/test/hooks/index-doctor.json"),
+        serde_json::to_string_pretty(&hook("https://test.rossum.app/api/v1/users/222")).unwrap(),
+    ).unwrap();
+    std::fs::write(
+        project.path().join("envs/prod/hooks/index-doctor.json"),
+        serde_json::to_string_pretty(&hook("https://prod.rossum.app/api/v1/users/333")).unwrap(),
+    ).unwrap();
+
+    // Default diff: the two hooks differ ONLY in token_owner → stripped → silent.
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["diff", "test", "prod"])
+        .assert().success()
+        .stdout(predicate::str::contains("no diffs"));
+
+    // --raw reveals token_owner and both per-env user URLs.
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["diff", "test", "prod", "--raw"])
+        .assert().success()
+        .stdout(predicate::str::contains("token_owner"))
+        .stdout(predicate::str::contains("users/222"))
+        .stdout(predicate::str::contains("users/333"))
+        .stdout(predicate::str::contains("no diffs").not());
+}
