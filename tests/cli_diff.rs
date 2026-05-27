@@ -565,3 +565,55 @@ cost-invoices = "cost-invoices"
         .stdout(predicate::str::contains("hooks/42").not())
         .stdout(predicate::str::contains("hooks/99").not());
 }
+
+#[test]
+fn diff_snapshot_vs_snapshot_raw_reveals_id_and_url() {
+    // Two hooks differing ONLY in id+url. Normal diff strips them and is
+    // silent; --raw must reveal both.
+    let project = TempDir::new().unwrap();
+    write_two_env_project(project.path());
+
+    let hook_test = serde_json::json!({
+        "id": 42,
+        "url": "https://test.rossum.app/api/v1/hooks/42",
+        "name": "validator-invoices",
+        "type": "function",
+        "events": ["annotation_status"],
+        "queues": [],
+        "config": { "runtime": "python3.12", "code": "pass\n" }
+    });
+    let hook_prod = serde_json::json!({
+        "id": 99,
+        "url": "https://prod.rossum.app/api/v1/hooks/99",
+        "name": "validator-invoices",
+        "type": "function",
+        "events": ["annotation_status"],
+        "queues": [],
+        "config": { "runtime": "python3.12", "code": "pass\n" }
+    });
+    std::fs::write(
+        project.path().join("envs/test/hooks/validator-invoices.json"),
+        serde_json::to_string_pretty(&hook_test).unwrap(),
+    ).unwrap();
+    std::fs::write(
+        project.path().join("envs/prod/hooks/validator-invoices.json"),
+        serde_json::to_string_pretty(&hook_prod).unwrap(),
+    ).unwrap();
+
+    // Sanity: normal diff is silent.
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["diff", "test", "prod"])
+        .assert().success()
+        .stdout(predicate::str::contains("no diffs"));
+
+    // --raw reveals id + both urls.
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["diff", "test", "prod", "--raw"])
+        .assert().success()
+        .stdout(predicate::str::contains("\"id\""))
+        .stdout(predicate::str::contains("hooks/42"))
+        .stdout(predicate::str::contains("hooks/99"))
+        .stdout(predicate::str::contains("no diffs").not());
+}

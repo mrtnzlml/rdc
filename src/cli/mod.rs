@@ -201,6 +201,12 @@ pub enum Command {
         left: String,
         #[arg(add = ArgValueCandidates::new(env_name_candidates))]
         right: Option<String>,
+        /// Show the unadjusted diff: reveal id/url/organization, server
+        /// back-references, modified_at/modifier, and un-rewritten
+        /// cross-reference URLs. Keys and string-arrays stay sorted for
+        /// readability.
+        #[arg(long)]
+        raw: bool,
     },
     /// Set or refresh an env's API token. Validates the token before
     /// writing to `secrets/<env>.secrets.json` (mode 0600 on Unix).
@@ -334,7 +340,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             })
             .await
         }
-        Some(Command::Diff { left, right }) => crate::cli::diff::run(left, right).await,
+        Some(Command::Diff { left, right, raw }) => crate::cli::diff::run(left, right, raw).await,
         Some(Command::Auth { env, token, username }) => {
             let env = crate::cli::env_picker::pick_env("Set token for which env?", env)?;
             crate::cli::auth::run(&env, token, username).await
