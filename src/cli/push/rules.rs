@@ -103,7 +103,7 @@ pub async fn push(
         let remote_json_stripped = maybe_strip_overlay(remote_json_full, overlay_paths)?;
         let remote_combined = rule_combined_hash(&remote_json_stripped, &remote_code);
         let mut payload_to_send = payload_rule;
-        if &remote_combined != &base {
+        if remote_combined != base {
             use crate::cli::resolve::{resolve_push_drift, PushDriftOutcome};
             match resolve_push_drift(interactive, local_json_path, &remote_json_stripped, env)? {
                 PushDriftOutcome::Patch { payload_override } => {

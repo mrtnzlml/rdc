@@ -367,18 +367,9 @@ async fn fetch_remote_modified_at(
         },
         // No direct get_* for these kinds → use list + filter (one
         // list call per kind, irrespective of tombstone count).
-        "labels" => match client.list_labels(None).await?.into_iter().find(|x| x.id == id) {
-            Some(x) => Some(x.modified_at().map(|s| s.to_string())),
-            None => None,
-        },
-        "rules" => match client.list_rules(None).await?.into_iter().find(|x| x.id == id) {
-            Some(x) => Some(x.modified_at().map(|s| s.to_string())),
-            None => None,
-        },
-        "queues" => match client.list_queues(None).await?.into_iter().find(|x| x.id == id) {
-            Some(x) => Some(x.modified_at().map(|s| s.to_string())),
-            None => None,
-        },
+        "labels" => client.list_labels(None).await?.into_iter().find(|x| x.id == id).map(|x| x.modified_at().map(|s| s.to_string())),
+        "rules" => client.list_rules(None).await?.into_iter().find(|x| x.id == id).map(|x| x.modified_at().map(|s| s.to_string())),
+        "queues" => client.list_queues(None).await?.into_iter().find(|x| x.id == id).map(|x| x.modified_at().map(|s| s.to_string())),
         // Engines / engine_fields don't expose modified_at on their
         // model today; existence is the best signal we have. Treat
         // "exists" as "not drifted" so the user isn't prompted for
@@ -390,15 +381,11 @@ async fn fetch_remote_modified_at(
             .into_iter()
             .find(|x| x.id == id)
             .map(|_| None),
-        "email_templates" => match client
+        "email_templates" => client
             .list_email_templates(None)
             .await?
             .into_iter()
-            .find(|x| x.id == id)
-        {
-            Some(x) => Some(x.modified_at().map(|s| s.to_string())),
-            None => None,
-        },
+            .find(|x| x.id == id).map(|x| x.modified_at().map(|s| s.to_string())),
         _ => None,
     })
 }

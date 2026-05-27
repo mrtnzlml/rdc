@@ -159,11 +159,10 @@ impl Matcher {
     }
 
     pub(crate) fn matches(&self, kind: &str, slug: &str) -> bool {
-        if let Some(k) = &self.kind {
-            if k != kind {
+        if let Some(k) = &self.kind
+            && k != kind {
                 return false;
             }
-        }
         glob_matches(&self.slug_pattern, slug)
     }
 }

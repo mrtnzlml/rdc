@@ -555,7 +555,7 @@ async fn list_users_paginates() {
     Mock::given(method("GET"))
         .and(path("/api/v1/users"))
         .and(header("Authorization", "token TEST_TOKEN"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&json!({
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "pagination": { "next": null },
             "results": [
                 {"id": 938493, "url": format!("{}/api/v1/users/938493", server.uri()),

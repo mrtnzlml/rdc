@@ -27,7 +27,7 @@ pub fn pick_env_excluding(
     let mut envs: Vec<String> = cfg
         .envs
         .keys()
-        .filter(|n| !exclude.iter().any(|x| *x == n.as_str()))
+        .filter(|n| !exclude.contains(&n.as_str()))
         .cloned()
         .collect();
     envs.sort();

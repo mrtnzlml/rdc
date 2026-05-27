@@ -239,7 +239,7 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
         &src_client,
         &src_lockfile,
         &tgt_hook_secrets,
-        hook_slugs_in_scope.into_iter(),
+        hook_slugs_in_scope,
         tgt,
         tgt_paths.root(),
     )

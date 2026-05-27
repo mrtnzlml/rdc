@@ -388,14 +388,13 @@ pub async fn create_hook(
         // hook secrets so the just-installed store extension carries
         // the right values from the very first PATCH (no second pass).
         let mut reconcile_body = body;
-        if let Some(secrets) = ctx.hook_secrets_plan.for_slug(slug) {
-            if let Some(obj) = reconcile_body.as_object_mut() {
+        if let Some(secrets) = ctx.hook_secrets_plan.for_slug(slug)
+            && let Some(obj) = reconcile_body.as_object_mut() {
                 obj.insert(
                     "secrets".to_string(),
                     serde_json::to_value(secrets).expect("BTreeMap<String,String> serializes"),
                 );
             }
-        }
         ctx.tgt_client
             .update_hook_value(installed_id, &reconcile_body, None)
             .await
@@ -434,14 +433,13 @@ pub async fn create_hook(
         // built with the source's `secrets_keys` as the canonical key
         // set; extras in the target file have already been filtered out
         // and warned about by `hook_secrets::precheck`.
-        if let Some(secrets) = ctx.hook_secrets_plan.for_slug(slug) {
-            if let Some(obj) = body.as_object_mut() {
+        if let Some(secrets) = ctx.hook_secrets_plan.for_slug(slug)
+            && let Some(obj) = body.as_object_mut() {
                 obj.insert(
                     "secrets".to_string(),
                     serde_json::to_value(secrets).expect("BTreeMap<String,String> serializes"),
                 );
             }
-        }
         ctx.tgt_client
             .create_hook(&body, None)
             .await

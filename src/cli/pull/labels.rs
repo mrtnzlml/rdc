@@ -103,7 +103,7 @@ mod tests {
     use crate::paths::Paths;
     use crate::state::Lockfile;
     use serde_json::Value;
-    use std::collections::BTreeMap;
+    
 
     fn mk_label(id: u64, name: &str) -> Label {
         Label {
