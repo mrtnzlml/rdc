@@ -1,4 +1,4 @@
-//! `rdc repair <env> --fix-store-anomaly` — repair hooks with
+//! `rdc doctor <env>` — fix hooks with
 //! `extension_source: "rossum_store"` and `hook_template: null`.
 //!
 //! Two cures, picked interactively per hook:
@@ -116,7 +116,7 @@ pub async fn run(env: &str, check: bool, yes: bool) -> Result<()> {
     lockfile.save(&paths.lockfile())
         .with_context(|| format!("saving lockfile to {}", paths.lockfile().display()))?;
 
-    log.event(Action::Repair, &format!(
+    log.event(Action::Doctor, &format!(
         "done env '{env}': {fixed} fixed, {skipped} skipped"
     ));
     Ok(())
@@ -169,7 +169,7 @@ async fn convert_to_custom(
         },
     );
     log.event(
-        Action::Repair,
+        Action::Doctor,
         &format!("hooks/{slug} (id {}) \u{2192} converted to custom", updated.id),
     );
     Ok(())
@@ -179,7 +179,7 @@ async fn convert_to_custom(
 /// for an anomalous hook. Errors describe what the user must do to
 /// disambiguate. Mirrors `build_template_url_map` in
 /// `cli::deploy::store_extensions` but for the single-env case where
-/// the user is repairing an existing hook.
+/// the user is fixing an existing hook.
 pub fn match_template<'a>(
     hook: &Hook,
     templates: &'a [crate::model::HookTemplate],
@@ -369,7 +369,7 @@ async fn reinstall_as_store_extension(
         });
     }
 
-    log.event(Action::Repair, &format!(
+    log.event(Action::Doctor, &format!(
         "hooks/{slug}: reinstalled (new id {}); old id {} removed; {} dependent(s) rewired",
         updated.id, old_hook.id, rewired,
     ));

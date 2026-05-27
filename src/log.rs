@@ -7,7 +7,7 @@
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     // Run lifecycle
-    Sync, Deploy, Pull, Push, Diff, Auth, Init, Repair, Upgr,
+    Sync, Deploy, Pull, Push, Diff, Auth, Init, Doctor, Upgr,
     // Phase
     Plan, List, Watch,
     // Per-resource
@@ -31,7 +31,7 @@ impl Action {
             Action::Diff   => "diff  ",
             Action::Auth   => "auth  ",
             Action::Init   => "init  ",
-            Action::Repair => "repair",
+            Action::Doctor => "doctor",
             Action::Upgr   => "upgr  ",
             Action::Plan   => "plan  ",
             Action::List   => "list  ",
@@ -74,7 +74,7 @@ impl Action {
         match self {
             // Lifecycle / command boundaries (bold amber).
             Action::Sync | Action::Deploy | Action::Auth | Action::Init
-            | Action::Repair | Action::Upgr | Action::Watch              => ActionColor::Accent,
+            | Action::Doctor | Action::Upgr | Action::Watch              => ActionColor::Accent,
             // Network reads + local read-only computations (light green).
             Action::Pull | Action::List | Action::Diff | Action::Plan    => ActionColor::Read,
             // Remote mutations: the per-resource events and the push
@@ -98,7 +98,7 @@ mod action_tests {
     fn pad_is_always_six_chars() {
         let variants = [
             Action::Sync, Action::Deploy, Action::Pull, Action::Push,
-            Action::Diff, Action::Auth, Action::Init, Action::Repair, Action::Upgr,
+            Action::Diff, Action::Auth, Action::Init, Action::Doctor, Action::Upgr,
             Action::Plan, Action::List, Action::Watch,
             Action::Post, Action::Patch, Action::Delete, Action::Skip,
             Action::Done, Action::Fail, Action::Warn, Action::Retry, Action::Info,
@@ -114,7 +114,7 @@ mod action_tests {
         // Lifecycle / command boundaries -> bold amber.
         for a in [
             Action::Sync, Action::Deploy, Action::Auth, Action::Init,
-            Action::Repair, Action::Upgr, Action::Watch,
+            Action::Doctor, Action::Upgr, Action::Watch,
         ] {
             assert_eq!(a.color(), ActionColor::Accent, "{a:?} should be Accent");
         }

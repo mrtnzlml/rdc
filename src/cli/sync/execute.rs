@@ -105,7 +105,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
     // Side-map of `workspace_url → slug` populated alongside
     // `workspace_by_slug`. Used by the queue loop below as a fallback
     // when `ctx.lockfile.slug_for_url("workspaces", …)` misses — which
-    // it does on `repair --rebuild-lock` (lockfile starts empty) and any
+    // it does on `doctor --rebuild-lock` (lockfile starts empty) and any
     // resume path where queues were created on remote in a prior failed
     // run but the lockfile was never persisted. Without this, every
     // queue silently `continue`s and the conflict resolver reports
@@ -724,7 +724,7 @@ fn resolve_one_conflict<R: BufRead>(
         // run still completes without blocking on stdin. The local file
         // stays as-is and the lockfile is pinned to the prior base —
         // advancing it would let the conflict silently disappear on
-        // subsequent runs. When there is no prior base (post-`rdc repair
+        // subsequent runs. When there is no prior base (post-`rdc doctor
         // --rebuild-lock` with diverged sides, or any first-encounter
         // conflict), record `None` for the content_hash so the next sync
         // re-classifies as `BothDiverged` and re-prompts — recording
@@ -1047,7 +1047,7 @@ fn resolve_one_conflict<R: BufRead>(
                 "{} partially resolved (markers retained); lockfile base preserved; re-run to resolve",
                 edit_target.display(),
             ));
-            // When base is absent (post-`rdc repair --rebuild-lock`, or any
+            // When base is absent (post-`rdc doctor --rebuild-lock`, or any
             // first-encounter conflict), record `None` for the content_hash
             // so the next sync re-classifies as `BothDiverged` and re-prompts
             // — recording local hash here would let the next sync see a
@@ -1079,7 +1079,7 @@ fn resolve_one_conflict<R: BufRead>(
                 prompt_path.display(),
                 conflict_path.display(),
             ));
-            // When base is absent (post-`rdc repair --rebuild-lock`, or any
+            // When base is absent (post-`rdc doctor --rebuild-lock`, or any
             // first-encounter conflict), record `None` for the content_hash
             // so the next sync re-classifies as `BothDiverged` and re-prompts
             // — recording local hash here would let the next sync see a
@@ -2232,7 +2232,7 @@ pub async fn run(
         // driver's own `subset.contains(...)` guard.
         //
         // Also include `Clean` items whose lockfile entry is missing
-        // (`base_hash` is `None`) — this is the post-`rdc repair
+        // (`base_hash` is `None`) — this is the post-`rdc doctor
         // --rebuild-lock` "in sync but no lockfile entry" case. Routing
         // through the pull driver is a safe no-op write (the bytes
         // canonicalize equal) and lets `record_object` rebuild the
