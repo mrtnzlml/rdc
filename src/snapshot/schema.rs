@@ -128,7 +128,11 @@ pub fn read_local_formulas(queue_dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
 
 /// Recursively walk a schema content node. For any datapoint with a string
 /// `formula`, remove it and append (id, formula) to `out`. Recurses into
-/// `children` arrays.
+/// `children`, which is an array for sections and tuples but a single object
+/// for a multivalue (its element schema — a tuple of columns for a line-items
+/// table, or a lone datapoint for a simple list). Descending into both is
+/// what lets formulas on line-item columns be extracted, not just top-level
+/// datapoints.
 fn extract_formulas(node: &mut Value, out: &mut Vec<(String, String)>) {
     let Some(obj) = node.as_object_mut() else { return };
 
@@ -142,10 +146,14 @@ fn extract_formulas(node: &mut Value, out: &mut Vec<(String, String)>) {
         }
     }
 
-    if let Some(children) = obj.get_mut("children").and_then(|c| c.as_array_mut()) {
-        for child in children.iter_mut() {
-            extract_formulas(child, out);
+    match obj.get_mut("children") {
+        Some(Value::Array(children)) => {
+            for child in children.iter_mut() {
+                extract_formulas(child, out);
+            }
         }
+        Some(child @ Value::Object(_)) => extract_formulas(child, out),
+        _ => {}
     }
 }
 
@@ -167,10 +175,18 @@ fn merge_formulas(node: &mut Value, formulas_dir: &Path) -> Result<()> {
         }
     }
 
-    if let Some(children) = obj.get_mut("children").and_then(|c| c.as_array_mut()) {
-        for child in children.iter_mut() {
-            merge_formulas(child, formulas_dir)?;
+    // Mirror `extract_formulas`: descend array children (sections, tuples)
+    // and the single object child of a multivalue, so line-item column
+    // formulas get spliced back in on read/push. Without this the push side
+    // would omit them and silently delete them on the remote.
+    match obj.get_mut("children") {
+        Some(Value::Array(children)) => {
+            for child in children.iter_mut() {
+                merge_formulas(child, formulas_dir)?;
+            }
         }
+        Some(child @ Value::Object(_)) => merge_formulas(child, formulas_dir)?,
+        _ => {}
     }
 
     Ok(())
@@ -240,6 +256,86 @@ mod tests {
         let original = sample_with_formula();
         write_schema(&dir.path().join("q1"), &original).unwrap();
         let read = read_schema(&dir.path().join("q1")).unwrap();
+        assert_eq!(original, read);
+    }
+
+    fn sample_with_lineitem_formula() -> Schema {
+        // A top-level formula datapoint plus a line-items table
+        // (multivalue -> tuple -> column datapoints), one column of which
+        // carries a formula. The multivalue's `children` is a single object,
+        // which is exactly the shape the old extractor skipped.
+        let v = json!({
+            "id": 3,
+            "url": "https://x/api/v1/schemas/3",
+            "name": "LineItems",
+            "queues": [],
+            "content": [
+                {
+                    "category": "section",
+                    "id": "header",
+                    "label": "Header",
+                    "children": [
+                        {
+                            "category": "datapoint",
+                            "id": "order_normalized",
+                            "type": "string",
+                            "formula": "order.strip()"
+                        },
+                        {
+                            "category": "multivalue",
+                            "id": "line_items",
+                            "children": {
+                                "category": "tuple",
+                                "id": "line_item",
+                                "children": [
+                                    { "category": "datapoint", "id": "item_qty", "type": "number" },
+                                    {
+                                        "category": "datapoint",
+                                        "id": "item_description_export",
+                                        "type": "string",
+                                        "formula": "field.item_description.upper()"
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn extracts_formula_nested_under_multivalue_tuple() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("q")).unwrap();
+        write_schema(&dir.path().join("q"), &sample_with_lineitem_formula()).unwrap();
+        assert!(dir.path().join("q/formulas/order_normalized.py").exists());
+        assert!(
+            dir.path().join("q/formulas/item_description_export.py").exists(),
+            "line-item column formula must be extracted to a .py sidecar"
+        );
+        let code =
+            std::fs::read_to_string(dir.path().join("q/formulas/item_description_export.py"))
+                .unwrap();
+        assert_eq!(code, "field.item_description.upper()");
+        let raw = std::fs::read_to_string(dir.path().join("q/schema.json")).unwrap();
+        assert!(
+            !raw.contains("field.item_description.upper()"),
+            "line-item formula should live in .py, not schema.json: {raw}"
+        );
+    }
+
+    #[test]
+    fn round_trip_preserves_lineitem_formula() {
+        // extract (write) then merge (read) must restore the original schema
+        // exactly — otherwise a push after migration would omit the column
+        // formula and delete it on the remote.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("q")).unwrap();
+        let original = sample_with_lineitem_formula();
+        write_schema(&dir.path().join("q"), &original).unwrap();
+        let read = read_schema(&dir.path().join("q")).unwrap();
         assert_eq!(original, read);
     }
 
