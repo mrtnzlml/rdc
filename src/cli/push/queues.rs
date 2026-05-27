@@ -46,9 +46,12 @@ pub async fn push(
             let create_result = client.create_queue(&payload, Some(progress.clone())).await
                 .with_context(|| format!("POST /queues (creating '{q_slug}')"));
             let created = create_result?;
-            let mut created_bytes = serde_json::to_vec_pretty(&created)
+            // Canonical on-disk bytes (redact `counts` etc.) so the file we
+            // write and the hash we record match what a pull would produce —
+            // otherwise the next sync sees the redacted remote drift from this
+            // raw-counts base. Same helper as the pull driver.
+            let created_bytes = crate::snapshot::create::redacted_disk_bytes(&created, "queues")
                 .context("serializing created queue")?;
-            created_bytes.push(b'\n');
             let created_bytes = maybe_strip_overlay(created_bytes, overlay_paths)?;
             let created_hash = content_hash(&created_bytes);
             write_atomic(queue_path, &created_bytes)
@@ -100,9 +103,12 @@ pub async fn push(
             skipped += 1;
             continue;
         };
-        let mut remote_bytes = serde_json::to_vec_pretty(&remote_queue)
+        // Redact `counts` before hashing the remote for the drift check; the
+        // lockfile base was recorded from redacted bytes, so comparing raw
+        // bytes here would flag live counts churn as drift and pop a spurious
+        // push-drift prompt.
+        let remote_bytes = crate::snapshot::create::redacted_disk_bytes(&remote_queue, "queues")
             .context("serializing remote queue")?;
-        remote_bytes.push(b'\n');
         let remote_bytes = maybe_strip_overlay(remote_bytes, overlay_paths)?;
         let remote_combined = content_hash(&remote_bytes);
         let mut payload_to_send = payload_queue;
@@ -145,9 +151,8 @@ pub async fn push(
             .with_context(|| format!("PATCH /queues/{id}"));
         let updated = patch_result?;
 
-        let mut updated_bytes = serde_json::to_vec_pretty(&updated)
+        let updated_bytes = crate::snapshot::create::redacted_disk_bytes(&updated, "queues")
             .context("serializing updated queue")?;
-        updated_bytes.push(b'\n');
         let updated_bytes = maybe_strip_overlay(updated_bytes, overlay_paths)?;
         let updated_hash = content_hash(&updated_bytes);
         write_atomic(queue_path, &updated_bytes)

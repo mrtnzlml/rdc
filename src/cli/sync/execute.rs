@@ -367,11 +367,14 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 })
             }),
             "queues" => queue_by_slug.get(it.slug.as_str()).and_then(|(q, ws_slug)| {
-                let mut bytes = match serde_json::to_vec_pretty(*q) {
+                // Redact `counts` etc. so the resolver diff is
+                // sentinel-vs-sentinel (no live-counts noise) and a keep-remote
+                // resolution writes the canonical on-disk bytes — the same
+                // helper the pull driver and classifier use.
+                let bytes = match crate::snapshot::create::redacted_disk_bytes(*q, "queues") {
                     Ok(b) => b,
                     Err(_) => return None,
                 };
-                bytes.push(b'\n');
                 let local_path = ctx.paths.queue_dir(ws_slug, &it.slug).join("queue.json");
                 Some(ConflictRefs {
                     remote_bytes: bytes,
@@ -1538,12 +1541,11 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                         };
                         Some(RemoteDeleteRefs {
                             local_path,
-                            restore_bytes: body
-                                .and_then(|(q, _)| serde_json::to_vec_pretty(*q).ok())
-                                .map(|mut b| {
-                                    b.push(b'\n');
-                                    b
-                                }),
+                            // Redact `counts` so a restore writes the same
+                            // canonical bytes a pull would (matching the base).
+                            restore_bytes: body.and_then(|(q, _)| {
+                                crate::snapshot::create::redacted_disk_bytes(*q, "queues").ok()
+                            }),
                             restore_code: None,
                             id: body.map(|(q, _)| q.id),
                             url: body.map(|(q, _)| q.url.clone()),

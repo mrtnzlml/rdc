@@ -6,6 +6,7 @@
 //! clean — the user's placeholder `id: 0` / `url: ""` (or missing fields)
 //! never reach the server.
 
+use serde::Serialize;
 use serde_json::Value;
 
 /// Field names that the server assigns / computes on every kind. Always
@@ -102,6 +103,28 @@ pub fn redact_for_disk(body: &mut Value, kind: &str) {
             );
         }
     }
+}
+
+/// Serialize a remote object to its canonical on-disk byte form: pretty
+/// JSON, [`redact_for_disk`]-applied, with a trailing newline.
+///
+/// This is the single source of truth for "what bytes represent this object
+/// on disk", and therefore for the `content_hash` recorded in the lockfile.
+/// Every code path that recomputes a remote object's hash or hands its bytes
+/// to the conflict resolver MUST go through here — the pull driver, and the
+/// `rdc sync` classifier/executor alike. Skipping the redaction in one path
+/// (as the sync adapter previously did for queues) makes a server-set runtime
+/// field like `counts` churn read as remote drift, surfacing a spurious
+/// conflict against a lockfile base that *was* recorded from redacted bytes.
+///
+/// Note: any per-object overlay strip is layered on top by the caller
+/// (`maybe_strip_overlay`); it's kind-agnostic and orthogonal to redaction.
+pub fn redacted_disk_bytes<T: Serialize>(value: &T, kind: &str) -> Result<Vec<u8>, serde_json::Error> {
+    let mut v = serde_json::to_value(value)?;
+    redact_for_disk(&mut v, kind);
+    let mut bytes = serde_json::to_vec_pretty(&v)?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 /// Like `strip_for_create`, but also strips `organization` — used for
@@ -287,5 +310,42 @@ mod tests {
         let after_first = v.clone();
         redact_for_disk(&mut v, "queues");
         assert_eq!(v, after_first);
+    }
+
+    #[test]
+    fn redacted_disk_bytes_makes_counts_changes_invisible() {
+        // Two queue snapshots that differ ONLY in the server-set `counts`
+        // aggregate must serialize to identical on-disk bytes, so their content
+        // hashes match and `rdc sync` never classifies live counts churn as a
+        // conflict. This is the property the pull driver and the sync
+        // classifier/executor all rely on by routing through this helper.
+        let a = json!({
+            "name": "invoices",
+            "counts": {"to_review": 4, "exported": 100},
+            "automation_level": "never",
+        });
+        let b = json!({
+            "name": "invoices",
+            "counts": {"to_review": 999, "exported": 0, "importing": 7},
+            "automation_level": "never",
+        });
+        let ba = redacted_disk_bytes(&a, "queues").unwrap();
+        let bb = redacted_disk_bytes(&b, "queues").unwrap();
+        assert_eq!(ba, bb, "counts-only differences must redact to identical bytes");
+        assert!(String::from_utf8_lossy(&ba).contains(REDACTED_VALUE_SENTINEL));
+        // Trailing newline like every on-disk snapshot file.
+        assert_eq!(ba.last(), Some(&b'\n'));
+    }
+
+    #[test]
+    fn redacted_disk_bytes_preserves_other_kinds_verbatim() {
+        // Non-queue kinds have nothing to redact: the bytes are just the
+        // canonical pretty JSON + newline, unchanged.
+        let h = json!({"name": "h", "counts": {"x": 1}});
+        let bytes = redacted_disk_bytes(&h, "hooks").unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains(REDACTED_VALUE_SENTINEL));
+        let mut expected = serde_json::to_vec_pretty(&h).unwrap();
+        expected.push(b'\n');
+        assert_eq!(bytes, expected);
     }
 }
