@@ -55,7 +55,7 @@ pub async fn process(
         if hook.is_store_extension() && hook.hook_template().is_none() {
             progress.event(Action::Warn, &format!(
                 "hook/{slug} (id {}): extension_source=rossum_store but hook_template is null — \
-                 run `rdc repair {env} --fix-store-anomaly` to fix",
+                 run `rdc doctor {env}` to fix",
                 hook.id,
                 env = ctx.paths.env(),
             ));

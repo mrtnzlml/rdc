@@ -1316,7 +1316,7 @@ pub enum AnomalyCure {
 }
 
 /// Per-hook interactive prompt. Non-TTY → `Convert` is the default,
-/// unless `RDC_REPAIR_CURE` env var selects another option:
+/// unless `RDC_DOCTOR_CURE` env var selects another option:
 /// `"reinstall"` → Reinstall, `"skip"` → Skip. Anything else → Convert.
 pub fn prompt_anomaly_cure(
     slug: &str,
@@ -1324,7 +1324,7 @@ pub fn prompt_anomaly_cure(
     interactive: bool,
 ) -> anyhow::Result<AnomalyCure> {
     if !interactive {
-        let env_choice = std::env::var("RDC_REPAIR_CURE").unwrap_or_default();
+        let env_choice = std::env::var("RDC_DOCTOR_CURE").unwrap_or_default();
         return Ok(match env_choice.as_str() {
             "reinstall" => AnomalyCure::Reinstall,
             "skip" => AnomalyCure::Skip,

@@ -776,9 +776,9 @@ so the sentinel never reaches the server.
 - `rdc deploy <src> <tgt>` — promote one env to another in one shot
   (POST missing + PATCH deltas, URL rewrites included); `--dry-run`
   previews without writing
-- `rdc repair <env> --rename-slugs` — realign stale local slugs after
+- `rdc doctor <env>` — realign stale local slugs after
   a remote rename (offline)
-- `rdc repair <env> --rebuild-lock` — recover from a corrupted
+- `rdc doctor <env> --rebuild-lock` — recover from a corrupted
   lockfile by re-syncing everything
 
 ## Conflicts & drift

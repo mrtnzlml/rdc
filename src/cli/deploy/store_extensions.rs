@@ -313,7 +313,7 @@ pub fn find_orphan<'a>(hooks: &'a [Hook], name: &str, template_url: &str) -> Opt
 /// client PATCHes `extension_source` to `"rossum_store"` without going
 /// through `POST /hooks/create` — the API silently drops `hook_template`
 /// on direct write but accepts the marker, leaving the hook in this
-/// broken state. The fix is `rdc repair <env> --fix-store-anomaly`.
+/// broken state. The fix is `rdc doctor <env>`.
 pub fn check_store_extension_anomaly(hook: &Hook, slug: &str, env: &str) -> Result<()> {
     if hook.is_store_extension() && hook.hook_template().is_none() {
         return Err(anyhow!(
@@ -327,7 +327,7 @@ pub fn check_store_extension_anomaly(hook: &Hook, slug: &str, env: &str) -> Resu
                  hook genuinely is a Store template instance and the hook_template link\n\
                  should be restored.\n\
              \n\
-             Run `rdc repair {env} --fix-store-anomaly` to choose interactively.",
+             Run `rdc doctor {env}` to choose interactively.",
             id = hook.id
         ));
     }
@@ -490,8 +490,8 @@ mod tests {
         assert!(msg.contains("prod"), "names the env: {msg}");
         assert!(msg.contains("12345"), "names the hook id: {msg}");
         assert!(msg.contains("hook_template"), "explains the problem: {msg}");
-        assert!(msg.contains("rdc repair prod --fix-store-anomaly"),
-            "points at the repair command: {msg}");
+        assert!(msg.contains("rdc doctor prod"),
+            "points at the doctor command: {msg}");
         assert!(msg.contains("Convert to custom") || msg.contains("convert to custom"),
             "names Cure B: {msg}");
         assert!(msg.contains("Reinstall") || msg.contains("reinstall"),

@@ -1,6 +1,6 @@
 //! Within-env slug realignment.
 //!
-//! Invoked via `rdc repair <env> --rename-slugs`. Walks the
+//! Invoked via `rdc doctor <env>`. Walks the
 //! lockfile, reads each object's local JSON `name` field, slugifies it,
 //! and proposes a rename for every entry whose current sticky slug
 //! differs from the proposed one.
@@ -640,7 +640,7 @@ fn list_mapping_files(paths: &Paths) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// Entry point used by `rdc repair <env> --rename-slugs`.
+/// Entry point used by `rdc doctor <env>`.
 pub async fn run_within_env(env: &str, check: bool, yes: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let paths = Paths::for_env(&cwd, env);

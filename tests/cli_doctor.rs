@@ -31,23 +31,81 @@ async fn mount_minimal_pull(server: &MockServer) {
     }
 }
 
+/// Clean env: doctor runs every step, finds nothing to do, and (non-TTY,
+/// no flag) skips the destructive rebuild rather than running it.
 #[tokio::test]
-async fn repair_requires_rebuild_lock_flag() {
+async fn doctor_clean_env_runs_steps_and_skips_rebuild_lock() {
+    let server = MockServer::start().await;
+    mount_minimal_pull(&server).await;
+
     let project = TempDir::new().unwrap();
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["init", "--env", "dev=https://x/api/v1:1"])
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
         .assert().success();
+    std::fs::write(project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#).unwrap();
+    Command::cargo_bin("rdc").unwrap().current_dir(project.path())
+        .args(["sync", "dev", "--no-push"]).assert().success();
 
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["repair", "dev"])
-        .assert().failure()
-        .stderr(predicate::str::contains("--rebuild-lock"));
+        .args(["doctor", "dev"])
+        .assert().success()
+        .stderr(predicate::str::contains("no unpushed local changes"))
+        .stderr(predicate::str::contains("no anomalous"))
+        .stderr(predicate::str::contains("rebuild-lock skipped"))
+        .stderr(predicate::str::contains("doctor finished for env 'dev'"));
 }
 
+/// Pre-flight: doctor warns up front when the local snapshot has edits not
+/// yet pushed to the remote (offline scan), so the user knows what the
+/// destructive rebuild would discard.
 #[tokio::test]
-async fn repair_backs_up_lockfile_and_repulls() {
+async fn doctor_warns_about_unpushed_local_changes() {
+    let server = MockServer::start().await;
+    mount_minimal_pull(&server).await;
+    // One label so there's a tracked object to edit locally.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [{
+                "id": 7, "url": format!("{}/api/v1/labels/7", server.uri()),
+                "name": "Priority", "color": "#ff0000",
+                "organization": format!("{}/api/v1/organizations/1", server.uri())
+            }]
+        })))
+        .with_priority(1)
+        .mount(&server).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap().current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())]).assert().success();
+    std::fs::write(project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#).unwrap();
+    Command::cargo_bin("rdc").unwrap().current_dir(project.path())
+        .args(["sync", "dev", "--no-push"]).assert().success();
+
+    // Edit the local label so it diverges from the lockfile base (color only,
+    // so the slug still matches the name and the realign step stays a no-op).
+    let label_path = project.path().join("envs/dev/labels/priority.json");
+    let mut label: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&label_path).unwrap()).unwrap();
+    label["color"] = serde_json::json!("#00ff00");
+    std::fs::write(&label_path, format!("{}\n", serde_json::to_string_pretty(&label).unwrap())).unwrap();
+
+    Command::cargo_bin("rdc").unwrap().current_dir(project.path())
+        .args(["doctor", "dev"])
+        .assert().success()
+        .stderr(predicate::str::contains("1 local change"))
+        .stderr(predicate::str::contains("not yet pushed"));
+}
+
+/// `--rebuild-lock` authorizes the destructive rebuild directly (no confirm),
+/// which backs up the lockfile and re-pulls.
+#[tokio::test]
+async fn doctor_rebuild_lock_flag_backs_up_and_repulls() {
     let server = MockServer::start().await;
     mount_minimal_pull(&server).await;
 
@@ -70,14 +128,13 @@ async fn repair_backs_up_lockfile_and_repulls() {
 
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["repair", "dev", "--rebuild-lock"])
+        .args(["doctor", "dev", "--rebuild-lock"])
         .assert().success()
         .stderr(predicate::str::contains("done env 'dev' rebuilt"))
         .stderr(predicate::str::contains("backed up lockfile to"));
 
     assert!(lockfile_path.exists(), "lockfile re-created by sync");
 
-    // Backup file should exist.
     let state_dir = project.path().join(".rdc/state");
     let backups: Vec<_> = std::fs::read_dir(&state_dir).unwrap()
         .filter_map(|e| e.ok())
@@ -86,8 +143,10 @@ async fn repair_backs_up_lockfile_and_repulls() {
     assert_eq!(backups.len(), 1, "exactly one backup file");
 }
 
+/// `--rebuild-lock` with no lockfile yet: the lockfile-dependent checks are
+/// skipped and the rebuild proceeds from a fresh pull.
 #[tokio::test]
-async fn repair_works_when_lockfile_is_missing() {
+async fn doctor_rebuild_lock_works_when_lockfile_missing() {
     let server = MockServer::start().await;
     mount_minimal_pull(&server).await;
 
@@ -101,19 +160,22 @@ async fn repair_works_when_lockfile_is_missing() {
         r#"{"api_token":"TEST_TOKEN"}"#,
     ).unwrap();
 
-    // No lockfile yet.
+    // No lockfile yet (no prior sync).
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["repair", "dev", "--rebuild-lock"])
+        .args(["doctor", "dev", "--rebuild-lock"])
         .assert().success()
+        .stderr(predicate::str::contains("no lockfile yet"))
         .stderr(predicate::str::contains("done env 'dev' rebuilt"))
         .stderr(predicate::str::contains("no existing lockfile"));
 
     assert!(project.path().join(".rdc/state/dev.lock.json").exists());
 }
 
+/// `--check` lists anomalous store-extension hooks without writing or
+/// touching the remote.
 #[tokio::test]
-async fn fix_store_anomaly_lists_anomalous_hooks_then_exits_in_check_mode() {
+async fn doctor_check_lists_anomalous_hooks() {
     let server = MockServer::start().await;
     mount_minimal_pull(&server).await;
 
@@ -156,15 +218,17 @@ async fn fix_store_anomaly_lists_anomalous_hooks_then_exits_in_check_mode() {
 
     Command::cargo_bin("rdc").unwrap()
         .current_dir(project.path())
-        .args(["repair", "dev", "--fix-store-anomaly", "--check"])
+        .args(["doctor", "dev", "--check"])
         .assert().success()
         .stderr(predicate::str::contains("broken-store-hook"))
         .stderr(predicate::str::contains("id 42"))
         .stderr(predicate::str::contains("1 anomalous hook"));
 }
 
+/// Store-anomaly cure B (default, non-interactive): PATCH `extension_source`
+/// to `custom`. Reached through `doctor` automatically under `--yes`.
 #[tokio::test]
-async fn fix_store_anomaly_cure_b_patches_extension_source_to_custom() {
+async fn doctor_converts_store_anomaly_to_custom() {
     let server = MockServer::start().await;
     mount_minimal_pull(&server).await;
 
@@ -182,7 +246,6 @@ async fn fix_store_anomaly_cure_b_patches_extension_source_to_custom() {
         .with_priority(1)
         .mount(&server).await;
 
-    // The PATCH the cure will issue. Capture and verify the body.
     let patched = std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
     let patched_clone = patched.clone();
     let server_uri = server.uri();
@@ -211,24 +274,26 @@ async fn fix_store_anomaly_cure_b_patches_extension_source_to_custom() {
     Command::cargo_bin("rdc").unwrap().current_dir(project.path())
         .args(["sync", "dev", "--no-push"]).assert().success();
 
-    // Non-interactive (`--yes`): default cure is convert-to-custom.
+    // Non-interactive (`--yes`): default cure is convert-to-custom; the
+    // destructive rebuild is skipped (no --rebuild-lock).
     Command::cargo_bin("rdc").unwrap().current_dir(project.path())
-        .args(["--yes", "repair", "dev", "--fix-store-anomaly"])
+        .args(["--yes", "doctor", "dev"])
         .assert().success()
         .stderr(predicate::str::contains("hooks/broken (id 42) \u{2192} converted to custom"));
 
     let body = patched.lock().unwrap().clone();
     assert_eq!(body, serde_json::json!({"extension_source": "custom"}));
 
-    // Local snapshot reflects the change.
     let local: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(project.path().join("envs/dev/hooks/broken.json")).unwrap()
     ).unwrap();
     assert_eq!(local["extension_source"], "custom");
 }
 
+/// Store-anomaly cure A (forced via `RDC_DOCTOR_CURE=reinstall`): reinstall
+/// as a store extension and rewire dependents. Reached through `doctor`.
 #[tokio::test]
-async fn fix_store_anomaly_cure_a_reinstalls_and_rewires_dependents() {
+async fn doctor_reinstalls_store_anomaly_and_rewires_dependents() {
     let server = MockServer::start().await;
     mount_minimal_pull(&server).await;
 
@@ -237,7 +302,6 @@ async fn fix_store_anomaly_cure_a_reinstalls_and_rewires_dependents() {
     let new_hook_url = format!("{}/api/v1/hooks/999", server.uri());
     let template_url = format!("{}/api/v1/hook_templates/39", server.uri());
 
-    // Phase 1: pull sees the anomalous hook + a dependent.
     Mock::given(method("GET")).and(path("/api/v1/hooks"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "pagination": { "next": null },
@@ -259,7 +323,6 @@ async fn fix_store_anomaly_cure_a_reinstalls_and_rewires_dependents() {
             ]
         }))).with_priority(1).mount(&server).await;
 
-    // Templates listing.
     let template_url_for_listing = template_url.clone();
     Mock::given(method("GET")).and(path("/api/v1/hook_templates"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -271,7 +334,6 @@ async fn fix_store_anomaly_cure_a_reinstalls_and_rewires_dependents() {
             }]
         }))).with_priority(1).mount(&server).await;
 
-    // POST /hooks/create.
     let install_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
     let install_clone = install_calls.clone();
     let new_url_inst = new_hook_url.clone();
@@ -289,7 +351,6 @@ async fn fix_store_anomaly_cure_a_reinstalls_and_rewires_dependents() {
             }))
         }).mount(&server).await;
 
-    // PATCH /hooks/999 (mirror).
     let new_url_p = new_hook_url.clone();
     let tmpl_url_p = template_url.clone();
     Mock::given(method("PATCH")).and(path("/api/v1/hooks/999"))
@@ -304,7 +365,6 @@ async fn fix_store_anomaly_cure_a_reinstalls_and_rewires_dependents() {
             }))
         }).mount(&server).await;
 
-    // PATCH /hooks/100 (dependent rewire).
     let dep_patches = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
     let dep_clone = dep_patches.clone();
     let new_url_d = new_hook_url.clone();
@@ -322,7 +382,6 @@ async fn fix_store_anomaly_cure_a_reinstalls_and_rewires_dependents() {
             }))
         }).mount(&server).await;
 
-    // GET /hooks/100 (post-rewire refresh).
     let new_url_g100 = new_hook_url.clone();
     let dep_url_g100 = dependent_url.clone();
     Mock::given(method("GET")).and(path("/api/v1/hooks/100"))
@@ -337,7 +396,6 @@ async fn fix_store_anomaly_cure_a_reinstalls_and_rewires_dependents() {
             }))
         }).mount(&server).await;
 
-    // GET /hooks/999 (post-install reconcile if needed by implementation).
     let new_url_g999 = new_hook_url.clone();
     let tmpl_url_g999 = template_url.clone();
     Mock::given(method("GET")).and(path("/api/v1/hooks/999"))
@@ -352,7 +410,6 @@ async fn fix_store_anomaly_cure_a_reinstalls_and_rewires_dependents() {
             }))
         }).mount(&server).await;
 
-    // DELETE /hooks/42.
     Mock::given(method("DELETE")).and(path("/api/v1/hooks/42"))
         .respond_with(ResponseTemplate::new(204))
         .mount(&server).await;
@@ -366,25 +423,22 @@ async fn fix_store_anomaly_cure_a_reinstalls_and_rewires_dependents() {
     Command::cargo_bin("rdc").unwrap().current_dir(project.path())
         .args(["sync", "dev", "--no-push"]).assert().success();
 
-    // Force Cure A via env var.
+    // Force Cure A via env var; doctor reaches store-anomaly automatically.
     Command::cargo_bin("rdc").unwrap().current_dir(project.path())
-        .env("RDC_REPAIR_CURE", "reinstall")
-        .args(["--yes", "repair", "dev", "--fix-store-anomaly"])
+        .env("RDC_DOCTOR_CURE", "reinstall")
+        .args(["--yes", "doctor", "dev"])
         .assert().success()
         .stderr(predicate::str::contains("hooks/master-data-hub").and(
             predicate::str::contains("reinstalled (new id 999)")));
 
-    // Install body had the right template URL.
     let installs = install_calls.lock().unwrap();
     assert_eq!(installs.len(), 1);
     assert_eq!(installs[0]["hook_template"], serde_json::json!(template_url));
 
-    // Dependent was rewired.
     let deps = dep_patches.lock().unwrap();
     assert_eq!(deps.len(), 1);
     assert_eq!(deps[0], serde_json::json!({"run_after": [new_hook_url]}));
 
-    // Local snapshot reflects new id+url.
     let local: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(project.path().join("envs/dev/hooks/master-data-hub.json")).unwrap()
     ).unwrap();
