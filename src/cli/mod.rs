@@ -27,8 +27,27 @@ fn env_name_candidates_in(project_root: &std::path::Path) -> Vec<CompletionCandi
         return Vec::new();
     };
     cfg.envs
-        .keys()
-        .map(|name| CompletionCandidate::new(name))
+        .iter()
+        .map(|(name, env)| {
+            // Each env gets a *unique* description, which is load-bearing for
+            // completion ordering under zsh — for two separate reasons:
+            //
+            //   1. `_describe` renders matches that HAVE a description ahead of
+            //      those that don't. A bare env name (no description) sinks into
+            //      the trailing undescribed bucket, below every described flag.
+            //   2. zsh groups matches that SHARE a description and then
+            //      re-sorts; the regrouping pushes the whole env block below the
+            //      alphabetically-first flags (`-…` sorts before letters). It is
+            //      common for several envs to target one cluster (same
+            //      api_base), so api_base alone is not unique — the `org_id`
+            //      suffix keeps the descriptions distinct.
+            //
+            // A unique, present description keeps every env in the same match
+            // group as the flags, where clap_complete already emits envs ahead
+            // of options. See zsh's `_describe` / `compdescribe -g` machinery.
+            let desc = format!("{} (org {})", env.api_base, env.org_id);
+            CompletionCandidate::new(name).help(Some(desc.into()))
+        })
         .collect()
 }
 
@@ -486,12 +505,58 @@ org_id = 2
 "#,
         )
         .unwrap();
-        let cands: Vec<String> = env_name_candidates_in(dir.path())
-            .into_iter()
+        let cands = env_name_candidates_in(dir.path());
+        let values: Vec<String> = cands
+            .iter()
             .map(|c| c.get_value().to_string_lossy().into_owned())
             .collect();
         // BTreeMap iteration order is alphabetical, so dev comes before prod.
-        assert_eq!(cands, vec!["dev".to_string(), "prod".to_string()]);
+        assert_eq!(values, vec!["dev".to_string(), "prod".to_string()]);
+        // Every candidate must carry a description (api_base + org_id). This is
+        // what keeps env names in zsh's "described" match group so they render
+        // above the flags rather than in the trailing undescribed bucket.
+        let helps: Vec<String> = cands
+            .iter()
+            .map(|c| c.get_help().expect("env candidate has a description").to_string())
+            .collect();
+        assert_eq!(
+            helps,
+            vec![
+                "https://dev.example/api/v1 (org 1)".to_string(),
+                "https://prod.example/api/v1 (org 2)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_candidates_have_unique_descriptions_when_api_base_shared() {
+        // Two envs on the same cluster share an api_base. Their completion
+        // descriptions MUST stay distinct: zsh groups matches that carry an
+        // identical description and re-sorts the result, which sinks the env
+        // block below the flags. The org_id suffix is what keeps them apart.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("rdc.toml"),
+            r#"
+[envs.dev-ap]
+api_base = "https://ferguson-dev.rossum.app/api/v1"
+org_id = 1
+
+[envs.dev-mtr]
+api_base = "https://ferguson-dev.rossum.app/api/v1"
+org_id = 2
+"#,
+        )
+        .unwrap();
+        let helps: Vec<String> = env_name_candidates_in(dir.path())
+            .iter()
+            .map(|c| c.get_help().expect("description present").to_string())
+            .collect();
+        assert_eq!(helps.len(), 2);
+        assert_ne!(
+            helps[0], helps[1],
+            "envs sharing an api_base must still get distinct descriptions"
+        );
     }
 
     #[test]
