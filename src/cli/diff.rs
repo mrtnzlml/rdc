@@ -13,7 +13,7 @@ use crate::snapshot::email_template::read_email_template;
 use crate::snapshot::hook::{read_hook, serialize_hook, serialize_hook_raw};
 use crate::snapshot::inbox::read_inbox;
 use crate::snapshot::queue::read_queue;
-use crate::snapshot::schema::{read_schema, serialize_schema};
+use crate::snapshot::schema::{read_schema, serialize_schema, serialize_schema_raw};
 use crate::state::Lockfile;
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
@@ -81,7 +81,7 @@ pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str, ra
     }
 
     // Rules: combined-form (.json + optional .py for trigger_condition).
-    diff_rules(&paths, &lockfile, &client, &mut diffs_printed, &progress).await?;
+    diff_rules(&paths, &lockfile, &client, &mut diffs_printed, &progress, raw).await?;
     // Flat kinds with simple typed JSON. The remote list is fetched ONCE
     // and reused across all per-slug diffs.
     diff_labels(&paths, &lockfile, &client, &mut diffs_printed, &progress).await?;
@@ -93,7 +93,7 @@ pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str, ra
     // per-queue schema + inbox GETs run in a single bounded-concurrency
     // batch.
     if paths.workspaces_dir().exists() {
-        diff_queue_tree(&paths, &lockfile, &client, &mut diffs_printed, &progress).await?;
+        diff_queue_tree(&paths, &lockfile, &client, &mut diffs_printed, &progress, raw).await?;
     }
 
     if diffs_printed == 0 {
@@ -577,8 +577,9 @@ async fn diff_rules(
     client: &RossumClient,
     counter: &mut usize,
     progress: &Arc<Log>,
+    raw: bool,
 ) -> Result<()> {
-    use crate::snapshot::rule::{read_rule, serialize_rule};
+    use crate::snapshot::rule::{read_rule, serialize_rule, serialize_rule_raw};
     let dir = paths.rules_dir();
     if !dir.exists() {
         return Ok(());
@@ -600,7 +601,8 @@ async fn diff_rules(
             Ok(r) => r,
             Err(_) => continue,
         };
-        let (local_json, local_code) = serialize_rule(&local)?;
+        let (local_json, local_code) =
+            if raw { serialize_rule_raw(&local)? } else { serialize_rule(&local)? };
 
         let id = match lookup_id(lockfile, "rules", slug) {
             Some(i) => i,
@@ -610,7 +612,8 @@ async fn diff_rules(
             progress.event(Action::Warn, &format!("rule/{slug} not on remote"));
             continue;
         };
-        let (remote_json, remote_code) = serialize_rule(remote)?;
+        let (remote_json, remote_code) =
+            if raw { serialize_rule_raw(remote)? } else { serialize_rule(remote)? };
 
         let lj = String::from_utf8_lossy(&local_json);
         let rj = String::from_utf8_lossy(&remote_json);
@@ -839,6 +842,7 @@ async fn diff_queue_tree(
     client: &RossumClient,
     counter: &mut usize,
     progress: &Arc<Log>,
+    raw: bool,
 ) -> Result<()> {
     // Phase A: walk the local tree, classify items by kind. No API
     // calls yet.
@@ -975,8 +979,10 @@ async fn diff_queue_tree(
     let mut schemas_sorted = schemas_fetched;
     schemas_sorted.sort_by(|a, b| a.0.cmp(&b.0));
     for (q_slug, local, remote) in schemas_sorted {
-        let (lj, l_formulas) = serialize_schema(&local)?;
-        let (rj, r_formulas) = serialize_schema(&remote)?;
+        let (lj, l_formulas) =
+            if raw { serialize_schema_raw(&local)? } else { serialize_schema(&local)? };
+        let (rj, r_formulas) =
+            if raw { serialize_schema_raw(&remote)? } else { serialize_schema(&remote)? };
         let ljs = String::from_utf8_lossy(&lj);
         let rjs = String::from_utf8_lossy(&rj);
         let before = *counter;

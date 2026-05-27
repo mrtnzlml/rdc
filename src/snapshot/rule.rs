@@ -33,6 +33,19 @@ pub fn write_rule(dir: &Path, slug: &str, r: &Rule) -> Result<Vec<u8>> {
     Ok(json_bytes)
 }
 
+/// Remove a string `trigger_condition` from a serialized rule Value and
+/// return it for the sidecar. Shared by `serialize_rule`/`serialize_rule_raw`.
+fn split_rule_trigger_condition(json_value: &mut Value) -> Option<String> {
+    if matches!(json_value.get("trigger_condition"), Some(Value::String(_))) {
+        json_value
+            .as_object_mut()
+            .and_then(|m| m.remove("trigger_condition"))
+            .and_then(|v| if let Value::String(s) = v { Some(s) } else { None })
+    } else {
+        None
+    }
+}
+
 /// Serialize a rule to its on-disk byte form WITHOUT writing. Returns
 /// the JSON bytes (post-extraction, with trailing newline) and the
 /// optional extracted `trigger_condition` string. Used by pull/push
@@ -44,17 +57,22 @@ pub fn serialize_rule(r: &Rule) -> Result<(Vec<u8>, Option<String>)> {
     // Only extract when the field is actually a string. If a tenant
     // ever emits a non-string trigger_condition (unexpected per the
     // Rossum API), leave it in the JSON so round-trip stays lossless.
-    let code = if matches!(json_value.get("trigger_condition"), Some(Value::String(_))) {
-        json_value
-            .as_object_mut()
-            .and_then(|m| m.remove("trigger_condition"))
-            .and_then(|v| if let Value::String(s) = v { Some(s) } else { None })
-    } else {
-        None
-    };
+    let code = split_rule_trigger_condition(&mut json_value);
 
     crate::snapshot::key_order::strip_hidden_fields_recursive(&mut json_value);
 
+    let mut bytes = serde_json::to_vec_pretty(&json_value).context("serializing rule json")?;
+    bytes.push(b'\n');
+    Ok((bytes, code))
+}
+
+/// Like [`serialize_rule`] but for `rdc diff --raw`: splits
+/// `trigger_condition` to the sidecar and tidies, without stripping
+/// server-managed fields.
+pub fn serialize_rule_raw(r: &Rule) -> Result<(Vec<u8>, Option<String>)> {
+    let mut json_value = serde_json::to_value(r).context("serializing rule to value")?;
+    let code = split_rule_trigger_condition(&mut json_value);
+    crate::snapshot::noise::tidy_raw(&mut json_value);
     let mut bytes = serde_json::to_vec_pretty(&json_value).context("serializing rule json")?;
     bytes.push(b'\n');
     Ok((bytes, code))
@@ -217,5 +235,21 @@ mod tests {
         write_rule(dir.path(), "u", &rule).unwrap();
         let read = read_rule(dir.path(), "u").unwrap();
         assert_eq!(rule, read);
+    }
+
+    #[test]
+    fn serialize_rule_raw_keeps_modified_at_and_splits_trigger() {
+        let r: Rule = serde_json::from_value(serde_json::json!({
+            "id": 5,
+            "url": "https://x/api/v1/rules/5",
+            "name": "r",
+            "trigger_condition": "field.x > 0",
+            "modified_at": "2026-01-01T00:00:00Z"
+        })).unwrap();
+        let (json, code) = serialize_rule_raw(&r).unwrap();
+        let s = String::from_utf8(json).unwrap();
+        assert!(s.contains("modified_at"));
+        assert!(!s.contains("trigger_condition"));
+        assert_eq!(code.as_deref(), Some("field.x > 0"));
     }
 }
