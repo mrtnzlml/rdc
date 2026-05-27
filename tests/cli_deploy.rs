@@ -184,8 +184,8 @@ version = 1
         .current_dir(project.path())
         .args(["deploy", "test", "prod", "--yes"])
         .assert().success()
-        // Preview pass emits the per-object diff header before confirm.
-        .stdout(predicate::str::contains("(src after overlay+rewrite)"))
+        // Preview pass emits the per-object diff (side legend names the sides).
+        .stdout(predicate::str::contains("src after overlay+rewrite"))
         .stdout(predicate::str::contains("Applied 1 hooks"))
         .stdout(predicate::str::contains("(1 PATCHes)"));
 

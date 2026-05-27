@@ -256,8 +256,7 @@ async fn diff_local_remote_shows_edit_in_unified_format() {
         .current_dir(project.path())
         .args(["diff", "dev"])
         .assert().success()
-        .stdout(predicate::str::contains("--- hooks/validator-invoices.py (local)"))
-        .stdout(predicate::str::contains("+++ hooks/validator-invoices.py (remote)"))
+        .stdout(predicate::str::contains("Update(hooks/validator-invoices.py)"))
         .stdout(predicate::str::contains("DIFF MARKER LINE"));
 }
 
@@ -299,8 +298,8 @@ async fn diff_snapshot_vs_snapshot_no_api_calls() {
         .current_dir(project.path())
         .args(["diff", "a", "b"])
         .assert().success()
-        .stdout(predicate::str::contains("hooks/validator-invoices.py (in a)"))
-        .stdout(predicate::str::contains("hooks/validator-invoices.py (in b)"))
+        .stdout(predicate::str::contains("Update(hooks/validator-invoices.py)"))
+        .stdout(predicate::str::contains("- in a   + in b"))
         .stdout(predicate::str::contains("A-only edit"));
 }
 

@@ -30,7 +30,7 @@ reqwest = { version = "0.13", features = ["json", "rustls"], default-features = 
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = { version = "0.11", default-features = false, features = ["alloc"] }
-similar = "3"
+similar = { version = "3", features = ["inline"] }
 tar = { version = "0.4", default-features = false }
 tempfile = "3"
 thiserror = "2"
