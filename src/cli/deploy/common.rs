@@ -146,6 +146,42 @@ mod normalize_tests {
             "different key order must normalise to the same bytes",
         );
     }
+
+    #[test]
+    fn normalize_strips_token_owner_for_hooks() {
+        // `token_owner` is a per-env user URL — each env's hooks point at
+        // that env's users (not a deployable kind). It always differs across
+        // envs and is never meaningful cross-env drift, so cross-env
+        // normalization must strip it (like id/url/organization), keeping
+        // `rdc diff <a> <b>` quiet on it.
+        let dev = br#"{
+          "id": 1,
+          "url": "https://dev.example.app/api/v1/hooks/1",
+          "name": "h",
+          "type": "function",
+          "events": ["annotation_status"],
+          "queues": [],
+          "token_owner": "https://dev.example.app/api/v1/users/111",
+          "config": {"runtime": "python3.12"}
+        }"#;
+        let test = br#"{
+          "id": 2,
+          "url": "https://test.example.app/api/v1/hooks/2",
+          "name": "h",
+          "type": "function",
+          "events": ["annotation_status"],
+          "queues": [],
+          "token_owner": "https://test.example.app/api/v1/users/222",
+          "config": {"runtime": "python3.12"}
+        }"#;
+        let nd = normalize_for_cross_env_compare(dev, "hooks").unwrap();
+        let nt = normalize_for_cross_env_compare(test, "hooks").unwrap();
+        assert_eq!(
+            std::str::from_utf8(&nd).unwrap(),
+            std::str::from_utf8(&nt).unwrap(),
+            "hooks differing only in token_owner must normalise equal",
+        );
+    }
 }
 
 /// Convenience: are two serialised payloads equivalent under
