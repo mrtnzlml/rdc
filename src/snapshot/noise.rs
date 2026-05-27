@@ -99,8 +99,7 @@ pub(crate) fn sort_keys_recursive(value: &mut serde_json::Value) {
 /// Set-like URL arrays (a hook's `queues`, `events`, `run_after`) come
 /// back from Rossum in per-env id order; sorting makes cross-env compares
 /// order-insensitive. Mixed-type arrays (objects/numbers) are left alone —
-/// `content[]` field order is meaningful. (Moved here from
-/// `cli::deploy::common` so the snapshot serializers can share it.)
+/// `content[]` field order is meaningful.
 pub(crate) fn sort_string_arrays(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Array(arr) => {
@@ -130,8 +129,6 @@ pub(crate) fn sort_string_arrays(value: &mut serde_json::Value) {
 /// The inverse of `normalize_for_cross_env_compare` minus the
 /// stripping/rewriting — two payloads compare equal iff they carry the
 /// same fields/values modulo key/array ordering.
-// Called by the diff CLI layer (Task 2+); allow dead_code until then.
-#[allow(dead_code)]
 pub(crate) fn tidy_raw(value: &mut serde_json::Value) {
     sort_string_arrays(value);
     sort_keys_recursive(value);

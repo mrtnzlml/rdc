@@ -34,7 +34,7 @@ struct RewriteCtx<'a> {
     tgt_lockfile: &'a Lockfile,
 }
 
-pub async fn run(left: String, right: Option<String>) -> Result<()> {
+pub async fn run(left: String, right: Option<String>, raw: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let cfg_path = cwd.join("rdc.toml");
     let cfg = ProjectConfig::load(&cfg_path)?;
@@ -49,7 +49,7 @@ pub async fn run(left: String, right: Option<String>) -> Result<()> {
             if !cfg.envs.contains_key(&other) {
                 return Err(anyhow!("env '{other}' is not defined in rdc.toml"));
             }
-            diff_snapshot_vs_snapshot(&cwd, &left, &other)
+            diff_snapshot_vs_snapshot(&cwd, &left, &other, raw)
         }
     }
 }
@@ -229,25 +229,22 @@ async fn diff_labels(
     )
 }
 
-fn diff_snapshot_vs_snapshot(cwd: &Path, src: &str, tgt: &str) -> Result<()> {
+fn diff_snapshot_vs_snapshot(cwd: &Path, src: &str, tgt: &str, raw: bool) -> Result<()> {
     let src_paths = Paths::for_env(cwd, src);
     let tgt_paths = Paths::for_env(cwd, tgt);
 
     let mut diffs_printed = 0usize;
 
-    // Try to load the deploy-managed mapping and both lockfiles so URL
-    // cross-references on the src side can be rewritten into their tgt
-    // equivalents before line-diffing. Any missing piece degrades to
-    // noise-stripping only — the diff still works, it just shows
-    // deploy-managed URLs as differences.
+    // In raw mode, skip mapping + lockfile loads entirely — no URL
+    // rewriting, so the ctx is always None.
     let mapping_path = src_paths.mapping_file(src, tgt);
-    let mapping = if mapping_path.exists() {
+    let mapping = if !raw && mapping_path.exists() {
         Mapping::load(&mapping_path).ok()
     } else {
         None
     };
-    let src_lockfile = Lockfile::load(&src_paths.lockfile()).ok();
-    let tgt_lockfile = Lockfile::load(&tgt_paths.lockfile()).ok();
+    let src_lockfile = if raw { None } else { Lockfile::load(&src_paths.lockfile()).ok() };
+    let tgt_lockfile = if raw { None } else { Lockfile::load(&tgt_paths.lockfile()).ok() };
     let ctx = match (mapping.as_ref(), src_lockfile.as_ref(), tgt_lockfile.as_ref()) {
         (Some(m), Some(s), Some(t)) => Some(RewriteCtx { mapping: m, src_lockfile: s, tgt_lockfile: t }),
         _ => None,
@@ -272,8 +269,8 @@ fn diff_snapshot_vs_snapshot(cwd: &Path, src: &str, tgt: &str) -> Result<()> {
                 // mapping is available, also rewrite src-side
                 // cross-reference URLs (queue.workspace, hook.queues, …)
                 // into their tgt form so paired objects compare equal.
-                let left_norm = normalize_for_diff(&rel, left, ctx.as_ref());
-                let right_norm = normalize_for_diff(&rel, right, None);
+                let left_norm = normalize_for_diff(&rel, left, ctx.as_ref(), raw);
+                let right_norm = normalize_for_diff(&rel, right, None, raw);
                 if left_norm != right_norm {
                     let ls = String::from_utf8_lossy(&left_norm);
                     let rs = String::from_utf8_lossy(&right_norm);
@@ -316,8 +313,20 @@ fn diff_snapshot_vs_snapshot(cwd: &Path, src: &str, tgt: &str) -> Result<()> {
 /// are also rewritten src → tgt using the deploy-managed mapping. Pass
 /// `Some(...)` on the src side and `None` on the tgt side so paired
 /// objects compare byte-equal after canonicalisation.
-fn normalize_for_diff(rel: &str, bytes: &[u8], rewrite_ctx: Option<&RewriteCtx<'_>>) -> Vec<u8> {
+fn normalize_for_diff(rel: &str, bytes: &[u8], rewrite_ctx: Option<&RewriteCtx<'_>>, raw: bool) -> Vec<u8> {
     if !rel.ends_with(".json") {
+        return bytes.to_vec();
+    }
+    if raw {
+        if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+            crate::snapshot::noise::tidy_raw(&mut value);
+            if let Ok(mut pretty) = serde_json::to_vec_pretty(&value) {
+                if !pretty.ends_with(b"\n") {
+                    pretty.push(b'\n');
+                }
+                return pretty;
+            }
+        }
         return bytes.to_vec();
     }
     if let Some(kind) = kind_from_relative_path(rel) {
