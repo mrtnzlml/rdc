@@ -11,11 +11,10 @@ use std::time::Duration;
 /// Ten-segment bar showing position within the polling interval.
 fn polling_bar(elapsed: u64, total: u64) -> String {
     const SEGMENTS: u64 = 10;
-    let filled = if total == 0 {
-        SEGMENTS
-    } else {
-        (elapsed.saturating_mul(SEGMENTS) / total).min(SEGMENTS)
-    };
+    let filled = elapsed
+        .saturating_mul(SEGMENTS)
+        .checked_div(total)
+        .map_or(SEGMENTS, |f| f.min(SEGMENTS));
     let empty = SEGMENTS - filled;
     let mut bar = String::with_capacity((SEGMENTS as usize) * 3);
     for _ in 0..filled { bar.push('▰'); }

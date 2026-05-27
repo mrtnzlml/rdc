@@ -1,3 +1,7 @@
+// The cwd_lock() guard is intentionally held across .await to serialize
+// tests that mutate the process-wide current directory.
+#![allow(clippy::await_holding_lock)]
+
 use rdc::api::{DataStorageClient, RossumClient};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

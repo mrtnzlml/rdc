@@ -1,3 +1,8 @@
+// Several pull/push/deploy/sync/diff helpers take many positional params
+// (paths, lockfile, client, progress, counters, flags). Grouping them into
+// structs would be artificial; allow the lint crate-wide.
+#![allow(clippy::too_many_arguments)]
+
 pub mod api;
 pub mod cli;
 pub mod config;
