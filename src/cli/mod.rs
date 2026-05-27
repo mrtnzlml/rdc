@@ -538,12 +538,12 @@ org_id = 2
         std::fs::write(
             dir.path().join("rdc.toml"),
             r#"
-[envs.dev-ap]
-api_base = "https://acme-dev.rossum.app/api/v1"
+[envs.dev-a]
+api_base = "https://shared.rossum.app/api/v1"
 org_id = 1
 
-[envs.dev-ops]
-api_base = "https://acme-dev.rossum.app/api/v1"
+[envs.dev-b]
+api_base = "https://shared.rossum.app/api/v1"
 org_id = 2
 "#,
         )

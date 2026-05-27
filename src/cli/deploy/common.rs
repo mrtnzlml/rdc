@@ -124,7 +124,7 @@ mod normalize_tests {
         let src = br#"{
           "name": "Annotation status change - received",
           "subject": "Documents received: {{ parent_email_subject }}",
-          "queue": "https://acme-test.rossum.app/api/v1/queues/5550442",
+          "queue": "https://example.rossum.app/api/v1/queues/100",
           "automate": false,
           "bcc": [],
           "cc": [],
@@ -134,17 +134,17 @@ mod normalize_tests {
           "type": "custom"
         }"#;
         let tgt = br#"{
-          "id": 55551418,
-          "url": "https://acme-test.rossum.app/api/v1/email_templates/55551418",
+          "id": 200,
+          "url": "https://example.rossum.app/api/v1/email_templates/200",
           "name": "Annotation status change - received",
           "subject": "Documents received: {{ parent_email_subject }}",
-          "queue": "https://acme-test.rossum.app/api/v1/queues/5550442",
-          "organization": "https://acme-test.rossum.app/api/v1/organizations/555976",
+          "queue": "https://example.rossum.app/api/v1/queues/100",
+          "organization": "https://example.rossum.app/api/v1/organizations/1",
           "message": "<p>Hi</p>",
           "type": "custom",
           "enabled": false,
           "automate": false,
-          "triggers": ["https://acme-test.rossum.app/api/v1/triggers/55557520"],
+          "triggers": ["https://example.rossum.app/api/v1/triggers/300"],
           "to": [{"email": "{{sender_email}}"}],
           "cc": [],
           "bcc": [],
