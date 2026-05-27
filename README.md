@@ -212,6 +212,7 @@ Hook secret values aren't copied between envs. If the target's `secrets/<tgt>.ho
 | `rdc deploy <src> <tgt>` | Promote one env's snapshot to another. |
 | `rdc diff <env>` | Local-vs-remote diff for `<env>`. |
 | `rdc diff <a> <b>` | Diff two local snapshots. |
+| `rdc diff … --raw` | Unadjusted diff (either form): also reveal id/url/organization, modified_at/modifier, server back-references, and un-rewritten cross-reference URLs. Keys/arrays stay sorted for readability. |
 | `rdc doctor <env>` | Diagnose and fix the local snapshot — realign stale slugs, repair store-extension hooks, optionally rebuild the lockfile (`--rebuild-lock`). |
 | `rdc upgrade` | Self-update the binary. |
 
