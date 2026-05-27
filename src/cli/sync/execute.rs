@@ -43,6 +43,10 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// `(resolution, code_conflict_only, local_bytes, remote_bytes, path)` — the
+/// resolved prompt outcome stored in the per-item `RefCell`.
+type PromptOutcome = (Resolution, bool, Vec<u8>, Vec<u8>, PathBuf);
+
 /// Items the conflict resolver promoted into the push pipeline. The caller
 /// merges these into the push-side `ChangeList` so a single PATCH round
 /// covers both the original `LocalEdit`/`LocalCreate` items and the
@@ -814,11 +818,10 @@ fn resolve_one_conflict<R: BufRead>(
     // Wrap all prompt reads in `with_prompt` so the grid renderer
     // suspends its draw region for the duration of the stdin read.
     // For the log renderer this is a transparent no-op.
-    let prompt_out: std::cell::RefCell<
-        Option<(Resolution, bool, Vec<u8>, Vec<u8>, PathBuf)>,
-    > = std::cell::RefCell::new(None);
+    let prompt_out: std::cell::RefCell<Option<PromptOutcome>> =
+        std::cell::RefCell::new(None);
     progress.with_prompt(|| -> anyhow::Result<_> {
-        let computed: (Resolution, bool, Vec<u8>, Vec<u8>, PathBuf) =
+        let computed: PromptOutcome =
             if json_canonicalize_equal && sidecar_diverges {
                 match hash_strategy {
                     HashStrategy::Hook | HashStrategy::Rule => {
@@ -2259,7 +2262,7 @@ pub async fn run(
         // (no push side), so any `subsets.get("organization")` hit means
         // we want the driver to write the local file. The driver takes
         // the full Organization rather than a subset filter.
-        if subsets.get("organization").is_some() {
+        if subsets.contains_key("organization") {
             crate::cli::pull::organization::process(ctx, catalog.organization.clone(), progress).await?;
         }
 
@@ -2474,10 +2477,10 @@ mod tests {
     }
 
     /// Scaffolding for a one-label conflict scenario: a temp dir + Paths
-    /// + Lockfile + a label that exists locally with the BASE bytes and
-    /// has a divergent remote variant. The caller supplies the local
-    /// edit and the remote variant separately to set up the BothDiverged
-    /// state.
+    ///     + Lockfile + a label that exists locally with the BASE bytes and
+    ///     has a divergent remote variant. The caller supplies the local
+    ///     edit and the remote variant separately to set up the BothDiverged
+    ///     state.
     struct ConflictFixture {
         _tmp: tempfile::TempDir,
         paths: Paths,
