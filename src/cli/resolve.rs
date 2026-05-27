@@ -232,13 +232,23 @@ pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
     writeln!(output, "{}", colorize_header(&header, mode))?;
     writeln!(output)?;
 
-    let diff = unified_diff("local", &local_display, env, &remote_display);
+    // Same styled renderer every other diff surface uses, so the conflict
+    // preview shares the look. The `env` side is `+` (the prompt already
+    // names it: "[r] use {env}"); local is `-`.
+    let left = String::from_utf8_lossy(&local_display);
+    let right = String::from_utf8_lossy(&remote_display);
+    let p = local_path.display();
+    let diff = render_styled_diff(
+        &format!("{p} (local)"),
+        &format!("{p} ({env})"),
+        &left,
+        &right,
+        mode,
+    );
     if diff.is_empty() {
         return Ok(Resolution::KeepLocal);
     }
-    for line in diff.lines() {
-        writeln!(output, "{}", colorize_diff_line(line, mode))?;
-    }
+    write!(output, "{diff}")?;
     writeln!(output)?;
 
     loop {
@@ -1427,6 +1437,314 @@ const SGR_ADD: &str = "\x1b[38;2;120;180;90m";
 const SGR_ADD_BOLD: &str = "\x1b[1;38;2;120;180;90m";
 const SGR_DIM: &str = "\x1b[2m";
 
+// --- Styled diff renderer (line numbers, ± row backgrounds, JSON highlight) ---
+//
+// Row backgrounds use truecolor + the EL trick (`\x1b[K`): once a background
+// is active, erase-to-end-of-line fills the rest of the row with it, so a
+// removed/added row tints edge-to-edge regardless of content width.
+// Foreground tokens inside a tinted row end with `\x1b[39m` (reset fg, keep
+// bg) — never a full `\x1b[0m` — so the bg survives until the trailing
+// EL + reset.
+const SGR_BG_ADD: &str = "\x1b[48;2;20;48;28m"; // deep green (added row)
+const SGR_BG_REMOVE: &str = "\x1b[48;2;60;24;26m"; // deep red (removed row)
+const SGR_BG_ADD_HI: &str = "\x1b[48;2;38;92;52m"; // brighter green — changed span
+const SGR_BG_REMOVE_HI: &str = "\x1b[48;2;120;42;46m"; // brighter red — changed span
+const SGR_GUTTER: &str = "\x1b[38;2;120;120;120m"; // gray line numbers (context)
+const SGR_GUTTER_ADD: &str = "\x1b[38;2;135;190;120m"; // green line number (added)
+const SGR_GUTTER_REMOVE: &str = "\x1b[38;2;225;130;130m"; // red line number (removed)
+const SGR_FG_DEFAULT: &str = "\x1b[39m"; // reset fg, preserve bg
+const SGR_EOL: &str = "\x1b[K"; // erase to EOL → fills current bg
+const SGR_J_KEY: &str = "\x1b[38;2;126;167;255m"; // JSON keys
+const SGR_J_STR: &str = "\x1b[38;2;152;195;121m"; // JSON string values
+const SGR_J_NUM: &str = "\x1b[38;2;229;181;103m"; // JSON numbers
+const SGR_J_KW: &str = "\x1b[38;2;198;146;233m"; // true / false / null
+
+/// Render a styled diff for inline display — the single renderer behind every
+/// user-facing diff (`rdc diff`, dry-run/deploy previews, and the conflict
+/// resolver), so they all share one look.
+///
+/// Layout: a `Verb(path)` header, an `Added N / removed M` summary, then
+/// line-numbered hunks (3 lines of context) with gray gutters, red/green row
+/// backgrounds on `-`/`+` lines, and simple JSON syntax highlighting (only
+/// when `path` ends in `.json`). `Verb` is `Create` (left empty) / `Delete`
+/// (right empty) / `Update`. In [`ColorMode::Plain`] the same layout renders
+/// with no SGR at all (line numbers + `-`/`+` markers). Returns `""` when the
+/// two sides are byte-identical.
+pub fn render_styled_diff(
+    left_label: &str,
+    right_label: &str,
+    left: &str,
+    right: &str,
+    mode: ColorMode,
+) -> String {
+    use similar::ChangeTag;
+    use std::fmt::Write as _;
+
+    let path = diff_display_path(left_label, right_label);
+    let left_ann = label_annotation(left_label);
+    let right_ann = label_annotation(right_label);
+    let diff = line_diff(left, right);
+    let groups = diff.grouped_ops(3);
+    if groups.is_empty() {
+        return String::new();
+    }
+
+    let (mut added, mut removed, mut max_line) = (0usize, 0usize, 1usize);
+    for op in groups.iter().flatten() {
+        for ch in diff.iter_changes(op) {
+            if let Some(i) = ch.old_index() {
+                max_line = max_line.max(i + 1);
+            }
+            if let Some(i) = ch.new_index() {
+                max_line = max_line.max(i + 1);
+            }
+            match ch.tag() {
+                ChangeTag::Insert => added += 1,
+                ChangeTag::Delete => removed += 1,
+                ChangeTag::Equal => {}
+            }
+        }
+    }
+
+    let w = max_line.to_string().len().max(3);
+    let verb = if left.is_empty() {
+        "Create"
+    } else if right.is_empty() {
+        "Delete"
+    } else {
+        "Update"
+    };
+    let is_json = path.ends_with(".json");
+    let plain = mode == ColorMode::Plain;
+    let s = |n: usize| if n == 1 { "" } else { "s" };
+
+    let mut out = String::new();
+    if plain {
+        let _ = writeln!(out, "{verb}({path})");
+        let _ = writeln!(
+            out,
+            "  Added {added} line{}, removed {removed} line{}",
+            s(added),
+            s(removed)
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "{SGR_ADD_BOLD}\u{25cf}{SGR_RESET} {SGR_AMBER_BOLD}{verb}{SGR_RESET}({path})"
+        );
+        let _ = writeln!(
+            out,
+            "  {SGR_DIM}\u{23bf} Added {added} line{}, removed {removed} line{}{SGR_RESET}",
+            s(added),
+            s(removed)
+        );
+    }
+
+    // Side legend (when both labels carry a ` (…)` annotation) so the reader
+    // knows what `-` and `+` mean — e.g. `- local  + remote`, or for a deploy
+    // preview `- src after overlay+rewrite  + tgt remote`.
+    if let (Some(la), Some(ra)) = (left_ann, right_ann) {
+        let _ = if plain {
+            writeln!(out, "  - {la}   + {ra}")
+        } else {
+            writeln!(out, "  {SGR_DIM}- {la}   + {ra}{SGR_RESET}")
+        };
+    }
+
+    for (gi, group) in groups.iter().enumerate() {
+        if gi > 0 {
+            let _ = if plain {
+                writeln!(out, "  \u{22ee}")
+            } else {
+                writeln!(out, "  {SGR_DIM}\u{22ee}{SGR_RESET}")
+            };
+        }
+        for op in group {
+            for change in diff.iter_inline_changes(op) {
+                // Reassemble the row text and record which byte ranges differ
+                // from the paired row (emphasized), for intra-line highlight.
+                let mut content = String::new();
+                let mut emph: Vec<(usize, usize)> = Vec::new();
+                for (emphasized, val) in change.iter_strings_lossy() {
+                    let start = content.len();
+                    content.push_str(&val);
+                    if emphasized {
+                        emph.push((start, content.len()));
+                    }
+                }
+                if content.ends_with('\n') {
+                    content.pop();
+                }
+                let clen = content.len();
+                for r in emph.iter_mut() {
+                    r.0 = r.0.min(clen);
+                    r.1 = r.1.min(clen);
+                }
+                emph.retain(|(s, e)| s < e);
+
+                let (marker, idx) = match change.tag() {
+                    ChangeTag::Equal => (' ', change.new_index()),
+                    ChangeTag::Delete => ('-', change.old_index()),
+                    ChangeTag::Insert => ('+', change.new_index()),
+                };
+                let n = idx.map(|i| i + 1).unwrap_or(0);
+
+                if plain {
+                    let _ = writeln!(out, "  {n:>w$} {marker} {content}");
+                    continue;
+                }
+                let _ = match change.tag() {
+                    ChangeTag::Delete => {
+                        let body = render_content(&content, is_json, Some(SGR_BG_REMOVE), SGR_BG_REMOVE_HI, &emph);
+                        writeln!(out, "{SGR_BG_REMOVE}  {SGR_GUTTER_REMOVE}{n:>w$} {marker}{SGR_FG_DEFAULT} {body}{SGR_EOL}{SGR_RESET}")
+                    }
+                    ChangeTag::Insert => {
+                        let body = render_content(&content, is_json, Some(SGR_BG_ADD), SGR_BG_ADD_HI, &emph);
+                        writeln!(out, "{SGR_BG_ADD}  {SGR_GUTTER_ADD}{n:>w$} {marker}{SGR_FG_DEFAULT} {body}{SGR_EOL}{SGR_RESET}")
+                    }
+                    ChangeTag::Equal => {
+                        let body = render_content(&content, is_json, None, "", &[]);
+                        writeln!(out, "  {SGR_GUTTER}{n:>w$}{SGR_RESET}   {body}")
+                    }
+                };
+            }
+        }
+    }
+    out
+}
+
+/// Derive the header path for [`render_styled_diff`] from the two side
+/// labels callers pass (e.g. `"queues/q/queue.json (local)"` and
+/// `"… (remote)"`, or `"/dev/null"` for a created/deleted side). Picks the
+/// non-`/dev/null` side and strips a trailing ` (…)` annotation.
+pub fn diff_display_path(a: &str, b: &str) -> String {
+    let pick = if a == "/dev/null" { b } else { a };
+    pick.rsplit_once(" (").map(|(p, _)| p).unwrap_or(pick).to_string()
+}
+
+/// Extract the ` (…)` annotation a caller appends to a diff side label
+/// (e.g. `"hooks/x.json (src after overlay+rewrite)"` → `"src after
+/// overlay+rewrite"`). Returns `None` for bare paths or `/dev/null`.
+fn label_annotation(label: &str) -> Option<&str> {
+    let start = label.rfind(" (")? + 2;
+    label[start..].strip_suffix(')')
+}
+
+/// JSON syntax-highlight spans for one line: `(start, end, fg)` byte ranges
+/// for `"keys"` (a string immediately followed by `:`), `"string values"`,
+/// numbers, and the literals `true`/`false`/`null`. Bytes not covered by any
+/// span render in the default foreground. Best-effort and line-local; never
+/// panics.
+fn json_fg_spans(line: &str) -> Vec<(usize, usize, &'static str)> {
+    let b = line.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'"' {
+            let start = i;
+            i += 1;
+            while i < b.len() {
+                match b[i] {
+                    b'\\' => i = (i + 2).min(b.len()),
+                    b'"' => {
+                        i += 1;
+                        break;
+                    }
+                    _ => i += 1,
+                }
+            }
+            let mut j = i;
+            while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+                j += 1;
+            }
+            let color = if j < b.len() && b[j] == b':' { SGR_J_KEY } else { SGR_J_STR };
+            spans.push((start, i, color));
+        } else if c.is_ascii_digit() || (c == b'-' && i + 1 < b.len() && b[i + 1].is_ascii_digit()) {
+            let start = i;
+            i += 1;
+            while i < b.len() && (b[i].is_ascii_digit() || matches!(b[i], b'.' | b'e' | b'E' | b'+' | b'-')) {
+                i += 1;
+            }
+            spans.push((start, i, SGR_J_NUM));
+        } else if let Some(kw) = ["true", "false", "null"]
+            .into_iter()
+            .find(|kw| line[i..].starts_with(kw))
+            .filter(|kw| {
+                let e = i + kw.len();
+                e >= b.len() || !(b[e].is_ascii_alphanumeric() || b[e] == b'_')
+            })
+        {
+            spans.push((i, i + kw.len(), SGR_J_KW));
+            i += kw.len();
+        } else {
+            let ch = line[i..].chars().next().unwrap();
+            i += ch.len_utf8();
+        }
+    }
+    spans
+}
+
+/// Render one diff row's content (everything after the gutter + marker),
+/// combining two overlays: JSON syntax highlighting (foreground) and
+/// intra-line change emphasis — a brighter background (`hi_bg`) over the
+/// `emph` byte ranges, which are the substrings that actually differ from the
+/// paired row. `base_bg` is `Some` for changed (`-`/`+`) rows (the row's base
+/// background, which the caller has already set and whose trailing `\x1b[K`
+/// fills the rest of the line) and `None` for context rows. Foreground
+/// changes use `\x1b[39m` so the active background is never disturbed; the
+/// background is restored to `base_bg` before returning.
+fn render_content(
+    content: &str,
+    is_json: bool,
+    base_bg: Option<&str>,
+    hi_bg: &str,
+    emph: &[(usize, usize)],
+) -> String {
+    let fg = if is_json { json_fg_spans(content) } else { Vec::new() };
+    let mut bounds: Vec<usize> = vec![0, content.len()];
+    for (s, e, _) in &fg {
+        bounds.push(*s);
+        bounds.push(*e);
+    }
+    for (s, e) in emph {
+        bounds.push(*s);
+        bounds.push(*e);
+    }
+    bounds.sort_unstable();
+    bounds.dedup();
+
+    let mut out = String::new();
+    let mut cur_fg: Option<&str> = None;
+    let mut cur_emph = false;
+    for win in bounds.windows(2) {
+        let (a, z) = (win[0], win[1]);
+        if a >= z {
+            continue;
+        }
+        let seg_fg = fg.iter().find(|(s, e, _)| *s <= a && a < *e).map(|(_, _, c)| *c);
+        let seg_emph = emph.iter().any(|(s, e)| *s <= a && a < *e);
+        if base_bg.is_some() && seg_emph != cur_emph {
+            out.push_str(if seg_emph { hi_bg } else { base_bg.unwrap() });
+            cur_emph = seg_emph;
+        }
+        if seg_fg != cur_fg {
+            out.push_str(seg_fg.unwrap_or(SGR_FG_DEFAULT));
+            cur_fg = seg_fg;
+        }
+        out.push_str(&content[a..z]);
+    }
+    if cur_fg.is_some() {
+        out.push_str(SGR_FG_DEFAULT);
+    }
+    if let Some(bg) = base_bg {
+        if cur_emph {
+            out.push_str(bg);
+        }
+    }
+    out
+}
+
 /// Apply color to a single line of unified-diff output. Returns `line`
 /// unchanged in [`ColorMode::Plain`].
 pub fn colorize_diff_line(line: &str, mode: ColorMode) -> String {
@@ -1948,10 +2266,13 @@ mod tests {
         )
         .unwrap();
         let s = String::from_utf8(output).unwrap();
-        // Conflict header in bold amber, action letters in bold amber,
-        // diff lines in remove/add hues.
+        // Conflict header + action letters in bold amber; the styled diff
+        // marks changed rows with red/green backgrounds.
         assert!(s.contains(SGR_AMBER_BOLD), "no amber accent: {s:?}");
-        assert!(s.contains(SGR_REMOVE) || s.contains(SGR_ADD), "no diff hue: {s:?}");
+        assert!(
+            s.contains(SGR_BG_REMOVE) || s.contains(SGR_BG_ADD),
+            "no diff row background: {s:?}"
+        );
     }
 
     #[test]
@@ -2081,8 +2402,56 @@ mod tests {
 
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("[r] use production"), "prompt missing env-named [r] label: {s}");
-        assert!(s.contains("+++ production"), "diff header should name the env: {s}");
+        // The env name now lives only in the prompt's `[r]` label, not the
+        // diff body (the styled renderer headers with the file path). Confirm
+        // the styled diff rendered and shows the changed value.
+        assert!(s.contains("Update("), "styled diff header missing: {s}");
+        assert!(s.contains("\"a\": 2"), "diff should show the remote value: {s}");
         assert!(!s.contains("[r]emote"), "old literal label leaked: {s}");
+    }
+
+    #[test]
+    fn render_styled_diff_plain_layout() {
+        let l = "{\n  \"hidden\": true\n}\n";
+        let r = "{\n  \"hidden\": false\n}\n";
+        let out = render_styled_diff("q/schema.json (local)", "q/schema.json (remote)", l, r, ColorMode::Plain);
+        assert!(out.starts_with("Update(q/schema.json)\n"), "header: {out}");
+        assert!(out.contains("Added 1 line, removed 1 line"), "summary: {out}");
+        assert!(out.contains("- local   + remote"), "side legend: {out}");
+        assert!(out.contains(" - "), "removed marker: {out}");
+        assert!(out.contains(" + "), "added marker: {out}");
+        assert!(out.contains("true") && out.contains("false"), "both values: {out}");
+        assert!(!out.contains('\u{1b}'), "plain mode must carry no SGR: {out}");
+        // identical sides → empty
+        assert!(render_styled_diff("q/x.json (local)", "q/x.json (remote)", l, l, ColorMode::Plain).is_empty());
+        // verb reflects one-sided diffs
+        assert!(render_styled_diff("/dev/null", "q/x.json", "", r, ColorMode::Plain).starts_with("Create("));
+        assert!(render_styled_diff("q/x.json", "/dev/null", l, "", ColorMode::Plain).starts_with("Delete("));
+    }
+
+    #[test]
+    fn render_styled_diff_color_backgrounds_and_highlight() {
+        let l = "{\n  \"hidden\": true\n}\n";
+        let r = "{\n  \"hidden\": false\n}\n";
+        let out = render_styled_diff("q/schema.json (local)", "q/schema.json (remote)", l, r, ColorMode::Color);
+        assert!(out.contains(SGR_BG_REMOVE), "removed row needs a red background");
+        assert!(out.contains(SGR_BG_ADD), "added row needs a green background");
+        assert!(out.contains(SGR_EOL), "rows must fill the background to the line end");
+        assert!(out.contains(SGR_J_KEY), "JSON keys should be highlighted");
+        assert!(out.contains(SGR_J_KW), "true/false should be highlighted");
+        // Colored gutters on changed rows.
+        assert!(out.contains(SGR_GUTTER_REMOVE), "removed line number should be red");
+        assert!(out.contains(SGR_GUTTER_ADD), "added line number should be green");
+        // Intra-line emphasis: the changed value carries the brighter bg.
+        assert!(out.contains(SGR_BG_REMOVE_HI), "changed span on removed row needs brighter red");
+        assert!(out.contains(SGR_BG_ADD_HI), "changed span on added row needs brighter green");
+        // Non-.json content is not JSON-highlighted (but still gets row bg).
+        let py = render_styled_diff("hooks/h.py (local)", "hooks/h.py (remote)", "a = 1\n", "a = 2\n", ColorMode::Color);
+        assert!(
+            !py.contains(SGR_J_KEY) && !py.contains(SGR_J_NUM),
+            "non-json must skip syntax highlighting: {py:?}"
+        );
+        assert!(py.contains(SGR_BG_ADD), "non-json still gets row backgrounds");
     }
 
     #[test]

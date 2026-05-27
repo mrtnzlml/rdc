@@ -4,7 +4,6 @@
 //! Both modes produce unified diffs on stdout. No file writes, no PATCHes.
 
 use crate::api::RossumClient;
-use crate::cli::resolve::line_diff;
 use crate::config::ProjectConfig;
 use crate::log::{Action, Log};
 use crate::mapping::Mapping;
@@ -469,13 +468,18 @@ fn canonical_json_for_diff<T: serde::Serialize>(v: &T) -> Result<String> {
     Ok(String::from_utf8(bytes)?)
 }
 
-/// Print a unified diff (3-line context) of two text blobs with custom
-/// header labels. If the inputs are byte-equal, prints nothing and leaves
-/// `counter` untouched — callers can pass a no-op counter (`&mut 0`) when
-/// they only care about the side effect.
+/// Print a styled diff (3-line context) of two text blobs. The `*_label`
+/// args only supply the header path (via [`resolve::diff_display_path`]);
+/// the `-`/`+` sides are left/right. If the inputs are byte-equal, prints
+/// nothing and leaves `counter` untouched — callers can pass a no-op counter
+/// (`&mut 0`) when they only care about the side effect.
 ///
-/// Output is colorized for TTY stdout (red `-`, green `+`, cyan `@@`),
-/// plain otherwise (respects `NO_COLOR` and the global `--no-color` flag).
+/// Rendering goes through [`resolve::render_styled_diff`] — the one renderer
+/// shared by `rdc diff`, the dry-run/deploy previews, and the conflict
+/// resolver — so every diff looks the same: a `Verb(path)` header, an
+/// `Added N / removed M` summary, and line-numbered hunks with red/green row
+/// backgrounds + JSON syntax highlighting on a TTY (plain — line numbers +
+/// `-`/`+` only — otherwise; respects `NO_COLOR` and `--no-color`).
 ///
 /// Used by `rdc diff` directly and by `rdc push --dry-run --diff` /
 /// `rdc deploy --dry-run` to surface per-object changes.
@@ -489,16 +493,12 @@ pub fn print_unified(
     if left == right {
         return;
     }
-    let diff = line_diff(left, right);
-    let unified = diff
-        .unified_diff()
-        .context_radius(3)
-        .header(left_label, right_label)
-        .to_string();
     let mode = crate::cli::resolve::detect_color_mode(false);
-    for line in unified.lines() {
-        println!("{}", crate::cli::resolve::colorize_diff_line(line, mode));
+    let rendered = crate::cli::resolve::render_styled_diff(left_label, right_label, left, right, mode);
+    if rendered.is_empty() {
+        return;
     }
+    print!("{rendered}");
     *counter += 1;
 }
 
