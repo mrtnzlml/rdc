@@ -276,7 +276,7 @@ pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
                 match run_editor_loop(
                     &mut input,
                     &mut output,
-                    &local_bytes,
+                    local_bytes,
                     remote_bytes,
                     local_path,
                     env,
@@ -1739,11 +1739,10 @@ fn render_content(
     if cur_fg.is_some() {
         out.push_str(SGR_FG_DEFAULT);
     }
-    if let Some(bg) = base_bg {
-        if cur_emph {
+    if let Some(bg) = base_bg
+        && cur_emph {
             out.push_str(bg);
         }
-    }
     out
 }
 
@@ -1823,8 +1822,8 @@ pub fn colorize_prompt(text: &str, mode: ColorMode) -> String {
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '[' {
-            if let Some(&letter) = chars.peek() {
-                if letter.is_ascii_alphabetic() {
+            if let Some(&letter) = chars.peek()
+                && letter.is_ascii_alphabetic() {
                     chars.next(); // consume letter
                     if matches!(chars.peek(), Some(']')) {
                         chars.next(); // consume ]
@@ -1841,7 +1840,6 @@ pub fn colorize_prompt(text: &str, mode: ColorMode) -> String {
                         continue;
                     }
                 }
-            }
             out.push(c);
         } else {
             out.push(c);

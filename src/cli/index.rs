@@ -385,11 +385,10 @@ fn emit_inboxes(md: &mut String, ctx: &IndexCtx<'_>) {
             "  - path: workspaces/{ws_slug}/queues/{slug}/inbox.json\n"
         ));
         md.push_str(&format!("  - queue: `{slug}`\n"));
-        if let Some(email) = v.as_ref().and_then(|v| v.get("email").and_then(|e| e.as_str())) {
-            if !email.is_empty() {
+        if let Some(email) = v.as_ref().and_then(|v| v.get("email").and_then(|e| e.as_str()))
+            && !email.is_empty() {
                 md.push_str(&format!("  - email: {email}\n"));
             }
-        }
     }
     md.push('\n');
 }
@@ -523,17 +522,15 @@ fn emit_engine_fields(md: &mut String, ctx: &IndexCtx<'_>) {
         let v = path.as_ref().and_then(|p| read_json(p));
         write_header(md, slug, entry.id);
         write_name(md, v.as_ref());
-        if let Some(p) = path.as_ref() {
-            if let Ok(rel) = p.strip_prefix(ctx.paths.env_root()) {
+        if let Some(p) = path.as_ref()
+            && let Ok(rel) = p.strip_prefix(ctx.paths.env_root()) {
                 md.push_str(&format!("  - path: {}\n", rel.display()));
             }
-        }
         let _ = field_entry;
-        if let Some(v) = v.as_ref() {
-            if let Some(engine_slug) = url_to_slug(v, "engine", "engines", ctx.lockfile) {
+        if let Some(v) = v.as_ref()
+            && let Some(engine_slug) = url_to_slug(v, "engine", "engines", ctx.lockfile) {
                 md.push_str(&format!("  - engine: `{engine_slug}`\n"));
             }
-        }
     }
     md.push('\n');
 }
@@ -583,16 +580,14 @@ fn emit_workflow_steps(md: &mut String, ctx: &IndexCtx<'_>) {
         let v = path.as_ref().and_then(|p| read_json(p));
         write_header(md, slug, entry.id);
         write_name(md, v.as_ref());
-        if let Some(p) = path.as_ref() {
-            if let Ok(rel) = p.strip_prefix(ctx.paths.env_root()) {
+        if let Some(p) = path.as_ref()
+            && let Ok(rel) = p.strip_prefix(ctx.paths.env_root()) {
                 md.push_str(&format!("  - path: {}\n", rel.display()));
             }
-        }
-        if let Some(v) = v.as_ref() {
-            if let Some(wf_slug) = url_to_slug(v, "workflow", "workflows", ctx.lockfile) {
+        if let Some(v) = v.as_ref()
+            && let Some(wf_slug) = url_to_slug(v, "workflow", "workflows", ctx.lockfile) {
                 md.push_str(&format!("  - workflow: `{wf_slug}`\n"));
             }
-        }
     }
     md.push('\n');
 }
@@ -636,11 +631,10 @@ fn emit_email_templates(md: &mut String, ctx: &IndexCtx<'_>) {
             "  - path: workspaces/{ws}/queues/{q}/email-templates/{t}.json\n"
         ));
         md.push_str(&format!("  - queue: `{q}`\n"));
-        if let Some(subject) = v.as_ref().and_then(|v| v.get("subject").and_then(|s| s.as_str())) {
-            if !subject.is_empty() {
+        if let Some(subject) = v.as_ref().and_then(|v| v.get("subject").and_then(|s| s.as_str()))
+            && !subject.is_empty() {
                 md.push_str(&format!("  - subject: {}\n", quote_for_md(subject)));
             }
-        }
     }
     md.push('\n');
 }
@@ -709,7 +703,7 @@ fn list_formula_fields(queue_dir: &Path) -> Vec<String> {
 /// Truncates pathologically long names so the index stays scannable.
 fn quote_for_md(s: &str) -> String {
     const MAX: usize = 120;
-    let safe = s.replace('\n', " ").replace('\r', " ");
+    let safe = s.replace(['\n', '\r'], " ");
     if safe.chars().count() > MAX {
         let head: String = safe.chars().take(MAX).collect();
         format!("\"{head}…\"")

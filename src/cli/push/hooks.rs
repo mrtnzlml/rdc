@@ -28,14 +28,13 @@ fn inject_hook_secrets(body: &mut Value, slug: &str, secrets: &HookSecrets) -> S
     let empty = BTreeMap::<String, String>::new();
     let kv = secrets.for_slug(slug).unwrap_or(&empty);
     let hash = hook_secrets_hash(kv);
-    if !kv.is_empty() {
-        if let Some(obj) = body.as_object_mut() {
+    if !kv.is_empty()
+        && let Some(obj) = body.as_object_mut() {
             obj.insert(
                 "secrets".to_string(),
                 serde_json::to_value(kv).expect("BTreeMap<String,String> serializes"),
             );
         }
-    }
     hash
 }
 

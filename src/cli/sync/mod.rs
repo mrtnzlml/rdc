@@ -964,11 +964,10 @@ pub fn from_catalog_scan_lockfile(
         remote_hashes.insert(("queues".to_string(), q_slug.clone()), q_hash);
 
         // schemas — combined (json + formulas). Pre-fetched in `list_remote`.
-        if let Some(schema) = catalog.schemas_by_queue_id.get(&q.id) {
-            if let Ok((schema_json_bytes, schema_formulas)) =
+        if let Some(schema) = catalog.schemas_by_queue_id.get(&q.id)
+            && let Ok((schema_json_bytes, schema_formulas)) =
                 crate::snapshot::schema::serialize_schema(schema)
-            {
-                if let Ok(schema_json_bytes) = crate::cli::pull::common::maybe_strip_overlay(
+                && let Ok(schema_json_bytes) = crate::cli::pull::common::maybe_strip_overlay(
                     schema_json_bytes,
                     overlay.and_then(|o| o.schema(&q_slug)),
                 ) {
@@ -976,12 +975,10 @@ pub fn from_catalog_scan_lockfile(
                         crate::state::schema_combined_hash(&schema_json_bytes, &schema_formulas);
                     remote_hashes.insert(("schemas".to_string(), q_slug.clone()), schema_hash);
                 }
-            }
-        }
 
         // inboxes — flat JSON. Only present for queues that have an inbox.
-        if let Some(inbox) = catalog.inboxes_by_queue_id.get(&q.id) {
-            if let Ok(mut inbox_proposed) = serde_json::to_vec_pretty(inbox) {
+        if let Some(inbox) = catalog.inboxes_by_queue_id.get(&q.id)
+            && let Ok(mut inbox_proposed) = serde_json::to_vec_pretty(inbox) {
                 inbox_proposed.push(b'\n');
                 if let Ok(inbox_proposed) = crate::cli::pull::common::maybe_strip_overlay(
                     inbox_proposed,
@@ -991,7 +988,6 @@ pub fn from_catalog_scan_lockfile(
                     remote_hashes.insert(("inboxes".to_string(), q_slug.clone()), inbox_hash);
                 }
             }
-        }
     }
 
     // Scan-side hashes for queues / inboxes (flat) and schemas (combined).

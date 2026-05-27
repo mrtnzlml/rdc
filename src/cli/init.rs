@@ -102,10 +102,7 @@ pub async fn run(env_specs: Vec<String>) -> Result<()> {
             Ok(t) if !t.trim().is_empty() => Some((t.trim().to_string(), env_var_name.clone())),
             _ => {
                 if std::io::stdin().is_terminal() {
-                    match prompt_token_for_env(env)? {
-                        Some(t) => Some((t, "interactive prompt".to_string())),
-                        None => None,
-                    }
+                    prompt_token_for_env(env)?.map(|t| (t, "interactive prompt".to_string()))
                 } else {
                     None
                 }
