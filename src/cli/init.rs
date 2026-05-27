@@ -302,16 +302,21 @@ fn resolve_env_specs(
             Err(PromptOutcome::Failed(e)) => return Err(e),
         };
 
-        let api_base = match prompt_api_base() {
-            Ok(s) => s,
+        // Ask org id before api_base: env name + org id are the identity
+        // facts a user knows offhand, so leading with them feels more
+        // natural than the connection URL. The API token is gathered later
+        // (the auth phase in `run`), so the user-facing question order is
+        // env name -> org id -> api_base -> token.
+        let org_id = match prompt_org_id() {
+            Ok(n) => n,
             Err(PromptOutcome::Cancelled) => {
                 return finish_or_cancel(specs);
             }
             Err(PromptOutcome::Failed(e)) => return Err(e),
         };
 
-        let org_id = match prompt_org_id() {
-            Ok(n) => n,
+        let api_base = match prompt_api_base() {
+            Ok(s) => s,
             Err(PromptOutcome::Cancelled) => {
                 return finish_or_cancel(specs);
             }
