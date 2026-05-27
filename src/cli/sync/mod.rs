@@ -899,7 +899,7 @@ pub fn from_catalog_scan_lockfile(
     //
     // The remote hash for each kind mirrors the pull driver's canonical
     // bytes:
-    //   queues   → `serde_json::to_vec_pretty(q)` + `\n` + strip + `content_hash`
+    //   queues   → `redacted_disk_bytes(q)` (redact `counts`) + strip + `content_hash`
     //   schemas  → `serialize_schema` → strip → `schema_combined_hash(json, formulas)`
     //   inboxes  → `serde_json::to_vec_pretty(i)` + `\n` + strip + `content_hash`
     //   email_tpl→ `serde_json::to_vec_pretty(t)` + `\n` + strip + `content_hash`
@@ -945,12 +945,14 @@ pub fn from_catalog_scan_lockfile(
         used.insert(q_slug.clone());
         q_url_to_ws_q.insert(q.url.clone(), (ws_slug.clone(), q_slug.clone()));
 
-        // queues — flat JSON.
-        let mut q_proposed = match serde_json::to_vec_pretty(q) {
+        // queues — flat JSON. Must mirror the pull driver's canonical on-disk
+        // bytes, which redact server-set runtime fields (`counts`). Serializing
+        // the raw queue here instead made live `counts` churn read as remote
+        // drift, surfacing a spurious queue.json conflict.
+        let q_proposed = match crate::snapshot::create::redacted_disk_bytes(q, "queues") {
             Ok(b) => b,
             Err(_) => continue,
         };
-        q_proposed.push(b'\n');
         let q_proposed = match crate::cli::pull::common::maybe_strip_overlay(
             q_proposed,
             overlay.and_then(|o| o.queue(&q_slug)),
