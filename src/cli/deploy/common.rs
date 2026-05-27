@@ -5,7 +5,7 @@
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::mapping::Mapping;
 use crate::snapshot::create::strip_for_cross_env_patch;
-use crate::snapshot::noise::{sort_keys_recursive, strip_noise_fields};
+use crate::snapshot::noise::{sort_keys_recursive, sort_string_arrays, strip_noise_fields};
 use crate::state::{content_hash, Lockfile};
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -41,73 +41,9 @@ pub fn normalize_for_cross_env_compare(bytes: &[u8], kind: &str) -> Result<Vec<u
     Ok(out)
 }
 
-/// Recursively sort every all-string array in the tree alphabetically.
-///
-/// Rossum returns set-like URL arrays (a hook's `queues`, its `run_after`,
-/// `events`) sorted by the server's internal numeric id. The same set of
-/// queues attached to a sandbox hook and a prod hook will therefore appear
-/// in *different* orders because the ids are assigned per-env; after URL
-/// rewriting the contents match but the ordering doesn't. Sorting both sides
-/// alphabetically before comparing makes the idempotency check
-/// order-insensitive for these set-like fields, which is the README's
-/// "0 PATCHes on re-apply" contract.
-///
-/// Mixed-type arrays (containing objects, numbers, etc.) are left alone —
-/// stable order matters for `content[]` schema definitions where the array
-/// order *is* the field order users see in the UI.
-fn sort_string_arrays(value: &mut Value) {
-    match value {
-        Value::Array(arr) => {
-            let all_strings = arr.iter().all(|v| matches!(v, Value::String(_)));
-            if all_strings {
-                arr.sort_by(|a, b| match (a, b) {
-                    (Value::String(s1), Value::String(s2)) => s1.cmp(s2),
-                    _ => std::cmp::Ordering::Equal,
-                });
-            } else {
-                for v in arr {
-                    sort_string_arrays(v);
-                }
-            }
-        }
-        Value::Object(obj) => {
-            for v in obj.values_mut() {
-                sort_string_arrays(v);
-            }
-        }
-        _ => {}
-    }
-}
-
 #[cfg(test)]
 mod normalize_tests {
     use super::*;
-
-    #[test]
-    fn sort_string_arrays_sorts_top_level_url_array() {
-        let mut v = serde_json::json!({"queues": ["https://x/queues/3", "https://x/queues/1", "https://x/queues/2"]});
-        sort_string_arrays(&mut v);
-        assert_eq!(
-            v,
-            serde_json::json!({"queues": ["https://x/queues/1", "https://x/queues/2", "https://x/queues/3"]})
-        );
-    }
-
-    #[test]
-    fn sort_string_arrays_leaves_mixed_arrays_alone() {
-        // schema content[] mixes datapoint objects + section objects;
-        // their order is the UI field order and must not be sorted.
-        let mut v = serde_json::json!({"content": [{"id": "b"}, {"id": "a"}]});
-        sort_string_arrays(&mut v);
-        assert_eq!(v, serde_json::json!({"content": [{"id": "b"}, {"id": "a"}]}));
-    }
-
-    #[test]
-    fn sort_string_arrays_recurses_into_objects() {
-        let mut v = serde_json::json!({"config": {"sideload": ["b", "a"]}});
-        sort_string_arrays(&mut v);
-        assert_eq!(v, serde_json::json!({"config": {"sideload": ["a", "b"]}}));
-    }
 
     #[test]
     fn normalize_collapses_real_world_email_template_noise() {

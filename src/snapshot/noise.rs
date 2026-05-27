@@ -95,6 +95,48 @@ pub(crate) fn sort_keys_recursive(value: &mut serde_json::Value) {
     }
 }
 
+/// Recursively sort every all-string array in the tree alphabetically.
+/// Set-like URL arrays (a hook's `queues`, `events`, `run_after`) come
+/// back from Rossum in per-env id order; sorting makes cross-env compares
+/// order-insensitive. Mixed-type arrays (objects/numbers) are left alone —
+/// `content[]` field order is meaningful. (Moved here from
+/// `cli::deploy::common` so the snapshot serializers can share it.)
+pub(crate) fn sort_string_arrays(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(arr) => {
+            let all_strings = arr.iter().all(|v| matches!(v, serde_json::Value::String(_)));
+            if all_strings {
+                arr.sort_by(|a, b| match (a, b) {
+                    (serde_json::Value::String(s1), serde_json::Value::String(s2)) => s1.cmp(s2),
+                    _ => std::cmp::Ordering::Equal,
+                });
+            } else {
+                for v in arr.iter_mut() {
+                    sort_string_arrays(v);
+                }
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            for v in obj.values_mut() {
+                sort_string_arrays(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Tidy-raw normalisation for `rdc diff --raw`: sort string-arrays and
+/// object keys for readability, but strip NOTHING and rewrite no URLs.
+/// The inverse of `normalize_for_cross_env_compare` minus the
+/// stripping/rewriting — two payloads compare equal iff they carry the
+/// same fields/values modulo key/array ordering.
+// Called by the diff CLI layer (Task 2+); allow dead_code until then.
+#[allow(dead_code)]
+pub(crate) fn tidy_raw(value: &mut serde_json::Value) {
+    sort_string_arrays(value);
+    sort_keys_recursive(value);
+}
+
 fn strip_field_recursive(value: &mut serde_json::Value, fields: &[&str]) {
     match value {
         serde_json::Value::Object(map) => {
@@ -209,5 +251,29 @@ mod tests {
         let a = b"{\"name\":\"x\",\"modifier\":\"u1\"}";
         let b = b"{\"name\":\"x\",\"modifier\":\"u2\"}";
         assert_eq!(canonicalize_for_hash(a), canonicalize_for_hash(b));
+    }
+
+    #[test]
+    fn tidy_raw_sorts_keys_and_string_arrays_but_strips_nothing() {
+        let mut v = serde_json::json!({
+            "url": "https://x/api/v1/hooks/1",
+            "id": 1,
+            "modified_at": "2026-01-01T00:00:00Z",
+            "modifier": "https://x/api/v1/users/9",
+            "queues": ["https://x/q/3", "https://x/q/1", "https://x/q/2"]
+        });
+        super::tidy_raw(&mut v);
+        // Nothing stripped:
+        assert_eq!(v.get("id").and_then(|x| x.as_u64()), Some(1));
+        assert!(v.get("url").is_some());
+        assert!(v.get("modified_at").is_some());
+        assert!(v.get("modifier").is_some());
+        // String array sorted:
+        assert_eq!(v["queues"], serde_json::json!([
+            "https://x/q/1", "https://x/q/2", "https://x/q/3"
+        ]));
+        // Keys alphabetically sorted (id before url in the serialized form):
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(s.find("\"id\"").unwrap() < s.find("\"url\"").unwrap());
     }
 }
