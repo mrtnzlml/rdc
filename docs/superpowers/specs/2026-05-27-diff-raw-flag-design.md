@@ -85,10 +85,12 @@ tidy_raw(value: &mut serde_json::Value):
     // caller pretty-prints + appends trailing newline
 ```
 
-No stripping, no URL rewriting. Lives next to
-`normalize_for_cross_env_compare` in `src/cli/deploy/common.rs` so it
-sits beside the normalizer it mirrors and reuses the already-present
-`sort_string_arrays`. Exposed `pub(crate)`.
+No stripping, no URL rewriting. Lives in `src/snapshot/noise.rs` beside
+`sort_keys_recursive` (which is `pub(crate)` there). This requires moving
+`sort_string_arrays` from `src/cli/deploy/common.rs` into `noise.rs` (as
+`pub(crate)`) so both the cli-layer diff path and the lower-level snapshot
+serializers can call `tidy_raw` without an upward (snapshot → cli)
+dependency. Exposed `pub(crate)`.
 
 ### Env-vs-env mode (`diff_snapshot_vs_snapshot`)
 
@@ -144,12 +146,18 @@ them), or pull without the overlay.
   and the six local-vs-remote helpers; raw branch in the env-vs-env
   normalize step; raw serialize variants (or `raw` param) for the per-kind
   JSON sides.
-- `src/cli/deploy/common.rs` — new `tidy_raw`; make `sort_string_arrays`
-  reachable (already in this module).
+- `src/snapshot/noise.rs` — new `pub(crate) tidy_raw`; receives
+  `sort_string_arrays` moved here from `common.rs` (co-located with
+  `sort_keys_recursive`).
+- `src/cli/deploy/common.rs` — import `sort_string_arrays` from `noise`
+  (function moved out); behavior of `normalize_for_cross_env_compare`
+  unchanged.
 - `src/snapshot/hook.rs`, `src/snapshot/rule.rs`, `src/snapshot/schema.rs`
-  — thin raw serialize variants reusing the existing code/formula split
-  plus `tidy_raw` (or a `raw` parameter on the existing serializers,
-  whichever keeps call sites cleanest; decided in the plan).
+  — sibling `serialize_*_raw` functions sharing a private code/formula
+  split helper with the existing serializer. Sibling functions (not a
+  `raw` parameter) because the existing serializers have 15–30 callers
+  across sync/push/pull/deploy; sibling fns keep the blast radius to
+  `diff.rs` only.
 
 ## Testing
 
