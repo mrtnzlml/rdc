@@ -237,11 +237,15 @@ fn diff_snapshot_vs_snapshot(cwd: &Path, src: &str, tgt: &str, raw: bool) -> Res
 
     // In raw mode, skip mapping + lockfile loads entirely — no URL
     // rewriting, so the ctx is always None.
-    let mapping_path = src_paths.mapping_file(src, tgt);
-    let mapping = if !raw && mapping_path.exists() {
-        Mapping::load(&mapping_path).ok()
-    } else {
+    let mapping = if raw {
         None
+    } else {
+        let mapping_path = src_paths.mapping_file(src, tgt);
+        if mapping_path.exists() {
+            Mapping::load(&mapping_path).ok()
+        } else {
+            None
+        }
     };
     let src_lockfile = if raw { None } else { Lockfile::load(&src_paths.lockfile()).ok() };
     let tgt_lockfile = if raw { None } else { Lockfile::load(&tgt_paths.lockfile()).ok() };
@@ -296,7 +300,11 @@ fn diff_snapshot_vs_snapshot(cwd: &Path, src: &str, tgt: &str, raw: bool) -> Res
     }
 
     if diffs_printed == 0 {
-        println!("no diffs (snapshots '{src}' and '{tgt}' are identical after stripping cross-env noise)");
+        if raw {
+            println!("no diffs (snapshots '{src}' and '{tgt}' are identical; raw mode — no fields stripped)");
+        } else {
+            println!("no diffs (snapshots '{src}' and '{tgt}' are identical after stripping cross-env noise)");
+        }
     }
     Ok(())
 }
