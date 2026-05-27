@@ -84,9 +84,9 @@ pub async fn diff_local_vs_remote(cwd: &Path, cfg: &ProjectConfig, env: &str, ra
     diff_rules(&paths, &lockfile, &client, &mut diffs_printed, &progress, raw).await?;
     // Flat kinds with simple typed JSON. The remote list is fetched ONCE
     // and reused across all per-slug diffs.
-    diff_labels(&paths, &lockfile, &client, &mut diffs_printed, &progress).await?;
-    diff_engines(&paths, &lockfile, &client, &mut diffs_printed, &progress).await?;
-    diff_engine_fields(&paths, &lockfile, &client, &mut diffs_printed, &progress).await?;
+    diff_labels(&paths, &lockfile, &client, &mut diffs_printed, &progress, raw).await?;
+    diff_engines(&paths, &lockfile, &client, &mut diffs_printed, &progress, raw).await?;
+    diff_engine_fields(&paths, &lockfile, &client, &mut diffs_printed, &progress, raw).await?;
 
     // Queue-nested kinds. Three list calls are hoisted (`queues`,
     // `email_templates`, and the queue tree-walk uses them by id), and
@@ -218,6 +218,7 @@ async fn diff_labels(
     client: &RossumClient,
     counter: &mut usize,
     progress: &Arc<Log>,
+    raw: bool,
 ) -> Result<()> {
     let dir = paths.labels_dir();
     if !dir.exists() {
@@ -228,7 +229,7 @@ async fn diff_labels(
     let by_id: std::collections::BTreeMap<u64, &crate::model::Label> =
         remotes.iter().map(|l| (l.id, l)).collect();
     diff_flat_remote::<crate::model::Label>(
-        &dir, "label", paths.env(), lockfile, counter, progress, &by_id,
+        &dir, "label", paths.env(), lockfile, counter, progress, &by_id, raw,
     )
 }
 
@@ -482,7 +483,14 @@ fn lookup_id(lockfile: &Lockfile, kind: &str, slug: &str) -> Option<u64> {
     lockfile.objects.get(kind).and_then(|m| m.get(slug)).map(|e| e.id)
 }
 
-fn canonical_json_for_diff<T: serde::Serialize>(v: &T) -> Result<String> {
+fn canonical_json_for_diff<T: serde::Serialize>(v: &T, raw: bool) -> Result<String> {
+    if raw {
+        let mut value = serde_json::to_value(v).context("serializing for raw diff")?;
+        crate::snapshot::noise::tidy_raw(&mut value);
+        let mut bytes = serde_json::to_vec_pretty(&value)?;
+        bytes.push(b'\n');
+        return Ok(String::from_utf8(bytes)?);
+    }
     let mut bytes = serde_json::to_vec_pretty(v)?;
     bytes.push(b'\n');
     Ok(String::from_utf8(bytes)?)
@@ -651,6 +659,7 @@ async fn diff_engines(
     client: &RossumClient,
     counter: &mut usize,
     progress: &Arc<Log>,
+    raw: bool,
 ) -> Result<()> {
     let engines_dir = paths.engines_dir();
     if !engines_dir.exists() {
@@ -673,13 +682,13 @@ async fn diff_engines(
             continue;
         }
         let local: crate::model::Engine = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-        let local_canon = canonical_json_for_diff(&local)?;
+        let local_canon = canonical_json_for_diff(&local, raw)?;
         let Some(id) = lookup_id(lockfile, "engines", &e_slug) else { continue };
         let Some(remote) = by_id.get(&id) else {
             progress.event(Action::Warn, &format!("engine/{e_slug} not on remote"));
             continue;
         };
-        let remote_canon = canonical_json_for_diff(remote)?;
+        let remote_canon = canonical_json_for_diff(remote, raw)?;
         let before = *counter;
         print_unified(
             &format!("engines/{e_slug}/engine.json (local)"),
@@ -704,6 +713,7 @@ async fn diff_engine_fields(
     client: &RossumClient,
     counter: &mut usize,
     progress: &Arc<Log>,
+    raw: bool,
 ) -> Result<()> {
     let engines_dir = paths.engines_dir();
     if !engines_dir.exists() {
@@ -734,13 +744,13 @@ async fn diff_engine_fields(
             let Some(f_slug) = name.strip_suffix(".json") else { continue };
             let path = fields_dir.join(format!("{f_slug}.json"));
             let local: crate::model::EngineField = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-            let local_canon = canonical_json_for_diff(&local)?;
+            let local_canon = canonical_json_for_diff(&local, raw)?;
             let Some(id) = lookup_id(lockfile, "engine_fields", f_slug) else { continue };
             let Some(remote) = by_id.get(&id) else {
                 progress.event(Action::Warn, &format!("engine_field/{e_slug}/{f_slug} not on remote"));
                 continue;
             };
-            let remote_canon = canonical_json_for_diff(remote)?;
+            let remote_canon = canonical_json_for_diff(remote, raw)?;
             let before = *counter;
             print_unified(
                 &format!("engines/{e_slug}/fields/{f_slug}.json (local)"),
@@ -774,6 +784,7 @@ fn diff_flat_remote<T>(
     counter: &mut usize,
     progress: &Arc<Log>,
     by_id: &std::collections::BTreeMap<u64, &T>,
+    raw: bool,
 ) -> Result<()>
 where
     T: serde::de::DeserializeOwned + serde::Serialize,
@@ -795,9 +806,9 @@ where
         }
         let Some(slug) = name.strip_suffix(".json") else { continue };
         let path = dir.join(format!("{slug}.json"));
-        let raw = std::fs::read_to_string(&path)?;
-        let local: T = serde_json::from_str(&raw)?;
-        let local_canon = canonical_json_for_diff(&local)?;
+        let contents = std::fs::read_to_string(&path)?;
+        let local: T = serde_json::from_str(&contents)?;
+        let local_canon = canonical_json_for_diff(&local, raw)?;
 
         let id = match lookup_id(lockfile, &kind_plural, slug) {
             Some(i) => i, None => continue,
@@ -806,7 +817,7 @@ where
             progress.event(Action::Warn, &format!("{kind_singular}/{slug} not on remote"));
             continue;
         };
-        let remote_canon = canonical_json_for_diff(remote)?;
+        let remote_canon = canonical_json_for_diff(remote, raw)?;
 
         let before = *counter;
         print_unified(
@@ -957,8 +968,8 @@ async fn diff_queue_tree(
     for (q_slug, local, id) in queues_sorted {
         let before = *counter;
         if let Some(remote) = queues_remote.get(&id) {
-            let lj = canonical_json_for_diff(&local)?;
-            let rj = canonical_json_for_diff(remote)?;
+            let lj = canonical_json_for_diff(&local, raw)?;
+            let rj = canonical_json_for_diff(remote, raw)?;
             print_unified(
                 &format!("queues/{q_slug}/queue.json (local)"),
                 &format!("queues/{q_slug}/queue.json (remote)"),
@@ -1003,8 +1014,8 @@ async fn diff_queue_tree(
     let mut inboxes_sorted = inboxes_fetched;
     inboxes_sorted.sort_by(|a, b| a.0.cmp(&b.0));
     for (q_slug, local, remote) in inboxes_sorted {
-        let lj = canonical_json_for_diff(&local)?;
-        let rj = canonical_json_for_diff(&remote)?;
+        let lj = canonical_json_for_diff(&local, raw)?;
+        let rj = canonical_json_for_diff(&remote, raw)?;
         let before = *counter;
         print_unified(
             &format!("inboxes/{q_slug}/inbox.json (local)"),
@@ -1024,8 +1035,8 @@ async fn diff_queue_tree(
     for (key, local, id) in templates_sorted {
         let before = *counter;
         if let Some(remote) = templates_remote.get(&id) {
-            let lj = canonical_json_for_diff(&local)?;
-            let rj = canonical_json_for_diff(remote)?;
+            let lj = canonical_json_for_diff(&local, raw)?;
+            let rj = canonical_json_for_diff(remote, raw)?;
             print_unified(
                 &format!("email_templates/{key}.json (local)"),
                 &format!("email_templates/{key}.json (remote)"),
@@ -1086,4 +1097,24 @@ where
     let fetched = fetched_result?;
     progress.event(Action::Diff, &format!("{kind_label} ({total} fetched)"));
     Ok(fetched)
+}
+
+#[cfg(test)]
+mod raw_tests {
+    use super::canonical_json_for_diff;
+
+    #[derive(serde::Serialize)]
+    struct Dummy { url: String, id: u64, modified_at: String }
+
+    #[test]
+    fn canonical_json_for_diff_raw_sorts_keys_and_keeps_fields() {
+        let d = Dummy { url: "u".into(), id: 1, modified_at: "t".into() };
+        let raw = canonical_json_for_diff(&d, true).unwrap();
+        // Alphabetical key order: id < modified_at < url.
+        let id = raw.find("\"id\"").unwrap();
+        let m = raw.find("\"modified_at\"").unwrap();
+        let u = raw.find("\"url\"").unwrap();
+        assert!(id < m && m < u, "raw output must be key-sorted: {raw}");
+        assert!(raw.contains("modified_at"));
+    }
 }
