@@ -364,7 +364,7 @@ pub async fn push(
         let updated_json_stripped = maybe_strip_overlay(updated_json_full, overlay_paths)?;
         let updated_hash = hook_combined_hash(&updated_json_stripped, &updated_code);
         let updated_ext = hook_code_extension(&updated);
-        write_atomic(local_json_path, &updated_json_stripped)
+        crate::state::base_cache::write_disk_and_cache(paths, local_json_path, &updated_json_stripped)
             .with_context(|| format!("writing post-push canonical form for '{slug}'"))?;
         if let Some(code) = &updated_code {
             write_hook_code(&hooks_dir, slug, code, updated_ext)
