@@ -155,7 +155,7 @@ pub async fn push(
             .context("serializing updated queue")?;
         let updated_bytes = maybe_strip_overlay(updated_bytes, overlay_paths)?;
         let updated_hash = content_hash(&updated_bytes);
-        write_atomic(queue_path, &updated_bytes)
+        crate::state::base_cache::write_disk_and_cache(paths, queue_path, &updated_bytes)
             .with_context(|| format!("writing post-push canonical form for queue '{q_slug}'"))?;
 
         lockfile.upsert(

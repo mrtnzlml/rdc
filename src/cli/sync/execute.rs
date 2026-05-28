@@ -612,6 +612,228 @@ impl HashStrategy {
 /// the short-circuit would silently return `KeepLocal`, promoting
 /// the item to push and overwriting the divergent remote state.
 ///
+/// Result of a successful 3-way auto-merge:
+/// `(combined_hash, local_paths, remote_paths)`. The caller uses
+/// `combined_hash` to update the lockfile entry; the path lists feed
+/// the one-line log summary.
+type AutoMergeResult = (String, Vec<String>, Vec<String>);
+
+/// Per-strategy 3-way merge attempt. Returns `Some(...)` when the
+/// merge auto-resolves cleanly and the merged bytes have been written
+/// to disk + base cache; `None` means the caller should fall through
+/// to the existing interactive / shadow-file flow.
+///
+/// Strategy dispatch:
+/// * `Flat` — single JSON file, `merge3_json` against the on-disk
+///   `local_path`. Output written to `local_path` + cache mirror.
+/// * `Hook` / `Rule` — `merge3_json` for the JSON file + strict
+///   `merge3_sidecar` for the code file (`.py` / `.js`). Both must
+///   resolve cleanly.
+/// * `Schema` — `merge3_json` for the schema body + strict
+///   `merge3_sidecar` for each formula `.py`. All must resolve.
+#[allow(clippy::too_many_arguments)]
+fn try_auto_merge(
+    ctx: &mut PullCtx<'_>,
+    hash_strategy: HashStrategy,
+    lockfile_base_hash: &Option<String>,
+    local_path: &Path,
+    code_path: &Path,
+    local_json_bytes: &[u8],
+    local_code: &Option<String>,
+    local_formulas: &[(String, Vec<u8>)],
+    remote_bytes: &[u8],
+    remote_code: &Option<String>,
+    remote_formulas: &[(String, Vec<u8>)],
+) -> Result<Option<AutoMergeResult>> {
+    let Some(base_hash) = lockfile_base_hash else {
+        return Ok(None);
+    };
+
+    // Step 1: Read the JSON base from cache; bail if absent/stale for
+    // any reason. Subsequent dispatches reuse this.
+    let Ok(Some(base_json_bytes)) = crate::state::base_cache::read(ctx.paths, local_path) else {
+        return Ok(None);
+    };
+
+    // Helper: strip noise fields a fresh pull would strip from disk
+    // (HIDDEN_FIELDS — currently just `modified_at`) so the merge
+    // never introduces them into the merged output.
+    let parse_and_strip = |bytes: &[u8]| -> Option<serde_json::Value> {
+        let mut v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        crate::snapshot::key_order::strip_hidden_fields_recursive(&mut v);
+        Some(v)
+    };
+    let Some(base_v) = parse_and_strip(&base_json_bytes) else {
+        return Ok(None);
+    };
+    let Some(local_v) = parse_and_strip(local_json_bytes) else {
+        return Ok(None);
+    };
+    let Some(remote_v) = parse_and_strip(remote_bytes) else {
+        return Ok(None);
+    };
+
+    match hash_strategy {
+        HashStrategy::Flat => {
+            // Single-file merge. cache_matches_base is exact: the
+            // cached JSON bytes hash to the lockfile content_hash.
+            if &crate::state::content_hash(&base_json_bytes) != base_hash {
+                return Ok(None);
+            }
+            let crate::merge::MergeOutcome::Merged { merged, local_paths, remote_paths } =
+                crate::merge::json3::merge3_json(&base_v, &local_v, &remote_v)
+            else {
+                return Ok(None);
+            };
+            let mut merged_bytes = serde_json::to_vec_pretty(&merged)?;
+            merged_bytes.push(b'\n');
+            crate::snapshot::writer::write_atomic(local_path, &merged_bytes)?;
+            crate::state::base_cache::write(ctx.paths, local_path, &merged_bytes)?;
+            let merged_hash = crate::state::content_hash(&merged_bytes);
+            Ok(Some((merged_hash, local_paths, remote_paths)))
+        }
+        HashStrategy::Hook | HashStrategy::Rule => {
+            // JSON + single code sidecar (.py or .js for hooks; .py
+            // for rules). The lockfile records the combined hash —
+            // we read the cached sidecar (if any) to reconstruct it.
+            let base_code_bytes = crate::state::base_cache::read(ctx.paths, code_path)
+                .ok()
+                .flatten();
+            let base_code_str: Option<String> = base_code_bytes
+                .as_ref()
+                .and_then(|b| String::from_utf8(b.clone()).ok());
+            let cached_combined = match hash_strategy {
+                HashStrategy::Hook => crate::state::hook_combined_hash(&base_json_bytes, &base_code_str),
+                HashStrategy::Rule => crate::state::rule_combined_hash(&base_json_bytes, &base_code_str),
+                _ => unreachable!(),
+            };
+            if &cached_combined != base_hash {
+                return Ok(None);
+            }
+
+            let crate::merge::MergeOutcome::Merged { merged: json_merged, mut local_paths, mut remote_paths } =
+                crate::merge::json3::merge3_json(&base_v, &local_v, &remote_v)
+            else {
+                return Ok(None);
+            };
+            let code_label = if matches!(hash_strategy, HashStrategy::Hook) { "hook.code" } else { "rule.code" };
+            let crate::merge::MergeOutcome::Merged {
+                merged: code_merged_bytes,
+                local_paths: code_lp,
+                remote_paths: code_rp,
+            } = crate::merge::sidecar::merge3_sidecar(
+                base_code_str.as_deref().unwrap_or("").as_bytes(),
+                local_code.as_deref().unwrap_or("").as_bytes(),
+                remote_code.as_deref().unwrap_or("").as_bytes(),
+                code_label,
+            )
+            else {
+                return Ok(None);
+            };
+            local_paths.extend(code_lp);
+            remote_paths.extend(code_rp);
+
+            // Serialize merged JSON, write disk + cache.
+            let mut merged_json_bytes = serde_json::to_vec_pretty(&json_merged)?;
+            merged_json_bytes.push(b'\n');
+            crate::snapshot::writer::write_atomic(local_path, &merged_json_bytes)?;
+            crate::state::base_cache::write(ctx.paths, local_path, &merged_json_bytes)?;
+
+            // Sidecar: write if non-empty, otherwise delete + forget.
+            let merged_code_str = String::from_utf8(code_merged_bytes).ok();
+            let final_code: Option<String> = merged_code_str.filter(|s| !s.is_empty());
+            if let Some(c) = &final_code {
+                crate::snapshot::writer::write_atomic(code_path, c.as_bytes())?;
+                crate::state::base_cache::write(ctx.paths, code_path, c.as_bytes())?;
+            } else if code_path.exists() {
+                std::fs::remove_file(code_path)
+                    .with_context(|| format!("removing merged-empty sidecar {}", code_path.display()))?;
+                crate::state::base_cache::forget(ctx.paths, code_path)?;
+            }
+
+            let combined = match hash_strategy {
+                HashStrategy::Hook => crate::state::hook_combined_hash(&merged_json_bytes, &final_code),
+                HashStrategy::Rule => crate::state::rule_combined_hash(&merged_json_bytes, &final_code),
+                _ => unreachable!(),
+            };
+            Ok(Some((combined, local_paths, remote_paths)))
+        }
+        HashStrategy::Schema => {
+            // Schema body + zero-to-many formula `.py` sidecars under
+            // `<queue_dir>/formulas/`. Each formula is strict-merged
+            // independently; the JSON body uses Tier-C recursive
+            // merge (id-keyed `content[]` benefits).
+            let queue_dir = match local_path.parent() {
+                Some(d) => d,
+                None => return Ok(None),
+            };
+            // Read base formulas from cache (preserves slug order).
+            let cache_formulas_dir = crate::state::base_cache::cache_mirror(ctx.paths, &queue_dir.join("formulas"))
+                .unwrap_or_else(|| ctx.paths.base_cache_root().join("__missing__"));
+            let mut base_formulas: Vec<(String, Vec<u8>)> = Vec::new();
+            if cache_formulas_dir.exists()
+                && let Ok(entries) = std::fs::read_dir(&cache_formulas_dir) {
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if let Some(id) = name.strip_suffix(".py")
+                        && let Ok(b) = std::fs::read(e.path()) {
+                            base_formulas.push((id.to_string(), b));
+                        }
+                }
+                base_formulas.sort_by(|a, b| a.0.cmp(&b.0));
+            }
+            let cached_combined = crate::state::schema_combined_hash(&base_json_bytes, &base_formulas);
+            if &cached_combined != base_hash {
+                return Ok(None);
+            }
+
+            let crate::merge::MergeOutcome::Merged { merged: json_merged, mut local_paths, mut remote_paths } =
+                crate::merge::json3::merge3_json(&base_v, &local_v, &remote_v)
+            else {
+                return Ok(None);
+            };
+
+            // Per-formula strict merge. Union of ids across all three
+            // sides. Empty formula on a side = "absent".
+            use std::collections::BTreeSet;
+            let mut ids: BTreeSet<String> = BTreeSet::new();
+            for (id, _) in &base_formulas { ids.insert(id.clone()); }
+            for (id, _) in local_formulas { ids.insert(id.clone()); }
+            for (id, _) in remote_formulas { ids.insert(id.clone()); }
+            let mut merged_formulas: Vec<(String, Vec<u8>)> = Vec::new();
+            for id in &ids {
+                let b = base_formulas.iter().find(|(i, _)| i == id).map(|(_, v)| v.as_slice()).unwrap_or(&[]);
+                let l = local_formulas.iter().find(|(i, _)| i == id).map(|(_, v)| v.as_slice()).unwrap_or(&[]);
+                let r = remote_formulas.iter().find(|(i, _)| i == id).map(|(_, v)| v.as_slice()).unwrap_or(&[]);
+                let outcome = crate::merge::sidecar::merge3_sidecar(b, l, r, &format!("schema.formula.{id}"));
+                let crate::merge::MergeOutcome::Merged { merged: m, local_paths: lp, remote_paths: rp } = outcome else {
+                    return Ok(None);
+                };
+                local_paths.extend(lp);
+                remote_paths.extend(rp);
+                if !m.is_empty() {
+                    merged_formulas.push((id.clone(), m));
+                }
+            }
+
+            // Serialize and write via schema writer — handles
+            // schema.json, formulas/*.py, AND sweeps orphan formula
+            // sidecars (formulas removed by one side, other side left
+            // base alone).
+            let mut merged_json_bytes = serde_json::to_vec_pretty(&json_merged)?;
+            merged_json_bytes.push(b'\n');
+            crate::snapshot::schema::write_schema_bytes_with_cache(
+                queue_dir,
+                &merged_json_bytes,
+                &merged_formulas,
+                Some(ctx.paths),
+            )?;
+            let combined = crate::state::schema_combined_hash(&merged_json_bytes, &merged_formulas);
+            Ok(Some((combined, local_paths, remote_paths)))
+        }
+    }
+}
+
 /// To prevent that, this function:
 /// - Detects sidecar divergence directly (regardless of JSON state).
 /// - When sidecar diverges, redirects the prompt to the sidecar bytes
@@ -724,8 +946,10 @@ fn resolve_one_conflict<R: BufRead>(
     };
 
     // Defensive sanity: if the canonical hashes already match, the
-    // classifier was confused (e.g. by a transient catalog reorder).
-    // Treat as Clean — record the matching hash and don't promote.
+    // classifier was confused (e.g. by a transient catalog reorder)
+    // OR both sides made the IDENTICAL change. Treat as Clean — record
+    // the matching hash, refresh the cache so the next merge has the
+    // current base, and don't promote.
     if canonical_local_hash == canonical_remote_hash {
         crate::cli::pull::common::record_object(
             ctx.lockfile,
@@ -735,6 +959,74 @@ fn resolve_one_conflict<R: BufRead>(
             url,
             modified_at,
             Some(canonical_local_hash),
+        );
+        // Refresh cache from disk so its hash matches the new lockfile.
+        // Without this, a subsequent BothDiverged would fail the
+        // `cache_matches_base` guard and silently skip auto-merge.
+        if matches!(hash_strategy, HashStrategy::Flat)
+            && let Ok(on_disk) = std::fs::read(&local_path) {
+            crate::state::base_cache::write(ctx.paths, &local_path, &on_disk)?;
+        }
+        return Ok(());
+    }
+
+    // Auto-merge attempt. For every kind, we:
+    //  1. Confirm the cached base bytes are still consistent with the
+    //     lockfile (`cache_matches_base`) — otherwise the base is
+    //     stale and merging would mix up which side moved away.
+    //  2. Dispatch by `HashStrategy`:
+    //     * `Flat` — JSON-only `merge3_json` against the on-disk file.
+    //     * `Hook` / `Rule` — JSON `merge3_json` + strict sidecar
+    //       `merge3_sidecar` for the code file (`.py` / `.js`).
+    //     * `Schema` — JSON `merge3_json` for the schema body + a
+    //       strict `merge3_sidecar` per formula sidecar (`.py` under
+    //       `formulas/`).
+    //  3. On success: write merged bytes to env tree + cache mirror,
+    //     update the lockfile combined hash, emit a single log line
+    //     listing the disjoint edit sites, and skip the prompt.
+    //  4. On any `Conflict` (genuine overlap) or missing-data case,
+    //     fall through to the existing interactive / shadow-file
+    //     flow.
+    if let Some((merged_combined_hash, lp, rp)) = try_auto_merge(
+        ctx,
+        hash_strategy,
+        &it.base_hash,
+        &local_path,
+        &code_path,
+        &local_json_bytes,
+        &local_code,
+        &local_formulas,
+        &remote_bytes,
+        &remote_code,
+        &remote_formulas,
+    )? {
+        crate::cli::pull::common::record_object(
+            ctx.lockfile,
+            &it.kind,
+            &it.slug,
+            id,
+            url,
+            modified_at,
+            Some(merged_combined_hash),
+        );
+        let render = |xs: &[String]| -> String {
+            if xs.is_empty() {
+                "<none>".to_string()
+            } else if xs.len() <= 3 {
+                xs.join(", ")
+            } else {
+                format!("{}, +{} more", xs[..3].join(", "), xs.len() - 3)
+            }
+        };
+        progress.event(
+            Action::Info,
+            &format!(
+                "auto-merge {}/{} (local: {}; remote: {})",
+                it.kind,
+                it.slug,
+                render(&lp),
+                render(&rp),
+            ),
         );
         return Ok(());
     }

@@ -106,7 +106,7 @@ pub async fn process(
         if action == PullAction::Conflict {
             conflicts += 1;
         }
-        let recorded_hash = apply_pull_action(action, &local_path, &proposed, remote_hash, ctx.interactive, progress, ctx.paths.env(), base_hash.as_deref())?;
+        let recorded_hash = apply_pull_action(action, &local_path, &proposed, remote_hash, ctx.interactive, progress, ctx.paths.env(), base_hash.as_deref(), Some(ctx.paths))?;
 
         record_object(
             ctx.lockfile,

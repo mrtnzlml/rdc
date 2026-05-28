@@ -36,7 +36,6 @@ use crate::snapshot::email_template::{read_email_template, write_email_template}
 use crate::snapshot::hook::{read_hook_value, write_hook};
 use crate::snapshot::rule::{read_rule_value, serialize_rule, write_rule};
 use crate::snapshot::schema::{read_schema_value, serialize_schema, write_schema_bytes};
-use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, hook_combined_hash, rule_combined_hash, schema_combined_hash, Lockfile, ObjectEntry};
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
@@ -118,7 +117,7 @@ pub async fn create_workspace(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()>
     let mut bytes = serde_json::to_vec_pretty(&created).context("serializing created workspace")?;
     bytes.push(b'\n');
     let tgt_file = ctx.tgt_paths.workspace_dir(slug).join("workspace.json");
-    write_atomic(&tgt_file, &bytes)?;
+    crate::state::base_cache::write_disk_and_cache(ctx.tgt_paths, &tgt_file, &bytes)?;
     ctx.tgt_lockfile.upsert(
         "workspaces",
         slug,
@@ -207,7 +206,7 @@ pub async fn create_queue(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
     let tgt_file = tgt_queue_dir.join("queue.json");
     let mut bytes = serde_json::to_vec_pretty(&created).context("serializing created queue")?;
     bytes.push(b'\n');
-    write_atomic(&tgt_file, &bytes)?;
+    crate::state::base_cache::write_disk_and_cache(ctx.tgt_paths, &tgt_file, &bytes)?;
     ctx.tgt_lockfile.upsert(
         "queues",
         queue_slug,
@@ -296,7 +295,7 @@ pub async fn create_inbox(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
     let tgt_inbox = ctx.tgt_paths.queue_dir(&ws_slug, queue_slug).join("inbox.json");
     let mut bytes = serde_json::to_vec_pretty(&created).context("serializing created inbox")?;
     bytes.push(b'\n');
-    write_atomic(&tgt_inbox, &bytes)?;
+    crate::state::base_cache::write_disk_and_cache(ctx.tgt_paths, &tgt_inbox, &bytes)?;
     ctx.tgt_lockfile.upsert(
         "inboxes",
         queue_slug,
@@ -528,7 +527,7 @@ pub async fn create_label(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
     let tgt_file = tgt_labels_dir.join(format!("{slug}.json"));
     let mut bytes = serde_json::to_vec_pretty(&created).context("serializing created label")?;
     bytes.push(b'\n');
-    write_atomic(&tgt_file, &bytes)?;
+    crate::state::base_cache::write_disk_and_cache(ctx.tgt_paths, &tgt_file, &bytes)?;
     ctx.tgt_lockfile.upsert(
         "labels",
         slug,
@@ -620,7 +619,7 @@ pub async fn create_engine(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
     let mut bytes =
         serde_json::to_vec_pretty(&created).context("serializing created engine")?;
     bytes.push(b'\n');
-    write_atomic(&tgt_file, &bytes)?;
+    crate::state::base_cache::write_disk_and_cache(ctx.tgt_paths, &tgt_file, &bytes)?;
     ctx.tgt_lockfile.upsert(
         "engines",
         slug,
@@ -691,7 +690,7 @@ pub async fn create_engine_field(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<
     let mut bytes = serde_json::to_vec_pretty(&created)
         .context("serializing created engine_field")?;
     bytes.push(b'\n');
-    write_atomic(&tgt_file, &bytes)?;
+    crate::state::base_cache::write_disk_and_cache(ctx.tgt_paths, &tgt_file, &bytes)?;
     ctx.tgt_lockfile.upsert(
         "engine_fields",
         &tgt_composite,

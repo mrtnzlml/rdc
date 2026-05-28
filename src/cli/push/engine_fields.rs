@@ -154,7 +154,7 @@ pub async fn push(
         updated_bytes.push(b'\n');
         let updated_bytes = maybe_strip_overlay(updated_bytes, overlay_paths)?;
         let updated_hash = content_hash(&updated_bytes);
-        write_atomic(path, &updated_bytes)
+        crate::state::base_cache::write_disk_and_cache(paths, path, &updated_bytes)
             .with_context(|| format!("writing post-push canonical form for engine field '{slug}'"))?;
 
         lockfile.upsert(
