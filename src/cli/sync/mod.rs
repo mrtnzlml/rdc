@@ -552,13 +552,21 @@ pub fn from_catalog_scan_lockfile(
     // Slug derivation mirrors `pull::workflows::process`: prefer the
     // lockfile-anchored id mapping, else `slugify_unique(name, used)`.
     // Hash computation matches the driver byte-for-byte.
+    //
+    // `workflow_url_to_slug` is populated here so the workflow_steps
+    // block below can resolve `step.workflow` (a URL) to the workflow
+    // slug even on a fresh lockfile where `slug_for_url` would
+    // otherwise return `None`.
     let mut used_workflow_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut workflow_url_to_slug: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for w in &catalog.workflows {
         let slug = match lockfile.slug_for_id("workflows", w.id) {
             Some(existing) => existing.to_string(),
             None => crate::slug::slugify_unique(&w.name, &used_workflow_slugs),
         };
         used_workflow_slugs.insert(slug.clone());
+        workflow_url_to_slug.insert(w.url.clone(), slug.clone());
 
         let mut proposed = match serde_json::to_vec_pretty(w) {
             Ok(b) => b,
@@ -577,18 +585,36 @@ pub fn from_catalog_scan_lockfile(
     }
 
     // --- workflow_steps (pull-only) -----------------------------------
-    // Flat slug derivation, like engine_fields. The driver also skips
-    // orphan steps (no parent workflow in the lockfile) but here we
-    // emit the catalog-side slug regardless — the classifier doesn't
-    // care, and an orphan step still classifies as RemoteCreate (the
-    // driver's `process` will then skip it and emit a warning).
-    let mut used_step_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Steps nest under workflows; the lockfile key is composite
+    // `<workflow_slug>/<step_slug>` so per-workflow slugs stay clean
+    // (the same per-parent scoping as engine_fields and email_templates).
+    // The driver skips orphan steps (no parent workflow); here we emit
+    // composite keys for every step that has a known parent, and silently
+    // drop orphans (their absence from `remote_hashes` means the
+    // classifier never schedules them — which matches the prior
+    // behavior of "warn-and-skip at apply time").
+    let mut per_workflow_used_step: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
     for s in &catalog.workflow_steps {
-        let slug = match lockfile.slug_for_id("workflow_steps", s.id) {
-            Some(existing) => existing.to_string(),
-            None => crate::slug::slugify_unique(&s.name, &used_step_slugs),
+        let Some(workflow_slug) = lockfile
+            .slug_for_url("workflows", &s.workflow)
+            .map(|x| x.to_string())
+            .or_else(|| workflow_url_to_slug.get(&s.workflow).cloned())
+        else {
+            continue;
         };
-        used_step_slugs.insert(slug.clone());
+        let used = per_workflow_used_step
+            .entry(workflow_slug.clone())
+            .or_default();
+        let step_slug = match lockfile.slug_for_id("workflow_steps", s.id) {
+            Some(existing) => existing
+                .strip_prefix(&format!("{workflow_slug}/"))
+                .map(|x| x.to_string())
+                .unwrap_or_else(|| existing.to_string()),
+            None => crate::slug::slugify_unique(&s.name, used),
+        };
+        used.insert(step_slug.clone());
+        let composite_key = format!("{workflow_slug}/{step_slug}");
 
         let mut proposed = match serde_json::to_vec_pretty(s) {
             Ok(b) => b,
@@ -596,7 +622,7 @@ pub fn from_catalog_scan_lockfile(
         };
         proposed.push(b'\n');
         let hash = crate::state::content_hash(&proposed);
-        remote_hashes.insert(("workflow_steps".to_string(), slug), hash);
+        remote_hashes.insert(("workflow_steps".to_string(), composite_key), hash);
     }
     if let Some(map) = lockfile.objects.get("workflow_steps") {
         for (slug, entry) in map {
@@ -661,13 +687,21 @@ pub fn from_catalog_scan_lockfile(
     // calls `maybe_strip_overlay` before hashing. The adapter mirrors
     // that strip so the recomputed remote hash matches the lockfile
     // base for unchanged envs.
+    //
+    // `engine_url_to_slug` is populated here so the engine_fields block
+    // below can resolve `field.engine` (a URL) to the engine slug even
+    // on a fresh lockfile where `slug_for_url` would otherwise return
+    // `None`.
     let mut used_engine_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut engine_url_to_slug: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for e in &catalog.engines {
         let slug = match lockfile.slug_for_id("engines", e.id) {
             Some(existing) => existing.to_string(),
             None => crate::slug::slugify_unique(&e.name, &used_engine_slugs),
         };
         used_engine_slugs.insert(slug.clone());
+        engine_url_to_slug.insert(e.url.clone(), slug.clone());
 
         let mut proposed = match serde_json::to_vec_pretty(e) {
             Ok(b) => b,
@@ -704,22 +738,36 @@ pub fn from_catalog_scan_lockfile(
     }
 
     // --- engine_fields ------------------------------------------------
-    // Push-capable flat kind keyed by field slug alone (matching the
-    // lockfile + push scanner). Path is `engines/<engine>/fields/<slug>.json`
-    // and `change_list_from_classified` already sweeps for it. The pull
-    // driver also skips orphan fields (no parent engine in the lockfile),
-    // but the adapter emits a slug regardless; classifier emits
-    // RemoteCreate and the driver later skips with a warning.
+    // Push-capable kind nested under engines. Lockfile key is the composite
+    // `<engine_slug>/<field_slug>` so per-engine slugs stay clean (two
+    // engines can both carry an `Amount` field). Path is
+    // `engines/<engine>/fields/<slug>.json`. The pull driver also skips
+    // orphan fields (no parent engine in the lockfile), but the adapter
+    // emits a key regardless; classifier emits RemoteCreate and the driver
+    // later skips with a warning.
     //
     // Overlay strip matches the pull driver so the recomputed remote hash
     // lines up with the lockfile base for unchanged envs.
-    let mut used_ef_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut per_engine_used_ef: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
     for f in &catalog.engine_fields {
-        let slug = match lockfile.slug_for_id("engine_fields", f.id) {
-            Some(existing) => existing.to_string(),
-            None => crate::slug::slugify_unique(&f.name, &used_ef_slugs),
+        let Some(engine_slug) = lockfile
+            .slug_for_url("engines", &f.engine)
+            .map(|s| s.to_string())
+            .or_else(|| engine_url_to_slug.get(&f.engine).cloned())
+        else {
+            continue;
         };
-        used_ef_slugs.insert(slug.clone());
+        let used = per_engine_used_ef.entry(engine_slug.clone()).or_default();
+        let field_slug = match lockfile.slug_for_id("engine_fields", f.id) {
+            Some(existing) => existing
+                .strip_prefix(&format!("{engine_slug}/"))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| existing.to_string()),
+            None => crate::slug::slugify_unique(&f.name, used),
+        };
+        used.insert(field_slug.clone());
+        let composite_key = format!("{engine_slug}/{field_slug}");
 
         let mut proposed = match serde_json::to_vec_pretty(f) {
             Ok(b) => b,
@@ -728,13 +776,13 @@ pub fn from_catalog_scan_lockfile(
         proposed.push(b'\n');
         let proposed = match crate::cli::pull::common::maybe_strip_overlay(
             proposed,
-            overlay.and_then(|o| o.engine_field(&slug)),
+            overlay.and_then(|o| o.engine_field(&composite_key)),
         ) {
             Ok(b) => b,
             Err(_) => continue,
         };
         let hash = crate::state::content_hash(&proposed);
-        remote_hashes.insert(("engine_fields".to_string(), slug), hash);
+        remote_hashes.insert(("engine_fields".to_string(), composite_key), hash);
     }
     for (slug, path) in &changes.engine_fields {
         if let Ok(bytes) = std::fs::read(path) {

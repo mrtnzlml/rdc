@@ -884,7 +884,9 @@ fn list_engine_field_slugs(paths: &Paths) -> Result<Vec<String>> {
                 continue;
             }
             if let Some(stem) = name.strip_suffix(".json") {
-                out.push(stem.to_string());
+                // Composite `<engine_slug>/<field_slug>` matches the
+                // lockfile / mapping / overlay key shape.
+                out.push(format!("{e_slug}/{stem}"));
             }
         }
     }
@@ -1233,16 +1235,16 @@ fn read_src_for_preview(
         }
         "engine_fields" => {
             // Engine fields live at engines/<engine_slug>/fields/<field_slug>.json.
-            // Find which engine contains this field via the shared helper.
-            let e_slug = src_paths.engine_slug_for_field(slug).ok_or_else(|| {
+            // `slug` is the composite `<engine_slug>/<field_slug>` key.
+            let (e_slug, f_slug) = slug.split_once('/').ok_or_else(|| {
                 anyhow!(
-                    "engine_field '{slug}' not found under any engine in {}",
-                    src_paths.engines_dir().display()
+                    "engine_field key '{slug}' is not <engine>/<field>; \
+                     re-run `rdc sync` to migrate the lockfile"
                 )
             })?;
             let p = src_paths
-                .engine_fields_dir(&e_slug)
-                .join(format!("{slug}.json"));
+                .engine_fields_dir(e_slug)
+                .join(format!("{f_slug}.json"));
             Ok((std::fs::read(&p)?, None))
         }
         "queues" | "schemas" | "inboxes" => {
@@ -1507,10 +1509,11 @@ mod tests {
     }
 
     #[test]
-    fn read_src_for_preview_engine_field_finds_file_via_engine_walk() {
-        // Engine fields live at `engines/<engine_slug>/fields/<field_slug>.json`.
-        // The preview function takes only `kind` + `slug` (no engine context),
-        // so it must walk the engines tree to locate the field.
+    fn read_src_for_preview_engine_field_splits_composite_key() {
+        // Engine fields live at `engines/<engine_slug>/fields/<field_slug>.json`
+        // and the preview function takes the composite key
+        // `<engine_slug>/<field_slug>` (matching the lockfile / mapping
+        // shape) and splits it for the path.
         let dir = TempDir::new().unwrap();
         let paths = Paths::for_env(dir.path(), "env");
         let fields_dir = paths.engine_fields_dir("my-engine");
@@ -1519,7 +1522,7 @@ mod tests {
         std::fs::write(fields_dir.join("item-qty.json"), body).unwrap();
 
         let (bytes, code) =
-            read_src_for_preview("engine_fields", "item-qty", &paths).unwrap();
+            read_src_for_preview("engine_fields", "my-engine/item-qty", &paths).unwrap();
         assert_eq!(bytes, body);
         assert!(code.is_none());
     }
