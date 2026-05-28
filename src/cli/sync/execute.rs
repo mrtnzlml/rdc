@@ -140,16 +140,34 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
             engine_by_slug.insert(slug, e);
         }
     }
+    // Engine fields are nested under their parent engine — the lockfile
+    // key is the composite `<engine_slug>/<field_slug>` so two engines
+    // can both carry a field named e.g. `Amount` and keep clean
+    // per-engine slugs. `slug_for_id` returns a key that may be either
+    // composite (post-migration) or legacy flat (older lockfile); both
+    // shapes index the catalog by the same composite key here.
     let mut engine_field_by_slug: BTreeMap<String, &crate::model::EngineField> = BTreeMap::new();
     {
-        let mut used: HashSet<String> = HashSet::new();
+        let mut per_engine_used: std::collections::HashMap<String, HashSet<String>> =
+            std::collections::HashMap::new();
         for f in &catalog.engine_fields {
-            let slug = match ctx.lockfile.slug_for_id("engine_fields", f.id) {
-                Some(existing) => existing.to_string(),
-                None => slugify_unique(&f.name, &used),
+            let Some(engine_slug) = ctx
+                .lockfile
+                .slug_for_url("engines", &f.engine)
+                .map(|s| s.to_string())
+            else {
+                continue;
             };
-            used.insert(slug.clone());
-            engine_field_by_slug.insert(slug, f);
+            let used = per_engine_used.entry(engine_slug.clone()).or_default();
+            let field_slug = match ctx.lockfile.slug_for_id("engine_fields", f.id) {
+                Some(existing) => existing
+                    .strip_prefix(&format!("{engine_slug}/"))
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| existing.to_string()),
+                None => slugify_unique(&f.name, used),
+            };
+            used.insert(field_slug.clone());
+            engine_field_by_slug.insert(format!("{engine_slug}/{field_slug}"), f);
         }
     }
     let mut hook_by_slug: BTreeMap<String, &crate::model::Hook> = BTreeMap::new();
@@ -311,17 +329,15 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                         Err(_) => return None,
                     };
                     bytes.push(b'\n');
-                    // Engine fields live under their parent engine; use the
-                    // lockfile's id → engine slug mapping (same as the pull
-                    // driver). Missing parent → defensive skip.
-                    let engine_slug = ctx
-                        .lockfile
-                        .slug_for_url("engines", &f.engine)
-                        .map(|s| s.to_string())?;
+                    // `it.slug` is the composite `<engine_slug>/<field_slug>`;
+                    // split it to derive both the directory and filename.
+                    let (engine_slug, field_slug) = it.slug
+                        .split_once('/')
+                        .map(|(a, b)| (a.to_string(), b.to_string()))?;
                     let local_path = ctx
                         .paths
                         .engine_fields_dir(&engine_slug)
-                        .join(format!("{}.json", it.slug));
+                        .join(format!("{field_slug}.json"));
                     Some(ConflictRefs {
                         remote_bytes: bytes,
                         remote_code: None,
@@ -1263,16 +1279,34 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
             engine_by_slug.insert(slug, e);
         }
     }
+    // Engine fields are nested under their parent engine — the lockfile
+    // key is the composite `<engine_slug>/<field_slug>` so two engines
+    // can both carry a field named e.g. `Amount` and keep clean
+    // per-engine slugs. `slug_for_id` returns a key that may be either
+    // composite (post-migration) or legacy flat (older lockfile); both
+    // shapes index the catalog by the same composite key here.
     let mut engine_field_by_slug: BTreeMap<String, &crate::model::EngineField> = BTreeMap::new();
     {
-        let mut used: HashSet<String> = HashSet::new();
+        let mut per_engine_used: std::collections::HashMap<String, HashSet<String>> =
+            std::collections::HashMap::new();
         for f in &catalog.engine_fields {
-            let slug = match ctx.lockfile.slug_for_id("engine_fields", f.id) {
-                Some(existing) => existing.to_string(),
-                None => slugify_unique(&f.name, &used),
+            let Some(engine_slug) = ctx
+                .lockfile
+                .slug_for_url("engines", &f.engine)
+                .map(|s| s.to_string())
+            else {
+                continue;
             };
-            used.insert(slug.clone());
-            engine_field_by_slug.insert(slug, f);
+            let used = per_engine_used.entry(engine_slug.clone()).or_default();
+            let field_slug = match ctx.lockfile.slug_for_id("engine_fields", f.id) {
+                Some(existing) => existing
+                    .strip_prefix(&format!("{engine_slug}/"))
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| existing.to_string()),
+                None => slugify_unique(&f.name, used),
+            };
+            used.insert(field_slug.clone());
+            engine_field_by_slug.insert(format!("{engine_slug}/{field_slug}"), f);
         }
     }
     let mut hook_by_slug: BTreeMap<String, &crate::model::Hook> = BTreeMap::new();
@@ -1448,31 +1482,27 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     }
                     "engine_fields" => {
                         let body = engine_field_by_slug.get(it.slug.as_str()).copied();
-                        // For LocalDeleteRemoteEdit / RemoteDelete, the
-                        // local path depends on which engine owns the
-                        // field. Walk the lockfile / catalog mapping to
-                        // find it.
-                        let engine_slug_opt = body
-                            .and_then(|f| ctx.lockfile.slug_for_url("engines", &f.engine))
-                            .map(|s| s.to_string())
-                            .or_else(|| {
-                                // No catalog body (env-side dropped the
-                                // field): fall back to disk sweep using
-                                // the existing scanner helper.
-                                find_engine_field_engine_slug(ctx.paths, &it.slug)
-                            });
+                        // `it.slug` is composite `<engine_slug>/<field_slug>`.
+                        // Split it to derive both the parent dir and the
+                        // file name; fall back to a sentinel `__orphan__`
+                        // path when the composite shape is unexpected.
+                        let (engine_slug_opt, field_slug) = match it.slug.split_once('/') {
+                            Some((e, f)) => (Some(e.to_string()), f.to_string()),
+                            None => (
+                                find_engine_field_engine_slug(ctx.paths, &it.slug),
+                                it.slug.clone(),
+                            ),
+                        };
                         let local_path = match engine_slug_opt {
                             Some(es) => ctx
                                 .paths
                                 .engine_fields_dir(&es)
-                                .join(format!("{}.json", it.slug)),
-                            // Fallback path — won't exist, prompt will
-                            // skip via the `!local_path.exists()` guard.
+                                .join(format!("{field_slug}.json")),
                             None => ctx
                                 .paths
                                 .engines_dir()
                                 .join("__orphan__/fields")
-                                .join(format!("{}.json", it.slug)),
+                                .join(format!("{field_slug}.json")),
                         };
                         Some(RemoteDeleteRefs {
                             local_path,

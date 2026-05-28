@@ -639,16 +639,18 @@ pub async fn create_engine(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
 }
 
 pub async fn create_engine_field(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
+    // `slug` is the composite `<src_engine_slug>/<src_field_slug>`.
     // Engine fields live at engines/<engine_slug>/fields/<field_slug>.json.
-    // Resolve the engine slug from the field slug via the path walker.
-    let src_engine_slug = ctx
-        .src_paths
-        .engine_slug_for_field(slug)
-        .ok_or_else(|| anyhow!("engine_field '{slug}' not found under any src engine"))?;
+    let (src_engine_slug, src_field_slug) = slug.split_once('/').ok_or_else(|| {
+        anyhow!(
+            "engine_field key '{slug}' is not <engine>/<field>; \
+             re-run `rdc sync` to migrate the lockfile"
+        )
+    })?;
     let path = ctx
         .src_paths
-        .engine_fields_dir(&src_engine_slug)
-        .join(format!("{slug}.json"));
+        .engine_fields_dir(src_engine_slug)
+        .join(format!("{src_field_slug}.json"));
     let raw: Value = serde_json::from_slice(
         &std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
     )
@@ -671,25 +673,28 @@ pub async fn create_engine_field(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<
         .await
         .with_context(|| format!("POST /engine_fields (creating '{slug}')"))?;
     // The tgt engine slug may differ from src (engine slug rename via
-    // mapping); fall back to the src slug for the local file location if
-    // no mapping entry exists.
+    // mapping); fall back to the src slug if no mapping entry exists.
     let tgt_engine_slug = ctx
         .mapping
         .engines
-        .get(&src_engine_slug)
+        .get(src_engine_slug)
         .cloned()
-        .unwrap_or_else(|| src_engine_slug.clone());
+        .unwrap_or_else(|| src_engine_slug.to_string());
+    // Create copies the source field slug verbatim onto tgt; per-engine
+    // dedup already guaranteed it's unique within the tgt engine dir.
+    let tgt_field_slug = src_field_slug.to_string();
+    let tgt_composite = format!("{tgt_engine_slug}/{tgt_field_slug}");
     let tgt_fields_dir = ctx.tgt_paths.engine_fields_dir(&tgt_engine_slug);
     std::fs::create_dir_all(&tgt_fields_dir)
         .with_context(|| format!("creating {}", tgt_fields_dir.display()))?;
-    let tgt_file = tgt_fields_dir.join(format!("{slug}.json"));
+    let tgt_file = tgt_fields_dir.join(format!("{tgt_field_slug}.json"));
     let mut bytes = serde_json::to_vec_pretty(&created)
         .context("serializing created engine_field")?;
     bytes.push(b'\n');
     write_atomic(&tgt_file, &bytes)?;
     ctx.tgt_lockfile.upsert(
         "engine_fields",
-        slug,
+        &tgt_composite,
         ObjectEntry {
             id: created.id,
             url: Some(created.url.clone()),
@@ -700,7 +705,7 @@ pub async fn create_engine_field(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<
     );
     ctx.mapping
         .engine_fields
-        .insert(slug.to_string(), slug.to_string());
+        .insert(slug.to_string(), tgt_composite);
     Ok(())
 }
 
