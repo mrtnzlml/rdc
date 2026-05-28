@@ -74,7 +74,6 @@ pub fn read_schema(queue_dir: &Path) -> Result<Schema> {
 
 /// Walk schema `content[]`, extract every datapoint `formula` (removing it
 /// from the JSON), and return `(field_id, code_bytes)` sorted by id.
-/// Shared by `serialize_schema`/`serialize_schema_raw`.
 fn split_schema_formulas(value: &mut Value) -> Vec<(String, Vec<u8>)> {
     let mut formulas: Vec<(String, String)> = Vec::new();
     if let Some(content) = value.get_mut("content").and_then(|c| c.as_array_mut()) {
@@ -105,16 +104,6 @@ pub fn serialize_schema(schema: &Schema) -> Result<SchemaJsonAndFormulas> {
     Ok((bytes, formulas))
 }
 
-/// Like [`serialize_schema`] but for `rdc diff --raw`: splits formulas to
-/// sidecars and tidies, without stripping server-managed fields.
-pub fn serialize_schema_raw(schema: &Schema) -> Result<SchemaJsonAndFormulas> {
-    let mut value = serde_json::to_value(schema).context("serializing schema to value")?;
-    let formulas = split_schema_formulas(&mut value);
-    crate::snapshot::noise::tidy_raw(&mut value);
-    let mut bytes = serde_json::to_vec_pretty(&value).context("serializing schema json")?;
-    bytes.push(b'\n');
-    Ok((bytes, formulas))
-}
 
 /// Walk the on-disk `<queue_dir>/formulas/` directory and return
 /// `(field_id, bytes)` pairs sorted by `field_id`. Returns an empty vec if the
@@ -420,19 +409,6 @@ mod tests {
         assert_eq!(f[0].0, "alpha");
         assert_eq!(f[1].0, "mid");
         assert_eq!(f[2].0, "zeta");
-    }
-
-    #[test]
-    fn serialize_schema_raw_keeps_modified_at() {
-        let s: Schema = serde_json::from_value(serde_json::json!({
-            "id": 7,
-            "url": "https://x/api/v1/schemas/7",
-            "name": "s",
-            "content": [],
-            "modified_at": "2026-01-01T00:00:00Z"
-        })).unwrap();
-        let (json, _formulas) = serialize_schema_raw(&s).unwrap();
-        assert!(String::from_utf8(json).unwrap().contains("modified_at"));
     }
 
     #[test]

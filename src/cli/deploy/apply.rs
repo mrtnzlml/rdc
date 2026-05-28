@@ -1047,7 +1047,7 @@ pub(crate) async fn run(
 fn print_update_diff(label: &str, src: &[u8], tgt_remote: &[u8]) {
     let l = String::from_utf8_lossy(src);
     let r = String::from_utf8_lossy(tgt_remote);
-    crate::cli::diff::print_unified(
+    crate::cli::resolve::print_unified(
         &format!("{label} (src after overlay+rewrite)"),
         &format!("{label} (tgt remote)"),
         &l,

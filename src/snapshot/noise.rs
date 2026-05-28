@@ -4,7 +4,7 @@
 //! server-side touch. Including them in `content_hash` produces false-positive
 //! conflicts on re-pull. This module strips them at hash-computation time
 //! only; the on-disk JSON keeps every field (matches API output, useful
-//! in editor and `rdc diff`).
+//! in editor and dry-run previews).
 //!
 //! The list is intentionally a code constant. Adding a field requires a
 //! one-line code change with a rationale comment.
@@ -70,8 +70,8 @@ pub fn canonicalize_with_extra_strips(bytes: &[u8], extra: &[&str]) -> Vec<u8> {
 /// Recursively sort the keys of every JSON object alphabetically. Used
 /// to canonicalise for hashing so on-disk key order doesn't affect
 /// `content_hash`. Also reused by `normalize_for_cross_env_compare` so
-/// `rdc diff <src> <tgt>` and the deploy idempotency check are equally
-/// insensitive to key order — the Rossum API doesn't guarantee stable
+/// the deploy idempotency check and `rdc deploy --dry-run` previews are
+/// equally insensitive to key order — the Rossum API doesn't guarantee stable
 /// key order across endpoints, so two byte-different bodies with the
 /// same content would otherwise diff (or trigger a spurious PATCH on
 /// re-deploy).
@@ -122,16 +122,6 @@ pub(crate) fn sort_string_arrays(value: &mut serde_json::Value) {
         }
         _ => {}
     }
-}
-
-/// Tidy-raw normalisation for `rdc diff --raw`: sort string-arrays and
-/// object keys for readability, but strip NOTHING and rewrite no URLs.
-/// The inverse of `normalize_for_cross_env_compare` minus the
-/// stripping/rewriting — two payloads compare equal iff they carry the
-/// same fields/values modulo key/array ordering.
-pub(crate) fn tidy_raw(value: &mut serde_json::Value) {
-    sort_string_arrays(value);
-    sort_keys_recursive(value);
 }
 
 fn strip_field_recursive(value: &mut serde_json::Value, fields: &[&str]) {
@@ -250,27 +240,4 @@ mod tests {
         assert_eq!(canonicalize_for_hash(a), canonicalize_for_hash(b));
     }
 
-    #[test]
-    fn tidy_raw_sorts_keys_and_string_arrays_but_strips_nothing() {
-        let mut v = serde_json::json!({
-            "url": "https://x/api/v1/hooks/1",
-            "id": 1,
-            "modified_at": "2026-01-01T00:00:00Z",
-            "modifier": "https://x/api/v1/users/9",
-            "queues": ["https://x/q/3", "https://x/q/1", "https://x/q/2"]
-        });
-        super::tidy_raw(&mut v);
-        // Nothing stripped:
-        assert_eq!(v.get("id").and_then(|x| x.as_u64()), Some(1));
-        assert!(v.get("url").is_some());
-        assert!(v.get("modified_at").is_some());
-        assert!(v.get("modifier").is_some());
-        // String array sorted:
-        assert_eq!(v["queues"], serde_json::json!([
-            "https://x/q/1", "https://x/q/2", "https://x/q/3"
-        ]));
-        // Keys alphabetically sorted (id before url in the serialized form):
-        let s = serde_json::to_string(&v).unwrap();
-        assert!(s.find("\"id\"").unwrap() < s.find("\"url\"").unwrap());
-    }
 }
