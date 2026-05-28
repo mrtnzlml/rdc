@@ -535,15 +535,22 @@ fn emit_engine_fields(md: &mut String, ctx: &IndexCtx<'_>) {
     md.push('\n');
 }
 
-/// Helper: walk engines/*/fields/ to find a specific engine field's
-/// on-disk path. Same pattern as locate_engine_field_file in realign.
-fn find_engine_field_path(ctx: &IndexCtx<'_>, slug: &str) -> Option<std::path::PathBuf> {
+/// Resolve an engine_field on-disk path from its composite
+/// `<engine_slug>/<field_slug>` lockfile key. Falls back to a global
+/// walk for legacy flat keys.
+fn find_engine_field_path(ctx: &IndexCtx<'_>, composite_key: &str) -> Option<std::path::PathBuf> {
+    if let Some((e_slug, f_slug)) = composite_key.split_once('/') {
+        let candidate = ctx.paths.engine_fields_dir(e_slug).join(format!("{f_slug}.json"));
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
     let entries = std::fs::read_dir(ctx.paths.engines_dir()).ok()?;
     for e in entries.flatten() {
         let Ok(ft) = e.file_type() else { continue };
         if !ft.is_dir() { continue }
         let e_slug = e.file_name().to_string_lossy().to_string();
-        let p = ctx.paths.engine_fields_dir(&e_slug).join(format!("{slug}.json"));
+        let p = ctx.paths.engine_fields_dir(&e_slug).join(format!("{composite_key}.json"));
         if p.exists() {
             return Some(p);
         }
@@ -592,15 +599,22 @@ fn emit_workflow_steps(md: &mut String, ctx: &IndexCtx<'_>) {
     md.push('\n');
 }
 
-/// Helper: walk workflows/*/steps/ to find a specific workflow step's
-/// on-disk path.
-fn find_workflow_step_path(ctx: &IndexCtx<'_>, slug: &str) -> Option<std::path::PathBuf> {
+/// Resolve a workflow_step on-disk path from its composite
+/// `<workflow_slug>/<step_slug>` lockfile key. Falls back to a global
+/// walk for legacy flat keys.
+fn find_workflow_step_path(ctx: &IndexCtx<'_>, composite_key: &str) -> Option<std::path::PathBuf> {
+    if let Some((w_slug, s_slug)) = composite_key.split_once('/') {
+        let candidate = ctx.paths.workflow_steps_dir(w_slug).join(format!("{s_slug}.json"));
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
     let entries = std::fs::read_dir(ctx.paths.workflows_dir()).ok()?;
     for w in entries.flatten() {
         let Ok(ft) = w.file_type() else { continue };
         if !ft.is_dir() { continue }
         let w_slug = w.file_name().to_string_lossy().to_string();
-        let p = ctx.paths.workflow_steps_dir(&w_slug).join(format!("{slug}.json"));
+        let p = ctx.paths.workflow_steps_dir(&w_slug).join(format!("{composite_key}.json"));
         if p.exists() {
             return Some(p);
         }

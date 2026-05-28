@@ -228,7 +228,17 @@ fn queue_nested_file_exists(paths: &Paths, q_slug: &str, file_name: &str) -> boo
     false
 }
 
-fn engine_field_file_exists(paths: &Paths, slug: &str) -> bool {
+fn engine_field_file_exists(paths: &Paths, composite_key: &str) -> bool {
+    // `composite_key` is `<engine_slug>/<field_slug>`; the file lives at
+    // `engines/<engine>/fields/<field>.json`. Fall back to a global walk
+    // when the key isn't composite (legacy flat lockfile entry that
+    // hasn't migrated yet).
+    if let Some((e_slug, f_slug)) = composite_key.split_once('/') {
+        return paths
+            .engine_fields_dir(e_slug)
+            .join(format!("{f_slug}.json"))
+            .exists();
+    }
     let engines_dir = paths.engines_dir();
     if !engines_dir.exists() {
         return false;
@@ -238,7 +248,7 @@ fn engine_field_file_exists(paths: &Paths, slug: &str) -> bool {
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
-        if entry.path().join("fields").join(format!("{slug}.json")).exists() {
+        if entry.path().join("fields").join(format!("{composite_key}.json")).exists() {
             return true;
         }
     }
@@ -284,8 +294,9 @@ fn scan_engines(
 }
 
 /// Walk `engines/<engine>/fields/<field>.json` files. Each field nests
-/// under exactly one engine; the engine slug is just for path
-/// resolution — the lockfile keys fields by field slug alone.
+/// under exactly one engine; the lockfile keys fields by the composite
+/// `<engine_slug>/<field_slug>` so two engines can both carry a field
+/// with the same field-slug (and thus the same `.json` filename).
 fn scan_engine_fields(
     paths: &Paths,
     lockfile: &Lockfile,
@@ -319,16 +330,22 @@ fn scan_engine_fields(
                 continue;
             }
             let Some(f_slug) = f_path.file_stem().and_then(|s| s.to_str()) else { continue };
+            let composite_key = format!("{e_slug}/{f_slug}");
             let bytes = std::fs::read(&f_path)?;
             let local_hash = content_hash(&bytes);
             scanned += 1;
             let base_hash = lockfile
                 .objects
                 .get("engine_fields")
-                .and_then(|m| m.get(f_slug))
+                .and_then(|m| {
+                    // Prefer composite key; fall back to legacy flat key
+                    // so a not-yet-migrated lockfile still classifies
+                    // correctly during the first sync after upgrade.
+                    m.get(&composite_key).or_else(|| m.get(f_slug))
+                })
                 .and_then(|x| x.content_hash.as_deref());
             if base_hash != Some(local_hash.as_str()) {
-                out.insert(f_slug.to_string(), f_path);
+                out.insert(composite_key, f_path);
             }
         }
     }
@@ -783,9 +800,19 @@ pub(crate) fn find_queue_nested_path(
     None
 }
 
-/// Sweep `engines/*/fields/<slug>.json` and return the first match.
-/// Mirrors `engine_field_file_exists` but returns the path.
-fn find_engine_field_path(paths: &Paths, slug: &str) -> Option<std::path::PathBuf> {
+/// Resolve the on-disk path for an engine_field given its composite key
+/// `<engine_slug>/<field_slug>`. Falls back to a global `engines/*/fields/`
+/// sweep for legacy flat keys (lockfile entries written before the
+/// composite-key migration).
+fn find_engine_field_path(paths: &Paths, composite_key: &str) -> Option<std::path::PathBuf> {
+    if let Some((e_slug, f_slug)) = composite_key.split_once('/') {
+        let candidate = paths
+            .engine_fields_dir(e_slug)
+            .join(format!("{f_slug}.json"));
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
     let engines_dir = paths.engines_dir();
     if !engines_dir.exists() {
         return None;
@@ -795,7 +822,10 @@ fn find_engine_field_path(paths: &Paths, slug: &str) -> Option<std::path::PathBu
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
-        let candidate = entry.path().join("fields").join(format!("{slug}.json"));
+        let candidate = entry
+            .path()
+            .join("fields")
+            .join(format!("{composite_key}.json"));
         if candidate.exists() {
             return Some(candidate);
         }

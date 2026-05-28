@@ -337,6 +337,20 @@ pub fn write_secrets_file(
     write_secrets_file_full(project_root, env, &current)
 }
 
+/// Literal string rdc writes in `secrets/<env>.hook-secrets.json` for
+/// every required key the user hasn't filled in yet. The deploy
+/// precheck and the push injection sites both treat any value equal
+/// to this constant as "missing" — so a re-run of `rdc deploy` with
+/// the placeholders unchanged still refuses to proceed and re-prompts
+/// the user.
+///
+/// Angle brackets are deliberate: they're not valid in any sane real
+/// secret value (API keys, passwords, JWTs), so the chance of a real
+/// secret accidentally colliding with the sentinel is effectively
+/// zero. `null` is reserved for the Rossum API semantic of "unset the
+/// secret key entirely" and must NOT be hijacked for this purpose.
+pub const UNFILLED_SENTINEL: &str = "<unfilled>";
+
 /// Per-env, per-hook secret values that ship to the Rossum API in the
 /// `secrets` top-level field of `POST /hooks/` and `PATCH /hooks/<id>`.
 ///
@@ -348,10 +362,15 @@ pub fn write_secrets_file(
 /// {
 ///   "hooks": {
 ///     "master-data-hub": { "mdh_api_token": "abc..." },
-///     "notify-slack":    { "signing_secret": "xyz..." }
+///     "notify-slack":    { "signing_secret": "<unfilled>" }
 ///   }
 /// }
 /// ```
+///
+/// A value equal to [`UNFILLED_SENTINEL`] (`"<unfilled>"`) means rdc
+/// pre-populated the key during a deploy precheck and the user hasn't
+/// typed a real value yet — the next precheck refuses the deploy on
+/// that key, the push pipeline never sends it to the API.
 ///
 /// Values are never read back from the server (`GET /hooks/<id>` does
 /// not return `secrets`; `GET /hooks/<id>/secrets_keys` exposes the
@@ -366,10 +385,29 @@ pub struct HookSecrets {
 }
 
 impl HookSecrets {
-    /// Look up the K/V map for a hook slug. `None` when the slug has no
-    /// entry; callers should treat that the same as "no secrets to send".
+    /// Look up the raw K/V map for a hook slug (values may include the
+    /// unfilled sentinel). `None` when the slug has no entry; callers
+    /// should treat that the same as "no secrets to send". Use
+    /// [`Self::filled_kv_for_slug`] when the sentinel must be stripped
+    /// before sending values to the API.
     pub fn for_slug(&self, slug: &str) -> Option<&BTreeMap<String, String>> {
         self.by_slug.get(slug)
+    }
+
+    /// Owned K/V map containing only the keys the user has actually
+    /// filled in (i.e. the value is not the unfilled sentinel). Used
+    /// by the push injection sites that must never leak the sentinel
+    /// string to the Rossum API.
+    pub fn filled_kv_for_slug(&self, slug: &str) -> BTreeMap<String, String> {
+        self.by_slug
+            .get(slug)
+            .map(|kv| {
+                kv.iter()
+                    .filter(|(_, v)| v.as_str() != UNFILLED_SENTINEL)
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// All slugs present in the local secrets file. Used to detect
@@ -380,7 +418,7 @@ impl HookSecrets {
 
     /// Full slug → K/V map. Exposed so callers can produce merged
     /// outputs (e.g. the deploy template writer that pre-populates the
-    /// file with empty placeholders for missing keys) without
+    /// file with sentinel placeholders for missing keys) without
     /// re-reading from disk.
     pub fn entries(&self) -> &BTreeMap<String, BTreeMap<String, String>> {
         &self.by_slug
@@ -434,9 +472,11 @@ pub fn load_hook_secrets(project_root: &Path, env: &str) -> Result<HookSecrets> 
 /// Write `secrets/<env>.hook-secrets.json` so every hook in
 /// `required_per_slug` has an entry with every required key declared —
 /// values already filled in by the user are preserved, anything else
-/// becomes an empty-string placeholder. Slugs already present in
-/// `existing` but not in `required_per_slug` are passed through
-/// unchanged so unrelated hooks aren't clobbered.
+/// becomes the [`UNFILLED_SENTINEL`] string. A re-run of the precheck
+/// treats sentinel-valued keys as still missing, so an unedited
+/// pre-populated file never accidentally counts as user input.
+/// Slugs already present in `existing` but not in `required_per_slug`
+/// are passed through unchanged so unrelated hooks aren't clobbered.
 ///
 /// Used by `rdc deploy`'s pre-flight when the target's local file lacks
 /// values: instead of asking the user to figure out the JSON shape, rdc
@@ -458,7 +498,11 @@ pub fn write_hook_secrets_template(
     for (slug, required) in required_per_slug {
         let entry = merged.entry(slug.clone()).or_default();
         for key in required {
-            entry.entry(key.clone()).or_default();
+            // `or_insert_with` only fires when the key is missing
+            // entirely; existing values (filled or sentinel) survive.
+            entry
+                .entry(key.clone())
+                .or_insert_with(|| UNFILLED_SENTINEL.to_string());
         }
     }
 
@@ -705,10 +749,13 @@ mod tests {
     }
 
     #[test]
-    fn write_template_creates_file_with_empty_placeholders() {
+    fn write_template_creates_file_with_sentinel_placeholders() {
         // First-deploy case: no local file yet, no prior values. The
-        // template must materialize the full required shape so the user
-        // can just fill in values without reverse-engineering the JSON.
+        // template materializes every required key with the
+        // [`UNFILLED_SENTINEL`] string so a re-run with the file
+        // unchanged still trips the precheck (empty/null/blank values
+        // were rejected because the user wanted `null` to retain its
+        // Rossum-API meaning of "unset this secret").
         let dir = TempDir::new().unwrap();
         let req = required(&[
             ("master-data-hub", &["mdh_api_token", "mdh_endpoint"]),
@@ -723,8 +770,13 @@ mod tests {
             v,
             serde_json::json!({
                 "hooks": {
-                    "master-data-hub": { "mdh_api_token": "", "mdh_endpoint": "" },
-                    "notify-slack":    { "signing_secret": "" }
+                    "master-data-hub": {
+                        "mdh_api_token": UNFILLED_SENTINEL,
+                        "mdh_endpoint": UNFILLED_SENTINEL,
+                    },
+                    "notify-slack": {
+                        "signing_secret": UNFILLED_SENTINEL,
+                    }
                 }
             })
         );
@@ -733,7 +785,8 @@ mod tests {
     #[test]
     fn write_template_preserves_existing_values() {
         // User has already filled in some keys for a previous deploy;
-        // re-running for a new hook must NOT wipe what they typed.
+        // re-running for a new hook must NOT wipe what they typed and
+        // must add unfilled keys with the sentinel string.
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
         std::fs::write(
@@ -750,8 +803,8 @@ mod tests {
 
         let v = read_template(dir.path(), "test-mtr");
         assert_eq!(v["hooks"]["master-data-hub"]["mdh_api_token"], "kept-by-user");
-        assert_eq!(v["hooks"]["master-data-hub"]["mdh_endpoint"], "");
-        assert_eq!(v["hooks"]["notify-slack"]["signing_secret"], "");
+        assert_eq!(v["hooks"]["master-data-hub"]["mdh_endpoint"], UNFILLED_SENTINEL);
+        assert_eq!(v["hooks"]["notify-slack"]["signing_secret"], UNFILLED_SENTINEL);
     }
 
     #[test]
@@ -771,7 +824,7 @@ mod tests {
 
         let v = read_template(dir.path(), "test-mtr");
         assert_eq!(v["hooks"]["old-hook"]["legacy_token"], "still-here");
-        assert_eq!(v["hooks"]["new-hook"]["new_key"], "");
+        assert_eq!(v["hooks"]["new-hook"]["new_key"], UNFILLED_SENTINEL);
     }
 
     #[test]
@@ -986,8 +1039,8 @@ mod tests {
     #[test]
     fn write_template_load_round_trip_is_lossless() {
         // The reader and writer must agree on the JSON shape — write a
-        // template, load it back, and verify every slug+key the writer
-        // wrote appears in the loaded view.
+        // template, load it back, and verify every slug+key carries
+        // the sentinel placeholder until the user types a real value.
         let dir = TempDir::new().unwrap();
         let req = required(&[
             ("alpha", &["k1", "k2"]),
@@ -998,10 +1051,52 @@ mod tests {
         let loaded = load_hook_secrets(dir.path(), "test-mtr").unwrap();
         assert!(loaded.was_loaded());
         let alpha = loaded.for_slug("alpha").expect("alpha entry");
-        assert_eq!(alpha.get("k1").map(String::as_str), Some(""));
-        assert_eq!(alpha.get("k2").map(String::as_str), Some(""));
+        assert_eq!(alpha.get("k1").map(String::as_str), Some(UNFILLED_SENTINEL));
+        assert_eq!(alpha.get("k2").map(String::as_str), Some(UNFILLED_SENTINEL));
         let beta = loaded.for_slug("beta").expect("beta entry");
-        assert_eq!(beta.get("bk").map(String::as_str), Some(""));
+        assert_eq!(beta.get("bk").map(String::as_str), Some(UNFILLED_SENTINEL));
+    }
+
+    #[test]
+    fn filled_kv_for_slug_strips_sentinel_values() {
+        // The injection-side helper must never leak the sentinel string
+        // to the API. A half-edited template (one key filled, one not)
+        // must result in just the filled key in the outbound map.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        std::fs::write(
+            dir.path().join("secrets/dev.hook-secrets.json"),
+            format!(
+                r#"{{ "hooks": {{ "h": {{ "filled": "real-value", "still_unfilled": "{UNFILLED_SENTINEL}" }} }} }}"#,
+            ),
+        )
+        .unwrap();
+        let s = load_hook_secrets(dir.path(), "dev").unwrap();
+        let kv = s.filled_kv_for_slug("h");
+        assert_eq!(kv.len(), 1, "sentinel-valued keys must be excluded: {kv:?}");
+        assert_eq!(kv.get("filled").map(String::as_str), Some("real-value"));
+        assert!(!kv.contains_key("still_unfilled"));
+    }
+
+    #[test]
+    fn write_template_re_run_with_unedited_file_keeps_sentinel() {
+        // Reproduce the user-reported bug: pre-populate, do nothing,
+        // re-run the template writer. The values must still be the
+        // sentinel — not silently upgraded to "" or anything else
+        // that would let the precheck mistake them for user input.
+        let dir = TempDir::new().unwrap();
+        let req = required(&[("h", &["password", "type"])]);
+        let existing = HookSecrets::default();
+        write_hook_secrets_template(dir.path(), "test-mtr", &req, &existing).unwrap();
+
+        // Reload from disk + re-write template. The merge step must
+        // preserve sentinel values exactly so re-runs are idempotent.
+        let reloaded = load_hook_secrets(dir.path(), "test-mtr").unwrap();
+        write_hook_secrets_template(dir.path(), "test-mtr", &req, &reloaded).unwrap();
+
+        let v = read_template(dir.path(), "test-mtr");
+        assert_eq!(v["hooks"]["h"]["password"], UNFILLED_SENTINEL);
+        assert_eq!(v["hooks"]["h"]["type"], UNFILLED_SENTINEL);
     }
 
     #[test]

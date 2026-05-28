@@ -184,13 +184,27 @@ version = 1
         .current_dir(project.path())
         .args(["deploy", "test", "prod", "--yes"])
         .assert().success()
-        // Preview pass emits the per-object diff (side legend names the sides).
-        .stdout(predicate::str::contains("src after overlay+rewrite"))
+        // Preview pass emits the per-object diff with a `- tgt before / + tgt
+        // after` legend so the reader sees the tgt state delta directly,
+        // instead of an apples-to-oranges src-vs-tgt comparison.
+        .stdout(predicate::str::contains("tgt before"))
+        .stdout(predicate::str::contains("tgt after"))
         .stdout(predicate::str::contains("1 hooks"))
         .stdout(predicate::str::contains("(1 PATCHes)"));
 
     let body = captured.lock().unwrap().clone().expect("PATCH body for hook 401");
     assert_eq!(body["name"], serde_json::Value::String("Validator (PROD)".into()));
+
+    // Inline write-back: after `rdc deploy`, the local tgt snapshot must
+    // reflect the PATCH response (no separate `rdc sync` needed).
+    let written = std::fs::read_to_string(
+        project.path().join("envs/prod/hooks/validator-invoices.json"),
+    ).expect("local prod hook file must exist after deploy");
+    let written: serde_json::Value = serde_json::from_str(&written).unwrap();
+    assert_eq!(
+        written["name"], serde_json::Value::String("Validator (PROD)".into()),
+        "local prod hook file should reflect the PATCH response",
+    );
 }
 
 /// Mount mocks sufficient to pull a single workspace + queue + schema, with
@@ -2063,7 +2077,8 @@ async fn deploy_pre_populates_hook_secrets_file_on_missing_keys() {
         .stderr(predicate::str::contains("prod.hook-secrets.json"));
 
     // The template file must exist on disk with both required keys
-    // present and empty — that's the whole point of the feature.
+    // pre-populated with the UNFILLED sentinel — re-running deploy
+    // without edits must NOT count the placeholders as user input.
     let secrets_path = project.path().join("secrets/prod.hook-secrets.json");
     assert!(
         secrets_path.exists(),
@@ -2072,12 +2087,26 @@ async fn deploy_pre_populates_hook_secrets_file_on_missing_keys() {
     );
     let v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&secrets_path).unwrap()).unwrap();
-    assert_eq!(v["hooks"]["mdh-lookup"]["api_key"], "");
-    assert_eq!(v["hooks"]["mdh-lookup"]["signing_secret"], "");
+    assert_eq!(v["hooks"]["mdh-lookup"]["api_key"], rdc::secrets::UNFILLED_SENTINEL);
+    assert_eq!(v["hooks"]["mdh-lookup"]["signing_secret"], rdc::secrets::UNFILLED_SENTINEL);
+
+    // Bug regression: a re-run with the file unchanged must still
+    // refuse, listing the same keys as missing. The previous
+    // empty-string placeholder was indistinguishable from a user-
+    // provided "" and let the second run pass without any edit.
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["deploy", "test", "prod", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("deploy refused"))
+        .stderr(predicate::str::contains("api_key"))
+        .stderr(predicate::str::contains("signing_secret"));
 
     // Existing values must be preserved on a re-run: pre-fill one key,
     // re-deploy, and assert the value isn't wiped while the still-missing
-    // key remains empty.
+    // key remains the sentinel.
     std::fs::write(
         &secrets_path,
         r#"{ "hooks": { "mdh-lookup": { "api_key": "kept-by-user" } } }"#,
@@ -2095,5 +2124,5 @@ async fn deploy_pre_populates_hook_secrets_file_on_missing_keys() {
         v2["hooks"]["mdh-lookup"]["api_key"], "kept-by-user",
         "the user's typed-in value must survive a re-deploy"
     );
-    assert_eq!(v2["hooks"]["mdh-lookup"]["signing_secret"], "");
+    assert_eq!(v2["hooks"]["mdh-lookup"]["signing_secret"], rdc::secrets::UNFILLED_SENTINEL);
 }

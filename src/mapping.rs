@@ -76,10 +76,28 @@ impl Mapping {
         }
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?;
-        let m: Mapping = toml::from_str(&raw)
+        let mut m: Mapping = toml::from_str(&raw)
             .with_context(|| format!("parsing {}", path.display()))?;
+        m.migrate_legacy_nested_keys();
         Ok(m)
     }
+
+    /// Drop legacy flat-key entries from `engine_fields` and
+    /// `workflow_steps` so a mapping file written before per-parent
+    /// scoping doesn't carry stale slugs forward. The auto-match in
+    /// `cli::deploy::map` repopulates these sections with composite
+    /// `<parent>/<child>` keys on the next `rdc deploy` run.
+    fn migrate_legacy_nested_keys(&mut self) {
+        self.engine_fields.retain(|src, tgt| {
+            src.contains('/') && tgt.contains('/')
+        });
+        self.workflow_steps_passthrough(); // present in lockfile, not in Mapping
+    }
+
+    /// Reserved for parity with `engine_fields` if/when `workflow_steps`
+    /// is added to `Mapping` (currently pull-only at the Rossum API, so
+    /// no slug pairing is needed).
+    fn workflow_steps_passthrough(&mut self) {}
 
     pub fn save(&self, path: &Path) -> Result<()> {
         let s = toml::to_string_pretty(self)
@@ -143,6 +161,30 @@ mod tests {
         m.save(&path).unwrap();
         let loaded = Mapping::load(&path).unwrap();
         assert_eq!(loaded, m);
+    }
+
+    #[test]
+    fn load_drops_legacy_flat_engine_field_keys() {
+        // A pre-migration mapping wrote `[engine_fields]` with bare field
+        // slugs. After the schema change to composite `<engine>/<field>`
+        // keys those entries are useless — auto-match regenerates them
+        // on the next deploy. Dropping silently on load is the
+        // user's chosen migration path.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.toml");
+        std::fs::write(&path, r#"
+version = 1
+
+[engine_fields]
+"amount" = "amount"
+"item-qty" = "item-quantity"
+"my-engine/total" = "my-engine/total"
+"#).unwrap();
+        let loaded = Mapping::load(&path).unwrap();
+        assert_eq!(loaded.engine_fields.len(), 1);
+        assert_eq!(loaded.engine_fields.get("my-engine/total"), Some(&"my-engine/total".to_string()));
+        assert!(!loaded.engine_fields.contains_key("amount"));
+        assert!(!loaded.engine_fields.contains_key("item-qty"));
     }
 
     #[test]

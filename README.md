@@ -159,8 +159,8 @@ rdc deploy test prod
 Example session:
 
 ```
---- hooks/validator-invoices.json (src after overlay+rewrite+normalize)
-+++ hooks/validator-invoices.json (tgt remote, normalized)
+--- hooks/validator-invoices.json (tgt before)
++++ hooks/validator-invoices.json (tgt after)
 @@ ...
 -  "name": "Validator: invoices",
 +  "name": "Validator (PROD)",

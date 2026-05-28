@@ -50,9 +50,9 @@ fn kind_specific_strip(kind: &str) -> &'static [&'static str] {
         // 400s with "Invalid hyperlink", so strip them. The remote keeps its
         // own triggers, which is the conservative outcome.
         "email_templates" => &["triggers"],
-        // `agenda_id` is a per-env, server-generated identifier ("ferg_<hash>")
-        // that Rossum assigns when the engine is created and refreshes
-        // on training cycles. It's read-only and changes often; strip it
+        // `agenda_id` is a per-env, server-generated identifier (an opaque
+        // tenant-prefixed hash) that Rossum assigns when the engine is created
+        // and refreshes on training cycles. It's read-only and changes often; strip it
         // from POST/PATCH bodies so cross-env deploys don't try to overwrite
         // the tgt's identifier with the src's, and so push doesn't echo a
         // value the API will ignore or reject.
@@ -241,7 +241,7 @@ mod tests {
             "id": 0,
             "url": "",
             "name": "e",
-            "agenda_id": "ferg_abc123",
+            "agenda_id": "tnt_abc123",
         });
         strip_for_create(&mut v, "engines");
         assert!(
@@ -417,7 +417,7 @@ mod tests {
         let mut v = json!({
             "id": 1,
             "name": "e",
-            "agenda_id": "ferg_abc123",
+            "agenda_id": "tnt_abc123",
             "type": "extractor",
         });
         redact_for_disk(&mut v, "engines");
