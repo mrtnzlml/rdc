@@ -106,7 +106,7 @@ pub async fn process(
 
         let recorded_hash = match action {
             PullAction::Write => {
-                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone(), ctx.interactive, progress, ctx.paths.env(), base_hash.as_deref())?;
+                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone(), ctx.interactive, progress, ctx.paths.env(), base_hash.as_deref(), Some(ctx.paths))?;
                 if let Some(code) = &proposed_code {
                     write_rule_code(&ctx.paths.rules_dir(), &slug, code)
                         .with_context(|| format!("writing rule code for '{}'", r.name))?;

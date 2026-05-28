@@ -134,7 +134,7 @@ pub async fn process(
         if q_action == PullAction::Conflict {
             counts.conflicts += 1;
         }
-        let q_recorded = apply_pull_action(q_action, &queue_path, &queue_proposed, q_remote_hash, ctx.interactive, progress, ctx.paths.env(), queue_base.as_deref())?;
+        let q_recorded = apply_pull_action(q_action, &queue_path, &queue_proposed, q_remote_hash, ctx.interactive, progress, ctx.paths.env(), queue_base.as_deref(), Some(ctx.paths))?;
         record_object(
             ctx.lockfile,
             "queues",
@@ -378,7 +378,7 @@ fn write_inbox_for_queue(
     if i_action == PullAction::Conflict {
         counts.conflicts += 1;
     }
-    let i_recorded = apply_pull_action(i_action, &inbox_path, &inbox_proposed, i_remote_hash, ctx.interactive, progress, ctx.paths.env(), inbox_base.as_deref())?;
+    let i_recorded = apply_pull_action(i_action, &inbox_path, &inbox_proposed, i_remote_hash, ctx.interactive, progress, ctx.paths.env(), inbox_base.as_deref(), Some(ctx.paths))?;
     record_object(
         ctx.lockfile,
         "inboxes",

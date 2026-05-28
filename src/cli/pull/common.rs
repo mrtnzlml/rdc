@@ -573,25 +573,41 @@ pub fn apply_pull_action(
     progress: &Arc<Log>,
     env: &str,
     base_hash: Option<&str>,
+    paths: Option<&crate::paths::Paths>,
 ) -> Result<String> {
     use crate::snapshot::writer::write_atomic;
     match action {
         PullAction::Write => {
             write_atomic(local_path, remote_bytes)?;
+            // Mirror to base cache: same bytes are now both the disk
+            // truth AND the new merge base for the next sync.
+            if let Some(p) = paths {
+                crate::state::base_cache::write(p, local_path, remote_bytes)?;
+            }
             Ok(remote_hash)
         }
         PullAction::KeepLocal => {
             let local_bytes = std::fs::read(local_path)
                 .with_context(|| format!("reading {}", local_path.display()))?;
+            // Local won the merge → it's the new base.
+            if let Some(p) = paths {
+                crate::state::base_cache::write(p, local_path, &local_bytes)?;
+            }
             Ok(content_hash(&local_bytes))
         }
         PullAction::NoChange => {
             // Local and remote canonicalize equal — preserve disk bytes.
-            // Hash is identical to remote_hash by construction.
+            // Hash is identical to remote_hash by construction. Cache
+            // the disk bytes (whatever flavour the canonical form took)
+            // so the next merge has them.
+            if let Some(p) = paths
+                && let Ok(on_disk) = std::fs::read(local_path) {
+                crate::state::base_cache::write(p, local_path, &on_disk)?;
+            }
             Ok(remote_hash)
         }
         PullAction::Conflict => {
-            if interactive {
+            let resolved_hash = if interactive {
                 resolve_conflict_interactive(
                     local_path,
                     remote_bytes,
@@ -599,10 +615,20 @@ pub fn apply_pull_action(
                     progress,
                     env,
                     base_hash,
-                )
+                )?
             } else {
-                shadow_file_conflict(local_path, remote_bytes, progress, env, base_hash)
+                shadow_file_conflict(local_path, remote_bytes, progress, env, base_hash)?
+            };
+            // Only update the cache when the lockfile entry actually
+            // advanced. Shadow-skip preserves `base_hash`, leaving the
+            // prior cache (which holds true base bytes) untouched —
+            // crucial, because the disk still holds LOCAL, not base.
+            if let Some(p) = paths
+                && base_hash != Some(resolved_hash.as_str())
+                && let Ok(on_disk) = std::fs::read(local_path) {
+                crate::state::base_cache::write(p, local_path, &on_disk)?;
             }
+            Ok(resolved_hash)
         }
     }
 }
@@ -790,7 +816,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
-        let h = apply_pull_action(PullAction::Write, &path, b"hello", "h".repeat(64), false, &p, "test", None).unwrap();
+        let h = apply_pull_action(PullAction::Write, &path, b"hello", "h".repeat(64), false, &p, "test", None, None).unwrap();
         assert_eq!(h, "h".repeat(64));
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
     }
@@ -802,7 +828,7 @@ mod tests {
         std::fs::write(&path, b"local").unwrap();
         // interactive=false → legacy shadow-file behavior.
         let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
-        let _ = apply_pull_action(PullAction::Conflict, &path, b"remote", "h".repeat(64), false, &p, "test", None).unwrap();
+        let _ = apply_pull_action(PullAction::Conflict, &path, b"remote", "h".repeat(64), false, &p, "test", None, None).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"local");
         assert_eq!(
             std::fs::read(dir.path().join("x.json.test")).unwrap(),
@@ -890,6 +916,7 @@ mod tests {
             &p,
             "test",
             None,
+            None,
         )
         .unwrap();
         assert_eq!(h, "h".repeat(64));
@@ -921,6 +948,7 @@ mod tests {
             &p,
             "test",
             Some(&prior_base),
+            None,
         )
         .unwrap();
         // Lockfile must NOT advance — recorded hash equals prior base.
@@ -954,6 +982,7 @@ mod tests {
             &p,
             "test",
             None, // no prior base
+            None,
         )
         .unwrap();
         assert_eq!(recorded, content_hash(local));
@@ -985,6 +1014,7 @@ mod tests {
             &p,
             "test",
             Some(&base_hash),
+            None,
         )
         .unwrap();
         assert_eq!(recorded1, base_hash, "first pull preserves base");

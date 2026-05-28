@@ -244,7 +244,7 @@ pub async fn process(
         if i_action == PullAction::Conflict {
             conflicts += 1;
         }
-        let i_recorded = apply_pull_action(i_action, &ix_path, &ix_proposed, i_remote_hash, ctx.interactive, progress, ctx.paths.env(), ix_base.as_deref())?;
+        let i_recorded = apply_pull_action(i_action, &ix_path, &ix_proposed, i_remote_hash, ctx.interactive, progress, ctx.paths.env(), ix_base.as_deref(), Some(ctx.paths))?;
         record_object(
             ctx.lockfile,
             "mdh_indexes",
