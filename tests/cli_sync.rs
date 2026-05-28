@@ -3843,6 +3843,20 @@ async fn run_hook_conflict_scenario(variant: HookConflictVariant) {
             // We just assert no PATCH (already asserted above).
             let _ = (base_before, base_after);
         }
+        HookConflictVariant::JsonBothEdited
+        | HookConflictVariant::LocalJsonRemoteCode => {
+            // Auto-merge variants: 3-way merge resolves these cleanly.
+            // JsonBothEdited: both sides added a different element to
+            //   `events` (string array → set-merge union). No overlap.
+            // LocalJsonRemoteCode: local edits JSON `events`, remote
+            //   edits sidecar `.py`. Strict sidecar + JSON merge both
+            //   succeed.
+            // Contract: lockfile MAY advance to the merged hash (no
+            // longer pinned); the no-silent-push guarantee (the load-
+            // bearing safety property) still holds via the PATCH=0
+            // assertion above.
+            let _ = (base_before, base_after);
+        }
         _ => {
             assert_eq!(
                 base_before, base_after,
@@ -4136,7 +4150,17 @@ async fn run_rule_conflict_scenario(variant: RuleConflictVariant) {
     let v_after: serde_json::Value = serde_json::from_str(&lf_after).unwrap();
     let base_before = v_before.pointer(&format!("/objects/rules/{slug}/content_hash")).cloned();
     let base_after = v_after.pointer(&format!("/objects/rules/{slug}/content_hash")).cloned();
-    if !matches!(variant, RuleConflictVariant::BothEditedToSameCode) {
+    // Auto-merge resolves LocalJsonRemoteCode (disjoint edits) and may
+    // auto-resolve JsonBothEdited when the edits are set-merge-friendly
+    // (e.g. both add distinct entries to a string array). The strong
+    // contract — "rules endpoint MUST NOT receive mutating requests" —
+    // is asserted above; the lockfile base may advance on auto-merge.
+    if !matches!(
+        variant,
+        RuleConflictVariant::BothEditedToSameCode
+            | RuleConflictVariant::JsonBothEdited
+            | RuleConflictVariant::LocalJsonRemoteCode
+    ) {
         assert_eq!(
             base_before, base_after,
             "variant {variant:?}: lockfile base must remain pinned (before={base_before:?}, after={base_after:?})",
