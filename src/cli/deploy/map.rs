@@ -116,8 +116,11 @@ fn list_engine_slugs(paths: &Paths) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// List engine-field slugs across every engine. Slugs are globally
-/// unique so the parent-engine slug doesn't appear in the result.
+/// List engine-field composite keys (`<engine_slug>/<field_slug>`) across
+/// every engine. Engine fields are scoped per-engine, so two engines can
+/// carry a field with the same field-slug — they only differ in the
+/// `<engine_slug>/` prefix, which is what makes the key globally unique
+/// for lockfile / mapping purposes.
 fn list_engine_field_slugs(paths: &Paths) -> Result<Vec<String>> {
     let engines_dir = paths.engines_dir();
     if !engines_dir.exists() {
@@ -140,8 +143,8 @@ fn list_engine_field_slugs(paths: &Paths) -> Result<Vec<String>> {
             if crate::paths::is_shadow_artifact(&name, paths.env()) {
                 continue;
             }
-            if let Some(slug) = name.strip_suffix(".json") {
-                out.push(slug.to_string());
+            if let Some(f_slug) = name.strip_suffix(".json") {
+                out.push(format!("{e_slug}/{f_slug}"));
             }
         }
     }
