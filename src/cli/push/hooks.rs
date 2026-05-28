@@ -25,14 +25,16 @@ use std::sync::Arc;
 /// that's also the hash recorded for "this hook has no secrets",
 /// distinguishing it from "we never tried to sync secrets" (`None`).
 fn inject_hook_secrets(body: &mut Value, slug: &str, secrets: &HookSecrets) -> String {
-    let empty = BTreeMap::<String, String>::new();
-    let kv = secrets.for_slug(slug).unwrap_or(&empty);
-    let hash = hook_secrets_hash(kv);
+    // `filled_kv_for_slug` strips any value equal to UNFILLED_SENTINEL
+    // (rdc's pre-populated placeholder marker) so a half-edited
+    // template never leaks a `"<unfilled>"` literal to the API.
+    let kv = secrets.filled_kv_for_slug(slug);
+    let hash = hook_secrets_hash(&kv);
     if !kv.is_empty()
         && let Some(obj) = body.as_object_mut() {
             obj.insert(
                 "secrets".to_string(),
-                serde_json::to_value(kv).expect("BTreeMap<String,String> serializes"),
+                serde_json::to_value(&kv).expect("BTreeMap<String,String> serializes"),
             );
         }
     hash
@@ -73,10 +75,9 @@ pub async fn push(
     // a sync with no hook changes AND no secret drift would still
     // print an empty section.
     let secrets_pass_has_work = || -> bool {
-        let empty = BTreeMap::<String, String>::new();
         for slug in hook_secrets.slugs() {
-            let local = hook_secrets.for_slug(slug).unwrap_or(&empty);
-            let local_hash = hook_secrets_hash(local);
+            let local = hook_secrets.filled_kv_for_slug(slug);
+            let local_hash = hook_secrets_hash(&local);
             let lf_hash = lockfile
                 .objects
                 .get("hooks")
@@ -123,9 +124,11 @@ pub async fn push(
 
             // Compute the secrets hash now (before injection) so the
             // lockfile entry written below carries the up-to-date value
-            // regardless of which branch creates the hook.
+            // regardless of which branch creates the hook. Filtered map
+            // strips the sentinel so an unedited template doesn't shift
+            // the hash and trigger a spurious force-push.
             let created_secrets_hash =
-                hook_secrets_hash(hook_secrets.for_slug(slug).unwrap_or(&BTreeMap::new()));
+                hook_secrets_hash(&hook_secrets.filled_kv_for_slug(slug));
 
             let post_result: Result<crate::model::Hook> = async {
             let created = if typed.is_store_extension() {
@@ -407,10 +410,12 @@ pub async fn push(
     // wrong slug either (we just don't have a matching id to target).
     let mut secrets_pushed = 0usize;
     let mut secrets_warned: Vec<String> = Vec::new();
-    let empty = BTreeMap::<String, String>::new();
     for slug in hook_secrets.slugs() {
-        let local_kv = hook_secrets.for_slug(slug).unwrap_or(&empty);
-        let local_hash = hook_secrets_hash(local_kv);
+        // Sentinel-valued keys must not reach the API; the filtered
+        // map drops them so a half-edited template doesn't PATCH a
+        // literal `"<unfilled>"` into Rossum.
+        let local_kv = hook_secrets.filled_kv_for_slug(slug);
+        let local_hash = hook_secrets_hash(&local_kv);
         let entry = lockfile.objects.get("hooks").and_then(|m| m.get(slug.as_str()));
         let Some(entry) = entry else {
             // No lockfile entry → either the hook hasn't been synced yet
