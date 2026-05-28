@@ -45,6 +45,21 @@ pub fn cache_mirror(paths: &Paths, env_file: &Path) -> Option<PathBuf> {
     Some(paths.base_cache_root().join(rel))
 }
 
+/// Convenience for push / deploy: atomically write `bytes` to
+/// `env_file` (the env-tree path), then mirror to the base cache.
+/// Errors propagate — both writes are load-bearing for the next
+/// sync's classifier (env file) and the next sync's auto-merge
+/// (cache).
+///
+/// Most push drivers call this instead of `snapshot::writer::write_atomic`
+/// when committing the API response bytes — the cache must move in
+/// lock-step so the next conflict has a current base.
+pub fn write_disk_and_cache(paths: &Paths, env_file: &Path, bytes: &[u8]) -> Result<()> {
+    crate::snapshot::writer::write_atomic(env_file, bytes)
+        .with_context(|| format!("writing {}", env_file.display()))?;
+    write(paths, env_file, bytes)
+}
+
 /// Commit `bytes` as the new base for `env_file`. Writes the cache
 /// mirror atomically; the parent dir tree is created as needed.
 ///
