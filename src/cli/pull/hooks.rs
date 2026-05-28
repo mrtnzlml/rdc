@@ -144,7 +144,7 @@ pub async fn process(
             PullAction::Write => {
                 // The `interactive` flag is irrelevant on Write (no resolver
                 // path); pass `ctx.interactive` for consistency.
-                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone(), ctx.interactive, progress, ctx.paths.env(), base_hash.as_deref())?;
+                apply_pull_action(action, &local_path, &proposed_json, remote_combined_hash.clone(), ctx.interactive, progress, ctx.paths.env(), base_hash.as_deref(), Some(ctx.paths))?;
                 if let Some(code) = &proposed_code {
                     write_hook_code(&ctx.paths.hooks_dir(), &slug, code, ext)
                         .with_context(|| format!("writing hook code for '{}'", hook.name))?;
