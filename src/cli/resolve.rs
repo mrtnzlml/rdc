@@ -803,27 +803,44 @@ fn prompt_single_hunk<R: BufRead, W: Write>(
     );
     writeln!(output, "{}", colorize_header(&header, mode))?;
 
-    // Context before the hunk: unified-diff convention prefixes equal
-    // lines with a single space (no color).
+    // Render this hunk through the same styled renderer the main
+    // conflict prompt and deploy --dry-run use — line-numbered gutter,
+    // colored row backgrounds, intra-line emphasis, JSON syntax
+    // highlighting. We build a tiny synthetic before/after pair
+    // containing CONTEXT lines of equal context plus the hunk's local /
+    // remote slices, so the renderer sees a single self-contained diff
+    // and produces output indistinguishable from any other rdc diff.
+    let mut local_view = String::new();
+    let mut remote_view = String::new();
+    let push_line = |buf: &mut String, line: &str| {
+        buf.push_str(line);
+        if !line.ends_with('\n') {
+            buf.push('\n');
+        }
+    };
     for line in prefix {
-        let stripped = line.strip_suffix('\n').unwrap_or(line);
-        writeln!(output, " {stripped}")?;
+        push_line(&mut local_view, line);
+        push_line(&mut remote_view, line);
     }
     for line in local_slice {
-        let stripped = line.strip_suffix('\n').unwrap_or(line);
-        let formatted = format!("-{stripped}");
-        writeln!(output, "{}", colorize_diff_line(&formatted, mode))?;
+        push_line(&mut local_view, line);
     }
     for line in remote_slice {
-        let stripped = line.strip_suffix('\n').unwrap_or(line);
-        let formatted = format!("+{stripped}");
-        writeln!(output, "{}", colorize_diff_line(&formatted, mode))?;
+        push_line(&mut remote_view, line);
     }
-    // Context after the hunk.
     for line in suffix {
-        let stripped = line.strip_suffix('\n').unwrap_or(line);
-        writeln!(output, " {stripped}")?;
+        push_line(&mut local_view, line);
+        push_line(&mut remote_view, line);
     }
+    let p = local_path.display();
+    let diff = render_styled_diff(
+        &format!("{p} (local)"),
+        &format!("{p} ({env})"),
+        &local_view,
+        &remote_view,
+        mode,
+    );
+    write!(output, "{diff}")?;
     writeln!(output)?;
 
     loop {
@@ -1429,9 +1446,7 @@ fn decide_color_mode(no_color: bool, no_color_env: bool, is_tty: bool) -> ColorM
 // soft red for removed lines, sage green for added — chosen for
 // contrast on both light and dark terminal themes.
 const SGR_RESET: &str = "\x1b[0m";
-const SGR_AMBER: &str = "\x1b[38;2;237;142;71m";
 const SGR_AMBER_BOLD: &str = "\x1b[1;38;2;237;142;71m";
-const SGR_REMOVE: &str = "\x1b[38;2;220;80;80m";
 const SGR_REMOVE_BOLD: &str = "\x1b[1;38;2;220;80;80m";
 const SGR_ADD: &str = "\x1b[38;2;120;180;90m";
 const SGR_ADD_BOLD: &str = "\x1b[1;38;2;120;180;90m";
@@ -1745,28 +1760,6 @@ fn render_content(
             out.push_str(bg);
         }
     out
-}
-
-/// Apply color to a single line of unified-diff output. Returns `line`
-/// unchanged in [`ColorMode::Plain`].
-pub fn colorize_diff_line(line: &str, mode: ColorMode) -> String {
-    if mode == ColorMode::Plain {
-        return line.to_string();
-    }
-    let prefix = if line.starts_with("--- ") {
-        SGR_REMOVE_BOLD
-    } else if line.starts_with("+++ ") {
-        SGR_ADD_BOLD
-    } else if line.starts_with("@@") {
-        SGR_AMBER
-    } else if line.starts_with('-') {
-        SGR_REMOVE
-    } else if line.starts_with('+') {
-        SGR_ADD
-    } else {
-        return line.to_string();
-    };
-    format!("{prefix}{line}{SGR_RESET}")
 }
 
 /// Colorize the conflict header line in bold amber — matches the
@@ -2210,52 +2203,6 @@ mod tests {
     }
 
     #[test]
-    fn colorize_plain_mode_returns_unchanged() {
-        let line = "-  \"name\": \"old\"";
-        assert_eq!(colorize_diff_line(line, ColorMode::Plain), line.to_string());
-    }
-
-    #[test]
-    fn colorize_color_mode_renders_minus_in_remove_hue() {
-        let line = "-  \"name\": \"old\"";
-        let out = colorize_diff_line(line, ColorMode::Color);
-        // Truecolor SGR for the "remove" hue used by `-` lines.
-        assert!(out.contains(SGR_REMOVE), "expected remove hue in: {out:?}");
-        assert!(out.ends_with(SGR_RESET), "expected reset suffix in: {out:?}");
-    }
-
-    #[test]
-    fn colorize_color_mode_renders_plus_in_add_hue() {
-        let line = "+  \"name\": \"new\"";
-        let out = colorize_diff_line(line, ColorMode::Color);
-        assert!(out.contains(SGR_ADD), "expected add hue in: {out:?}");
-    }
-
-    #[test]
-    fn colorize_color_mode_leaves_context_lines_alone() {
-        let line = "   \"unchanged\": true";
-        assert_eq!(
-            colorize_diff_line(line, ColorMode::Color),
-            line.to_string()
-        );
-    }
-
-    #[test]
-    fn colorize_color_mode_hunk_header_is_amber() {
-        let line = "@@ -1,3 +1,3 @@";
-        let out = colorize_diff_line(line, ColorMode::Color);
-        assert!(out.contains(SGR_AMBER), "expected amber accent in: {out:?}");
-    }
-
-    #[test]
-    fn colorize_file_headers_use_bold_remove_and_add_hues() {
-        let minus_hdr = colorize_diff_line("--- local", ColorMode::Color);
-        let plus_hdr = colorize_diff_line("+++ remote", ColorMode::Color);
-        assert!(minus_hdr.contains(SGR_REMOVE_BOLD), "got: {minus_hdr:?}");
-        assert!(plus_hdr.contains(SGR_ADD_BOLD), "got: {plus_hdr:?}");
-    }
-
-    #[test]
     fn decide_color_mode_no_color_env_returns_plain() {
         assert!(matches!(decide_color_mode(false, true, true), ColorMode::Plain));
         assert!(matches!(decide_color_mode(false, true, false), ColorMode::Plain));
@@ -2693,9 +2640,11 @@ mod tests {
     #[test]
     fn prompt_single_hunk_displays_surrounding_context() {
         // Local has 10 lines, hunk at line 4 (one line changed). The
-        // display must render at least one line of equal context above
-        // and below the differing block, following the unified-diff
-        // convention (leading space).
+        // hunk view goes through `render_styled_diff` (same renderer
+        // every other diff surface uses), so we assert on its plain
+        // output shape: `Update(<path>)` header, line-numbered gutter,
+        // and `- LOCAL_LINE` / `+ REMOTE_LINE` rows for the conflicting
+        // lines with surrounding equal-context rows.
         let local = b"line1\nline2\nline3\nLOCAL_LINE\nline5\nline6\nline7\nline8\nline9\nline10\n";
         let remote = b"line1\nline2\nline3\nREMOTE_LINE\nline5\nline6\nline7\nline8\nline9\nline10\n";
 
@@ -2717,19 +2666,28 @@ mod tests {
         .unwrap();
 
         let s = String::from_utf8_lossy(&output);
-        // The differing lines themselves:
-        assert!(s.contains("-LOCAL_LINE"), "diff should show local-removed: {s}");
-        assert!(s.contains("+REMOTE_LINE"), "diff should show remote-added: {s}");
-        // Surrounding context — at least one of the lines before / after
-        // the hunk must appear with the leading-space prefix that the
-        // unified-diff convention uses for equal lines.
         assert!(
-            s.contains(" line1") || s.contains(" line2") || s.contains(" line3"),
-            "should include lines preceding the hunk as context: {s}"
+            s.contains("Update(") && s.contains("x.py)"),
+            "styled renderer's header must appear: {s}"
         );
         assert!(
-            s.contains(" line5") || s.contains(" line6") || s.contains(" line7"),
-            "should include lines following the hunk as context: {s}"
+            s.contains("- LOCAL_LINE"),
+            "diff should show local-removed via styled renderer: {s}"
+        );
+        assert!(
+            s.contains("+ REMOTE_LINE"),
+            "diff should show remote-added via styled renderer: {s}"
+        );
+        // At least one surrounding equal-context line must appear (the
+        // styled renderer emits these without `-`/`+` markers — just
+        // line number, blank gutter, content).
+        assert!(
+            s.contains("line1") || s.contains("line2") || s.contains("line3"),
+            "context lines preceding the hunk must appear: {s}"
+        );
+        assert!(
+            s.contains("line5") || s.contains("line6") || s.contains("line7"),
+            "context lines following the hunk must appear: {s}"
         );
     }
 
