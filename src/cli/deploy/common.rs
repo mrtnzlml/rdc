@@ -182,6 +182,38 @@ mod normalize_tests {
             "hooks differing only in token_owner must normalise equal",
         );
     }
+
+    #[test]
+    fn normalize_strips_name_for_engine_fields() {
+        // The Rossum API treats engine_field `name` as immutable after
+        // create. A cross-env mapping may legitimately pair two fields
+        // with different names (e.g. `item-qty` -> `item-quantity`); the
+        // cross-env compare must treat that as a non-difference, otherwise
+        // deploy attempts a PATCH that the API rejects with 400.
+        let src = br#"{
+          "id": 1,
+          "url": "https://dev.example.app/api/v1/engine_fields/1",
+          "name": "item_qty",
+          "engine": "https://example.app/api/v1/engines/100",
+          "label": "Qty",
+          "type": "string"
+        }"#;
+        let tgt = br#"{
+          "id": 2,
+          "url": "https://test.example.app/api/v1/engine_fields/2",
+          "name": "item_quantity",
+          "engine": "https://example.app/api/v1/engines/100",
+          "label": "Qty",
+          "type": "string"
+        }"#;
+        let ns = normalize_for_cross_env_compare(src, "engine_fields").unwrap();
+        let nt = normalize_for_cross_env_compare(tgt, "engine_fields").unwrap();
+        assert_eq!(
+            std::str::from_utf8(&ns).unwrap(),
+            std::str::from_utf8(&nt).unwrap(),
+            "engine_fields differing only in `name` must normalise equal",
+        );
+    }
 }
 
 /// Convenience: are two serialised payloads equivalent under
