@@ -283,6 +283,14 @@ impl RossumClient {
         self.patch_json(&format!("/engine_fields/{id}"), field, progress).await
     }
 
+    /// Partial-body variant: PATCH with a hand-built `serde_json::Value`.
+    /// Useful when the caller needs to omit immutable fields like `name`
+    /// (Rossum rejects renaming an existing engine field with 400). Mirror
+    /// of [`update_hook_value`].
+    pub async fn update_engine_field_value(&self, id: u64, body: &serde_json::Value, progress: ProgressHandle) -> Result<EngineField> {
+        self.patch_json(&format!("/engine_fields/{id}"), body, progress).await
+    }
+
     // --- delete endpoints (DELETE) ------------------------------------
     //
     // Used by `rdc deploy --mirror`, which prunes tgt-only resources so

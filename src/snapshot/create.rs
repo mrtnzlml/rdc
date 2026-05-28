@@ -149,6 +149,17 @@ pub fn strip_for_cross_env_patch(body: &mut Value, kind: &str) {
     if kind == "hooks" {
         obj.remove("token_owner");
     }
+    // The Rossum API treats an engine field's `name` as immutable after
+    // create — `PATCH /engine_fields/<id>` with a changed `name` returns
+    // 400 "You cannot change the name of an existing engine field." Strip
+    // it from the cross-env compare and from cross-env PATCH bodies so a
+    // slug mapping that pairs two differently-named fields (e.g.
+    // `item-qty` -> `item-quantity`) doesn't trigger a doomed PATCH. The
+    // name is still preserved for POSTs (strip_for_create — used by real
+    // creates — does not remove it).
+    if kind == "engine_fields" {
+        obj.remove("name");
+    }
 }
 
 #[cfg(test)]
