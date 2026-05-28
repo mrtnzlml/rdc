@@ -816,8 +816,10 @@ fn try_auto_merge(
                 }
             }
 
-            // Serialize and write via schema writer (handles both
-            // schema.json and formulas/*.py).
+            // Serialize and write via schema writer — handles
+            // schema.json, formulas/*.py, AND sweeps orphan formula
+            // sidecars (formulas removed by one side, other side left
+            // base alone).
             let mut merged_json_bytes = serde_json::to_vec_pretty(&json_merged)?;
             merged_json_bytes.push(b'\n');
             crate::snapshot::schema::write_schema_bytes_with_cache(
@@ -826,21 +828,6 @@ fn try_auto_merge(
                 &merged_formulas,
                 Some(ctx.paths),
             )?;
-            // Clean up formula files that no longer appear in the merged
-            // set (formula removed by one side, other side left base alone).
-            let formulas_dir = queue_dir.join("formulas");
-            if formulas_dir.exists()
-                && let Ok(entries) = std::fs::read_dir(&formulas_dir) {
-                let kept: BTreeSet<&str> = merged_formulas.iter().map(|(i, _)| i.as_str()).collect();
-                for e in entries.flatten() {
-                    let name = e.file_name().to_string_lossy().to_string();
-                    if let Some(id) = name.strip_suffix(".py")
-                        && !kept.contains(id) {
-                        let _ = std::fs::remove_file(e.path());
-                        let _ = crate::state::base_cache::forget(ctx.paths, &e.path());
-                    }
-                }
-            }
             let combined = crate::state::schema_combined_hash(&merged_json_bytes, &merged_formulas);
             Ok(Some((combined, local_paths, remote_paths)))
         }
