@@ -191,6 +191,17 @@ version = 1
 
     let body = captured.lock().unwrap().clone().expect("PATCH body for hook 401");
     assert_eq!(body["name"], serde_json::Value::String("Validator (PROD)".into()));
+
+    // Inline write-back: after `rdc deploy`, the local tgt snapshot must
+    // reflect the PATCH response (no separate `rdc sync` needed).
+    let written = std::fs::read_to_string(
+        project.path().join("envs/prod/hooks/validator-invoices.json"),
+    ).expect("local prod hook file must exist after deploy");
+    let written: serde_json::Value = serde_json::from_str(&written).unwrap();
+    assert_eq!(
+        written["name"], serde_json::Value::String("Validator (PROD)".into()),
+        "local prod hook file should reflect the PATCH response",
+    );
 }
 
 /// Mount mocks sufficient to pull a single workspace + queue + schema, with

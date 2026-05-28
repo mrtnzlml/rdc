@@ -1,6 +1,6 @@
 use crate::api::{anyhow_has_status, RossumClient};
 use crate::cli::deploy::common::{bytes_equal_after_strip, rewrite_urls, tgt_drift_status};
-use crate::snapshot::create::strip_for_cross_env_patch;
+use crate::snapshot::create::{redact_for_disk, strip_for_cross_env_patch};
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::config::ProjectConfig;
 use crate::log::{Action, Log};
@@ -8,14 +8,19 @@ use crate::mapping::Mapping;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
 use crate::secrets::resolve_token;
-use crate::snapshot::email_template::read_email_template;
-use crate::snapshot::hook::read_hook_value;
-use crate::snapshot::schema::read_schema_value;
-use crate::state::Lockfile;
+use crate::snapshot::email_template::{read_email_template, write_email_template};
+use crate::snapshot::hook::{read_hook_value, write_hook};
+use crate::snapshot::rule::write_rule;
+use crate::snapshot::schema::{read_schema_value, write_schema_bytes};
+use crate::snapshot::writer::write_atomic;
+use crate::state::{
+    content_hash, hook_combined_hash, rule_combined_hash, schema_combined_hash, Lockfile,
+    ObjectEntry,
+};
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// One target object that's drifted from the lockfile baseline — i.e.,
@@ -306,8 +311,11 @@ pub(crate) async fn run(
             // before PATCH to mirror queues/email_templates/inboxes.
             let mut patch_body = payload.clone();
             crate::snapshot::create::strip_for_cross_env_patch(&mut patch_body, "workspaces");
-            tgt_client.patch_value(&format!("/workspaces/{tgt_id}"), &patch_body, None).await
+            let response_value = tgt_client.patch_value(&format!("/workspaces/{tgt_id}"), &patch_body, None).await
                 .with_context(|| format!("PATCH tgt workspaces/{tgt_id}"))?;
+            let updated: crate::model::Workspace = serde_json::from_value(response_value)
+                .context("parsing PATCH /workspaces response as Workspace")?;
+            write_back_workspace(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
         }
         applied.workspaces += 1;
         if let Some(p) = &progress { p.event(Action::Patch, &format!("workspace/{tgt_slug}")); }
@@ -450,8 +458,9 @@ pub(crate) async fn run(
                             .expect("BTreeMap<String,String> serializes"),
                     );
                 }
-            tgt_client.update_hook_value(tgt_id, &body, None).await
+            let updated = tgt_client.update_hook_value(tgt_id, &body, None).await
                 .with_context(|| format!("PATCH tgt hooks/{tgt_id} (mapped from src '{src_slug}')"))?;
+            write_back_hook(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
             // Record the just-injected secrets-hash so a subsequent
             // sync on the target doesn't see drift.
             let empty = std::collections::BTreeMap::<String, String>::new();
@@ -543,8 +552,9 @@ pub(crate) async fn run(
             }
         }
         if !dry_run {
-            tgt_client.update_rule(tgt_id, &payload_rule, None).await
+            let updated = tgt_client.update_rule(tgt_id, &payload_rule, None).await
                 .with_context(|| format!("PATCH tgt rules/{tgt_id}"))?;
+            write_back_rule(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
         }
         applied.rules += 1;
         if let Some(p) = &progress { p.event(Action::Patch, &format!("rule/{tgt_slug}")); }
@@ -609,8 +619,9 @@ pub(crate) async fn run(
             )?;
         }
         if !dry_run {
-            tgt_client.update_label(tgt_id, &payload_label, None).await
+            let updated = tgt_client.update_label(tgt_id, &payload_label, None).await
                 .with_context(|| format!("PATCH tgt labels/{tgt_id}"))?;
+            write_back_label(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
         }
         applied.labels += 1;
         if let Some(p) = &progress { p.event(Action::Patch, &format!("label/{tgt_slug}")); }
@@ -687,8 +698,11 @@ pub(crate) async fn run(
             )?;
         }
         if !dry_run {
-            tgt_client.patch_value(&format!("/queues/{tgt_id}"), &payload_for_patch, None).await
+            let response_value = tgt_client.patch_value(&format!("/queues/{tgt_id}"), &payload_for_patch, None).await
                 .with_context(|| format!("PATCH tgt queues/{tgt_id}"))?;
+            let updated: crate::model::Queue = serde_json::from_value(response_value)
+                .context("parsing PATCH /queues response as Queue")?;
+            write_back_queue(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
         }
         applied.queues += 1;
         if let Some(p) = &progress { p.event(Action::Patch, &format!("queue/{tgt_slug}")); }
@@ -775,8 +789,9 @@ pub(crate) async fn run(
             }
         }
         if !dry_run {
-            tgt_client.update_schema(tgt_id, &payload_schema, None).await
+            let updated = tgt_client.update_schema(tgt_id, &payload_schema, None).await
                 .with_context(|| format!("PATCH tgt schemas/{tgt_id}"))?;
+            write_back_schema(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
         }
         applied.schemas += 1;
         if let Some(p) = &progress { p.event(Action::Patch, &format!("schema/{tgt_slug}")); }
@@ -847,8 +862,9 @@ pub(crate) async fn run(
             let mut patch_body = serde_json::to_value(&payload_inbox)
                 .context("serializing payload inbox for PATCH")?;
             crate::snapshot::create::strip_for_cross_env_patch(&mut patch_body, "inboxes");
-            tgt_client.update_inbox_value(tgt_id, &patch_body, None).await
+            let updated = tgt_client.update_inbox_value(tgt_id, &patch_body, None).await
                 .with_context(|| format!("PATCH tgt inboxes/{tgt_id}"))?;
+            write_back_inbox(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
         }
         applied.inboxes += 1;
         if let Some(p) = &progress { p.event(Action::Patch, &format!("inbox/{tgt_slug}")); }
@@ -922,8 +938,11 @@ pub(crate) async fn run(
             )?;
         }
         if !dry_run {
-            tgt_client.patch_value(&format!("/email_templates/{tgt_id}"), &payload_for_patch, None).await
+            let response_value = tgt_client.patch_value(&format!("/email_templates/{tgt_id}"), &payload_for_patch, None).await
                 .with_context(|| format!("PATCH tgt email_templates/{tgt_id}"))?;
+            let updated: crate::model::EmailTemplate = serde_json::from_value(response_value)
+                .context("parsing PATCH /email_templates response as EmailTemplate")?;
+            write_back_email_template(&tgt_paths, tgt_lockfile, tgt_key, &updated)?;
         }
         applied.email_templates += 1;
         if let Some(p) = &progress { p.event(Action::Patch, &format!("email_template/{tgt_key}")); }
@@ -992,7 +1011,8 @@ pub(crate) async fn run(
             match tgt_client.update_engine(tgt_id, &payload_engine, None).await
                 .with_context(|| format!("PATCH tgt engines/{tgt_id}"))
             {
-                Ok(_) => {
+                Ok(updated) => {
+                    write_back_engine(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
                     applied.engines += 1;
                     if let Some(p) = &progress { p.event(Action::Patch, &format!("engine/{tgt_slug}")); }
                 }
@@ -1085,7 +1105,8 @@ pub(crate) async fn run(
             match tgt_client.update_engine_field_value(tgt_id, &patch_body, None).await
                 .with_context(|| format!("PATCH tgt engine_fields/{tgt_id}"))
             {
-                Ok(_) => {
+                Ok(updated) => {
+                    write_back_engine_field(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
                     applied.engine_fields += 1;
                     if let Some(p) = &progress { p.event(Action::Patch, &format!("engine_field/{tgt_slug}")); }
                 }
@@ -1261,4 +1282,252 @@ pub(crate) fn split_template_key(key: &str) -> Option<(&str, &str, &str)> {
         return None;
     }
     Some((ws, q, t))
+}
+
+// ─── write-back helpers (apply → tgt local snapshot) ──────────────────
+//
+// After a successful cross-env PATCH the Rossum API returns the canonical
+// post-PATCH state of the object. Write it back to the tgt local snapshot
+// and refresh the tgt lockfile entry so `rdc sync <tgt>` is unnecessary
+// after `rdc deploy <src> <tgt>`. Mirrors the per-create writes in
+// `cli::deploy::create` and the per-pull writes in `cli::pull`. No extra
+// API calls — the data is already in hand.
+//
+// Each helper: redact_for_disk → write via kind-specific writer (sidecars
+// included for hook/rule/schema) → hash with the kind's hash function →
+// upsert tgt lockfile, preserving secrets_hash for hooks.
+
+/// Round-trip the response through `redact_for_disk` so server-noise fields
+/// (e.g. hook.status, engine.agenda_id) land as the sentinel string on disk,
+/// matching what a fresh `pull`/`sync` would write.
+fn redacted_response<T: serde::Serialize + serde::de::DeserializeOwned>(
+    response: &T,
+    kind: &str,
+) -> Result<T> {
+    let mut v = serde_json::to_value(response)
+        .with_context(|| format!("serialising {kind} response for redaction"))?;
+    redact_for_disk(&mut v, kind);
+    let typed: T = serde_json::from_value(v)
+        .with_context(|| format!("deserialising redacted {kind} response"))?;
+    Ok(typed)
+}
+
+fn upsert_after_write_back(
+    lockfile: &mut Lockfile,
+    kind: &str,
+    slug: &str,
+    id: u64,
+    url: &str,
+    modified_at: Option<&str>,
+    hash: String,
+) {
+    let prev_secrets = lockfile
+        .objects
+        .get(kind)
+        .and_then(|m| m.get(slug))
+        .and_then(|e| e.secrets_hash.clone());
+    lockfile.upsert(
+        kind,
+        slug,
+        ObjectEntry {
+            id,
+            url: Some(url.to_string()),
+            modified_at: modified_at.map(|s| s.to_string()),
+            content_hash: Some(hash),
+            secrets_hash: prev_secrets,
+        },
+    );
+}
+
+/// Common path for flat (no-sidecar) kinds: redact, pretty-print, write,
+/// hash with `content_hash`, update lockfile.
+fn write_back_flat<T: serde::Serialize>(
+    tgt_lockfile: &mut Lockfile,
+    kind: &str,
+    slug: &str,
+    file_path: &Path,
+    response: &T,
+    id: u64,
+    url: &str,
+    modified_at: Option<&str>,
+) -> Result<()> {
+    let mut value = serde_json::to_value(response)
+        .with_context(|| format!("serialising {kind}/{slug} response for write-back"))?;
+    redact_for_disk(&mut value, kind);
+    let mut bytes = serde_json::to_vec_pretty(&value)
+        .with_context(|| format!("encoding {kind}/{slug} write-back bytes"))?;
+    bytes.push(b'\n');
+    write_atomic(file_path, &bytes)?;
+    upsert_after_write_back(
+        tgt_lockfile, kind, slug, id, url, modified_at, content_hash(&bytes),
+    );
+    Ok(())
+}
+
+fn write_back_workspace(
+    tgt_paths: &Paths,
+    tgt_lockfile: &mut Lockfile,
+    slug: &str,
+    response: &crate::model::Workspace,
+) -> Result<()> {
+    let dir = tgt_paths.workspace_dir(slug);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    write_back_flat(
+        tgt_lockfile, "workspaces", slug, &dir.join("workspace.json"),
+        response, response.id, &response.url, response.modified_at(),
+    )
+}
+
+fn write_back_label(
+    tgt_paths: &Paths,
+    tgt_lockfile: &mut Lockfile,
+    slug: &str,
+    response: &crate::model::Label,
+) -> Result<()> {
+    let dir = tgt_paths.labels_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    write_back_flat(
+        tgt_lockfile, "labels", slug, &dir.join(format!("{slug}.json")),
+        response, response.id, &response.url, response.modified_at(),
+    )
+}
+
+fn write_back_queue(
+    tgt_paths: &Paths,
+    tgt_lockfile: &mut Lockfile,
+    q_slug: &str,
+    response: &crate::model::Queue,
+) -> Result<()> {
+    let dir = locate_queue_dir(tgt_paths, q_slug)
+        .ok_or_else(|| anyhow!("tgt queue dir for '{q_slug}' not found for write-back"))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    write_back_flat(
+        tgt_lockfile, "queues", q_slug, &dir.join("queue.json"),
+        response, response.id, &response.url, response.modified_at(),
+    )
+}
+
+fn write_back_inbox(
+    tgt_paths: &Paths,
+    tgt_lockfile: &mut Lockfile,
+    q_slug: &str,
+    response: &crate::model::Inbox,
+) -> Result<()> {
+    let dir = locate_queue_dir(tgt_paths, q_slug)
+        .ok_or_else(|| anyhow!("tgt queue dir for inbox '{q_slug}' not found for write-back"))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    write_back_flat(
+        tgt_lockfile, "inboxes", q_slug, &dir.join("inbox.json"),
+        response, response.id, &response.url, response.modified_at(),
+    )
+}
+
+fn write_back_engine(
+    tgt_paths: &Paths,
+    tgt_lockfile: &mut Lockfile,
+    slug: &str,
+    response: &crate::model::Engine,
+) -> Result<()> {
+    let dir = tgt_paths.engine_dir(slug);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    write_back_flat(
+        tgt_lockfile, "engines", slug, &dir.join("engine.json"),
+        response, response.id, &response.url, response.modified_at(),
+    )
+}
+
+fn write_back_engine_field(
+    tgt_paths: &Paths,
+    tgt_lockfile: &mut Lockfile,
+    slug: &str,
+    response: &crate::model::EngineField,
+) -> Result<()> {
+    // Engine fields are nested under their engine on disk; walk to find
+    // the tgt engine that owns this field (the tgt file already exists
+    // because we either created it in an earlier deploy or pulled it).
+    let engine_slug = tgt_paths.engine_slug_for_field(slug).ok_or_else(|| {
+        anyhow!("tgt engine_field '{slug}' not found under any engine for write-back")
+    })?;
+    let dir = tgt_paths.engine_fields_dir(&engine_slug);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    write_back_flat(
+        tgt_lockfile, "engine_fields", slug, &dir.join(format!("{slug}.json")),
+        response, response.id, &response.url, response.modified_at(),
+    )
+}
+
+fn write_back_hook(
+    tgt_paths: &Paths,
+    tgt_lockfile: &mut Lockfile,
+    slug: &str,
+    response: &crate::model::Hook,
+) -> Result<()> {
+    let dir = tgt_paths.hooks_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let redacted = redacted_response(response, "hooks")?;
+    let json_bytes = write_hook(&dir, slug, &redacted)?;
+    let code = redacted
+        .config
+        .get("code")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let hash = hook_combined_hash(&json_bytes, &code);
+    upsert_after_write_back(
+        tgt_lockfile, "hooks", slug, redacted.id, &redacted.url, redacted.modified_at(), hash,
+    );
+    Ok(())
+}
+
+fn write_back_rule(
+    tgt_paths: &Paths,
+    tgt_lockfile: &mut Lockfile,
+    slug: &str,
+    response: &crate::model::Rule,
+) -> Result<()> {
+    let dir = tgt_paths.rules_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let (json_bytes, code) = crate::snapshot::rule::serialize_rule(response)?;
+    write_rule(&dir, slug, response)?;
+    let hash = rule_combined_hash(&json_bytes, &code);
+    upsert_after_write_back(
+        tgt_lockfile, "rules", slug, response.id, &response.url, response.modified_at(), hash,
+    );
+    Ok(())
+}
+
+fn write_back_schema(
+    tgt_paths: &Paths,
+    tgt_lockfile: &mut Lockfile,
+    q_slug: &str,
+    response: &crate::model::Schema,
+) -> Result<()> {
+    let dir = locate_queue_dir(tgt_paths, q_slug)
+        .ok_or_else(|| anyhow!("tgt queue dir for schema '{q_slug}' not found for write-back"))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let (json_bytes, formula_parts) = crate::snapshot::schema::serialize_schema(response)?;
+    write_schema_bytes(&dir, &json_bytes, &formula_parts)?;
+    let hash = schema_combined_hash(&json_bytes, &formula_parts);
+    upsert_after_write_back(
+        tgt_lockfile, "schemas", q_slug, response.id, &response.url, response.modified_at(), hash,
+    );
+    Ok(())
+}
+
+fn write_back_email_template(
+    tgt_paths: &Paths,
+    tgt_lockfile: &mut Lockfile,
+    key: &str,
+    response: &crate::model::EmailTemplate,
+) -> Result<()> {
+    let (ws, q, t) = split_template_key(key)
+        .ok_or_else(|| anyhow!("email_template key '{key}' is not <ws>/<q>/<template>"))?;
+    let dir = tgt_paths.queue_email_templates_dir(ws, q);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let bytes = write_email_template(&dir, t, response)?;
+    upsert_after_write_back(
+        tgt_lockfile, "email_templates", key,
+        response.id, &response.url, response.modified_at(),
+        content_hash(&bytes),
+    );
+    Ok(())
 }
