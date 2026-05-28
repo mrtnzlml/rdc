@@ -768,7 +768,16 @@ pub(crate) async fn run(
             )?;
         }
         if !dry_run {
-            tgt_client.update_inbox(tgt_id, &payload_inbox, None).await
+            // Inbox `email` is per-env (auto-assigned at create on the
+            // tgt domain). Sending the src env's email cross-env is at
+            // best ignored, at worst destructive. Build the PATCH body
+            // from the typed payload, then apply the same cross-env
+            // strip the idempotency check uses (which removes `email`
+            // via the "inboxes" entry in kind_specific_strip).
+            let mut patch_body = serde_json::to_value(&payload_inbox)
+                .context("serializing payload inbox for PATCH")?;
+            crate::snapshot::create::strip_for_cross_env_patch(&mut patch_body, "inboxes");
+            tgt_client.update_inbox_value(tgt_id, &patch_body, None).await
                 .with_context(|| format!("PATCH tgt inboxes/{tgt_id}"))?;
         }
         applied.inboxes += 1;
