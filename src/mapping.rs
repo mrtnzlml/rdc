@@ -92,7 +92,17 @@ impl Mapping {
     /// if the kind isn't deployable or the pair isn't mapped. Used by
     /// the URL-rewrite step inside `rdc deploy`.
     pub fn lookup_tgt_slug(&self, kind: &str, src_slug: &str) -> Option<&str> {
-        let map = match kind {
+        self.kind_map(kind)
+            .and_then(|m| m.get(src_slug).map(|s| s.as_str()))
+    }
+
+    /// Borrow the slug-pair map for a given deployable kind. Returns
+    /// `None` for non-deployable kinds (e.g. `hook_templates`, which
+    /// uses a URL-pair map instead). Used by callers that need to
+    /// iterate values (e.g. compute_plan's mirror-delete branch, which
+    /// must exclude mapped tgt slugs).
+    pub fn kind_map(&self, kind: &str) -> Option<&BTreeMap<String, String>> {
+        Some(match kind {
             "workspaces" => &self.workspaces,
             "hooks" => &self.hooks,
             "rules" => &self.rules,
@@ -104,8 +114,7 @@ impl Mapping {
             "engines" => &self.engines,
             "engine_fields" => &self.engine_fields,
             _ => return None,
-        };
-        map.get(src_slug).map(|s| s.as_str())
+        })
     }
 }
 

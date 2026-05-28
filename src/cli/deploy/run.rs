@@ -607,9 +607,18 @@ fn compute_plan(
         }
         if mirror {
             let src_set: std::collections::HashSet<&String> = src_slugs.iter().collect();
+            // tgt slugs paired by the mapping must NOT be deleted under
+            // --mirror; they're the rename-targets of src objects, not
+            // strangers. Without this filter, a mapping like
+            // `engines.X = "Y"` would destroy tgt Y the moment the user
+            // ran --mirror, because src has no literal Y.
+            let mapped_tgts: std::collections::HashSet<&str> = mapping
+                .kind_map(kind)
+                .map(|m| m.values().map(|s| s.as_str()).collect())
+                .unwrap_or_default();
             let to_delete: Vec<String> = tgt_slugs
                 .iter()
-                .filter(|s| !src_set.contains(*s))
+                .filter(|s| !src_set.contains(*s) && !mapped_tgts.contains(s.as_str()))
                 .cloned()
                 .collect();
             if !to_delete.is_empty() {
@@ -1539,5 +1548,53 @@ mod tests {
             read_src_for_preview("engines", "my-engine", &paths).unwrap();
         assert_eq!(bytes, body);
         assert!(code.is_none());
+    }
+
+    #[test]
+    fn compute_plan_mirror_does_not_delete_mapping_targets() {
+        // With `--mirror`, the delete branch of compute_plan must consult
+        // the mapping. Without this check, a slug rename
+        // (mapping: src "x" -> tgt "y") makes mirror plan a delete of the
+        // tgt "y" because src has no literal "y" — destroying the paired
+        // tgt object.
+        let src_dir = TempDir::new().unwrap();
+        let tgt_dir = TempDir::new().unwrap();
+        let src_paths = Paths::for_env(src_dir.path(), "src");
+        let tgt_paths = Paths::for_env(tgt_dir.path(), "tgt");
+
+        // Labels are the simplest flat kind; use them for the fixture.
+        std::fs::create_dir_all(src_paths.labels_dir()).unwrap();
+        std::fs::write(src_paths.labels_dir().join("x.json"), b"{}").unwrap();
+        std::fs::create_dir_all(tgt_paths.labels_dir()).unwrap();
+        std::fs::write(tgt_paths.labels_dir().join("y.json"), b"{}").unwrap();
+
+        let mut mapping = Mapping::default();
+        mapping.labels.insert("x".to_string(), "y".to_string());
+
+        let plan = compute_plan(
+            &src_paths,
+            &tgt_paths,
+            &Lockfile::default(),
+            &Lockfile::default(),
+            &mapping,
+            true, // mirror
+            None, // no selection
+        )
+        .unwrap();
+
+        let labels_deletes: Vec<String> =
+            plan.deletes.get("labels").cloned().unwrap_or_default();
+        assert!(
+            !labels_deletes.contains(&"y".to_string()),
+            "tgt slug 'y' paired by mapping must NOT be in deletes: {labels_deletes:?}",
+        );
+        // The previous fix (creates branch) is also asserted here as a
+        // regression guard: src "x" must not be a create (paired via mapping).
+        let labels_creates: Vec<String> =
+            plan.creates.get("labels").cloned().unwrap_or_default();
+        assert!(
+            !labels_creates.contains(&"x".to_string()),
+            "src slug 'x' paired by mapping must NOT be in creates: {labels_creates:?}",
+        );
     }
 }
