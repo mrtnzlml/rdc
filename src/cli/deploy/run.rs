@@ -23,8 +23,9 @@
 
 use crate::api::RossumClient;
 use crate::cli::deploy::create::{
-    create_hook, create_inbox, create_label, create_queue, create_rule, create_schema,
-    create_workspace, locate_queue_dir, CreateCtx,
+    create_engine, create_engine_field, create_hook, create_inbox, create_label,
+    create_queue, create_rule, create_schema, create_workspace, locate_queue_dir,
+    CreateCtx,
 };
 use crate::config::ProjectConfig;
 use crate::log::{Action, Log};
@@ -429,24 +430,8 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
                 }
                 "rules" => create_rule(&mut ctx, slug).await,
                 "labels" => create_label(&mut ctx, slug).await,
-                "engines" | "engine_fields" => {
-                    // Engines/engine_fields creation isn't implemented in
-                    // rdc yet (the API supports POST, but the
-                    // lockfile/mapping recording for these kinds isn't
-                    // wired up). Warn loudly so the user knows the object
-                    // was NOT created, then skip the post-event +
-                    // bookkeeping below via `continue` after the match.
-                    if let Some(p) = &progress {
-                        p.event(
-                            Action::Warn,
-                            &format!(
-                                "{singular}/{slug}: create not implemented; \
-                                 skipping (will NOT be created on tgt)"
-                            ),
-                        );
-                    }
-                    Ok(())
-                }
+                "engines" => create_engine(&mut ctx, slug).await,
+                "engine_fields" => create_engine_field(&mut ctx, slug).await,
                 _ => Ok(()),
             };
             // create_schema/create_queue/create_inbox emit their own
@@ -454,7 +439,8 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
             // self-report.
             if result.is_ok() {
                 match *kind {
-                    "workspaces" | "hooks" | "rules" | "labels" => {
+                    "workspaces" | "hooks" | "rules" | "labels" | "engines"
+                    | "engine_fields" => {
                         if let Some(p) = &progress {
                             p.event(Action::Post, &format!("{singular}/{slug}"));
                         }
@@ -465,13 +451,6 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
             if let Err(e) = result {
                 create_err = Some(e);
                 break 'outer;
-            }
-            // Engines/engine_fields creation is a no-op for now; skip the
-            // lockfile save + counter increments below so the deploy
-            // summary doesn't claim a create that didn't happen. The
-            // warning above already told the user.
-            if matches!(*kind, "engines" | "engine_fields") {
-                continue;
             }
             // Flush after each successful create so a later failure
             // can be resumed by re-running `rdc deploy` (the resume
@@ -1147,17 +1126,6 @@ fn preview_create_bodies(
     for kind in KINDS_IN_DEP_ORDER {
         let Some(slugs) = plan.creates.get(kind) else { continue };
         for slug in slugs {
-            // engines/engine_fields create is not implemented yet — flag
-            // it here so the dry-run body preview isn't read as a promise
-            // of an actual POST on real deploy. See the matching
-            // skip-with-warning in the apply loop above.
-            if matches!(*kind, "engines" | "engine_fields") {
-                eprintln!(
-                    "warning: {kind}/{slug}: create not implemented; \
-                     the body below is informational only \
-                     \u{2014} it will NOT be POSTed on real deploy"
-                );
-            }
             // For each kind, work out the on-disk path of the src file +
             // (when the kind is hooks/rules/schemas) the extracted code
             // sidecar that ships alongside the JSON.
@@ -1255,32 +1223,17 @@ fn read_src_for_preview(
         }
         "engine_fields" => {
             // Engine fields live at engines/<engine_slug>/fields/<field_slug>.json.
-            // The preview function only has the field slug, so walk the engines
-            // directory to find the engine that contains this field.
-            let engines_dir = src_paths.engines_dir();
-            if !engines_dir.exists() {
-                return Err(anyhow!(
-                    "no engines directory at {}",
-                    engines_dir.display()
-                ));
-            }
-            for entry in std::fs::read_dir(&engines_dir)? {
-                let entry = entry?;
-                if !entry.file_type()?.is_dir() {
-                    continue;
-                }
-                let e_slug = entry.file_name().to_string_lossy().into_owned();
-                let p = src_paths
-                    .engine_fields_dir(&e_slug)
-                    .join(format!("{slug}.json"));
-                if p.exists() {
-                    return Ok((std::fs::read(&p)?, None));
-                }
-            }
-            Err(anyhow!(
-                "engine_field '{slug}' not found under any engine in {}",
-                engines_dir.display()
-            ))
+            // Find which engine contains this field via the shared helper.
+            let e_slug = src_paths.engine_slug_for_field(slug).ok_or_else(|| {
+                anyhow!(
+                    "engine_field '{slug}' not found under any engine in {}",
+                    src_paths.engines_dir().display()
+                )
+            })?;
+            let p = src_paths
+                .engine_fields_dir(&e_slug)
+                .join(format!("{slug}.json"));
+            Ok((std::fs::read(&p)?, None))
         }
         "queues" | "schemas" | "inboxes" => {
             let q_dir = crate::cli::deploy::create::locate_queue_dir(src_paths, slug)
