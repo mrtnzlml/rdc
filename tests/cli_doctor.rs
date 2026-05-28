@@ -445,3 +445,106 @@ async fn doctor_reinstalls_store_anomaly_and_rewires_dependents() {
     assert_eq!(local["extension_source"], "rossum_store");
     assert!(local["hook_template"].as_str().unwrap().contains("/hook_templates/39"));
 }
+
+/// Canonicalize-keys: a hook file with non-canonical top-level key order
+/// (priority keys not at the front) is silently rewritten by doctor to
+/// the canonical order — same shape `rdc sync` would have written from
+/// scratch. content_hash is invariant under reordering, so the lockfile
+/// stays valid without any rebuild.
+#[tokio::test]
+async fn doctor_canonicalizes_hook_with_bad_key_order() {
+    let server = MockServer::start().await;
+    mount_minimal_pull(&server).await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [{
+                "id": 700,
+                "url": format!("{}/api/v1/hooks/700", server.uri()),
+                "name": "Validator",
+                "type": "function",
+                "queues": [],
+                "events": ["annotation_content"],
+                "config": { "runtime": "python3.12", "code": "def run(p):\n    pass\n" }
+            }]
+        })))
+        .with_priority(1)
+        .mount(&server).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert().success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    ).unwrap();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev", "--no-push"])
+        .assert().success();
+
+    // Hand-rewrite the hook file with non-canonical top-level key order:
+    // `queues` and `type` deliberately placed BEFORE `id` / `name` /
+    // `events`, mimicking the historical case where Rossum's API emitted
+    // keys in an arbitrary order and `rdc sync` wrote them as-received
+    // (before HOOK_KEY_ORDER existed).
+    let hook_path = project.path().join("envs/dev/hooks/validator.json");
+    std::fs::write(
+        &hook_path,
+        r#"{
+  "queues": [],
+  "type": "function",
+  "url": "REPLACED_BY_TEST",
+  "id": 700,
+  "events": ["annotation_content"],
+  "name": "Validator"
+}
+"#,
+    ).unwrap();
+
+    // Capture lockfile content_hash BEFORE doctor — it must be unchanged
+    // afterward, since canonicalization is purely cosmetic.
+    let lockfile_path = project.path().join(".rdc/state/dev.lock.json");
+    let lf_before: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&lockfile_path).unwrap()).unwrap();
+    let hash_before = lf_before["objects"]["hooks"]["validator"]["content_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["doctor", "dev"])
+        .assert().success();
+
+    // After doctor: the first non-`{` token in the file must name a
+    // HOOK_KEY_ORDER key (id/name/...). Asserting on the raw bytes
+    // because `serde_json::Value` Display order isn't preserved.
+    let raw = std::fs::read_to_string(&hook_path).unwrap();
+    let id_pos = raw.find("\"id\"").expect("id key must exist");
+    let queues_pos = raw.find("\"queues\"").expect("queues key must exist");
+    assert!(
+        id_pos < queues_pos,
+        "id must appear before queues after canonicalization:\n{raw}"
+    );
+    let name_pos = raw.find("\"name\"").expect("name key must exist");
+    assert!(
+        name_pos < queues_pos,
+        "name must appear before queues after canonicalization:\n{raw}"
+    );
+
+    // Lockfile hash unchanged — canonicalization is hash-invariant.
+    let lf_after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&lockfile_path).unwrap()).unwrap();
+    let hash_after = lf_after["objects"]["hooks"]["validator"]["content_hash"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        hash_after, hash_before,
+        "content_hash must be invariant under key-order canonicalization"
+    );
+}

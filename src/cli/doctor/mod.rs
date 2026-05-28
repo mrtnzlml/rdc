@@ -8,16 +8,23 @@
 //!    destructive step.
 //! 2. **Slug renames** (offline, automatic): rename local files whose slug no
 //!    longer matches their JSON `name`. Cascade-aware; no decision to make.
-//! 3. **Store-anomaly hooks** (online): hooks with `extension_source:
+//! 3. **Canonical key order** (offline, automatic): rewrite any on-disk
+//!    JSON file whose top-level key order has drifted from what a fresh
+//!    `rdc sync` would produce. Cosmetic only (`content_hash` is
+//!    invariant under key-order changes), so it never invalidates the
+//!    lockfile. Fixes the legacy case of hooks pulled before
+//!    `HOOK_KEY_ORDER` existed.
+//! 4. **Store-anomaly hooks** (online): hooks with `extension_source:
 //!    "rossum_store"` and `hook_template: null`. Per hook the user picks the
 //!    cure (Convert / Reinstall / Skip).
-//! 4. **Rebuild lockfile** (online, DESTRUCTIVE): re-pull from remote,
+//! 5. **Rebuild lockfile** (online, DESTRUCTIVE): re-pull from remote,
 //!    overwriting local snapshot files. Offered behind a confirm (default
 //!    No) that names how many unpushed changes would be lost. Skipped under
 //!    `--yes` / non-TTY — destruction is never auto-authorized.
 //!
 //! `--check` previews every step without writing or prompting.
 
+pub mod canonicalize_keys;
 pub mod rebuild_lock;
 pub mod rename_slugs;
 pub mod store_anomaly;
@@ -59,13 +66,20 @@ pub async fn run(env: &str, rebuild_lock: bool, check: bool, yes: bool) -> Resul
         log.event(Action::Doctor, "checking slug alignment");
         rename_slugs::run(env, check, /* yes = auto-apply, no per-rename prompt */ true).await?;
 
-        // 3. Store-anomaly hooks — per-hook decision, prompted (unless --yes/non-TTY).
+        // 3. Canonical key order — mechanical, applied automatically.
+        //    Hash-invariant, so it can run independently of the lockfile
+        //    state (we still gate on lockfile presence for ordering with
+        //    the other "read the lockfile, then fix" steps).
+        log.event(Action::Doctor, "checking canonical key order");
+        canonicalize_keys::run(&paths, check, &log)?;
+
+        // 4. Store-anomaly hooks — per-hook decision, prompted (unless --yes/non-TTY).
         log.event(Action::Doctor, "checking store-extension hooks");
         store_anomaly::run(env, check, yes).await?;
     } else {
         log.event(
             Action::Skip,
-            "slug-realign + store-anomaly checks skipped — no lockfile yet (sync first, or rebuild below)",
+            "slug-realign + canonicalize + store-anomaly checks skipped — no lockfile yet (sync first, or rebuild below)",
         );
     }
 
