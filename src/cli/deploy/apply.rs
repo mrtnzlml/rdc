@@ -858,7 +858,9 @@ pub(crate) async fn run(
                 continue;
             }
         let Some(tgt_id) = lookup_tgt_id_w(tgt_lockfile, "engines", tgt_slug, &mut skipped, &progress) else { continue };
-        let path = src_paths.engines_dir().join(format!("{src_slug}.json"));
+        // Engines live at `engines/<slug>/engine.json`, not directly at
+        // `engines/<slug>.json` — same nested-dir layout as workspaces.
+        let path = src_paths.engine_dir(src_slug).join("engine.json");
         let raw = match std::fs::read_to_string(&path) {
             Ok(r) => r,
             Err(e) => { warn(&progress, format!("warning: cannot read src engines/{src_slug}: {e:#}")); skipped += 1; continue; }
