@@ -23,9 +23,9 @@
 
 use crate::api::RossumClient;
 use crate::cli::deploy::create::{
-    create_engine, create_engine_field, create_hook, create_inbox, create_label,
-    create_queue, create_rule, create_schema, create_workspace, locate_queue_dir,
-    CreateCtx,
+    create_email_template, create_engine, create_engine_field, create_hook,
+    create_inbox, create_label, create_queue, create_rule, create_schema,
+    create_workspace, locate_queue_dir, CreateCtx,
 };
 use crate::config::ProjectConfig;
 use crate::log::{Action, Log};
@@ -414,16 +414,7 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
                     create_queue(&mut ctx, slug).await
                 }
                 "inboxes" => create_inbox(&mut ctx, slug).await,
-                "email_templates" => {
-                    // Email templates with unique types are auto-created
-                    // by queue POST; here we only POST any custom
-                    // (non-default) templates the user explicitly added
-                    // in src that the queue auto-create didn't cover.
-                    // The Rossum API rejects POSTing a second template
-                    // with a unique type, so we let those flow to the
-                    // update phase instead.
-                    Ok(())
-                }
+                "email_templates" => create_email_template(&mut ctx, slug).await,
                 "hooks" => {
                     let plan = store_plans.iter().find(|p| p.src_slug == *slug);
                     create_hook(&mut ctx, slug, plan, &mut remote_hooks_cache).await
