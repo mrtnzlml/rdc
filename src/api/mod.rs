@@ -263,6 +263,15 @@ impl RossumClient {
         self.patch_json(&format!("/inboxes/{id}"), inbox, progress).await
     }
 
+    /// Partial-body variant: PATCH with a hand-built `serde_json::Value`.
+    /// Deploy uses this so it can strip per-env fields like `email`
+    /// (auto-assigned at create, immutable in practice; sending the src
+    /// env's value cross-env at best is ignored, at worst rewrites the
+    /// tgt inbox's email). Mirror of [`update_hook_value`].
+    pub async fn update_inbox_value(&self, id: u64, body: &serde_json::Value, progress: ProgressHandle) -> Result<Inbox> {
+        self.patch_json(&format!("/inboxes/{id}"), body, progress).await
+    }
+
     pub async fn update_email_template(&self, id: u64, t: &EmailTemplate, progress: ProgressHandle) -> Result<EmailTemplate> {
         self.patch_json(&format!("/email_templates/{id}"), t, progress).await
     }
