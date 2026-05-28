@@ -54,6 +54,9 @@ pub async fn process(
 
         let bytes = write_workspace(&ws_dir, ws)
             .with_context(|| format!("writing workspace '{}' to disk", ws.name))?;
+        // Mirror the just-written bytes to the base cache so the next
+        // sync's 3-way merge has a current merge base.
+        crate::state::base_cache::write(ctx.paths, &ws_dir.join("workspace.json"), &bytes)?;
         let hash = content_hash(&bytes);
 
         record_object(
