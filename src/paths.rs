@@ -134,6 +134,34 @@ impl Paths {
         self.engine_dir(engine_slug).join("fields")
     }
 
+    /// Find which engine contains the given field by walking
+    /// `engines/<e_slug>/fields/<field_slug>.json` on disk. Returns the
+    /// engine slug of the first match, or `None` if the field file isn't
+    /// found under any engine. Used by deploy's preview and create paths
+    /// to resolve the engine context for a field (the field slug alone
+    /// isn't enough — fields are nested under engines).
+    pub fn engine_slug_for_field(&self, field_slug: &str) -> Option<String> {
+        let dir = self.engines_dir();
+        if !dir.exists() {
+            return None;
+        }
+        for entry in std::fs::read_dir(&dir).ok()? {
+            let Ok(entry) = entry else { continue };
+            if !entry.file_type().ok()?.is_dir() {
+                continue;
+            }
+            let e_slug = entry.file_name().to_string_lossy().into_owned();
+            if self
+                .engine_fields_dir(&e_slug)
+                .join(format!("{field_slug}.json"))
+                .exists()
+            {
+                return Some(e_slug);
+            }
+        }
+        None
+    }
+
     /// `<root>/envs/<env>/workflows/`
     pub fn workflows_dir(&self) -> PathBuf {
         self.env_root().join("workflows")
@@ -405,5 +433,28 @@ mod tests {
             shadow_path_for(Path::new("/"), "dev"),
             PathBuf::from("shadow.dev")
         );
+    }
+
+    #[test]
+    fn engine_slug_for_field_finds_field_by_walking_engines() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = Paths::for_env(dir.path(), "env");
+        let fields_dir = paths.engine_fields_dir("my-engine");
+        std::fs::create_dir_all(&fields_dir).unwrap();
+        std::fs::write(fields_dir.join("item-qty.json"), b"{}").unwrap();
+
+        assert_eq!(
+            paths.engine_slug_for_field("item-qty"),
+            Some("my-engine".to_string()),
+        );
+        assert_eq!(paths.engine_slug_for_field("missing"), None);
+    }
+
+    #[test]
+    fn engine_slug_for_field_returns_none_when_engines_dir_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = Paths::for_env(dir.path(), "env");
+        // engines/ does not exist
+        assert_eq!(paths.engine_slug_for_field("anything"), None);
     }
 }

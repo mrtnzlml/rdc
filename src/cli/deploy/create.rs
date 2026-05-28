@@ -38,7 +38,7 @@ use crate::snapshot::rule::{read_rule_value, serialize_rule, write_rule};
 use crate::snapshot::schema::{read_schema_value, serialize_schema, write_schema_bytes};
 use crate::snapshot::writer::write_atomic;
 use crate::state::{content_hash, hook_combined_hash, rule_combined_hash, schema_combined_hash, Lockfile, ObjectEntry};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -541,6 +541,117 @@ pub async fn create_label(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
         },
     );
     ctx.mapping.labels.insert(slug.to_string(), slug.to_string());
+    Ok(())
+}
+
+pub async fn create_engine(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
+    let path = ctx.src_paths.engine_dir(slug).join("engine.json");
+    let raw: Value = serde_json::from_slice(
+        &std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
+    )
+    .with_context(|| format!("parsing {}", path.display()))?;
+    let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.engine(slug));
+    let body = shape_create_body_no_subs(
+        raw,
+        "engines",
+        overlay_paths,
+        ctx.src_lockfile,
+        ctx.tgt_lockfile,
+        ctx.mapping,
+    );
+    let created = ctx
+        .tgt_client
+        .create_engine(&body, None)
+        .await
+        .with_context(|| format!("POST /engines (creating '{slug}')"))?;
+    let tgt_engine_dir = ctx.tgt_paths.engine_dir(slug);
+    std::fs::create_dir_all(&tgt_engine_dir)
+        .with_context(|| format!("creating {}", tgt_engine_dir.display()))?;
+    let tgt_file = tgt_engine_dir.join("engine.json");
+    let mut bytes =
+        serde_json::to_vec_pretty(&created).context("serializing created engine")?;
+    bytes.push(b'\n');
+    write_atomic(&tgt_file, &bytes)?;
+    ctx.tgt_lockfile.upsert(
+        "engines",
+        slug,
+        ObjectEntry {
+            id: created.id,
+            url: Some(created.url.clone()),
+            modified_at: created.modified_at().map(|s| s.to_string()),
+            content_hash: Some(content_hash(&bytes)),
+            secrets_hash: None,
+        },
+    );
+    ctx.mapping
+        .engines
+        .insert(slug.to_string(), slug.to_string());
+    Ok(())
+}
+
+pub async fn create_engine_field(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
+    // Engine fields live at engines/<engine_slug>/fields/<field_slug>.json.
+    // Resolve the engine slug from the field slug via the path walker.
+    let src_engine_slug = ctx
+        .src_paths
+        .engine_slug_for_field(slug)
+        .ok_or_else(|| anyhow!("engine_field '{slug}' not found under any src engine"))?;
+    let path = ctx
+        .src_paths
+        .engine_fields_dir(&src_engine_slug)
+        .join(format!("{slug}.json"));
+    let raw: Value = serde_json::from_slice(
+        &std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
+    )
+    .with_context(|| format!("parsing {}", path.display()))?;
+    let overlay_paths = ctx
+        .tgt_overlay
+        .as_ref()
+        .and_then(|ov| ov.engine_field(slug));
+    let body = shape_create_body_no_subs(
+        raw,
+        "engine_fields",
+        overlay_paths,
+        ctx.src_lockfile,
+        ctx.tgt_lockfile,
+        ctx.mapping,
+    );
+    let created = ctx
+        .tgt_client
+        .create_engine_field(&body, None)
+        .await
+        .with_context(|| format!("POST /engine_fields (creating '{slug}')"))?;
+    // The tgt engine slug may differ from src (engine slug rename via
+    // mapping); fall back to the src slug for the local file location if
+    // no mapping entry exists.
+    let tgt_engine_slug = ctx
+        .mapping
+        .engines
+        .get(&src_engine_slug)
+        .cloned()
+        .unwrap_or_else(|| src_engine_slug.clone());
+    let tgt_fields_dir = ctx.tgt_paths.engine_fields_dir(&tgt_engine_slug);
+    std::fs::create_dir_all(&tgt_fields_dir)
+        .with_context(|| format!("creating {}", tgt_fields_dir.display()))?;
+    let tgt_file = tgt_fields_dir.join(format!("{slug}.json"));
+    let mut bytes = serde_json::to_vec_pretty(&created)
+        .context("serializing created engine_field")?;
+    bytes.push(b'\n');
+    write_atomic(&tgt_file, &bytes)?;
+    ctx.tgt_lockfile.upsert(
+        "engine_fields",
+        slug,
+        ObjectEntry {
+            id: created.id,
+            url: Some(created.url.clone()),
+            modified_at: created.modified_at().map(|s| s.to_string()),
+            content_hash: Some(content_hash(&bytes)),
+            secrets_hash: None,
+        },
+    );
+    ctx.mapping
+        .engine_fields
+        .insert(slug.to_string(), slug.to_string());
     Ok(())
 }
 
