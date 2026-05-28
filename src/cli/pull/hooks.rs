@@ -148,15 +148,21 @@ pub async fn process(
                 if let Some(code) = &proposed_code {
                     write_hook_code(&ctx.paths.hooks_dir(), &slug, code, ext)
                         .with_context(|| format!("writing hook code for '{}'", hook.name))?;
+                    // Cache the code sidecar so a future 3-way merge
+                    // can compare hook-as-pulled vs hook-as-edited.
+                    let code_disk_path = ctx.paths.hooks_dir().join(format!("{slug}.{ext}"));
+                    crate::state::base_cache::write(ctx.paths, &code_disk_path, code.as_bytes())?;
                 } else if code_path.exists() {
                     std::fs::remove_file(&code_path)
                         .with_context(|| format!("removing stale {}", code_path.display()))?;
+                    crate::state::base_cache::forget(ctx.paths, &code_path)?;
                 }
                 // Always sweep a sidecar with the other extension —
                 // runtime may have just changed, leaving a stale file.
                 if stale_code_path.exists() {
                     std::fs::remove_file(&stale_code_path)
                         .with_context(|| format!("removing stale {}", stale_code_path.display()))?;
+                    crate::state::base_cache::forget(ctx.paths, &stale_code_path)?;
                 }
                 remote_combined_hash
             }

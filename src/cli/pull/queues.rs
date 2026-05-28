@@ -241,8 +241,8 @@ fn write_schema_for_queue(
 
     let schema_recorded = match s_action {
         PullAction::Write => {
-            crate::snapshot::schema::write_schema_bytes(
-                queue_dir, &remote_json_bytes, &remote_formulas,
+            crate::snapshot::schema::write_schema_bytes_with_cache(
+                queue_dir, &remote_json_bytes, &remote_formulas, Some(ctx.paths),
             ).with_context(|| format!("writing schema for queue '{}'", w.q.name))?;
             remote_combined_hash
         }

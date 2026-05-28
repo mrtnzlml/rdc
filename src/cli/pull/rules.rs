@@ -110,9 +110,12 @@ pub async fn process(
                 if let Some(code) = &proposed_code {
                     write_rule_code(&ctx.paths.rules_dir(), &slug, code)
                         .with_context(|| format!("writing rule code for '{}'", r.name))?;
+                    let code_disk_path = ctx.paths.rules_dir().join(format!("{slug}.py"));
+                    crate::state::base_cache::write(ctx.paths, &code_disk_path, code.as_bytes())?;
                 } else if py_path.exists() {
                     std::fs::remove_file(&py_path)
                         .with_context(|| format!("removing stale {}", py_path.display()))?;
+                    crate::state::base_cache::forget(ctx.paths, &py_path)?;
                 }
                 remote_combined_hash
             }

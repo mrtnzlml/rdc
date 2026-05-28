@@ -724,8 +724,10 @@ fn resolve_one_conflict<R: BufRead>(
     };
 
     // Defensive sanity: if the canonical hashes already match, the
-    // classifier was confused (e.g. by a transient catalog reorder).
-    // Treat as Clean — record the matching hash and don't promote.
+    // classifier was confused (e.g. by a transient catalog reorder)
+    // OR both sides made the IDENTICAL change. Treat as Clean — record
+    // the matching hash, refresh the cache so the next merge has the
+    // current base, and don't promote.
     if canonical_local_hash == canonical_remote_hash {
         crate::cli::pull::common::record_object(
             ctx.lockfile,
@@ -736,6 +738,13 @@ fn resolve_one_conflict<R: BufRead>(
             modified_at,
             Some(canonical_local_hash),
         );
+        // Refresh cache from disk so its hash matches the new lockfile.
+        // Without this, a subsequent BothDiverged would fail the
+        // `cache_matches_base` guard and silently skip auto-merge.
+        if matches!(hash_strategy, HashStrategy::Flat)
+            && let Ok(on_disk) = std::fs::read(&local_path) {
+            crate::state::base_cache::write(ctx.paths, &local_path, &on_disk)?;
+        }
         return Ok(());
     }
 
