@@ -186,7 +186,7 @@ version = 1
         .assert().success()
         // Preview pass emits the per-object diff (side legend names the sides).
         .stdout(predicate::str::contains("src after overlay+rewrite"))
-        .stdout(predicate::str::contains("Applied 1 hooks"))
+        .stdout(predicate::str::contains("1 hooks"))
         .stdout(predicate::str::contains("(1 PATCHes)"));
 
     let body = captured.lock().unwrap().clone().expect("PATCH body for hook 401");

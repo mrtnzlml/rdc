@@ -243,6 +243,76 @@ pub(crate) async fn run(
     let mut applied = ApplyCounts::default();
     let mut skipped = 0usize;
 
+    // Workspaces -------------------------------------------------------
+    // First in dependency order; queues/hooks/etc. all reference their
+    // parent workspace. Before this loop existed, src-side workspace
+    // changes (name, autopilot, metadata) silently never reached the
+    // tgt after the workspace's initial POST.
+    for (src_slug, tgt_slug) in &mapping.workspaces {
+        if let Some(sel) = selection
+            && !sel.contains("workspaces", src_slug) {
+                continue;
+            }
+        let Some(tgt_id) = lookup_tgt_id_w(tgt_lockfile, "workspaces", tgt_slug, &mut skipped, &progress) else { continue };
+        let path = src_paths.workspace_dir(src_slug).join("workspace.json");
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(r) => r,
+            Err(e) => { warn(&progress, format!("warning: cannot read src workspaces/{src_slug}: {e:#}")); skipped += 1; continue; }
+        };
+        let mut payload: Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => { warn(&progress, format!("warning: parsing workspaces/{src_slug}: {e:#}")); skipped += 1; continue; }
+        };
+        rewrite_urls(&mut payload, &src_lockfile, tgt_lockfile, &mapping, &mapping.hook_templates);
+        // Overlay has no per-workspace section in the current schema; if
+        // that changes, add the `ov.workspace(tgt_slug)` apply here.
+        // List + find pattern matches engines/engine_fields and is what
+        // existing deploy test mocks expose (`GET /workspaces` list, not
+        // individual id GETs).
+        let remotes = tgt_client.list_workspaces(None).await.context("listing tgt workspaces for drift check")?;
+        let Some(remote_ws) = remotes.iter().find(|w| w.id == tgt_id) else {
+            warn(&progress, format!("warning: workspace id {tgt_id} not found on tgt remote; skipping"));
+            skipped += 1;
+            continue;
+        };
+        let mut remote_bytes = serde_json::to_vec_pretty(remote_ws).context("serializing remote workspace")?;
+        remote_bytes.push(b'\n');
+        // Bytes for the idempotency check — must match what the PATCH body
+        // would be after stripping.
+        let mut payload_bytes = serde_json::to_vec_pretty(&payload)
+            .context("serializing payload workspace")?;
+        payload_bytes.push(b'\n');
+        let (in_sync, remote_hash) =
+            tgt_drift_status(remote_bytes.clone(), None, tgt_lockfile, "workspaces", tgt_slug)?;
+        if !in_sync {
+            match handle_drift(&progress, tgt_lockfile, drift_decisions, &mut drifted, dry_run, "workspaces", tgt_slug, remote_hash)? {
+                DriftHandling::SkipObject => continue,
+                DriftHandling::Patch => {}
+            }
+        }
+        if bytes_equal_after_strip(&payload_bytes, &remote_bytes, "workspaces")? {
+            continue;
+        }
+        if dry_run && diff {
+            print_update_diff_normalized(
+                &format!("workspaces/{tgt_slug}.json"),
+                &payload_bytes,
+                &remote_bytes,
+                "workspaces",
+            )?;
+        }
+        if !dry_run {
+            // Strip server-managed + back-ref fields (id/url/organization/queues)
+            // before PATCH to mirror queues/email_templates/inboxes.
+            let mut patch_body = payload.clone();
+            crate::snapshot::create::strip_for_cross_env_patch(&mut patch_body, "workspaces");
+            tgt_client.patch_value(&format!("/workspaces/{tgt_id}"), &patch_body, None).await
+                .with_context(|| format!("PATCH tgt workspaces/{tgt_id}"))?;
+        }
+        applied.workspaces += 1;
+        if let Some(p) = &progress { p.event(Action::Patch, &format!("workspace/{tgt_slug}")); }
+    }
+
     // Hooks ------------------------------------------------------------
     for (src_slug, tgt_slug) in &mapping.hooks {
         if let Some(sel) = selection
@@ -1036,17 +1106,17 @@ pub(crate) async fn run(
     let suffix = if dry_run { "(dry run, no PATCHes sent)" } else { "PATCHes" };
     let mut summary = if dry_run {
         format!(
-            "{verb} {} hooks, {} rules, {} labels, {} queues, {} schemas, {} inboxes, \
-{} email templates, {} engines, {} engine fields ({} change(s)) from {src} to {tgt} {suffix}",
-            applied.hooks, applied.rules, applied.labels, applied.queues,
+            "{verb} {} workspaces, {} hooks, {} rules, {} labels, {} queues, {} schemas, \
+{} inboxes, {} email templates, {} engines, {} engine fields ({} change(s)) from {src} to {tgt} {suffix}",
+            applied.workspaces, applied.hooks, applied.rules, applied.labels, applied.queues,
             applied.schemas, applied.inboxes, applied.email_templates,
             applied.engines, applied.engine_fields, total,
         )
     } else {
         format!(
-            "Applied {} hooks, {} rules, {} labels, {} queues, {} schemas, {} inboxes, \
-{} email templates, {} engines, {} engine fields ({} PATCHes) from {src} to {tgt}",
-            applied.hooks, applied.rules, applied.labels, applied.queues,
+            "Applied {} workspaces, {} hooks, {} rules, {} labels, {} queues, {} schemas, \
+{} inboxes, {} email templates, {} engines, {} engine fields ({} PATCHes) from {src} to {tgt}",
+            applied.workspaces, applied.hooks, applied.rules, applied.labels, applied.queues,
             applied.schemas, applied.inboxes, applied.email_templates,
             applied.engines, applied.engine_fields, total,
         )
@@ -1106,6 +1176,7 @@ fn print_update_diff_normalized(
 
 #[derive(Default)]
 struct ApplyCounts {
+    workspaces: usize,
     hooks: usize,
     rules: usize,
     labels: usize,
@@ -1118,8 +1189,9 @@ struct ApplyCounts {
 }
 impl ApplyCounts {
     fn total(&self) -> usize {
-        self.hooks + self.rules + self.labels + self.queues + self.schemas
-            + self.inboxes + self.email_templates + self.engines + self.engine_fields
+        self.workspaces + self.hooks + self.rules + self.labels + self.queues
+            + self.schemas + self.inboxes + self.email_templates
+            + self.engines + self.engine_fields
     }
 }
 
