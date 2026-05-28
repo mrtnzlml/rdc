@@ -557,7 +557,7 @@ fn compute_plan(
     tgt_paths: &Paths,
     src_lockfile: &Lockfile,
     _tgt_lockfile: &Lockfile,
-    _mapping: &Mapping,
+    mapping: &Mapping,
     mirror: bool,
     selection: Option<&crate::cli::deploy::selection::Selection>,
 ) -> Result<PlanCounts> {
@@ -575,6 +575,16 @@ fn compute_plan(
         let mut to_create = Vec::new();
         for slug in &src_slugs {
             if !tgt_slugs.contains(slug) {
+                // Skip if this src slug is paired via the deploy mapping.
+                // The mapping ties this src to a (possibly differently
+                // named) tgt object; the update phase in apply.rs
+                // iterates `mapping.<kind>` and PATCHes that pair. Without
+                // this check, slug renames (e.g. `engines` mapping
+                // `3-valve-mtr-duplicate` -> `3-valve-mtr`) plan a phantom
+                // duplicate create alongside the legitimate update.
+                if mapping.lookup_tgt_slug(kind, slug).is_some() {
+                    continue;
+                }
                 to_create.push(slug.clone());
             }
         }
