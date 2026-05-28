@@ -12,7 +12,6 @@ use crate::snapshot::email_template::{read_email_template, write_email_template}
 use crate::snapshot::hook::{read_hook_value, write_hook};
 use crate::snapshot::rule::write_rule;
 use crate::snapshot::schema::{read_schema_value, write_schema_bytes};
-use crate::snapshot::writer::write_atomic;
 use crate::state::{
     content_hash, hook_combined_hash, rule_combined_hash, schema_combined_hash, Lockfile,
     ObjectEntry,
@@ -1357,8 +1356,11 @@ fn upsert_after_write_back(
 }
 
 /// Common path for flat (no-sidecar) kinds: redact, pretty-print, write,
-/// hash with `content_hash`, update lockfile.
+/// hash with `content_hash`, update lockfile. Also mirrors the bytes to
+/// the tgt env's base cache so the next sync on tgt can 3-way-merge
+/// from a current base.
 fn write_back_flat<T: serde::Serialize>(
+    tgt_paths: &Paths,
     tgt_lockfile: &mut Lockfile,
     kind: &str,
     slug: &str,
@@ -1374,7 +1376,7 @@ fn write_back_flat<T: serde::Serialize>(
     let mut bytes = serde_json::to_vec_pretty(&value)
         .with_context(|| format!("encoding {kind}/{slug} write-back bytes"))?;
     bytes.push(b'\n');
-    write_atomic(file_path, &bytes)?;
+    crate::state::base_cache::write_disk_and_cache(tgt_paths, file_path, &bytes)?;
     upsert_after_write_back(
         tgt_lockfile, kind, slug, id, url, modified_at, content_hash(&bytes),
     );
@@ -1390,7 +1392,7 @@ fn write_back_workspace(
     let dir = tgt_paths.workspace_dir(slug);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     write_back_flat(
-        tgt_lockfile, "workspaces", slug, &dir.join("workspace.json"),
+        tgt_paths, tgt_lockfile, "workspaces", slug, &dir.join("workspace.json"),
         response, response.id, &response.url, response.modified_at(),
     )
 }
@@ -1404,7 +1406,7 @@ fn write_back_label(
     let dir = tgt_paths.labels_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     write_back_flat(
-        tgt_lockfile, "labels", slug, &dir.join(format!("{slug}.json")),
+        tgt_paths, tgt_lockfile, "labels", slug, &dir.join(format!("{slug}.json")),
         response, response.id, &response.url, response.modified_at(),
     )
 }
@@ -1419,7 +1421,7 @@ fn write_back_queue(
         .ok_or_else(|| anyhow!("tgt queue dir for '{q_slug}' not found for write-back"))?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     write_back_flat(
-        tgt_lockfile, "queues", q_slug, &dir.join("queue.json"),
+        tgt_paths, tgt_lockfile, "queues", q_slug, &dir.join("queue.json"),
         response, response.id, &response.url, response.modified_at(),
     )
 }
@@ -1434,7 +1436,7 @@ fn write_back_inbox(
         .ok_or_else(|| anyhow!("tgt queue dir for inbox '{q_slug}' not found for write-back"))?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     write_back_flat(
-        tgt_lockfile, "inboxes", q_slug, &dir.join("inbox.json"),
+        tgt_paths, tgt_lockfile, "inboxes", q_slug, &dir.join("inbox.json"),
         response, response.id, &response.url, response.modified_at(),
     )
 }
@@ -1448,7 +1450,7 @@ fn write_back_engine(
     let dir = tgt_paths.engine_dir(slug);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     write_back_flat(
-        tgt_lockfile, "engines", slug, &dir.join("engine.json"),
+        tgt_paths, tgt_lockfile, "engines", slug, &dir.join("engine.json"),
         response, response.id, &response.url, response.modified_at(),
     )
 }
@@ -1470,7 +1472,7 @@ fn write_back_engine_field(
     let dir = tgt_paths.engine_fields_dir(engine_slug);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     write_back_flat(
-        tgt_lockfile, "engine_fields", composite_key, &dir.join(format!("{field_slug}.json")),
+        tgt_paths, tgt_lockfile, "engine_fields", composite_key, &dir.join(format!("{field_slug}.json")),
         response, response.id, &response.url, response.modified_at(),
     )
 }

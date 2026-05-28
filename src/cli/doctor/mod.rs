@@ -73,7 +73,29 @@ pub async fn run(env: &str, rebuild_lock: bool, check: bool, yes: bool) -> Resul
         log.event(Action::Doctor, "checking canonical key order");
         canonicalize_keys::run(&paths, check, &log)?;
 
-        // 4. Store-anomaly hooks — per-hook decision, prompted (unless --yes/non-TTY).
+        // 4. Base-cache GC — drop `.rdc/state/<env>.base/` files whose
+        //    env-tree counterpart no longer exists (deleted object,
+        //    renamed slug after pull, etc.). Best-effort; check-mode
+        //    reports what would be removed without writing.
+        log.event(Action::Doctor, "checking base cache for orphans");
+        if check {
+            log.event(
+                Action::Info,
+                "would prune orphan base cache entries (use without --check to apply)",
+            );
+        } else {
+            let pruned = crate::state::base_cache::prune_orphans(&paths)?;
+            if pruned == 0 {
+                log.event(Action::Info, "base cache: no orphans");
+            } else {
+                log.event(
+                    Action::Done,
+                    &format!("base cache: pruned {pruned} orphan file(s)"),
+                );
+            }
+        }
+
+        // 5. Store-anomaly hooks — per-hook decision, prompted (unless --yes/non-TTY).
         log.event(Action::Doctor, "checking store-extension hooks");
         store_anomaly::run(env, check, yes).await?;
     } else {

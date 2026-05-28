@@ -3843,6 +3843,20 @@ async fn run_hook_conflict_scenario(variant: HookConflictVariant) {
             // We just assert no PATCH (already asserted above).
             let _ = (base_before, base_after);
         }
+        HookConflictVariant::JsonBothEdited
+        | HookConflictVariant::LocalJsonRemoteCode => {
+            // Auto-merge variants: 3-way merge resolves these cleanly.
+            // JsonBothEdited: both sides added a different element to
+            //   `events` (string array → set-merge union). No overlap.
+            // LocalJsonRemoteCode: local edits JSON `events`, remote
+            //   edits sidecar `.py`. Strict sidecar + JSON merge both
+            //   succeed.
+            // Contract: lockfile MAY advance to the merged hash (no
+            // longer pinned); the no-silent-push guarantee (the load-
+            // bearing safety property) still holds via the PATCH=0
+            // assertion above.
+            let _ = (base_before, base_after);
+        }
         _ => {
             assert_eq!(
                 base_before, base_after,
@@ -4136,7 +4150,17 @@ async fn run_rule_conflict_scenario(variant: RuleConflictVariant) {
     let v_after: serde_json::Value = serde_json::from_str(&lf_after).unwrap();
     let base_before = v_before.pointer(&format!("/objects/rules/{slug}/content_hash")).cloned();
     let base_after = v_after.pointer(&format!("/objects/rules/{slug}/content_hash")).cloned();
-    if !matches!(variant, RuleConflictVariant::BothEditedToSameCode) {
+    // Auto-merge resolves LocalJsonRemoteCode (disjoint edits) and may
+    // auto-resolve JsonBothEdited when the edits are set-merge-friendly
+    // (e.g. both add distinct entries to a string array). The strong
+    // contract — "rules endpoint MUST NOT receive mutating requests" —
+    // is asserted above; the lockfile base may advance on auto-merge.
+    if !matches!(
+        variant,
+        RuleConflictVariant::BothEditedToSameCode
+            | RuleConflictVariant::JsonBothEdited
+            | RuleConflictVariant::LocalJsonRemoteCode
+    ) {
         assert_eq!(
             base_before, base_after,
             "variant {variant:?}: lockfile base must remain pinned (before={base_before:?}, after={base_after:?})",
@@ -5206,4 +5230,116 @@ async fn pull_warns_on_anomalous_store_extension() {
         .stderr(predicates::str::contains("broken-store-hook"))
         .stderr(predicates::str::contains("hook_template"))
         .stderr(predicates::str::contains("rdc doctor"));
+}
+
+/// 3-way auto-merge: local changes one field, remote changes a
+/// different field. With a fresh base cache from the previous sync,
+/// the next sync should auto-resolve without any user prompt — and
+/// the merged file must contain BOTH edits.
+#[tokio::test]
+async fn sync_auto_merges_disjoint_label_edits_without_prompting() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // Round 1 mock: initial label body, only matches the first call.
+    let initial_label = serde_json::json!({
+        "id": 81,
+        "url": format!("{}/api/v1/labels/81", server.uri()),
+        "name": "Three Way",
+        "organization": format!("{}/api/v1/organizations/1", server.uri()),
+        "color": "#aabbcc"
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+            "results": [initial_label.clone()]
+        })))
+        .up_to_n_times(1)
+        .with_priority(1) // higher priority than the Round 2 fallback below
+        .mount(&server)
+        .await;
+
+    // Round 2 mock (lower priority, matches after Round 1's `up_to_n_times` is exhausted):
+    // remote rewrites ONLY the `name` field.
+    let mut round2_label = initial_label.clone();
+    round2_label["name"] = serde_json::json!("Three Way (renamed by remote)");
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+            "results": [round2_label]
+        })))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/labels"]).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // First sync — seeds lockfile + base cache from Round 1.
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("first sync");
+
+    // Local edit: change ONLY color. Keep name as initially synced.
+    let label_path = project.path().join("envs/dev/labels/three-way.json");
+    let raw = std::fs::read_to_string(&label_path).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    v["color"] = serde_json::Value::String("#112233".to_string());
+    let local_edited = format!("{}\n", serde_json::to_string_pretty(&v).unwrap());
+    std::fs::write(&label_path, &local_edited).unwrap();
+
+    // Second sync — local changed `color`, remote (Round 2 mock now
+    // serving) changed `name`. The 3-way merge should accept both
+    // since they're disjoint.
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("second sync auto-merges");
+
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    let merged_raw = std::fs::read_to_string(&label_path).unwrap();
+    let merged: serde_json::Value = serde_json::from_str(&merged_raw).unwrap();
+    assert_eq!(
+        merged["color"], "#112233",
+        "merged file must keep the local color edit: {merged_raw}"
+    );
+    assert_eq!(
+        merged["name"], "Three Way (renamed by remote)",
+        "merged file must include the remote name change: {merged_raw}"
+    );
+
+    // No PATCH happened — auto-merge writes locally only.
+    let patch_calls = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.method == http::Method::PATCH)
+        .count();
+    assert_eq!(
+        patch_calls, 0,
+        "auto-merge must not push; expected 0 PATCH calls, saw {patch_calls}"
+    );
 }

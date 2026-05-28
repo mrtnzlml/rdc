@@ -60,6 +60,18 @@ impl Paths {
         self.root.join("envs").join(&self.env)
     }
 
+    /// `<root>/.rdc/state/<env>.base/`. Mirrors the env tree one-to-one
+    /// and stores the last-synced bytes of every tracked file (JSON +
+    /// `.py` / `.js` / formula sidecars). Used by sync's 3-way merge
+    /// to recover the merge base when local and remote both diverged.
+    /// See `state::base_cache` for the read / write / GC helpers.
+    pub fn base_cache_root(&self) -> PathBuf {
+        self.root
+            .join(".rdc")
+            .join("state")
+            .join(format!("{}.base", self.env))
+    }
+
     /// `<root>/envs/<env>/organization.json`
     pub fn organization_file(&self) -> PathBuf {
         self.env_root().join("organization.json")
