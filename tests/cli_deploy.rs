@@ -184,8 +184,11 @@ version = 1
         .current_dir(project.path())
         .args(["deploy", "test", "prod", "--yes"])
         .assert().success()
-        // Preview pass emits the per-object diff (side legend names the sides).
-        .stdout(predicate::str::contains("src after overlay+rewrite"))
+        // Preview pass emits the per-object diff with a `- tgt before / + tgt
+        // after` legend so the reader sees the tgt state delta directly,
+        // instead of an apples-to-oranges src-vs-tgt comparison.
+        .stdout(predicate::str::contains("tgt before"))
+        .stdout(predicate::str::contains("tgt after"))
         .stdout(predicate::str::contains("1 hooks"))
         .stdout(predicate::str::contains("(1 PATCHes)"));
 

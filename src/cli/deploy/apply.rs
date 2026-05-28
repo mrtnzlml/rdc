@@ -1148,27 +1148,36 @@ pub(crate) async fn run(
     Ok(ApplyOutcome { summary, drifted })
 }
 
-/// Emit a `--- src / +++ tgt remote` unified diff for one update.
+/// Emit a `--- tgt before / +++ tgt after` unified diff for one update.
 /// Skipped silently when bytes are equal (matches `print_unified`).
+///
+/// Frames the delta as the tgt's own before/after state — `-` rows are what
+/// tgt currently has, `+` rows are what tgt will have post-PATCH — rather
+/// than a cross-env comparison. The "after" side is the normalised src
+/// payload (which is exactly what the PATCH writes for the visible field
+/// set; server-only fields are stripped from both sides by
+/// [`normalize_for_cross_env_compare`], so the displayed delta is precisely
+/// what the PATCH would change on tgt).
 ///
 /// Used for non-JSON sidecars (hook `.py` / `.js`, rule `.py`, schema
 /// formulas) where there's nothing to normalise — the rendered diff is
 /// the raw byte delta. JSON updates use [`print_update_diff_normalized`]
 /// so server-only fields and key-order jitter don't pollute the view.
 fn print_update_diff(label: &str, src: &[u8], tgt_remote: &[u8]) {
-    let l = String::from_utf8_lossy(src);
-    let r = String::from_utf8_lossy(tgt_remote);
+    let before = String::from_utf8_lossy(tgt_remote);
+    let after = String::from_utf8_lossy(src);
     crate::cli::resolve::print_unified(
-        &format!("{label} (src after overlay+rewrite)"),
-        &format!("{label} (tgt remote)"),
-        &l,
-        &r,
+        &format!("{label} (tgt before)"),
+        &format!("{label} (tgt after)"),
+        &before,
+        &after,
         &mut 0,
     );
 }
 
-/// Emit a `--- src / +++ tgt remote` unified diff for one JSON update,
-/// piping both sides through [`normalize_for_cross_env_compare`] first.
+/// Emit a `--- tgt before / +++ tgt after` unified diff for one JSON
+/// update, piping both sides through [`normalize_for_cross_env_compare`]
+/// first.
 ///
 /// Why: the idempotency check (`bytes_equal_after_strip`) compares
 /// normalised bytes — server-only fields (`id`, `url`, `organization`,
