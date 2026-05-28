@@ -1252,7 +1252,7 @@ fn locate_engine_field_path(paths: &Paths, field_slug: &str) -> Option<PathBuf> 
     None
 }
 
-fn split_template_key(key: &str) -> Option<(&str, &str, &str)> {
+pub(crate) fn split_template_key(key: &str) -> Option<(&str, &str, &str)> {
     let mut parts = key.splitn(3, '/');
     let ws = parts.next()?;
     let q = parts.next()?;
