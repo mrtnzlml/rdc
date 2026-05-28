@@ -1460,8 +1460,8 @@ const SGR_J_NUM: &str = "\x1b[38;2;229;181;103m"; // JSON numbers
 const SGR_J_KW: &str = "\x1b[38;2;198;146;233m"; // true / false / null
 
 /// Render a styled diff for inline display — the single renderer behind every
-/// user-facing diff (`rdc diff`, dry-run/deploy previews, and the conflict
-/// resolver), so they all share one look.
+/// user-facing diff (dry-run/deploy previews and the conflict resolver), so
+/// they all share one look.
 ///
 /// Layout: a `Verb(path)` header, an `Added N / removed M` summary, then
 /// line-numbered hunks (3 lines of context) with gray gutters, red/green row
@@ -1856,6 +1856,49 @@ pub fn colorize_dim(text: &str, mode: ColorMode) -> String {
         return text.to_string();
     }
     format!("{SGR_DIM}{text}{SGR_RESET}")
+}
+
+/// Print a styled diff (3-line context) of two text blobs. The `*_label`
+/// args supply the header path; the `-`/`+` sides are left/right. If the
+/// inputs are byte-equal, prints nothing and leaves `counter` untouched —
+/// callers can pass a no-op counter (`&mut 0`) when they only care about
+/// the side effect. Rendering goes through [`render_styled_diff`], the one
+/// renderer shared by the dry-run/deploy previews and the conflict resolver,
+/// so every diff looks the same: a `Verb(path)` header, an `Added N /
+/// removed M` summary, and line-numbered hunks with red/green row
+/// backgrounds + JSON syntax highlighting on a TTY (plain otherwise;
+/// respects `NO_COLOR` and `--no-color`).
+pub fn print_unified(
+    left_label: &str,
+    right_label: &str,
+    left: &str,
+    right: &str,
+    counter: &mut usize,
+) {
+    if left == right {
+        return;
+    }
+    let mode = detect_color_mode(false);
+    let rendered = render_styled_diff(left_label, right_label, left, right, mode);
+    if rendered.is_empty() {
+        return;
+    }
+    print!("{rendered}");
+    *counter += 1;
+}
+
+/// Print a "new file" unified diff — the right side is empty so every line
+/// of `body` shows up as a `+` insertion. Used by the dry-run preview when
+/// reporting a would-be POST (no remote counterpart yet).
+pub fn print_new_file_diff(label: &str, body: &str) {
+    print_unified("/dev/null", label, "", body, &mut 0);
+}
+
+/// Mirror of [`print_new_file_diff`] for would-be deletions: every line of
+/// `body` shows up as a `-` removal. Used by `rdc deploy --mirror --dry-run`
+/// previews.
+pub fn print_deleted_file_diff(label: &str, body: &str) {
+    print_unified(label, "/dev/null", body, "", &mut 0);
 }
 
 #[cfg(test)]

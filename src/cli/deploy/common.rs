@@ -23,8 +23,8 @@ use std::collections::BTreeMap;
 /// Without this normalisation, byte-level equality between the src snapshot
 /// and the tgt remote would never hold and `rdc deploy` would re-PATCH on
 /// every run (`README` "Idempotency" claim). The recursive key sort also
-/// keeps `rdc diff <src> <tgt>` quiet when only the API's key emission
-/// order differs — the Rossum API doesn't guarantee stable key order
+/// keeps `rdc deploy --dry-run` previews quiet when only the API's key
+/// emission order differs — the Rossum API doesn't guarantee stable key order
 /// across endpoints, and on-disk files written by different code paths
 /// (`pull` vs the queue-auto-create email-template capture, say) end up
 /// with their `extra` IndexMaps populated in different orders.
@@ -102,8 +102,8 @@ mod normalize_tests {
         // (the Rossum API doesn't guarantee stable key order, and on-disk
         // files written by different code paths end up with different
         // `extra` IndexMap orders). After normalisation they must compare
-        // byte-equal so (a) `rdc diff <src> <tgt>` doesn't show spurious
-        // key-reordering churn, and (b) `bytes_equal_after_strip` doesn't
+        // byte-equal so (a) `rdc deploy --dry-run` previews don't show
+        // spurious key-reordering churn, and (b) `bytes_equal_after_strip` doesn't
         // PATCH on every re-deploy.
         // The `id`/`url`/`organization` differences are stripped by
         // `strip_for_cross_env_patch`; what's left has the same content
@@ -153,7 +153,7 @@ mod normalize_tests {
         // that env's users (not a deployable kind). It always differs across
         // envs and is never meaningful cross-env drift, so cross-env
         // normalization must strip it (like id/url/organization), keeping
-        // `rdc diff <a> <b>` quiet on it.
+        // `rdc deploy --dry-run` previews quiet on it.
         let dev = br#"{
           "id": 1,
           "url": "https://dev.example.app/api/v1/hooks/1",

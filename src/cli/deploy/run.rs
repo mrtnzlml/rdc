@@ -1112,8 +1112,8 @@ fn remove_local_file(paths: &Paths, kind: &str, slug: &str) {
 /// For every would-be create in the plan, build the body the real deploy
 /// would POST (URL-rewritten via the auto-matched mapping, tgt overlay
 /// applied, server-managed fields stripped) and print it as a new-file
-/// unified diff. The output matches `git diff` / `rdc diff` formatting so
-/// it pipes cleanly into a pager or review tool.
+/// unified diff. The output matches `git diff` formatting so it pipes
+/// cleanly into a pager or review tool.
 fn preview_create_bodies(
     plan: &PlanCounts,
     src_paths: &Paths,
@@ -1154,7 +1154,7 @@ fn preview_create_bodies(
             }
             strip_for_create(&mut value, kind);
             let body = serde_json::to_string_pretty(&value)?;
-            crate::cli::diff::print_new_file_diff(
+            crate::cli::resolve::print_new_file_diff(
                 &format!("{kind}/{slug}.json (would create)"),
                 &body,
             );
@@ -1163,7 +1163,7 @@ fn preview_create_bodies(
                     "hooks" | "rules" => "py",
                     _ => "txt",
                 };
-                crate::cli::diff::print_new_file_diff(
+                crate::cli::resolve::print_new_file_diff(
                     &format!("{kind}/{slug}.{ext} (would create)"),
                     &code,
                 );
@@ -1286,7 +1286,7 @@ fn preview_delete_bodies(plan: &PlanCounts, tgt_paths: &Paths) -> Result<()> {
                 }
             };
             let body = String::from_utf8_lossy(&json);
-            crate::cli::diff::print_deleted_file_diff(
+            crate::cli::resolve::print_deleted_file_diff(
                 &format!("{kind}/{slug}.json (would delete)"),
                 &body,
             );
@@ -1295,7 +1295,7 @@ fn preview_delete_bodies(plan: &PlanCounts, tgt_paths: &Paths) -> Result<()> {
                     "hooks" | "rules" => "py",
                     _ => "txt",
                 };
-                crate::cli::diff::print_deleted_file_diff(
+                crate::cli::resolve::print_deleted_file_diff(
                     &format!("{kind}/{slug}.{ext} (would delete)"),
                     &code,
                 );

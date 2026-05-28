@@ -152,7 +152,7 @@ pub async fn preview_tombstone_bodies(
             let label = format!("{kind}/{slug}.json");
             match fetch_remote_body(client, kind, *id).await {
                 Ok(Some(body)) => {
-                    crate::cli::diff::print_deleted_file_diff(&label, &body);
+                    crate::cli::resolve::print_deleted_file_diff(&label, &body);
                 }
                 Ok(None) => {
                     eprintln!("  (already absent on remote: {kind}/{slug})");

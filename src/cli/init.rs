@@ -765,11 +765,10 @@ so the sentinel never reaches the server.
 
 - `rdc sync <env>` — reconcile local snapshot and remote in one pass;
   pulls remote edits + pushes local edits + creates new objects;
-  `--allow-deletes` to also remove remote objects whose local files
-  you've deleted; `--no-push` for read-only audit; `--no-pull` to
-  deploy local edits without overwriting local files
-- `rdc diff <env>` — local-vs-remote diff (no writes)
-- `rdc diff <a> <b>` — diff two local snapshots
+  `--dry-run` previews changes without writing; `--allow-deletes` to
+  also remove remote objects whose local files you've deleted;
+  `--no-push` for read-only audit; `--no-pull` to deploy local edits
+  without overwriting local files
 - `rdc deploy <src> <tgt>` — promote one env to another in one shot
   (POST missing + PATCH deltas, URL rewrites included); `--dry-run`
   previews without writing
