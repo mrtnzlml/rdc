@@ -1263,10 +1263,16 @@ fn locate_queue_dir(paths: &Paths, q_slug: &str) -> Option<PathBuf> {
     None
 }
 
-/// Locate an engine field's on-disk path by walking
-/// `engines/*/fields/<field_slug>.json`. Returns the first match
-/// (engine_fields slugs are globally unique).
-fn locate_engine_field_path(paths: &Paths, field_slug: &str) -> Option<PathBuf> {
+/// Locate an engine field's on-disk path from its composite
+/// `<engine_slug>/<field_slug>` key. Falls back to a global walk for
+/// legacy flat keys (lockfiles written before composite-key migration).
+fn locate_engine_field_path(paths: &Paths, composite_key: &str) -> Option<PathBuf> {
+    if let Some((e_slug, f_slug)) = composite_key.split_once('/') {
+        let candidate = paths.engine_fields_dir(e_slug).join(format!("{f_slug}.json"));
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
     let engines_dir = paths.engines_dir();
     let entries = std::fs::read_dir(&engines_dir).ok()?;
     for e_entry in entries.flatten() {
@@ -1274,7 +1280,9 @@ fn locate_engine_field_path(paths: &Paths, field_slug: &str) -> Option<PathBuf> 
             continue;
         }
         let e_slug = e_entry.file_name().to_string_lossy().to_string();
-        let candidate = paths.engine_fields_dir(&e_slug).join(format!("{field_slug}.json"));
+        let candidate = paths
+            .engine_fields_dir(&e_slug)
+            .join(format!("{composite_key}.json"));
         if candidate.exists() {
             return Some(candidate);
         }
@@ -1448,19 +1456,21 @@ fn write_back_engine(
 fn write_back_engine_field(
     tgt_paths: &Paths,
     tgt_lockfile: &mut Lockfile,
-    slug: &str,
+    composite_key: &str,
     response: &crate::model::EngineField,
 ) -> Result<()> {
-    // Engine fields are nested under their engine on disk; walk to find
-    // the tgt engine that owns this field (the tgt file already exists
-    // because we either created it in an earlier deploy or pulled it).
-    let engine_slug = tgt_paths.engine_slug_for_field(slug).ok_or_else(|| {
-        anyhow!("tgt engine_field '{slug}' not found under any engine for write-back")
+    // `composite_key` is `<engine_slug>/<field_slug>` — the lockfile /
+    // mapping shape. Split it for the on-disk path.
+    let (engine_slug, field_slug) = composite_key.split_once('/').ok_or_else(|| {
+        anyhow!(
+            "tgt engine_field key '{composite_key}' is not <engine>/<field>; \
+             re-run `rdc sync` on the target to migrate the lockfile"
+        )
     })?;
-    let dir = tgt_paths.engine_fields_dir(&engine_slug);
+    let dir = tgt_paths.engine_fields_dir(engine_slug);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     write_back_flat(
-        tgt_lockfile, "engine_fields", slug, &dir.join(format!("{slug}.json")),
+        tgt_lockfile, "engine_fields", composite_key, &dir.join(format!("{field_slug}.json")),
         response, response.id, &response.url, response.modified_at(),
     )
 }

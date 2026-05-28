@@ -1165,8 +1165,127 @@ async fn sync_remote_create_writes_local_workflow_step() {
         "lockfile must record workflow_steps: {lf_raw}"
     );
     assert!(
-        lf_raw.contains("manager-approval"),
-        "lockfile must record step slug: {lf_raw}"
+        lf_raw.contains("\"ap-approval-flow/manager-approval\""),
+        "lockfile must record step under composite `<workflow>/<step>` key: {lf_raw}"
+    );
+}
+
+/// Workflow steps nest under their parent workflow; two workflows can
+/// both carry a step with the same name and keep clean per-workflow
+/// slugs (no `manager-approval-2`). The lockfile keys steps by the
+/// composite `<workflow_slug>/<step_slug>`.
+#[tokio::test]
+async fn sync_pulls_same_named_step_under_two_workflows_with_clean_slugs() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let wf_a_url = format!("{}/api/v1/workflows/701", server.uri());
+    let wf_b_url = format!("{}/api/v1/workflows/702", server.uri());
+    let workflows_body = serde_json::json!({
+        "pagination": { "total": 2, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 701,
+                "url": wf_a_url,
+                "name": "Workflow A",
+                "steps": [format!("{}/api/v1/workflow_steps/11", server.uri())],
+                "modified_at": "2026-04-20T08:00:00Z"
+            },
+            {
+                "id": 702,
+                "url": wf_b_url,
+                "name": "Workflow B",
+                "steps": [format!("{}/api/v1/workflow_steps/12", server.uri())],
+                "modified_at": "2026-04-20T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workflows"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(workflows_body))
+        .mount(&server)
+        .await;
+
+    let steps_body = serde_json::json!({
+        "pagination": { "total": 2, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 11,
+                "url": format!("{}/api/v1/workflow_steps/11", server.uri()),
+                "name": "Approval",
+                "workflow": format!("{}/api/v1/workflows/701", server.uri()),
+                "modified_at": "2026-04-20T08:00:00Z"
+            },
+            {
+                "id": 12,
+                "url": format!("{}/api/v1/workflow_steps/12", server.uri()),
+                "name": "Approval",
+                "workflow": format!("{}/api/v1/workflows/702", server.uri()),
+                "modified_at": "2026-04-20T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workflow_steps"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(steps_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/workflows", "/api/v1/workflow_steps"]).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", false, false, false, false, false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+    result.expect("sync should succeed");
+
+    let a_path = project
+        .path()
+        .join("envs/dev/workflows/workflow-a/steps/approval.json");
+    let b_path = project
+        .path()
+        .join("envs/dev/workflows/workflow-b/steps/approval.json");
+    assert!(a_path.exists(), "workflow A step should be at {}", a_path.display());
+    assert!(
+        b_path.exists(),
+        "workflow B step should be at {} — globally-unique slugging would have put it at approval-2.json",
+        b_path.display()
+    );
+
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    assert!(
+        lf_raw.contains("\"workflow-a/approval\""),
+        "lockfile must record under composite `workflow-a/approval`: {lf_raw}"
+    );
+    assert!(
+        lf_raw.contains("\"workflow-b/approval\""),
+        "lockfile must record under composite `workflow-b/approval`: {lf_raw}"
+    );
+    assert!(
+        !lf_raw.contains("\"approval-2\""),
+        "lockfile must NOT auto-suffix workflow_step slugs: {lf_raw}"
     );
 }
 
@@ -1570,8 +1689,137 @@ async fn sync_remote_create_writes_local_engine_field() {
         "lockfile must record engine_fields: {lf_raw}"
     );
     assert!(
-        lf_raw.contains("invoice-number"),
-        "lockfile must record field slug: {lf_raw}"
+        lf_raw.contains("\"invoice-engine/invoice-number\""),
+        "lockfile must record field under composite `<engine>/<field>` key: {lf_raw}"
+    );
+}
+
+/// Engine fields nest under their parent engine, so two engines having a
+/// field with the same name must each get a clean per-engine slug — not
+/// `amount` + `amount-2`. The lockfile keys engine_fields by the composite
+/// `<engine_slug>/<field_slug>` (mirroring email_templates' per-queue
+/// scoping) so two `amount`s coexist.
+#[tokio::test]
+async fn sync_pulls_same_named_field_under_two_engines_with_clean_slugs() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let engine_a_url = format!("{}/api/v1/engines/401", server.uri());
+    let engine_b_url = format!("{}/api/v1/engines/402", server.uri());
+    let engines_body = serde_json::json!({
+        "pagination": { "total": 2, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 401,
+                "url": engine_a_url,
+                "name": "Engine A",
+                "type": "extractor",
+                "modified_at": "2026-04-20T08:00:00Z"
+            },
+            {
+                "id": 402,
+                "url": engine_b_url,
+                "name": "Engine B",
+                "type": "extractor",
+                "modified_at": "2026-04-20T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/engines"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(engines_body))
+        .mount(&server)
+        .await;
+
+    let fields_body = serde_json::json!({
+        "pagination": { "total": 2, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 501,
+                "url": format!("{}/api/v1/engine_fields/501", server.uri()),
+                "name": "Amount",
+                "engine": format!("{}/api/v1/engines/401", server.uri()),
+                "field_type": "number",
+                "modified_at": "2026-04-20T08:00:00Z"
+            },
+            {
+                "id": 502,
+                "url": format!("{}/api/v1/engine_fields/502", server.uri()),
+                "name": "Amount",
+                "engine": format!("{}/api/v1/engines/402", server.uri()),
+                "field_type": "number",
+                "modified_at": "2026-04-20T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/engine_fields"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fields_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/engines", "/api/v1/engine_fields"]).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* allow_deletes = */ false,
+        /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+    result.expect("sync should succeed");
+
+    let a_path = project
+        .path()
+        .join("envs/dev/engines/engine-a/fields/amount.json");
+    let b_path = project
+        .path()
+        .join("envs/dev/engines/engine-b/fields/amount.json");
+    assert!(
+        a_path.exists(),
+        "engine A field should be at {}",
+        a_path.display()
+    );
+    assert!(
+        b_path.exists(),
+        "engine B field should be at {} — globally-unique slugging would have put it at amount-2.json",
+        b_path.display()
+    );
+
+    // Lockfile uses composite `<engine>/<field>` keys so both fields coexist.
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    assert!(
+        lf_raw.contains("\"engine-a/amount\""),
+        "lockfile must record engine_fields under composite `engine-a/amount` key: {lf_raw}"
+    );
+    assert!(
+        lf_raw.contains("\"engine-b/amount\""),
+        "lockfile must record engine_fields under composite `engine-b/amount` key: {lf_raw}"
+    );
+    assert!(
+        !lf_raw.contains("\"amount-2\""),
+        "lockfile must NOT auto-suffix engine_field slugs: {lf_raw}"
     );
 }
 
