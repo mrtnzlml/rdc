@@ -1164,7 +1164,7 @@ fn preview_create_bodies(
                     continue;
                 }
             };
-            rewrite_urls(&mut value, src_lockfile, tgt_lockfile, mapping, &std::collections::BTreeMap::new());
+            rewrite_urls(&mut value, src_lockfile, tgt_lockfile, mapping, &mapping.hook_templates);
             if let Some(overlay_paths) = overlay_for(kind, slug, tgt_overlay) {
                 apply_overrides(&mut value, overlay_paths);
             }
