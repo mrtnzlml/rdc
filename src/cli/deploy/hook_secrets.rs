@@ -191,20 +191,33 @@ pub fn format_missing_keys_message(
 /// local K/V map. Returns either the filtered K/V to inject OR the
 /// sorted list of keys missing from target. Used by [`precheck`] for
 /// real deploys and by unit tests to lock the contract.
+///
+/// A value equal to [`crate::secrets::UNFILLED_SENTINEL`] is treated as
+/// "key present but not yet filled in" — the precheck refuses the
+/// deploy, the filtered injection map excludes it, so the sentinel
+/// never reaches the Rossum API. Other string values (including `""`
+/// and `null` once we add that support) are deliberate user settings.
 pub fn diff_for_slug(
     required: &[String],
     tgt_kv: &BTreeMap<String, String>,
 ) -> SlugDiff {
+    use crate::secrets::UNFILLED_SENTINEL;
+
     let required_set: BTreeSet<&str> = required.iter().map(String::as_str).collect();
-    let tgt_set: BTreeSet<&str> = tgt_kv.keys().map(String::as_str).collect();
+    let filled_set: BTreeSet<&str> = tgt_kv
+        .iter()
+        .filter(|(_, v)| v.as_str() != UNFILLED_SENTINEL)
+        .map(|(k, _)| k.as_str())
+        .collect();
+    let all_keys_set: BTreeSet<&str> = tgt_kv.keys().map(String::as_str).collect();
 
     let mut missing: Vec<String> = required_set
-        .difference(&tgt_set)
+        .difference(&filled_set)
         .map(|s| (*s).to_string())
         .collect();
     missing.sort();
 
-    let mut extras: Vec<String> = tgt_set
+    let mut extras: Vec<String> = all_keys_set
         .difference(&required_set)
         .map(|s| (*s).to_string())
         .collect();
@@ -212,7 +225,12 @@ pub fn diff_for_slug(
 
     let filtered: BTreeMap<String, String> = required
         .iter()
-        .filter_map(|k| tgt_kv.get(k).map(|v| (k.clone(), v.clone())))
+        .filter_map(|k| {
+            tgt_kv
+                .get(k)
+                .filter(|v| v.as_str() != UNFILLED_SENTINEL)
+                .map(|v| (k.clone(), v.clone()))
+        })
         .collect();
 
     SlugDiff { missing, extras, filtered }
@@ -268,6 +286,52 @@ mod tests {
             kv(&[("a", "1")]),
             "filtered map must contain only keys required by src"
         );
+    }
+
+    #[test]
+    fn diff_sentinel_value_counts_as_missing_not_filled() {
+        // The bug this regression catches: the pre-populated template
+        // used to write `""` for unfilled keys, then the precheck saw
+        // the key as "present" and let the second run pass. Now the
+        // template writes `UNFILLED_SENTINEL`, which `diff_for_slug`
+        // must treat the same as a missing key.
+        let d = diff_for_slug(
+            &["password".into(), "type".into()],
+            &kv(&[
+                ("password", crate::secrets::UNFILLED_SENTINEL),
+                ("type", crate::secrets::UNFILLED_SENTINEL),
+            ]),
+        );
+        assert_eq!(d.missing, vec!["password".to_string(), "type".to_string()]);
+        assert!(
+            d.filtered.is_empty(),
+            "sentinel-valued keys must never reach the injection map"
+        );
+    }
+
+    #[test]
+    fn diff_mixed_sentinel_and_filled_only_missing_for_sentinel() {
+        let d = diff_for_slug(
+            &["password".into(), "type".into()],
+            &kv(&[
+                ("password", "real-value"),
+                ("type", crate::secrets::UNFILLED_SENTINEL),
+            ]),
+        );
+        assert_eq!(d.missing, vec!["type".to_string()]);
+        assert_eq!(d.filtered, kv(&[("password", "real-value")]));
+    }
+
+    #[test]
+    fn diff_empty_string_value_counts_as_filled() {
+        // Deliberate empty string is a user value (rare but allowed);
+        // only the sentinel is treated as unfilled.
+        let d = diff_for_slug(
+            &["password".into()],
+            &kv(&[("password", "")]),
+        );
+        assert!(d.missing.is_empty());
+        assert_eq!(d.filtered, kv(&[("password", "")]));
     }
 
     #[test]
