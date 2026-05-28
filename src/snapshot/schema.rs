@@ -44,8 +44,8 @@ pub fn write_schema_bytes_with_cache(
     if let Some(p) = paths {
         crate::state::base_cache::write(p, &json_path, json_bytes)?;
     }
+    let formulas_dir = queue_dir.join("formulas");
     if !formulas.is_empty() {
-        let formulas_dir = queue_dir.join("formulas");
         std::fs::create_dir_all(&formulas_dir)
             .with_context(|| format!("creating {}", formulas_dir.display()))?;
         for (field_id, code) in formulas {
@@ -54,6 +54,31 @@ pub fn write_schema_bytes_with_cache(
             write_atomic(&py_path, code)?;
             if let Some(p) = paths {
                 crate::state::base_cache::write(p, &py_path, code)?;
+            }
+        }
+    }
+    // Sweep orphan formula sidecars — `.py` files in `formulas/` whose
+    // datapoint was removed from the schema (e.g. user deleted the
+    // field in the Rossum UI). Without this, the on-disk env diverges
+    // from a fresh pull, the next push would try to send a
+    // `combined_hash` that doesn't match the lockfile, and the user
+    // sees stale `.py` files in their git tree forever.
+    if formulas_dir.exists() {
+        let kept: std::collections::BTreeSet<&str> =
+            formulas.iter().map(|(id, _)| id.as_str()).collect();
+        let entries = std::fs::read_dir(&formulas_dir)
+            .with_context(|| format!("reading {}", formulas_dir.display()))?;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(id) = name.strip_suffix(".py") else { continue };
+            if kept.contains(id) {
+                continue;
+            }
+            let path = entry.path();
+            std::fs::remove_file(&path)
+                .with_context(|| format!("removing orphan formula {}", path.display()))?;
+            if let Some(p) = paths {
+                crate::state::base_cache::forget(p, &path)?;
             }
         }
     }
@@ -360,6 +385,37 @@ mod tests {
         write_schema(&dir.path().join("q"), &original).unwrap();
         let read = read_schema(&dir.path().join("q")).unwrap();
         assert_eq!(original, read);
+    }
+
+    #[test]
+    fn write_schema_bytes_sweeps_orphan_formula_sidecars() {
+        // When a user removes a formula datapoint from the Rossum
+        // schema (e.g. via the UI), the next `rdc sync` should drop
+        // the stale `.py` sidecar from the env tree. Without the
+        // sweep, the file lingers forever, polluting `git status`
+        // and shifting the lockfile combined hash on the next push.
+        let dir = TempDir::new().unwrap();
+        let queue_dir = dir.path().join("q");
+        std::fs::create_dir_all(queue_dir.join("formulas")).unwrap();
+        // Seed an orphan sidecar from an earlier pull.
+        std::fs::write(queue_dir.join("formulas/orphan.py"), b"1+1").unwrap();
+        std::fs::write(queue_dir.join("formulas/kept.py"), b"old").unwrap();
+
+        // Re-write the schema with only one formula. `orphan.py`
+        // should be deleted; `kept.py` should be refreshed.
+        let json = br#"{"id": 1, "url": "u", "name": "n", "queues": [], "content": []}"#;
+        let formulas = vec![("kept".to_string(), b"new".to_vec())];
+        write_schema_bytes(&queue_dir, json, &formulas).unwrap();
+
+        assert!(
+            !queue_dir.join("formulas/orphan.py").exists(),
+            "orphan formula should have been swept"
+        );
+        assert_eq!(
+            std::fs::read(queue_dir.join("formulas/kept.py")).unwrap(),
+            b"new",
+            "kept formula should have been refreshed"
+        );
     }
 
     #[test]
