@@ -430,10 +430,21 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
                 "rules" => create_rule(&mut ctx, slug).await,
                 "labels" => create_label(&mut ctx, slug).await,
                 "engines" | "engine_fields" => {
-                    // Engines/engine_fields creation isn't exercised in
-                    // current orgs and may 403; fall through silently
-                    // to the update phase (which already has 405/403
-                    // handling).
+                    // Engines/engine_fields creation isn't implemented in
+                    // rdc yet (the API supports POST, but the
+                    // lockfile/mapping recording for these kinds isn't
+                    // wired up). Warn loudly so the user knows the object
+                    // was NOT created, then skip the post-event +
+                    // bookkeeping below via `continue` after the match.
+                    if let Some(p) = &progress {
+                        p.event(
+                            Action::Warn,
+                            &format!(
+                                "{singular}/{slug}: create not implemented; \
+                                 skipping (will NOT be created on tgt)"
+                            ),
+                        );
+                    }
                     Ok(())
                 }
                 _ => Ok(()),
@@ -443,7 +454,7 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
             // self-report.
             if result.is_ok() {
                 match *kind {
-                    "workspaces" | "hooks" | "rules" | "labels" | "engines" | "engine_fields" => {
+                    "workspaces" | "hooks" | "rules" | "labels" => {
                         if let Some(p) = &progress {
                             p.event(Action::Post, &format!("{singular}/{slug}"));
                         }
@@ -454,6 +465,13 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
             if let Err(e) = result {
                 create_err = Some(e);
                 break 'outer;
+            }
+            // Engines/engine_fields creation is a no-op for now; skip the
+            // lockfile save + counter increments below so the deploy
+            // summary doesn't claim a create that didn't happen. The
+            // warning above already told the user.
+            if matches!(*kind, "engines" | "engine_fields") {
+                continue;
             }
             // Flush after each successful create so a later failure
             // can be resumed by re-running `rdc deploy` (the resume
@@ -1129,6 +1147,17 @@ fn preview_create_bodies(
     for kind in KINDS_IN_DEP_ORDER {
         let Some(slugs) = plan.creates.get(kind) else { continue };
         for slug in slugs {
+            // engines/engine_fields create is not implemented yet — flag
+            // it here so the dry-run body preview isn't read as a promise
+            // of an actual POST on real deploy. See the matching
+            // skip-with-warning in the apply loop above.
+            if matches!(*kind, "engines" | "engine_fields") {
+                eprintln!(
+                    "warning: {kind}/{slug}: create not implemented; \
+                     the body below is informational only \
+                     \u{2014} it will NOT be POSTed on real deploy"
+                );
+            }
             // For each kind, work out the on-disk path of the src file +
             // (when the kind is hooks/rules/schemas) the extracted code
             // sidecar that ships alongside the JSON.
@@ -1216,14 +1245,42 @@ fn read_src_for_preview(
             };
             Ok((std::fs::read(&json_p)?, py))
         }
-        "labels" | "engines" | "engine_fields" => {
-            let dir = match kind {
-                "labels" => src_paths.labels_dir(),
-                "engines" => src_paths.engines_dir(),
-                _ => src_paths.engines_dir(),
-            };
-            let p = dir.join(format!("{slug}.json"));
+        "labels" => {
+            let p = src_paths.labels_dir().join(format!("{slug}.json"));
             Ok((std::fs::read(&p)?, None))
+        }
+        "engines" => {
+            let p = src_paths.engine_dir(slug).join("engine.json");
+            Ok((std::fs::read(&p)?, None))
+        }
+        "engine_fields" => {
+            // Engine fields live at engines/<engine_slug>/fields/<field_slug>.json.
+            // The preview function only has the field slug, so walk the engines
+            // directory to find the engine that contains this field.
+            let engines_dir = src_paths.engines_dir();
+            if !engines_dir.exists() {
+                return Err(anyhow!(
+                    "no engines directory at {}",
+                    engines_dir.display()
+                ));
+            }
+            for entry in std::fs::read_dir(&engines_dir)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let e_slug = entry.file_name().to_string_lossy().into_owned();
+                let p = src_paths
+                    .engine_fields_dir(&e_slug)
+                    .join(format!("{slug}.json"));
+                if p.exists() {
+                    return Ok((std::fs::read(&p)?, None));
+                }
+            }
+            Err(anyhow!(
+                "engine_field '{slug}' not found under any engine in {}",
+                engines_dir.display()
+            ))
         }
         "queues" | "schemas" | "inboxes" => {
             let q_dir = crate::cli::deploy::create::locate_queue_dir(src_paths, slug)
@@ -1484,5 +1541,40 @@ mod tests {
         assert!(msg.contains("queues/cost-invoices"), "msg: {msg}");
         assert!(msg.contains("--force-overwrite-drift"), "msg: {msg}");
         assert!(msg.contains("rdc sync prod"), "msg: {msg}");
+    }
+
+    #[test]
+    fn read_src_for_preview_engine_field_finds_file_via_engine_walk() {
+        // Engine fields live at `engines/<engine_slug>/fields/<field_slug>.json`.
+        // The preview function takes only `kind` + `slug` (no engine context),
+        // so it must walk the engines tree to locate the field.
+        let dir = TempDir::new().unwrap();
+        let paths = Paths::for_env(dir.path(), "env");
+        let fields_dir = paths.engine_fields_dir("my-engine");
+        std::fs::create_dir_all(&fields_dir).unwrap();
+        let body = br#"{"name":"item_qty","type":"string"}"#;
+        std::fs::write(fields_dir.join("item-qty.json"), body).unwrap();
+
+        let (bytes, code) =
+            read_src_for_preview("engine_fields", "item-qty", &paths).unwrap();
+        assert_eq!(bytes, body);
+        assert!(code.is_none());
+    }
+
+    #[test]
+    fn read_src_for_preview_engine_finds_engine_json() {
+        // Engines live at `engines/<engine_slug>/engine.json`, not
+        // `engines/<engine_slug>.json`.
+        let dir = TempDir::new().unwrap();
+        let paths = Paths::for_env(dir.path(), "env");
+        let engine_dir = paths.engine_dir("my-engine");
+        std::fs::create_dir_all(&engine_dir).unwrap();
+        let body = br#"{"name":"my engine","type":"line_item"}"#;
+        std::fs::write(engine_dir.join("engine.json"), body).unwrap();
+
+        let (bytes, code) =
+            read_src_for_preview("engines", "my-engine", &paths).unwrap();
+        assert_eq!(bytes, body);
+        assert!(code.is_none());
     }
 }
