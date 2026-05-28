@@ -992,7 +992,17 @@ pub(crate) async fn run(
             applied.engine_fields += 1;
             if let Some(p) = &progress { p.event(Action::Patch, &format!("engine_field/{tgt_slug}")); }
         } else {
-            match tgt_client.update_engine_field(tgt_id, &payload_field, None).await
+            // Engine field `name` is immutable on the Rossum API (a PATCH
+            // that changes it returns 400). Build the PATCH body from the
+            // typed payload, then strip `name` so a slug mapping that
+            // pairs differently-named fields (e.g. `item-qty` paired with
+            // `item-quantity`) can still PATCH the other attributes.
+            let mut patch_body = serde_json::to_value(&payload_field)
+                .context("serializing payload engine_field for PATCH")?;
+            if let Some(obj) = patch_body.as_object_mut() {
+                obj.remove("name");
+            }
+            match tgt_client.update_engine_field_value(tgt_id, &patch_body, None).await
                 .with_context(|| format!("PATCH tgt engine_fields/{tgt_id}"))
             {
                 Ok(_) => {
