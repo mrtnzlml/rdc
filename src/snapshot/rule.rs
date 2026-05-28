@@ -34,7 +34,7 @@ pub fn write_rule(dir: &Path, slug: &str, r: &Rule) -> Result<Vec<u8>> {
 }
 
 /// Remove a string `trigger_condition` from a serialized rule Value and
-/// return it for the sidecar. Shared by `serialize_rule`/`serialize_rule_raw`.
+/// return it for the sidecar.
 fn split_rule_trigger_condition(json_value: &mut Value) -> Option<String> {
     if matches!(json_value.get("trigger_condition"), Some(Value::String(_))) {
         json_value
@@ -61,18 +61,6 @@ pub fn serialize_rule(r: &Rule) -> Result<(Vec<u8>, Option<String>)> {
 
     crate::snapshot::key_order::strip_hidden_fields_recursive(&mut json_value);
 
-    let mut bytes = serde_json::to_vec_pretty(&json_value).context("serializing rule json")?;
-    bytes.push(b'\n');
-    Ok((bytes, code))
-}
-
-/// Like [`serialize_rule`] but for `rdc diff --raw`: splits
-/// `trigger_condition` to the sidecar and tidies, without stripping
-/// server-managed fields.
-pub fn serialize_rule_raw(r: &Rule) -> Result<(Vec<u8>, Option<String>)> {
-    let mut json_value = serde_json::to_value(r).context("serializing rule to value")?;
-    let code = split_rule_trigger_condition(&mut json_value);
-    crate::snapshot::noise::tidy_raw(&mut json_value);
     let mut bytes = serde_json::to_vec_pretty(&json_value).context("serializing rule json")?;
     bytes.push(b'\n');
     Ok((bytes, code))
@@ -237,19 +225,4 @@ mod tests {
         assert_eq!(rule, read);
     }
 
-    #[test]
-    fn serialize_rule_raw_keeps_modified_at_and_splits_trigger() {
-        let r: Rule = serde_json::from_value(serde_json::json!({
-            "id": 5,
-            "url": "https://x/api/v1/rules/5",
-            "name": "r",
-            "trigger_condition": "field.x > 0",
-            "modified_at": "2026-01-01T00:00:00Z"
-        })).unwrap();
-        let (json, code) = serialize_rule_raw(&r).unwrap();
-        let s = String::from_utf8(json).unwrap();
-        assert!(s.contains("modified_at"));
-        assert!(!s.contains("trigger_condition"));
-        assert_eq!(code.as_deref(), Some("field.x > 0"));
-    }
 }

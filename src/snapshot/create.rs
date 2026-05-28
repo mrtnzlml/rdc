@@ -142,11 +142,10 @@ pub fn strip_for_cross_env_patch(body: &mut Value, kind: &str) {
     // A hook's `token_owner` is a per-env user URL: each env's hooks point at
     // that env's users, which aren't a deployable kind in rdc (no cross-env
     // mapping). It always differs across envs and is never meaningful cross-env
-    // drift, so strip it from cross-env comparisons/diffs — exactly like
+    // drift, so strip it from cross-env comparisons — exactly like
     // `organization`. Deploy still sets the correct target owner explicitly via
     // `store_extension_token_owner` before PATCH (see deploy::apply), which is
-    // independent of this strip; and `rdc diff --raw` skips this path, so it
-    // still surfaces `token_owner` when you want the unadjusted view.
+    // independent of this strip.
     if kind == "hooks" {
         obj.remove("token_owner");
     }
