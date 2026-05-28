@@ -1539,9 +1539,9 @@ pub fn render_styled_diff(
 
     // Side legend (when both labels carry a ` (…)` annotation) so the reader
     // knows what `-` and `+` mean — e.g. `- local  + remote`, or for a deploy
-    // preview `- src after overlay+rewrite  + tgt remote`. The `-`/`+` tokens
-    // are colored bold red/green to mirror the `-`/`+` row colors below, so the
-    // side mapping reads at a glance — do not dim it back.
+    // preview `- tgt before  + tgt after`. The `-`/`+` tokens are colored bold
+    // red/green to mirror the `-`/`+` row colors below, so the side mapping
+    // reads at a glance — do not dim it back.
     if let (Some(la), Some(ra)) = (left_ann, right_ann) {
         let _ = if plain {
             writeln!(out, "  - {la}   + {ra}")
@@ -1625,8 +1625,8 @@ pub fn diff_display_path(a: &str, b: &str) -> String {
 }
 
 /// Extract the ` (…)` annotation a caller appends to a diff side label
-/// (e.g. `"hooks/x.json (src after overlay+rewrite)"` → `"src after
-/// overlay+rewrite"`). Returns `None` for bare paths or `/dev/null`.
+/// (e.g. `"hooks/x.json (tgt before)"` → `"tgt before"`). Returns `None`
+/// for bare paths or `/dev/null`.
 fn label_annotation(label: &str) -> Option<&str> {
     let start = label.rfind(" (")? + 2;
     label[start..].strip_suffix(')')
