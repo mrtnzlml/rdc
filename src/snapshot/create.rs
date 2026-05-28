@@ -39,13 +39,24 @@ fn kind_specific_strip(kind: &str) -> &'static [&'static str] {
         "schemas" => &["queues"],
         // server assigns the inbox's email address
         "inboxes" => &["email"],
-        // server-managed sub-resource on hooks
-        "hooks" => &["test"],
+        // server-managed sub-resource on hooks. `status` is a runtime
+        // health field ("ready" / "failed" / etc.) that Rossum sets and
+        // updates as the hook fires — read-only from the user's
+        // perspective. Sending it back in PATCH/POST is at best ignored
+        // and at worst 400s, so strip it like `counts` on queues.
+        "hooks" => &["test", "status"],
         // `triggers` references a sub-resource kind (`/api/v1/triggers/<id>`)
         // that rdc doesn't pull or deploy; sending src trigger URLs to tgt
         // 400s with "Invalid hyperlink", so strip them. The remote keeps its
         // own triggers, which is the conservative outcome.
         "email_templates" => &["triggers"],
+        // `agenda_id` is a per-env, server-generated identifier ("ferg_<hash>")
+        // that Rossum assigns when the engine is created and refreshes
+        // on training cycles. It's read-only and changes often; strip it
+        // from POST/PATCH bodies so cross-env deploys don't try to overwrite
+        // the tgt's identifier with the src's, and so push doesn't echo a
+        // value the API will ignore or reject.
+        "engines" => &["agenda_id"],
         _ => &[],
     }
 }
@@ -80,6 +91,14 @@ pub fn strip_for_create(body: &mut Value, kind: &str) {
 fn redact_on_pull(kind: &str) -> &'static [&'static str] {
     match kind {
         "queues" => &["counts"],
+        // `status` is the runtime health of the hook; Rossum updates it
+        // on every fire. Without redaction, every `rdc sync` rewrites
+        // hooks/<slug>.json with a fresh status string and the git diff
+        // is full of churn.
+        "hooks" => &["status"],
+        // `agenda_id` rotates on training; redact so the on-disk JSON
+        // stays stable across syncs.
+        "engines" => &["agenda_id"],
         _ => &[],
     }
 }
@@ -199,15 +218,36 @@ mod tests {
     }
 
     #[test]
-    fn strips_kind_specific_hooks_test_field() {
+    fn strips_kind_specific_hooks_test_and_status_fields() {
         let mut v = json!({
             "id": 0,
             "url": "",
             "name": "h",
             "test": {"some": "data"},
+            "status": "ready",
         });
         strip_for_create(&mut v, "hooks");
-        assert!(!v.as_object().unwrap().contains_key("test"));
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("test"), "test sub-resource must be stripped");
+        assert!(
+            !obj.contains_key("status"),
+            "runtime status must be stripped (Rossum sets/updates it server-side)",
+        );
+    }
+
+    #[test]
+    fn strips_kind_specific_engines_agenda_id_field() {
+        let mut v = json!({
+            "id": 0,
+            "url": "",
+            "name": "e",
+            "agenda_id": "ferg_abc123",
+        });
+        strip_for_create(&mut v, "engines");
+        assert!(
+            !v.as_object().unwrap().contains_key("agenda_id"),
+            "engine agenda_id is per-env + read-only; must be stripped from POST/PATCH bodies",
+        );
     }
 
     #[test]
@@ -344,13 +384,48 @@ mod tests {
     }
 
     #[test]
-    fn redact_for_disk_noop_for_other_kinds() {
-        let mut v = json!({"counts": {"importing": 5}, "name": "x"});
+    fn redact_for_disk_noop_for_unredacted_kinds() {
+        // Schemas / workspaces have no redact list; their on-disk values
+        // are kept verbatim. (Hooks and engines DO redact — status and
+        // agenda_id respectively — so they're excluded here.)
+        let mut v = json!({"counts": {"importing": 5}, "status": "ready", "name": "x"});
         let before = v.clone();
-        redact_for_disk(&mut v, "hooks");
         redact_for_disk(&mut v, "schemas");
         redact_for_disk(&mut v, "workspaces");
         assert_eq!(v, before);
+    }
+
+    #[test]
+    fn redact_for_disk_replaces_hook_status_with_sentinel() {
+        let mut v = json!({
+            "id": 1,
+            "name": "h",
+            "status": "ready",
+            "type": "function",
+        });
+        redact_for_disk(&mut v, "hooks");
+        assert_eq!(
+            v["status"],
+            Value::String(REDACTED_VALUE_SENTINEL.to_string())
+        );
+        assert_eq!(v["name"], json!("h"));
+        assert_eq!(v["type"], json!("function"));
+    }
+
+    #[test]
+    fn redact_for_disk_replaces_engine_agenda_id_with_sentinel() {
+        let mut v = json!({
+            "id": 1,
+            "name": "e",
+            "agenda_id": "ferg_abc123",
+            "type": "extractor",
+        });
+        redact_for_disk(&mut v, "engines");
+        assert_eq!(
+            v["agenda_id"],
+            Value::String(REDACTED_VALUE_SENTINEL.to_string())
+        );
+        assert_eq!(v["name"], json!("e"));
     }
 
     #[test]
