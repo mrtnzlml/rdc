@@ -25,8 +25,25 @@ pub fn write_schema_bytes(
     json_bytes: &[u8],
     formulas: &[(String, Vec<u8>)],
 ) -> Result<()> {
+    write_schema_bytes_with_cache(queue_dir, json_bytes, formulas, None)
+}
+
+/// Same as [`write_schema_bytes`] but also mirrors the just-written
+/// files to the base cache when `paths` is `Some`. Used by pull /
+/// deploy where the cache must move in lock-step with the env tree
+/// so the next sync's 3-way merge has a current merge base for
+/// schemas (and their formula sidecars).
+pub fn write_schema_bytes_with_cache(
+    queue_dir: &Path,
+    json_bytes: &[u8],
+    formulas: &[(String, Vec<u8>)],
+    paths: Option<&crate::paths::Paths>,
+) -> Result<()> {
     let json_path = queue_dir.join("schema.json");
     write_atomic(&json_path, json_bytes)?;
+    if let Some(p) = paths {
+        crate::state::base_cache::write(p, &json_path, json_bytes)?;
+    }
     if !formulas.is_empty() {
         let formulas_dir = queue_dir.join("formulas");
         std::fs::create_dir_all(&formulas_dir)
@@ -35,6 +52,9 @@ pub fn write_schema_bytes(
             let py_path = formulas_dir.join(format!("{field_id}.py"));
             // Byte-exact: code is whatever serialize_schema returned.
             write_atomic(&py_path, code)?;
+            if let Some(p) = paths {
+                crate::state::base_cache::write(p, &py_path, code)?;
+            }
         }
     }
     Ok(())
