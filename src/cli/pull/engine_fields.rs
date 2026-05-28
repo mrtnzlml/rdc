@@ -6,7 +6,7 @@ use crate::log::{Action, Log};
 use crate::model::EngineField;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all engine fields from the API.
@@ -23,15 +23,25 @@ pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<Log>) -> Result<Vec<EngineFi
 /// Orphan fields (no engine in the lockfile) are skipped with a warning
 /// — same pattern as orphan queues.
 ///
-/// `subset` selects which `(kind, slug)` pairs are written; items outside
-/// the subset are skipped silently.
+/// Lockfile keys are namespaced as `<engine_slug>/<field_slug>` so two
+/// engines can both carry a field called `Amount` and keep clean per-engine
+/// slugs (mirrors the email_templates per-queue scoping). `slugify_unique`
+/// runs against a per-engine `used` set, not a global one.
+///
+/// Legacy flat-key entries (lockfiles written before the composite-key
+/// migration) are auto-rewritten on the first sync after upgrade: when
+/// `slug_for_id` matches a flat entry for this field, the entry is moved
+/// to the composite key and the field's content_hash baseline is preserved.
+///
+/// `subset` selects which `(kind, composite_key)` pairs are written;
+/// items outside the subset are skipped silently.
 pub async fn process(
     ctx: &mut PullCtx<'_>,
     fields: Vec<EngineField>,
     subset: &BTreeSet<(String, String)>,
     progress: &Arc<Log>,
 ) -> Result<(usize, usize)> {
-    let mut used: HashSet<String> = HashSet::new();
+    let mut per_engine_used: HashMap<String, HashSet<String>> = HashMap::new();
     let mut conflicts = 0usize;
     let mut written = 0usize;
     for f in &fields {
@@ -43,13 +53,22 @@ pub async fn process(
             continue;
         };
 
-        let slug = match ctx.lockfile.slug_for_id("engine_fields", f.id) {
-            Some(existing) => existing.to_string(),
-            None => slugify_unique(&f.name, &used),
+        let used = per_engine_used.entry(engine_slug.clone()).or_default();
+        let (field_slug, legacy_flat_key) = match ctx.lockfile.slug_for_id("engine_fields", f.id) {
+            Some(existing) => {
+                let existing = existing.to_string();
+                if let Some(tail) = existing.strip_prefix(&format!("{engine_slug}/")) {
+                    (tail.to_string(), None)
+                } else {
+                    (existing.clone(), Some(existing))
+                }
+            }
+            None => (slugify_unique(&f.name, used), None),
         };
-        used.insert(slug.clone());
+        used.insert(field_slug.clone());
+        let composite_key = format!("{engine_slug}/{field_slug}");
 
-        if !subset.contains(&("engine_fields".to_string(), slug.clone())) {
+        if !subset.contains(&("engine_fields".to_string(), composite_key.clone())) {
             continue;
         }
 
@@ -63,15 +82,18 @@ pub async fn process(
         proposed.push(b'\n');
         let proposed = maybe_strip_overlay(
             proposed,
-            ctx.overlay.as_ref().and_then(|o| o.engine_field(&slug)),
+            ctx.overlay.as_ref().and_then(|o| o.engine_field(&composite_key)),
         )?;
 
-        let local_path = fields_dir.join(format!("{slug}.json"));
+        let local_path = fields_dir.join(format!("{field_slug}.json"));
         let base_hash = ctx
             .lockfile
             .objects
             .get("engine_fields")
-            .and_then(|m| m.get(&slug))
+            .and_then(|m| {
+                m.get(&composite_key)
+                    .or_else(|| legacy_flat_key.as_deref().and_then(|k| m.get(k)))
+            })
             .and_then(|x| x.content_hash.clone());
 
         let (action, remote_hash) =
@@ -81,10 +103,15 @@ pub async fn process(
         }
         let recorded_hash = apply_pull_action(action, &local_path, &proposed, remote_hash, ctx.interactive, progress, ctx.paths.env(), base_hash.as_deref())?;
 
+        if let Some(old) = legacy_flat_key.as_deref()
+            && old != composite_key
+            && let Some(m) = ctx.lockfile.objects.get_mut("engine_fields") {
+            m.remove(old);
+        }
         record_object(
             ctx.lockfile,
             "engine_fields",
-            &slug,
+            &composite_key,
             f.id,
             Some(f.url.clone()),
             f.modified_at().map(|s| s.to_string()),

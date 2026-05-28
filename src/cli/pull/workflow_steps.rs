@@ -3,7 +3,7 @@ use crate::log::{Action, Log};
 use crate::model::WorkflowStep;
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Phase 1: list all workflow steps from the API.
@@ -19,15 +19,20 @@ pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<Log>) -> Result<Vec<Workflow
 /// its parent workflow at `workflows/<workflow_slug>/steps/<step_slug>.json`.
 /// Orphan steps (no workflow in the lockfile) are skipped with a warning.
 ///
-/// `subset` selects which `(kind, slug)` pairs are written; items outside
-/// the subset are skipped silently.
+/// Lockfile keys are namespaced as `<workflow_slug>/<step_slug>` so two
+/// workflows can both carry a step with the same name and keep clean
+/// per-workflow slugs (mirrors `pull::engine_fields` and
+/// `pull::email_templates`). Legacy flat-key lockfile entries are auto-
+/// rewritten on the first sync after upgrade.
+///
+/// `subset` selects which `(kind, composite_key)` pairs are written.
 pub async fn process(
     ctx: &mut PullCtx<'_>,
     steps: Vec<WorkflowStep>,
     subset: &BTreeSet<(String, String)>,
     progress: &Arc<Log>,
 ) -> Result<(usize, usize)> {
-    let mut used: HashSet<String> = HashSet::new();
+    let mut per_workflow_used: HashMap<String, HashSet<String>> = HashMap::new();
     let mut conflicts = 0usize;
     let mut written = 0usize;
     for s in &steps {
@@ -39,13 +44,22 @@ pub async fn process(
             continue;
         };
 
-        let slug = match ctx.lockfile.slug_for_id("workflow_steps", s.id) {
-            Some(existing) => existing.to_string(),
-            None => slugify_unique(&s.name, &used),
+        let used = per_workflow_used.entry(workflow_slug.clone()).or_default();
+        let (step_slug, legacy_flat_key) = match ctx.lockfile.slug_for_id("workflow_steps", s.id) {
+            Some(existing) => {
+                let existing = existing.to_string();
+                if let Some(tail) = existing.strip_prefix(&format!("{workflow_slug}/")) {
+                    (tail.to_string(), None)
+                } else {
+                    (existing.clone(), Some(existing))
+                }
+            }
+            None => (slugify_unique(&s.name, used), None),
         };
-        used.insert(slug.clone());
+        used.insert(step_slug.clone());
+        let composite_key = format!("{workflow_slug}/{step_slug}");
 
-        if !subset.contains(&("workflow_steps".to_string(), slug.clone())) {
+        if !subset.contains(&("workflow_steps".to_string(), composite_key.clone())) {
             continue;
         }
 
@@ -58,12 +72,15 @@ pub async fn process(
         let mut proposed = serde_json::to_vec_pretty(s).context("serializing workflow step")?;
         proposed.push(b'\n');
 
-        let local_path = steps_dir.join(format!("{slug}.json"));
+        let local_path = steps_dir.join(format!("{step_slug}.json"));
         let base_hash = ctx
             .lockfile
             .objects
             .get("workflow_steps")
-            .and_then(|m| m.get(&slug))
+            .and_then(|m| {
+                m.get(&composite_key)
+                    .or_else(|| legacy_flat_key.as_deref().and_then(|k| m.get(k)))
+            })
             .and_then(|x| x.content_hash.clone());
 
         let (action, remote_hash) =
@@ -73,10 +90,15 @@ pub async fn process(
         }
         let recorded_hash = apply_pull_action(action, &local_path, &proposed, remote_hash, ctx.interactive, progress, ctx.paths.env(), base_hash.as_deref())?;
 
+        if let Some(old) = legacy_flat_key.as_deref()
+            && old != composite_key
+            && let Some(m) = ctx.lockfile.objects.get_mut("workflow_steps") {
+            m.remove(old);
+        }
         record_object(
             ctx.lockfile,
             "workflow_steps",
-            &slug,
+            &composite_key,
             s.id,
             Some(s.url.clone()),
             s.modified_at().map(|x| x.to_string()),
