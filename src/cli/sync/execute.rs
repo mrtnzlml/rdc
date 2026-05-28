@@ -739,6 +739,77 @@ fn resolve_one_conflict<R: BufRead>(
         return Ok(());
     }
 
+    // Auto-merge attempt (Flat kinds only in v1). Reads the base bytes
+    // from `.rdc/state/<env>.base/`, runs `merge::json3::merge3_json`,
+    // and if it produces a clean result writes the merged file and
+    // skips the prompt. On `Conflict` (genuine overlap) or any
+    // missing-data case (no base cache yet, parse failure), falls
+    // through to the existing interactive / shadow-file flow.
+    //
+    // Combined-hash kinds (Hook/Rule/Schema) are skipped here in v1:
+    // the cache doesn't yet mirror their sidecar files, so the merge
+    // base for the JSON portion alone is misleading. A follow-up will
+    // extend the cache + the merge call to handle those.
+    // Only auto-merge when the cached base hashes to the lockfile's
+    // recorded base — guards against rebuild_lock having wiped the
+    // lockfile, or any other path where the cache is stale relative
+    // to what the classifier saw. Without this gate, auto-merge would
+    // silently take one side using an out-of-date merge base.
+    let cache_matches_base = it.base_hash.is_some()
+        && match crate::state::base_cache::read(ctx.paths, &local_path) {
+            Ok(Some(b)) => Some(crate::state::content_hash(&b)) == it.base_hash.clone(),
+            _ => false,
+        };
+    if matches!(hash_strategy, HashStrategy::Flat)
+        && cache_matches_base
+        && let Ok(Some(base_bytes)) = crate::state::base_cache::read(ctx.paths, &local_path)
+        && let (Ok(base_v), Ok(local_v), Ok(remote_v)) = (
+            serde_json::from_slice::<serde_json::Value>(&base_bytes),
+            serde_json::from_slice::<serde_json::Value>(&local_json_bytes),
+            serde_json::from_slice::<serde_json::Value>(&remote_bytes),
+        )
+        && let crate::merge::MergeOutcome::Merged { merged, local_paths, remote_paths } =
+            crate::merge::json3::merge3_json(&base_v, &local_v, &remote_v)
+        && let Ok(mut merged_bytes) = serde_json::to_vec_pretty(&merged)
+    {
+        merged_bytes.push(b'\n');
+        write_atomic(&local_path, &merged_bytes)?;
+        crate::state::base_cache::write(ctx.paths, &local_path, &merged_bytes)?;
+        let merged_hash = crate::state::content_hash(&merged_bytes);
+        crate::cli::pull::common::record_object(
+            ctx.lockfile,
+            &it.kind,
+            &it.slug,
+            id,
+            url,
+            modified_at,
+            Some(merged_hash),
+        );
+        // Short log line naming the disjoint edit sites (capped —
+        // schemas can have many). `<none>` happens when one side made
+        // a noop-after-canonicalize change.
+        let render = |xs: &[String]| -> String {
+            if xs.is_empty() {
+                "<none>".to_string()
+            } else if xs.len() <= 3 {
+                xs.join(", ")
+            } else {
+                format!("{}, +{} more", xs[..3].join(", "), xs.len() - 3)
+            }
+        };
+        progress.event(
+            Action::Info,
+            &format!(
+                "auto-merge {}/{} (local: {}; remote: {})",
+                it.kind,
+                it.slug,
+                render(&local_paths),
+                render(&remote_paths),
+            ),
+        );
+        return Ok(());
+    }
+
     if !interactive {
         // Non-TTY/--yes: fall back to legacy shadow-file behavior so the
         // run still completes without blocking on stdin. The local file
