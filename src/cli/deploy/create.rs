@@ -32,7 +32,7 @@ use crate::mapping::Mapping;
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
 use crate::snapshot::create::strip_for_create;
-use crate::snapshot::email_template::write_email_template;
+use crate::snapshot::email_template::{read_email_template, write_email_template};
 use crate::snapshot::hook::{read_hook_value, write_hook};
 use crate::snapshot::rule::{read_rule_value, serialize_rule, write_rule};
 use crate::snapshot::schema::{read_schema_value, serialize_schema, write_schema_bytes};
@@ -541,6 +541,55 @@ pub async fn create_label(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
         },
     );
     ctx.mapping.labels.insert(slug.to_string(), slug.to_string());
+    Ok(())
+}
+
+pub async fn create_email_template(ctx: &mut CreateCtx<'_>, key: &str) -> Result<()> {
+    // Email template keys are composite: `<ws_slug>/<q_slug>/<template_slug>`.
+    let (ws, q, t) = crate::cli::deploy::apply::split_template_key(key)
+        .ok_or_else(|| anyhow!("email_template key '{key}' is not <ws>/<q>/<template>"))?;
+    let templates_dir = ctx.src_paths.queue_email_templates_dir(ws, q);
+    let template = read_email_template(&templates_dir, t)
+        .with_context(|| format!("reading src email_template '{key}'"))?;
+    let raw = serde_json::to_value(&template)
+        .context("serializing src email_template to value")?;
+    let overlay_paths = ctx
+        .tgt_overlay
+        .as_ref()
+        .and_then(|ov| ov.email_template(key));
+    let body = shape_create_body_no_subs(
+        raw,
+        "email_templates",
+        overlay_paths,
+        ctx.src_lockfile,
+        ctx.tgt_lockfile,
+        ctx.mapping,
+    );
+    let created = ctx
+        .tgt_client
+        .create_email_template(&body, None)
+        .await
+        .with_context(|| format!("POST /email_templates (creating '{key}')"))?;
+    // Write the on-disk twin to the tgt snapshot so subsequent runs see
+    // it as paired (and to keep parity with the pull-side state).
+    let tgt_templates_dir = ctx.tgt_paths.queue_email_templates_dir(ws, q);
+    std::fs::create_dir_all(&tgt_templates_dir)
+        .with_context(|| format!("creating {}", tgt_templates_dir.display()))?;
+    let bytes = write_email_template(&tgt_templates_dir, t, &created)?;
+    ctx.tgt_lockfile.upsert(
+        "email_templates",
+        key,
+        ObjectEntry {
+            id: created.id,
+            url: Some(created.url.clone()),
+            modified_at: created.modified_at().map(|s| s.to_string()),
+            content_hash: Some(content_hash(&bytes)),
+            secrets_hash: None,
+        },
+    );
+    ctx.mapping
+        .email_templates
+        .insert(key.to_string(), key.to_string());
     Ok(())
 }
 
