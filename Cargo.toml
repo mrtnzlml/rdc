@@ -1,6 +1,6 @@
 [package]
 name = "rdc"
-version = "0.1.1"
+version = "0.2.0"
 edition.workspace = true
 description = "Rossum Deployment as Code — CLI for snapshotting and deploying Rossum.ai configurations"
 license.workspace = true
