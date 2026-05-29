@@ -5,6 +5,8 @@ Cargo.lock.bak
 # rdc tool-managed paths (per design spec)
 /secrets
 /.rdc/cache
+/.rdc/state/*.lock
+/.rdc/state/*.base
 
 # Editor scratch
 /.idea
