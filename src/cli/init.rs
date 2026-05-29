@@ -455,11 +455,19 @@ fn write_gitignore(root: &Path) -> Result<()> {
     // always empty by design and the contents are per-machine, so it
     // shouldn't be committed. `*.lock` is narrow enough not to match
     // `.lock.json` (that's the actual committable lockfile state).
+    //
+    // `/.rdc/state/*.base` — sync's 3-way merge keeps a per-machine
+    // sidecar cache at `.rdc/state/<env>.base/` mirroring the env
+    // tree at the moment of the last successful sync (see
+    // `state::base_cache`). Like the advisory lock file, it's
+    // local-only and regenerated on the next sync, so it must not
+    // be committed.
     const PATTERNS: &[&str] = &[
         "/target",
         "/secrets",
         "/.rdc/cache",
         "/.rdc/state/*.lock",
+        "/.rdc/state/*.base",
     ];
 
     if !path.exists() {
