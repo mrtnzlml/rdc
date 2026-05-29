@@ -283,10 +283,17 @@ fn walk_strings_mut(value: &mut Value, f: &mut dyn FnMut(&mut String)) {
     }
 }
 
-/// Drift check: hash the post-overlay-strip remote bytes and compare to
-/// the tgt lockfile's recorded `content_hash`. Returns `(in_sync,
-/// current_remote_hash)`. Use the hash to refresh the lockfile entry
-/// when adopting out-of-band changes.
+/// Drift check: hash the post-overlay-strip, post-disk-redaction remote
+/// bytes and compare to the tgt lockfile's recorded `content_hash`.
+/// Returns `(in_sync, current_remote_hash)`. Use the hash to refresh
+/// the lockfile entry when adopting out-of-band changes.
+///
+/// The redaction step mirrors `snapshot::create::redacted_disk_bytes`,
+/// which the pull driver uses when it records the baseline hash. Without
+/// it the two paths normalise differently and any kind whose redaction
+/// isn't also stripped by `canonicalize_for_hash` reports phantom drift
+/// on every deploy — queues (`counts`) and engines (`agenda_id`) in
+/// particular.
 ///
 /// Lockfile entries with no `content_hash` (older snapshots) yield
 /// `in_sync = true` so deploys don't spuriously block on legacy state.
@@ -298,7 +305,19 @@ pub fn tgt_drift_status(
     tgt_slug: &str,
 ) -> Result<(bool, String)> {
     let stripped = maybe_strip_overlay(remote_bytes, overlay_paths)?;
-    let remote_hash = content_hash(&stripped);
+    let canonical = match serde_json::from_slice::<Value>(&stripped) {
+        Ok(mut v) => {
+            crate::snapshot::create::redact_for_disk(&mut v, kind);
+            let mut out = serde_json::to_vec_pretty(&v)
+                .context("re-serialising remote JSON for drift hash")?;
+            out.push(b'\n');
+            out
+        }
+        // Non-JSON input (defensive — every caller passes JSON). Fall
+        // back to the raw bytes; `content_hash` also tolerates non-JSON.
+        Err(_) => stripped,
+    };
+    let remote_hash = content_hash(&canonical);
     let base = tgt_lockfile
         .objects
         .get(kind)
@@ -430,5 +449,94 @@ mod tests {
         rewrite_urls(&mut payload, &src, &tgt, &mapping, &subs);
         assert_eq!(payload["hook_template"].as_str().unwrap(), "https://prod/api/v1/hook_templates/41");
         assert_eq!(payload["unrelated"].as_str().unwrap(), "https://docs.rossum.ai");
+    }
+
+    fn lf_with_hash(kind: &str, slug: &str, hash: &str) -> Lockfile {
+        let mut lf = Lockfile::default();
+        lf.upsert(
+            kind,
+            slug,
+            ObjectEntry {
+                id: 1,
+                url: Some(format!("https://test/api/v1/{kind}/1")),
+                modified_at: None,
+                content_hash: Some(hash.to_string()),
+                secrets_hash: None,
+            },
+        );
+        lf
+    }
+
+    #[test]
+    fn tgt_drift_status_queue_with_live_counts_matches_redacted_baseline() {
+        // Regression: deploy reported phantom drift on every queue because
+        // it hashed the raw remote bytes (`counts` = live numeric object)
+        // while sync's pull driver hashed the redacted form
+        // (`counts` = sentinel string). Drift hash must apply the same
+        // `redact_for_disk` to match.
+        let value = serde_json::json!({
+            "id": 1,
+            "name": "Inbox sorting",
+            "url": "https://test/api/v1/queues/1",
+            "counts": { "document_status": { "to_review": 7, "exported": 12 } },
+        });
+        let baseline_bytes =
+            crate::snapshot::create::redacted_disk_bytes(&value, "queues").unwrap();
+        let baseline_hash = content_hash(&baseline_bytes);
+        let lf = lf_with_hash("queues", "inbox-sorting", &baseline_hash);
+        let remote_bytes = serde_json::to_vec_pretty(&value).unwrap();
+        let (in_sync, _) =
+            tgt_drift_status(remote_bytes, None, &lf, "queues", "inbox-sorting").unwrap();
+        assert!(
+            in_sync,
+            "queue with live counts should be in_sync against redacted baseline"
+        );
+    }
+
+    #[test]
+    fn tgt_drift_status_engine_with_rotated_agenda_id_matches_redacted_baseline() {
+        // Engines redact `agenda_id` on pull (rotates every training
+        // cycle). Same fix as queues: drift hash must redact before
+        // comparing, otherwise every engine deploy shows phantom drift.
+        let value = serde_json::json!({
+            "id": 7,
+            "name": "training-engine",
+            "url": "https://test/api/v1/engines/7",
+            "agenda_id": "rotating-abc123",
+        });
+        let baseline_bytes =
+            crate::snapshot::create::redacted_disk_bytes(&value, "engines").unwrap();
+        let baseline_hash = content_hash(&baseline_bytes);
+        let lf = lf_with_hash("engines", "training", &baseline_hash);
+        let mut rotated = value.clone();
+        rotated["agenda_id"] = serde_json::Value::String("rotating-xyz999".into());
+        let remote_bytes = serde_json::to_vec_pretty(&rotated).unwrap();
+        let (in_sync, _) =
+            tgt_drift_status(remote_bytes, None, &lf, "engines", "training").unwrap();
+        assert!(
+            in_sync,
+            "engine with rotated agenda_id should be in_sync against redacted baseline"
+        );
+    }
+
+    #[test]
+    fn tgt_drift_status_still_detects_real_change_after_redaction() {
+        // The redaction fix must not mask actual drift: a name change
+        // should still flip in_sync to false even when counts churn.
+        let value = serde_json::json!({
+            "id": 1,
+            "name": "Old name",
+            "url": "https://test/api/v1/queues/1",
+            "counts": { "document_status": { "to_review": 0 } },
+        });
+        let baseline_bytes =
+            crate::snapshot::create::redacted_disk_bytes(&value, "queues").unwrap();
+        let baseline_hash = content_hash(&baseline_bytes);
+        let lf = lf_with_hash("queues", "q1", &baseline_hash);
+        let mut changed = value.clone();
+        changed["name"] = serde_json::Value::String("New name".into());
+        let remote_bytes = serde_json::to_vec_pretty(&changed).unwrap();
+        let (in_sync, _) = tgt_drift_status(remote_bytes, None, &lf, "queues", "q1").unwrap();
+        assert!(!in_sync, "name change should still register as drift");
     }
 }
