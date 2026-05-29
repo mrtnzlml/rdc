@@ -42,6 +42,11 @@ fn init_creates_expected_files() {
     // snapshot. The committable `<env>.lock.json` lockfile is NOT
     // matched by `*.lock` (it ends in `.json`).
     assert!(gitignore.contains("/.rdc/state/*.lock"));
+    // Sync's 3-way auto-merge keeps a per-machine base cache at
+    // `.rdc/state/<env>.base/`. Each entry mirrors the env tree and
+    // is regenerated on the next sync, so it shouldn't be committed —
+    // the on-disk env tree + lockfile remain the canonical source.
+    assert!(gitignore.contains("/.rdc/state/*.base"));
 
     // Generated files under .rdc/ (lockfile, mapping) are marked so
     // GitHub collapses their diffs and excludes them from language stats.
