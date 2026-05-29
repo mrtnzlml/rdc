@@ -283,17 +283,38 @@ fn walk_strings_mut(value: &mut Value, f: &mut dyn FnMut(&mut String)) {
     }
 }
 
-/// Drift check: hash the post-overlay-strip, post-disk-redaction remote
-/// bytes and compare to the tgt lockfile's recorded `content_hash`.
-/// Returns `(in_sync, current_remote_hash)`. Use the hash to refresh
-/// the lockfile entry when adopting out-of-band changes.
+/// Whether the kind's pull driver writes the on-disk file (and the
+/// lockfile baseline) through `redacted_disk_bytes`. The drift hash MUST
+/// mirror this — if pull redacts but drift doesn't (or vice versa), the
+/// two paths produce different hashes and the kind phantom-drifts on
+/// every deploy.
 ///
-/// The redaction step mirrors `snapshot::create::redacted_disk_bytes`,
-/// which the pull driver uses when it records the baseline hash. Without
-/// it the two paths normalise differently and any kind whose redaction
-/// isn't also stripped by `canonicalize_for_hash` reports phantom drift
-/// on every deploy — queues (`counts`) and engines (`agenda_id`) in
-/// particular.
+/// Today only `queues` runs through `redacted_disk_bytes` in
+/// `pull/queues.rs`. `engines` and `hooks` both have entries in
+/// `redact_on_pull` per the design intent (`agenda_id` rotates on
+/// training; `status` cycles `pending → ready`), but their pull drivers
+/// still use `to_vec_pretty` / `serialize_hook` directly. Hooks are
+/// hash-neutral anyway — `hook_combined_hash` strips `status` via
+/// `canonicalize_with_extra_strips` — so the inconsistency is invisible
+/// there; engines aren't, so any drift-side redaction must wait until
+/// `pull/engines.rs` is aligned with the queue pattern (one-time
+/// on-disk migration).
+fn pull_redacts_kind(kind: &str) -> bool {
+    matches!(kind, "queues")
+}
+
+/// Drift check: hash the post-overlay-strip remote bytes (post-redaction
+/// for kinds where pull also redacts on disk) and compare to the tgt
+/// lockfile's recorded `content_hash`. Returns `(in_sync,
+/// current_remote_hash)`. Use the hash to refresh the lockfile entry
+/// when adopting out-of-band changes.
+///
+/// The conditional redaction mirrors what `pull/queues.rs` writes as the
+/// baseline: skipping it makes queues phantom-drift on every deploy
+/// (`counts` is live numeric on the wire but a sentinel string on
+/// disk); applying it for kinds whose pull driver doesn't redact (e.g.
+/// engines) would cause the opposite mismatch. See `pull_redacts_kind`
+/// for the per-kind contract.
 ///
 /// Lockfile entries with no `content_hash` (older snapshots) yield
 /// `in_sync = true` so deploys don't spuriously block on legacy state.
@@ -305,17 +326,22 @@ pub fn tgt_drift_status(
     tgt_slug: &str,
 ) -> Result<(bool, String)> {
     let stripped = maybe_strip_overlay(remote_bytes, overlay_paths)?;
-    let canonical = match serde_json::from_slice::<Value>(&stripped) {
-        Ok(mut v) => {
-            crate::snapshot::create::redact_for_disk(&mut v, kind);
-            let mut out = serde_json::to_vec_pretty(&v)
-                .context("re-serialising remote JSON for drift hash")?;
-            out.push(b'\n');
-            out
+    let canonical = if pull_redacts_kind(kind) {
+        match serde_json::from_slice::<Value>(&stripped) {
+            Ok(mut v) => {
+                crate::snapshot::create::redact_for_disk(&mut v, kind);
+                let mut out = serde_json::to_vec_pretty(&v)
+                    .context("re-serialising remote JSON for drift hash")?;
+                out.push(b'\n');
+                out
+            }
+            // Non-JSON input (defensive — every caller passes JSON).
+            // Fall back to the raw bytes; `content_hash` also tolerates
+            // non-JSON.
+            Err(_) => stripped,
         }
-        // Non-JSON input (defensive — every caller passes JSON). Fall
-        // back to the raw bytes; `content_hash` also tolerates non-JSON.
-        Err(_) => stripped,
+    } else {
+        stripped
     };
     let remote_hash = content_hash(&canonical);
     let base = tgt_lockfile
@@ -494,28 +520,32 @@ mod tests {
     }
 
     #[test]
-    fn tgt_drift_status_engine_with_rotated_agenda_id_matches_redacted_baseline() {
-        // Engines redact `agenda_id` on pull (rotates every training
-        // cycle). Same fix as queues: drift hash must redact before
-        // comparing, otherwise every engine deploy shows phantom drift.
+    fn tgt_drift_status_engine_with_unchanged_agenda_id_is_in_sync() {
+        // Regression guard: a previous version of this fix unconditionally
+        // applied `redact_for_disk` to the drift hash, which broke engines
+        // because `pull/engines.rs` uses `to_vec_pretty` directly (no
+        // redaction). Baselines are recorded from raw bytes, so the drift
+        // hash must also be raw — anything else phantom-drifts every
+        // engine on every deploy. The design intent is to redact
+        // `agenda_id`; that requires aligning the pull driver too.
         let value = serde_json::json!({
             "id": 7,
             "name": "training-engine",
             "url": "https://test/api/v1/engines/7",
-            "agenda_id": "rotating-abc123",
+            "agenda_id": "stable-abc123",
         });
-        let baseline_bytes =
-            crate::snapshot::create::redacted_disk_bytes(&value, "engines").unwrap();
-        let baseline_hash = content_hash(&baseline_bytes);
+        let raw_bytes = {
+            let mut b = serde_json::to_vec_pretty(&value).unwrap();
+            b.push(b'\n');
+            b
+        };
+        let baseline_hash = content_hash(&raw_bytes);
         let lf = lf_with_hash("engines", "training", &baseline_hash);
-        let mut rotated = value.clone();
-        rotated["agenda_id"] = serde_json::Value::String("rotating-xyz999".into());
-        let remote_bytes = serde_json::to_vec_pretty(&rotated).unwrap();
         let (in_sync, _) =
-            tgt_drift_status(remote_bytes, None, &lf, "engines", "training").unwrap();
+            tgt_drift_status(raw_bytes.clone(), None, &lf, "engines", "training").unwrap();
         assert!(
             in_sync,
-            "engine with rotated agenda_id should be in_sync against redacted baseline"
+            "engine with stable agenda_id should be in_sync against raw baseline"
         );
     }
 
