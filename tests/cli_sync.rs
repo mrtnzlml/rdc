@@ -5354,3 +5354,76 @@ async fn sync_auto_merges_disjoint_label_edits_without_prompting() {
         "auto-merge must not push; expected 0 PATCH calls, saw {patch_calls}"
     );
 }
+
+/// Milestone progress line on CI: when the listing phase processes ≥200
+/// items, `bump` emits a `list   listing 200` event line on non-TTY. This
+/// test mocks 300 labels across 3 pages so the aggregate count crosses 200
+/// during the fan-out, triggering exactly one milestone. All other kinds
+/// return empty lists so only labels contribute to the count.
+#[tokio::test]
+async fn sync_emits_progress_milestone_for_large_list() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let label = |id: u64| serde_json::json!({
+        "id": id,
+        "url": format!("{}/api/v1/labels/{}", server.uri(), id),
+        "name": format!("Label {id}"),
+        "organization": format!("{}/api/v1/organizations/1", server.uri())
+    });
+    let page = |from: u64| serde_json::json!({
+        "pagination": { "total_pages": 3, "next": null },
+        "results": (from..from + 100).map(label).collect::<Vec<_>>()
+    });
+    use wiremock::matchers::query_param;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(100)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .and(query_param("page", "3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(200)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(0)))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &["/api/v1/labels"]).await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("rdc").unwrap();
+    let assert = cmd
+        .current_dir(project.path())
+        .args(["sync", "dev", "--yes"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("listing 200"),
+        "expected a list milestone in:\n{stderr}"
+    );
+}

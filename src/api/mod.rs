@@ -394,6 +394,7 @@ impl RossumClient {
         let first: Page<Value> = self.get_json(&page_url(1), progress.clone()).await?;
         let total_pages = first.pagination.total_pages;
         let mut raw: Vec<Value> = first.results;
+        if let Some(p) = &progress { p.bump(raw.len() as u64); }
 
         if total_pages > 1 {
             // Offset fan-out for pages 2..=total_pages (parallel, paced by the limiter).
@@ -404,7 +405,8 @@ impl RossumClient {
                     let url = page_url(n);
                     let progress = progress.clone();
                     async move {
-                        let pg: Page<Value> = self.get_json(&url, progress).await?;
+                        let pg: Page<Value> = self.get_json(&url, progress.clone()).await?;
+                        if let Some(p) = &progress { p.bump(pg.results.len() as u64); }
                         anyhow::Ok(pg.results)
                     }
                 })
@@ -420,6 +422,7 @@ impl RossumClient {
             let mut next = first.pagination.next.clone();
             while let Some(u) = next {
                 let pg: Page<Value> = self.get_json(&u, progress.clone()).await?;
+                if let Some(p) = &progress { p.bump(pg.results.len() as u64); }
                 next = pg.pagination.next.clone();
                 raw.extend(pg.results);
             }

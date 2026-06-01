@@ -165,6 +165,7 @@ pub async fn list_remote(
         Kind::Workflows, Kind::WorkflowSteps, Kind::EmailTemplates, Kind::Mdh,
     ];
 
+    progress.start_phase(Action::List, "listing", 0);
     let results: Vec<Listed> = futures::stream::iter(kinds.iter().copied())
         .map(|kind| {
             async move {
@@ -264,6 +265,7 @@ pub async fn list_remote(
         .buffer_unordered(PULL_FANOUT)
         .try_collect()
         .await?;
+    progress.end_phase();
 
     // Re-group the results into typed bindings. Each variant appears
     // exactly once by construction.
@@ -363,20 +365,27 @@ async fn prefetch_queue_schemas(
         return Ok(std::collections::BTreeMap::new());
     }
 
+    let with_schema = pairs.iter().filter(|(_, _, sid)| sid.is_some()).count() as u64;
+    // `List` (read), matching the `schemas (N fetched)` summary below and the
+    // surrounding `list <kind>` lines — this fetch is a read sub-step of Phase 1.
+    progress.start_phase(Action::List, "schema bodies", with_schema);
+
     let fetched_result: Result<Vec<(u64, Option<crate::model::Schema>)>> =
         futures::stream::iter(pairs)
             .map(|(qid, qname, sid)| {
                 let progress = progress.clone();
                 async move {
                     let schema = match sid {
-                        Some(id) => Some(
-                            client
+                        Some(id) => {
+                            let s = client
                                 .get_schema(id, Some(progress.clone()))
                                 .await
                                 .with_context(|| {
                                     format!("prefetching schema {id} for queue '{qname}'")
-                                })?,
-                        ),
+                                })?;
+                            progress.bump(1);
+                            Some(s)
+                        }
                         None => None,
                     };
                     Ok::<_, anyhow::Error>((qid, schema))
@@ -387,7 +396,7 @@ async fn prefetch_queue_schemas(
             .await;
 
     let fetched = fetched_result?;
-    progress.event(Action::List, &format!("schemas ({total} fetched)"));
+    progress.end_phase();
 
     let mut schemas = std::collections::BTreeMap::new();
     for (qid, s) in fetched {
@@ -395,6 +404,7 @@ async fn prefetch_queue_schemas(
             schemas.insert(qid, s);
         }
     }
+    progress.event(Action::List, &format!("schemas ({} fetched)", schemas.len()));
     Ok(schemas)
 }
 
