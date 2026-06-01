@@ -47,7 +47,20 @@ struct Page<T> {
 #[derive(Debug, Deserialize)]
 struct Pagination {
     next: Option<String>,
+    /// Rossum returns `total_pages` on every core list endpoint (verified
+    /// 2026-06-01). Absent/0 ⇒ fall back to sequential `next`-cursor follow.
+    #[serde(default)]
+    total_pages: u64,
 }
+
+/// Rossum caps list `page_size` at 100 (default 20); always request the max to
+/// minimize round-trips. Verified against the live API 2026-06-01.
+const LIST_PAGE_SIZE: u64 = 100;
+
+/// Bound on concurrently in-flight page fetches within one list call. True
+/// throughput is capped by the per-token `RateLimiter` (10 req/s); this only
+/// bounds how many page requests are outstanding at once.
+const LIST_PAGE_FANOUT: usize = 5;
 
 /// Construct the shared reqwest Client used by every rdc HTTP path.
 ///
@@ -366,14 +379,63 @@ impl RossumClient {
         path: &str,
         progress: ProgressHandle,
     ) -> Result<Vec<T>> {
-        let mut url = format!("{}{}", self.base_url, path);
-        let mut out = Vec::new();
-        loop {
-            let page: Page<T> = self.get_json(&url, progress.clone()).await?;
-            out.extend(page.results);
-            match page.pagination.next {
-                Some(next) => url = next,
-                None => break,
+        use futures::stream::{StreamExt, TryStreamExt};
+        use serde_json::Value;
+
+        let base = format!("{}{}", self.base_url, path);
+        let page_url = |n: u64| format!("{base}?page_size={LIST_PAGE_SIZE}&ordering=id&page={n}");
+
+        // Page 1 — learn total_pages. Collect as Value so we can dedupe by `url`
+        // before deserializing into the typed model.
+        let first: Page<Value> = self.get_json(&page_url(1), progress.clone()).await?;
+        let total_pages = first.pagination.total_pages;
+        let mut raw: Vec<Value> = first.results;
+
+        if total_pages > 1 {
+            // Offset fan-out for pages 2..=total_pages (parallel, paced by the limiter).
+            // NOTE: these page futures borrow `self` and are not `'static`; they must be
+            // driven by `buffer_unordered` on the current task, never `tokio::spawn`ed.
+            let rest: Vec<Vec<Value>> = futures::stream::iter(2..=total_pages)
+                .map(|n| {
+                    let url = page_url(n);
+                    let progress = progress.clone();
+                    async move {
+                        let pg: Page<Value> = self.get_json(&url, progress).await?;
+                        anyhow::Ok(pg.results)
+                    }
+                })
+                .buffer_unordered(LIST_PAGE_FANOUT)
+                .try_collect()
+                .await?;
+            for page in rest {
+                raw.extend(page);
+            }
+        } else if total_pages == 0 {
+            // Fallback: endpoint did not report total_pages — follow the `next`
+            // cursor sequentially (legacy behavior; guards a non-conforming kind).
+            let mut next = first.pagination.next.clone();
+            while let Some(u) = next {
+                let pg: Page<Value> = self.get_json(&u, progress.clone()).await?;
+                next = pg.pagination.next.clone();
+                raw.extend(pg.results);
+            }
+        }
+
+        // Dedupe by `url` (defensive vs offset paging under mid-pull mutation),
+        // then deserialize to T.
+        let mut seen = std::collections::HashSet::with_capacity(raw.len());
+        let mut out = Vec::with_capacity(raw.len());
+        for v in raw {
+            let key = v
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| v.to_string());
+            if seen.insert(key) {
+                out.push(
+                    serde_json::from_value::<T>(v)
+                        .with_context(|| format!("decoding list item from {base}"))?,
+                );
             }
         }
         Ok(out)
