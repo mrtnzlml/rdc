@@ -785,6 +785,61 @@ org_id = 1
 }
 
 #[tokio::test]
+async fn list_paginated_fetches_all_pages_via_offset() {
+    use serde_json::json;
+    use wiremock::matchers::query_param;
+    let server = MockServer::start().await;
+    let mk = |ids: &[(u64, &str)]| {
+        json!({
+            "pagination": { "total_pages": 3, "next": null, "previous": null },
+            "results": ids.iter().map(|(id, name)| json!({
+                "id": id,
+                "url": format!("{}/api/v1/labels/{}", server.uri(), id),
+                "name": name,
+                "organization": format!("{}/api/v1/organizations/1", server.uri())
+            })).collect::<Vec<_>>()
+        })
+    };
+    Mock::given(method("GET")).and(path("/api/v1/labels")).and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mk(&[(13, "C"), (14, "D")])))
+        .mount(&server).await;
+    Mock::given(method("GET")).and(path("/api/v1/labels")).and(query_param("page", "3")).and(query_param("ordering", "id"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mk(&[(15, "E"), (16, "F")])))
+        .mount(&server).await;
+    Mock::given(method("GET")).and(path("/api/v1/labels"))
+        .and(query_param("page_size", "100")).and(query_param("ordering", "id"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mk(&[(11, "A"), (12, "B")])))
+        .mount(&server).await;
+
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "T".into()).unwrap();
+    let labels = client.list_labels(None).await.unwrap();
+    assert_eq!(labels.len(), 6, "all three pages concatenated");
+    let names: Vec<&str> = labels.iter().map(|l| l.name.as_str()).collect();
+    assert!(names.contains(&"A") && names.contains(&"F"), "first+last page present: {names:?}");
+}
+
+#[tokio::test]
+async fn list_paginated_dedupes_by_url() {
+    use serde_json::json;
+    use wiremock::matchers::query_param;
+    let server = MockServer::start().await;
+    let label = |id: u64, name: &str| json!({
+        "id": id, "url": format!("{}/api/v1/labels/{}", server.uri(), id),
+        "name": name, "organization": format!("{}/api/v1/organizations/1", server.uri())
+    });
+    let page1 = json!({ "pagination": {"total_pages": 2, "next": null}, "results": [label(11,"A"), label(12,"B")] });
+    let page2 = json!({ "pagination": {"total_pages": 2, "next": null}, "results": [label(12,"B"), label(13,"C")] });
+    Mock::given(method("GET")).and(path("/api/v1/labels")).and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page2)).mount(&server).await;
+    Mock::given(method("GET")).and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page1)).mount(&server).await;
+
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "T".into()).unwrap();
+    let labels = client.list_labels(None).await.unwrap();
+    assert_eq!(labels.len(), 3, "duplicate url collapsed: {:?}", labels.iter().map(|l| l.id).collect::<Vec<_>>());
+}
+
+#[tokio::test]
 async fn resolve_token_propagates_login_401_when_creds_are_stale() {
     use tempfile::TempDir;
     use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
