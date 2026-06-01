@@ -57,9 +57,9 @@ pub struct PullCtx<'a> {
 }
 
 /// Bound for the per-item async fan-out in drivers that pipeline sub-fetches
-/// (queues fetching schema + inbox, mdh fetching indexes + search-indexes).
-/// Empirically saturates upstream — going higher doesn't help because
-/// `list_*` calls remain serial.
+/// (queues fetching schema bodies by id, mdh fetching indexes + search-indexes).
+/// The real throughput cap is the per-token `RateLimiter` (10 req/s); this
+/// bound just limits how many requests are outstanding at once.
 pub const PULL_FANOUT: usize = 5;
 
 /// All kinds listed from one env's API. Produced by Phase 1 of pull,
