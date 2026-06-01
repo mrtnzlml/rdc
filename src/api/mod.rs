@@ -146,6 +146,10 @@ impl RossumClient {
         self.list_paginated("/hook_templates", progress).await
     }
 
+    pub async fn list_inboxes(&self, progress: ProgressHandle) -> Result<Vec<Inbox>> {
+        self.list_paginated("/inboxes", progress).await
+    }
+
     pub async fn list_users(&self, progress: ProgressHandle) -> Result<Vec<User>> {
         self.list_paginated("/users", progress).await
     }

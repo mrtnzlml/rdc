@@ -62,7 +62,7 @@ async fn mount_full_pull(server: &MockServer, hooks_payload: serde_json::Value) 
         .respond_with(ResponseTemplate::new(200).set_body_json(hooks_payload))
         .mount(server).await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes",
         "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
         "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
     ] {
@@ -245,7 +245,7 @@ async fn mount_minimal_for_deploy(server: &MockServer, schema: serde_json::Value
         .respond_with(ResponseTemplate::new(200).set_body_json(schema))
         .mount(server).await;
     for ep in [
-        "/api/v1/hooks", "/api/v1/rules", "/api/v1/labels",
+        "/api/v1/hooks", "/api/v1/inboxes", "/api/v1/rules", "/api/v1/labels",
         "/api/v1/engines", "/api/v1/engine_fields",
         "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
     ] {
@@ -433,7 +433,7 @@ async fn deploy_bootstraps_empty_target_with_url_rewriting() {
         })))
         .mount(&test_server).await;
     for ep in [
-        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/inboxes", "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
         "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
     ] {
         Mock::given(method("GET"))
@@ -448,7 +448,7 @@ async fn deploy_bootstraps_empty_target_with_url_rewriting() {
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
         .mount(&prod_server).await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/hooks",
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes", "/api/v1/hooks",
         "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
         "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
     ] {
@@ -608,7 +608,7 @@ async fn deploy_refuses_non_tty_without_token_owner_overlay() {
         })))
         .mount(&test_server).await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes",
         "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
         "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
     ] {
@@ -635,7 +635,7 @@ async fn deploy_refuses_non_tty_without_token_owner_overlay() {
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
         .mount(&prod_server).await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/hooks",
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes", "/api/v1/hooks",
         "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
         "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
     ] {
@@ -747,7 +747,7 @@ async fn deploy_errors_when_template_missing_on_tgt() {
         })))
         .mount(&test_server).await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes",
         "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
         "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
     ] {
@@ -775,7 +775,7 @@ async fn deploy_errors_when_template_missing_on_tgt() {
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
         .mount(&prod_server).await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/hooks",
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes", "/api/v1/hooks",
         "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
         "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
     ] {
@@ -895,7 +895,7 @@ async fn deploy_resolves_templates_and_prompts_for_token_owner() {
         .mount(&test_server).await;
     // all other src list endpoints — empty
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes",
         "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
         "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
     ] {
@@ -924,7 +924,7 @@ async fn deploy_resolves_templates_and_prompts_for_token_owner() {
         .mount(&prod_server).await;
     // prod starts with no hooks
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/hooks",
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes", "/api/v1/hooks",
         "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
         "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
     ] {
@@ -1388,7 +1388,7 @@ async fn deploy_plan_lists_store_extensions_in_dry_run() {
         })))
         .mount(&test_server).await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes",
         "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
         "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
     ] {
@@ -1415,7 +1415,7 @@ async fn deploy_plan_lists_store_extensions_in_dry_run() {
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
         .mount(&prod_server).await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/hooks",
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes", "/api/v1/hooks",
         "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
         "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
     ] {
@@ -1564,7 +1564,7 @@ async fn deploy_only_mirror_only_deletes_in_scope() {
         .respond_with(ResponseTemplate::new(200).set_body_json(prod_rules))
         .mount(&prod_server).await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes",
         "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
         "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
     ] {
@@ -1676,7 +1676,7 @@ async fn deploy_only_missing_dep_ci_refuses_with_suggestion() {
         })))
         .mount(&test_server).await;
     for ep in [
-        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
+        "/api/v1/inboxes", "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
         "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
     ] {
         Mock::given(method("GET"))
@@ -1906,7 +1906,7 @@ async fn deploy_rewrites_organization_url_on_workspace_create() {
         })))
         .mount(&dev_server).await;
     for ep in [
-        "/api/v1/queues", "/api/v1/hooks", "/api/v1/rules", "/api/v1/labels",
+        "/api/v1/queues", "/api/v1/inboxes", "/api/v1/hooks", "/api/v1/rules", "/api/v1/labels",
         "/api/v1/engines", "/api/v1/engine_fields", "/api/v1/workflows",
         "/api/v1/workflow_steps", "/api/v1/email_templates",
     ] {
@@ -1929,7 +1929,7 @@ async fn deploy_rewrites_organization_url_on_workspace_create() {
         })))
         .mount(&test_server).await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/hooks",
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes", "/api/v1/hooks",
         "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
         "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
     ] {

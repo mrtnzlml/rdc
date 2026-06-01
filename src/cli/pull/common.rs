@@ -7,9 +7,6 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-/// `(queue_id, optional schema, optional inbox)` — one fetched queue row.
-type QueueSchemaInboxRow = (u64, Option<crate::model::Schema>, Option<crate::model::Inbox>);
-
 /// If `result` is a 403 permission_denied from the Rossum API, log a warning
 /// and return an empty list — the kind is unavailable to this token, but
 /// other kinds should still pull. Otherwise propagate the error unchanged.
@@ -68,14 +65,12 @@ pub const PULL_FANOUT: usize = 5;
 /// All kinds listed from one env's API. Produced by Phase 1 of pull,
 /// consumed by Phase 2 (pull) or by the sync classifier.
 ///
-/// `schemas_by_queue_id` and `inboxes_by_queue_id` are pre-fetched by
-/// `list_remote` because the Rossum API has no `/schemas/` or `/inboxes/`
-/// listing — each must be fetched per-queue. Pre-fetching here lets the
-/// sync classifier compute remote hashes without having to issue an
-/// additional fetch per queue, and the pull driver
-/// ([`crate::cli::pull::queues::process`]) consumes the same maps so a
-/// single sync cycle pays exactly one round of `get_schema` / `get_inbox`
-/// per queue.
+/// `schemas_by_queue_id` is pre-fetched by `list_remote` because the Rossum
+/// API's `/schemas` list omits `content` — each body must be fetched by id.
+/// `inboxes_by_queue_id` is built from a single bulk `GET /inboxes` list.
+/// Both maps are consumed by the sync classifier (for remote hashes) and by
+/// [`crate::cli::pull::queues::process`] (for writing), so a single sync
+/// cycle pays exactly one fetch per schema and zero extra inbox fetches.
 pub struct RemoteCatalog {
     pub organization: crate::model::Organization,
     pub workspaces: Vec<crate::model::Workspace>,
@@ -103,17 +98,18 @@ pub struct RemoteCatalog {
 /// Each list call emits a single `list <kind> (<N>)` event line after its
 /// API call returns.
 ///
-/// The twelve top-level list calls run **concurrently** with a bounded
+/// The top-level list calls run **concurrently** with a bounded
 /// fan-out at [`PULL_FANOUT`] (the same cap that
-/// [`prefetch_queue_children`] uses). The bound matches the existing
-/// queue-children pattern and avoids overwhelming the wire on
+/// [`prefetch_queue_schemas`] uses). The bound matches the existing
+/// queue-schema prefetch pattern and avoids overwhelming the wire on
 /// dense-config envs while still cutting wall-clock for a typical sync
 /// roughly in half versus the prior fully-sequential pass. The `list`
 /// lines commit in whatever order responses return, so the final
 /// transcript may be reordered relative to the declaration order of
 /// `Kind` below.
-/// The per-queue schema+inbox prefetch runs serially after `queues`
-/// resolves because it depends on the queue list.
+/// The per-queue schema prefetch runs serially after `queues` resolves
+/// because it depends on the queue list. Inboxes are fetched concurrently
+/// as part of the top-level kind set via a bulk `GET /inboxes`.
 ///
 /// Each list-call future explicitly yields once before issuing the
 /// request (`tokio::task::yield_now`). This matters under
@@ -145,6 +141,7 @@ pub async fn list_remote(
         Organization(crate::model::Organization),
         Workspaces(Vec<crate::model::Workspace>),
         Queues(Vec<crate::model::Queue>),
+        Inboxes(Vec<crate::model::Inbox>),
         Hooks(Vec<crate::model::Hook>),
         Rules(Vec<crate::model::Rule>),
         Labels(Vec<crate::model::Label>),
@@ -158,12 +155,12 @@ pub async fn list_remote(
 
     #[derive(Clone, Copy)]
     enum Kind {
-        Organization, Workspaces, Queues, Hooks, Rules, Labels,
+        Organization, Workspaces, Queues, Inboxes, Hooks, Rules, Labels,
         Engines, EngineFields, Workflows, WorkflowSteps, EmailTemplates, Mdh,
     }
 
     let kinds = [
-        Kind::Organization, Kind::Workspaces, Kind::Queues, Kind::Hooks,
+        Kind::Organization, Kind::Workspaces, Kind::Queues, Kind::Inboxes, Kind::Hooks,
         Kind::Rules, Kind::Labels, Kind::Engines, Kind::EngineFields,
         Kind::Workflows, Kind::WorkflowSteps, Kind::EmailTemplates, Kind::Mdh,
     ];
@@ -196,6 +193,16 @@ pub async fn list_remote(
                             .with_context(|| format!("listing queues for env '{env}'"))?;
                         progress.event(Action::List, &format!("queues ({})", r.len()));
                         anyhow::Ok(Listed::Queues(r))
+                    }
+                    Kind::Inboxes => {
+                        let r = skip_on_permission_denied(
+                            ctx_ref.client.list_inboxes(Some(progress.clone())).await
+                                .with_context(|| format!("listing inboxes for env '{env}'")),
+                            "inboxes",
+                            progress,
+                        )?;
+                        progress.event(Action::List, &format!("inboxes ({})", r.len()));
+                        anyhow::Ok(Listed::Inboxes(r))
                     }
                     Kind::Hooks => {
                         let r = crate::cli::pull::hooks::list(ctx_ref, progress).await
@@ -263,6 +270,7 @@ pub async fn list_remote(
     let mut organization: Option<crate::model::Organization> = None;
     let mut workspaces: Option<Vec<crate::model::Workspace>> = None;
     let mut queues: Option<Vec<crate::model::Queue>> = None;
+    let mut inboxes: Option<Vec<crate::model::Inbox>> = None;
     let mut hooks: Option<Vec<crate::model::Hook>> = None;
     let mut rules: Option<Vec<crate::model::Rule>> = None;
     let mut labels: Option<Vec<crate::model::Label>> = None;
@@ -277,6 +285,7 @@ pub async fn list_remote(
             Listed::Organization(v) => organization = Some(v),
             Listed::Workspaces(v) => workspaces = Some(v),
             Listed::Queues(v) => queues = Some(v),
+            Listed::Inboxes(v) => inboxes = Some(v),
             Listed::Hooks(v) => hooks = Some(v),
             Listed::Rules(v) => rules = Some(v),
             Listed::Labels(v) => labels = Some(v),
@@ -291,6 +300,7 @@ pub async fn list_remote(
     let organization = organization.expect("organization listed");
     let workspaces = workspaces.expect("workspaces listed");
     let queues = queues.expect("queues listed");
+    let inboxes = inboxes.expect("inboxes listed");
     let hooks = hooks.expect("hooks listed");
     let rules = rules.expect("rules listed");
     let labels = labels.expect("labels listed");
@@ -300,21 +310,19 @@ pub async fn list_remote(
     let workflow_steps = workflow_steps.expect("workflow_steps listed");
     let email_templates = email_templates.expect("email_templates listed");
     let mdh = mdh.expect("mdh listed");
+    let inboxes_by_queue_id = inboxes_by_queue(inboxes);
 
-    // Per-queue schema + inbox prefetch. The Rossum API has no `/schemas/`
-    // or `/inboxes/` listing — each must be fetched by id. Doing it here
-    // gives the sync classifier accurate remote hashes for queue-nested
-    // kinds, and the resulting maps are also handed to
-    // `pull::queues::process` so it can write the same bytes without a
-    // second fetch round.
+    // Per-queue schema prefetch. The `/schemas` list omits `content`, so
+    // the body must be fetched by id. Doing it here gives the sync classifier
+    // accurate remote hashes for queue-nested kinds, and the resulting map is
+    // also handed to `pull::queues::process` so it can write the same bytes
+    // without a second fetch round.
     //
-    // Bounded fan-out (`buffer_unordered(PULL_FANOUT)`) over
-    // (queue_id, schema_id?, inbox_id?). A single spinner shows progress
-    // while the parallel batch runs; without it the user sees nothing for
-    // several seconds during a tree of dozens.
-    let (schemas_by_queue_id, inboxes_by_queue_id) =
-        prefetch_queue_children(ctx.client, &queues, progress).await
-            .with_context(|| format!("prefetching schemas + inboxes for env '{env}'"))?;
+    // Inboxes are now fetched via the bulk `/inboxes` list above and converted
+    // to a queue-id map via `inboxes_by_queue`.
+    let schemas_by_queue_id =
+        prefetch_queue_schemas(ctx.client, &queues, progress).await
+            .with_context(|| format!("prefetching schemas for env '{env}'"))?;
 
     Ok(RemoteCatalog {
         organization, workspaces, queues, schemas_by_queue_id, inboxes_by_queue_id,
@@ -324,34 +332,18 @@ pub async fn list_remote(
     })
 }
 
-/// Concurrent per-queue schema + inbox fetch. Bounded fan-out at
-/// [`PULL_FANOUT`]; the resulting maps are the single source of truth
-/// for queue-nested remote bytes within one sync cycle (the classifier
-/// hashes against them and [`crate::cli::pull::queues::process`] writes
-/// from them). Queues with no schema / no inbox — and queues whose
-/// schema/inbox URL fails to parse — contribute nothing to the returned
-/// maps, and the consuming pull driver treats absent entries as "nothing
-/// to write for that piece."
-///
-/// A single spinner ("schemas + inboxes") is held by the calling task and
-/// updates its message via `set_message` as each parallel fetch completes,
-/// so the user sees a `(N/M)` running counter while the batch is in flight.
-/// `progress` is threaded into each `get_schema` / `get_inbox` call so any
-/// 429 retry warning renders cleanly above the spinner instead of tearing
-/// the surrounding draw region.
-async fn prefetch_queue_children(
+/// Per-queue schema body prefetch. The `/schemas` list omits `content`, so the
+/// body must be fetched by id. Bounded fan-out at `PULL_FANOUT`.
+async fn prefetch_queue_schemas(
     client: &RossumClient,
     queues: &[crate::model::Queue],
     progress: &Arc<Log>,
-) -> Result<(
-    std::collections::BTreeMap<u64, crate::model::Schema>,
-    std::collections::BTreeMap<u64, crate::model::Inbox>,
-)> {
+) -> Result<std::collections::BTreeMap<u64, crate::model::Schema>> {
     use futures::stream::{StreamExt, TryStreamExt};
 
-    // Build (queue_id, schema_id?, inbox_id?) triples once so the future
+    // Build (queue_id, queue_name, schema_id?) pairs once so the future
     // body doesn't borrow `queues`.
-    let triples: Vec<(u64, String, Option<u64>, Option<u64>)> = queues
+    let pairs: Vec<(u64, String, Option<u64>)> = queues
         .iter()
         .map(|q| {
             let s = q
@@ -361,26 +353,19 @@ async fn prefetch_queue_children(
                 .transpose()
                 .ok()
                 .flatten();
-            let i = q
-                .inbox
-                .as_deref()
-                .map(parse_id_from_url)
-                .transpose()
-                .ok()
-                .flatten();
-            (q.id, q.name.clone(), s, i)
+            (q.id, q.name.clone(), s)
         })
         .collect();
-    let total = triples.len();
+    let total = pairs.len();
 
-    // Nothing to fetch — emit no summary, just return empty maps.
+    // Nothing to fetch — emit no summary, just return empty map.
     if total == 0 {
-        return Ok((std::collections::BTreeMap::new(), std::collections::BTreeMap::new()));
+        return Ok(std::collections::BTreeMap::new());
     }
 
-    let fetched_result: Result<Vec<QueueSchemaInboxRow>> =
-        futures::stream::iter(triples)
-            .map(|(qid, qname, sid, iid)| {
+    let fetched_result: Result<Vec<(u64, Option<crate::model::Schema>)>> =
+        futures::stream::iter(pairs)
+            .map(|(qid, qname, sid)| {
                 let progress = progress.clone();
                 async move {
                     let schema = match sid {
@@ -394,18 +379,7 @@ async fn prefetch_queue_children(
                         ),
                         None => None,
                     };
-                    let inbox = match iid {
-                        Some(id) => Some(
-                            client
-                                .get_inbox(id, Some(progress.clone()))
-                                .await
-                                .with_context(|| {
-                                    format!("prefetching inbox {id} for queue '{qname}'")
-                                })?,
-                        ),
-                        None => None,
-                    };
-                    Ok::<_, anyhow::Error>((qid, schema, inbox))
+                    Ok::<_, anyhow::Error>((qid, schema))
                 }
             })
             .buffer_unordered(PULL_FANOUT)
@@ -413,19 +387,15 @@ async fn prefetch_queue_children(
             .await;
 
     let fetched = fetched_result?;
-    progress.event(Action::List, &format!("schemas+inboxes ({total} fetched)"));
+    progress.event(Action::List, &format!("schemas ({total} fetched)"));
 
     let mut schemas = std::collections::BTreeMap::new();
-    let mut inboxes = std::collections::BTreeMap::new();
-    for (qid, s, i) in fetched {
+    for (qid, s) in fetched {
         if let Some(s) = s {
             schemas.insert(qid, s);
         }
-        if let Some(i) = i {
-            inboxes.insert(qid, i);
-        }
     }
-    Ok((schemas, inboxes))
+    Ok(schemas)
 }
 
 /// If `paths` is `Some` and non-empty, strip those overlay-managed dotted
@@ -476,6 +446,24 @@ pub fn parse_id_from_url(url: &str) -> Result<u64> {
         .ok_or_else(|| anyhow!("URL has no path segments: {url}"))?;
     last.parse::<u64>()
         .map_err(|e| anyhow!("URL trailing segment '{last}' is not a u64: {e}"))
+}
+
+/// Build the queue-id → inbox map from a bulk `/inboxes` list. Each inbox is
+/// 1:1 with a queue (`inbox.queues[0]`). Inboxes whose queue URL is missing or
+/// unparseable contribute nothing — same forgiving policy as the old per-queue
+/// prefetch.
+pub fn inboxes_by_queue(
+    inboxes: Vec<crate::model::Inbox>,
+) -> std::collections::BTreeMap<u64, crate::model::Inbox> {
+    let mut map = std::collections::BTreeMap::new();
+    for inbox in inboxes {
+        if let Some(q_url) = inbox.queues.first()
+            && let Ok(qid) = parse_id_from_url(q_url)
+        {
+            map.insert(qid, inbox);
+        }
+    }
+    map
 }
 
 /// Outcome of a three-way comparison for a single object on pull.
@@ -745,6 +733,25 @@ fn resolve_conflict_interactive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inboxes_by_queue_maps_by_attached_queue_id() {
+        let inbox: crate::model::Inbox = serde_json::from_value(serde_json::json!({
+            "id": 5, "url": "https://x/api/v1/inboxes/5", "name": "n", "email": "e",
+            "queues": ["https://x/api/v1/queues/42"]
+        })).unwrap();
+        let map = inboxes_by_queue(vec![inbox]);
+        assert_eq!(map.get(&42).map(|i| i.id), Some(5));
+    }
+
+    #[test]
+    fn inboxes_by_queue_skips_inbox_with_no_queue() {
+        let inbox: crate::model::Inbox = serde_json::from_value(serde_json::json!({
+            "id": 6, "url": "https://x/api/v1/inboxes/6", "name": "n", "email": "e",
+            "queues": []
+        })).unwrap();
+        assert!(inboxes_by_queue(vec![inbox]).is_empty());
+    }
 
     #[test]
     fn parse_id_basic() {
