@@ -198,6 +198,20 @@ use std::sync::{Arc, Mutex};
 
 use crate::cli::resolve::ColorMode;
 
+/// Emit a non-TTY milestone line every this many items during a phase. Phases
+/// shorter than this stay silent (no noise for small orgs).
+const PROGRESS_MILESTONE: u64 = 200;
+
+/// In-flight progress counter for one pull phase (the list fan-out, or the
+/// per-queue schema-body fetch). `total == 0` means "unknown — count up".
+struct Phase {
+    action: Action,
+    label: String,
+    done: u64,
+    total: u64,
+    last_milestone: u64,
+}
+
 /// Single-renderer event log. Threaded as `Arc<Log>` through every
 /// command. Lines are emitted to stderr.
 pub struct Log {
@@ -207,6 +221,9 @@ pub struct Log {
     /// are no-ops so log output stays scrollback-friendly.
     is_tty: bool,
     state: Mutex<LogState>,
+    /// Active pull-phase counter, or `None` outside a phase. Separate mutex from
+    /// `state` so `bump` computes its line, releases this lock, then draws.
+    phase: Mutex<Option<Phase>>,
     /// Test-only clock override. Production code reads
     /// `std::time::SystemTime::now()`.
     #[cfg(test)]
@@ -233,6 +250,7 @@ impl Log {
                 out: Box::new(std::io::stderr()),
                 status_active: false,
             }),
+            phase: Mutex::new(None),
             #[cfg(test)]
             fixed_time: None,
         })
@@ -245,6 +263,7 @@ impl Log {
             color,
             is_tty: false,
             state: Mutex::new(LogState { out: sink, status_active: false }),
+            phase: Mutex::new(None),
             fixed_time: None,
         })
     }
@@ -261,6 +280,7 @@ impl Log {
             color,
             is_tty: false,
             state: Mutex::new(LogState { out: sink, status_active: false }),
+            phase: Mutex::new(None),
             fixed_time: Some(time),
         })
     }
@@ -277,6 +297,7 @@ impl Log {
             color,
             is_tty: true,
             state: Mutex::new(LogState { out: sink, status_active: false }),
+            phase: Mutex::new(None),
             fixed_time: Some(time),
         })
     }
@@ -387,6 +408,47 @@ impl Log {
         let _ = state.out.flush();
         drop(state);
         f()
+    }
+
+    /// Begin a progress phase. `total == 0` renders as a bare count ("listing 40");
+    /// `total > 0` renders as "label done/total".
+    pub fn start_phase(&self, action: Action, label: &str, total: u64) {
+        *self.phase.lock().unwrap() =
+            Some(Phase { action, label: label.to_string(), done: 0, total, last_milestone: 0 });
+    }
+
+    /// Advance the active phase by `delta`. No-op when no phase is active (so the
+    /// shared `list_paginated` can call it unconditionally). Redraws the in-place
+    /// status line on a TTY; on non-TTY emits a milestone event line every
+    /// `PROGRESS_MILESTONE` items.
+    pub fn bump(&self, delta: u64) {
+        let drawn = {
+            let mut guard = self.phase.lock().unwrap();
+            let Some(ph) = guard.as_mut() else { return };
+            ph.done += delta;
+            let body = if ph.total > 0 {
+                format!("{} {}/{}", ph.label, ph.done, ph.total)
+            } else {
+                format!("{} {}", ph.label, ph.done)
+            };
+            let milestone = !self.is_tty && ph.done - ph.last_milestone >= PROGRESS_MILESTONE;
+            if milestone {
+                ph.last_milestone = ph.done;
+            }
+            (ph.action, body, milestone)
+        };
+        let (action, body, milestone) = drawn;
+        if self.is_tty {
+            self.tick_status(action, &body);
+        } else if milestone {
+            self.event(action, &body);
+        }
+    }
+
+    /// End the active phase and leave the cursor on a clean line.
+    pub fn end_phase(&self) {
+        *self.phase.lock().unwrap() = None;
+        self.finish_status();
     }
 }
 
@@ -547,5 +609,36 @@ mod log_tests {
         let len_after_first = buf.text().len();
         log.finish_status();
         assert_eq!(buf.text().len(), len_after_first, "finish_status must be idempotent");
+    }
+
+    #[test]
+    fn bump_emits_milestones_on_non_tty() {
+        let buf = Buf::default();
+        let log = Log::for_test(ColorMode::Plain, Box::new(buf.clone()));
+        log.start_phase(Action::List, "listing", 0);
+        for _ in 0..450 { log.bump(1); }
+        log.end_phase();
+        let text = buf.text();
+        assert!(text.contains("listing 200"), "missing 200 milestone: {text:?}");
+        assert!(text.contains("listing 400"), "missing 400 milestone: {text:?}");
+        assert!(!text.contains("listing 600"), "should not reach 600: {text:?}");
+    }
+
+    #[test]
+    fn bump_is_quiet_on_non_tty_for_short_phase() {
+        let buf = Buf::default();
+        let log = Log::for_test(ColorMode::Plain, Box::new(buf.clone()));
+        log.start_phase(Action::List, "listing", 0);
+        for _ in 0..50 { log.bump(1); }
+        log.end_phase();
+        assert_eq!(buf.text(), "", "short phase must stay quiet on non-TTY");
+    }
+
+    #[test]
+    fn bump_without_active_phase_is_noop() {
+        let buf = Buf::default();
+        let log = Log::for_test(ColorMode::Plain, Box::new(buf.clone()));
+        log.bump(100);
+        assert_eq!(buf.text(), "", "bump with no active phase must do nothing");
     }
 }
