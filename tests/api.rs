@@ -303,6 +303,29 @@ async fn list_email_templates_returns_templates() {
 }
 
 #[tokio::test]
+async fn list_inboxes_returns_inboxes_with_queue_links() {
+    use serde_json::json;
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/api/v1/inboxes"))
+        .and(header("Authorization", "token TEST_TOKEN"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "pagination": { "total_pages": 1, "next": null },
+            "results": [{
+                "id": 5, "url": format!("{}/api/v1/inboxes/5", server.uri()),
+                "name": "Cost Invoices Inbox", "email": "ci@x.rossum.app",
+                "queues": [format!("{}/api/v1/queues/42", server.uri())]
+            }]
+        })))
+        .mount(&server).await;
+
+    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
+    let inboxes = client.list_inboxes(None).await.unwrap();
+    assert_eq!(inboxes.len(), 1);
+    assert_eq!(inboxes[0].id, 5);
+    assert!(inboxes[0].queues[0].ends_with("/queues/42"));
+}
+
+#[tokio::test]
 async fn data_storage_list_collections() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

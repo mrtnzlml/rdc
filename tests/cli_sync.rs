@@ -75,6 +75,7 @@ async fn sync_clean_env_does_no_writes() {
         "/api/v1/hooks",
         "/api/v1/workspaces",
         "/api/v1/queues",
+        "/api/v1/inboxes",
         "/api/v1/rules",
         "/api/v1/labels",
         "/api/v1/engines",
@@ -171,6 +172,7 @@ async fn mock_empty_lists_except(server: &MockServer, override_paths: &[&str]) {
         "/api/v1/hooks",
         "/api/v1/workspaces",
         "/api/v1/queues",
+        "/api/v1/inboxes",
         "/api/v1/rules",
         "/api/v1/labels",
         "/api/v1/engines",
@@ -2440,18 +2442,21 @@ async fn mount_queue_tree_fixture(server: &MockServer) {
         .mount(server)
         .await;
 
-    let inbox_body = serde_json::json!({
-        "id": 300,
-        "url": inbox_url,
-        "name": "Cost Invoices Inbox",
-        "email": "cost-invoices@mock.rossum.app",
-        "queues": [queue_url.clone()],
-        "modified_at": "2026-04-10T09:00:00Z",
-        "filters": []
+    let inboxes_body = serde_json::json!({
+        "pagination": { "total_pages": 1, "next": null },
+        "results": [{
+            "id": 300,
+            "url": inbox_url,
+            "name": "Cost Invoices Inbox",
+            "email": "cost-invoices@mock.rossum.app",
+            "queues": [queue_url.clone()],
+            "modified_at": "2026-04-10T09:00:00Z",
+            "filters": []
+        }]
     });
     Mock::given(method("GET"))
-        .and(path("/api/v1/inboxes/300"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(inbox_body))
+        .and(path("/api/v1/inboxes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(inboxes_body))
         .mount(server)
         .await;
 
@@ -2498,6 +2503,7 @@ async fn sync_remote_create_writes_local_queue_tree() {
         &[
             "/api/v1/workspaces",
             "/api/v1/queues",
+            "/api/v1/inboxes",
             "/api/v1/email_templates",
         ],
     )
@@ -2621,6 +2627,7 @@ async fn sync_clean_queue_tree_no_writes() {
         &[
             "/api/v1/workspaces",
             "/api/v1/queues",
+            "/api/v1/inboxes",
             "/api/v1/email_templates",
         ],
     )
@@ -2694,6 +2701,7 @@ async fn sync_clean_queue_tree_no_writes() {
         &[
             "/api/v1/workspaces",
             "/api/v1/queues",
+            "/api/v1/inboxes",
             "/api/v1/email_templates",
         ],
     )
@@ -4282,15 +4290,18 @@ async fn run_schema_conflict_scenario(variant: SchemaConflictVariant) {
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path(format!("/api/v1/inboxes/{inbox_id}")))
+        .and(path("/api/v1/inboxes"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": inbox_id,
-            "url": inbox_url,
-            "name": "Cost Invoices Inbox",
-            "email": "cost-invoices@mock.rossum.app",
-            "queues": [queue_url.clone()],
-            "filters": [],
-            "modified_at": "2026-04-20T08:00:00Z"
+            "pagination": { "total_pages": 1, "next": null },
+            "results": [{
+                "id": inbox_id,
+                "url": inbox_url,
+                "name": "Cost Invoices Inbox",
+                "email": "cost-invoices@mock.rossum.app",
+                "queues": [queue_url.clone()],
+                "filters": [],
+                "modified_at": "2026-04-20T08:00:00Z"
+            }]
         })))
         .mount(&server)
         .await;
@@ -4378,7 +4389,7 @@ async fn run_schema_conflict_scenario(variant: SchemaConflictVariant) {
         .mount(&server)
         .await;
 
-    mock_empty_lists_except(&server, &["/api/v1/workspaces", "/api/v1/queues"]).await;
+    mock_empty_lists_except(&server, &["/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes"]).await;
 
     Mock::given(method("PATCH"))
         .and(path(format!("/api/v1/schemas/{schema_id}")))
@@ -5170,7 +5181,7 @@ async fn mount_minimal_pull(server: &MockServer) {
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
         .mount(server).await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes",
         "/api/v1/hooks", "/api/v1/rules", "/api/v1/labels",
         "/api/v1/engines", "/api/v1/engine_fields",
         "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",

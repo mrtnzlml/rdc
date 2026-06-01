@@ -19,7 +19,7 @@ async fn mount_minimal_pull(server: &MockServer) {
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
         .mount(server).await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues",
+        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes",
         "/api/v1/hooks", "/api/v1/rules", "/api/v1/labels",
         "/api/v1/engines", "/api/v1/engine_fields",
         "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
