@@ -41,11 +41,11 @@ const MAX_SLEEP_SECS: u64 = 60;
 /// passes a closure that produces a fresh `RequestBuilder` each attempt
 /// (since `RequestBuilder` is consumed by `.send()`).
 ///
-/// Retries are silent on the user side: the caller's spinner keeps animating
-/// (so it's obvious rdc isn't stuck), and a terminal failure after
-/// `MAX_ATTEMPTS` surfaces as a normal error. The `progress` parameter is
-/// reserved for future use (e.g. structured retry telemetry) and is otherwise
-/// unused — callers may pass `None`.
+/// Retries are silent on the user side: any active progress line is left as-is
+/// during backoff, and a terminal failure after `MAX_ATTEMPTS` surfaces as a
+/// normal error. The `progress` parameter is reserved for future use (e.g.
+/// structured retry telemetry) and is otherwise unused — callers may pass
+/// `None`.
 pub async fn send_with_retry(
     mut build: impl FnMut() -> reqwest::RequestBuilder,
     desc: &str,
@@ -72,8 +72,7 @@ pub async fn send_with_retry(
         let Some(reason) = retriable_reason(resp.status()) else {
             return Ok(resp);
         };
-        // Retries are an internal concern: the active spinner keeps animating
-        // so the user can see rdc isn't stuck, and a terminal failure after
+        // Retries are an internal concern: a terminal failure after
         // MAX_ATTEMPTS surfaces as an error from the final `build().send()`
         // call below. No user-facing retry chatter.
         let _ = (reason, &progress);

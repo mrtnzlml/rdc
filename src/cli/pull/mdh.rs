@@ -191,8 +191,8 @@ pub async fn process(
         }
 
     // === Sub-phase B: concurrent index fetches per collection (regular +
-    //            search). Bounded fan-out (see common::PULL_FANOUT). A single
-    //            spinner shows progress while the parallel batch runs.
+    //            search). Bounded fan-out (see common::PULL_FANOUT); the
+    //            per-token rate limiter is the real throughput cap.
     let client_ref = &client;
     let total = dataset_dirs.len();
     if total == 0 {

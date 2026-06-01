@@ -953,8 +953,9 @@ pub fn from_catalog_scan_lockfile(
     //   email_tpl→ `serde_json::to_vec_pretty(t)` + `\n` + strip + `content_hash`
     //
     // The `catalog.schemas_by_queue_id` / `inboxes_by_queue_id` maps were
-    // pre-fetched in `list_remote`; we look up by queue id, since the API
-    // has no list endpoint for these.
+    // populated in `list_remote`; we look up by queue id. Schema bodies are
+    // fetched per id (the `/schemas` list omits `content`); inboxes come from
+    // the bulk `/inboxes` list.
     //
     // Overlay strip on each branch keeps the recomputed remote hash in
     // parity with the lockfile base (which was recorded post-strip on
