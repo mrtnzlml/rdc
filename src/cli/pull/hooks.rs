@@ -138,14 +138,11 @@ pub async fn process(
                 None
             };
 
-            // Remote hash via KindCodec (intentionally differs from the legacy
-            // hook_combined_hash — this is the designed one-time rehash that
-            // moves hooks to a sentinel-stable hash format).
-            let value = serde_json::to_value(hook)?;
-            let remote_combined_hash = crate::snapshot::codec::codec(KIND)
-                .unwrap()
-                .base_hash(&value)
-                .context("hashing hook")?;
+            // Remote hash is computed over the POST-overlay bytes so it matches
+            // what is actually written to disk. Using codec.base_hash(&value)
+            // (PRE-overlay) would diverge whenever an overlay is configured,
+            // causing phantom drift on every subsequent pull.
+            let remote_combined_hash = local_hook_combined_hash(&proposed_json, &proposed_code);
 
             let base_hash = ctx
                 .lockfile

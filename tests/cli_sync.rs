@@ -125,8 +125,7 @@ async fn sync_clean_env_does_no_writes() {
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
-        /* allow_deletes = */ false,
-        /* no_push = */ false, /* no_pull = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -156,11 +155,17 @@ async fn sync_clean_env_does_no_writes() {
     // Lockfile is saved (at least the version header is there). Empty
     // env still produces a parseable file.
     let lf_path = project.path().join(".rdc/state/dev.lock.json");
-    assert!(lf_path.exists(), "lockfile should be saved at {}", lf_path.display());
+    assert!(
+        lf_path.exists(),
+        "lockfile should be saved at {}",
+        lf_path.display()
+    );
     let lf_raw = std::fs::read_to_string(&lf_path).unwrap();
-    let lf: serde_json::Value = serde_json::from_str(&lf_raw)
-        .expect("lockfile must be valid JSON");
-    assert!(lf.get("version").is_some(), "lockfile should have a version: {lf_raw}");
+    let lf: serde_json::Value = serde_json::from_str(&lf_raw).expect("lockfile must be valid JSON");
+    assert!(
+        lf.get("version").is_some(),
+        "lockfile should have a version: {lf_raw}"
+    );
 }
 
 /// Helper: mock every Rossum listing endpoint with an empty body. The
@@ -247,8 +252,7 @@ async fn sync_remote_create_writes_local_label() {
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
-        /* allow_deletes = */ false,
-        /* no_push = */ false, /* no_pull = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -284,8 +288,14 @@ async fn sync_remote_create_writes_local_label() {
 
     // Lockfile records the label.
     let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
-    assert!(lf_raw.contains("\"labels\""), "lockfile must record label: {lf_raw}");
-    assert!(lf_raw.contains("priority-high"), "lockfile must record slug: {lf_raw}");
+    assert!(
+        lf_raw.contains("\"labels\""),
+        "lockfile must record label: {lf_raw}"
+    );
+    assert!(
+        lf_raw.contains("priority-high"),
+        "lockfile must record slug: {lf_raw}"
+    );
 }
 
 /// Clean-state label: env has the label, local snapshot already mirrors
@@ -343,11 +353,9 @@ async fn sync_clean_label_no_writes() {
     let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
-    rdc::cli::sync::run(
-        "dev", false, false, false, false, false,
-    )
-    .await
-    .expect("first sync should succeed");
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("first sync should succeed");
 
     // Snapshot request counts after the first sync so we can assert the
     // second one is a no-op on writes (same write count == 0).
@@ -367,11 +375,9 @@ async fn sync_clean_label_no_writes() {
 
     // Second sync: nothing should change. The label is on the env, on
     // disk, and in the lockfile with a matching hash → Clean.
-    rdc::cli::sync::run(
-        "dev", false, false, false, false, false,
-    )
-    .await
-    .expect("clean-state second sync should succeed");
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("clean-state second sync should succeed");
     std::env::set_current_dir(&prev_cwd).unwrap();
 
     let writes_after = server
@@ -391,10 +397,18 @@ async fn sync_clean_label_no_writes() {
         writes_before, writes_after,
         "clean-state second sync must not issue any mutating requests"
     );
-    assert_eq!(writes_before, 0, "first sync must not issue any mutating requests either");
+    assert_eq!(
+        writes_before, 0,
+        "first sync must not issue any mutating requests either"
+    );
 
     // Label file is still present and the lockfile still records it.
-    assert!(project.path().join("envs/dev/labels/priority-high.json").exists());
+    assert!(
+        project
+            .path()
+            .join("envs/dev/labels/priority-high.json")
+            .exists()
+    );
     let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
     assert!(lf_raw.contains("priority-high"));
 }
@@ -480,8 +494,7 @@ async fn sync_local_edit_only_patches_remote_label() {
     // base content hash. Pull-side branch (Task 14) handles this.
     rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
-        /* allow_deletes = */ false,
-        /* no_push = */ false, /* no_pull = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
     )
     .await
     .expect("first sync should succeed");
@@ -490,22 +503,25 @@ async fn sync_local_edit_only_patches_remote_label() {
     // class on the second sync. The remote still serves the pre-edit
     // body, so `remote_hash == base_hash` and `local_hash != base_hash`.
     let label_path = project.path().join("envs/dev/labels/audit-hold.json");
-    assert!(label_path.exists(), "first sync should have written the label");
+    assert!(
+        label_path.exists(),
+        "first sync should have written the label"
+    );
     let raw = std::fs::read_to_string(&label_path).unwrap();
     let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
     v["color"] = serde_json::Value::String(patched_color.to_string());
-    std::fs::write(&label_path, format!("{}\n", serde_json::to_string_pretty(&v).unwrap()))
-        .unwrap();
+    std::fs::write(
+        &label_path,
+        format!("{}\n", serde_json::to_string_pretty(&v).unwrap()),
+    )
+    .unwrap();
 
     // Snapshot lockfile hash before second sync so we can assert it changes.
-    let lf_before = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json"))
-        .unwrap();
+    let lf_before =
+        std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
 
     // Second sync: classifier sees LocalEdit; executor must PATCH.
-    let result = rdc::cli::sync::run(
-        "dev", false, false, false, false, false,
-    )
-    .await;
+    let result = rdc::cli::sync::run("dev", false, false, false, false, false).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
 
     result.expect("second sync should succeed and PATCH the remote label");
@@ -534,13 +550,16 @@ async fn sync_local_edit_only_patches_remote_label() {
 
     // Lockfile hash for labels/audit-hold must have changed: it now
     // records the post-PATCH canonical form, not the pre-edit base.
-    let lf_after = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json"))
-        .unwrap();
+    let lf_after =
+        std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
     assert_ne!(
         lf_before, lf_after,
         "lockfile must update after a successful PATCH"
     );
-    assert!(lf_after.contains("audit-hold"), "lockfile keeps the slug: {lf_after}");
+    assert!(
+        lf_after.contains("audit-hold"),
+        "lockfile keeps the slug: {lf_after}"
+    );
 }
 
 /// `--no-push` must suppress the push side of sync entirely. Setup mirrors
@@ -617,15 +636,17 @@ async fn sync_no_push_skips_local_edit() {
     // the "clean" baseline `--no-push` will be compared against.
     rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
-        /* allow_deletes = */ false,
-        /* no_push = */ false, /* no_pull = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
     )
     .await
     .expect("first sync should succeed");
 
     // Edit the local file so the next sync sees a LocalEdit candidate.
     let label_path = project.path().join("envs/dev/labels/no-push-label.json");
-    assert!(label_path.exists(), "first sync should have written the label");
+    assert!(
+        label_path.exists(),
+        "first sync should have written the label"
+    );
     let raw = std::fs::read_to_string(&label_path).unwrap();
     let edited_color = "#ff00ff";
     let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -633,14 +654,11 @@ async fn sync_no_push_skips_local_edit() {
     let edited_body = format!("{}\n", serde_json::to_string_pretty(&v).unwrap());
     std::fs::write(&label_path, &edited_body).unwrap();
 
-    let lf_before = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json"))
-        .unwrap();
+    let lf_before =
+        std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
 
     // Second sync with --no-push: the LocalEdit must be ignored.
-    let result = rdc::cli::sync::run(
-        "dev", false, false, false, /* no_push = */ true, false,
-    )
-    .await;
+    let result = rdc::cli::sync::run("dev", false, false, false, /* no_push = */ true, false).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
 
     result.expect("sync --no-push should succeed");
@@ -653,7 +671,10 @@ async fn sync_no_push_skips_local_edit() {
         .into_iter()
         .filter(|r| r.method == http::Method::PATCH && r.url.path() == "/api/v1/labels/77")
         .count();
-    assert_eq!(patch_calls, 0, "expected 0 PATCH calls under --no-push, saw {patch_calls}");
+    assert_eq!(
+        patch_calls, 0,
+        "expected 0 PATCH calls under --no-push, saw {patch_calls}"
+    );
 
     // Local edit survived intact — the push branch was the only thing
     // that would have rewritten the file with the server's canonical body.
@@ -664,8 +685,8 @@ async fn sync_no_push_skips_local_edit() {
     );
 
     // Lockfile is byte-identical: no push → no post-PATCH hash update.
-    let lf_after = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json"))
-        .unwrap();
+    let lf_after =
+        std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
     assert_eq!(
         lf_before, lf_after,
         "lockfile must not change when --no-push suppresses the only write"
@@ -729,8 +750,7 @@ async fn sync_no_pull_skips_remote_change() {
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
-        /* allow_deletes = */ false,
-        /* no_push = */ false, /* no_pull = */ true,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ true,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -749,8 +769,7 @@ async fn sync_no_pull_skips_remote_change() {
     // Lockfile must not record the remote-only label. Reading the JSON
     // and asserting absence is more robust than a substring scan because
     // the labels key may exist with an empty map.
-    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json"))
-        .unwrap();
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
     let lf: serde_json::Value = serde_json::from_str(&lf_raw).unwrap();
     let labels = lf
         .get("objects")
@@ -836,16 +855,17 @@ async fn sync_dry_run_makes_zero_writes() {
     let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
-    rdc::cli::sync::run(
-        "dev", false, false, false, false, false,
-    )
-    .await
-    .expect("seed sync should succeed");
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("seed sync should succeed");
     std::env::set_current_dir(&prev_cwd).unwrap();
 
     let edit_path = project.path().join("envs/dev/labels/dry-edit.json");
     let create_path = project.path().join("envs/dev/labels/dry-create.json");
-    assert!(edit_path.exists() && create_path.exists(), "seed sync must write both files");
+    assert!(
+        edit_path.exists() && create_path.exists(),
+        "seed sync must write both files"
+    );
 
     // Edit one label.
     let raw = std::fs::read_to_string(&edit_path).unwrap();
@@ -919,8 +939,14 @@ async fn sync_dry_run_makes_zero_writes() {
 
     // Local files and lockfile are byte-identical.
     let edit_after = std::fs::read_to_string(&edit_path).unwrap();
-    assert_eq!(edit_before, edit_after, "dry-run must not rewrite local files");
-    assert!(!create_path.exists(), "dry-run must not materialize remote-only labels");
+    assert_eq!(
+        edit_before, edit_after,
+        "dry-run must not rewrite local files"
+    );
+    assert!(
+        !create_path.exists(),
+        "dry-run must not materialize remote-only labels"
+    );
     let lf_after = std::fs::read_to_string(&lf_path).unwrap();
     assert_eq!(lf_before, lf_after, "dry-run must not touch the lockfile");
 }
@@ -940,8 +966,7 @@ async fn sync_no_push_and_no_pull_together_errors() {
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
-        /* allow_deletes = */ false,
-        /* no_push = */ true, /* no_pull = */ true,
+        /* allow_deletes = */ false, /* no_push = */ true, /* no_pull = */ true,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -1008,8 +1033,7 @@ async fn sync_remote_create_writes_local_workflow() {
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
-        /* allow_deletes = */ false,
-        /* no_push = */ false, /* no_pull = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -1042,12 +1066,21 @@ async fn sync_remote_create_writes_local_workflow() {
         workflow_path.display()
     );
     let body = std::fs::read_to_string(&workflow_path).unwrap();
-    assert!(body.contains("AP Approval Flow"), "workflow content: {body}");
+    assert!(
+        body.contains("AP Approval Flow"),
+        "workflow content: {body}"
+    );
 
     // Lockfile records the workflow.
     let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
-    assert!(lf_raw.contains("\"workflows\""), "lockfile must record workflow: {lf_raw}");
-    assert!(lf_raw.contains("ap-approval-flow"), "lockfile must record slug: {lf_raw}");
+    assert!(
+        lf_raw.contains("\"workflows\""),
+        "lockfile must record workflow: {lf_raw}"
+    );
+    assert!(
+        lf_raw.contains("ap-approval-flow"),
+        "lockfile must record slug: {lf_raw}"
+    );
 }
 
 /// Pull-side RemoteCreate for a workflow step. Requires the parent
@@ -1125,8 +1158,7 @@ async fn sync_remote_create_writes_local_workflow_step() {
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
-        /* allow_deletes = */ false,
-        /* no_push = */ false, /* no_pull = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -1256,10 +1288,7 @@ async fn sync_pulls_same_named_step_under_two_workflows_with_clean_slugs() {
     let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
-    let result = rdc::cli::sync::run(
-        "dev", false, false, false, false, false,
-    )
-    .await;
+    let result = rdc::cli::sync::run("dev", false, false, false, false, false).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
     result.expect("sync should succeed");
 
@@ -1269,7 +1298,11 @@ async fn sync_pulls_same_named_step_under_two_workflows_with_clean_slugs() {
     let b_path = project
         .path()
         .join("envs/dev/workflows/workflow-b/steps/approval.json");
-    assert!(a_path.exists(), "workflow A step should be at {}", a_path.display());
+    assert!(
+        a_path.exists(),
+        "workflow A step should be at {}",
+        a_path.display()
+    );
     assert!(
         b_path.exists(),
         "workflow B step should be at {} — globally-unique slugging would have put it at approval-2.json",
@@ -1327,8 +1360,7 @@ async fn sync_remote_create_writes_local_organization() {
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
-        /* allow_deletes = */ false,
-        /* no_push = */ false, /* no_pull = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -1431,8 +1463,7 @@ async fn sync_remote_create_writes_local_workspace() {
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
-        /* allow_deletes = */ false,
-        /* no_push = */ false, /* no_pull = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -1530,8 +1561,7 @@ async fn sync_remote_create_writes_local_engine() {
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
-        /* allow_deletes = */ false,
-        /* no_push = */ false, /* no_pull = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -1573,6 +1603,173 @@ async fn sync_remote_create_writes_local_engine() {
     assert!(
         lf_raw.contains("invoice-engine"),
         "lockfile must record slug: {lf_raw}"
+    );
+}
+
+/// Regression repro: an engine carrying a server-set `agenda_id` must land on
+/// disk with the value redacted to the sentinel (like queue `counts` / hook
+/// `status`), NOT the raw live identifier. `redact_on_pull` lists
+/// `engines => ["agenda_id"]` and `redact_for_disk` is unit-tested, but the
+/// engine pull/sync write path must actually route through it.
+#[tokio::test]
+async fn sync_redacts_engine_agenda_id_on_disk() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let engines_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 401,
+                "url": format!("{}/api/v1/engines/401", server.uri()),
+                "name": "Invoice Engine",
+                "type": "extractor",
+                "agenda_id": "tnt_live_secret_123",
+                "modified_at": "2026-04-20T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/engines"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(engines_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/engines"]).await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    result.expect("sync should succeed when remote has a new engine");
+
+    let engine_path = project
+        .path()
+        .join("envs/dev/engines/invoice-engine/engine.json");
+    let body = std::fs::read_to_string(&engine_path).unwrap();
+    assert!(
+        body.contains("agenda_id"),
+        "agenda_id key should remain present on disk: {body}"
+    );
+    assert!(
+        !body.contains("tnt_live_secret_123"),
+        "raw live agenda_id must NOT be written to disk; it must be redacted. engine.json:\n{body}"
+    );
+    assert!(
+        body.contains("refreshed live in Rossum; not synced by rdc"),
+        "agenda_id must be redacted to the sentinel on disk. engine.json:\n{body}"
+    );
+}
+
+/// Regression repro: a hook carrying a server-set `status` must land on disk
+/// with the value redacted to the sentinel (same root cause as engine
+/// `agenda_id` — added together in commit 78b351c). `redact_on_pull` lists
+/// `hooks => ["status"]` but the hook serializer must actually route through it.
+#[tokio::test]
+async fn sync_redacts_hook_status_on_disk() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let hooks_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 501,
+                "url": format!("{}/api/v1/hooks/501", server.uri()),
+                "name": "Validator: invoices",
+                "type": "function",
+                "queues": [],
+                "events": ["annotation_content"],
+                "config": {
+                    "runtime": "python3.12",
+                    "code": "def x(payload):\n    return {}\n"
+                },
+                "status": "ready",
+                "modified_at": "2026-04-20T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(hooks_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/hooks"]).await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    result.expect("sync should succeed when remote has a new hook");
+
+    let json_path = project
+        .path()
+        .join("envs/dev/hooks/validator-invoices.json");
+    let body = std::fs::read_to_string(&json_path).unwrap();
+    assert!(
+        body.contains("status"),
+        "status key should remain present on disk: {body}"
+    );
+    assert!(
+        !body.contains("\"ready\""),
+        "raw live hook status must NOT be written to disk; it must be redacted. hook json:\n{body}"
+    );
+    assert!(
+        body.contains("refreshed live in Rossum; not synced by rdc"),
+        "hook status must be redacted to the sentinel on disk. hook json:\n{body}"
     );
 }
 
@@ -1650,8 +1847,7 @@ async fn sync_remote_create_writes_local_engine_field() {
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
-        /* allow_deletes = */ false,
-        /* no_push = */ false, /* no_pull = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -1785,8 +1981,7 @@ async fn sync_pulls_same_named_field_under_two_engines_with_clean_slugs() {
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
-        /* allow_deletes = */ false,
-        /* no_push = */ false, /* no_pull = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -1848,20 +2043,18 @@ async fn sync_writes_local_mdh_indexes_without_collection_json() {
     use wiremock::matchers::body_partial_json;
     Mock::given(method("POST"))
         .and(path("/svc/data-storage/api/v1/collections/list"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "code": "ok",
-                "message": "",
-                "result": [
-                    {
-                        "name": "vendors",
-                        "type": "collection",
-                        "options": {},
-                        "idIndex": { "v": 2, "key": { "_id": 1 }, "name": "_id_" }
-                    }
-                ]
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "ok",
+            "message": "",
+            "result": [
+                {
+                    "name": "vendors",
+                    "type": "collection",
+                    "options": {},
+                    "idIndex": { "v": 2, "key": { "_id": 1 }, "name": "_id_" }
+                }
+            ]
+        })))
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -1869,15 +2062,13 @@ async fn sync_writes_local_mdh_indexes_without_collection_json() {
         .and(body_partial_json(
             serde_json::json!({"collectionName": "vendors"}),
         ))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "code": "ok",
-                "message": "",
-                "result": [
-                    { "v": 2, "name": "_id_", "key": { "_id": 1 } }
-                ]
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "ok",
+            "message": "",
+            "result": [
+                { "v": 2, "name": "_id_", "key": { "_id": 1 } }
+            ]
+        })))
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -1885,13 +2076,11 @@ async fn sync_writes_local_mdh_indexes_without_collection_json() {
         .and(body_partial_json(
             serde_json::json!({"collectionName": "vendors"}),
         ))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "code": "ok",
-                "message": "",
-                "result": []
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "ok",
+            "message": "",
+            "result": []
+        })))
         .mount(&server)
         .await;
 
@@ -1915,8 +2104,7 @@ async fn sync_writes_local_mdh_indexes_without_collection_json() {
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
-        /* allow_deletes = */ false,
-        /* no_push = */ false, /* no_pull = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -2050,8 +2238,7 @@ async fn sync_remote_create_writes_local_hook() {
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
-        /* allow_deletes = */ false,
-        /* no_push = */ false, /* no_pull = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -2075,7 +2262,9 @@ async fn sync_remote_create_writes_local_hook() {
         );
     }
 
-    let json_path = project.path().join("envs/dev/hooks/validator-invoices.json");
+    let json_path = project
+        .path()
+        .join("envs/dev/hooks/validator-invoices.json");
     let py_path = project.path().join("envs/dev/hooks/validator-invoices.py");
     assert!(
         json_path.exists(),
@@ -2174,8 +2363,7 @@ async fn sync_remote_create_writes_local_js_hook() {
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
-        /* allow_deletes = */ false,
-        /* no_push = */ false, /* no_pull = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -2199,9 +2387,15 @@ async fn sync_remote_create_writes_local_js_hook() {
         );
     }
 
-    let json_path = project.path().join("envs/dev/hooks/validator-invoices-js.json");
-    let js_path = project.path().join("envs/dev/hooks/validator-invoices-js.js");
-    let py_path = project.path().join("envs/dev/hooks/validator-invoices-js.py");
+    let json_path = project
+        .path()
+        .join("envs/dev/hooks/validator-invoices-js.json");
+    let js_path = project
+        .path()
+        .join("envs/dev/hooks/validator-invoices-js.js");
+    let py_path = project
+        .path()
+        .join("envs/dev/hooks/validator-invoices-js.py");
     assert!(
         json_path.exists(),
         "hook JSON should be written at {}",
@@ -2300,8 +2494,7 @@ async fn sync_remote_create_writes_local_rule() {
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
-        /* allow_deletes = */ false,
-        /* no_push = */ false, /* no_pull = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -2324,8 +2517,12 @@ async fn sync_remote_create_writes_local_rule() {
         );
     }
 
-    let json_path = project.path().join("envs/dev/rules/e-invoice-validation.json");
-    let py_path = project.path().join("envs/dev/rules/e-invoice-validation.py");
+    let json_path = project
+        .path()
+        .join("envs/dev/rules/e-invoice-validation.json");
+    let py_path = project
+        .path()
+        .join("envs/dev/rules/e-invoice-validation.py");
     assert!(
         json_path.exists(),
         "rule JSON should be written at {}",
@@ -2529,8 +2726,7 @@ async fn sync_remote_create_writes_local_queue_tree() {
     std::env::set_current_dir(project.path()).unwrap();
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
-        /* allow_deletes = */ false,
-        /* no_push = */ false, /* no_pull = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -2592,14 +2788,26 @@ async fn sync_remote_create_writes_local_queue_tree() {
     );
 
     let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
-    assert!(lf_raw.contains("\"queues\""), "lockfile must record queues: {lf_raw}");
-    assert!(lf_raw.contains("\"schemas\""), "lockfile must record schemas: {lf_raw}");
-    assert!(lf_raw.contains("\"inboxes\""), "lockfile must record inboxes: {lf_raw}");
+    assert!(
+        lf_raw.contains("\"queues\""),
+        "lockfile must record queues: {lf_raw}"
+    );
+    assert!(
+        lf_raw.contains("\"schemas\""),
+        "lockfile must record schemas: {lf_raw}"
+    );
+    assert!(
+        lf_raw.contains("\"inboxes\""),
+        "lockfile must record inboxes: {lf_raw}"
+    );
     assert!(
         lf_raw.contains("\"email_templates\""),
         "lockfile must record email_templates: {lf_raw}"
     );
-    assert!(lf_raw.contains("cost-invoices"), "queue slug recorded: {lf_raw}");
+    assert!(
+        lf_raw.contains("cost-invoices"),
+        "queue slug recorded: {lf_raw}"
+    );
     assert!(
         lf_raw.contains("invoices-ap/cost-invoices/rejection-notice"),
         "email template compound key recorded: {lf_raw}"
@@ -2654,8 +2862,7 @@ async fn sync_clean_queue_tree_no_writes() {
     std::env::set_current_dir(project.path()).unwrap();
     rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
-        /* allow_deletes = */ false,
-        /* no_push = */ false, /* no_pull = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
     )
     .await
     .expect("first sync should succeed");
@@ -2710,8 +2917,7 @@ async fn sync_clean_queue_tree_no_writes() {
     // Second sync: should be a no-op.
     rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
-        /* allow_deletes = */ false,
-        /* no_push = */ false, /* no_pull = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
     )
     .await
     .expect("second sync should succeed (clean state)");
@@ -2747,15 +2953,26 @@ async fn sync_clean_queue_tree_no_writes() {
         .unwrap()
         .modified()
         .unwrap();
-    let tpl_mtime_after =
-        std::fs::metadata(cost_dir.join("email-templates/rejection-notice.json"))
-            .unwrap()
-            .modified()
-            .unwrap();
-    assert_eq!(queue_mtime, queue_mtime_after, "queue.json must not be rewritten");
-    assert_eq!(schema_mtime, schema_mtime_after, "schema.json must not be rewritten");
-    assert_eq!(inbox_mtime, inbox_mtime_after, "inbox.json must not be rewritten");
-    assert_eq!(tpl_mtime, tpl_mtime_after, "email template must not be rewritten");
+    let tpl_mtime_after = std::fs::metadata(cost_dir.join("email-templates/rejection-notice.json"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(
+        queue_mtime, queue_mtime_after,
+        "queue.json must not be rewritten"
+    );
+    assert_eq!(
+        schema_mtime, schema_mtime_after,
+        "schema.json must not be rewritten"
+    );
+    assert_eq!(
+        inbox_mtime, inbox_mtime_after,
+        "inbox.json must not be rewritten"
+    );
+    assert_eq!(
+        tpl_mtime, tpl_mtime_after,
+        "email template must not be rewritten"
+    );
 }
 
 /// Watch-mode initial reconcile: on `run_watch` startup, before the
@@ -3194,8 +3411,8 @@ async fn sync_watch_does_not_deadlock_with_one_shot_sync() {
             .expect("building one-shot sub-runtime");
         let res = rt.block_on(rdc::cli::sync::run(
             "dev", /* interactive = */ false, /* dry_run = */ false,
-            /* allow_deletes = */ false,
-            /* no_push = */ false, /* no_pull = */ false,
+            /* allow_deletes = */ false, /* no_push = */ false,
+            /* no_pull = */ false,
         ));
         let _ = one_shot_tx.send(res);
     });
@@ -3327,8 +3544,12 @@ async fn sync_hook_code_only_divergence_does_not_silently_push() {
         .expect("first sync should succeed");
 
     // Edit local .py only — JSON file is untouched on disk.
-    let py_path = project.path().join("envs/dev/hooks/ap-reject-if-no-doc-id.py");
-    let json_path = project.path().join("envs/dev/hooks/ap-reject-if-no-doc-id.json");
+    let py_path = project
+        .path()
+        .join("envs/dev/hooks/ap-reject-if-no-doc-id.py");
+    let json_path = project
+        .path()
+        .join("envs/dev/hooks/ap-reject-if-no-doc-id.json");
     let json_before = std::fs::read(&json_path).unwrap();
     std::fs::write(&py_path, b"def local_edit():\n    return 2\n").unwrap();
 
@@ -3350,8 +3571,7 @@ async fn sync_hook_code_only_divergence_does_not_silently_push() {
         .unwrap_or_default()
         .into_iter()
         .filter(|r| {
-            r.method == http::Method::PATCH
-                && r.url.path() == format!("/api/v1/hooks/{hook_id}")
+            r.method == http::Method::PATCH && r.url.path() == format!("/api/v1/hooks/{hook_id}")
         })
         .count();
     assert_eq!(
@@ -3379,8 +3599,14 @@ async fn sync_hook_code_only_divergence_does_not_silently_push() {
     // Shadow file written next to the .py sidecar (the prompt
     // redirected away from the JSON, so the shadow lives next to the
     // code).
-    let shadow = project.path().join("envs/dev/hooks/ap-reject-if-no-doc-id.py.dev");
-    assert!(shadow.exists(), "shadow file should land next to the .py: {}", shadow.display());
+    let shadow = project
+        .path()
+        .join("envs/dev/hooks/ap-reject-if-no-doc-id.py.dev");
+    assert!(
+        shadow.exists(),
+        "shadow file should land next to the .py: {}",
+        shadow.display()
+    );
     let shadow_body = std::fs::read(&shadow).unwrap();
     assert_eq!(shadow_body, b"def remote_edit():\n    return 3\n");
 }
@@ -3501,15 +3727,18 @@ async fn sync_both_diverged_hook_does_not_silently_push() {
     std::env::set_current_dir(project.path()).unwrap();
 
     // First sync — seeds the lockfile with base bytes.
-    rdc::cli::sync::run(
-        "dev", false, false, false, false, false,
-    )
-    .await
-    .expect("first sync should succeed");
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("first sync should succeed");
 
     // Locally edit the .py sidecar — different code from base.
-    let py_path = project.path().join("envs/dev/hooks/ap-reject-if-no-doc-id.py");
-    assert!(py_path.exists(), "first sync should have written the .py sidecar");
+    let py_path = project
+        .path()
+        .join("envs/dev/hooks/ap-reject-if-no-doc-id.py");
+    assert!(
+        py_path.exists(),
+        "first sync should have written the .py sidecar"
+    );
     std::fs::write(&py_path, b"def local_edit():\n    return 2\n").unwrap();
 
     // Snapshot the lockfile so we can confirm the conflict path doesn't
@@ -3521,10 +3750,7 @@ async fn sync_both_diverged_hook_does_not_silently_push() {
     // Second sync — remote now serves the modified hook. Both sides have
     // diverged from the lockfile-recorded base → classifier MUST emit
     // BothDiverged, and the non-TTY fallback MUST NOT push.
-    let result = rdc::cli::sync::run(
-        "dev", false, false, false, false, false,
-    )
-    .await;
+    let result = rdc::cli::sync::run("dev", false, false, false, false, false).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
 
     result.expect("second sync should succeed (no push, conflict deferred)");
@@ -3536,8 +3762,7 @@ async fn sync_both_diverged_hook_does_not_silently_push() {
         .unwrap_or_default()
         .into_iter()
         .filter(|r| {
-            r.method == http::Method::PATCH
-                && r.url.path() == format!("/api/v1/hooks/{hook_id}")
+            r.method == http::Method::PATCH && r.url.path() == format!("/api/v1/hooks/{hook_id}")
         })
         .count();
     assert_eq!(
@@ -3838,8 +4063,12 @@ async fn run_hook_conflict_scenario(variant: HookConflictVariant) {
         std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
     let v_before: serde_json::Value = serde_json::from_str(&lf_before).unwrap();
     let v_after: serde_json::Value = serde_json::from_str(&lf_after).unwrap();
-    let base_before = v_before.pointer(&format!("/objects/hooks/{slug}/content_hash")).cloned();
-    let base_after = v_after.pointer(&format!("/objects/hooks/{slug}/content_hash")).cloned();
+    let base_before = v_before
+        .pointer(&format!("/objects/hooks/{slug}/content_hash"))
+        .cloned();
+    let base_after = v_after
+        .pointer(&format!("/objects/hooks/{slug}/content_hash"))
+        .cloned();
 
     match variant {
         HookConflictVariant::BothEditedToSameCode => {
@@ -3851,8 +4080,7 @@ async fn run_hook_conflict_scenario(variant: HookConflictVariant) {
             // We just assert no PATCH (already asserted above).
             let _ = (base_before, base_after);
         }
-        HookConflictVariant::JsonBothEdited
-        | HookConflictVariant::LocalJsonRemoteCode => {
+        HookConflictVariant::JsonBothEdited | HookConflictVariant::LocalJsonRemoteCode => {
             // Auto-merge variants: 3-way merge resolves these cleanly.
             // JsonBothEdited: both sides added a different element to
             //   `events` (string array → set-merge union). No overlap.
@@ -3901,7 +4129,8 @@ async fn run_hook_conflict_scenario(variant: HookConflictVariant) {
         HookConflictVariant::JsonBothEdited | HookConflictVariant::LocalJsonRemoteCode
     ) {
         // Local JSON edit must survive (no silent overwrite).
-        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&json_path).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&json_path).unwrap()).unwrap();
         let evs = v["events"].as_array().unwrap();
         assert!(
             evs.iter().any(|x| x.as_str() == Some("annotation_status")),
@@ -4013,11 +4242,9 @@ async fn run_rule_conflict_scenario(variant: RuleConflictVariant) {
                         Some(remote_cond_edit.to_string()),
                         "2026-05-14T10:00:00Z".to_string(),
                     ),
-                    RuleConflictVariant::LocalHasCodeRemoteRemoved => (
-                        name_base.clone(),
-                        None,
-                        "2026-05-14T10:00:00Z".to_string(),
-                    ),
+                    RuleConflictVariant::LocalHasCodeRemoteRemoved => {
+                        (name_base.clone(), None, "2026-05-14T10:00:00Z".to_string())
+                    }
                     RuleConflictVariant::LocalRemovedCodeRemoteEdited => (
                         name_base.clone(),
                         Some(remote_cond_edit.to_string()),
@@ -4156,8 +4383,12 @@ async fn run_rule_conflict_scenario(variant: RuleConflictVariant) {
         std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
     let v_before: serde_json::Value = serde_json::from_str(&lf_before).unwrap();
     let v_after: serde_json::Value = serde_json::from_str(&lf_after).unwrap();
-    let base_before = v_before.pointer(&format!("/objects/rules/{slug}/content_hash")).cloned();
-    let base_after = v_after.pointer(&format!("/objects/rules/{slug}/content_hash")).cloned();
+    let base_before = v_before
+        .pointer(&format!("/objects/rules/{slug}/content_hash"))
+        .cloned();
+    let base_after = v_after
+        .pointer(&format!("/objects/rules/{slug}/content_hash"))
+        .cloned();
     // Auto-merge resolves LocalJsonRemoteCode (disjoint edits) and may
     // auto-resolve JsonBothEdited when the edits are set-merge-friendly
     // (e.g. both add distinct entries to a string array). The strong
@@ -4181,7 +4412,8 @@ async fn run_rule_conflict_scenario(variant: RuleConflictVariant) {
     ) {
         let py_after = std::fs::read(&py_path).unwrap();
         assert_eq!(
-            py_after, local_cond_edit.as_bytes(),
+            py_after,
+            local_cond_edit.as_bytes(),
             "variant {variant:?}: local .py edit must survive",
         );
     }
@@ -4343,11 +4575,9 @@ async fn run_schema_conflict_scenario(variant: SchemaConflictVariant) {
                         Some(remote_formula_edit.to_string()),
                         "2026-05-14T10:00:00Z".to_string(),
                     ),
-                    SchemaConflictVariant::LocalHasFormulaRemoteRemoved => (
-                        base_name.clone(),
-                        None,
-                        "2026-05-14T10:00:00Z".to_string(),
-                    ),
+                    SchemaConflictVariant::LocalHasFormulaRemoteRemoved => {
+                        (base_name.clone(), None, "2026-05-14T10:00:00Z".to_string())
+                    }
                     SchemaConflictVariant::LocalRemovedFormulaRemoteEdited => (
                         base_name.clone(),
                         Some(remote_formula_edit.to_string()),
@@ -4389,7 +4619,11 @@ async fn run_schema_conflict_scenario(variant: SchemaConflictVariant) {
         .mount(&server)
         .await;
 
-    mock_empty_lists_except(&server, &["/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes"]).await;
+    mock_empty_lists_except(
+        &server,
+        &["/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes"],
+    )
+    .await;
 
     Mock::given(method("PATCH"))
         .and(path(format!("/api/v1/schemas/{schema_id}")))
@@ -4452,8 +4686,7 @@ async fn run_schema_conflict_scenario(variant: SchemaConflictVariant) {
             std::fs::write(&formula_path, local_formula_edit.as_bytes()).unwrap();
         }
         SchemaConflictVariant::LocalRemovedFormulaRemoteEdited => {
-            std::fs::remove_file(&formula_path)
-                .expect("seeded formula sidecar must exist");
+            std::fs::remove_file(&formula_path).expect("seeded formula sidecar must exist");
         }
         SchemaConflictVariant::JsonAndFormulaBothEdited => {
             let mut v: serde_json::Value = serde_json::from_slice(&schema_before).unwrap();
@@ -4496,8 +4729,12 @@ async fn run_schema_conflict_scenario(variant: SchemaConflictVariant) {
         std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
     let v_before: serde_json::Value = serde_json::from_str(&lf_before).unwrap();
     let v_after: serde_json::Value = serde_json::from_str(&lf_after).unwrap();
-    let base_before = v_before.pointer("/objects/schemas/cost-invoices/content_hash").cloned();
-    let base_after = v_after.pointer("/objects/schemas/cost-invoices/content_hash").cloned();
+    let base_before = v_before
+        .pointer("/objects/schemas/cost-invoices/content_hash")
+        .cloned();
+    let base_after = v_after
+        .pointer("/objects/schemas/cost-invoices/content_hash")
+        .cloned();
     assert_eq!(
         base_before, base_after,
         "variant {variant:?}: lockfile base for schema must remain pinned (before={base_before:?}, after={base_after:?})",
@@ -4511,7 +4748,8 @@ async fn run_schema_conflict_scenario(variant: SchemaConflictVariant) {
     ) {
         let formula_after = std::fs::read(&formula_path).unwrap();
         assert_eq!(
-            formula_after, local_formula_edit.as_bytes(),
+            formula_after,
+            local_formula_edit.as_bytes(),
             "variant {variant:?}: local formula edit must survive",
         );
     }
@@ -4624,13 +4862,13 @@ async fn sync_after_rebuild_lock_in_sync_label_yields_clean_and_rebuilds_lockfil
     std::env::set_current_dir(project.path()).unwrap();
 
     // First sync: pulls the label and seeds the lockfile.
-    rdc::cli::sync::run(
-        "dev", false, false, false, false, false,
-    )
-    .await
-    .expect("first sync seeds the lockfile");
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("first sync seeds the lockfile");
 
-    let label_path = project.path().join("envs/dev/labels/rebuild-lock-stable.json");
+    let label_path = project
+        .path()
+        .join("envs/dev/labels/rebuild-lock-stable.json");
     assert!(label_path.exists(), "first sync writes the label file");
 
     // Snapshot the local bytes so we can later prove they survive the
@@ -4648,10 +4886,7 @@ async fn sync_after_rebuild_lock_in_sync_label_yields_clean_and_rebuilds_lockfil
     // Second sync: this would have panicked pre-fix. With the fix in
     // place, the canonical hashes match → classify as Clean → executor
     // dispatches through pull driver to rebuild the lockfile entry.
-    let result = rdc::cli::sync::run(
-        "dev", false, false, false, false, false,
-    )
-    .await;
+    let result = rdc::cli::sync::run("dev", false, false, false, false, false).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
     result.expect("post-rebuild-lock sync must not panic when local==remote");
 
@@ -4695,7 +4930,9 @@ async fn sync_after_rebuild_lock_in_sync_label_yields_clean_and_rebuilds_lockfil
     );
 
     // No shadow file landed — Clean means "no conflict, no prompt".
-    let shadow = project.path().join("envs/dev/labels/rebuild-lock-stable.json.dev");
+    let shadow = project
+        .path()
+        .join("envs/dev/labels/rebuild-lock-stable.json.dev");
     assert!(
         !shadow.exists(),
         "Clean post-rebuild-lock must not produce a shadow file at {}",
@@ -4770,13 +5007,13 @@ async fn sync_after_rebuild_lock_diverged_label_does_not_panic_and_does_not_sile
     std::env::set_current_dir(project.path()).unwrap();
 
     // First sync seeds local + lockfile from remote.
-    rdc::cli::sync::run(
-        "dev", false, false, false, false, false,
-    )
-    .await
-    .expect("first sync seeds the lockfile");
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("first sync seeds the lockfile");
 
-    let label_path = project.path().join("envs/dev/labels/rebuild-lock-diverged.json");
+    let label_path = project
+        .path()
+        .join("envs/dev/labels/rebuild-lock-diverged.json");
     assert!(label_path.exists(), "first sync writes the label file");
 
     // Locally edit the label so it no longer matches the remote body.
@@ -4795,10 +5032,7 @@ async fn sync_after_rebuild_lock_diverged_label_does_not_panic_and_does_not_sile
     // local_hash != remote_hash → BothDiverged. Non-TTY → shadow file
     // fallback, no push, base preserved (None) so the next sync
     // re-prompts.
-    let result = rdc::cli::sync::run(
-        "dev", false, false, false, false, false,
-    )
-    .await;
+    let result = rdc::cli::sync::run("dev", false, false, false, false, false).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
     result.expect("post-rebuild-lock diverged sync must not panic");
 
@@ -4825,7 +5059,9 @@ async fn sync_after_rebuild_lock_diverged_label_does_not_panic_and_does_not_sile
 
     // Shadow file is written next to the local file so the user sees
     // the env-side body.
-    let shadow = project.path().join("envs/dev/labels/rebuild-lock-diverged.json.dev");
+    let shadow = project
+        .path()
+        .join("envs/dev/labels/rebuild-lock-diverged.json.dev");
     assert!(
         shadow.exists(),
         "BothDiverged in non-TTY mode must produce a shadow file at {}",
@@ -4961,8 +5197,7 @@ async fn sync_pushes_local_edits_before_pulling_remote_changes() {
     // Seed: pull the first label to populate the lockfile.
     rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
-        /* allow_deletes = */ false,
-        /* no_push = */ false, /* no_pull = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
     )
     .await
     .expect("seed sync should succeed");
@@ -5005,7 +5240,9 @@ async fn sync_pushes_local_edits_before_pulling_remote_changes() {
 
     // Sanity: the PATCH happened (covered by `.expect(1)` on the mock)
     // and the RemoteCreate landed on disk.
-    let created_path = project.path().join("envs/dev/labels/order-push-create.json");
+    let created_path = project
+        .path()
+        .join("envs/dev/labels/order-push-create.json");
     assert!(
         created_path.exists(),
         "pull-side RemoteCreate must still run after the push: {}",
@@ -5134,8 +5371,7 @@ async fn sync_hook_secrets_only_edit_triggers_force_patch() {
         .unwrap_or_default()
         .into_iter()
         .filter(|r| {
-            r.method == http::Method::PATCH
-                && r.url.path() == format!("/api/v1/hooks/{hook_id}")
+            r.method == http::Method::PATCH && r.url.path() == format!("/api/v1/hooks/{hook_id}")
         })
         .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
         .collect();
@@ -5179,17 +5415,26 @@ async fn mount_minimal_pull(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/api/v1/organizations/1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
-        .mount(server).await;
+        .mount(server)
+        .await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes",
-        "/api/v1/hooks", "/api/v1/rules", "/api/v1/labels",
-        "/api/v1/engines", "/api/v1/engine_fields",
-        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+        "/api/v1/workspaces",
+        "/api/v1/queues",
+        "/api/v1/inboxes",
+        "/api/v1/hooks",
+        "/api/v1/rules",
+        "/api/v1/labels",
+        "/api/v1/engines",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
     ] {
         Mock::given(method("GET"))
             .and(path(ep))
             .respond_with(ResponseTemplate::new(200).set_body_json(empty.clone()))
-            .mount(server).await;
+            .mount(server)
+            .await;
     }
 }
 
@@ -5222,22 +5467,28 @@ async fn pull_warns_on_anomalous_store_extension() {
             }]
         })))
         .with_priority(1)
-        .mount(&server).await;
+        .mount(&server)
+        .await;
 
     let project = TempDir::new().unwrap();
-    assert_cmd::Command::cargo_bin("rdc").unwrap()
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
-        .assert().success();
+        .assert()
+        .success();
     std::fs::write(
         project.path().join("secrets/dev.secrets.json"),
         r#"{"api_token":"TEST_TOKEN"}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
-    assert_cmd::Command::cargo_bin("rdc").unwrap()
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args(["sync", "dev", "--no-push"])
-        .assert().success()
+        .assert()
+        .success()
         .stderr(predicates::str::contains("broken-store-hook"))
         .stderr(predicates::str::contains("hook_template"))
         .stderr(predicates::str::contains("rdc doctor"));
@@ -5370,16 +5621,20 @@ async fn sync_emits_progress_milestone_for_large_list() {
         .mount(&server)
         .await;
 
-    let label = |id: u64| serde_json::json!({
-        "id": id,
-        "url": format!("{}/api/v1/labels/{}", server.uri(), id),
-        "name": format!("Label {id}"),
-        "organization": format!("{}/api/v1/organizations/1", server.uri())
-    });
-    let page = |from: u64| serde_json::json!({
-        "pagination": { "total_pages": 3, "next": null },
-        "results": (from..from + 100).map(label).collect::<Vec<_>>()
-    });
+    let label = |id: u64| {
+        serde_json::json!({
+            "id": id,
+            "url": format!("{}/api/v1/labels/{}", server.uri(), id),
+            "name": format!("Label {id}"),
+            "organization": format!("{}/api/v1/organizations/1", server.uri())
+        })
+    };
+    let page = |from: u64| {
+        serde_json::json!({
+            "pagination": { "total_pages": 3, "next": null },
+            "results": (from..from + 100).map(label).collect::<Vec<_>>()
+        })
+    };
     use wiremock::matchers::query_param;
     Mock::given(method("GET"))
         .and(path("/api/v1/labels"))
@@ -5425,5 +5680,150 @@ async fn sync_emits_progress_milestone_for_large_list() {
     assert!(
         stderr.contains("listing 200"),
         "expected a list milestone in:\n{stderr}"
+    );
+}
+
+/// Regression: hook with an overlay must NOT oscillate between Write and
+/// KeepLocal across successive pulls.
+///
+/// Before the fix, `pull::hooks::process` recorded `codec.base_hash(&value)`
+/// (PRE-overlay JSON) in the lockfile, but the file written to disk was the
+/// POST-overlay-stripped JSON. The on-disk hash (computed at sync classification
+/// time via `local_hook_combined_hash`) uses the POST-overlay bytes, so the
+/// stored baseline never matched the on-disk hash → the hook was always
+/// classified as a change ("phantom drift") on every subsequent pull.
+///
+/// After the fix, the baseline is `local_hook_combined_hash(post_overlay_json,
+/// code)` — identical to what the classifier computes → the second sync sees
+/// Clean (no rewrites, no API mutations).
+#[tokio::test]
+async fn sync_hook_with_overlay_no_phantom_drift() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // Hook served by the API. It has a `description` field that the overlay
+    // will strip from the on-disk snapshot.
+    let hook_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [{
+            "id": 555,
+            "url": format!("{}/api/v1/hooks/555", server.uri()),
+            "name": "Validator hook",
+            "type": "function",
+            "queues": [],
+            "events": ["annotation_content"],
+            "config": {
+                "runtime": "python3.12",
+                "code": "def validate(payload):\n    pass\n"
+            },
+            "description": "PROD-specific description managed by overlay"
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(hook_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/hooks"]).await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // Install an overlay that manages the `description` field on this hook.
+    // The overlay causes `maybe_strip_overlay` to remove `description` from
+    // the on-disk JSON — the on-disk bytes are therefore DIFFERENT from the
+    // raw serialize_hook bytes (pre-overlay), and the hash must reflect that.
+    let overlay_dir = project.path().join("envs/dev");
+    std::fs::create_dir_all(&overlay_dir).unwrap();
+    std::fs::write(
+        overlay_dir.join("overlay.toml"),
+        r#"version = 1
+
+[hooks.validator-hook]
+"description" = "PROD-specific description managed by overlay"
+"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // First sync: pull writes the hook (overlay-stripped) and records the
+    // post-overlay combined hash in the lockfile.
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("first sync should succeed");
+
+    // Verify the on-disk hook does NOT contain the overlay-managed field.
+    let hook_path = project.path().join("envs/dev/hooks/validator-hook.json");
+    assert!(hook_path.exists(), "hook file must exist after first sync");
+    let disk_json = std::fs::read_to_string(&hook_path).unwrap();
+    assert!(
+        !disk_json.contains("PROD-specific description"),
+        "overlay-managed field must be stripped from on-disk hook: {disk_json}",
+    );
+
+    // Snapshot the lockfile hash and the on-disk file so we can assert they
+    // are untouched by the second sync.
+    let lf_before =
+        std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    let disk_before = std::fs::read_to_string(&hook_path).unwrap();
+
+    // Second sync: API still serves the same hook body. The classifier must
+    // see the recorded hash == on-disk hash == remote hash → Clean. No file
+    // rewrites, no API mutations. This is the phantom-drift regression.
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("second sync should succeed (clean state)");
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    // No mutating requests on either sync.
+    for req in server.received_requests().await.unwrap_or_default() {
+        let p = req.url.path();
+        if p.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "unexpected mutating request: {} {} — hook with overlay must not cause phantom drift",
+            req.method,
+            p
+        );
+    }
+
+    // Lockfile and on-disk file are unchanged: Clean classification produces
+    // no writes. Any change here would indicate the oscillation bug is back.
+    let lf_after =
+        std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    let disk_after = std::fs::read_to_string(&hook_path).unwrap();
+    assert_eq!(
+        lf_before, lf_after,
+        "lockfile must be unchanged after second sync (no phantom drift)"
+    );
+    assert_eq!(
+        disk_before, disk_after,
+        "on-disk hook file must be unchanged after second sync (no phantom drift)"
     );
 }

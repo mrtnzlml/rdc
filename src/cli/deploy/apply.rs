@@ -494,17 +494,19 @@ pub(crate) async fn run(
             .await
             .with_context(|| format!("fetching tgt hook {tgt_id} for drift check"))?;
         let (remote_json_full, remote_code) = crate::snapshot::hook::serialize_hook(&remote_hook)?;
-        // Hash in codec format (matches what pull::hooks::process now records in
-        // the lockfile). The lockfile records the hash of the PRE-OVERLAY bytes
-        // (same as `codec.base_hash(&value)` on the raw API body), so the drift
-        // check hashes `remote_json_full` directly (not the overlay-stripped form).
+        // Hash must match what pull::hooks::process records: the POST-overlay
+        // combined hash. If an overlay strips fields from the JSON before writing
+        // to disk, the on-disk (and lockfile-recorded) hash is over the stripped
+        // bytes. Drift check must use the same framing or it falsely fires on
+        // every deploy for hooks with overlays.
+        let remote_json_for_hash = maybe_strip_overlay(remote_json_full.clone(), overlay_paths)?;
         let remote_combined_hash = {
             let sidecars: Vec<(String, Vec<u8>)> = if let Some(c) = &remote_code {
                 vec![("code".to_string(), c.as_bytes().to_vec())]
             } else {
                 vec![]
             };
-            crate::snapshot::codec::combined_hash(&remote_json_full, &sidecars)
+            crate::snapshot::codec::combined_hash(&remote_json_for_hash, &sidecars)
         };
         let in_sync = tgt_lockfile
             .objects
@@ -576,7 +578,7 @@ pub(crate) async fn run(
                 .with_context(|| {
                     format!("PATCH tgt hooks/{tgt_id} (mapped from src '{src_slug}')")
                 })?;
-            write_back_hook(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
+            write_back_hook(&tgt_paths, tgt_lockfile, tgt_slug, &updated, overlay_paths)?;
             // Record the just-injected secrets-hash so a subsequent
             // sync on the target doesn't see drift.
             let empty = std::collections::BTreeMap::<String, String>::new();
@@ -719,7 +721,7 @@ pub(crate) async fn run(
                 .update_rule(tgt_id, &payload_rule, None)
                 .await
                 .with_context(|| format!("PATCH tgt rules/{tgt_id}"))?;
-            write_back_rule(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
+            write_back_rule(&tgt_paths, tgt_lockfile, tgt_slug, &updated, overlay_paths)?;
         }
         applied.rules += 1;
         if let Some(p) = &progress {
@@ -1123,7 +1125,7 @@ pub(crate) async fn run(
                 .update_schema(tgt_id, &payload_schema, None)
                 .await
                 .with_context(|| format!("PATCH tgt schemas/{tgt_id}"))?;
-            write_back_schema(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
+            write_back_schema(&tgt_paths, tgt_lockfile, tgt_slug, &updated, overlay_paths)?;
         }
         applied.schemas += 1;
         if let Some(p) = &progress {
@@ -2159,6 +2161,7 @@ fn write_back_hook(
     tgt_lockfile: &mut Lockfile,
     slug: &str,
     response: &crate::model::Hook,
+    overlay_paths: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
 ) -> Result<()> {
     let dir = tgt_paths.hooks_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -2169,14 +2172,18 @@ fn write_back_hook(
         .get("code")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    // Hash in codec format (matches what pull::hooks records).
+    // Hash over POST-overlay bytes so it matches what pull::hooks records in
+    // the lockfile. Without stripping, a subsequent `sync tgt` would see the
+    // pre-overlay hash here and the post-overlay hash computed from disk,
+    // causing phantom drift on every deploy for hooks with overlays.
+    let json_for_hash = maybe_strip_overlay(json_bytes, overlay_paths)?;
     let hash = {
         let sidecars: Vec<(String, Vec<u8>)> = if let Some(c) = &code {
             vec![("code".to_string(), c.as_bytes().to_vec())]
         } else {
             vec![]
         };
-        crate::snapshot::codec::combined_hash(&json_bytes, &sidecars)
+        crate::snapshot::codec::combined_hash(&json_for_hash, &sidecars)
     };
     upsert_after_write_back(
         tgt_lockfile,
@@ -2195,12 +2202,16 @@ fn write_back_rule(
     tgt_lockfile: &mut Lockfile,
     slug: &str,
     response: &crate::model::Rule,
+    overlay_paths: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
 ) -> Result<()> {
     let dir = tgt_paths.rules_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let (json_bytes, code) = crate::snapshot::rule::serialize_rule(response)?;
     write_rule(&dir, slug, response)?;
-    let hash = rule_combined_hash(&json_bytes, &code);
+    // Hash over POST-overlay bytes so it matches what pull::rules records in
+    // the lockfile (same framing as the drift check above).
+    let json_for_hash = maybe_strip_overlay(json_bytes, overlay_paths)?;
+    let hash = rule_combined_hash(&json_for_hash, &code);
     upsert_after_write_back(
         tgt_lockfile,
         "rules",
@@ -2218,13 +2229,17 @@ fn write_back_schema(
     tgt_lockfile: &mut Lockfile,
     q_slug: &str,
     response: &crate::model::Schema,
+    overlay_paths: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
 ) -> Result<()> {
     let dir = locate_queue_dir(tgt_paths, q_slug)
         .ok_or_else(|| anyhow!("tgt queue dir for schema '{q_slug}' not found for write-back"))?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let (json_bytes, formula_parts) = crate::snapshot::schema::serialize_schema(response)?;
     write_schema_bytes(&dir, &json_bytes, &formula_parts)?;
-    let hash = schema_combined_hash(&json_bytes, &formula_parts);
+    // Hash over POST-overlay bytes so it matches what pull::queues records in
+    // the lockfile (same framing as the drift check above).
+    let json_for_hash = maybe_strip_overlay(json_bytes, overlay_paths)?;
+    let hash = schema_combined_hash(&json_for_hash, &formula_parts);
     upsert_after_write_back(
         tgt_lockfile,
         "schemas",
