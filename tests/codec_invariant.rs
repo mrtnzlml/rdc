@@ -110,10 +110,59 @@ fn sample_inbox() -> serde_json::Value {
     })
 }
 
+fn sample_workspace() -> serde_json::Value {
+    // Includes a nested `modified_at` to exercise recursive stripping.
+    json!({
+        "id": 700852,
+        "url": "https://x/api/v1/workspaces/700852",
+        "name": "Invoices AP",
+        "organization": "https://x/api/v1/organizations/285704",
+        "queues": ["https://x/api/v1/queues/2137275"],
+        "modified_at": "2026-03-15T11:00:00Z",
+        "metadata": {
+            "tag": "ap",
+            "modified_at": "2026-03-15T11:00:00Z"
+        }
+    })
+}
+
+fn sample_engine_field() -> serde_json::Value {
+    json!({
+        "id": 501,
+        "url": "https://x/api/v1/engine_fields/501",
+        "name": "Invoice ID",
+        "engine": "https://x/api/v1/engines/401",
+        "field_type": "string",
+        "modified_at": "2026-04-15T08:00:00Z"
+    })
+}
+
+fn sample_workflow() -> serde_json::Value {
+    json!({
+        "id": 700,
+        "url": "https://x/api/v1/workflows/700",
+        "name": "AP Invoice Flow",
+        "organization": "https://x/api/v1/organizations/285704",
+        "modified_at": "2026-04-01T10:00:00Z"
+    })
+}
+
+fn sample_workflow_step() -> serde_json::Value {
+    json!({
+        "id": 42,
+        "url": "https://x/api/v1/workflow_steps/42",
+        "name": "Manager Approval",
+        "workflow": "https://x/api/v1/workflows/700",
+        "step_type": "approval",
+        "modified_at": "2026-04-20T08:00:00Z"
+    })
+}
+
 /// Run the consistency + idempotency invariants against every registered codec
 /// that can be exercised with the sample values defined above.
 fn codec_cases() -> Vec<(&'static str, serde_json::Value)> {
     vec![
+        ("engine_fields", sample_engine_field()),
         ("engines", sample_engine()),
         ("hooks", sample_hook()),
         ("inboxes", sample_inbox()),
@@ -121,6 +170,9 @@ fn codec_cases() -> Vec<(&'static str, serde_json::Value)> {
         ("queues", sample_queue()),
         ("rules", sample_rule()),
         ("schemas", sample_schema()),
+        ("workflow_steps", sample_workflow_step()),
+        ("workflows", sample_workflow()),
+        ("workspaces", sample_workspace()),
     ]
 }
 
@@ -439,6 +491,116 @@ fn schemas_sidecar_invariants() {
     assert_eq!(
         art.sidecars[0].0, "formulas/amount_total.py",
         "sidecar label must be 'formulas/<field_id>.py'"
+    );
+}
+
+/// Workspaces: no redaction, no sidecars, modified_at stripped recursively
+/// (including nested modified_at inside sub-objects).
+#[test]
+fn workspaces_invariants() {
+    let c = codec("workspaces").expect("workspaces codec must be registered");
+    let v = sample_workspace();
+
+    let art = c.disk_bytes(&v).expect("disk_bytes");
+    let disk_str = std::str::from_utf8(&art.json).expect("disk bytes must be UTF-8");
+
+    assert!(
+        !disk_str.contains("modified_at"),
+        "modified_at (including nested) must be stripped from workspace disk bytes; got:\n{disk_str}"
+    );
+    assert!(
+        !disk_str.contains("refreshed live in Rossum"),
+        "workspaces must not have any redaction sentinel; got:\n{disk_str}"
+    );
+    assert!(
+        art.sidecars.is_empty(),
+        "workspaces must produce no sidecars"
+    );
+}
+
+/// Engine fields: no redaction, no sidecars, modified_at stripped.
+/// `name` kept by create_body but stripped by cross_env_body.
+#[test]
+fn engine_fields_invariants() {
+    let c = codec("engine_fields").expect("engine_fields codec must be registered");
+    let v = sample_engine_field();
+
+    let art = c.disk_bytes(&v).expect("disk_bytes");
+    let disk_str = std::str::from_utf8(&art.json).expect("disk bytes must be UTF-8");
+
+    assert!(
+        !disk_str.contains("modified_at"),
+        "modified_at must be stripped from engine_fields disk bytes; got:\n{disk_str}"
+    );
+    assert!(
+        !disk_str.contains("refreshed live in Rossum"),
+        "engine_fields must not have any redaction sentinel; got:\n{disk_str}"
+    );
+    assert!(
+        art.sidecars.is_empty(),
+        "engine_fields must produce no sidecars"
+    );
+
+    // create_body keeps name
+    let mut body = v.clone();
+    c.create_body(&mut body);
+    assert!(
+        body.get("name").is_some(),
+        "create_body must keep name for engine_fields"
+    );
+
+    // cross_env_body strips name
+    let mut body = v.clone();
+    c.cross_env_body(&mut body);
+    assert!(
+        body.get("name").is_none(),
+        "cross_env_body must strip the immutable name for engine_fields"
+    );
+}
+
+/// Workflows: no redaction, no sidecars, modified_at stripped.
+#[test]
+fn workflows_invariants() {
+    let c = codec("workflows").expect("workflows codec must be registered");
+    let v = sample_workflow();
+
+    let art = c.disk_bytes(&v).expect("disk_bytes");
+    let disk_str = std::str::from_utf8(&art.json).expect("disk bytes must be UTF-8");
+
+    assert!(
+        !disk_str.contains("modified_at"),
+        "modified_at must be stripped from workflow disk bytes; got:\n{disk_str}"
+    );
+    assert!(
+        !disk_str.contains("refreshed live in Rossum"),
+        "workflows must not have any redaction sentinel; got:\n{disk_str}"
+    );
+    assert!(
+        art.sidecars.is_empty(),
+        "workflows must produce no sidecars"
+    );
+}
+
+/// Workflow steps: no redaction, no sidecars, modified_at stripped.
+#[test]
+fn workflow_steps_invariants() {
+    let c = codec("workflow_steps").expect("workflow_steps codec must be registered");
+    let v = sample_workflow_step();
+
+    let art = c.disk_bytes(&v).expect("disk_bytes");
+    let disk_str = std::str::from_utf8(&art.json).expect("disk bytes must be UTF-8");
+
+    assert!(
+        !disk_str.contains("modified_at"),
+        "modified_at must be stripped from workflow_steps disk bytes; got:\n{disk_str}"
+    );
+    assert!(
+        !disk_str.contains("refreshed live in Rossum"),
+        "workflow_steps must not have any redaction sentinel; got:\n{disk_str}"
+    );
+    assert!(
+        art.sidecars.is_empty(),
+        "workflow_steps must produce no sidecars"
     );
 }
 
