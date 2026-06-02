@@ -1,18 +1,22 @@
-use super::common::{record_object, skip_on_permission_denied, PullCtx};
+use super::common::{PullCtx, record_object, skip_on_permission_denied};
 use crate::log::{Action, Log};
 use crate::model::Workspace;
 use crate::slug::slugify_unique;
-use crate::snapshot::workspace::write_workspace;
-use crate::state::content_hash;
+use crate::snapshot::writer::write_atomic;
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
+const KIND: &str = "workspaces";
+
 /// Phase 1: list all workspaces from the API.
 pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<Log>) -> Result<Vec<Workspace>> {
     skip_on_permission_denied(
-        ctx.client.list_workspaces(Some(progress.clone())).await.context("listing workspaces"),
-        "workspaces",
+        ctx.client
+            .list_workspaces(Some(progress.clone()))
+            .await
+            .context("listing workspaces"),
+        KIND,
         progress,
     )
 }
@@ -30,47 +34,61 @@ pub async fn process(
     let mut dir_created = false;
     let mut count = 0usize;
     for ws in &workspaces {
-        let slug = match ctx.lockfile.slug_for_id("workspaces", ws.id) {
+        let slug = match ctx.lockfile.slug_for_id(KIND, ws.id) {
             Some(existing) => existing.to_string(),
             None => slugify_unique(&ws.name, &used_slugs),
         };
         used_slugs.insert(slug.clone());
 
-        if !subset.contains(&("workspaces".to_string(), slug.clone())) {
+        if !subset.contains(&(KIND.to_string(), slug.clone())) {
             continue;
         }
 
         let result: Result<()> = (|| {
+            if !dir_created {
+                std::fs::create_dir_all(ctx.paths.workspaces_dir()).with_context(|| {
+                    format!("creating {}", ctx.paths.workspaces_dir().display())
+                })?;
+                dir_created = true;
+            }
 
-        if !dir_created {
-            std::fs::create_dir_all(ctx.paths.workspaces_dir())
-                .with_context(|| format!("creating {}", ctx.paths.workspaces_dir().display()))?;
-            dir_created = true;
-        }
+            let ws_dir = ctx.paths.workspace_dir(&slug);
+            std::fs::create_dir_all(&ws_dir)
+                .with_context(|| format!("creating {}", ws_dir.display()))?;
 
-        let ws_dir = ctx.paths.workspace_dir(&slug);
-        std::fs::create_dir_all(&ws_dir)
-            .with_context(|| format!("creating {}", ws_dir.display()))?;
+            // Canonical on-disk bytes via KindCodec: strips `modified_at`.
+            // No overlay for workspaces.
+            let value = serde_json::to_value(ws)?;
+            let art = crate::snapshot::codec::codec(KIND)
+                .unwrap()
+                .disk_bytes(&value)
+                .context("serializing workspace")?;
+            let bytes = art.json;
 
-        let bytes = write_workspace(&ws_dir, ws)
-            .with_context(|| format!("writing workspace '{}' to disk", ws.name))?;
-        // Mirror the just-written bytes to the base cache so the next
-        // sync's 3-way merge has a current merge base.
-        crate::state::base_cache::write(ctx.paths, &ws_dir.join("workspace.json"), &bytes)?;
-        let hash = content_hash(&bytes);
+            let ws_path = ws_dir.join("workspace.json");
+            write_atomic(&ws_path, &bytes)
+                .with_context(|| format!("writing {}", ws_path.display()))?;
+            // Mirror the just-written bytes to the base cache so the next
+            // sync's 3-way merge has a current merge base.
+            crate::state::base_cache::write(ctx.paths, &ws_path, &bytes)?;
 
-        record_object(
-            ctx.lockfile,
-            "workspaces",
-            &slug,
-            ws.id,
-            Some(ws.url.clone()),
-            ws.modified_at().map(|s| s.to_string()),
-            Some(hash),
-        );
+            let hash = crate::snapshot::codec::codec(KIND)
+                .unwrap()
+                .base_hash(&value)
+                .context("hashing workspace")?;
 
-        count += 1;
-        Ok(())
+            record_object(
+                ctx.lockfile,
+                KIND,
+                &slug,
+                ws.id,
+                Some(ws.url.clone()),
+                ws.modified_at().map(|s| s.to_string()),
+                Some(hash),
+            );
+
+            count += 1;
+            Ok(())
         })();
         result?;
     }

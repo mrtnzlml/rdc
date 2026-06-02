@@ -1,6 +1,6 @@
 use super::common::{
-    apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
-    skip_on_permission_denied, PullAction, PullCtx,
+    PullAction, PullCtx, apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
+    skip_on_permission_denied,
 };
 use crate::log::{Action, Log};
 use crate::model::EmailTemplate;
@@ -9,13 +9,18 @@ use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+const KIND: &str = "email_templates";
+
 /// Phase 1: list all email templates from the API.
 /// Note: the orphan-skipping logic (templates without a known queue_location)
 /// lives in `process`, where ctx.queue_locations is fully populated.
 pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<Log>) -> Result<Vec<EmailTemplate>> {
     skip_on_permission_denied(
-        ctx.client.list_email_templates(Some(progress.clone())).await.context("listing email templates"),
-        "email_templates",
+        ctx.client
+            .list_email_templates(Some(progress.clone()))
+            .await
+            .context("listing email templates"),
+        KIND,
         progress,
     )
 }
@@ -64,61 +69,73 @@ pub async fn process(
         let used = per_queue_used_slugs
             .entry((ws_slug.clone(), q_slug.clone()))
             .or_default();
-        let template_slug = match ctx.lockfile.slug_for_id("email_templates", t.id) {
+        let template_slug = match ctx.lockfile.slug_for_id(KIND, t.id) {
             // Existing key is `<ws>/<q>/<template>`; take the last segment.
-            Some(existing) => existing
-                .rsplit('/')
-                .next()
-                .unwrap_or(existing)
-                .to_string(),
+            Some(existing) => existing.rsplit('/').next().unwrap_or(existing).to_string(),
             None => slugify_unique(&t.name, used),
         };
         used.insert(template_slug.clone());
         let lockfile_key = format!("{ws_slug}/{q_slug}/{template_slug}");
 
-        if !subset.contains(&("email_templates".to_string(), lockfile_key.clone())) {
+        if !subset.contains(&(KIND.to_string(), lockfile_key.clone())) {
             continue;
         }
 
         let result: Result<()> = (|| {
+            let dir = ctx.paths.queue_email_templates_dir(&ws_slug, &q_slug);
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
-        let dir = ctx.paths.queue_email_templates_dir(&ws_slug, &q_slug);
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
+            // Canonical on-disk bytes via KindCodec: strips `modified_at`.
+            // Overlay is keyed by the full composite lockfile_key.
+            let value = serde_json::to_value(t)?;
+            let art = crate::snapshot::codec::codec(KIND)
+                .unwrap()
+                .disk_bytes(&value)
+                .context("serializing email template")?;
+            let codec = crate::snapshot::codec::codec(KIND).unwrap();
+            let proposed = maybe_strip_overlay(
+                art.json,
+                ctx.overlay
+                    .as_ref()
+                    .and_then(|o| codec.overlay(o, &lockfile_key)),
+            )?;
 
-        let mut proposed = serde_json::to_vec_pretty(t).context("serializing email template")?;
-        proposed.push(b'\n');
-        let proposed = maybe_strip_overlay(
-            proposed,
-            ctx.overlay.as_ref().and_then(|o| o.email_template(&lockfile_key)),
-        )?;
+            let local_path = dir.join(format!("{template_slug}.json"));
+            let base_hash = ctx
+                .lockfile
+                .objects
+                .get(KIND)
+                .and_then(|m| m.get(&lockfile_key))
+                .and_then(|x| x.content_hash.clone());
 
-        let local_path = dir.join(format!("{template_slug}.json"));
-        let base_hash = ctx
-            .lockfile
-            .objects
-            .get("email_templates")
-            .and_then(|m| m.get(&lockfile_key))
-            .and_then(|x| x.content_hash.clone());
+            let (action, remote_hash) =
+                decide_pull_action(&local_path, base_hash.as_deref(), &proposed)?;
+            if action == PullAction::Conflict {
+                conflicts += 1;
+            }
+            let recorded_hash = apply_pull_action(
+                action,
+                &local_path,
+                &proposed,
+                remote_hash,
+                ctx.interactive,
+                progress,
+                ctx.paths.env(),
+                base_hash.as_deref(),
+                Some(ctx.paths),
+            )?;
 
-        let (action, remote_hash) =
-            decide_pull_action(&local_path, base_hash.as_deref(), &proposed)?;
-        if action == PullAction::Conflict {
-            conflicts += 1;
-        }
-        let recorded_hash = apply_pull_action(action, &local_path, &proposed, remote_hash, ctx.interactive, progress, ctx.paths.env(), base_hash.as_deref(), Some(ctx.paths))?;
-
-        record_object(
-            ctx.lockfile,
-            "email_templates",
-            &lockfile_key,
-            t.id,
-            Some(t.url.clone()),
-            t.modified_at().map(|s| s.to_string()),
-            Some(recorded_hash),
-        );
-        count += 1;
-        Ok(())
+            record_object(
+                ctx.lockfile,
+                KIND,
+                &lockfile_key,
+                t.id,
+                Some(t.url.clone()),
+                t.modified_at().map(|s| s.to_string()),
+                Some(recorded_hash),
+            );
+            count += 1;
+            Ok(())
         })();
         result?;
     }

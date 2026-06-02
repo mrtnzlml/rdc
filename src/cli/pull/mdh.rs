@@ -1,5 +1,5 @@
-use super::common::{apply_pull_action, decide_pull_action, record_object, PullAction, PullCtx};
-use crate::api::{anyhow_has_status, DataStorageClient};
+use super::common::{PullAction, PullCtx, apply_pull_action, decide_pull_action, record_object};
+use crate::api::{DataStorageClient, anyhow_has_status};
 use crate::config::EnvConfig;
 use crate::log::{Action, Log};
 use crate::model::{Collection, IndexSet};
@@ -9,6 +9,8 @@ use futures::stream::{StreamExt, TryStreamExt};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
+
+const KIND: &str = "mdh";
 
 /// Strip server-only fields from an index set so the user only sees /
 /// round-trips the fields they can actually edit. Two flavors:
@@ -30,9 +32,7 @@ fn strip_server_managed(set: &IndexSet) -> IndexSet {
     let mut regular: Vec<Value> = set
         .regular
         .iter()
-        .filter(|ix| {
-            ix.get("name").and_then(|n| n.as_str()) != Some("_id_")
-        })
+        .filter(|ix| ix.get("name").and_then(|n| n.as_str()) != Some("_id_"))
         .cloned()
         .collect();
     for ix in regular.iter_mut() {
@@ -101,7 +101,10 @@ pub async fn list(env_cfg: &EnvConfig, token: &str, progress: &Arc<Log>) -> Resu
         Err(e) => return Err(e.context("listing MDH collections")),
     };
 
-    Ok(MdhListed { client, collections })
+    Ok(MdhListed {
+        client,
+        collections,
+    })
 }
 
 /// Phase 2: write listed collections + indexes to disk.
@@ -120,7 +123,10 @@ pub async fn process(
     subset: &BTreeSet<(String, String)>,
     progress: &Arc<Log>,
 ) -> Result<(usize, usize)> {
-    let MdhListed { client, collections } = listed;
+    let MdhListed {
+        client,
+        collections,
+    } = listed;
 
     if collections.is_empty() {
         return Ok((0, 0));
@@ -142,7 +148,7 @@ pub async fn process(
         let slug = slugify_unique(&c.name, &used);
         used.insert(slug.clone());
 
-        if !subset.contains(&("mdh".to_string(), slug.clone())) {
+        if !subset.contains(&(KIND.to_string(), slug.clone())) {
             continue;
         }
 
@@ -164,21 +170,21 @@ pub async fn process(
         // to remove and stay quiet.
         let legacy_coll_path = dataset_dir.join("collection.json");
         if legacy_coll_path.exists() {
-            std::fs::remove_file(&legacy_coll_path).with_context(|| {
-                format!("removing legacy {}", legacy_coll_path.display())
-            })?;
+            std::fs::remove_file(&legacy_coll_path)
+                .with_context(|| format!("removing legacy {}", legacy_coll_path.display()))?;
             progress.event(
                 Action::Info,
                 &format!("migrated mdh/{slug}: removed obsolete collection.json"),
             );
         }
         if let Some(map) = ctx.lockfile.objects.get_mut("mdh_collections")
-            && map.remove(&slug).is_some() {
-                progress.event(
-                    Action::Info,
-                    &format!("migrated mdh/{slug}: dropped mdh_collections lockfile entry"),
-                );
-            }
+            && map.remove(&slug).is_some()
+        {
+            progress.event(
+                Action::Info,
+                &format!("migrated mdh/{slug}: dropped mdh_collections lockfile entry"),
+            );
+        }
 
         dataset_dirs.push((slug.clone(), dataset_dir, c));
     }
@@ -186,9 +192,10 @@ pub async fn process(
     // up empty after migration. Leaves the json clean for users grepping
     // the lockfile.
     if let Some(map) = ctx.lockfile.objects.get("mdh_collections")
-        && map.is_empty() {
-            ctx.lockfile.objects.remove("mdh_collections");
-        }
+        && map.is_empty()
+    {
+        ctx.lockfile.objects.remove("mdh_collections");
+    }
 
     // === Sub-phase B: concurrent index fetches per collection (regular +
     //            search). Bounded fan-out (see common::PULL_FANOUT); the
@@ -199,14 +206,20 @@ pub async fn process(
         return Ok((0, conflicts));
     }
     let fetched_result: Result<Vec<(String, IndexSet)>> = futures::stream::iter(
-        dataset_dirs.iter().map(|(slug, _, c)| (slug.clone(), c.name.clone()))
+        dataset_dirs
+            .iter()
+            .map(|(slug, _, c)| (slug.clone(), c.name.clone())),
     )
     .map(|(slug, name)| {
         let progress = progress.clone();
         async move {
-            let regular = client_ref.list_indexes(&name, Some(progress.clone())).await
+            let regular = client_ref
+                .list_indexes(&name, Some(progress.clone()))
+                .await
                 .with_context(|| format!("listing indexes for '{name}'"))?;
-            let search = client_ref.list_search_indexes(&name, Some(progress.clone())).await
+            let search = client_ref
+                .list_search_indexes(&name, Some(progress.clone()))
+                .await
                 .with_context(|| format!("listing search indexes for '{name}'"))?;
             Ok::<_, anyhow::Error>((slug, IndexSet { regular, search }))
         }
@@ -223,44 +236,67 @@ pub async fn process(
     //            stripped of server-managed fields (the implicit `_id_`
     //            regular index, the `v` index-version field) before
     //            serializing so the on-disk JSON contains only what the
-    //            user can actually edit.
+    //            user can actually edit. Hash via KindCodec (byte-identical
+    //            to the legacy content_hash path since codec.disk_bytes for
+    //            mdh produces the same bytes as the legacy strip+serialize).
     for (slug, dataset_dir, _c) in &dataset_dirs {
-        let Some(index_set) = by_slug.get(slug) else { continue };
+        let Some(index_set) = by_slug.get(slug) else {
+            continue;
+        };
         let trimmed = strip_server_managed(index_set);
 
         let ix_result: Result<()> = (|| {
+            let ix_path = dataset_dir.join("indexes.json");
 
-        let ix_path = dataset_dir.join("indexes.json");
-        let mut ix_proposed = serde_json::to_vec_pretty(&trimmed).context("serializing index set")?;
-        ix_proposed.push(b'\n');
-        let ix_base = ctx
-            .lockfile
-            .objects
-            .get("mdh_indexes")
-            .and_then(|m| m.get(slug))
-            .and_then(|e| e.content_hash.clone());
-        let (i_action, i_remote_hash) =
-            decide_pull_action(&ix_path, ix_base.as_deref(), &ix_proposed)?;
-        if i_action == PullAction::Conflict {
-            conflicts += 1;
-        }
-        let i_recorded = apply_pull_action(i_action, &ix_path, &ix_proposed, i_remote_hash, ctx.interactive, progress, ctx.paths.env(), ix_base.as_deref(), Some(ctx.paths))?;
-        record_object(
-            ctx.lockfile,
-            "mdh_indexes",
-            slug,
-            0,
-            None,
-            None,
-            Some(i_recorded),
-        );
-        Ok(())
+            // Use KindCodec for byte + hash production.
+            let value = serde_json::to_value(&trimmed).context("serializing index set as value")?;
+            let art = crate::snapshot::codec::codec(KIND)
+                .unwrap()
+                .disk_bytes(&value)
+                .context("serializing index set via codec")?;
+            let ix_proposed = art.json;
+
+            let ix_base = ctx
+                .lockfile
+                .objects
+                .get("mdh_indexes")
+                .and_then(|m| m.get(slug))
+                .and_then(|e| e.content_hash.clone());
+            let (i_action, i_remote_hash) =
+                decide_pull_action(&ix_path, ix_base.as_deref(), &ix_proposed)?;
+            if i_action == PullAction::Conflict {
+                conflicts += 1;
+            }
+            let i_recorded = apply_pull_action(
+                i_action,
+                &ix_path,
+                &ix_proposed,
+                i_remote_hash,
+                ctx.interactive,
+                progress,
+                ctx.paths.env(),
+                ix_base.as_deref(),
+                Some(ctx.paths),
+            )?;
+            record_object(
+                ctx.lockfile,
+                "mdh_indexes",
+                slug,
+                0,
+                None,
+                None,
+                Some(i_recorded),
+            );
+            Ok(())
         })();
         ix_result?;
     }
 
     if !dataset_dirs.is_empty() {
-        progress.event(Action::Pull, &format!("mdh_datasets ({} pulled)", dataset_dirs.len()));
+        progress.event(
+            Action::Pull,
+            &format!("mdh_datasets ({} pulled)", dataset_dirs.len()),
+        );
     }
 
     Ok((dataset_dirs.len(), conflicts))

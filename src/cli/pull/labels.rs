@@ -1,6 +1,6 @@
 use super::common::{
-    apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
-    skip_on_permission_denied, PullAction, PullCtx,
+    PullAction, PullCtx, apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
+    skip_on_permission_denied,
 };
 use crate::log::{Action, Log};
 use crate::model::Label;
@@ -9,11 +9,16 @@ use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
+const KIND: &str = "labels";
+
 /// Phase 1: list all labels from the API.
 pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<Log>) -> Result<Vec<Label>> {
     skip_on_permission_denied(
-        ctx.client.list_labels(Some(progress.clone())).await.context("listing labels"),
-        "labels",
+        ctx.client
+            .list_labels(Some(progress.clone()))
+            .await
+            .context("listing labels"),
+        KIND,
         progress,
     )
 }
@@ -34,57 +39,70 @@ pub async fn process(
     let mut conflicts = 0usize;
     let mut written = 0usize;
     for l in &labels {
-        let slug = match ctx.lockfile.slug_for_id("labels", l.id) {
+        let slug = match ctx.lockfile.slug_for_id(KIND, l.id) {
             Some(existing) => existing.to_string(),
             None => slugify_unique(&l.name, &used),
         };
         used.insert(slug.clone());
 
-        if !subset.contains(&("labels".to_string(), slug.clone())) {
+        if !subset.contains(&(KIND.to_string(), slug.clone())) {
             continue;
         }
 
         let result: Result<()> = (|| {
+            if !dir_created {
+                std::fs::create_dir_all(ctx.paths.labels_dir())
+                    .with_context(|| format!("creating {}", ctx.paths.labels_dir().display()))?;
+                dir_created = true;
+            }
 
-        if !dir_created {
-            std::fs::create_dir_all(ctx.paths.labels_dir())
-                .with_context(|| format!("creating {}", ctx.paths.labels_dir().display()))?;
-            dir_created = true;
-        }
+            let value = serde_json::to_value(l)?;
+            let art = crate::snapshot::codec::codec(KIND)
+                .unwrap()
+                .disk_bytes(&value)
+                .context("serializing label")?;
+            let codec = crate::snapshot::codec::codec(KIND).unwrap();
+            let proposed = maybe_strip_overlay(
+                art.json,
+                ctx.overlay.as_ref().and_then(|o| codec.overlay(o, &slug)),
+            )?;
 
-        let mut proposed = serde_json::to_vec_pretty(l).context("serializing label")?;
-        proposed.push(b'\n');
-        let proposed = maybe_strip_overlay(
-            proposed,
-            ctx.overlay.as_ref().and_then(|o| o.label(&slug)),
-        )?;
+            let local_path = ctx.paths.labels_dir().join(format!("{slug}.json"));
+            let base_hash = ctx
+                .lockfile
+                .objects
+                .get(KIND)
+                .and_then(|m| m.get(&slug))
+                .and_then(|e| e.content_hash.clone());
 
-        let local_path = ctx.paths.labels_dir().join(format!("{slug}.json"));
-        let base_hash = ctx
-            .lockfile
-            .objects
-            .get("labels")
-            .and_then(|m| m.get(&slug))
-            .and_then(|e| e.content_hash.clone());
+            let (action, remote_hash) =
+                decide_pull_action(&local_path, base_hash.as_deref(), &proposed)?;
+            if action == PullAction::Conflict {
+                conflicts += 1;
+            }
+            let recorded_hash = apply_pull_action(
+                action,
+                &local_path,
+                &proposed,
+                remote_hash,
+                ctx.interactive,
+                progress,
+                ctx.paths.env(),
+                base_hash.as_deref(),
+                Some(ctx.paths),
+            )?;
 
-        let (action, remote_hash) =
-            decide_pull_action(&local_path, base_hash.as_deref(), &proposed)?;
-        if action == PullAction::Conflict {
-            conflicts += 1;
-        }
-        let recorded_hash = apply_pull_action(action, &local_path, &proposed, remote_hash, ctx.interactive, progress, ctx.paths.env(), base_hash.as_deref(), Some(ctx.paths))?;
-
-        record_object(
-            ctx.lockfile,
-            "labels",
-            &slug,
-            l.id,
-            Some(l.url.clone()),
-            l.modified_at().map(|s| s.to_string()),
-            Some(recorded_hash),
-        );
-        written += 1;
-        Ok(())
+            record_object(
+                ctx.lockfile,
+                KIND,
+                &slug,
+                l.id,
+                Some(l.url.clone()),
+                l.modified_at().map(|s| s.to_string()),
+                Some(recorded_hash),
+            );
+            written += 1;
+            Ok(())
         })();
         result?;
     }
@@ -103,7 +121,6 @@ mod tests {
     use crate::paths::Paths;
     use crate::state::Lockfile;
     use serde_json::Value;
-    
 
     fn mk_label(id: u64, name: &str) -> Label {
         Label {
@@ -149,9 +166,13 @@ mod tests {
 
         assert_eq!(written, 1, "only the in-subset label should be written");
         assert_eq!(conflicts, 0);
-        assert!(paths.labels_dir().join("in-scope.json").exists(),
-            "in-scope label file must exist");
-        assert!(!paths.labels_dir().join("out-of-scope.json").exists(),
-            "out-of-scope label file must NOT exist");
+        assert!(
+            paths.labels_dir().join("in-scope.json").exists(),
+            "in-scope label file must exist"
+        );
+        assert!(
+            !paths.labels_dir().join("out-of-scope.json").exists(),
+            "out-of-scope label file must NOT exist"
+        );
     }
 }

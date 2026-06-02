@@ -1,22 +1,19 @@
-use crate::api::{anyhow_has_status, RossumClient};
+use crate::api::{RossumClient, anyhow_has_status};
 use crate::cli::deploy::common::{bytes_equal_after_strip, rewrite_urls, tgt_drift_status};
-use crate::snapshot::create::{redact_for_disk, strip_for_cross_env_patch};
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::config::ProjectConfig;
 use crate::log::{Action, Log};
 use crate::mapping::Mapping;
-use crate::overlay::{apply_overrides, Overlay};
+use crate::overlay::{Overlay, apply_overrides};
 use crate::paths::Paths;
 use crate::secrets::resolve_token;
+use crate::snapshot::create::{redact_for_disk, strip_for_cross_env_patch};
 use crate::snapshot::email_template::{read_email_template, write_email_template};
 use crate::snapshot::hook::{read_hook_value, write_hook};
 use crate::snapshot::rule::write_rule;
 use crate::snapshot::schema::{read_schema_value, write_schema_bytes};
-use crate::state::{
-    content_hash, hook_combined_hash, rule_combined_hash, schema_combined_hash, Lockfile,
-    ObjectEntry,
-};
-use anyhow::{anyhow, Context, Result};
+use crate::state::{Lockfile, ObjectEntry, content_hash, rule_combined_hash, schema_combined_hash};
+use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -79,10 +76,7 @@ fn warn(progress: &Option<Arc<Log>>, msg: String) {
 /// decide whether to pin `token_owner` from the tgt overlay during the
 /// cross-env update phase.
 fn is_store_extension(payload: &Value) -> bool {
-    payload
-        .get("extension_source")
-        .and_then(|v| v.as_str())
-        == Some("rossum_store")
+    payload.get("extension_source").and_then(|v| v.as_str()) == Some("rossum_store")
 }
 
 /// Adopt an out-of-band change on tgt: refresh the lockfile entry's
@@ -159,17 +153,21 @@ fn handle_drift(
         }
         Some(DriftDecision::Keep) => {
             adopt_tgt_drift(progress, tgt_lockfile, kind, tgt_slug, remote_hash);
-            if let Some(p) = progress { p.event(
-                Action::Skip,
-                &format!("{kind}/{tgt_slug} kept tgt out-of-band edit"),
-            ) }
+            if let Some(p) = progress {
+                p.event(
+                    Action::Skip,
+                    &format!("{kind}/{tgt_slug} kept tgt out-of-band edit"),
+                )
+            }
             Ok(DriftHandling::SkipObject)
         }
         Some(DriftDecision::Skip) => {
-            if let Some(p) = progress { p.event(
-                Action::Skip,
-                &format!("{kind}/{tgt_slug} drift deferred; re-prompts next deploy"),
-            ) }
+            if let Some(p) = progress {
+                p.event(
+                    Action::Skip,
+                    &format!("{kind}/{tgt_slug} drift deferred; re-prompts next deploy"),
+                )
+            }
             Ok(DriftHandling::SkipObject)
         }
         None => {
@@ -230,8 +228,14 @@ pub(crate) async fn run(
     let tgt_paths = Paths::for_env(&cwd, tgt);
 
     let cfg = ProjectConfig::load(&src_paths.project_config())?;
-    let _src_cfg = cfg.envs.get(src).ok_or_else(|| anyhow!("env '{src}' is not defined in rdc.toml"))?;
-    let tgt_cfg = cfg.envs.get(tgt).ok_or_else(|| anyhow!("env '{tgt}' is not defined in rdc.toml"))?;
+    let _src_cfg = cfg
+        .envs
+        .get(src)
+        .ok_or_else(|| anyhow!("env '{src}' is not defined in rdc.toml"))?;
+    let tgt_cfg = cfg
+        .envs
+        .get(tgt)
+        .ok_or_else(|| anyhow!("env '{tgt}' is not defined in rdc.toml"))?;
 
     let token = resolve_token(&cwd, tgt, &tgt_cfg.api_base).await?;
     let tgt_client = RossumClient::new(tgt_cfg.api_base.clone(), token)
@@ -239,10 +243,18 @@ pub(crate) async fn run(
         .with_env_label(tgt);
 
     let mapping = Mapping::load(&src_paths.mapping_file(src, tgt))?;
-    let src_lockfile = Lockfile::load(&src_paths.lockfile())
-        .with_context(|| format!("loading src lockfile from {}", src_paths.lockfile().display()))?;
-    let tgt_overlay = Overlay::load(&tgt_paths.overlay_file())
-        .with_context(|| format!("loading tgt overlay from {}", tgt_paths.overlay_file().display()))?;
+    let src_lockfile = Lockfile::load(&src_paths.lockfile()).with_context(|| {
+        format!(
+            "loading src lockfile from {}",
+            src_paths.lockfile().display()
+        )
+    })?;
+    let tgt_overlay = Overlay::load(&tgt_paths.overlay_file()).with_context(|| {
+        format!(
+            "loading tgt overlay from {}",
+            tgt_paths.overlay_file().display()
+        )
+    })?;
 
     let mut applied = ApplyCounts::default();
     let mut skipped = 0usize;
@@ -254,42 +266,92 @@ pub(crate) async fn run(
     // tgt after the workspace's initial POST.
     for (src_slug, tgt_slug) in &mapping.workspaces {
         if let Some(sel) = selection
-            && !sel.contains("workspaces", src_slug) {
-                continue;
-            }
-        let Some(tgt_id) = lookup_tgt_id_w(tgt_lockfile, "workspaces", tgt_slug, &mut skipped, &progress) else { continue };
+            && !sel.contains("workspaces", src_slug)
+        {
+            continue;
+        }
+        let Some(tgt_id) = lookup_tgt_id_w(
+            tgt_lockfile,
+            "workspaces",
+            tgt_slug,
+            &mut skipped,
+            &progress,
+        ) else {
+            continue;
+        };
         let path = src_paths.workspace_dir(src_slug).join("workspace.json");
         let raw = match std::fs::read_to_string(&path) {
             Ok(r) => r,
-            Err(e) => { warn(&progress, format!("warning: cannot read src workspaces/{src_slug}: {e:#}")); skipped += 1; continue; }
+            Err(e) => {
+                warn(
+                    &progress,
+                    format!("warning: cannot read src workspaces/{src_slug}: {e:#}"),
+                );
+                skipped += 1;
+                continue;
+            }
         };
         let mut payload: Value = match serde_json::from_str(&raw) {
             Ok(v) => v,
-            Err(e) => { warn(&progress, format!("warning: parsing workspaces/{src_slug}: {e:#}")); skipped += 1; continue; }
+            Err(e) => {
+                warn(
+                    &progress,
+                    format!("warning: parsing workspaces/{src_slug}: {e:#}"),
+                );
+                skipped += 1;
+                continue;
+            }
         };
-        rewrite_urls(&mut payload, &src_lockfile, tgt_lockfile, &mapping, &mapping.hook_templates);
+        rewrite_urls(
+            &mut payload,
+            &src_lockfile,
+            tgt_lockfile,
+            &mapping,
+            &mapping.hook_templates,
+        );
         // Overlay has no per-workspace section in the current schema; if
         // that changes, add the `ov.workspace(tgt_slug)` apply here.
         // List + find pattern matches engines/engine_fields and is what
         // existing deploy test mocks expose (`GET /workspaces` list, not
         // individual id GETs).
-        let remotes = tgt_client.list_workspaces(None).await.context("listing tgt workspaces for drift check")?;
+        let remotes = tgt_client
+            .list_workspaces(None)
+            .await
+            .context("listing tgt workspaces for drift check")?;
         let Some(remote_ws) = remotes.iter().find(|w| w.id == tgt_id) else {
-            warn(&progress, format!("warning: workspace id {tgt_id} not found on tgt remote; skipping"));
+            warn(
+                &progress,
+                format!("warning: workspace id {tgt_id} not found on tgt remote; skipping"),
+            );
             skipped += 1;
             continue;
         };
-        let mut remote_bytes = serde_json::to_vec_pretty(remote_ws).context("serializing remote workspace")?;
+        let mut remote_bytes =
+            serde_json::to_vec_pretty(remote_ws).context("serializing remote workspace")?;
         remote_bytes.push(b'\n');
         // Bytes for the idempotency check — must match what the PATCH body
         // would be after stripping.
-        let mut payload_bytes = serde_json::to_vec_pretty(&payload)
-            .context("serializing payload workspace")?;
+        let mut payload_bytes =
+            serde_json::to_vec_pretty(&payload).context("serializing payload workspace")?;
         payload_bytes.push(b'\n');
-        let (in_sync, remote_hash) =
-            tgt_drift_status(remote_bytes.clone(), None, tgt_lockfile, "workspaces", tgt_slug)?;
+        let (in_sync, remote_hash) = tgt_drift_status(
+            remote_bytes.clone(),
+            None,
+            tgt_lockfile,
+            "workspaces",
+            tgt_slug,
+        )?;
         if !in_sync {
-            match handle_drift(&progress, tgt_lockfile, drift_decisions, &mut drifted, dry_run, "workspaces", tgt_slug, remote_hash)? {
+            match handle_drift(
+                &progress,
+                tgt_lockfile,
+                drift_decisions,
+                &mut drifted,
+                dry_run,
+                "workspaces",
+                tgt_slug,
+                remote_hash,
+            )? {
                 DriftHandling::SkipObject => continue,
                 DriftHandling::Patch => {}
             }
@@ -310,28 +372,50 @@ pub(crate) async fn run(
             // before PATCH to mirror queues/email_templates/inboxes.
             let mut patch_body = payload.clone();
             crate::snapshot::create::strip_for_cross_env_patch(&mut patch_body, "workspaces");
-            let response_value = tgt_client.patch_value(&format!("/workspaces/{tgt_id}"), &patch_body, None).await
+            let response_value = tgt_client
+                .patch_value(&format!("/workspaces/{tgt_id}"), &patch_body, None)
+                .await
                 .with_context(|| format!("PATCH tgt workspaces/{tgt_id}"))?;
             let updated: crate::model::Workspace = serde_json::from_value(response_value)
                 .context("parsing PATCH /workspaces response as Workspace")?;
             write_back_workspace(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
         }
         applied.workspaces += 1;
-        if let Some(p) = &progress { p.event(Action::Patch, &format!("workspace/{tgt_slug}")); }
+        if let Some(p) = &progress {
+            p.event(Action::Patch, &format!("workspace/{tgt_slug}"));
+        }
     }
 
     // Hooks ------------------------------------------------------------
     for (src_slug, tgt_slug) in &mapping.hooks {
         if let Some(sel) = selection
-            && !sel.contains("hooks", src_slug) {
-                continue;
-            }
-        let Some(tgt_id) = lookup_tgt_id_w(tgt_lockfile, "hooks", tgt_slug, &mut skipped, &progress) else { continue };
+            && !sel.contains("hooks", src_slug)
+        {
+            continue;
+        }
+        let Some(tgt_id) =
+            lookup_tgt_id_w(tgt_lockfile, "hooks", tgt_slug, &mut skipped, &progress)
+        else {
+            continue;
+        };
         let mut payload = match read_hook_value(&src_paths.hooks_dir(), src_slug) {
             Ok(v) => v,
-            Err(e) => { warn(&progress, format!("warning: cannot read src hooks/{src_slug}: {e:#}")); skipped += 1; continue; }
+            Err(e) => {
+                warn(
+                    &progress,
+                    format!("warning: cannot read src hooks/{src_slug}: {e:#}"),
+                );
+                skipped += 1;
+                continue;
+            }
         };
-        rewrite_urls(&mut payload, &src_lockfile, tgt_lockfile, &mapping, &mapping.hook_templates);
+        rewrite_urls(
+            &mut payload,
+            &src_lockfile,
+            tgt_lockfile,
+            &mapping,
+            &mapping.hook_templates,
+        );
         let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.hook(tgt_slug));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
@@ -368,14 +452,17 @@ pub(crate) async fn run(
                     }
                 }
                 None if is_store_extension(&payload) => {
-                    warn(&progress, format!(
-                        "warning: hooks/{tgt_slug} is a store extension but {} has no \
+                    warn(
+                        &progress,
+                        format!(
+                            "warning: hooks/{tgt_slug} is a store extension but {} has no \
                          token_owner for it (neither [hooks.{tgt_slug}] token_owner nor \
                          [defaults] store_extension_token_owner). Run `rdc deploy {src} {tgt}` \
                          on a TTY once to pick interactively, or set it in the overlay file \
                          directly. Skipping this hook.",
-                        tgt_paths.overlay_file().display(),
-                    ));
+                            tgt_paths.overlay_file().display(),
+                        ),
+                    );
                     skipped += 1;
                     continue;
                 }
@@ -389,19 +476,36 @@ pub(crate) async fn run(
         let payload_hook: crate::model::Hook = match serde_json::from_value(payload.clone()) {
             Ok(h) => h,
             Err(e) => {
-                warn(&progress, format!("warn: hooks/{src_slug} -> {tgt_slug}: payload not a valid Hook ({e:#}); skipping. Did you forget to set tgt overlay for required fields?"));
+                warn(
+                    &progress,
+                    format!(
+                        "warn: hooks/{src_slug} -> {tgt_slug}: payload not a valid Hook ({e:#}); skipping. Did you forget to set tgt overlay for required fields?"
+                    ),
+                );
                 skipped += 1;
                 continue;
             }
         };
-        let (payload_json_full, payload_code) = crate::snapshot::hook::serialize_hook(&payload_hook)?;
+        let (payload_json_full, payload_code) =
+            crate::snapshot::hook::serialize_hook(&payload_hook)?;
         // Drift check.
-        let remote_hook = tgt_client.get_hook(tgt_id, None).await
+        let remote_hook = tgt_client
+            .get_hook(tgt_id, None)
+            .await
             .with_context(|| format!("fetching tgt hook {tgt_id} for drift check"))?;
         let (remote_json_full, remote_code) = crate::snapshot::hook::serialize_hook(&remote_hook)?;
-        let stripped = maybe_strip_overlay(remote_json_full.clone(), overlay_paths)?;
-        let remote_combined_hash =
-            crate::state::hook_combined_hash(&stripped, &remote_code);
+        // Hash in codec format (matches what pull::hooks::process now records in
+        // the lockfile). The lockfile records the hash of the PRE-OVERLAY bytes
+        // (same as `codec.base_hash(&value)` on the raw API body), so the drift
+        // check hashes `remote_json_full` directly (not the overlay-stripped form).
+        let remote_combined_hash = {
+            let sidecars: Vec<(String, Vec<u8>)> = if let Some(c) = &remote_code {
+                vec![("code".to_string(), c.as_bytes().to_vec())]
+            } else {
+                vec![]
+            };
+            crate::snapshot::codec::combined_hash(&remote_json_full, &sidecars)
+        };
         let in_sync = tgt_lockfile
             .objects
             .get("hooks")
@@ -410,7 +514,16 @@ pub(crate) async fn run(
             .map(|b| b == remote_combined_hash)
             .unwrap_or(true);
         if !in_sync {
-            match handle_drift(&progress, tgt_lockfile, drift_decisions, &mut drifted, dry_run, "hooks", tgt_slug, remote_combined_hash)? {
+            match handle_drift(
+                &progress,
+                tgt_lockfile,
+                drift_decisions,
+                &mut drifted,
+                dry_run,
+                "hooks",
+                tgt_slug,
+                remote_combined_hash,
+            )? {
                 DriftHandling::SkipObject => continue,
                 DriftHandling::Patch => {}
             }
@@ -450,15 +563,19 @@ pub(crate) async fn run(
             let mut body = serde_json::to_value(&payload_hook)
                 .with_context(|| format!("serializing hook '{src_slug}' for PATCH"))?;
             if let Some(secrets) = hook_secrets_plan.for_slug(src_slug)
-                && let Some(obj) = body.as_object_mut() {
-                    obj.insert(
-                        "secrets".to_string(),
-                        serde_json::to_value(secrets)
-                            .expect("BTreeMap<String,String> serializes"),
-                    );
-                }
-            let updated = tgt_client.update_hook_value(tgt_id, &body, None).await
-                .with_context(|| format!("PATCH tgt hooks/{tgt_id} (mapped from src '{src_slug}')"))?;
+                && let Some(obj) = body.as_object_mut()
+            {
+                obj.insert(
+                    "secrets".to_string(),
+                    serde_json::to_value(secrets).expect("BTreeMap<String,String> serializes"),
+                );
+            }
+            let updated = tgt_client
+                .update_hook_value(tgt_id, &body, None)
+                .await
+                .with_context(|| {
+                    format!("PATCH tgt hooks/{tgt_id} (mapped from src '{src_slug}')")
+                })?;
             write_back_hook(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
             // Record the just-injected secrets-hash so a subsequent
             // sync on the target doesn't see drift.
@@ -474,7 +591,9 @@ pub(crate) async fn run(
             }
         }
         applied.hooks += 1;
-        if let Some(p) = &progress { p.event(Action::Patch, &format!("hook/{tgt_slug}")); }
+        if let Some(p) = &progress {
+            p.event(Action::Patch, &format!("hook/{tgt_slug}"));
+        }
     }
 
     // Rules ------------------------------------------------------------
@@ -484,38 +603,74 @@ pub(crate) async fn run(
     let mut remote_rules_cache: Option<Vec<crate::model::Rule>> = None;
     for (src_slug, tgt_slug) in &mapping.rules {
         if let Some(sel) = selection
-            && !sel.contains("rules", src_slug) {
-                continue;
-            }
-        let Some(tgt_id) = lookup_tgt_id_w(tgt_lockfile, "rules", tgt_slug, &mut skipped, &progress) else { continue };
-        let mut payload = match crate::snapshot::rule::read_rule_value(&src_paths.rules_dir(), src_slug) {
-            Ok(v) => v,
-            Err(e) => { warn(&progress, format!("warning: cannot read src rules/{src_slug}: {e:#}")); skipped += 1; continue; }
+            && !sel.contains("rules", src_slug)
+        {
+            continue;
+        }
+        let Some(tgt_id) =
+            lookup_tgt_id_w(tgt_lockfile, "rules", tgt_slug, &mut skipped, &progress)
+        else {
+            continue;
         };
-        rewrite_urls(&mut payload, &src_lockfile, tgt_lockfile, &mapping, &mapping.hook_templates);
+        let mut payload =
+            match crate::snapshot::rule::read_rule_value(&src_paths.rules_dir(), src_slug) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn(
+                        &progress,
+                        format!("warning: cannot read src rules/{src_slug}: {e:#}"),
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
+        rewrite_urls(
+            &mut payload,
+            &src_lockfile,
+            tgt_lockfile,
+            &mapping,
+            &mapping.hook_templates,
+        );
         let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.rule(tgt_slug));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }
         let payload_rule: crate::model::Rule = match serde_json::from_value(payload) {
             Ok(v) => v,
-            Err(e) => { warn(&progress, format!("warn: rules/{src_slug} -> {tgt_slug}: payload not a valid Rule ({e:#}); skipping")); skipped += 1; continue; }
+            Err(e) => {
+                warn(
+                    &progress,
+                    format!(
+                        "warn: rules/{src_slug} -> {tgt_slug}: payload not a valid Rule ({e:#}); skipping"
+                    ),
+                );
+                skipped += 1;
+                continue;
+            }
         };
-        let (payload_json_full, payload_code) = crate::snapshot::rule::serialize_rule(&payload_rule)?;
+        let (payload_json_full, payload_code) =
+            crate::snapshot::rule::serialize_rule(&payload_rule)?;
 
         if remote_rules_cache.is_none() {
-            remote_rules_cache = Some(tgt_client.list_rules(None).await.context("listing tgt rules for drift check")?);
+            remote_rules_cache = Some(
+                tgt_client
+                    .list_rules(None)
+                    .await
+                    .context("listing tgt rules for drift check")?,
+            );
         }
         let cache = remote_rules_cache.as_ref().unwrap();
         let Some(remote) = cache.iter().find(|r| r.id == tgt_id) else {
-            warn(&progress, format!("warning: rule id {tgt_id} not found on tgt remote; skipping"));
+            warn(
+                &progress,
+                format!("warning: rule id {tgt_id} not found on tgt remote; skipping"),
+            );
             skipped += 1;
             continue;
         };
         let (remote_json_full, remote_code) = crate::snapshot::rule::serialize_rule(remote)?;
         let stripped = maybe_strip_overlay(remote_json_full.clone(), overlay_paths)?;
-        let remote_combined_hash =
-            crate::state::rule_combined_hash(&stripped, &remote_code);
+        let remote_combined_hash = crate::state::rule_combined_hash(&stripped, &remote_code);
         let in_sync = tgt_lockfile
             .objects
             .get("rules")
@@ -524,7 +679,16 @@ pub(crate) async fn run(
             .map(|b| b == remote_combined_hash)
             .unwrap_or(true);
         if !in_sync {
-            match handle_drift(&progress, tgt_lockfile, drift_decisions, &mut drifted, dry_run, "rules", tgt_slug, remote_combined_hash)? {
+            match handle_drift(
+                &progress,
+                tgt_lockfile,
+                drift_decisions,
+                &mut drifted,
+                dry_run,
+                "rules",
+                tgt_slug,
+                remote_combined_hash,
+            )? {
                 DriftHandling::SkipObject => continue,
                 DriftHandling::Patch => {}
             }
@@ -551,57 +715,119 @@ pub(crate) async fn run(
             }
         }
         if !dry_run {
-            let updated = tgt_client.update_rule(tgt_id, &payload_rule, None).await
+            let updated = tgt_client
+                .update_rule(tgt_id, &payload_rule, None)
+                .await
                 .with_context(|| format!("PATCH tgt rules/{tgt_id}"))?;
             write_back_rule(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
         }
         applied.rules += 1;
-        if let Some(p) = &progress { p.event(Action::Patch, &format!("rule/{tgt_slug}")); }
+        if let Some(p) = &progress {
+            p.event(Action::Patch, &format!("rule/{tgt_slug}"));
+        }
     }
 
     // Labels -----------------------------------------------------------
     let mut remote_labels_cache: Option<Vec<crate::model::Label>> = None;
     for (src_slug, tgt_slug) in &mapping.labels {
         if let Some(sel) = selection
-            && !sel.contains("labels", src_slug) {
-                continue;
-            }
-        let Some(tgt_id) = lookup_tgt_id_w(tgt_lockfile, "labels", tgt_slug, &mut skipped, &progress) else { continue };
+            && !sel.contains("labels", src_slug)
+        {
+            continue;
+        }
+        let Some(tgt_id) =
+            lookup_tgt_id_w(tgt_lockfile, "labels", tgt_slug, &mut skipped, &progress)
+        else {
+            continue;
+        };
         let path = src_paths.labels_dir().join(format!("{src_slug}.json"));
         let raw = match std::fs::read_to_string(&path) {
             Ok(r) => r,
-            Err(e) => { warn(&progress, format!("warning: cannot read src labels/{src_slug}: {e:#}")); skipped += 1; continue; }
+            Err(e) => {
+                warn(
+                    &progress,
+                    format!("warning: cannot read src labels/{src_slug}: {e:#}"),
+                );
+                skipped += 1;
+                continue;
+            }
         };
         let mut payload: Value = match serde_json::from_str(&raw) {
             Ok(v) => v,
-            Err(e) => { warn(&progress, format!("warning: parsing labels/{src_slug}: {e:#}")); skipped += 1; continue; }
+            Err(e) => {
+                warn(
+                    &progress,
+                    format!("warning: parsing labels/{src_slug}: {e:#}"),
+                );
+                skipped += 1;
+                continue;
+            }
         };
-        rewrite_urls(&mut payload, &src_lockfile, tgt_lockfile, &mapping, &mapping.hook_templates);
+        rewrite_urls(
+            &mut payload,
+            &src_lockfile,
+            tgt_lockfile,
+            &mapping,
+            &mapping.hook_templates,
+        );
         let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.label(tgt_slug));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }
         let payload_label: crate::model::Label = match serde_json::from_value(payload) {
             Ok(v) => v,
-            Err(e) => { warn(&progress, format!("warn: labels/{src_slug} -> {tgt_slug}: payload not a valid Label ({e:#}); skipping")); skipped += 1; continue; }
+            Err(e) => {
+                warn(
+                    &progress,
+                    format!(
+                        "warn: labels/{src_slug} -> {tgt_slug}: payload not a valid Label ({e:#}); skipping"
+                    ),
+                );
+                skipped += 1;
+                continue;
+            }
         };
-        let mut payload_bytes = serde_json::to_vec_pretty(&payload_label).context("serializing payload label")?;
+        let mut payload_bytes =
+            serde_json::to_vec_pretty(&payload_label).context("serializing payload label")?;
         payload_bytes.push(b'\n');
         if remote_labels_cache.is_none() {
-            remote_labels_cache = Some(tgt_client.list_labels(None).await.context("listing tgt labels for drift check")?);
+            remote_labels_cache = Some(
+                tgt_client
+                    .list_labels(None)
+                    .await
+                    .context("listing tgt labels for drift check")?,
+            );
         }
         let cache = remote_labels_cache.as_ref().unwrap();
         let Some(remote) = cache.iter().find(|l| l.id == tgt_id) else {
-            warn(&progress, format!("warning: label id {tgt_id} not found on tgt remote; skipping"));
+            warn(
+                &progress,
+                format!("warning: label id {tgt_id} not found on tgt remote; skipping"),
+            );
             skipped += 1;
             continue;
         };
-        let mut remote_bytes = serde_json::to_vec_pretty(remote).context("serializing remote label")?;
+        let mut remote_bytes =
+            serde_json::to_vec_pretty(remote).context("serializing remote label")?;
         remote_bytes.push(b'\n');
-        let (in_sync, remote_hash) =
-            tgt_drift_status(remote_bytes.clone(), overlay_paths, tgt_lockfile, "labels", tgt_slug)?;
+        let (in_sync, remote_hash) = tgt_drift_status(
+            remote_bytes.clone(),
+            overlay_paths,
+            tgt_lockfile,
+            "labels",
+            tgt_slug,
+        )?;
         if !in_sync {
-            match handle_drift(&progress, tgt_lockfile, drift_decisions, &mut drifted, dry_run, "labels", tgt_slug, remote_hash)? {
+            match handle_drift(
+                &progress,
+                tgt_lockfile,
+                drift_decisions,
+                &mut drifted,
+                dry_run,
+                "labels",
+                tgt_slug,
+                remote_hash,
+            )? {
                 DriftHandling::SkipObject => continue,
                 DriftHandling::Patch => {}
             }
@@ -618,37 +844,69 @@ pub(crate) async fn run(
             )?;
         }
         if !dry_run {
-            let updated = tgt_client.update_label(tgt_id, &payload_label, None).await
+            let updated = tgt_client
+                .update_label(tgt_id, &payload_label, None)
+                .await
                 .with_context(|| format!("PATCH tgt labels/{tgt_id}"))?;
             write_back_label(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
         }
         applied.labels += 1;
-        if let Some(p) = &progress { p.event(Action::Patch, &format!("label/{tgt_slug}")); }
+        if let Some(p) = &progress {
+            p.event(Action::Patch, &format!("label/{tgt_slug}"));
+        }
     }
 
     // Queues -----------------------------------------------------------
     let mut remote_queues_cache: Option<Vec<crate::model::Queue>> = None;
     for (src_slug, tgt_slug) in &mapping.queues {
         if let Some(sel) = selection
-            && !sel.contains("queues", src_slug) {
-                continue;
-            }
-        let Some(tgt_id) = lookup_tgt_id_w(tgt_lockfile, "queues", tgt_slug, &mut skipped, &progress) else { continue };
+            && !sel.contains("queues", src_slug)
+        {
+            continue;
+        }
+        let Some(tgt_id) =
+            lookup_tgt_id_w(tgt_lockfile, "queues", tgt_slug, &mut skipped, &progress)
+        else {
+            continue;
+        };
         let Some(src_queue_dir) = locate_queue_dir(&src_paths, src_slug) else {
-            warn(&progress, format!("warn: cannot locate src queue '{src_slug}' on disk; skipping"));
+            warn(
+                &progress,
+                format!("warn: cannot locate src queue '{src_slug}' on disk; skipping"),
+            );
             skipped += 1;
             continue;
         };
         let queue_path = src_queue_dir.join("queue.json");
         let raw = match std::fs::read_to_string(&queue_path) {
             Ok(r) => r,
-            Err(e) => { warn(&progress, format!("warning: cannot read src queues/{src_slug}: {e:#}")); skipped += 1; continue; }
+            Err(e) => {
+                warn(
+                    &progress,
+                    format!("warning: cannot read src queues/{src_slug}: {e:#}"),
+                );
+                skipped += 1;
+                continue;
+            }
         };
         let mut payload: Value = match serde_json::from_str(&raw) {
             Ok(v) => v,
-            Err(e) => { warn(&progress, format!("warning: parsing queue '{src_slug}': {e:#}")); skipped += 1; continue; }
+            Err(e) => {
+                warn(
+                    &progress,
+                    format!("warning: parsing queue '{src_slug}': {e:#}"),
+                );
+                skipped += 1;
+                continue;
+            }
         };
-        rewrite_urls(&mut payload, &src_lockfile, tgt_lockfile, &mapping, &mapping.hook_templates);
+        rewrite_urls(
+            &mut payload,
+            &src_lockfile,
+            tgt_lockfile,
+            &mapping,
+            &mapping.hook_templates,
+        );
         let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.queue(tgt_slug));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
@@ -658,29 +916,58 @@ pub(crate) async fn run(
         // server-computed sub-collections (`hooks`, `webhooks`, `rules`,
         // `inbox`, `counts`) that the Rossum API rejects on PATCH.
         if let Err(e) = serde_json::from_value::<crate::model::Queue>(payload.clone()) {
-            warn(&progress, format!("warn: queues/{src_slug} -> {tgt_slug}: payload not a valid Queue ({e:#}); skipping"));
+            warn(
+                &progress,
+                format!(
+                    "warn: queues/{src_slug} -> {tgt_slug}: payload not a valid Queue ({e:#}); skipping"
+                ),
+            );
             skipped += 1;
             continue;
         }
         let mut payload_for_patch = payload;
         strip_for_cross_env_patch(&mut payload_for_patch, "queues");
-        let mut payload_bytes = serde_json::to_vec_pretty(&payload_for_patch).context("serializing payload queue")?;
+        let mut payload_bytes =
+            serde_json::to_vec_pretty(&payload_for_patch).context("serializing payload queue")?;
         payload_bytes.push(b'\n');
         if remote_queues_cache.is_none() {
-            remote_queues_cache = Some(tgt_client.list_queues(None).await.context("listing tgt queues for drift check")?);
+            remote_queues_cache = Some(
+                tgt_client
+                    .list_queues(None)
+                    .await
+                    .context("listing tgt queues for drift check")?,
+            );
         }
         let cache = remote_queues_cache.as_ref().unwrap();
         let Some(remote) = cache.iter().find(|q| q.id == tgt_id) else {
-            warn(&progress, format!("warning: queue id {tgt_id} not found on tgt remote; skipping"));
+            warn(
+                &progress,
+                format!("warning: queue id {tgt_id} not found on tgt remote; skipping"),
+            );
             skipped += 1;
             continue;
         };
-        let mut remote_bytes = serde_json::to_vec_pretty(remote).context("serializing remote queue")?;
+        let mut remote_bytes =
+            serde_json::to_vec_pretty(remote).context("serializing remote queue")?;
         remote_bytes.push(b'\n');
-        let (in_sync, remote_hash) =
-            tgt_drift_status(remote_bytes.clone(), overlay_paths, tgt_lockfile, "queues", tgt_slug)?;
+        let (in_sync, remote_hash) = tgt_drift_status(
+            remote_bytes.clone(),
+            overlay_paths,
+            tgt_lockfile,
+            "queues",
+            tgt_slug,
+        )?;
         if !in_sync {
-            match handle_drift(&progress, tgt_lockfile, drift_decisions, &mut drifted, dry_run, "queues", tgt_slug, remote_hash)? {
+            match handle_drift(
+                &progress,
+                tgt_lockfile,
+                drift_decisions,
+                &mut drifted,
+                dry_run,
+                "queues",
+                tgt_slug,
+                remote_hash,
+            )? {
                 DriftHandling::SkipObject => continue,
                 DriftHandling::Patch => {}
             }
@@ -697,50 +984,85 @@ pub(crate) async fn run(
             )?;
         }
         if !dry_run {
-            let response_value = tgt_client.patch_value(&format!("/queues/{tgt_id}"), &payload_for_patch, None).await
+            let response_value = tgt_client
+                .patch_value(&format!("/queues/{tgt_id}"), &payload_for_patch, None)
+                .await
                 .with_context(|| format!("PATCH tgt queues/{tgt_id}"))?;
             let updated: crate::model::Queue = serde_json::from_value(response_value)
                 .context("parsing PATCH /queues response as Queue")?;
             write_back_queue(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
         }
         applied.queues += 1;
-        if let Some(p) = &progress { p.event(Action::Patch, &format!("queue/{tgt_slug}")); }
+        if let Some(p) = &progress {
+            p.event(Action::Patch, &format!("queue/{tgt_slug}"));
+        }
     }
 
     // Schemas ----------------------------------------------------------
     for (src_slug, tgt_slug) in &mapping.schemas {
         if let Some(sel) = selection
-            && !sel.contains("schemas", src_slug) {
-                continue;
-            }
-        let Some(tgt_id) = lookup_tgt_id_w(tgt_lockfile, "schemas", tgt_slug, &mut skipped, &progress) else { continue };
+            && !sel.contains("schemas", src_slug)
+        {
+            continue;
+        }
+        let Some(tgt_id) =
+            lookup_tgt_id_w(tgt_lockfile, "schemas", tgt_slug, &mut skipped, &progress)
+        else {
+            continue;
+        };
         let Some(src_queue_dir) = locate_queue_dir(&src_paths, src_slug) else {
-            warn(&progress, format!("warn: cannot locate src queue '{src_slug}' for schema; skipping"));
+            warn(
+                &progress,
+                format!("warn: cannot locate src queue '{src_slug}' for schema; skipping"),
+            );
             skipped += 1;
             continue;
         };
         let mut payload = match read_schema_value(&src_queue_dir) {
             Ok(v) => v,
-            Err(e) => { warn(&progress, format!("warning: cannot read src schema for queue '{src_slug}': {e:#}")); skipped += 1; continue; }
+            Err(e) => {
+                warn(
+                    &progress,
+                    format!("warning: cannot read src schema for queue '{src_slug}': {e:#}"),
+                );
+                skipped += 1;
+                continue;
+            }
         };
-        rewrite_urls(&mut payload, &src_lockfile, tgt_lockfile, &mapping, &mapping.hook_templates);
+        rewrite_urls(
+            &mut payload,
+            &src_lockfile,
+            tgt_lockfile,
+            &mapping,
+            &mapping.hook_templates,
+        );
         let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.schema(tgt_slug));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }
         let payload_schema: crate::model::Schema = match serde_json::from_value(payload) {
             Ok(s) => s,
-            Err(e) => { warn(&progress, format!("warn: schemas/{src_slug} -> {tgt_slug}: payload not a valid Schema ({e:#}); skipping")); skipped += 1; continue; }
+            Err(e) => {
+                warn(
+                    &progress,
+                    format!(
+                        "warn: schemas/{src_slug} -> {tgt_slug}: payload not a valid Schema ({e:#}); skipping"
+                    ),
+                );
+                skipped += 1;
+                continue;
+            }
         };
         let (payload_json_full, payload_formulas) =
             crate::snapshot::schema::serialize_schema(&payload_schema)?;
-        let remote_schema = tgt_client.get_schema(tgt_id, None).await
+        let remote_schema = tgt_client
+            .get_schema(tgt_id, None)
+            .await
             .with_context(|| format!("fetching tgt schema {tgt_id} for drift check"))?;
         let (remote_json_full, remote_formulas) =
             crate::snapshot::schema::serialize_schema(&remote_schema)?;
         let stripped = maybe_strip_overlay(remote_json_full.clone(), overlay_paths)?;
-        let remote_combined_hash =
-            crate::state::schema_combined_hash(&stripped, &remote_formulas);
+        let remote_combined_hash = crate::state::schema_combined_hash(&stripped, &remote_formulas);
         let in_sync = tgt_lockfile
             .objects
             .get("schemas")
@@ -749,7 +1071,16 @@ pub(crate) async fn run(
             .map(|b| b == remote_combined_hash)
             .unwrap_or(true);
         if !in_sync {
-            match handle_drift(&progress, tgt_lockfile, drift_decisions, &mut drifted, dry_run, "schemas", tgt_slug, remote_combined_hash)? {
+            match handle_drift(
+                &progress,
+                tgt_lockfile,
+                drift_decisions,
+                &mut drifted,
+                dry_run,
+                "schemas",
+                tgt_slug,
+                remote_combined_hash,
+            )? {
                 DriftHandling::SkipObject => continue,
                 DriftHandling::Patch => {}
             }
@@ -769,73 +1100,132 @@ pub(crate) async fn run(
             // Diff each formula sidecar that differs. Set-of-formulas
             // mismatch (one side has a field the other doesn't) shows
             // as new-file or deleted-file diff.
-            let local_map: std::collections::BTreeMap<&str, &[u8]> =
-                payload_formulas.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
-            let remote_map: std::collections::BTreeMap<&str, &[u8]> =
-                remote_formulas.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+            let local_map: std::collections::BTreeMap<&str, &[u8]> = payload_formulas
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_slice()))
+                .collect();
+            let remote_map: std::collections::BTreeMap<&str, &[u8]> = remote_formulas
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_slice()))
+                .collect();
             let mut keys: std::collections::BTreeSet<&str> = local_map.keys().copied().collect();
             keys.extend(remote_map.keys().copied());
             for k in keys {
                 let l = local_map.get(k).copied().unwrap_or(&[]);
                 let r = remote_map.get(k).copied().unwrap_or(&[]);
                 if l != r {
-                    print_update_diff(
-                        &format!("schemas/{tgt_slug}/formulas/{k}.py"),
-                        l,
-                        r,
-                    );
+                    print_update_diff(&format!("schemas/{tgt_slug}/formulas/{k}.py"), l, r);
                 }
             }
         }
         if !dry_run {
-            let updated = tgt_client.update_schema(tgt_id, &payload_schema, None).await
+            let updated = tgt_client
+                .update_schema(tgt_id, &payload_schema, None)
+                .await
                 .with_context(|| format!("PATCH tgt schemas/{tgt_id}"))?;
             write_back_schema(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
         }
         applied.schemas += 1;
-        if let Some(p) = &progress { p.event(Action::Patch, &format!("schema/{tgt_slug}")); }
+        if let Some(p) = &progress {
+            p.event(Action::Patch, &format!("schema/{tgt_slug}"));
+        }
     }
 
     // Inboxes ----------------------------------------------------------
     for (src_slug, tgt_slug) in &mapping.inboxes {
         if let Some(sel) = selection
-            && !sel.contains("inboxes", src_slug) {
-                continue;
-            }
-        let Some(tgt_id) = lookup_tgt_id_w(tgt_lockfile, "inboxes", tgt_slug, &mut skipped, &progress) else { continue };
+            && !sel.contains("inboxes", src_slug)
+        {
+            continue;
+        }
+        let Some(tgt_id) =
+            lookup_tgt_id_w(tgt_lockfile, "inboxes", tgt_slug, &mut skipped, &progress)
+        else {
+            continue;
+        };
         let Some(src_queue_dir) = locate_queue_dir(&src_paths, src_slug) else {
-            warn(&progress, format!("warn: cannot locate src queue '{src_slug}' for inbox; skipping"));
+            warn(
+                &progress,
+                format!("warn: cannot locate src queue '{src_slug}' for inbox; skipping"),
+            );
             skipped += 1;
             continue;
         };
         let inbox_path = src_queue_dir.join("inbox.json");
         let raw = match std::fs::read_to_string(&inbox_path) {
             Ok(r) => r,
-            Err(e) => { warn(&progress, format!("warning: cannot read src inbox for queue '{src_slug}': {e:#}")); skipped += 1; continue; }
+            Err(e) => {
+                warn(
+                    &progress,
+                    format!("warning: cannot read src inbox for queue '{src_slug}': {e:#}"),
+                );
+                skipped += 1;
+                continue;
+            }
         };
         let mut payload: Value = match serde_json::from_str(&raw) {
             Ok(v) => v,
-            Err(e) => { warn(&progress, format!("warning: parsing inbox for queue '{src_slug}': {e:#}")); skipped += 1; continue; }
+            Err(e) => {
+                warn(
+                    &progress,
+                    format!("warning: parsing inbox for queue '{src_slug}': {e:#}"),
+                );
+                skipped += 1;
+                continue;
+            }
         };
-        rewrite_urls(&mut payload, &src_lockfile, tgt_lockfile, &mapping, &mapping.hook_templates);
+        rewrite_urls(
+            &mut payload,
+            &src_lockfile,
+            tgt_lockfile,
+            &mapping,
+            &mapping.hook_templates,
+        );
         let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.inbox(tgt_slug));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }
         let payload_inbox: crate::model::Inbox = match serde_json::from_value(payload) {
             Ok(i) => i,
-            Err(e) => { warn(&progress, format!("warn: inboxes/{src_slug} -> {tgt_slug}: payload not a valid Inbox ({e:#}); skipping")); skipped += 1; continue; }
+            Err(e) => {
+                warn(
+                    &progress,
+                    format!(
+                        "warn: inboxes/{src_slug} -> {tgt_slug}: payload not a valid Inbox ({e:#}); skipping"
+                    ),
+                );
+                skipped += 1;
+                continue;
+            }
         };
-        let mut payload_bytes = serde_json::to_vec_pretty(&payload_inbox).context("serializing payload inbox")?;
+        let mut payload_bytes =
+            serde_json::to_vec_pretty(&payload_inbox).context("serializing payload inbox")?;
         payload_bytes.push(b'\n');
-        let remote_inbox = tgt_client.get_inbox(tgt_id, None).await
+        let remote_inbox = tgt_client
+            .get_inbox(tgt_id, None)
+            .await
             .with_context(|| format!("fetching tgt inbox {tgt_id} for drift check"))?;
-        let mut remote_bytes = serde_json::to_vec_pretty(&remote_inbox).context("serializing remote inbox")?;
+        let mut remote_bytes =
+            serde_json::to_vec_pretty(&remote_inbox).context("serializing remote inbox")?;
         remote_bytes.push(b'\n');
-        let (in_sync, remote_hash) =
-            tgt_drift_status(remote_bytes.clone(), overlay_paths, tgt_lockfile, "inboxes", tgt_slug)?;
+        let (in_sync, remote_hash) = tgt_drift_status(
+            remote_bytes.clone(),
+            overlay_paths,
+            tgt_lockfile,
+            "inboxes",
+            tgt_slug,
+        )?;
         if !in_sync {
-            match handle_drift(&progress, tgt_lockfile, drift_decisions, &mut drifted, dry_run, "inboxes", tgt_slug, remote_hash)? {
+            match handle_drift(
+                &progress,
+                tgt_lockfile,
+                drift_decisions,
+                &mut drifted,
+                dry_run,
+                "inboxes",
+                tgt_slug,
+                remote_hash,
+            )? {
                 DriftHandling::SkipObject => continue,
                 DriftHandling::Patch => {}
             }
@@ -861,35 +1251,69 @@ pub(crate) async fn run(
             let mut patch_body = serde_json::to_value(&payload_inbox)
                 .context("serializing payload inbox for PATCH")?;
             crate::snapshot::create::strip_for_cross_env_patch(&mut patch_body, "inboxes");
-            let updated = tgt_client.update_inbox_value(tgt_id, &patch_body, None).await
+            let updated = tgt_client
+                .update_inbox_value(tgt_id, &patch_body, None)
+                .await
                 .with_context(|| format!("PATCH tgt inboxes/{tgt_id}"))?;
             write_back_inbox(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
         }
         applied.inboxes += 1;
-        if let Some(p) = &progress { p.event(Action::Patch, &format!("inbox/{tgt_slug}")); }
+        if let Some(p) = &progress {
+            p.event(Action::Patch, &format!("inbox/{tgt_slug}"));
+        }
     }
 
     // Email templates --------------------------------------------------
     let mut remote_template_cache: Option<Vec<crate::model::EmailTemplate>> = None;
     for (src_key, tgt_key) in &mapping.email_templates {
         if let Some(sel) = selection
-            && !sel.contains("email_templates", src_key) {
-                continue;
-            }
-        let Some(tgt_id) = lookup_tgt_id_w(tgt_lockfile, "email_templates", tgt_key, &mut skipped, &progress) else { continue };
+            && !sel.contains("email_templates", src_key)
+        {
+            continue;
+        }
+        let Some(tgt_id) = lookup_tgt_id_w(
+            tgt_lockfile,
+            "email_templates",
+            tgt_key,
+            &mut skipped,
+            &progress,
+        ) else {
+            continue;
+        };
         let Some((ws, q, t)) = split_template_key(src_key) else {
-            warn(&progress, format!("warning: src email_template key '{src_key}' is not <ws>/<q>/<template>; skipping"));
+            warn(
+                &progress,
+                format!(
+                    "warning: src email_template key '{src_key}' is not <ws>/<q>/<template>; skipping"
+                ),
+            );
             skipped += 1;
             continue;
         };
         let templates_dir = src_paths.queue_email_templates_dir(ws, q);
         let src_template = match read_email_template(&templates_dir, t) {
             Ok(t) => t,
-            Err(e) => { warn(&progress, format!("warning: cannot read src email_template '{src_key}': {e:#}")); skipped += 1; continue; }
+            Err(e) => {
+                warn(
+                    &progress,
+                    format!("warning: cannot read src email_template '{src_key}': {e:#}"),
+                );
+                skipped += 1;
+                continue;
+            }
         };
-        let mut payload = serde_json::to_value(&src_template).context("serializing src email template to value")?;
-        rewrite_urls(&mut payload, &src_lockfile, tgt_lockfile, &mapping, &mapping.hook_templates);
-        let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.email_template(tgt_key));
+        let mut payload = serde_json::to_value(&src_template)
+            .context("serializing src email template to value")?;
+        rewrite_urls(
+            &mut payload,
+            &src_lockfile,
+            tgt_lockfile,
+            &mapping,
+            &mapping.hook_templates,
+        );
+        let overlay_paths = tgt_overlay
+            .as_ref()
+            .and_then(|ov| ov.email_template(tgt_key));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }
@@ -897,30 +1321,58 @@ pub(crate) async fn run(
         // Value for the PATCH so we can strip `triggers` — which references a
         // non-deployable sub-resource and 400s the API on cross-env send.
         if let Err(e) = serde_json::from_value::<crate::model::EmailTemplate>(payload.clone()) {
-            warn(&progress, format!("warn: email_templates/{src_key} -> {tgt_key}: payload not a valid EmailTemplate ({e:#}); skipping"));
+            warn(
+                &progress,
+                format!(
+                    "warn: email_templates/{src_key} -> {tgt_key}: payload not a valid EmailTemplate ({e:#}); skipping"
+                ),
+            );
             skipped += 1;
             continue;
         }
         let mut payload_for_patch = payload;
         strip_for_cross_env_patch(&mut payload_for_patch, "email_templates");
-        let mut payload_bytes = serde_json::to_vec_pretty(&payload_for_patch).context("serializing payload email template")?;
+        let mut payload_bytes = serde_json::to_vec_pretty(&payload_for_patch)
+            .context("serializing payload email template")?;
         payload_bytes.push(b'\n');
         if remote_template_cache.is_none() {
-            remote_template_cache = Some(tgt_client.list_email_templates(None).await
-                .context("listing tgt email templates for drift check")?);
+            remote_template_cache = Some(
+                tgt_client
+                    .list_email_templates(None)
+                    .await
+                    .context("listing tgt email templates for drift check")?,
+            );
         }
         let cache = remote_template_cache.as_ref().unwrap();
         let Some(remote_template) = cache.iter().find(|t| t.id == tgt_id) else {
-            warn(&progress, format!("warning: email_template id {tgt_id} not found on tgt remote; skipping"));
+            warn(
+                &progress,
+                format!("warning: email_template id {tgt_id} not found on tgt remote; skipping"),
+            );
             skipped += 1;
             continue;
         };
-        let mut remote_bytes = serde_json::to_vec_pretty(remote_template).context("serializing remote email template")?;
+        let mut remote_bytes = serde_json::to_vec_pretty(remote_template)
+            .context("serializing remote email template")?;
         remote_bytes.push(b'\n');
-        let (in_sync, remote_hash) =
-            tgt_drift_status(remote_bytes.clone(), overlay_paths, tgt_lockfile, "email_templates", tgt_key)?;
+        let (in_sync, remote_hash) = tgt_drift_status(
+            remote_bytes.clone(),
+            overlay_paths,
+            tgt_lockfile,
+            "email_templates",
+            tgt_key,
+        )?;
         if !in_sync {
-            match handle_drift(&progress, tgt_lockfile, drift_decisions, &mut drifted, dry_run, "email_templates", tgt_key, remote_hash)? {
+            match handle_drift(
+                &progress,
+                tgt_lockfile,
+                drift_decisions,
+                &mut drifted,
+                dry_run,
+                "email_templates",
+                tgt_key,
+                remote_hash,
+            )? {
                 DriftHandling::SkipObject => continue,
                 DriftHandling::Patch => {}
             }
@@ -937,57 +1389,121 @@ pub(crate) async fn run(
             )?;
         }
         if !dry_run {
-            let response_value = tgt_client.patch_value(&format!("/email_templates/{tgt_id}"), &payload_for_patch, None).await
+            let response_value = tgt_client
+                .patch_value(
+                    &format!("/email_templates/{tgt_id}"),
+                    &payload_for_patch,
+                    None,
+                )
+                .await
                 .with_context(|| format!("PATCH tgt email_templates/{tgt_id}"))?;
             let updated: crate::model::EmailTemplate = serde_json::from_value(response_value)
                 .context("parsing PATCH /email_templates response as EmailTemplate")?;
             write_back_email_template(&tgt_paths, tgt_lockfile, tgt_key, &updated)?;
         }
         applied.email_templates += 1;
-        if let Some(p) = &progress { p.event(Action::Patch, &format!("email_template/{tgt_key}")); }
+        if let Some(p) = &progress {
+            p.event(Action::Patch, &format!("email_template/{tgt_key}"));
+        }
     }
 
     // Engines ----------------------------------------------------------
     for (src_slug, tgt_slug) in &mapping.engines {
         if let Some(sel) = selection
-            && !sel.contains("engines", src_slug) {
-                continue;
-            }
-        let Some(tgt_id) = lookup_tgt_id_w(tgt_lockfile, "engines", tgt_slug, &mut skipped, &progress) else { continue };
+            && !sel.contains("engines", src_slug)
+        {
+            continue;
+        }
+        let Some(tgt_id) =
+            lookup_tgt_id_w(tgt_lockfile, "engines", tgt_slug, &mut skipped, &progress)
+        else {
+            continue;
+        };
         // Engines live at `engines/<slug>/engine.json`, not directly at
         // `engines/<slug>.json` — same nested-dir layout as workspaces.
         let path = src_paths.engine_dir(src_slug).join("engine.json");
         let raw = match std::fs::read_to_string(&path) {
             Ok(r) => r,
-            Err(e) => { warn(&progress, format!("warning: cannot read src engines/{src_slug}: {e:#}")); skipped += 1; continue; }
+            Err(e) => {
+                warn(
+                    &progress,
+                    format!("warning: cannot read src engines/{src_slug}: {e:#}"),
+                );
+                skipped += 1;
+                continue;
+            }
         };
         let mut payload: Value = match serde_json::from_str(&raw) {
             Ok(v) => v,
-            Err(e) => { warn(&progress, format!("warning: parsing engines/{src_slug}: {e:#}")); skipped += 1; continue; }
+            Err(e) => {
+                warn(
+                    &progress,
+                    format!("warning: parsing engines/{src_slug}: {e:#}"),
+                );
+                skipped += 1;
+                continue;
+            }
         };
-        rewrite_urls(&mut payload, &src_lockfile, tgt_lockfile, &mapping, &mapping.hook_templates);
+        rewrite_urls(
+            &mut payload,
+            &src_lockfile,
+            tgt_lockfile,
+            &mapping,
+            &mapping.hook_templates,
+        );
         let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.engine(tgt_slug));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }
         let payload_engine: crate::model::Engine = match serde_json::from_value(payload) {
             Ok(e) => e,
-            Err(e) => { warn(&progress, format!("warn: engines/{src_slug} -> {tgt_slug}: payload not a valid Engine ({e:#}); skipping")); skipped += 1; continue; }
+            Err(e) => {
+                warn(
+                    &progress,
+                    format!(
+                        "warn: engines/{src_slug} -> {tgt_slug}: payload not a valid Engine ({e:#}); skipping"
+                    ),
+                );
+                skipped += 1;
+                continue;
+            }
         };
-        let mut payload_bytes = serde_json::to_vec_pretty(&payload_engine).context("serializing payload engine")?;
+        let mut payload_bytes =
+            serde_json::to_vec_pretty(&payload_engine).context("serializing payload engine")?;
         payload_bytes.push(b'\n');
-        let remotes = tgt_client.list_engines(None).await.context("listing tgt engines for drift check")?;
+        let remotes = tgt_client
+            .list_engines(None)
+            .await
+            .context("listing tgt engines for drift check")?;
         let Some(remote) = remotes.iter().find(|e| e.id == tgt_id) else {
-            warn(&progress, format!("warning: engine id {tgt_id} not found on tgt remote; skipping"));
+            warn(
+                &progress,
+                format!("warning: engine id {tgt_id} not found on tgt remote; skipping"),
+            );
             skipped += 1;
             continue;
         };
-        let mut remote_bytes = serde_json::to_vec_pretty(remote).context("serializing remote engine")?;
+        let mut remote_bytes =
+            serde_json::to_vec_pretty(remote).context("serializing remote engine")?;
         remote_bytes.push(b'\n');
-        let (in_sync, remote_hash) =
-            tgt_drift_status(remote_bytes.clone(), overlay_paths, tgt_lockfile, "engines", tgt_slug)?;
+        let (in_sync, remote_hash) = tgt_drift_status(
+            remote_bytes.clone(),
+            overlay_paths,
+            tgt_lockfile,
+            "engines",
+            tgt_slug,
+        )?;
         if !in_sync {
-            match handle_drift(&progress, tgt_lockfile, drift_decisions, &mut drifted, dry_run, "engines", tgt_slug, remote_hash)? {
+            match handle_drift(
+                &progress,
+                tgt_lockfile,
+                drift_decisions,
+                &mut drifted,
+                dry_run,
+                "engines",
+                tgt_slug,
+                remote_hash,
+            )? {
                 DriftHandling::SkipObject => continue,
                 DriftHandling::Patch => {}
             }
@@ -1005,15 +1521,21 @@ pub(crate) async fn run(
         }
         if dry_run {
             applied.engines += 1;
-            if let Some(p) = &progress { p.event(Action::Patch, &format!("engine/{tgt_slug}")); }
+            if let Some(p) = &progress {
+                p.event(Action::Patch, &format!("engine/{tgt_slug}"));
+            }
         } else {
-            match tgt_client.update_engine(tgt_id, &payload_engine, None).await
+            match tgt_client
+                .update_engine(tgt_id, &payload_engine, None)
+                .await
                 .with_context(|| format!("PATCH tgt engines/{tgt_id}"))
             {
                 Ok(updated) => {
                     write_back_engine(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
                     applied.engines += 1;
-                    if let Some(p) = &progress { p.event(Action::Patch, &format!("engine/{tgt_slug}")); }
+                    if let Some(p) = &progress {
+                        p.event(Action::Patch, &format!("engine/{tgt_slug}"));
+                    }
                 }
                 Err(e) if anyhow_has_status(&e, 405) => {
                     warn(&progress, "warning: engines are not writable via PATCH on tgt org/plan (405). Skipping all engine apply.".to_string());
@@ -1030,48 +1552,113 @@ pub(crate) async fn run(
     // Engine fields ----------------------------------------------------
     for (src_slug, tgt_slug) in &mapping.engine_fields {
         if let Some(sel) = selection
-            && !sel.contains("engine_fields", src_slug) {
-                continue;
-            }
-        let Some(tgt_id) = lookup_tgt_id_w(tgt_lockfile, "engine_fields", tgt_slug, &mut skipped, &progress) else { continue };
+            && !sel.contains("engine_fields", src_slug)
+        {
+            continue;
+        }
+        let Some(tgt_id) = lookup_tgt_id_w(
+            tgt_lockfile,
+            "engine_fields",
+            tgt_slug,
+            &mut skipped,
+            &progress,
+        ) else {
+            continue;
+        };
         let Some(path) = locate_engine_field_path(&src_paths, src_slug) else {
-            warn(&progress, format!(
-                "warning: cannot locate src engine field '{src_slug}' under any engine dir; skipping"
-            ));
+            warn(
+                &progress,
+                format!(
+                    "warning: cannot locate src engine field '{src_slug}' under any engine dir; skipping"
+                ),
+            );
             skipped += 1;
             continue;
         };
         let raw = match std::fs::read_to_string(&path) {
             Ok(r) => r,
-            Err(e) => { warn(&progress, format!("warning: cannot read src engine field '{src_slug}': {e:#}")); skipped += 1; continue; }
+            Err(e) => {
+                warn(
+                    &progress,
+                    format!("warning: cannot read src engine field '{src_slug}': {e:#}"),
+                );
+                skipped += 1;
+                continue;
+            }
         };
         let mut payload: Value = match serde_json::from_str(&raw) {
             Ok(v) => v,
-            Err(e) => { warn(&progress, format!("warning: parsing engine-fields/{src_slug}: {e:#}")); skipped += 1; continue; }
+            Err(e) => {
+                warn(
+                    &progress,
+                    format!("warning: parsing engine-fields/{src_slug}: {e:#}"),
+                );
+                skipped += 1;
+                continue;
+            }
         };
-        rewrite_urls(&mut payload, &src_lockfile, tgt_lockfile, &mapping, &mapping.hook_templates);
-        let overlay_paths = tgt_overlay.as_ref().and_then(|ov| ov.engine_field(tgt_slug));
+        rewrite_urls(
+            &mut payload,
+            &src_lockfile,
+            tgt_lockfile,
+            &mapping,
+            &mapping.hook_templates,
+        );
+        let overlay_paths = tgt_overlay
+            .as_ref()
+            .and_then(|ov| ov.engine_field(tgt_slug));
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }
         let payload_field: crate::model::EngineField = match serde_json::from_value(payload) {
             Ok(f) => f,
-            Err(e) => { warn(&progress, format!("warn: engine-fields/{src_slug} -> {tgt_slug}: payload not a valid EngineField ({e:#}); skipping")); skipped += 1; continue; }
+            Err(e) => {
+                warn(
+                    &progress,
+                    format!(
+                        "warn: engine-fields/{src_slug} -> {tgt_slug}: payload not a valid EngineField ({e:#}); skipping"
+                    ),
+                );
+                skipped += 1;
+                continue;
+            }
         };
-        let mut payload_bytes = serde_json::to_vec_pretty(&payload_field).context("serializing payload engine field")?;
+        let mut payload_bytes = serde_json::to_vec_pretty(&payload_field)
+            .context("serializing payload engine field")?;
         payload_bytes.push(b'\n');
-        let remotes = tgt_client.list_engine_fields(None).await.context("listing tgt engine fields for drift check")?;
+        let remotes = tgt_client
+            .list_engine_fields(None)
+            .await
+            .context("listing tgt engine fields for drift check")?;
         let Some(remote) = remotes.iter().find(|f| f.id == tgt_id) else {
-            warn(&progress, format!("warning: engine_field id {tgt_id} not found on tgt remote; skipping"));
+            warn(
+                &progress,
+                format!("warning: engine_field id {tgt_id} not found on tgt remote; skipping"),
+            );
             skipped += 1;
             continue;
         };
-        let mut remote_bytes = serde_json::to_vec_pretty(remote).context("serializing remote engine field")?;
+        let mut remote_bytes =
+            serde_json::to_vec_pretty(remote).context("serializing remote engine field")?;
         remote_bytes.push(b'\n');
-        let (in_sync, remote_hash) =
-            tgt_drift_status(remote_bytes.clone(), overlay_paths, tgt_lockfile, "engine_fields", tgt_slug)?;
+        let (in_sync, remote_hash) = tgt_drift_status(
+            remote_bytes.clone(),
+            overlay_paths,
+            tgt_lockfile,
+            "engine_fields",
+            tgt_slug,
+        )?;
         if !in_sync {
-            match handle_drift(&progress, tgt_lockfile, drift_decisions, &mut drifted, dry_run, "engine_fields", tgt_slug, remote_hash)? {
+            match handle_drift(
+                &progress,
+                tgt_lockfile,
+                drift_decisions,
+                &mut drifted,
+                dry_run,
+                "engine_fields",
+                tgt_slug,
+                remote_hash,
+            )? {
                 DriftHandling::SkipObject => continue,
                 DriftHandling::Patch => {}
             }
@@ -1089,7 +1676,9 @@ pub(crate) async fn run(
         }
         if dry_run {
             applied.engine_fields += 1;
-            if let Some(p) = &progress { p.event(Action::Patch, &format!("engine_field/{tgt_slug}")); }
+            if let Some(p) = &progress {
+                p.event(Action::Patch, &format!("engine_field/{tgt_slug}"));
+            }
         } else {
             // Engine field `name` is immutable on the Rossum API (a PATCH
             // that changes it returns 400). Build the PATCH body from the
@@ -1101,13 +1690,17 @@ pub(crate) async fn run(
             if let Some(obj) = patch_body.as_object_mut() {
                 obj.remove("name");
             }
-            match tgt_client.update_engine_field_value(tgt_id, &patch_body, None).await
+            match tgt_client
+                .update_engine_field_value(tgt_id, &patch_body, None)
+                .await
                 .with_context(|| format!("PATCH tgt engine_fields/{tgt_id}"))
             {
                 Ok(updated) => {
                     write_back_engine_field(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
                     applied.engine_fields += 1;
-                    if let Some(p) = &progress { p.event(Action::Patch, &format!("engine_field/{tgt_slug}")); }
+                    if let Some(p) = &progress {
+                        p.event(Action::Patch, &format!("engine_field/{tgt_slug}"));
+                    }
                 }
                 Err(e) if anyhow_has_status(&e, 405) => {
                     warn(&progress, "warning: engine fields are not writable via PATCH on tgt org/plan (405). Skipping all engine field apply.".to_string());
@@ -1123,22 +1716,42 @@ pub(crate) async fn run(
 
     let total = applied.total();
     let verb = if dry_run { "Would apply" } else { "Applied" };
-    let suffix = if dry_run { "(dry run, no PATCHes sent)" } else { "PATCHes" };
+    let suffix = if dry_run {
+        "(dry run, no PATCHes sent)"
+    } else {
+        "PATCHes"
+    };
     let mut summary = if dry_run {
         format!(
             "{verb} {} workspaces, {} hooks, {} rules, {} labels, {} queues, {} schemas, \
 {} inboxes, {} email templates, {} engines, {} engine fields ({} change(s)) from {src} to {tgt} {suffix}",
-            applied.workspaces, applied.hooks, applied.rules, applied.labels, applied.queues,
-            applied.schemas, applied.inboxes, applied.email_templates,
-            applied.engines, applied.engine_fields, total,
+            applied.workspaces,
+            applied.hooks,
+            applied.rules,
+            applied.labels,
+            applied.queues,
+            applied.schemas,
+            applied.inboxes,
+            applied.email_templates,
+            applied.engines,
+            applied.engine_fields,
+            total,
         )
     } else {
         format!(
             "Applied {} workspaces, {} hooks, {} rules, {} labels, {} queues, {} schemas, \
 {} inboxes, {} email templates, {} engines, {} engine fields ({} PATCHes) from {src} to {tgt}",
-            applied.workspaces, applied.hooks, applied.rules, applied.labels, applied.queues,
-            applied.schemas, applied.inboxes, applied.email_templates,
-            applied.engines, applied.engine_fields, total,
+            applied.workspaces,
+            applied.hooks,
+            applied.rules,
+            applied.labels,
+            applied.queues,
+            applied.schemas,
+            applied.inboxes,
+            applied.email_templates,
+            applied.engines,
+            applied.engine_fields,
+            total,
         )
     };
     if skipped > 0 {
@@ -1196,9 +1809,8 @@ fn print_update_diff_normalized(
 ) -> Result<()> {
     let src_norm = crate::cli::deploy::common::normalize_for_cross_env_compare(src, kind)
         .with_context(|| format!("normalising src bytes for {kind} diff render"))?;
-    let tgt_norm =
-        crate::cli::deploy::common::normalize_for_cross_env_compare(tgt_remote, kind)
-            .with_context(|| format!("normalising tgt bytes for {kind} diff render"))?;
+    let tgt_norm = crate::cli::deploy::common::normalize_for_cross_env_compare(tgt_remote, kind)
+        .with_context(|| format!("normalising tgt bytes for {kind} diff render"))?;
     print_update_diff(label, &src_norm, &tgt_norm);
     Ok(())
 }
@@ -1218,9 +1830,16 @@ struct ApplyCounts {
 }
 impl ApplyCounts {
     fn total(&self) -> usize {
-        self.workspaces + self.hooks + self.rules + self.labels + self.queues
-            + self.schemas + self.inboxes + self.email_templates
-            + self.engines + self.engine_fields
+        self.workspaces
+            + self.hooks
+            + self.rules
+            + self.labels
+            + self.queues
+            + self.schemas
+            + self.inboxes
+            + self.email_templates
+            + self.engines
+            + self.engine_fields
     }
 }
 
@@ -1231,12 +1850,20 @@ fn lookup_tgt_id_w(
     skipped: &mut usize,
     progress: &Option<Arc<Log>>,
 ) -> Option<u64> {
-    match tgt_lockfile.objects.get(kind).and_then(|m| m.get(tgt_slug)).map(|e| e.id) {
+    match tgt_lockfile
+        .objects
+        .get(kind)
+        .and_then(|m| m.get(tgt_slug))
+        .map(|e| e.id)
+    {
         Some(id) => Some(id),
         None => {
-            warn(progress, format!(
-                "warn: tgt lockfile has no entry for {kind}/{tgt_slug}; skipping (run `rdc sync <tgt>` first)"
-            ));
+            warn(
+                progress,
+                format!(
+                    "warn: tgt lockfile has no entry for {kind}/{tgt_slug}; skipping (run `rdc sync <tgt>` first)"
+                ),
+            );
             *skipped += 1;
             None
         }
@@ -1267,7 +1894,9 @@ fn locate_queue_dir(paths: &Paths, q_slug: &str) -> Option<PathBuf> {
 /// legacy flat keys (lockfiles written before composite-key migration).
 fn locate_engine_field_path(paths: &Paths, composite_key: &str) -> Option<PathBuf> {
     if let Some((e_slug, f_slug)) = composite_key.split_once('/') {
-        let candidate = paths.engine_fields_dir(e_slug).join(format!("{f_slug}.json"));
+        let candidate = paths
+            .engine_fields_dir(e_slug)
+            .join(format!("{f_slug}.json"));
         if candidate.exists() {
             return Some(candidate);
         }
@@ -1378,7 +2007,13 @@ fn write_back_flat<T: serde::Serialize>(
     bytes.push(b'\n');
     crate::state::base_cache::write_disk_and_cache(tgt_paths, file_path, &bytes)?;
     upsert_after_write_back(
-        tgt_lockfile, kind, slug, id, url, modified_at, content_hash(&bytes),
+        tgt_lockfile,
+        kind,
+        slug,
+        id,
+        url,
+        modified_at,
+        content_hash(&bytes),
     );
     Ok(())
 }
@@ -1392,8 +2027,15 @@ fn write_back_workspace(
     let dir = tgt_paths.workspace_dir(slug);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     write_back_flat(
-        tgt_paths, tgt_lockfile, "workspaces", slug, &dir.join("workspace.json"),
-        response, response.id, &response.url, response.modified_at(),
+        tgt_paths,
+        tgt_lockfile,
+        "workspaces",
+        slug,
+        &dir.join("workspace.json"),
+        response,
+        response.id,
+        &response.url,
+        response.modified_at(),
     )
 }
 
@@ -1406,8 +2048,15 @@ fn write_back_label(
     let dir = tgt_paths.labels_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     write_back_flat(
-        tgt_paths, tgt_lockfile, "labels", slug, &dir.join(format!("{slug}.json")),
-        response, response.id, &response.url, response.modified_at(),
+        tgt_paths,
+        tgt_lockfile,
+        "labels",
+        slug,
+        &dir.join(format!("{slug}.json")),
+        response,
+        response.id,
+        &response.url,
+        response.modified_at(),
     )
 }
 
@@ -1421,8 +2070,15 @@ fn write_back_queue(
         .ok_or_else(|| anyhow!("tgt queue dir for '{q_slug}' not found for write-back"))?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     write_back_flat(
-        tgt_paths, tgt_lockfile, "queues", q_slug, &dir.join("queue.json"),
-        response, response.id, &response.url, response.modified_at(),
+        tgt_paths,
+        tgt_lockfile,
+        "queues",
+        q_slug,
+        &dir.join("queue.json"),
+        response,
+        response.id,
+        &response.url,
+        response.modified_at(),
     )
 }
 
@@ -1436,8 +2092,15 @@ fn write_back_inbox(
         .ok_or_else(|| anyhow!("tgt queue dir for inbox '{q_slug}' not found for write-back"))?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     write_back_flat(
-        tgt_paths, tgt_lockfile, "inboxes", q_slug, &dir.join("inbox.json"),
-        response, response.id, &response.url, response.modified_at(),
+        tgt_paths,
+        tgt_lockfile,
+        "inboxes",
+        q_slug,
+        &dir.join("inbox.json"),
+        response,
+        response.id,
+        &response.url,
+        response.modified_at(),
     )
 }
 
@@ -1450,8 +2113,15 @@ fn write_back_engine(
     let dir = tgt_paths.engine_dir(slug);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     write_back_flat(
-        tgt_paths, tgt_lockfile, "engines", slug, &dir.join("engine.json"),
-        response, response.id, &response.url, response.modified_at(),
+        tgt_paths,
+        tgt_lockfile,
+        "engines",
+        slug,
+        &dir.join("engine.json"),
+        response,
+        response.id,
+        &response.url,
+        response.modified_at(),
     )
 }
 
@@ -1472,8 +2142,15 @@ fn write_back_engine_field(
     let dir = tgt_paths.engine_fields_dir(engine_slug);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     write_back_flat(
-        tgt_paths, tgt_lockfile, "engine_fields", composite_key, &dir.join(format!("{field_slug}.json")),
-        response, response.id, &response.url, response.modified_at(),
+        tgt_paths,
+        tgt_lockfile,
+        "engine_fields",
+        composite_key,
+        &dir.join(format!("{field_slug}.json")),
+        response,
+        response.id,
+        &response.url,
+        response.modified_at(),
     )
 }
 
@@ -1492,9 +2169,23 @@ fn write_back_hook(
         .get("code")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let hash = hook_combined_hash(&json_bytes, &code);
+    // Hash in codec format (matches what pull::hooks records).
+    let hash = {
+        let sidecars: Vec<(String, Vec<u8>)> = if let Some(c) = &code {
+            vec![("code".to_string(), c.as_bytes().to_vec())]
+        } else {
+            vec![]
+        };
+        crate::snapshot::codec::combined_hash(&json_bytes, &sidecars)
+    };
     upsert_after_write_back(
-        tgt_lockfile, "hooks", slug, redacted.id, &redacted.url, redacted.modified_at(), hash,
+        tgt_lockfile,
+        "hooks",
+        slug,
+        redacted.id,
+        &redacted.url,
+        redacted.modified_at(),
+        hash,
     );
     Ok(())
 }
@@ -1511,7 +2202,13 @@ fn write_back_rule(
     write_rule(&dir, slug, response)?;
     let hash = rule_combined_hash(&json_bytes, &code);
     upsert_after_write_back(
-        tgt_lockfile, "rules", slug, response.id, &response.url, response.modified_at(), hash,
+        tgt_lockfile,
+        "rules",
+        slug,
+        response.id,
+        &response.url,
+        response.modified_at(),
+        hash,
     );
     Ok(())
 }
@@ -1529,7 +2226,13 @@ fn write_back_schema(
     write_schema_bytes(&dir, &json_bytes, &formula_parts)?;
     let hash = schema_combined_hash(&json_bytes, &formula_parts);
     upsert_after_write_back(
-        tgt_lockfile, "schemas", q_slug, response.id, &response.url, response.modified_at(), hash,
+        tgt_lockfile,
+        "schemas",
+        q_slug,
+        response.id,
+        &response.url,
+        response.modified_at(),
+        hash,
     );
     Ok(())
 }
@@ -1546,8 +2249,12 @@ fn write_back_email_template(
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let bytes = write_email_template(&dir, t, response)?;
     upsert_after_write_back(
-        tgt_lockfile, "email_templates", key,
-        response.id, &response.url, response.modified_at(),
+        tgt_lockfile,
+        "email_templates",
+        key,
+        response.id,
+        &response.url,
+        response.modified_at(),
         content_hash(&bytes),
     );
     Ok(())
