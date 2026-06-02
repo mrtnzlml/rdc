@@ -13,6 +13,8 @@
 //! Call [`codec`] to look up the registry by kind string.
 
 mod engines;
+mod hooks;
+mod queues;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -64,7 +66,11 @@ pub trait KindCodec: Sync {
     ///
     /// `slug` is the object's canonical slug. The default returns `None`
     /// (kinds with no overlay section).
-    fn overlay<'a>(&self, _overlay: &'a Overlay, _slug: &str) -> Option<&'a BTreeMap<String, Value>> {
+    fn overlay<'a>(
+        &self,
+        _overlay: &'a Overlay,
+        _slug: &str,
+    ) -> Option<&'a BTreeMap<String, Value>> {
         None
     }
 
@@ -107,6 +113,8 @@ fn to_hex(digest: &[u8]) -> String {
 pub fn codec(kind: &str) -> Option<&'static dyn KindCodec> {
     match kind {
         "engines" => Some(&engines::Engines),
+        "hooks" => Some(&hooks::Hooks),
+        "queues" => Some(&queues::Queues),
         _ => None,
     }
 }
