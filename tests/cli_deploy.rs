@@ -56,20 +56,30 @@ async fn mount_full_pull(server: &MockServer, hooks_payload: serde_json::Value) 
     Mock::given(method("GET"))
         .and(path("/api/v1/organizations/1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
-        .mount(server).await;
+        .mount(server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/hooks"))
         .respond_with(ResponseTemplate::new(200).set_body_json(hooks_payload))
-        .mount(server).await;
+        .mount(server)
+        .await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes",
-        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
-        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+        "/api/v1/workspaces",
+        "/api/v1/queues",
+        "/api/v1/inboxes",
+        "/api/v1/rules",
+        "/api/v1/labels",
+        "/api/v1/engines",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
     ] {
         Mock::given(method("GET"))
             .and(path(ep))
             .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
-            .mount(server).await;
+            .mount(server)
+            .await;
     }
 }
 
@@ -113,11 +123,13 @@ async fn map_plan_apply_full_flow() {
     Mock::given(method("GET"))
         .and(path("/api/v1/hooks/401"))
         .respond_with(ResponseTemplate::new(200).set_body_json(prod_hook_401))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/hooks/402"))
         .respond_with(ResponseTemplate::new(200).set_body_json(prod_hook_402))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
 
     let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
     let captured_clone = captured.clone();
@@ -128,35 +140,53 @@ async fn map_plan_apply_full_flow() {
             *captured_clone.lock().unwrap() = Some(body.clone());
             ResponseTemplate::new(200).set_body_json(body)
         })
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
     Mock::given(method("PATCH"))
         .and(path("/api/v1/hooks/402"))
         .respond_with(move |req: &wiremock::Request| {
             let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
             ResponseTemplate::new(200).set_body_json(body)
         })
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
 
     let project = TempDir::new().unwrap();
-    Command::cargo_bin("rdc").unwrap()
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args([
             "init",
-            "--env", &format!("test={}/api/v1:1", test_server.uri()),
-            "--env", &format!("prod={}/api/v1:1", prod_server.uri()),
+            "--env",
+            &format!("test={}/api/v1:1", test_server.uri()),
+            "--env",
+            &format!("prod={}/api/v1:1", prod_server.uri()),
         ])
-        .assert().success();
+        .assert()
+        .success();
     std::fs::write(
         project.path().join("secrets/test.secrets.json"),
         r#"{"api_token":"TEST_TOKEN"}"#,
-    ).unwrap();
+    )
+    .unwrap();
     std::fs::write(
         project.path().join("secrets/prod.secrets.json"),
         r#"{"api_token":"PROD_TOKEN"}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
-    Command::cargo_bin("rdc").unwrap().current_dir(project.path()).args(["sync", "test", "--no-push"]).assert().success();
-    Command::cargo_bin("rdc").unwrap().current_dir(project.path()).args(["sync", "prod", "--no-push"]).assert().success();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "test", "--no-push"])
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "prod", "--no-push"])
+        .assert()
+        .success();
 
     // Set overlay BEFORE the second prod pull so the lockfile records the
     // stripped hash. Same caveat documented in the README for "overlay
@@ -169,21 +199,26 @@ version = 1
 [hooks.validator-invoices]
 "name" = "Validator (PROD)"
 "#,
-    ).unwrap();
-    Command::cargo_bin("rdc").unwrap()
+    )
+    .unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args(["sync", "prod", "--no-push"])
-        .assert().success();
+        .assert()
+        .success();
 
     // `rdc deploy` now owns the full cross-env workflow — it auto-builds
     // the mapping, prints a plan, and runs the update sub-step in one
     // call. Only validator-invoices needs a PATCH (overlay renames it);
     // sftp-import is byte-identical between test and prod after
     // env-specific stripping, so it's skipped as idempotent.
-    Command::cargo_bin("rdc").unwrap()
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args(["deploy", "test", "prod", "--yes"])
-        .assert().success()
+        .assert()
+        .success()
         // Preview pass emits the per-object diff with a `- tgt before / + tgt
         // after` legend so the reader sees the tgt state delta directly,
         // instead of an apples-to-oranges src-vs-tgt comparison.
@@ -192,17 +227,28 @@ version = 1
         .stdout(predicate::str::contains("1 hooks"))
         .stdout(predicate::str::contains("(1 PATCHes)"));
 
-    let body = captured.lock().unwrap().clone().expect("PATCH body for hook 401");
-    assert_eq!(body["name"], serde_json::Value::String("Validator (PROD)".into()));
+    let body = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("PATCH body for hook 401");
+    assert_eq!(
+        body["name"],
+        serde_json::Value::String("Validator (PROD)".into())
+    );
 
     // Inline write-back: after `rdc deploy`, the local tgt snapshot must
     // reflect the PATCH response (no separate `rdc sync` needed).
     let written = std::fs::read_to_string(
-        project.path().join("envs/prod/hooks/validator-invoices.json"),
-    ).expect("local prod hook file must exist after deploy");
+        project
+            .path()
+            .join("envs/prod/hooks/validator-invoices.json"),
+    )
+    .expect("local prod hook file must exist after deploy");
     let written: serde_json::Value = serde_json::from_str(&written).unwrap();
     assert_eq!(
-        written["name"], serde_json::Value::String("Validator (PROD)".into()),
+        written["name"],
+        serde_json::Value::String("Validator (PROD)".into()),
         "local prod hook file should reflect the PATCH response",
     );
 }
@@ -213,7 +259,8 @@ async fn mount_minimal_for_deploy(server: &MockServer, schema: serde_json::Value
     Mock::given(method("GET"))
         .and(path("/api/v1/organizations/1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
-        .mount(server).await;
+        .mount(server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/workspaces"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -226,7 +273,8 @@ async fn mount_minimal_for_deploy(server: &MockServer, schema: serde_json::Value
                 "queues": ["https://mock.rossum.app/api/v1/queues/100"]
             }]
         })))
-        .mount(server).await;
+        .mount(server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/queues"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -239,20 +287,29 @@ async fn mount_minimal_for_deploy(server: &MockServer, schema: serde_json::Value
                 "schema": "https://mock.rossum.app/api/v1/schemas/200"
             }]
         })))
-        .mount(server).await;
+        .mount(server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/schemas/200"))
         .respond_with(ResponseTemplate::new(200).set_body_json(schema))
-        .mount(server).await;
+        .mount(server)
+        .await;
     for ep in [
-        "/api/v1/hooks", "/api/v1/inboxes", "/api/v1/rules", "/api/v1/labels",
-        "/api/v1/engines", "/api/v1/engine_fields",
-        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+        "/api/v1/hooks",
+        "/api/v1/inboxes",
+        "/api/v1/rules",
+        "/api/v1/labels",
+        "/api/v1/engines",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
     ] {
         Mock::given(method("GET"))
             .and(path(ep))
             .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
-            .mount(server).await;
+            .mount(server)
+            .await;
     }
 }
 
@@ -280,7 +337,8 @@ async fn deploy_queue_and_schema() {
             *queue_patch_body_clone.lock().unwrap() = Some(body.clone());
             ResponseTemplate::new(200).set_body_json(body)
         })
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
 
     let schema_patch_seen: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let schema_patch_seen_clone = schema_patch_seen.clone();
@@ -291,46 +349,64 @@ async fn deploy_queue_and_schema() {
             let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
             ResponseTemplate::new(200).set_body_json(body)
         })
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
 
     let project = TempDir::new().unwrap();
-    Command::cargo_bin("rdc").unwrap()
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args([
-            "init", "--env", &format!("test={}/api/v1:1", test_server.uri()),
-            "--env", &format!("prod={}/api/v1:1", prod_server.uri()),
+            "init",
+            "--env",
+            &format!("test={}/api/v1:1", test_server.uri()),
+            "--env",
+            &format!("prod={}/api/v1:1", prod_server.uri()),
         ])
-        .assert().success();
+        .assert()
+        .success();
     std::fs::write(
         project.path().join("secrets/test.secrets.json"),
         r#"{"api_token":"TEST"}"#,
-    ).unwrap();
+    )
+    .unwrap();
     std::fs::write(
         project.path().join("secrets/prod.secrets.json"),
         r#"{"api_token":"PROD"}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
-    Command::cargo_bin("rdc").unwrap()
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args(["sync", "test", "--no-push"])
-        .assert().success();
-    Command::cargo_bin("rdc").unwrap()
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args(["sync", "prod", "--no-push"])
-        .assert().success();
+        .assert()
+        .success();
 
     // Edit test queue + schema formula to differ from prod (so apply has
     // a real change to push; otherwise apply's idempotency would
     // correctly skip the no-diff cases).
-    let queue_path = project.path()
+    let queue_path = project
+        .path()
         .join("envs/test/workspaces/invoices-ap/queues/cost-invoices/queue.json");
     let raw = std::fs::read_to_string(&queue_path).unwrap();
     let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
     v["default_score_threshold"] = serde_json::json!(0.99);
-    std::fs::write(&queue_path, format!("{}\n", serde_json::to_string_pretty(&v).unwrap())).unwrap();
+    std::fs::write(
+        &queue_path,
+        format!("{}\n", serde_json::to_string_pretty(&v).unwrap()),
+    )
+    .unwrap();
 
     // Edit test schema's first formula so it differs from prod's schema.
-    let formula_dir = project.path()
+    let formula_dir = project
+        .path()
         .join("envs/test/workspaces/invoices-ap/queues/cost-invoices/formulas");
     if formula_dir.exists() {
         for entry in std::fs::read_dir(&formula_dir).unwrap().flatten() {
@@ -343,14 +419,19 @@ async fn deploy_queue_and_schema() {
     }
 
     // `rdc deploy` does map + plan + apply in one call.
-    Command::cargo_bin("rdc").unwrap()
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args(["deploy", "test", "prod", "--yes"])
-        .assert().success()
+        .assert()
+        .success()
         .stdout(predicate::str::contains("1 queues"))
         .stdout(predicate::str::contains("1 schemas"));
 
-    let captured = queue_patch_body.lock().unwrap().clone()
+    let captured = queue_patch_body
+        .lock()
+        .unwrap()
+        .clone()
         .expect("queue PATCH body captured");
     assert_eq!(captured["default_score_threshold"], serde_json::json!(0.99));
     assert!(*schema_patch_seen.lock().unwrap(), "schema PATCH was made");
@@ -380,7 +461,8 @@ async fn deploy_bootstraps_empty_target_with_url_rewriting() {
     Mock::given(method("GET"))
         .and(path("/api/v1/organizations/1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/workspaces"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -393,7 +475,8 @@ async fn deploy_bootstraps_empty_target_with_url_rewriting() {
                 "queues": ["https://test.rossum.app/api/v1/queues/600"]
             }]
         })))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/queues"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -406,7 +489,8 @@ async fn deploy_bootstraps_empty_target_with_url_rewriting() {
                 "schema": "https://test.rossum.app/api/v1/schemas/700"
             }]
         })))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/schemas/700"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -416,7 +500,8 @@ async fn deploy_bootstraps_empty_target_with_url_rewriting() {
             "queues": ["https://test.rossum.app/api/v1/queues/600"],
             "content": [],
         })))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/hooks"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -431,31 +516,49 @@ async fn deploy_bootstraps_empty_target_with_url_rewriting() {
                 "config": { "runtime": "python3.12", "code": "def run(p):\n    return {}\n" }
             }]
         })))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
     for ep in [
-        "/api/v1/inboxes", "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
-        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+        "/api/v1/inboxes",
+        "/api/v1/rules",
+        "/api/v1/labels",
+        "/api/v1/engines",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
     ] {
         Mock::given(method("GET"))
             .and(path(ep))
             .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
-            .mount(&test_server).await;
+            .mount(&test_server)
+            .await;
     }
 
     // --- PROD env: empty (every list returns 0 results) ---
     Mock::given(method("GET"))
         .and(path("/api/v1/organizations/1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes", "/api/v1/hooks",
-        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
-        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+        "/api/v1/workspaces",
+        "/api/v1/queues",
+        "/api/v1/inboxes",
+        "/api/v1/hooks",
+        "/api/v1/rules",
+        "/api/v1/labels",
+        "/api/v1/engines",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
     ] {
         Mock::given(method("GET"))
             .and(path(ep))
             .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
-            .mount(&prod_server).await;
+            .mount(&prod_server)
+            .await;
     }
 
     // --- PROD env POST mocks: each returns a body shaped like the response,
@@ -471,7 +574,9 @@ async fn deploy_bootstraps_empty_target_with_url_rewriting() {
             body["id"] = serde_json::json!(5500);
             body["url"] = serde_json::json!("https://prod.rossum.app/api/v1/workspaces/5500");
             ResponseTemplate::new(201).set_body_json(body)
-        }).mount(&prod_server).await;
+        })
+        .mount(&prod_server)
+        .await;
     let pc = post_count.clone();
     Mock::given(method("POST"))
         .and(path("/api/v1/schemas"))
@@ -481,7 +586,9 @@ async fn deploy_bootstraps_empty_target_with_url_rewriting() {
             body["id"] = serde_json::json!(7700);
             body["url"] = serde_json::json!("https://prod.rossum.app/api/v1/schemas/7700");
             ResponseTemplate::new(201).set_body_json(body)
-        }).mount(&prod_server).await;
+        })
+        .mount(&prod_server)
+        .await;
     let pc = post_count.clone();
     Mock::given(method("POST"))
         .and(path("/api/v1/queues"))
@@ -491,7 +598,9 @@ async fn deploy_bootstraps_empty_target_with_url_rewriting() {
             body["id"] = serde_json::json!(6600);
             body["url"] = serde_json::json!("https://prod.rossum.app/api/v1/queues/6600");
             ResponseTemplate::new(201).set_body_json(body)
-        }).mount(&prod_server).await;
+        })
+        .mount(&prod_server)
+        .await;
     let hook_post_body: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
     let captured = hook_post_body.clone();
     let pc = post_count.clone();
@@ -505,7 +614,9 @@ async fn deploy_bootstraps_empty_target_with_url_rewriting() {
             resp["id"] = serde_json::json!(8800);
             resp["url"] = serde_json::json!("https://prod.rossum.app/api/v1/hooks/8800");
             ResponseTemplate::new(201).set_body_json(resp)
-        }).mount(&prod_server).await;
+        })
+        .mount(&prod_server)
+        .await;
 
     // After queue POST, deploy calls list_email_templates to capture auto-
     // created peers. The empty-list mock above already covers it.
@@ -525,7 +636,9 @@ async fn deploy_bootstraps_empty_target_with_url_rewriting() {
                 "events": ["annotation_content.initialize"],
                 "config": { "runtime": "python3.12", "code": "def run(p):\n    return {}\n" }
             }))
-        }).mount(&prod_server).await;
+        })
+        .mount(&prod_server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/schemas/7700"))
         .respond_with(move |_req: &wiremock::Request| {
@@ -536,29 +649,58 @@ async fn deploy_bootstraps_empty_target_with_url_rewriting() {
                 "queues": ["https://prod.rossum.app/api/v1/queues/6600"],
                 "content": [],
             }))
-        }).mount(&prod_server).await;
+        })
+        .mount(&prod_server)
+        .await;
 
     let project = TempDir::new().unwrap();
-    Command::cargo_bin("rdc").unwrap()
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args([
-            "init", "--env", &format!("test={}/api/v1:1", test_server.uri()),
-            "--env", &format!("prod={}/api/v1:1", prod_server.uri()),
+            "init",
+            "--env",
+            &format!("test={}/api/v1:1", test_server.uri()),
+            "--env",
+            &format!("prod={}/api/v1:1", prod_server.uri()),
         ])
-        .assert().success();
-    std::fs::write(project.path().join("secrets/test.secrets.json"), r#"{"api_token":"TEST"}"#).unwrap();
-    std::fs::write(project.path().join("secrets/prod.secrets.json"), r#"{"api_token":"PROD"}"#).unwrap();
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/test.secrets.json"),
+        r#"{"api_token":"TEST"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("secrets/prod.secrets.json"),
+        r#"{"api_token":"PROD"}"#,
+    )
+    .unwrap();
 
-    Command::cargo_bin("rdc").unwrap().current_dir(project.path()).args(["sync", "test", "--no-push"]).assert().success();
-    Command::cargo_bin("rdc").unwrap().current_dir(project.path()).args(["sync", "prod", "--no-push"]).assert().success();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "test", "--no-push"])
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "prod", "--no-push"])
+        .assert()
+        .success();
 
     // === The one-command deploy. ===
-    Command::cargo_bin("rdc").unwrap()
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args(["deploy", "test", "prod", "--yes"])
-        .assert().success()
+        .assert()
+        .success()
         // Preview emits create-body new-file diffs labeled by kind/slug.
-        .stdout(predicate::str::contains("--- create bodies (would-be POST) ---"))
+        .stdout(predicate::str::contains(
+            "--- create bodies (would-be POST) ---",
+        ))
         .stdout(predicate::str::contains("workspaces"))
         .stdout(predicate::str::contains("schemas"))
         .stdout(predicate::str::contains("queues"))
@@ -568,7 +710,11 @@ async fn deploy_bootstraps_empty_target_with_url_rewriting() {
     assert_eq!(*post_count.lock().unwrap(), 4, "expected exactly 4 POSTs");
 
     // The hook's POST body must reference the PROD queue URL, not the test one.
-    let hook_body = hook_post_body.lock().unwrap().clone().expect("hook POST body captured");
+    let hook_body = hook_post_body
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("hook POST body captured");
     let queues = hook_body["queues"].as_array().expect("queues array");
     assert_eq!(queues.len(), 1);
     assert_eq!(
@@ -593,7 +739,8 @@ async fn deploy_refuses_non_tty_without_token_owner_overlay() {
     Mock::given(method("GET"))
         .and(path("/api/v1/organizations/1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
     let mdh_src = {
         let mut b = mdh_snapshot_body(&src_api);
         b["id"] = serde_json::Value::from(999u64);
@@ -606,16 +753,25 @@ async fn deploy_refuses_non_tty_without_token_owner_overlay() {
             "pagination": {"next": null},
             "results": [mdh_src.clone()]
         })))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes",
-        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
-        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+        "/api/v1/workspaces",
+        "/api/v1/queues",
+        "/api/v1/inboxes",
+        "/api/v1/rules",
+        "/api/v1/labels",
+        "/api/v1/engines",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
     ] {
         Mock::given(method("GET"))
             .and(path(ep))
             .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
-            .mount(&test_server).await;
+            .mount(&test_server)
+            .await;
     }
     Mock::given(method("GET"))
         .and(path("/api/v1/hook_templates"))
@@ -627,22 +783,33 @@ async fn deploy_refuses_non_tty_without_token_owner_overlay() {
                  "extension_source": "rossum_store", "install_action": "copy"}
             ]
         })))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
 
     // ── Tgt (prod) pull mocks ────────────────────────────────────────────────
     Mock::given(method("GET"))
         .and(path("/api/v1/organizations/1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes", "/api/v1/hooks",
-        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
-        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+        "/api/v1/workspaces",
+        "/api/v1/queues",
+        "/api/v1/inboxes",
+        "/api/v1/hooks",
+        "/api/v1/rules",
+        "/api/v1/labels",
+        "/api/v1/engines",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
     ] {
         Mock::given(method("GET"))
             .and(path(ep))
             .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
-            .mount(&prod_server).await;
+            .mount(&prod_server)
+            .await;
     }
     Mock::given(method("GET"))
         .and(path("/api/v1/hook_templates"))
@@ -654,40 +821,52 @@ async fn deploy_refuses_non_tty_without_token_owner_overlay() {
                  "extension_source": "rossum_store", "install_action": "copy"}
             ]
         })))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
 
     // ── Project bootstrap ────────────────────────────────────────────────────
     let project = TempDir::new().unwrap();
-    Command::cargo_bin("rdc").unwrap()
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args([
             "init",
-            "--env", &format!("test={src_api}:1"),
-            "--env", &format!("prod={tgt_api}:1"),
+            "--env",
+            &format!("test={src_api}:1"),
+            "--env",
+            &format!("prod={tgt_api}:1"),
         ])
-        .assert().success();
+        .assert()
+        .success();
     std::fs::write(
         project.path().join("secrets/test.secrets.json"),
         r#"{"api_token":"TKN_TEST"}"#,
-    ).unwrap();
+    )
+    .unwrap();
     std::fs::write(
         project.path().join("secrets/prod.secrets.json"),
         r#"{"api_token":"TKN_PROD"}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
-    Command::cargo_bin("rdc").unwrap()
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args(["sync", "test", "--no-push"])
-        .assert().success();
-    Command::cargo_bin("rdc").unwrap()
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args(["sync", "prod", "--no-push"])
-        .assert().success();
+        .assert()
+        .success();
 
     // Deliberately omit the tgt overlay — no store_extension_token_owner set.
 
     // Deploy with --yes (non-interactive) must fail.
-    Command::cargo_bin("rdc").unwrap()
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args(["deploy", "test", "prod", "--yes"])
         .assert()
@@ -732,7 +911,8 @@ async fn deploy_errors_when_template_missing_on_tgt() {
     Mock::given(method("GET"))
         .and(path("/api/v1/organizations/1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
     let mdh_src = {
         let mut b = mdh_snapshot_body(&src_api);
         b["id"] = serde_json::Value::from(999u64);
@@ -745,16 +925,25 @@ async fn deploy_errors_when_template_missing_on_tgt() {
             "pagination": {"next": null},
             "results": [mdh_src.clone()]
         })))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes",
-        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
-        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+        "/api/v1/workspaces",
+        "/api/v1/queues",
+        "/api/v1/inboxes",
+        "/api/v1/rules",
+        "/api/v1/labels",
+        "/api/v1/engines",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
     ] {
         Mock::given(method("GET"))
             .and(path(ep))
             .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
-            .mount(&test_server).await;
+            .mount(&test_server)
+            .await;
     }
     // src /hook_templates — returns the MDH template (id 39)
     Mock::given(method("GET"))
@@ -767,22 +956,33 @@ async fn deploy_errors_when_template_missing_on_tgt() {
                  "extension_source": "rossum_store", "install_action": "copy"}
             ]
         })))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
 
     // ── Tgt (prod) pull mocks ────────────────────────────────────────────────
     Mock::given(method("GET"))
         .and(path("/api/v1/organizations/1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes", "/api/v1/hooks",
-        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
-        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+        "/api/v1/workspaces",
+        "/api/v1/queues",
+        "/api/v1/inboxes",
+        "/api/v1/hooks",
+        "/api/v1/rules",
+        "/api/v1/labels",
+        "/api/v1/engines",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
     ] {
         Mock::given(method("GET"))
             .and(path(ep))
             .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
-            .mount(&prod_server).await;
+            .mount(&prod_server)
+            .await;
     }
     // tgt /hook_templates — EMPTY: the template is not available on prod
     Mock::given(method("GET"))
@@ -791,35 +991,46 @@ async fn deploy_errors_when_template_missing_on_tgt() {
             "pagination": {"next": null},
             "results": []
         })))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
 
     // ── Project bootstrap ────────────────────────────────────────────────────
     let project = TempDir::new().unwrap();
-    Command::cargo_bin("rdc").unwrap()
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args([
             "init",
-            "--env", &format!("test={src_api}:1"),
-            "--env", &format!("prod={tgt_api}:1"),
+            "--env",
+            &format!("test={src_api}:1"),
+            "--env",
+            &format!("prod={tgt_api}:1"),
         ])
-        .assert().success();
+        .assert()
+        .success();
     std::fs::write(
         project.path().join("secrets/test.secrets.json"),
         r#"{"api_token":"TKN_TEST"}"#,
-    ).unwrap();
+    )
+    .unwrap();
     std::fs::write(
         project.path().join("secrets/prod.secrets.json"),
         r#"{"api_token":"TKN_PROD"}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
-    Command::cargo_bin("rdc").unwrap()
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args(["sync", "test", "--no-push"])
-        .assert().success();
-    Command::cargo_bin("rdc").unwrap()
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args(["sync", "prod", "--no-push"])
-        .assert().success();
+        .assert()
+        .success();
 
     // Tgt overlay HAS store_extension_token_owner — so the failure is
     // purely template-related, not token-related.
@@ -830,10 +1041,12 @@ async fn deploy_errors_when_template_missing_on_tgt() {
         format!(
             "version = 1\n\n[defaults]\nstore_extension_token_owner = \"{tgt_api}/users/521884\"\n"
         ),
-    ).unwrap();
+    )
+    .unwrap();
 
     // Deploy with --yes must fail because the template is absent on prod.
-    Command::cargo_bin("rdc").unwrap()
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args(["deploy", "test", "prod", "--yes"])
         .assert()
@@ -878,7 +1091,8 @@ async fn deploy_resolves_templates_and_prompts_for_token_owner() {
     Mock::given(method("GET"))
         .and(path("/api/v1/organizations/1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
     // hooks list: returns the MDH store extension
     let mdh_src = {
         let mut b = mdh_snapshot_body(&src_api);
@@ -892,17 +1106,26 @@ async fn deploy_resolves_templates_and_prompts_for_token_owner() {
             "pagination": {"next": null},
             "results": [mdh_src.clone()]
         })))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
     // all other src list endpoints — empty
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes",
-        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
-        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+        "/api/v1/workspaces",
+        "/api/v1/queues",
+        "/api/v1/inboxes",
+        "/api/v1/rules",
+        "/api/v1/labels",
+        "/api/v1/engines",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
     ] {
         Mock::given(method("GET"))
             .and(path(ep))
             .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
-            .mount(&test_server).await;
+            .mount(&test_server)
+            .await;
     }
     // src /hook_templates — pre-pass lists this to build the src→tgt pair
     Mock::given(method("GET"))
@@ -915,23 +1138,34 @@ async fn deploy_resolves_templates_and_prompts_for_token_owner() {
                  "extension_source": "rossum_store", "install_action": "copy"}
             ]
         })))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
 
     // ── Tgt (prod) pull mocks ────────────────────────────────────────────────
     Mock::given(method("GET"))
         .and(path("/api/v1/organizations/1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
     // prod starts with no hooks
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes", "/api/v1/hooks",
-        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
-        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+        "/api/v1/workspaces",
+        "/api/v1/queues",
+        "/api/v1/inboxes",
+        "/api/v1/hooks",
+        "/api/v1/rules",
+        "/api/v1/labels",
+        "/api/v1/engines",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
     ] {
         Mock::given(method("GET"))
             .and(path(ep))
             .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
-            .mount(&prod_server).await;
+            .mount(&prod_server)
+            .await;
     }
     // tgt /hook_templates — pre-pass lists this; id 41 (different from src's 39)
     Mock::given(method("GET"))
@@ -944,7 +1178,8 @@ async fn deploy_resolves_templates_and_prompts_for_token_owner() {
                  "extension_source": "rossum_store", "install_action": "copy"}
             ]
         })))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
 
     // ── Tgt deploy mocks ─────────────────────────────────────────────────────
     // The installed body returned by POST /hooks/create (template defaults,
@@ -964,51 +1199,65 @@ async fn deploy_resolves_templates_and_prompts_for_token_owner() {
     Mock::given(method("GET"))
         .and(path("/api/v1/hooks"))
         .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
     // Two-call install: POST /hooks/create.
     Mock::given(method("POST"))
         .and(path("/api/v1/hooks/create"))
         .respond_with(ResponseTemplate::new(201).set_body_json(installed_on_tgt.clone()))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
     // Reconcile PATCH /hooks/700.
     Mock::given(method("PATCH"))
         .and(path("/api/v1/hooks/700"))
         .respond_with(ResponseTemplate::new(200).set_body_json(customised_on_tgt.clone()))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
     // apply drift check: GET /api/v1/hooks/700.
     Mock::given(method("GET"))
         .and(path("/api/v1/hooks/700"))
         .respond_with(ResponseTemplate::new(200).set_body_json(customised_on_tgt.clone()))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
 
     // ── Project bootstrap ────────────────────────────────────────────────────
     let project = TempDir::new().unwrap();
-    Command::cargo_bin("rdc").unwrap()
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args([
             "init",
-            "--env", &format!("test={src_api}:1"),
-            "--env", &format!("prod={tgt_api}:1"),
+            "--env",
+            &format!("test={src_api}:1"),
+            "--env",
+            &format!("prod={tgt_api}:1"),
         ])
-        .assert().success();
+        .assert()
+        .success();
     std::fs::write(
         project.path().join("secrets/test.secrets.json"),
         r#"{"api_token":"TKN_TEST"}"#,
-    ).unwrap();
+    )
+    .unwrap();
     std::fs::write(
         project.path().join("secrets/prod.secrets.json"),
         r#"{"api_token":"TKN_PROD"}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Pull both envs to establish lockfiles and snapshots.
-    Command::cargo_bin("rdc").unwrap()
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args(["sync", "test", "--no-push"])
-        .assert().success();
-    Command::cargo_bin("rdc").unwrap()
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args(["sync", "prod", "--no-push"])
-        .assert().success();
+        .assert()
+        .success();
 
     // Pre-populate the tgt overlay with the system user URL so the pre-pass
     // resolves token_owner without hanging on stdin (non-interactive path).
@@ -1019,13 +1268,16 @@ async fn deploy_resolves_templates_and_prompts_for_token_owner() {
         format!(
             "version = 1\n\n[defaults]\nstore_extension_token_owner = \"{tgt_api}/users/521884\"\n"
         ),
-    ).unwrap();
+    )
+    .unwrap();
 
     // Deploy — pre-pass resolves templates, reads token_owner from overlay.
-    let out = Command::cargo_bin("rdc").unwrap()
+    let out = Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args(["deploy", "test", "prod", "--yes"])
-        .output().unwrap();
+        .output()
+        .unwrap();
 
     assert!(
         out.status.success(),
@@ -1055,7 +1307,10 @@ async fn deploy_resolves_templates_and_prompts_for_token_owner() {
     let hook_id = lf["objects"]["hooks"]["master-data-hub"]["id"]
         .as_u64()
         .expect("hooks.master-data-hub.id must be an integer in tgt lockfile");
-    assert!(hook_id > 0, "hook id in tgt lockfile must be positive, got {hook_id}");
+    assert!(
+        hook_id > 0,
+        "hook id in tgt lockfile must be positive, got {hook_id}"
+    );
 }
 
 /// `rdc deploy --only hooks/nonexistent` must fail fast with a clear error
@@ -1068,26 +1323,45 @@ async fn deploy_only_with_unknown_selector_errors() {
     mount_full_pull(&prod_server, empty_list()).await;
 
     let project = TempDir::new().unwrap();
-    Command::cargo_bin("rdc").unwrap()
-        .args(["init", "--env", &format!("test={}/api/v1:1", test_server.uri()),
-               "--env", &format!("prod={}/api/v1:1", prod_server.uri())])
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .args([
+            "init",
+            "--env",
+            &format!("test={}/api/v1:1", test_server.uri()),
+            "--env",
+            &format!("prod={}/api/v1:1", prod_server.uri()),
+        ])
         .current_dir(project.path())
         .env("RDC_TOKEN_TEST", "T")
         .env("RDC_TOKEN_PROD", "T")
-        .assert().success();
-    Command::cargo_bin("rdc").unwrap()
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
         .args(["sync", "test", "--no-push"])
         .current_dir(project.path())
         .env("RDC_TOKEN_TEST", "T")
-        .assert().success();
-    Command::cargo_bin("rdc").unwrap()
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
         .args(["sync", "prod", "--no-push"])
         .current_dir(project.path())
         .env("RDC_TOKEN_PROD", "T")
-        .assert().success();
+        .assert()
+        .success();
 
-    Command::cargo_bin("rdc").unwrap()
-        .args(["deploy", "test", "prod", "--yes", "--only", "hooks/nonexistent"])
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .args([
+            "deploy",
+            "test",
+            "prod",
+            "--yes",
+            "--only",
+            "hooks/nonexistent",
+        ])
         .current_dir(project.path())
         .env("RDC_TOKEN_TEST", "T")
         .env("RDC_TOKEN_PROD", "T")
@@ -1130,34 +1404,56 @@ async fn deploy_only_filters_plan() {
     Mock::given(method("GET"))
         .and(path("/api/v1/rules"))
         .respond_with(ResponseTemplate::new(200).set_body_json(rules_list))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
     mount_full_pull(&prod_server, empty_list()).await;
 
     let project = TempDir::new().unwrap();
-    Command::cargo_bin("rdc").unwrap()
-        .args(["init",
-               "--env", &format!("test={}/api/v1:1", test_server.uri()),
-               "--env", &format!("prod={}/api/v1:1", prod_server.uri())])
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .args([
+            "init",
+            "--env",
+            &format!("test={}/api/v1:1", test_server.uri()),
+            "--env",
+            &format!("prod={}/api/v1:1", prod_server.uri()),
+        ])
         .current_dir(project.path())
-        .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
-        .assert().success();
-    Command::cargo_bin("rdc").unwrap()
+        .env("RDC_TOKEN_TEST", "T")
+        .env("RDC_TOKEN_PROD", "T")
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
         .args(["sync", "test", "--no-push"])
         .current_dir(project.path())
         .env("RDC_TOKEN_TEST", "T")
-        .assert().success();
-    Command::cargo_bin("rdc").unwrap()
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
         .args(["sync", "prod", "--no-push"])
         .current_dir(project.path())
         .env("RDC_TOKEN_PROD", "T")
-        .assert().success();
+        .assert()
+        .success();
 
-    let assert = Command::cargo_bin("rdc").unwrap()
-        .args(["deploy", "test", "prod", "--yes", "--dry-run", "--only", "hooks/*"])
+    let assert = Command::cargo_bin("rdc")
+        .unwrap()
+        .args([
+            "deploy",
+            "test",
+            "prod",
+            "--yes",
+            "--dry-run",
+            "--only",
+            "hooks/*",
+        ])
         .current_dir(project.path())
         .env("RDC_TOKEN_TEST", "T")
         .env("RDC_TOKEN_PROD", "T")
-        .assert().success();
+        .assert()
+        .success();
     let out = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
     // Preview should emit a create body for the in-scope hook…
     assert!(
@@ -1210,7 +1506,8 @@ async fn deploy_only_creates_filtered_kind_only() {
     Mock::given(method("GET"))
         .and(path("/api/v1/rules"))
         .respond_with(ResponseTemplate::new(200).set_body_json(rules_list))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
     mount_full_pull(&prod_server, empty_list()).await;
 
     let counter = rule_post_calls.clone();
@@ -1220,7 +1517,8 @@ async fn deploy_only_creates_filtered_kind_only() {
             *counter.lock().unwrap() += 1;
             ResponseTemplate::new(201).set_body_json(serde_json::json!({}))
         })
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
     let hook_body = serde_json::json!({
         "id": 999,
         "url": format!("{}/api/v1/hooks/999", prod_server.uri()),
@@ -1230,37 +1528,60 @@ async fn deploy_only_creates_filtered_kind_only() {
     Mock::given(method("POST"))
         .and(path("/api/v1/hooks"))
         .respond_with(ResponseTemplate::new(201).set_body_json(hook_body.clone()))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
     // Apply's drift check does GET /hooks/999 — return the same body so apply
     // sees the hook as already in sync and issues no PATCH.
     Mock::given(method("GET"))
         .and(path("/api/v1/hooks/999"))
         .respond_with(ResponseTemplate::new(200).set_body_json(hook_body))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
 
     let project = TempDir::new().unwrap();
-    Command::cargo_bin("rdc").unwrap()
-        .args(["init",
-               "--env", &format!("test={}/api/v1:1", test_server.uri()),
-               "--env", &format!("prod={}/api/v1:1", prod_server.uri())])
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .args([
+            "init",
+            "--env",
+            &format!("test={}/api/v1:1", test_server.uri()),
+            "--env",
+            &format!("prod={}/api/v1:1", prod_server.uri()),
+        ])
         .current_dir(project.path())
-        .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
-        .assert().success();
-    Command::cargo_bin("rdc").unwrap()
-        .args(["sync", "test", "--no-push"]).current_dir(project.path())
-        .env("RDC_TOKEN_TEST", "T").assert().success();
-    Command::cargo_bin("rdc").unwrap()
-        .args(["sync", "prod", "--no-push"]).current_dir(project.path())
-        .env("RDC_TOKEN_PROD", "T").assert().success();
+        .env("RDC_TOKEN_TEST", "T")
+        .env("RDC_TOKEN_PROD", "T")
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .args(["sync", "test", "--no-push"])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T")
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .args(["sync", "prod", "--no-push"])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_PROD", "T")
+        .assert()
+        .success();
 
-    Command::cargo_bin("rdc").unwrap()
+    Command::cargo_bin("rdc")
+        .unwrap()
         .args(["deploy", "test", "prod", "--yes", "--only", "hooks/x"])
         .current_dir(project.path())
-        .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
-        .assert().success();
+        .env("RDC_TOKEN_TEST", "T")
+        .env("RDC_TOKEN_PROD", "T")
+        .assert()
+        .success();
 
-    assert_eq!(*rule_post_calls.lock().unwrap(), 0,
-        "POST /rules must not be called when --only hooks/x");
+    assert_eq!(
+        *rule_post_calls.lock().unwrap(),
+        0,
+        "POST /rules must not be called when --only hooks/x"
+    );
 }
 
 /// `--only hooks/x-v2` must PATCH the matching hook but never PATCH
@@ -1299,32 +1620,38 @@ async fn deploy_only_update_sweep_skips_unmatched_kinds() {
     mount_full_pull(
         &test_server,
         serde_json::json!({"pagination": {"next": null}, "results": [hook_test.clone()]}),
-    ).await;
+    )
+    .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/rules"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "pagination": {"next": null}, "results": [rule_test.clone()]
         })))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
     mount_full_pull(
         &prod_server,
         serde_json::json!({"pagination": {"next": null}, "results": [hook_prod.clone()]}),
-    ).await;
+    )
+    .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/rules"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "pagination": {"next": null}, "results": [rule_prod.clone()]
         })))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
     // GET single hook for apply drift check.
     Mock::given(method("GET"))
         .and(path("/api/v1/hooks/900"))
         .respond_with(ResponseTemplate::new(200).set_body_json(hook_prod.clone()))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
     Mock::given(method("PATCH"))
         .and(path("/api/v1/hooks/900"))
         .respond_with(ResponseTemplate::new(200).set_body_json(hook_prod.clone()))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
     let counter = rule_patch_calls.clone();
     Mock::given(method("PATCH"))
         .and(path("/api/v1/rules/950"))
@@ -1332,31 +1659,53 @@ async fn deploy_only_update_sweep_skips_unmatched_kinds() {
             *counter.lock().unwrap() += 1;
             ResponseTemplate::new(200).set_body_json(serde_json::json!({}))
         })
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
 
     let project = TempDir::new().unwrap();
-    Command::cargo_bin("rdc").unwrap()
-        .args(["init",
-               "--env", &format!("test={}/api/v1:1", test_server.uri()),
-               "--env", &format!("prod={}/api/v1:1", prod_server.uri())])
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .args([
+            "init",
+            "--env",
+            &format!("test={}/api/v1:1", test_server.uri()),
+            "--env",
+            &format!("prod={}/api/v1:1", prod_server.uri()),
+        ])
         .current_dir(project.path())
-        .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
-        .assert().success();
-    Command::cargo_bin("rdc").unwrap()
-        .args(["sync", "test", "--no-push"]).current_dir(project.path())
-        .env("RDC_TOKEN_TEST", "T").assert().success();
-    Command::cargo_bin("rdc").unwrap()
-        .args(["sync", "prod", "--no-push"]).current_dir(project.path())
-        .env("RDC_TOKEN_PROD", "T").assert().success();
+        .env("RDC_TOKEN_TEST", "T")
+        .env("RDC_TOKEN_PROD", "T")
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .args(["sync", "test", "--no-push"])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T")
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .args(["sync", "prod", "--no-push"])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_PROD", "T")
+        .assert()
+        .success();
 
-    Command::cargo_bin("rdc").unwrap()
+    Command::cargo_bin("rdc")
+        .unwrap()
         .args(["deploy", "test", "prod", "--yes", "--only", "hooks/x-v2"])
         .current_dir(project.path())
-        .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
-        .assert().success();
+        .env("RDC_TOKEN_TEST", "T")
+        .env("RDC_TOKEN_PROD", "T")
+        .assert()
+        .success();
 
-    assert_eq!(*rule_patch_calls.lock().unwrap(), 0,
-        "PATCH /rules/950 must not be called when --only hooks/x-v2");
+    assert_eq!(
+        *rule_patch_calls.lock().unwrap(),
+        0,
+        "PATCH /rules/950 must not be called when --only hooks/x-v2"
+    );
 }
 
 /// `rdc deploy test prod --dry-run` with a store extension in src must print
@@ -1373,7 +1722,8 @@ async fn deploy_plan_lists_store_extensions_in_dry_run() {
     Mock::given(method("GET"))
         .and(path("/api/v1/organizations/1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
     let mdh_src = {
         let mut b = mdh_snapshot_body(&src_api);
         b["id"] = serde_json::Value::from(999u64);
@@ -1386,16 +1736,25 @@ async fn deploy_plan_lists_store_extensions_in_dry_run() {
             "pagination": {"next": null},
             "results": [mdh_src.clone()]
         })))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes",
-        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
-        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+        "/api/v1/workspaces",
+        "/api/v1/queues",
+        "/api/v1/inboxes",
+        "/api/v1/rules",
+        "/api/v1/labels",
+        "/api/v1/engines",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
     ] {
         Mock::given(method("GET"))
             .and(path(ep))
             .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
-            .mount(&test_server).await;
+            .mount(&test_server)
+            .await;
     }
     Mock::given(method("GET"))
         .and(path("/api/v1/hook_templates"))
@@ -1407,22 +1766,33 @@ async fn deploy_plan_lists_store_extensions_in_dry_run() {
                  "extension_source": "rossum_store", "install_action": "copy"}
             ]
         })))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
 
     // ── Tgt (prod) pull mocks ────────────────────────────────────────────────
     Mock::given(method("GET"))
         .and(path("/api/v1/organizations/1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes", "/api/v1/hooks",
-        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
-        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+        "/api/v1/workspaces",
+        "/api/v1/queues",
+        "/api/v1/inboxes",
+        "/api/v1/hooks",
+        "/api/v1/rules",
+        "/api/v1/labels",
+        "/api/v1/engines",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
     ] {
         Mock::given(method("GET"))
             .and(path(ep))
             .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
-            .mount(&prod_server).await;
+            .mount(&prod_server)
+            .await;
     }
     // tgt /hook_templates — id 41 (different from src's 39)
     Mock::given(method("GET"))
@@ -1435,35 +1805,46 @@ async fn deploy_plan_lists_store_extensions_in_dry_run() {
                  "extension_source": "rossum_store", "install_action": "copy"}
             ]
         })))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
 
     // ── Project bootstrap ────────────────────────────────────────────────────
     let project = TempDir::new().unwrap();
-    Command::cargo_bin("rdc").unwrap()
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args([
             "init",
-            "--env", &format!("test={src_api}:1"),
-            "--env", &format!("prod={tgt_api}:1"),
+            "--env",
+            &format!("test={src_api}:1"),
+            "--env",
+            &format!("prod={tgt_api}:1"),
         ])
-        .assert().success();
+        .assert()
+        .success();
     std::fs::write(
         project.path().join("secrets/test.secrets.json"),
         r#"{"api_token":"TKN_TEST"}"#,
-    ).unwrap();
+    )
+    .unwrap();
     std::fs::write(
         project.path().join("secrets/prod.secrets.json"),
         r#"{"api_token":"TKN_PROD"}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
-    Command::cargo_bin("rdc").unwrap()
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args(["sync", "test", "--no-push"])
-        .assert().success();
-    Command::cargo_bin("rdc").unwrap()
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args(["sync", "prod", "--no-push"])
-        .assert().success();
+        .assert()
+        .success();
 
     // Pre-populate the tgt overlay with the system user URL so the pre-pass
     // resolves token_owner without hanging on stdin.
@@ -1474,13 +1855,16 @@ async fn deploy_plan_lists_store_extensions_in_dry_run() {
         format!(
             "version = 1\n\n[defaults]\nstore_extension_token_owner = \"{tgt_api}/users/521884\"\n"
         ),
-    ).unwrap();
+    )
+    .unwrap();
 
     // --dry-run: plan is printed but no writes happen.
-    let out = Command::cargo_bin("rdc").unwrap()
+    let out = Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args(["deploy", "test", "prod", "--dry-run"])
-        .output().unwrap();
+        .output()
+        .unwrap();
 
     assert!(
         out.status.success(),
@@ -1554,24 +1938,34 @@ async fn deploy_only_mirror_only_deletes_in_scope() {
     Mock::given(method("GET"))
         .and(path("/api/v1/organizations/1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/hooks"))
         .respond_with(ResponseTemplate::new(200).set_body_json(prod_hooks))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/rules"))
         .respond_with(ResponseTemplate::new(200).set_body_json(prod_rules))
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes",
-        "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
-        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+        "/api/v1/workspaces",
+        "/api/v1/queues",
+        "/api/v1/inboxes",
+        "/api/v1/labels",
+        "/api/v1/engines",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
     ] {
         Mock::given(method("GET"))
             .and(path(ep))
             .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
-            .mount(&prod_server).await;
+            .mount(&prod_server)
+            .await;
     }
 
     let hc = hook_delete_calls.clone();
@@ -1581,7 +1975,8 @@ async fn deploy_only_mirror_only_deletes_in_scope() {
             *hc.lock().unwrap() += 1;
             ResponseTemplate::new(204)
         })
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
     let rc = rule_delete_calls.clone();
     Mock::given(method("DELETE"))
         .and(path("/api/v1/rules/950"))
@@ -1589,31 +1984,60 @@ async fn deploy_only_mirror_only_deletes_in_scope() {
             *rc.lock().unwrap() += 1;
             ResponseTemplate::new(204)
         })
-        .mount(&prod_server).await;
+        .mount(&prod_server)
+        .await;
 
     let project = TempDir::new().unwrap();
-    Command::cargo_bin("rdc").unwrap()
-        .args(["init",
-               "--env", &format!("test={}/api/v1:1", test_server.uri()),
-               "--env", &format!("prod={}/api/v1:1", prod_server.uri())])
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .args([
+            "init",
+            "--env",
+            &format!("test={}/api/v1:1", test_server.uri()),
+            "--env",
+            &format!("prod={}/api/v1:1", prod_server.uri()),
+        ])
         .current_dir(project.path())
-        .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
-        .assert().success();
-    Command::cargo_bin("rdc").unwrap()
-        .args(["sync", "test", "--no-push"]).current_dir(project.path())
-        .env("RDC_TOKEN_TEST", "T").assert().success();
-    Command::cargo_bin("rdc").unwrap()
-        .args(["sync", "prod", "--no-push"]).current_dir(project.path())
-        .env("RDC_TOKEN_PROD", "T").assert().success();
-
-    Command::cargo_bin("rdc").unwrap()
-        .args(["deploy", "test", "prod", "--yes", "--mirror", "--only", "hooks/*"])
+        .env("RDC_TOKEN_TEST", "T")
+        .env("RDC_TOKEN_PROD", "T")
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .args(["sync", "test", "--no-push"])
         .current_dir(project.path())
-        .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
-        .assert().success();
+        .env("RDC_TOKEN_TEST", "T")
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .args(["sync", "prod", "--no-push"])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_PROD", "T")
+        .assert()
+        .success();
 
-    assert_eq!(*hook_delete_calls.lock().unwrap(), 1, "hook A must be deleted");
-    assert_eq!(*rule_delete_calls.lock().unwrap(), 0, "rule B must survive --only hooks/*");
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .args([
+            "deploy", "test", "prod", "--yes", "--mirror", "--only", "hooks/*",
+        ])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T")
+        .env("RDC_TOKEN_PROD", "T")
+        .assert()
+        .success();
+
+    assert_eq!(
+        *hook_delete_calls.lock().unwrap(),
+        1,
+        "hook A must be deleted"
+    );
+    assert_eq!(
+        *rule_delete_calls.lock().unwrap(),
+        0,
+        "rule B must survive --only hooks/*"
+    );
 }
 
 /// `rdc deploy --only hooks/h --yes` must refuse when the selected hook
@@ -1656,56 +2080,84 @@ async fn deploy_only_missing_dep_ci_refuses_with_suggestion() {
     Mock::given(method("GET"))
         .and(path("/api/v1/organizations/1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/hooks"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "pagination": {"next": null}, "results": [hook_body]
         })))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/workspaces"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "pagination": {"next": null}, "results": [workspace_body]
         })))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/queues"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "pagination": {"next": null}, "results": [queue_body]
         })))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
     for ep in [
-        "/api/v1/inboxes", "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
-        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+        "/api/v1/inboxes",
+        "/api/v1/rules",
+        "/api/v1/labels",
+        "/api/v1/engines",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
     ] {
         Mock::given(method("GET"))
             .and(path(ep))
             .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
-            .mount(&test_server).await;
+            .mount(&test_server)
+            .await;
     }
 
     mount_full_pull(&prod_server, empty_list()).await;
 
     let project = TempDir::new().unwrap();
-    Command::cargo_bin("rdc").unwrap()
-        .args(["init",
-               "--env", &format!("test={}/api/v1:1", test_server.uri()),
-               "--env", &format!("prod={}/api/v1:1", prod_server.uri())])
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .args([
+            "init",
+            "--env",
+            &format!("test={}/api/v1:1", test_server.uri()),
+            "--env",
+            &format!("prod={}/api/v1:1", prod_server.uri()),
+        ])
         .current_dir(project.path())
-        .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
-        .assert().success();
-    Command::cargo_bin("rdc").unwrap()
-        .args(["sync", "test", "--no-push"]).current_dir(project.path())
-        .env("RDC_TOKEN_TEST", "T").assert().success();
-    Command::cargo_bin("rdc").unwrap()
-        .args(["sync", "prod", "--no-push"]).current_dir(project.path())
-        .env("RDC_TOKEN_PROD", "T").assert().success();
+        .env("RDC_TOKEN_TEST", "T")
+        .env("RDC_TOKEN_PROD", "T")
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .args(["sync", "test", "--no-push"])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T")
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .args(["sync", "prod", "--no-push"])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_PROD", "T")
+        .assert()
+        .success();
 
-    Command::cargo_bin("rdc").unwrap()
+    Command::cargo_bin("rdc")
+        .unwrap()
         .args(["deploy", "test", "prod", "--yes", "--only", "hooks/h"])
         .current_dir(project.path())
-        .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
+        .env("RDC_TOKEN_TEST", "T")
+        .env("RDC_TOKEN_PROD", "T")
         .assert()
         .failure()
         .stderr(predicate::str::contains("queues/q"))
@@ -1736,23 +2188,39 @@ async fn deploy_only_dry_run_makes_no_api_calls() {
     mount_full_pull(
         &test_server,
         serde_json::json!({"pagination": {"next": null}, "results": [hook_body]}),
-    ).await;
+    )
+    .await;
     mount_full_pull(&prod_server, empty_list()).await;
 
     let project = TempDir::new().unwrap();
-    Command::cargo_bin("rdc").unwrap()
-        .args(["init",
-               "--env", &format!("test={}/api/v1:1", test_server.uri()),
-               "--env", &format!("prod={}/api/v1:1", prod_server.uri())])
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .args([
+            "init",
+            "--env",
+            &format!("test={}/api/v1:1", test_server.uri()),
+            "--env",
+            &format!("prod={}/api/v1:1", prod_server.uri()),
+        ])
         .current_dir(project.path())
-        .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
-        .assert().success();
-    Command::cargo_bin("rdc").unwrap()
-        .args(["sync", "test", "--no-push"]).current_dir(project.path())
-        .env("RDC_TOKEN_TEST", "T").assert().success();
-    Command::cargo_bin("rdc").unwrap()
-        .args(["sync", "prod", "--no-push"]).current_dir(project.path())
-        .env("RDC_TOKEN_PROD", "T").assert().success();
+        .env("RDC_TOKEN_TEST", "T")
+        .env("RDC_TOKEN_PROD", "T")
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .args(["sync", "test", "--no-push"])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_TEST", "T")
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .args(["sync", "prod", "--no-push"])
+        .current_dir(project.path())
+        .env("RDC_TOKEN_PROD", "T")
+        .assert()
+        .success();
 
     // Mount write-interceptors only after pulls so the MDH probe
     // (POST .../collections/list) during pull returns 404 instead of
@@ -1764,23 +2232,41 @@ async fn deploy_only_dry_run_makes_no_api_calls() {
         .respond_with(move |_: &wiremock::Request| {
             *c1.lock().unwrap() += 1;
             ResponseTemplate::new(201).set_body_json(serde_json::json!({}))
-        }).mount(&prod_server).await;
+        })
+        .mount(&prod_server)
+        .await;
     let c2 = post_or_patch.clone();
     Mock::given(method("PATCH"))
         .and(path_regex(r"^/api/v1/"))
         .respond_with(move |_: &wiremock::Request| {
             *c2.lock().unwrap() += 1;
             ResponseTemplate::new(200).set_body_json(serde_json::json!({}))
-        }).mount(&prod_server).await;
+        })
+        .mount(&prod_server)
+        .await;
 
-    Command::cargo_bin("rdc").unwrap()
-        .args(["deploy", "test", "prod", "--yes", "--dry-run", "--only", "hooks/h"])
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .args([
+            "deploy",
+            "test",
+            "prod",
+            "--yes",
+            "--dry-run",
+            "--only",
+            "hooks/h",
+        ])
         .current_dir(project.path())
-        .env("RDC_TOKEN_TEST", "T").env("RDC_TOKEN_PROD", "T")
-        .assert().success();
+        .env("RDC_TOKEN_TEST", "T")
+        .env("RDC_TOKEN_PROD", "T")
+        .assert()
+        .success();
 
-    assert_eq!(*post_or_patch.lock().unwrap(), 0,
-        "dry-run must make no write API calls");
+    assert_eq!(
+        *post_or_patch.lock().unwrap(),
+        0,
+        "dry-run must make no write API calls"
+    );
 }
 
 /// Deploy must wait for the target env's lock before entering its write
@@ -1836,10 +2322,19 @@ org_id = 1
 api_base = "http://127.0.0.1:1/api/v1"
 org_id = 1
 "#,
-    ).unwrap();
+    )
+    .unwrap();
     std::fs::create_dir_all(project_dir.join("secrets")).unwrap();
-    std::fs::write(project_dir.join("secrets/test.secrets.json"), r#"{"api_token":"t"}"#).unwrap();
-    std::fs::write(project_dir.join("secrets/prod.secrets.json"), r#"{"api_token":"t"}"#).unwrap();
+    std::fs::write(
+        project_dir.join("secrets/test.secrets.json"),
+        r#"{"api_token":"t"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project_dir.join("secrets/prod.secrets.json"),
+        r#"{"api_token":"t"}"#,
+    )
+    .unwrap();
     std::fs::create_dir_all(project_dir.join("envs/test")).unwrap();
     std::fs::create_dir_all(project_dir.join("envs/prod")).unwrap();
 
@@ -1891,7 +2386,8 @@ async fn deploy_rewrites_organization_url_on_workspace_create() {
             "settings": {},
             "users": [],
         })))
-        .mount(&dev_server).await;
+        .mount(&dev_server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/workspaces"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1904,16 +2400,25 @@ async fn deploy_rewrites_organization_url_on_workspace_create() {
                 "queues": []
             }]
         })))
-        .mount(&dev_server).await;
+        .mount(&dev_server)
+        .await;
     for ep in [
-        "/api/v1/queues", "/api/v1/inboxes", "/api/v1/hooks", "/api/v1/rules", "/api/v1/labels",
-        "/api/v1/engines", "/api/v1/engine_fields", "/api/v1/workflows",
-        "/api/v1/workflow_steps", "/api/v1/email_templates",
+        "/api/v1/queues",
+        "/api/v1/inboxes",
+        "/api/v1/hooks",
+        "/api/v1/rules",
+        "/api/v1/labels",
+        "/api/v1/engines",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
     ] {
         Mock::given(method("GET"))
             .and(path(ep))
             .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
-            .mount(&dev_server).await;
+            .mount(&dev_server)
+            .await;
     }
 
     // --- TEST env: org_id 222, empty, distinct org URL ---
@@ -1927,16 +2432,26 @@ async fn deploy_rewrites_organization_url_on_workspace_create() {
             "settings": {},
             "users": [],
         })))
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
     for ep in [
-        "/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes", "/api/v1/hooks",
-        "/api/v1/rules", "/api/v1/labels", "/api/v1/engines", "/api/v1/engine_fields",
-        "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+        "/api/v1/workspaces",
+        "/api/v1/queues",
+        "/api/v1/inboxes",
+        "/api/v1/hooks",
+        "/api/v1/rules",
+        "/api/v1/labels",
+        "/api/v1/engines",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
     ] {
         Mock::given(method("GET"))
             .and(path(ep))
             .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
-            .mount(&test_server).await;
+            .mount(&test_server)
+            .await;
     }
 
     // --- TEST env workspace POST: capture body, assert org URL is rewritten ---
@@ -1953,32 +2468,57 @@ async fn deploy_rewrites_organization_url_on_workspace_create() {
             resp["url"] = serde_json::json!(format!("{test_uri}/api/v1/workspaces/900"));
             ResponseTemplate::new(201).set_body_json(resp)
         })
-        .mount(&test_server).await;
+        .mount(&test_server)
+        .await;
 
     let project = TempDir::new().unwrap();
-    Command::cargo_bin("rdc").unwrap()
+    Command::cargo_bin("rdc")
+        .unwrap()
         .current_dir(project.path())
         .args([
             "init",
-            "--env", &format!("dev={}/api/v1:111", dev_server.uri()),
-            "--env", &format!("test={}/api/v1:222", test_server.uri()),
+            "--env",
+            &format!("dev={}/api/v1:111", dev_server.uri()),
+            "--env",
+            &format!("test={}/api/v1:222", test_server.uri()),
         ])
-        .assert().success();
-    std::fs::write(project.path().join("secrets/dev.secrets.json"),
-        r#"{"api_token":"DEV"}"#).unwrap();
-    std::fs::write(project.path().join("secrets/test.secrets.json"),
-        r#"{"api_token":"TEST"}"#).unwrap();
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"DEV"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("secrets/test.secrets.json"),
+        r#"{"api_token":"TEST"}"#,
+    )
+    .unwrap();
 
-    Command::cargo_bin("rdc").unwrap().current_dir(project.path())
-        .args(["sync", "dev", "--no-push"]).assert().success();
-    Command::cargo_bin("rdc").unwrap().current_dir(project.path())
-        .args(["sync", "test", "--no-push"]).assert().success();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev", "--no-push"])
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "test", "--no-push"])
+        .assert()
+        .success();
 
-    Command::cargo_bin("rdc").unwrap().current_dir(project.path())
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
         .args(["deploy", "dev", "test", "--yes"])
-        .assert().success();
+        .assert()
+        .success();
 
-    let body = captured_ws_body.lock().unwrap().clone()
+    let body = captured_ws_body
+        .lock()
+        .unwrap()
+        .clone()
         .expect("workspace POST body captured");
     assert_eq!(
         body["organization"].as_str().unwrap(),
@@ -2087,8 +2627,14 @@ async fn deploy_pre_populates_hook_secrets_file_on_missing_keys() {
     );
     let v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&secrets_path).unwrap()).unwrap();
-    assert_eq!(v["hooks"]["mdh-lookup"]["api_key"], rdc::secrets::UNFILLED_SENTINEL);
-    assert_eq!(v["hooks"]["mdh-lookup"]["signing_secret"], rdc::secrets::UNFILLED_SENTINEL);
+    assert_eq!(
+        v["hooks"]["mdh-lookup"]["api_key"],
+        rdc::secrets::UNFILLED_SENTINEL
+    );
+    assert_eq!(
+        v["hooks"]["mdh-lookup"]["signing_secret"],
+        rdc::secrets::UNFILLED_SENTINEL
+    );
 
     // Bug regression: a re-run with the file unchanged must still
     // refuse, listing the same keys as missing. The previous
@@ -2124,5 +2670,198 @@ async fn deploy_pre_populates_hook_secrets_file_on_missing_keys() {
         v2["hooks"]["mdh-lookup"]["api_key"], "kept-by-user",
         "the user's typed-in value must survive a re-deploy"
     );
-    assert_eq!(v2["hooks"]["mdh-lookup"]["signing_secret"], rdc::secrets::UNFILLED_SENTINEL);
+    assert_eq!(
+        v2["hooks"]["mdh-lookup"]["signing_secret"],
+        rdc::secrets::UNFILLED_SENTINEL
+    );
+}
+
+/// Deploy-CREATE records the codec baseline for engines: `engine.json` on the
+/// tgt snapshot must have `agenda_id` replaced with the redaction sentinel
+/// (NOT the raw value returned by the API), must have no `modified_at`, and
+/// the lockfile `content_hash` must equal `combined_hash(disk_json, &[])`.
+///
+/// Regression: before this fix the create path used raw `to_vec_pretty` which
+/// wrote the live `agenda_id` to disk and recorded its hash, causing every
+/// subsequent pull/sync to compute a codec-baseline hash that differed →
+/// phantom drift on engines after a deploy-create.
+#[tokio::test]
+async fn deploy_create_engine_records_codec_baseline() {
+    let src_server = MockServer::start().await;
+    let tgt_server = MockServer::start().await;
+    let src_uri = src_server.uri();
+    let tgt_uri = tgt_server.uri();
+
+    // --- src env: org 1, one engine with a live agenda_id ---
+    let src_engine = serde_json::json!({
+        "id": 501,
+        "url": format!("{src_uri}/api/v1/engines/501"),
+        "name": "Invoice Engine",
+        "type": "extractor",
+        "agenda_id": "tnt_src_live_agenda",
+        "modified_at": "2026-05-01T12:00:00Z"
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 1, "url": format!("{src_uri}/api/v1/organizations/1"),
+            "name": "Src Org", "modified_at": "2026-01-01T00:00:00Z",
+            "settings": {}, "users": []
+        })))
+        .mount(&src_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/engines"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [src_engine.clone()]
+        })))
+        .mount(&src_server)
+        .await;
+    for ep in [
+        "/api/v1/workspaces",
+        "/api/v1/queues",
+        "/api/v1/inboxes",
+        "/api/v1/hooks",
+        "/api/v1/rules",
+        "/api/v1/labels",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&src_server)
+            .await;
+    }
+
+    // --- tgt env: org 2, empty ---
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 2, "url": format!("{tgt_uri}/api/v1/organizations/2"),
+            "name": "Tgt Org", "modified_at": "2026-01-01T00:00:00Z",
+            "settings": {}, "users": []
+        })))
+        .mount(&tgt_server)
+        .await;
+    for ep in [
+        "/api/v1/workspaces",
+        "/api/v1/queues",
+        "/api/v1/inboxes",
+        "/api/v1/hooks",
+        "/api/v1/rules",
+        "/api/v1/labels",
+        "/api/v1/engines",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&tgt_server)
+            .await;
+    }
+
+    // The tgt server returns an engine with a *different* tgt-env agenda_id.
+    let tgt_uri_c = tgt_uri.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/v1/engines"))
+        .respond_with(move |_req: &wiremock::Request| {
+            ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": 701,
+                "url": format!("{tgt_uri_c}/api/v1/engines/701"),
+                "name": "Invoice Engine",
+                "type": "extractor",
+                "agenda_id": "tnt_tgt_live_agenda",
+                "modified_at": "2026-05-02T08:00:00Z"
+            }))
+        })
+        .mount(&tgt_server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args([
+            "init",
+            "--env",
+            &format!("src={src_uri}/api/v1:1"),
+            "--env",
+            &format!("tgt={tgt_uri}/api/v1:2"),
+        ])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/src.secrets.json"),
+        r#"{"api_token":"SRC"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("secrets/tgt.secrets.json"),
+        r#"{"api_token":"TGT"}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "src", "--no-push"])
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "tgt", "--no-push"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["deploy", "src", "tgt", "--yes"])
+        .assert()
+        .success();
+
+    // --- Assertions ---
+    // 1. The tgt on-disk engine.json must have agenda_id = sentinel, no modified_at.
+    let engine_json_path = project
+        .path()
+        .join("envs/tgt/engines/invoice-engine/engine.json");
+    assert!(
+        engine_json_path.exists(),
+        "engine.json must be written to tgt snapshot"
+    );
+    let disk_str = std::fs::read_to_string(&engine_json_path).unwrap();
+    let disk: serde_json::Value = serde_json::from_str(&disk_str).unwrap();
+    assert_eq!(
+        disk["agenda_id"].as_str().unwrap_or(""),
+        rdc::snapshot::create::REDACTED_VALUE_SENTINEL,
+        "deploy-create must write agenda_id = codec sentinel, not the raw live value"
+    );
+    assert!(
+        disk.get("modified_at").is_none(),
+        "deploy-create must strip modified_at from the tgt snapshot (codec strip)"
+    );
+
+    // 2. The tgt lockfile content_hash must equal combined_hash(disk_json, &[]).
+    let lf_path = project.path().join(".rdc/state/tgt.lock.json");
+    let lf: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&lf_path).unwrap()).unwrap();
+    let recorded_hash = lf["objects"]["engines"]["invoice-engine"]["content_hash"]
+        .as_str()
+        .expect("content_hash must be present in tgt lockfile for engine");
+
+    let disk_bytes = std::fs::read(&engine_json_path).unwrap();
+    let expected_hash = rdc::snapshot::codec::combined_hash(&disk_bytes, &[]);
+    assert_eq!(
+        recorded_hash, expected_hash,
+        "lockfile content_hash must equal combined_hash(disk_bytes, &[]) — \
+         codec baseline must be consistent between create-path and pull/sync"
+    );
 }
