@@ -48,7 +48,10 @@ pub struct ObjectEntry {
 
 impl Default for Lockfile {
     fn default() -> Self {
-        Self { version: LOCKFILE_VERSION, objects: BTreeMap::new() }
+        Self {
+            version: LOCKFILE_VERSION,
+            objects: BTreeMap::new(),
+        }
     }
 }
 
@@ -60,10 +63,10 @@ impl Lockfile {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let mut lf: Lockfile = serde_json::from_str(&raw)
-            .with_context(|| format!("parsing {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut lf: Lockfile =
+            serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
 
         match lf.version {
             1 => {
@@ -96,8 +99,7 @@ impl Lockfile {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        let s = serde_json::to_string_pretty(self)
-            .context("serializing lockfile")?;
+        let s = serde_json::to_string_pretty(self).context("serializing lockfile")?;
         crate::snapshot::writer::write_atomic(path, format!("{s}\n").as_bytes())?;
         Ok(())
     }
@@ -225,18 +227,22 @@ pub fn schema_combined_hash(json_bytes: &[u8], formulas: &[(String, Vec<u8>)]) -
 ///
 /// ```text
 /// SHA-256(
-///     json_bytes
+///     canonicalize_for_hash(json_bytes)
 ///     [|| 0x00 || "code" || 0x00 || code_bytes]
 /// )
 /// ```
+///
+/// `status` is NOT stripped here. Upstream, `serialize_hook` (and thus
+/// `KindCodec::disk_bytes` for hooks) redacts `status` to the constant
+/// sentinel `REDACTED_VALUE_SENTINEL` before the JSON bytes are ever
+/// passed here. A constant value is hash-stable regardless of server
+/// churn, so an extra strip is redundant. Removing it makes
+/// `hook_combined_hash(json, code)` byte-identical to
+/// `crate::snapshot::codec::combined_hash(json, &[("code", code_bytes)])`,
+/// which is what `KindCodec::base_hash` computes — aligning pull, push,
+/// sync, deploy, and doctor on a single hash definition.
 pub fn hook_combined_hash(json_bytes: &[u8], code: &Option<String>) -> String {
-    // `status` is server-managed for hooks (pending → ready transition
-    // happens asynchronously after a POST). Strip it from the hash so
-    // a hook created at T0 doesn't show drift at T0+a-few-seconds.
-    let canonical = crate::snapshot::noise::canonicalize_with_extra_strips(
-        json_bytes,
-        &["status"],
-    );
+    let canonical = crate::snapshot::noise::canonicalize_for_hash(json_bytes);
     let mut hasher = Sha256::new();
     hasher.update(&canonical);
     if let Some(code) = code {
@@ -495,10 +501,10 @@ mod tests {
     fn rule_and_hook_combined_hashes_do_not_collide() {
         let json = b"{}";
         let code = Some("x > 0".to_string());
-        // hook_combined_hash also strips `status`; the JSON has no
-        // status so canonicalize_with_extra_strips reduces to the same
-        // canonicalize_for_hash input on this minimal payload.
-        assert_ne!(rule_combined_hash(json, &code), hook_combined_hash(json, &code));
+        assert_ne!(
+            rule_combined_hash(json, &code),
+            hook_combined_hash(json, &code)
+        );
     }
 
     #[test]
@@ -518,7 +524,13 @@ mod tests {
         lf.upsert(
             "hooks",
             "validator-invoices",
-            ObjectEntry { id: 42, url: None, modified_at: None, content_hash: None, secrets_hash: None },
+            ObjectEntry {
+                id: 42,
+                url: None,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
         );
         assert_eq!(lf.slug_for_id("hooks", 42), Some("validator-invoices"));
         assert_eq!(lf.slug_for_id("hooks", 99), None);
@@ -544,6 +556,43 @@ mod tests {
             Some("invoices-ap"),
         );
         assert_eq!(lf.slug_for_url("workspaces", "https://nope"), None);
-        assert_eq!(lf.slug_for_url("hooks", "https://x/api/v1/workspaces/1"), None);
+        assert_eq!(
+            lf.slug_for_url("hooks", "https://x/api/v1/workspaces/1"),
+            None
+        );
+    }
+
+    /// Guard: `hook_combined_hash` must produce the same digest as
+    /// `crate::snapshot::codec::combined_hash` for the same input.
+    ///
+    /// This locks the alignment between the legacy state hash path
+    /// (pull/push/sync/deploy/doctor callers) and the codec-based hash path,
+    /// so a future refactor that accidentally re-introduces divergence
+    /// (e.g. extra strips or a different sidecar label) is caught immediately.
+    #[test]
+    fn hook_combined_hash_equals_codec_combined_hash() {
+        use crate::snapshot::codec::combined_hash as codec_combined_hash;
+
+        // --- with code ---
+        let json = b"{\"name\":\"validator\",\"status\":\"<refreshed live in Rossum; not synced by rdc>\"}";
+        let code = Some("def process(payload, settings):\n    pass\n".to_string());
+
+        let legacy = hook_combined_hash(json, &code);
+        let sidecars = vec![("code".to_string(), code.clone().unwrap().into_bytes())];
+        let codec = codec_combined_hash(json, &sidecars);
+        assert_eq!(
+            legacy, codec,
+            "hook_combined_hash must equal codec::combined_hash (with code)"
+        );
+
+        // --- without code ---
+        let json_no_code =
+            b"{\"name\":\"webhook\",\"status\":\"<refreshed live in Rossum; not synced by rdc>\"}";
+        let legacy_no_code = hook_combined_hash(json_no_code, &None);
+        let codec_no_code = codec_combined_hash(json_no_code, &[]);
+        assert_eq!(
+            legacy_no_code, codec_no_code,
+            "hook_combined_hash must equal codec::combined_hash (no code)"
+        );
     }
 }
