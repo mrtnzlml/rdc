@@ -7,12 +7,13 @@ use crate::mapping::Mapping;
 use crate::overlay::{Overlay, apply_overrides};
 use crate::paths::Paths;
 use crate::secrets::resolve_token;
+use crate::snapshot::codec::combined_hash;
 use crate::snapshot::create::{redact_for_disk, strip_for_cross_env_patch};
 use crate::snapshot::email_template::{read_email_template, write_email_template};
 use crate::snapshot::hook::{read_hook_value, write_hook};
 use crate::snapshot::rule::write_rule;
 use crate::snapshot::schema::{read_schema_value, write_schema_bytes};
-use crate::state::{Lockfile, ObjectEntry, content_hash, rule_combined_hash, schema_combined_hash};
+use crate::state::{Lockfile, ObjectEntry, rule_combined_hash, schema_combined_hash};
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -378,7 +379,7 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt workspaces/{tgt_id}"))?;
             let updated: crate::model::Workspace = serde_json::from_value(response_value)
                 .context("parsing PATCH /workspaces response as Workspace")?;
-            write_back_workspace(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
+            write_back_workspace(&tgt_paths, tgt_lockfile, tgt_slug, &updated, None)?;
         }
         applied.workspaces += 1;
         if let Some(p) = &progress {
@@ -850,7 +851,7 @@ pub(crate) async fn run(
                 .update_label(tgt_id, &payload_label, None)
                 .await
                 .with_context(|| format!("PATCH tgt labels/{tgt_id}"))?;
-            write_back_label(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
+            write_back_label(&tgt_paths, tgt_lockfile, tgt_slug, &updated, overlay_paths)?;
         }
         applied.labels += 1;
         if let Some(p) = &progress {
@@ -992,7 +993,7 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt queues/{tgt_id}"))?;
             let updated: crate::model::Queue = serde_json::from_value(response_value)
                 .context("parsing PATCH /queues response as Queue")?;
-            write_back_queue(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
+            write_back_queue(&tgt_paths, tgt_lockfile, tgt_slug, &updated, overlay_paths)?;
         }
         applied.queues += 1;
         if let Some(p) = &progress {
@@ -1257,7 +1258,7 @@ pub(crate) async fn run(
                 .update_inbox_value(tgt_id, &patch_body, None)
                 .await
                 .with_context(|| format!("PATCH tgt inboxes/{tgt_id}"))?;
-            write_back_inbox(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
+            write_back_inbox(&tgt_paths, tgt_lockfile, tgt_slug, &updated, overlay_paths)?;
         }
         applied.inboxes += 1;
         if let Some(p) = &progress {
@@ -1401,7 +1402,7 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt email_templates/{tgt_id}"))?;
             let updated: crate::model::EmailTemplate = serde_json::from_value(response_value)
                 .context("parsing PATCH /email_templates response as EmailTemplate")?;
-            write_back_email_template(&tgt_paths, tgt_lockfile, tgt_key, &updated)?;
+            write_back_email_template(&tgt_paths, tgt_lockfile, tgt_key, &updated, overlay_paths)?;
         }
         applied.email_templates += 1;
         if let Some(p) = &progress {
@@ -1533,7 +1534,7 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt engines/{tgt_id}"))
             {
                 Ok(updated) => {
-                    write_back_engine(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
+                    write_back_engine(&tgt_paths, tgt_lockfile, tgt_slug, &updated, overlay_paths)?;
                     applied.engines += 1;
                     if let Some(p) = &progress {
                         p.event(Action::Patch, &format!("engine/{tgt_slug}"));
@@ -1698,7 +1699,13 @@ pub(crate) async fn run(
                 .with_context(|| format!("PATCH tgt engine_fields/{tgt_id}"))
             {
                 Ok(updated) => {
-                    write_back_engine_field(&tgt_paths, tgt_lockfile, tgt_slug, &updated)?;
+                    write_back_engine_field(
+                        &tgt_paths,
+                        tgt_lockfile,
+                        tgt_slug,
+                        &updated,
+                        overlay_paths,
+                    )?;
                     applied.engine_fields += 1;
                     if let Some(p) = &progress {
                         p.event(Action::Patch, &format!("engine_field/{tgt_slug}"));
@@ -1986,10 +1993,12 @@ fn upsert_after_write_back(
     );
 }
 
-/// Common path for flat (no-sidecar) kinds: redact, pretty-print, write,
-/// hash with `content_hash`, update lockfile. Also mirrors the bytes to
-/// the tgt env's base cache so the next sync on tgt can 3-way-merge
-/// from a current base.
+/// Common path for flat (no-sidecar) kinds: run the API body through the
+/// [`KindCodec`] (redacts noise fields AND strips `modified_at` recursively),
+/// apply the tgt overlay strip so the recorded hash matches what a subsequent
+/// `pull`/`sync` on tgt would recompute, write the post-overlay JSON to disk,
+/// and update the tgt lockfile entry. Also mirrors the bytes to the tgt env's
+/// base cache so the next sync on tgt can 3-way-merge from a current base.
 fn write_back_flat<T: serde::Serialize>(
     tgt_paths: &Paths,
     tgt_lockfile: &mut Lockfile,
@@ -2000,23 +2009,31 @@ fn write_back_flat<T: serde::Serialize>(
     id: u64,
     url: &str,
     modified_at: Option<&str>,
+    overlay_paths: Option<&BTreeMap<String, Value>>,
 ) -> Result<()> {
-    let mut value = serde_json::to_value(response)
+    let value = serde_json::to_value(response)
         .with_context(|| format!("serialising {kind}/{slug} response for write-back"))?;
-    redact_for_disk(&mut value, kind);
-    let mut bytes = serde_json::to_vec_pretty(&value)
-        .with_context(|| format!("encoding {kind}/{slug} write-back bytes"))?;
-    bytes.push(b'\n');
-    crate::state::base_cache::write_disk_and_cache(tgt_paths, file_path, &bytes)?;
-    upsert_after_write_back(
-        tgt_lockfile,
-        kind,
-        slug,
-        id,
-        url,
-        modified_at,
-        content_hash(&bytes),
-    );
+    // Route through the codec so we get the same redaction + hidden-field strip
+    // that pull/sync apply. For unregistered kinds fall back to raw pretty-print.
+    let (disk_json, sidecars) = if let Some(c) = crate::snapshot::codec::codec(kind) {
+        let art = c
+            .disk_bytes(&value)
+            .with_context(|| format!("codec disk_bytes for {kind}/{slug}"))?;
+        (art.json, art.sidecars)
+    } else {
+        let mut b = serde_json::to_vec_pretty(&value)
+            .with_context(|| format!("encoding {kind}/{slug} write-back bytes"))?;
+        b.push(b'\n');
+        (b, vec![])
+    };
+    // Strip overlay paths so the recorded hash matches what `tgt_drift_status`
+    // (and the pull driver) would compute from the same remote response.
+    let json_for_hash = maybe_strip_overlay(disk_json.clone(), overlay_paths)?;
+    let hash = combined_hash(&json_for_hash, &sidecars);
+    // Write the post-overlay bytes to disk (overlay fields are tgt-specific
+    // overrides, so they must NOT appear in the stored snapshot either).
+    crate::state::base_cache::write_disk_and_cache(tgt_paths, file_path, &json_for_hash)?;
+    upsert_after_write_back(tgt_lockfile, kind, slug, id, url, modified_at, hash);
     Ok(())
 }
 
@@ -2025,6 +2042,7 @@ fn write_back_workspace(
     tgt_lockfile: &mut Lockfile,
     slug: &str,
     response: &crate::model::Workspace,
+    overlay_paths: Option<&BTreeMap<String, Value>>,
 ) -> Result<()> {
     let dir = tgt_paths.workspace_dir(slug);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -2038,6 +2056,7 @@ fn write_back_workspace(
         response.id,
         &response.url,
         response.modified_at(),
+        overlay_paths,
     )
 }
 
@@ -2046,6 +2065,7 @@ fn write_back_label(
     tgt_lockfile: &mut Lockfile,
     slug: &str,
     response: &crate::model::Label,
+    overlay_paths: Option<&BTreeMap<String, Value>>,
 ) -> Result<()> {
     let dir = tgt_paths.labels_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -2059,6 +2079,7 @@ fn write_back_label(
         response.id,
         &response.url,
         response.modified_at(),
+        overlay_paths,
     )
 }
 
@@ -2067,6 +2088,7 @@ fn write_back_queue(
     tgt_lockfile: &mut Lockfile,
     q_slug: &str,
     response: &crate::model::Queue,
+    overlay_paths: Option<&BTreeMap<String, Value>>,
 ) -> Result<()> {
     let dir = locate_queue_dir(tgt_paths, q_slug)
         .ok_or_else(|| anyhow!("tgt queue dir for '{q_slug}' not found for write-back"))?;
@@ -2081,6 +2103,7 @@ fn write_back_queue(
         response.id,
         &response.url,
         response.modified_at(),
+        overlay_paths,
     )
 }
 
@@ -2089,6 +2112,7 @@ fn write_back_inbox(
     tgt_lockfile: &mut Lockfile,
     q_slug: &str,
     response: &crate::model::Inbox,
+    overlay_paths: Option<&BTreeMap<String, Value>>,
 ) -> Result<()> {
     let dir = locate_queue_dir(tgt_paths, q_slug)
         .ok_or_else(|| anyhow!("tgt queue dir for inbox '{q_slug}' not found for write-back"))?;
@@ -2103,6 +2127,7 @@ fn write_back_inbox(
         response.id,
         &response.url,
         response.modified_at(),
+        overlay_paths,
     )
 }
 
@@ -2111,6 +2136,7 @@ fn write_back_engine(
     tgt_lockfile: &mut Lockfile,
     slug: &str,
     response: &crate::model::Engine,
+    overlay_paths: Option<&BTreeMap<String, Value>>,
 ) -> Result<()> {
     let dir = tgt_paths.engine_dir(slug);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -2124,6 +2150,7 @@ fn write_back_engine(
         response.id,
         &response.url,
         response.modified_at(),
+        overlay_paths,
     )
 }
 
@@ -2132,6 +2159,7 @@ fn write_back_engine_field(
     tgt_lockfile: &mut Lockfile,
     composite_key: &str,
     response: &crate::model::EngineField,
+    overlay_paths: Option<&BTreeMap<String, Value>>,
 ) -> Result<()> {
     // `composite_key` is `<engine_slug>/<field_slug>` — the lockfile /
     // mapping shape. Split it for the on-disk path.
@@ -2153,6 +2181,7 @@ fn write_back_engine_field(
         response.id,
         &response.url,
         response.modified_at(),
+        overlay_paths,
     )
 }
 
@@ -2257,12 +2286,17 @@ fn write_back_email_template(
     tgt_lockfile: &mut Lockfile,
     key: &str,
     response: &crate::model::EmailTemplate,
+    overlay_paths: Option<&BTreeMap<String, Value>>,
 ) -> Result<()> {
     let (ws, q, t) = split_template_key(key)
         .ok_or_else(|| anyhow!("email_template key '{key}' is not <ws>/<q>/<template>"))?;
     let dir = tgt_paths.queue_email_templates_dir(ws, q);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    // `write_email_template` already applies `serialize_for_disk` (strips
+    // `modified_at`), so the bytes are codec-equivalent for email_templates.
+    // Strip overlay paths so the recorded hash matches `tgt_drift_status`.
     let bytes = write_email_template(&dir, t, response)?;
+    let bytes_for_hash = maybe_strip_overlay(bytes, overlay_paths)?;
     upsert_after_write_back(
         tgt_lockfile,
         "email_templates",
@@ -2270,7 +2304,162 @@ fn write_back_email_template(
         response.id,
         &response.url,
         response.modified_at(),
-        content_hash(&bytes),
+        combined_hash(&bytes_for_hash, &[]),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::codec::combined_hash;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    /// Build a `Paths` pointing at a temporary directory and create the
+    /// `envs/<env>` subtree so `write_disk_and_cache` doesn't fail the
+    /// "path not under env_root" assertion.
+    fn tmp_paths(tmp: &TempDir, env: &str) -> Paths {
+        let paths = Paths::for_env(tmp.path(), env);
+        std::fs::create_dir_all(paths.env_root()).expect("creating env_root in tmpdir");
+        std::fs::create_dir_all(paths.base_cache_root()).expect("creating base_cache_root");
+        paths
+    }
+
+    /// The core consistency guarantee: after `write_back_flat` (via the engine
+    /// wrapper), the lockfile `content_hash` must equal
+    /// `combined_hash(maybe_strip_overlay(codec(kind).disk_bytes(&response).json, overlay), &sidecars)`.
+    ///
+    /// Additionally, the JSON written to disk must contain no top-level or
+    /// nested `modified_at` field (codec strips it recursively).
+    #[test]
+    fn write_back_engine_records_codec_baseline_no_modified_at() {
+        let tmp = TempDir::new().unwrap();
+        let paths = tmp_paths(&tmp, "tgt");
+        let mut lockfile = Lockfile::default();
+
+        // Simulate an API response that carries `modified_at` (top-level) and
+        // `agenda_id` (a redacted sentinel field). The PATCH response from the
+        // Rossum API always includes both.
+        let response_value = json!({
+            "id": 42,
+            "url": "https://prod.rossum.app/api/v1/engines/42",
+            "name": "invoice-extractor",
+            "modified_at": "2026-05-01T10:00:00Z",
+            "agenda_id": "live-agenda-uuid-12345",
+        });
+        let response: crate::model::Engine =
+            serde_json::from_value(response_value.clone()).unwrap();
+
+        let dir = paths.engine_dir("invoice-extractor");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Call write_back_engine with no overlay (no tgt-specific overrides).
+        write_back_engine(&paths, &mut lockfile, "invoice-extractor", &response, None).unwrap();
+
+        // ── Baseline consistency assertion ──────────────────────────────────
+        // The recorded hash must equal combined_hash(codec.disk_bytes, overlay).
+        let codec =
+            crate::snapshot::codec::codec("engines").expect("engines codec must be registered");
+        let art = codec.disk_bytes(&response_value).unwrap();
+        // No overlay → maybe_strip_overlay is a no-op.
+        let expected_hash = combined_hash(&art.json, &art.sidecars);
+
+        let recorded_hash = lockfile
+            .objects
+            .get("engines")
+            .and_then(|m| m.get("invoice-extractor"))
+            .and_then(|e| e.content_hash.as_deref())
+            .expect("lockfile must have an entry for the written engine");
+
+        assert_eq!(
+            recorded_hash, expected_hash,
+            "write_back_engine must record codec baseline hash (no modified_at, redacted sentinels)"
+        );
+
+        // ── On-disk content: no modified_at anywhere ─────────────────────
+        let disk_path = dir.join("engine.json");
+        let disk_raw = std::fs::read_to_string(&disk_path).unwrap();
+        let disk_value: serde_json::Value = serde_json::from_str(&disk_raw).unwrap();
+        assert!(
+            disk_value.get("modified_at").is_none(),
+            "on-disk file must not contain top-level modified_at after write_back"
+        );
+        // Verify the known-redacted field is replaced with the sentinel,
+        // not left as the live server value.
+        let on_disk_agenda = disk_value
+            .get("agenda_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(
+            on_disk_agenda,
+            crate::snapshot::create::REDACTED_VALUE_SENTINEL,
+            "agenda_id must be set to the REDACTED sentinel on disk (not the live server value)"
+        );
+    }
+
+    /// Overlay consistency: when a tgt overlay overrides a field, the lockfile
+    /// hash must use post-overlay bytes (field stripped), not pre-overlay.
+    /// This matches what `tgt_drift_status` and the pull driver compute.
+    #[test]
+    fn write_back_engine_with_overlay_records_post_overlay_hash() {
+        let tmp = TempDir::new().unwrap();
+        let paths = tmp_paths(&tmp, "tgt");
+        let mut lockfile = Lockfile::default();
+
+        let response_value = json!({
+            "id": 7,
+            "url": "https://prod.rossum.app/api/v1/engines/7",
+            "name": "classifier",
+            "modified_at": "2026-04-01T09:00:00Z",
+            "description": "tgt-specific-value",
+        });
+        let response: crate::model::Engine =
+            serde_json::from_value(response_value.clone()).unwrap();
+
+        // Overlay declares `description` as a tgt-managed override → it must
+        // be stripped from the hash bytes (so pull/sync compute the same hash).
+        let mut overlay_paths: BTreeMap<String, Value> = BTreeMap::new();
+        overlay_paths.insert("description".to_string(), json!("tgt-specific-value"));
+
+        let dir = paths.engine_dir("classifier");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write_back_engine(
+            &paths,
+            &mut lockfile,
+            "classifier",
+            &response,
+            Some(&overlay_paths),
+        )
+        .unwrap();
+
+        // Expected: codec bytes → strip overlay → combined_hash.
+        let codec =
+            crate::snapshot::codec::codec("engines").expect("engines codec must be registered");
+        let art = codec.disk_bytes(&response_value).unwrap();
+        let post_overlay =
+            crate::cli::pull::common::maybe_strip_overlay(art.json, Some(&overlay_paths)).unwrap();
+        let expected_hash = combined_hash(&post_overlay, &art.sidecars);
+
+        let recorded_hash = lockfile
+            .objects
+            .get("engines")
+            .and_then(|m| m.get("classifier"))
+            .and_then(|e| e.content_hash.as_deref())
+            .expect("lockfile must have an entry for the written engine");
+
+        assert_eq!(
+            recorded_hash, expected_hash,
+            "write_back_engine with overlay must record post-overlay codec hash"
+        );
+
+        // The hash must differ from the pre-overlay hash (regression guard).
+        let pre_overlay_art = codec.disk_bytes(&response_value).unwrap();
+        let pre_overlay_hash = combined_hash(&pre_overlay_art.json, &pre_overlay_art.sidecars);
+        assert_ne!(
+            recorded_hash, pre_overlay_hash,
+            "pre-overlay hash must differ from post-overlay hash (overlay strip must be effective)"
+        );
+    }
 }
