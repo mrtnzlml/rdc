@@ -29,14 +29,14 @@
 //!
 //! Spec: docs/superpowers/specs/2026-05-14-unified-sync-design.md.
 
-use crate::cli::pull::common::{PullCtx, RemoteCatalog};
-use crate::cli::resolve::{prompt_remote_delete, prompt_resolve, PullAborted, Resolution};
+use crate::cli::pull::common::{PullCtx, RemoteCatalog, maybe_strip_overlay};
+use crate::cli::resolve::{PullAborted, Resolution, prompt_remote_delete, prompt_resolve};
+use crate::cli::stdin_coord::CoordinatorStdin;
 use crate::cli::sync::classify::{ClassifiedItem, SyncClass};
 use crate::log::{Action, Log};
 use crate::slug::slugify_unique;
+use crate::snapshot::codec::combined_hash;
 use crate::snapshot::writer::write_atomic;
-use crate::state::content_hash;
-use crate::cli::stdin_coord::CoordinatorStdin;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::BufRead;
@@ -206,7 +206,9 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
         let mut per_ws: std::collections::HashMap<String, HashSet<String>> =
             std::collections::HashMap::new();
         for q in &catalog.queues {
-            let Some(ws_url) = q.workspace.as_ref() else { continue };
+            let Some(ws_url) = q.workspace.as_ref() else {
+                continue;
+            };
             // Prefer the lockfile slug (preserves user-customised slugs);
             // fall back to the freshly-derived slug from `ws_url_to_slug`
             // when the lockfile has no entry yet. Without the fallback,
@@ -232,15 +234,15 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
         let mut per_q: std::collections::HashMap<(String, String), HashSet<String>> =
             std::collections::HashMap::new();
         for t in &catalog.email_templates {
-            let Some(queue_url) = t.queue.as_ref() else { continue };
-            let Some((ws_slug, q_slug)) = q_url_to_ws_q.get(queue_url).cloned() else { continue };
+            let Some(queue_url) = t.queue.as_ref() else {
+                continue;
+            };
+            let Some((ws_slug, q_slug)) = q_url_to_ws_q.get(queue_url).cloned() else {
+                continue;
+            };
             let used = per_q.entry((ws_slug.clone(), q_slug.clone())).or_default();
             let template_slug = match ctx.lockfile.slug_for_id("email_templates", t.id) {
-                Some(existing) => existing
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(existing)
-                    .to_string(),
+                Some(existing) => existing.rsplit('/').next().unwrap_or(existing).to_string(),
                 None => slugify_unique(&t.name, used),
             };
             used.insert(template_slug.clone());
@@ -269,14 +271,17 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
         // here (no push side); we still emit a warning if it shows up.
         let Some(refs) = (match it.kind.as_str() {
             "labels" => label_by_slug.get(it.slug.as_str()).copied().and_then(|l| {
-                let mut bytes = match serde_json::to_vec_pretty(l) {
-                    Ok(b) => b,
-                    Err(_) => return None,
-                };
-                bytes.push(b'\n');
+                let codec = crate::snapshot::codec::codec("labels")?;
+                let value = serde_json::to_value(l).ok()?;
+                let art = codec.disk_bytes(&value).ok()?;
+                let ovl_paths = ctx
+                    .overlay
+                    .as_ref()
+                    .and_then(|o| codec.overlay(o, &it.slug));
+                let json_bytes = maybe_strip_overlay(art.json, ovl_paths).ok()?;
                 let local_path = ctx.paths.labels_dir().join(format!("{}.json", it.slug));
                 Some(ConflictRefs {
-                    remote_bytes: bytes,
+                    remote_bytes: json_bytes,
                     remote_code: None,
                     remote_formulas: Vec::new(),
                     local_path,
@@ -286,33 +291,42 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                     hash_strategy: HashStrategy::Flat,
                 })
             }),
-            "workspaces" => workspace_by_slug.get(it.slug.as_str()).copied().and_then(|w| {
-                let mut bytes = match serde_json::to_vec_pretty(w) {
-                    Ok(b) => b,
-                    Err(_) => return None,
-                };
-                bytes.push(b'\n');
-                let local_path = ctx.paths.workspace_dir(&it.slug).join("workspace.json");
-                Some(ConflictRefs {
-                    remote_bytes: bytes,
-                    remote_code: None,
-                    remote_formulas: Vec::new(),
-                    local_path,
-                    id: w.id,
-                    url: Some(w.url.clone()),
-                    modified_at: w.modified_at().map(|s| s.to_string()),
-                    hash_strategy: HashStrategy::Flat,
-                })
-            }),
+            "workspaces" => workspace_by_slug
+                .get(it.slug.as_str())
+                .copied()
+                .and_then(|w| {
+                    let codec = crate::snapshot::codec::codec("workspaces")?;
+                    let value = serde_json::to_value(w).ok()?;
+                    let art = codec.disk_bytes(&value).ok()?;
+                    let ovl_paths = ctx
+                        .overlay
+                        .as_ref()
+                        .and_then(|o| codec.overlay(o, &it.slug));
+                    let json_bytes = maybe_strip_overlay(art.json, ovl_paths).ok()?;
+                    let local_path = ctx.paths.workspace_dir(&it.slug).join("workspace.json");
+                    Some(ConflictRefs {
+                        remote_bytes: json_bytes,
+                        remote_code: None,
+                        remote_formulas: Vec::new(),
+                        local_path,
+                        id: w.id,
+                        url: Some(w.url.clone()),
+                        modified_at: w.modified_at().map(|s| s.to_string()),
+                        hash_strategy: HashStrategy::Flat,
+                    })
+                }),
             "engines" => engine_by_slug.get(it.slug.as_str()).copied().and_then(|e| {
-                let mut bytes = match serde_json::to_vec_pretty(e) {
-                    Ok(b) => b,
-                    Err(_) => return None,
-                };
-                bytes.push(b'\n');
+                let codec = crate::snapshot::codec::codec("engines")?;
+                let value = serde_json::to_value(e).ok()?;
+                let art = codec.disk_bytes(&value).ok()?;
+                let ovl_paths = ctx
+                    .overlay
+                    .as_ref()
+                    .and_then(|o| codec.overlay(o, &it.slug));
+                let json_bytes = maybe_strip_overlay(art.json, ovl_paths).ok()?;
                 let local_path = ctx.paths.engine_dir(&it.slug).join("engine.json");
                 Some(ConflictRefs {
-                    remote_bytes: bytes,
+                    remote_bytes: json_bytes,
                     remote_code: None,
                     remote_formulas: Vec::new(),
                     local_path,
@@ -323,40 +337,57 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 })
             }),
             "engine_fields" => {
-                engine_field_by_slug.get(it.slug.as_str()).copied().and_then(|f| {
-                    let mut bytes = match serde_json::to_vec_pretty(f) {
-                        Ok(b) => b,
-                        Err(_) => return None,
-                    };
-                    bytes.push(b'\n');
-                    // `it.slug` is the composite `<engine_slug>/<field_slug>`;
-                    // split it to derive both the directory and filename.
-                    let (engine_slug, field_slug) = it.slug
-                        .split_once('/')
-                        .map(|(a, b)| (a.to_string(), b.to_string()))?;
-                    let local_path = ctx
-                        .paths
-                        .engine_fields_dir(&engine_slug)
-                        .join(format!("{field_slug}.json"));
-                    Some(ConflictRefs {
-                        remote_bytes: bytes,
-                        remote_code: None,
-                        remote_formulas: Vec::new(),
-                        local_path,
-                        id: f.id,
-                        url: Some(f.url.clone()),
-                        modified_at: f.modified_at().map(|s| s.to_string()),
-                        hash_strategy: HashStrategy::Flat,
+                engine_field_by_slug
+                    .get(it.slug.as_str())
+                    .copied()
+                    .and_then(|f| {
+                        // `it.slug` is the composite `<engine_slug>/<field_slug>`;
+                        // split it to derive both the directory and filename.
+                        let (engine_slug, field_slug) = it
+                            .slug
+                            .split_once('/')
+                            .map(|(a, b)| (a.to_string(), b.to_string()))?;
+                        let codec = crate::snapshot::codec::codec("engine_fields")?;
+                        let value = serde_json::to_value(f).ok()?;
+                        let art = codec.disk_bytes(&value).ok()?;
+                        let ovl_paths = ctx
+                            .overlay
+                            .as_ref()
+                            .and_then(|o| codec.overlay(o, &it.slug));
+                        let json_bytes = maybe_strip_overlay(art.json, ovl_paths).ok()?;
+                        let local_path = ctx
+                            .paths
+                            .engine_fields_dir(&engine_slug)
+                            .join(format!("{field_slug}.json"));
+                        Some(ConflictRefs {
+                            remote_bytes: json_bytes,
+                            remote_code: None,
+                            remote_formulas: Vec::new(),
+                            local_path,
+                            id: f.id,
+                            url: Some(f.url.clone()),
+                            modified_at: f.modified_at().map(|s| s.to_string()),
+                            hash_strategy: HashStrategy::Flat,
+                        })
                     })
-                })
             }
             "hooks" => hook_by_slug.get(it.slug.as_str()).copied().and_then(|h| {
-                // Reproduce the pull driver's canonical bytes: serialize
-                // → strip `config.code` into `code` → trailing newline.
-                let (json_bytes, code) = match crate::snapshot::hook::serialize_hook(h) {
-                    Ok(pair) => pair,
-                    Err(_) => return None,
-                };
+                // Route through the codec to get the canonical on-disk bytes
+                // (status-redacted, code extracted) and apply the overlay strip
+                // so the remote bytes match what the pull driver writes to disk.
+                let codec = crate::snapshot::codec::codec("hooks")?;
+                let value = serde_json::to_value(h).ok()?;
+                let art = codec.disk_bytes(&value).ok()?;
+                let ovl_paths = ctx
+                    .overlay
+                    .as_ref()
+                    .and_then(|o| codec.overlay(o, &it.slug));
+                let json_bytes = maybe_strip_overlay(art.json, ovl_paths).ok()?;
+                let code = art
+                    .sidecars
+                    .into_iter()
+                    .find(|(k, _)| k == "code")
+                    .and_then(|(_, b)| String::from_utf8(b).ok());
                 let local_path = ctx.paths.hooks_dir().join(format!("{}.json", it.slug));
                 Some(ConflictRefs {
                     remote_bytes: json_bytes,
@@ -370,10 +401,19 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 })
             }),
             "rules" => rule_by_slug.get(it.slug.as_str()).copied().and_then(|r| {
-                let (json_bytes, code) = match crate::snapshot::rule::serialize_rule(r) {
-                    Ok(pair) => pair,
-                    Err(_) => return None,
-                };
+                let codec = crate::snapshot::codec::codec("rules")?;
+                let value = serde_json::to_value(r).ok()?;
+                let art = codec.disk_bytes(&value).ok()?;
+                let ovl_paths = ctx
+                    .overlay
+                    .as_ref()
+                    .and_then(|o| codec.overlay(o, &it.slug));
+                let json_bytes = maybe_strip_overlay(art.json, ovl_paths).ok()?;
+                let code = art
+                    .sidecars
+                    .into_iter()
+                    .find(|(k, _)| k == "trigger_condition")
+                    .and_then(|(_, b)| String::from_utf8(b).ok());
                 let local_path = ctx.paths.rules_dir().join(format!("{}.json", it.slug));
                 Some(ConflictRefs {
                     remote_bytes: json_bytes,
@@ -386,114 +426,153 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                     hash_strategy: HashStrategy::Rule,
                 })
             }),
-            "queues" => queue_by_slug.get(it.slug.as_str()).and_then(|(q, ws_slug)| {
-                // Redact `counts` etc. so the resolver diff is
-                // sentinel-vs-sentinel (no live-counts noise) and a keep-remote
-                // resolution writes the canonical on-disk bytes — the same
-                // helper the pull driver and classifier use.
-                let bytes = match crate::snapshot::create::redacted_disk_bytes(*q, "queues") {
-                    Ok(b) => b,
-                    Err(_) => return None,
-                };
-                let local_path = ctx.paths.queue_dir(ws_slug, &it.slug).join("queue.json");
-                Some(ConflictRefs {
-                    remote_bytes: bytes,
-                    remote_code: None,
-                    remote_formulas: Vec::new(),
-                    local_path,
-                    id: q.id,
-                    url: Some(q.url.clone()),
-                    modified_at: q.modified_at().map(|s| s.to_string()),
-                    hash_strategy: HashStrategy::Flat,
-                })
-            }),
-            "schemas" => {
-                // Schemas use `HashStrategy::Schema` so the resolver
-                // hashes the canonical schema_combined_hash (json +
-                // formulas) into the lockfile. Without this, a
-                // formula-only divergence would record only the JSON
-                // hash and either (a) silently round-trip via
-                // KeepLocal short-circuit on JSON canonicalize-equal
-                // bytes, or (b) leave the lockfile in a corrupt state
-                // where the recorded hash doesn't match what the
-                // classifier next computes.
-                queue_by_slug.get(it.slug.as_str()).and_then(|(q, ws_slug)| {
-                    let schema = catalog.schemas_by_queue_id.get(&q.id)?;
-                    let (json_bytes, formulas) =
-                        crate::snapshot::schema::serialize_schema(schema).ok()?;
-                    let local_path = ctx.paths.queue_dir(ws_slug, &it.slug).join("schema.json");
+            "queues" => queue_by_slug
+                .get(it.slug.as_str())
+                .and_then(|(q, ws_slug)| {
+                    // Route through codec to get canonical on-disk bytes
+                    // (counts-redacted) and apply overlay strip so the remote
+                    // bytes match what the pull driver writes to disk.
+                    let codec = crate::snapshot::codec::codec("queues")?;
+                    let value = serde_json::to_value(*q).ok()?;
+                    let art = codec.disk_bytes(&value).ok()?;
+                    let ovl_paths = ctx
+                        .overlay
+                        .as_ref()
+                        .and_then(|o| codec.overlay(o, &it.slug));
+                    let json_bytes = maybe_strip_overlay(art.json, ovl_paths).ok()?;
+                    let local_path = ctx.paths.queue_dir(ws_slug, &it.slug).join("queue.json");
                     Some(ConflictRefs {
                         remote_bytes: json_bytes,
                         remote_code: None,
-                        remote_formulas: formulas,
+                        remote_formulas: Vec::new(),
                         local_path,
-                        id: schema.id,
-                        url: Some(schema.url.clone()),
-                        modified_at: schema.modified_at().map(|s| s.to_string()),
-                        hash_strategy: HashStrategy::Schema,
+                        id: q.id,
+                        url: Some(q.url.clone()),
+                        modified_at: q.modified_at().map(|s| s.to_string()),
+                        hash_strategy: HashStrategy::Flat,
                     })
-                })
+                }),
+            "schemas" => {
+                // Route through codec so we get the canonical json + formula
+                // sidecars and apply the overlay strip. The combined_hash over
+                // (stripped_json, sidecars) matches what pull::queues records.
+                queue_by_slug
+                    .get(it.slug.as_str())
+                    .and_then(|(q, ws_slug)| {
+                        let schema = catalog.schemas_by_queue_id.get(&q.id)?;
+                        let codec = crate::snapshot::codec::codec("schemas")?;
+                        let value = serde_json::to_value(schema).ok()?;
+                        let art = codec.disk_bytes(&value).ok()?;
+                        // Schema slug for the codec overlay lookup is the
+                        // composite `<ws_slug>/<q_slug>` key.
+                        let composite = format!("{ws_slug}/{}", it.slug);
+                        let ovl_paths = ctx
+                            .overlay
+                            .as_ref()
+                            .and_then(|o| codec.overlay(o, &composite));
+                        let json_bytes = maybe_strip_overlay(art.json, ovl_paths).ok()?;
+                        // Sidecars are `"formulas/<field_id>.py"` → extract
+                        // the `(field_id, bytes)` pairs for the resolver.
+                        let formulas: Vec<(String, Vec<u8>)> = art
+                            .sidecars
+                            .into_iter()
+                            .filter_map(|(path, b)| {
+                                let id = path
+                                    .strip_prefix("formulas/")
+                                    .and_then(|s| s.strip_suffix(".py"))?;
+                                Some((id.to_string(), b))
+                            })
+                            .collect();
+                        let local_path = ctx.paths.queue_dir(ws_slug, &it.slug).join("schema.json");
+                        Some(ConflictRefs {
+                            remote_bytes: json_bytes,
+                            remote_code: None,
+                            remote_formulas: formulas,
+                            local_path,
+                            id: schema.id,
+                            url: Some(schema.url.clone()),
+                            modified_at: schema.modified_at().map(|s| s.to_string()),
+                            hash_strategy: HashStrategy::Schema,
+                        })
+                    })
             }
-            "inboxes" => queue_by_slug.get(it.slug.as_str()).and_then(|(q, ws_slug)| {
-                let inbox = catalog.inboxes_by_queue_id.get(&q.id)?;
-                let mut bytes = match serde_json::to_vec_pretty(inbox) {
-                    Ok(b) => b,
-                    Err(_) => return None,
-                };
-                bytes.push(b'\n');
-                let local_path = ctx.paths.queue_dir(ws_slug, &it.slug).join("inbox.json");
-                Some(ConflictRefs {
-                    remote_bytes: bytes,
-                    remote_code: None,
-                    remote_formulas: Vec::new(),
-                    local_path,
-                    id: inbox.id,
-                    url: Some(inbox.url.clone()),
-                    modified_at: inbox.modified_at().map(|s| s.to_string()),
-                    hash_strategy: HashStrategy::Flat,
-                })
-            }),
-            "email_templates" => {
-                email_template_by_compound.get(it.slug.as_str()).copied().and_then(|t| {
-                    let mut bytes = match serde_json::to_vec_pretty(t) {
-                        Ok(b) => b,
-                        Err(_) => return None,
-                    };
-                    bytes.push(b'\n');
-                    // Compound slug split: `<ws>/<q>/<tpl>`.
-                    let parts: Vec<&str> = it.slug.splitn(3, '/').collect();
-                    if parts.len() != 3 {
-                        return None;
-                    }
-                    let local_path = ctx
-                        .paths
-                        .queue_email_templates_dir(parts[0], parts[1])
-                        .join(format!("{}.json", parts[2]));
+            "inboxes" => queue_by_slug
+                .get(it.slug.as_str())
+                .and_then(|(q, ws_slug)| {
+                    let inbox = catalog.inboxes_by_queue_id.get(&q.id)?;
+                    let codec = crate::snapshot::codec::codec("inboxes")?;
+                    let value = serde_json::to_value(inbox).ok()?;
+                    let art = codec.disk_bytes(&value).ok()?;
+                    let ovl_paths = ctx
+                        .overlay
+                        .as_ref()
+                        .and_then(|o| codec.overlay(o, &it.slug));
+                    let json_bytes = maybe_strip_overlay(art.json, ovl_paths).ok()?;
+                    let local_path = ctx.paths.queue_dir(ws_slug, &it.slug).join("inbox.json");
                     Some(ConflictRefs {
-                        remote_bytes: bytes,
+                        remote_bytes: json_bytes,
                         remote_code: None,
                         remote_formulas: Vec::new(),
                         local_path,
-                        id: t.id,
-                        url: Some(t.url.clone()),
-                        modified_at: t.modified_at().map(|s| s.to_string()),
+                        id: inbox.id,
+                        url: Some(inbox.url.clone()),
+                        modified_at: inbox.modified_at().map(|s| s.to_string()),
                         hash_strategy: HashStrategy::Flat,
                     })
-                })
+                }),
+            "email_templates" => {
+                email_template_by_compound
+                    .get(it.slug.as_str())
+                    .copied()
+                    .and_then(|t| {
+                        // Compound slug split: `<ws>/<q>/<tpl>`.
+                        let parts: Vec<&str> = it.slug.splitn(3, '/').collect();
+                        if parts.len() != 3 {
+                            return None;
+                        }
+                        let codec = crate::snapshot::codec::codec("email_templates")?;
+                        let value = serde_json::to_value(t).ok()?;
+                        let art = codec.disk_bytes(&value).ok()?;
+                        let ovl_paths = ctx
+                            .overlay
+                            .as_ref()
+                            .and_then(|o| codec.overlay(o, &it.slug));
+                        let json_bytes = maybe_strip_overlay(art.json, ovl_paths).ok()?;
+                        let local_path = ctx
+                            .paths
+                            .queue_email_templates_dir(parts[0], parts[1])
+                            .join(format!("{}.json", parts[2]));
+                        Some(ConflictRefs {
+                            remote_bytes: json_bytes,
+                            remote_code: None,
+                            remote_formulas: Vec::new(),
+                            local_path,
+                            id: t.id,
+                            url: Some(t.url.clone()),
+                            modified_at: t.modified_at().map(|s| s.to_string()),
+                            hash_strategy: HashStrategy::Flat,
+                        })
+                    })
             }
             other => {
-                progress.event(Action::Warn, &format!(
-                    "conflict resolver not wired for kind '{}' (slug '{}'); skipping",
-                    other, it.slug,
-                ));
+                progress.event(
+                    Action::Warn,
+                    &format!(
+                        "conflict resolver not wired for kind '{}' (slug '{}'); skipping",
+                        other, it.slug,
+                    ),
+                );
                 None
             }
         }) else {
             // No catalog entry / orphan / unwired kind — warn and move on.
-            progress.event(Action::Warn, &format!(
-                "conflict for {}/{} but no matching remote object found; skipping",
-                it.kind, it.slug,
-            ));
+            progress.event(
+                Action::Warn,
+                &format!(
+                    "conflict for {}/{} but no matching remote object found; skipping",
+                    it.kind, it.slug,
+                ),
+            );
             continue;
         };
 
@@ -572,20 +651,39 @@ enum HashStrategy {
 
 impl HashStrategy {
     /// Compute the canonical lockfile hash for the resolved bytes.
+    ///
+    /// Uses `combined_hash` (the codec-compatible algorithm) for all
+    /// split-file kinds so the hash matches what the pull drivers record.
+    /// For `Flat` kinds the combined_hash with an empty sidecar list equals
+    /// `content_hash`, so both are equivalent.
     /// For `Schema`, `code` is unused (the formulas sidecar list is
     /// derived from the queue dir by the caller); use `hash_schema`
     /// instead.
     fn hash(self, json_bytes: &[u8], code: &Option<String>) -> String {
         match self {
-            HashStrategy::Flat => content_hash(json_bytes),
-            HashStrategy::Hook => crate::state::hook_combined_hash(json_bytes, code),
-            HashStrategy::Rule => crate::state::rule_combined_hash(json_bytes, code),
+            HashStrategy::Flat => combined_hash(json_bytes, &[]),
+            HashStrategy::Hook => {
+                let sidecars: Vec<(String, Vec<u8>)> = if let Some(c) = code {
+                    vec![("code".to_string(), c.as_bytes().to_vec())]
+                } else {
+                    vec![]
+                };
+                combined_hash(json_bytes, &sidecars)
+            }
+            HashStrategy::Rule => {
+                let sidecars: Vec<(String, Vec<u8>)> = if let Some(c) = code {
+                    vec![("trigger_condition".to_string(), c.as_bytes().to_vec())]
+                } else {
+                    vec![]
+                };
+                combined_hash(json_bytes, &sidecars)
+            }
             // For Schema the caller must use `hash_schema` so the
             // formulas sidecar list is included. Falling back to the
             // bare json-only hash here would silently drop the
             // formulas from the canonical hash — exactly the bug
             // this strategy exists to fix.
-            HashStrategy::Schema => content_hash(json_bytes),
+            HashStrategy::Schema => combined_hash(json_bytes, &[]),
         }
     }
 
@@ -593,7 +691,13 @@ impl HashStrategy {
     /// formulas. Use this for `HashStrategy::Schema` instead of `hash`.
     fn hash_schema(self, json_bytes: &[u8], formulas: &[(String, Vec<u8>)]) -> String {
         debug_assert!(matches!(self, HashStrategy::Schema));
-        crate::state::schema_combined_hash(json_bytes, formulas)
+        // Frame each formula as `"formulas/<field_id>.py"` to match the
+        // labels used by the schemas codec and `schema_combined_hash`.
+        let sidecars: Vec<(String, Vec<u8>)> = formulas
+            .iter()
+            .map(|(id, b)| (format!("formulas/{id}.py"), b.clone()))
+            .collect();
+        combined_hash(json_bytes, &sidecars)
     }
 }
 
@@ -634,6 +738,8 @@ type AutoMergeResult = (String, Vec<String>, Vec<String>);
 #[allow(clippy::too_many_arguments)]
 fn try_auto_merge(
     ctx: &mut PullCtx<'_>,
+    kind: &str,
+    slug: &str,
     hash_strategy: HashStrategy,
     lockfile_base_hash: &Option<String>,
     local_path: &Path,
@@ -673,23 +779,54 @@ fn try_auto_merge(
         return Ok(None);
     };
 
+    // Helper: canonicalize merged JSON through the codec for this kind
+    // (re-applies redact/hidden-strip so a merge can't bake in a live
+    // `counts`/`agenda_id`/`status` field) and apply the overlay strip
+    // so overlay-managed fields don't get baked into the merged bytes.
+    // Returns `(canonical_json, sidecars)`.
+    #[allow(clippy::type_complexity)]
+    let canonicalize_merged_json =
+        |v: serde_json::Value| -> Option<(Vec<u8>, Vec<(String, Vec<u8>)>)> {
+            let codec = crate::snapshot::codec::codec(kind)?;
+            let art = codec.disk_bytes(&v).ok()?;
+            let ovl_paths = ctx.overlay.as_ref().and_then(|o| codec.overlay(o, slug));
+            let json_out = maybe_strip_overlay(art.json, ovl_paths).ok()?;
+            Some((json_out, art.sidecars))
+        };
+
     match hash_strategy {
         HashStrategy::Flat => {
             // Single-file merge. cache_matches_base is exact: the
-            // cached JSON bytes hash to the lockfile content_hash.
-            if &crate::state::content_hash(&base_json_bytes) != base_hash {
+            // cached JSON bytes hash to the lockfile combined_hash.
+            if &combined_hash(&base_json_bytes, &[]) != base_hash {
                 return Ok(None);
             }
-            let crate::merge::MergeOutcome::Merged { merged, local_paths, remote_paths } =
-                crate::merge::json3::merge3_json(&base_v, &local_v, &remote_v)
+            let crate::merge::MergeOutcome::Merged {
+                merged,
+                local_paths,
+                remote_paths,
+            } = crate::merge::json3::merge3_json(&base_v, &local_v, &remote_v)
             else {
                 return Ok(None);
             };
-            let mut merged_bytes = serde_json::to_vec_pretty(&merged)?;
-            merged_bytes.push(b'\n');
+            // Canonicalize through codec + overlay so the merged bytes
+            // match what a fresh pull would write for the same remote value.
+            let (merged_bytes, _) = match canonicalize_merged_json(merged) {
+                Some(pair) => pair,
+                None => {
+                    // Codec not registered for this kind (shouldn't happen
+                    // for flat kinds the executor handles, but be defensive).
+                    let mut b = serde_json::to_vec_pretty(
+                        &serde_json::from_slice::<serde_json::Value>(local_json_bytes)
+                            .unwrap_or(serde_json::Value::Null),
+                    )?;
+                    b.push(b'\n');
+                    (b, vec![])
+                }
+            };
             crate::snapshot::writer::write_atomic(local_path, &merged_bytes)?;
             crate::state::base_cache::write(ctx.paths, local_path, &merged_bytes)?;
-            let merged_hash = crate::state::content_hash(&merged_bytes);
+            let merged_hash = combined_hash(&merged_bytes, &[]);
             Ok(Some((merged_hash, local_paths, remote_paths)))
         }
         HashStrategy::Hook | HashStrategy::Rule => {
@@ -702,21 +839,36 @@ fn try_auto_merge(
             let base_code_str: Option<String> = base_code_bytes
                 .as_ref()
                 .and_then(|b| String::from_utf8(b.clone()).ok());
-            let cached_combined = match hash_strategy {
-                HashStrategy::Hook => crate::state::hook_combined_hash(&base_json_bytes, &base_code_str),
-                HashStrategy::Rule => crate::state::rule_combined_hash(&base_json_bytes, &base_code_str),
-                _ => unreachable!(),
+            // Compute the cached combined hash using the codec-compatible
+            // algorithm (combined_hash with the correct sidecar label).
+            let sidecar_label = if matches!(hash_strategy, HashStrategy::Hook) {
+                "code"
+            } else {
+                "trigger_condition"
             };
+            let base_sidecars: Vec<(String, Vec<u8>)> = if let Some(c) = &base_code_str {
+                vec![(sidecar_label.to_string(), c.as_bytes().to_vec())]
+            } else {
+                vec![]
+            };
+            let cached_combined = combined_hash(&base_json_bytes, &base_sidecars);
             if &cached_combined != base_hash {
                 return Ok(None);
             }
 
-            let crate::merge::MergeOutcome::Merged { merged: json_merged, mut local_paths, mut remote_paths } =
-                crate::merge::json3::merge3_json(&base_v, &local_v, &remote_v)
+            let crate::merge::MergeOutcome::Merged {
+                merged: json_merged,
+                mut local_paths,
+                mut remote_paths,
+            } = crate::merge::json3::merge3_json(&base_v, &local_v, &remote_v)
             else {
                 return Ok(None);
             };
-            let code_label = if matches!(hash_strategy, HashStrategy::Hook) { "hook.code" } else { "rule.code" };
+            let code_label = if matches!(hash_strategy, HashStrategy::Hook) {
+                "hook.code"
+            } else {
+                "rule.code"
+            };
             let crate::merge::MergeOutcome::Merged {
                 merged: code_merged_bytes,
                 local_paths: code_lp,
@@ -733,9 +885,18 @@ fn try_auto_merge(
             local_paths.extend(code_lp);
             remote_paths.extend(code_rp);
 
-            // Serialize merged JSON, write disk + cache.
-            let mut merged_json_bytes = serde_json::to_vec_pretty(&json_merged)?;
-            merged_json_bytes.push(b'\n');
+            // Canonicalize merged JSON through the codec + overlay strip.
+            let merged_json_bytes = match canonicalize_merged_json(json_merged) {
+                Some((bytes, _)) => bytes,
+                None => {
+                    let mut b = serde_json::to_vec_pretty(
+                        &serde_json::from_slice::<serde_json::Value>(local_json_bytes)
+                            .unwrap_or(serde_json::Value::Null),
+                    )?;
+                    b.push(b'\n');
+                    b
+                }
+            };
             crate::snapshot::writer::write_atomic(local_path, &merged_json_bytes)?;
             crate::state::base_cache::write(ctx.paths, local_path, &merged_json_bytes)?;
 
@@ -746,17 +907,19 @@ fn try_auto_merge(
                 crate::snapshot::writer::write_atomic(code_path, c.as_bytes())?;
                 crate::state::base_cache::write(ctx.paths, code_path, c.as_bytes())?;
             } else if code_path.exists() {
-                std::fs::remove_file(code_path)
-                    .with_context(|| format!("removing merged-empty sidecar {}", code_path.display()))?;
+                std::fs::remove_file(code_path).with_context(|| {
+                    format!("removing merged-empty sidecar {}", code_path.display())
+                })?;
                 crate::state::base_cache::forget(ctx.paths, code_path)?;
             }
 
-            let combined = match hash_strategy {
-                HashStrategy::Hook => crate::state::hook_combined_hash(&merged_json_bytes, &final_code),
-                HashStrategy::Rule => crate::state::rule_combined_hash(&merged_json_bytes, &final_code),
-                _ => unreachable!(),
+            let final_sidecars: Vec<(String, Vec<u8>)> = if let Some(c) = &final_code {
+                vec![(sidecar_label.to_string(), c.as_bytes().to_vec())]
+            } else {
+                vec![]
             };
-            Ok(Some((combined, local_paths, remote_paths)))
+            let merged_combined = combined_hash(&merged_json_bytes, &final_sidecars);
+            Ok(Some((merged_combined, local_paths, remote_paths)))
         }
         HashStrategy::Schema => {
             // Schema body + zero-to-many formula `.py` sidecars under
@@ -768,27 +931,38 @@ fn try_auto_merge(
                 None => return Ok(None),
             };
             // Read base formulas from cache (preserves slug order).
-            let cache_formulas_dir = crate::state::base_cache::cache_mirror(ctx.paths, &queue_dir.join("formulas"))
-                .unwrap_or_else(|| ctx.paths.base_cache_root().join("__missing__"));
+            let cache_formulas_dir =
+                crate::state::base_cache::cache_mirror(ctx.paths, &queue_dir.join("formulas"))
+                    .unwrap_or_else(|| ctx.paths.base_cache_root().join("__missing__"));
             let mut base_formulas: Vec<(String, Vec<u8>)> = Vec::new();
             if cache_formulas_dir.exists()
-                && let Ok(entries) = std::fs::read_dir(&cache_formulas_dir) {
+                && let Ok(entries) = std::fs::read_dir(&cache_formulas_dir)
+            {
                 for e in entries.flatten() {
                     let name = e.file_name().to_string_lossy().to_string();
                     if let Some(id) = name.strip_suffix(".py")
-                        && let Ok(b) = std::fs::read(e.path()) {
-                            base_formulas.push((id.to_string(), b));
-                        }
+                        && let Ok(b) = std::fs::read(e.path())
+                    {
+                        base_formulas.push((id.to_string(), b));
+                    }
                 }
                 base_formulas.sort_by(|a, b| a.0.cmp(&b.0));
             }
-            let cached_combined = crate::state::schema_combined_hash(&base_json_bytes, &base_formulas);
+            // Frame as framed sidecars for combined_hash compatibility.
+            let base_framed: Vec<(String, Vec<u8>)> = base_formulas
+                .iter()
+                .map(|(id, b)| (format!("formulas/{id}.py"), b.clone()))
+                .collect();
+            let cached_combined = combined_hash(&base_json_bytes, &base_framed);
             if &cached_combined != base_hash {
                 return Ok(None);
             }
 
-            let crate::merge::MergeOutcome::Merged { merged: json_merged, mut local_paths, mut remote_paths } =
-                crate::merge::json3::merge3_json(&base_v, &local_v, &remote_v)
+            let crate::merge::MergeOutcome::Merged {
+                merged: json_merged,
+                mut local_paths,
+                mut remote_paths,
+            } = crate::merge::json3::merge3_json(&base_v, &local_v, &remote_v)
             else {
                 return Ok(None);
             };
@@ -797,16 +971,40 @@ fn try_auto_merge(
             // sides. Empty formula on a side = "absent".
             use std::collections::BTreeSet;
             let mut ids: BTreeSet<String> = BTreeSet::new();
-            for (id, _) in &base_formulas { ids.insert(id.clone()); }
-            for (id, _) in local_formulas { ids.insert(id.clone()); }
-            for (id, _) in remote_formulas { ids.insert(id.clone()); }
+            for (id, _) in &base_formulas {
+                ids.insert(id.clone());
+            }
+            for (id, _) in local_formulas {
+                ids.insert(id.clone());
+            }
+            for (id, _) in remote_formulas {
+                ids.insert(id.clone());
+            }
             let mut merged_formulas: Vec<(String, Vec<u8>)> = Vec::new();
             for id in &ids {
-                let b = base_formulas.iter().find(|(i, _)| i == id).map(|(_, v)| v.as_slice()).unwrap_or(&[]);
-                let l = local_formulas.iter().find(|(i, _)| i == id).map(|(_, v)| v.as_slice()).unwrap_or(&[]);
-                let r = remote_formulas.iter().find(|(i, _)| i == id).map(|(_, v)| v.as_slice()).unwrap_or(&[]);
-                let outcome = crate::merge::sidecar::merge3_sidecar(b, l, r, &format!("schema.formula.{id}"));
-                let crate::merge::MergeOutcome::Merged { merged: m, local_paths: lp, remote_paths: rp } = outcome else {
+                let b = base_formulas
+                    .iter()
+                    .find(|(i, _)| i == id)
+                    .map(|(_, v)| v.as_slice())
+                    .unwrap_or(&[]);
+                let l = local_formulas
+                    .iter()
+                    .find(|(i, _)| i == id)
+                    .map(|(_, v)| v.as_slice())
+                    .unwrap_or(&[]);
+                let r = remote_formulas
+                    .iter()
+                    .find(|(i, _)| i == id)
+                    .map(|(_, v)| v.as_slice())
+                    .unwrap_or(&[]);
+                let outcome =
+                    crate::merge::sidecar::merge3_sidecar(b, l, r, &format!("schema.formula.{id}"));
+                let crate::merge::MergeOutcome::Merged {
+                    merged: m,
+                    local_paths: lp,
+                    remote_paths: rp,
+                } = outcome
+                else {
                     return Ok(None);
                 };
                 local_paths.extend(lp);
@@ -816,20 +1014,36 @@ fn try_auto_merge(
                 }
             }
 
-            // Serialize and write via schema writer — handles
-            // schema.json, formulas/*.py, AND sweeps orphan formula
+            // Canonicalize the merged schema JSON through the codec +
+            // overlay strip before writing, so overlay-managed fields
+            // don't get baked into the merged output.
+            let merged_json_bytes = match canonicalize_merged_json(json_merged) {
+                Some((bytes, _)) => bytes,
+                None => {
+                    let mut b = serde_json::to_vec_pretty(
+                        &serde_json::from_slice::<serde_json::Value>(local_json_bytes)
+                            .unwrap_or(serde_json::Value::Null),
+                    )?;
+                    b.push(b'\n');
+                    b
+                }
+            };
+            // Write schema.json, formulas/*.py, AND sweep orphan formula
             // sidecars (formulas removed by one side, other side left
             // base alone).
-            let mut merged_json_bytes = serde_json::to_vec_pretty(&json_merged)?;
-            merged_json_bytes.push(b'\n');
             crate::snapshot::schema::write_schema_bytes_with_cache(
                 queue_dir,
                 &merged_json_bytes,
                 &merged_formulas,
                 Some(ctx.paths),
             )?;
-            let combined = crate::state::schema_combined_hash(&merged_json_bytes, &merged_formulas);
-            Ok(Some((combined, local_paths, remote_paths)))
+            // Hash using framed sidecars for combined_hash compatibility.
+            let merged_framed: Vec<(String, Vec<u8>)> = merged_formulas
+                .iter()
+                .map(|(id, b)| (format!("formulas/{id}.py"), b.clone()))
+                .collect();
+            let merged_combined = combined_hash(&merged_json_bytes, &merged_framed);
+            Ok(Some((merged_combined, local_paths, remote_paths)))
         }
     }
 }
@@ -881,30 +1095,30 @@ fn resolve_one_conflict<R: BufRead>(
     // non-interactive paths. Schemas don't use `code_path` for their
     // sidecars (they have a directory of formulas); instead we
     // re-derive the local formulas list from the queue dir.
-    let (local_code, local_formulas): (Option<String>, Vec<(String, Vec<u8>)>) =
-        match hash_strategy {
-            HashStrategy::Hook | HashStrategy::Rule => {
-                let code = if code_path.exists() {
-                    std::fs::read_to_string(&code_path).ok()
-                } else {
-                    None
-                };
-                (code, Vec::new())
-            }
-            HashStrategy::Schema => {
-                // Local formulas live under `<queue_dir>/formulas/`.
-                // `local_path` is `<queue_dir>/schema.json` so its
-                // parent is the queue dir.
-                let queue_dir = local_path.parent().unwrap_or(&local_path);
-                let formulas = crate::snapshot::schema::read_local_formulas(queue_dir)
-                    .unwrap_or_default();
-                (None, formulas)
-            }
-            // MDH never reaches the BothDiverged conflict resolver
-            // (classifier marks it pull-only), but the match must be
-            // exhaustive — treat as a flat single-file kind.
-            HashStrategy::Flat => (None, Vec::new()),
-        };
+    let (local_code, local_formulas): (Option<String>, Vec<(String, Vec<u8>)>) = match hash_strategy
+    {
+        HashStrategy::Hook | HashStrategy::Rule => {
+            let code = if code_path.exists() {
+                std::fs::read_to_string(&code_path).ok()
+            } else {
+                None
+            };
+            (code, Vec::new())
+        }
+        HashStrategy::Schema => {
+            // Local formulas live under `<queue_dir>/formulas/`.
+            // `local_path` is `<queue_dir>/schema.json` so its
+            // parent is the queue dir.
+            let queue_dir = local_path.parent().unwrap_or(&local_path);
+            let formulas =
+                crate::snapshot::schema::read_local_formulas(queue_dir).unwrap_or_default();
+            (None, formulas)
+        }
+        // MDH never reaches the BothDiverged conflict resolver
+        // (classifier marks it pull-only), but the match must be
+        // exhaustive — treat as a flat single-file kind.
+        HashStrategy::Flat => (None, Vec::new()),
+    };
 
     // Decide whether the divergence is in the JSON portion or only in
     // the sidecar. `sidecar_diverges` covers both symmetric (both
@@ -918,9 +1132,7 @@ fn resolve_one_conflict<R: BufRead>(
     let remote_json_canon = crate::snapshot::noise::canonicalize_for_hash(&remote_bytes);
     let json_canonicalize_equal = local_json_canon == remote_json_canon;
     let sidecar_diverges = match hash_strategy {
-        HashStrategy::Hook | HashStrategy::Rule => {
-            local_code.as_deref() != remote_code.as_deref()
-        }
+        HashStrategy::Hook | HashStrategy::Rule => local_code.as_deref() != remote_code.as_deref(),
         HashStrategy::Schema => {
             // Compare local formulas (slug-sorted by `read_local_formulas`)
             // to remote formulas (slug-sorted by `serialize_schema`).
@@ -964,7 +1176,8 @@ fn resolve_one_conflict<R: BufRead>(
         // Without this, a subsequent BothDiverged would fail the
         // `cache_matches_base` guard and silently skip auto-merge.
         if matches!(hash_strategy, HashStrategy::Flat)
-            && let Ok(on_disk) = std::fs::read(&local_path) {
+            && let Ok(on_disk) = std::fs::read(&local_path)
+        {
             crate::state::base_cache::write(ctx.paths, &local_path, &on_disk)?;
         }
         return Ok(());
@@ -989,6 +1202,8 @@ fn resolve_one_conflict<R: BufRead>(
     //     flow.
     if let Some((merged_combined_hash, lp, rp)) = try_auto_merge(
         ctx,
+        &it.kind,
+        &it.slug,
         hash_strategy,
         &it.base_hash,
         &local_path,
@@ -1048,53 +1263,48 @@ fn resolve_one_conflict<R: BufRead>(
         // land the shadow next to the sidecar so the user sees the
         // actual divergence — a `.json.<env>` shadow with byte-
         // identical-to-local content would be misleading.
-        let (shadow_anchor, shadow_bytes): (PathBuf, Vec<u8>) =
-            if json_canonicalize_equal && sidecar_diverges {
-                match hash_strategy {
-                    HashStrategy::Hook | HashStrategy::Rule => {
-                        let remote_code_bytes =
-                            remote_code.clone().unwrap_or_default().into_bytes();
-                        (code_path.clone(), remote_code_bytes)
-                    }
-                    HashStrategy::Schema => {
-                        // Pick the first divergent formula as the
-                        // representative shadow anchor; the lockfile
-                        // base is preserved so the next sync re-prompts
-                        // with proper UX. Schemas with multiple
-                        // divergent formulas land the shadow on the
-                        // first one for visibility.
-                        let queue_dir = local_path.parent().unwrap_or(&local_path);
-                        let formulas_dir = queue_dir.join("formulas");
-                        
-                        remote_formulas
-                            .iter()
-                            .find(|(id, bytes)| {
-                                local_formulas
-                                    .iter()
-                                    .find(|(lid, _)| lid == id)
-                                    .map(|(_, lb)| lb)
-                                    != Some(bytes)
-                            })
-                            .or_else(|| {
-                                // Local formula present, remote absent:
-                                // pick the first that's only in local.
-                                local_formulas.iter().find(|(id, _)| {
-                                    !remote_formulas.iter().any(|(rid, _)| rid == id)
-                                })
-                            })
-                            .map(|(fid, bytes)| {
-                                (
-                                    formulas_dir.join(format!("{fid}.py")),
-                                    bytes.clone(),
-                                )
-                            })
-                            .unwrap_or_else(|| (local_path.clone(), remote_bytes.clone()))
-                    }
-                    HashStrategy::Flat => (local_path.clone(), remote_bytes.clone()),
+        let (shadow_anchor, shadow_bytes): (PathBuf, Vec<u8>) = if json_canonicalize_equal
+            && sidecar_diverges
+        {
+            match hash_strategy {
+                HashStrategy::Hook | HashStrategy::Rule => {
+                    let remote_code_bytes = remote_code.clone().unwrap_or_default().into_bytes();
+                    (code_path.clone(), remote_code_bytes)
                 }
-            } else {
-                (local_path.clone(), remote_bytes.clone())
-            };
+                HashStrategy::Schema => {
+                    // Pick the first divergent formula as the
+                    // representative shadow anchor; the lockfile
+                    // base is preserved so the next sync re-prompts
+                    // with proper UX. Schemas with multiple
+                    // divergent formulas land the shadow on the
+                    // first one for visibility.
+                    let queue_dir = local_path.parent().unwrap_or(&local_path);
+                    let formulas_dir = queue_dir.join("formulas");
+
+                    remote_formulas
+                        .iter()
+                        .find(|(id, bytes)| {
+                            local_formulas
+                                .iter()
+                                .find(|(lid, _)| lid == id)
+                                .map(|(_, lb)| lb)
+                                != Some(bytes)
+                        })
+                        .or_else(|| {
+                            // Local formula present, remote absent:
+                            // pick the first that's only in local.
+                            local_formulas
+                                .iter()
+                                .find(|(id, _)| !remote_formulas.iter().any(|(rid, _)| rid == id))
+                        })
+                        .map(|(fid, bytes)| (formulas_dir.join(format!("{fid}.py")), bytes.clone()))
+                        .unwrap_or_else(|| (local_path.clone(), remote_bytes.clone()))
+                }
+                HashStrategy::Flat => (local_path.clone(), remote_bytes.clone()),
+            }
+        } else {
+            (local_path.clone(), remote_bytes.clone())
+        };
         let conflict_path = crate::paths::shadow_path_for(&shadow_anchor, env);
         write_atomic(&conflict_path, &shadow_bytes)?;
         progress.event(Action::Warn, &format!(
@@ -1126,97 +1336,110 @@ fn resolve_one_conflict<R: BufRead>(
     // Wrap all prompt reads in `with_prompt` so the grid renderer
     // suspends its draw region for the duration of the stdin read.
     // For the log renderer this is a transparent no-op.
-    let prompt_out: std::cell::RefCell<Option<PromptOutcome>> =
-        std::cell::RefCell::new(None);
+    let prompt_out: std::cell::RefCell<Option<PromptOutcome>> = std::cell::RefCell::new(None);
     progress.with_prompt(|| -> anyhow::Result<_> {
-        let computed: PromptOutcome =
-            if json_canonicalize_equal && sidecar_diverges {
-                match hash_strategy {
-                    HashStrategy::Hook | HashStrategy::Rule => {
-                        let local_bytes = local_code.clone().unwrap_or_default().into_bytes();
-                        let remote_bytes_for_prompt =
-                            remote_code.clone().unwrap_or_default().into_bytes();
-                        let r = crate::cli::resolve::prompt_resolve_with_bytes(
-                            &mut *input,
-                            &mut *stderr_lock,
-                            idx_one_based,
-                            total,
-                            &code_path,
-                            &local_bytes,
-                            &remote_bytes_for_prompt,
-                            env,
-                        )?;
-                        (r, true, local_bytes, remote_bytes_for_prompt, code_path.clone())
-                    }
-                    HashStrategy::Schema => {
-                        // Pick the first divergent formula sidecar for the
-                        // prompt focus. The user resolves the formula; we
-                        // record the schema_combined_hash on resolution.
-                        let queue_dir = local_path.parent().unwrap_or(&local_path);
-                        let formulas_dir = queue_dir.join("formulas");
-                        let (fid, local_b, remote_b) = {
-                            let mut chosen: Option<(String, Vec<u8>, Vec<u8>)> = None;
-                            for (rid, rbytes) in &remote_formulas {
-                                let lb = local_formulas
-                                    .iter()
-                                    .find(|(lid, _)| lid == rid)
-                                    .map(|(_, b)| b.clone());
-                                if lb.as_deref() != Some(rbytes.as_slice()) {
-                                    chosen = Some((rid.clone(), lb.unwrap_or_default(), rbytes.clone()));
+        let computed: PromptOutcome = if json_canonicalize_equal && sidecar_diverges {
+            match hash_strategy {
+                HashStrategy::Hook | HashStrategy::Rule => {
+                    let local_bytes = local_code.clone().unwrap_or_default().into_bytes();
+                    let remote_bytes_for_prompt =
+                        remote_code.clone().unwrap_or_default().into_bytes();
+                    let r = crate::cli::resolve::prompt_resolve_with_bytes(
+                        &mut *input,
+                        &mut *stderr_lock,
+                        idx_one_based,
+                        total,
+                        &code_path,
+                        &local_bytes,
+                        &remote_bytes_for_prompt,
+                        env,
+                    )?;
+                    (
+                        r,
+                        true,
+                        local_bytes,
+                        remote_bytes_for_prompt,
+                        code_path.clone(),
+                    )
+                }
+                HashStrategy::Schema => {
+                    // Pick the first divergent formula sidecar for the
+                    // prompt focus. The user resolves the formula; we
+                    // record the schema_combined_hash on resolution.
+                    let queue_dir = local_path.parent().unwrap_or(&local_path);
+                    let formulas_dir = queue_dir.join("formulas");
+                    let (fid, local_b, remote_b) = {
+                        let mut chosen: Option<(String, Vec<u8>, Vec<u8>)> = None;
+                        for (rid, rbytes) in &remote_formulas {
+                            let lb = local_formulas
+                                .iter()
+                                .find(|(lid, _)| lid == rid)
+                                .map(|(_, b)| b.clone());
+                            if lb.as_deref() != Some(rbytes.as_slice()) {
+                                chosen =
+                                    Some((rid.clone(), lb.unwrap_or_default(), rbytes.clone()));
+                                break;
+                            }
+                        }
+                        if chosen.is_none() {
+                            // Local-only formula (remote dropped it).
+                            for (lid, lbytes) in &local_formulas {
+                                if !remote_formulas.iter().any(|(rid, _)| rid == lid) {
+                                    chosen = Some((lid.clone(), lbytes.clone(), Vec::new()));
                                     break;
                                 }
                             }
-                            if chosen.is_none() {
-                                // Local-only formula (remote dropped it).
-                                for (lid, lbytes) in &local_formulas {
-                                    if !remote_formulas.iter().any(|(rid, _)| rid == lid) {
-                                        chosen = Some((lid.clone(), lbytes.clone(), Vec::new()));
-                                        break;
-                                    }
-                                }
-                            }
-                            chosen.unwrap_or_else(|| ("unknown".to_string(), Vec::new(), Vec::new()))
-                        };
-                        let formula_path = formulas_dir.join(format!("{fid}.py"));
-                        let r = crate::cli::resolve::prompt_resolve_with_bytes(
-                            &mut *input,
-                            &mut *stderr_lock,
-                            idx_one_based,
-                            total,
-                            &formula_path,
-                            &local_b,
-                            &remote_b,
-                            env,
-                        )?;
-                        // For schemas we don't write the sidecar from the
-                        // resolver — the `[r]` path adopts the whole
-                        // schema including all formulas (handled below).
-                        // `code_conflict_only` remains false because the
-                        // KeepLocal/KeepRemote/Edit branches need to
-                        // handle the whole schema, not just one formula.
-                        (r, false, local_b, remote_b, formula_path)
-                    }
-                    HashStrategy::Flat => unreachable!(),
+                        }
+                        chosen.unwrap_or_else(|| ("unknown".to_string(), Vec::new(), Vec::new()))
+                    };
+                    let formula_path = formulas_dir.join(format!("{fid}.py"));
+                    let r = crate::cli::resolve::prompt_resolve_with_bytes(
+                        &mut *input,
+                        &mut *stderr_lock,
+                        idx_one_based,
+                        total,
+                        &formula_path,
+                        &local_b,
+                        &remote_b,
+                        env,
+                    )?;
+                    // For schemas we don't write the sidecar from the
+                    // resolver — the `[r]` path adopts the whole
+                    // schema including all formulas (handled below).
+                    // `code_conflict_only` remains false because the
+                    // KeepLocal/KeepRemote/Edit branches need to
+                    // handle the whole schema, not just one formula.
+                    (r, false, local_b, remote_b, formula_path)
                 }
-            } else {
-                // Standard JSON-based prompt (path-driven; reads
-                // `local_path` for local bytes).
-                let r = prompt_resolve(
-                    &mut *input,
-                    &mut *stderr_lock,
-                    idx_one_based,
-                    total,
-                    &local_path,
-                    &remote_bytes,
-                    env,
-                )?;
-                (r, false, local_json_bytes.clone(), remote_bytes.clone(), local_path.clone())
-            };
+                HashStrategy::Flat => unreachable!(),
+            }
+        } else {
+            // Standard JSON-based prompt (path-driven; reads
+            // `local_path` for local bytes).
+            let r = prompt_resolve(
+                &mut *input,
+                &mut *stderr_lock,
+                idx_one_based,
+                total,
+                &local_path,
+                &remote_bytes,
+                env,
+            )?;
+            (
+                r,
+                false,
+                local_json_bytes.clone(),
+                remote_bytes.clone(),
+                local_path.clone(),
+            )
+        };
         *prompt_out.borrow_mut() = Some(computed);
         Ok(())
     })?;
     let (resolution, code_conflict_only, prompt_local_bytes, prompt_remote_bytes, prompt_path) =
-        prompt_out.into_inner().expect("with_prompt must populate the resolution");
+        prompt_out
+            .into_inner()
+            .expect("with_prompt must populate the resolution");
 
     // Suppress unused-warning for prompt_local_bytes when no Skip arm
     // reads it (the variable carries diagnostic value for future hooks).
@@ -1273,9 +1496,8 @@ fn resolve_one_conflict<R: BufRead>(
                 // If the previous-runtime sidecar still sits on disk
                 // (hook just flipped runtimes), drop it.
                 if canonical_code_path != code_path && code_path.exists() {
-                    std::fs::remove_file(&code_path).with_context(|| {
-                        format!("removing stale {}", code_path.display())
-                    })?;
+                    std::fs::remove_file(&code_path)
+                        .with_context(|| format!("removing stale {}", code_path.display()))?;
                 }
             } else if matches!(hash_strategy, HashStrategy::Schema) {
                 // Adopt full remote formulas dir: write every remote
@@ -1284,24 +1506,19 @@ fn resolve_one_conflict<R: BufRead>(
                 let queue_dir = local_path.parent().unwrap_or(&local_path);
                 let formulas_dir = queue_dir.join("formulas");
                 if !remote_formulas.is_empty() {
-                    std::fs::create_dir_all(&formulas_dir).with_context(|| {
-                        format!("creating {}", formulas_dir.display())
-                    })?;
+                    std::fs::create_dir_all(&formulas_dir)
+                        .with_context(|| format!("creating {}", formulas_dir.display()))?;
                 }
                 for (fid, bytes) in &remote_formulas {
-                    write_atomic(
-                        &formulas_dir.join(format!("{fid}.py")),
-                        bytes,
-                    )?;
+                    write_atomic(&formulas_dir.join(format!("{fid}.py")), bytes)?;
                 }
                 // Sweep formulas that exist locally but not remotely.
                 for (lid, _) in &local_formulas {
                     if !remote_formulas.iter().any(|(rid, _)| rid == lid) {
                         let stale = formulas_dir.join(format!("{lid}.py"));
                         if stale.exists() {
-                            std::fs::remove_file(&stale).with_context(|| {
-                                format!("removing stale {}", stale.display())
-                            })?;
+                            std::fs::remove_file(&stale)
+                                .with_context(|| format!("removing stale {}", stale.display()))?;
                         }
                     }
                 }
@@ -1323,7 +1540,11 @@ fn resolve_one_conflict<R: BufRead>(
             // to the code sidecar (`code_conflict_only`), the edited
             // bytes are code, not JSON, and must land on the sidecar
             // path; the JSON file is untouched.
-            let edit_target = if code_conflict_only { &code_path } else { &local_path };
+            let edit_target = if code_conflict_only {
+                &code_path
+            } else {
+                &local_path
+            };
             if let Some(parent) = edit_target.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
@@ -1349,7 +1570,11 @@ fn resolve_one_conflict<R: BufRead>(
             // the markers get silently baked in as the new base.
             // No push promotion either (the API would reject markers).
             // When prompt was on the sidecar, edited bytes are code.
-            let edit_target = if code_conflict_only { &code_path } else { &local_path };
+            let edit_target = if code_conflict_only {
+                &code_path
+            } else {
+                &local_path
+            };
             if let Some(parent) = edit_target.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
@@ -1424,18 +1649,17 @@ fn sidecar_path_for_conflict(local_path: &Path, strategy: HashStrategy) -> PathB
     match strategy {
         HashStrategy::Hook => {
             if let Ok(bytes) = std::fs::read(local_path)
-                && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                    let ext = crate::snapshot::hook::hook_code_extension_from_value(&v);
-                    return local_path.with_extension(ext);
-                }
+                && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            {
+                let ext = crate::snapshot::hook::hook_code_extension_from_value(&v);
+                return local_path.with_extension(ext);
+            }
             local_path.with_extension("py")
         }
         // Rules, Flat, and Mdh — `trigger_condition` is always Python
         // (Rules); Flat/Mdh have no sidecar at all but the function
         // contract returns `<json>.py` as a harmless fallback.
-        HashStrategy::Rule | HashStrategy::Flat => {
-            local_path.with_extension("py")
-        }
+        HashStrategy::Rule | HashStrategy::Flat => local_path.with_extension("py"),
         // Schemas don't have a single sidecar — they have a
         // `formulas/<id>.py` per datapoint with a formula. The
         // resolver picks the specific formula at prompt time; this
@@ -1637,7 +1861,9 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
         let mut per_ws: std::collections::HashMap<String, HashSet<String>> =
             std::collections::HashMap::new();
         for q in &catalog.queues {
-            let Some(ws_url) = q.workspace.as_ref() else { continue };
+            let Some(ws_url) = q.workspace.as_ref() else {
+                continue;
+            };
             let ws_slug = ctx
                 .lockfile
                 .slug_for_url("workspaces", ws_url)
@@ -1659,15 +1885,15 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
         let mut per_q: std::collections::HashMap<(String, String), HashSet<String>> =
             std::collections::HashMap::new();
         for t in &catalog.email_templates {
-            let Some(queue_url) = t.queue.as_ref() else { continue };
-            let Some((ws_slug, q_slug)) = q_url_to_ws_q.get(queue_url).cloned() else { continue };
+            let Some(queue_url) = t.queue.as_ref() else {
+                continue;
+            };
+            let Some((ws_slug, q_slug)) = q_url_to_ws_q.get(queue_url).cloned() else {
+                continue;
+            };
             let used = per_q.entry((ws_slug.clone(), q_slug.clone())).or_default();
             let template_slug = match ctx.lockfile.slug_for_id("email_templates", t.id) {
-                Some(existing) => existing
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(existing)
-                    .to_string(),
+                Some(existing) => existing.rsplit('/').next().unwrap_or(existing).to_string(),
                 None => slugify_unique(&t.name, used),
             };
             used.insert(template_slug.clone());
@@ -1699,10 +1925,13 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                 ) {
                     drop_lockfile_entry(ctx, &it.kind, &it.slug);
                 } else {
-                    progress.event(Action::Warn, &format!(
-                        "BothDeleted handler not yet wired for kind '{}' (slug '{}'); skipping",
-                        it.kind, it.slug,
-                    ));
+                    progress.event(
+                        Action::Warn,
+                        &format!(
+                            "BothDeleted handler not yet wired for kind '{}' (slug '{}'); skipping",
+                            it.kind, it.slug,
+                        ),
+                    );
                 }
                 continue;
             }
@@ -1717,18 +1946,24 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                 // classes only need `local_path`).
                 let refs_opt: Option<RemoteDeleteRefs> = match it.kind.as_str() {
                     "labels" => {
-                        let local_path =
-                            ctx.paths.labels_dir().join(format!("{}.json", it.slug));
+                        let local_path = ctx.paths.labels_dir().join(format!("{}.json", it.slug));
                         let body = label_by_slug.get(it.slug.as_str()).copied();
+                        let restore = body.and_then(|l| {
+                            let codec = crate::snapshot::codec::codec("labels")?;
+                            let value = serde_json::to_value(l).ok()?;
+                            let art = codec.disk_bytes(&value).ok()?;
+                            let ovl = ctx
+                                .overlay
+                                .as_ref()
+                                .and_then(|o| codec.overlay(o, &it.slug));
+                            let bytes = maybe_strip_overlay(art.json, ovl).ok()?;
+                            Some(bytes)
+                        });
                         Some(RemoteDeleteRefs {
                             local_path,
-                            restore_bytes: body
-                                .and_then(|l| serde_json::to_vec_pretty(l).ok())
-                                .map(|mut b| {
-                                    b.push(b'\n');
-                                    b
-                                }),
+                            restore_bytes: restore,
                             restore_code: None,
+                            restore_formulas: Vec::new(),
                             id: body.map(|l| l.id),
                             url: body.map(|l| l.url.clone()),
                             modified_at: body.and_then(|l| l.modified_at().map(|s| s.to_string())),
@@ -1736,18 +1971,24 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                         })
                     }
                     "workspaces" => {
-                        let local_path =
-                            ctx.paths.workspace_dir(&it.slug).join("workspace.json");
+                        let local_path = ctx.paths.workspace_dir(&it.slug).join("workspace.json");
                         let body = workspace_by_slug.get(it.slug.as_str()).copied();
+                        let restore = body.and_then(|w| {
+                            let codec = crate::snapshot::codec::codec("workspaces")?;
+                            let value = serde_json::to_value(w).ok()?;
+                            let art = codec.disk_bytes(&value).ok()?;
+                            let ovl = ctx
+                                .overlay
+                                .as_ref()
+                                .and_then(|o| codec.overlay(o, &it.slug));
+                            let bytes = maybe_strip_overlay(art.json, ovl).ok()?;
+                            Some(bytes)
+                        });
                         Some(RemoteDeleteRefs {
                             local_path,
-                            restore_bytes: body
-                                .and_then(|w| serde_json::to_vec_pretty(w).ok())
-                                .map(|mut b| {
-                                    b.push(b'\n');
-                                    b
-                                }),
+                            restore_bytes: restore,
                             restore_code: None,
+                            restore_formulas: Vec::new(),
                             id: body.map(|w| w.id),
                             url: body.map(|w| w.url.clone()),
                             modified_at: body.and_then(|w| w.modified_at().map(|s| s.to_string())),
@@ -1757,15 +1998,22 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     "engines" => {
                         let local_path = ctx.paths.engine_dir(&it.slug).join("engine.json");
                         let body = engine_by_slug.get(it.slug.as_str()).copied();
+                        let restore = body.and_then(|e| {
+                            let codec = crate::snapshot::codec::codec("engines")?;
+                            let value = serde_json::to_value(e).ok()?;
+                            let art = codec.disk_bytes(&value).ok()?;
+                            let ovl = ctx
+                                .overlay
+                                .as_ref()
+                                .and_then(|o| codec.overlay(o, &it.slug));
+                            let bytes = maybe_strip_overlay(art.json, ovl).ok()?;
+                            Some(bytes)
+                        });
                         Some(RemoteDeleteRefs {
                             local_path,
-                            restore_bytes: body
-                                .and_then(|e| serde_json::to_vec_pretty(e).ok())
-                                .map(|mut b| {
-                                    b.push(b'\n');
-                                    b
-                                }),
+                            restore_bytes: restore,
                             restore_code: None,
+                            restore_formulas: Vec::new(),
                             id: body.map(|e| e.id),
                             url: body.map(|e| e.url.clone()),
                             modified_at: body.and_then(|e| e.modified_at().map(|s| s.to_string())),
@@ -1796,15 +2044,22 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                                 .join("__orphan__/fields")
                                 .join(format!("{field_slug}.json")),
                         };
+                        let restore = body.and_then(|f| {
+                            let codec = crate::snapshot::codec::codec("engine_fields")?;
+                            let value = serde_json::to_value(f).ok()?;
+                            let art = codec.disk_bytes(&value).ok()?;
+                            let ovl = ctx
+                                .overlay
+                                .as_ref()
+                                .and_then(|o| codec.overlay(o, &it.slug));
+                            let bytes = maybe_strip_overlay(art.json, ovl).ok()?;
+                            Some(bytes)
+                        });
                         Some(RemoteDeleteRefs {
                             local_path,
-                            restore_bytes: body
-                                .and_then(|f| serde_json::to_vec_pretty(f).ok())
-                                .map(|mut b| {
-                                    b.push(b'\n');
-                                    b
-                                }),
+                            restore_bytes: restore,
                             restore_code: None,
+                            restore_formulas: Vec::new(),
                             id: body.map(|f| f.id),
                             url: body.map(|f| f.url.clone()),
                             modified_at: body.and_then(|f| f.modified_at().map(|s| s.to_string())),
@@ -1812,17 +2067,35 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                         })
                     }
                     "hooks" => {
-                        let local_path =
-                            ctx.paths.hooks_dir().join(format!("{}.json", it.slug));
+                        let local_path = ctx.paths.hooks_dir().join(format!("{}.json", it.slug));
                         let body = hook_by_slug.get(it.slug.as_str()).copied();
-                        // serialize_hook splits the JSON from `config.code`
-                        // — same canonical form the pull driver writes.
-                        let serialized =
-                            body.and_then(|h| crate::snapshot::hook::serialize_hook(h).ok());
+                        // Route through the codec to get the canonical on-disk
+                        // bytes (status-redacted, code extracted) and apply the
+                        // overlay strip so the restore matches the pull driver.
+                        let (restore_bytes, restore_code) = match body.and_then(|h| {
+                            let codec = crate::snapshot::codec::codec("hooks")?;
+                            let value = serde_json::to_value(h).ok()?;
+                            let art = codec.disk_bytes(&value).ok()?;
+                            let ovl = ctx
+                                .overlay
+                                .as_ref()
+                                .and_then(|o| codec.overlay(o, &it.slug));
+                            let json = maybe_strip_overlay(art.json, ovl).ok()?;
+                            let code = art
+                                .sidecars
+                                .into_iter()
+                                .find(|(k, _)| k == "code")
+                                .and_then(|(_, b)| String::from_utf8(b).ok());
+                            Some((json, code))
+                        }) {
+                            Some((j, c)) => (Some(j), c),
+                            None => (None, None),
+                        };
                         Some(RemoteDeleteRefs {
                             local_path,
-                            restore_bytes: serialized.as_ref().map(|(b, _)| b.clone()),
-                            restore_code: serialized.as_ref().and_then(|(_, c)| c.clone()),
+                            restore_bytes,
+                            restore_code,
+                            restore_formulas: Vec::new(),
                             id: body.map(|h| h.id),
                             url: body.map(|h| h.url.clone()),
                             modified_at: body.and_then(|h| h.modified_at().map(|s| s.to_string())),
@@ -1830,15 +2103,32 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                         })
                     }
                     "rules" => {
-                        let local_path =
-                            ctx.paths.rules_dir().join(format!("{}.json", it.slug));
+                        let local_path = ctx.paths.rules_dir().join(format!("{}.json", it.slug));
                         let body = rule_by_slug.get(it.slug.as_str()).copied();
-                        let serialized =
-                            body.and_then(|r| crate::snapshot::rule::serialize_rule(r).ok());
+                        let (restore_bytes, restore_code) = match body.and_then(|r| {
+                            let codec = crate::snapshot::codec::codec("rules")?;
+                            let value = serde_json::to_value(r).ok()?;
+                            let art = codec.disk_bytes(&value).ok()?;
+                            let ovl = ctx
+                                .overlay
+                                .as_ref()
+                                .and_then(|o| codec.overlay(o, &it.slug));
+                            let json = maybe_strip_overlay(art.json, ovl).ok()?;
+                            let code = art
+                                .sidecars
+                                .into_iter()
+                                .find(|(k, _)| k == "trigger_condition")
+                                .and_then(|(_, b)| String::from_utf8(b).ok());
+                            Some((json, code))
+                        }) {
+                            Some((j, c)) => (Some(j), c),
+                            None => (None, None),
+                        };
                         Some(RemoteDeleteRefs {
                             local_path,
-                            restore_bytes: serialized.as_ref().map(|(b, _)| b.clone()),
-                            restore_code: serialized.as_ref().and_then(|(_, c)| c.clone()),
+                            restore_bytes,
+                            restore_code,
+                            restore_formulas: Vec::new(),
                             id: body.map(|r| r.id),
                             url: body.map(|r| r.url.clone()),
                             modified_at: body.and_then(|r| r.modified_at().map(|s| s.to_string())),
@@ -1854,100 +2144,158 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             Some((_, ws_slug)) => {
                                 ctx.paths.queue_dir(ws_slug, &it.slug).join("queue.json")
                             }
-                            None => crate::cli::push::scan::find_queue_nested_path(ctx.paths, &it.slug, "queue.json")
-                                .unwrap_or_else(|| {
-                                    ctx.paths
-                                        .workspaces_dir()
-                                        .join("__orphan__/queues")
-                                        .join(&it.slug)
-                                        .join("queue.json")
-                                }),
+                            None => crate::cli::push::scan::find_queue_nested_path(
+                                ctx.paths,
+                                &it.slug,
+                                "queue.json",
+                            )
+                            .unwrap_or_else(|| {
+                                ctx.paths
+                                    .workspaces_dir()
+                                    .join("__orphan__/queues")
+                                    .join(&it.slug)
+                                    .join("queue.json")
+                            }),
                         };
+                        let restore = body.and_then(|(q, _)| {
+                            let codec = crate::snapshot::codec::codec("queues")?;
+                            let value = serde_json::to_value(*q).ok()?;
+                            let art = codec.disk_bytes(&value).ok()?;
+                            let ovl = ctx
+                                .overlay
+                                .as_ref()
+                                .and_then(|o| codec.overlay(o, &it.slug));
+                            let bytes = maybe_strip_overlay(art.json, ovl).ok()?;
+                            Some(bytes)
+                        });
                         Some(RemoteDeleteRefs {
                             local_path,
-                            // Redact `counts` so a restore writes the same
-                            // canonical bytes a pull would (matching the base).
-                            restore_bytes: body.and_then(|(q, _)| {
-                                crate::snapshot::create::redacted_disk_bytes(*q, "queues").ok()
-                            }),
+                            restore_bytes: restore,
                             restore_code: None,
+                            restore_formulas: Vec::new(),
                             id: body.map(|(q, _)| q.id),
                             url: body.map(|(q, _)| q.url.clone()),
-                            modified_at: body.and_then(|(q, _)| q.modified_at().map(|s| s.to_string())),
+                            modified_at: body
+                                .and_then(|(q, _)| q.modified_at().map(|s| s.to_string())),
                             hash_strategy: HashStrategy::Flat,
                         })
                     }
                     "schemas" => {
                         // schemas live alongside the queue at schema.json.
-                        let body_pair = queue_by_slug.get(it.slug.as_str()).and_then(|(q, ws_slug)| {
-                            catalog
-                                .schemas_by_queue_id
-                                .get(&q.id)
-                                .map(|s| (s, ws_slug.clone()))
-                        });
+                        // Bug e fix: route through the codec so formula sidecars
+                        // are preserved and restored on [r]/[k]. The hash must
+                        // be combined_hash(post-overlay json, framed sidecars).
+                        let body_pair =
+                            queue_by_slug
+                                .get(it.slug.as_str())
+                                .and_then(|(q, ws_slug)| {
+                                    catalog
+                                        .schemas_by_queue_id
+                                        .get(&q.id)
+                                        .map(|s| (s, ws_slug.clone()))
+                                });
                         let local_path = match &body_pair {
                             Some((_, ws_slug)) => {
                                 ctx.paths.queue_dir(ws_slug, &it.slug).join("schema.json")
                             }
-                            None => crate::cli::push::scan::find_queue_nested_path(ctx.paths, &it.slug, "schema.json")
-                                .unwrap_or_else(|| {
-                                    ctx.paths
-                                        .workspaces_dir()
-                                        .join("__orphan__/queues")
-                                        .join(&it.slug)
-                                        .join("schema.json")
-                                }),
+                            None => crate::cli::push::scan::find_queue_nested_path(
+                                ctx.paths,
+                                &it.slug,
+                                "schema.json",
+                            )
+                            .unwrap_or_else(|| {
+                                ctx.paths
+                                    .workspaces_dir()
+                                    .join("__orphan__/queues")
+                                    .join(&it.slug)
+                                    .join("schema.json")
+                            }),
                         };
-                        // Use flat hash strategy for the dispatcher
-                        // simplification (display only schema.json; formula
-                        // sidecars are not restored here on [k]). The
-                        // resolver's hash-into-lockfile call uses Flat so
-                        // it stays a single-file decision.
+                        // Derive codec artifacts (json + formula sidecars) and
+                        // apply overlay strip. The composite slug for overlay
+                        // lookup is `<ws_slug>/<q_slug>`.
+                        let (restore_bytes, restore_formulas) =
+                            match body_pair.as_ref().and_then(|(s, ws_slug)| {
+                                let composite = format!("{ws_slug}/{}", it.slug);
+                                let codec = crate::snapshot::codec::codec("schemas")?;
+                                let value = serde_json::to_value(*s).ok()?;
+                                let art = codec.disk_bytes(&value).ok()?;
+                                let ovl = ctx
+                                    .overlay
+                                    .as_ref()
+                                    .and_then(|o| codec.overlay(o, &composite));
+                                let json = maybe_strip_overlay(art.json, ovl).ok()?;
+                                let formulas: Vec<(String, Vec<u8>)> = art
+                                    .sidecars
+                                    .into_iter()
+                                    .filter_map(|(path, b)| {
+                                        let id = path
+                                            .strip_prefix("formulas/")
+                                            .and_then(|s| s.strip_suffix(".py"))?;
+                                        Some((id.to_string(), b))
+                                    })
+                                    .collect();
+                                Some((json, formulas))
+                            }) {
+                                Some((j, f)) => (Some(j), f),
+                                None => (None, Vec::new()),
+                            };
                         Some(RemoteDeleteRefs {
                             local_path,
-                            restore_bytes: body_pair
-                                .as_ref()
-                                .and_then(|(s, _)| crate::snapshot::schema::serialize_schema(s).ok())
-                                .map(|(json, _formulas)| json),
+                            restore_bytes,
                             restore_code: None,
+                            restore_formulas,
                             id: body_pair.as_ref().map(|(s, _)| s.id),
                             url: body_pair.as_ref().map(|(s, _)| s.url.clone()),
                             modified_at: body_pair
                                 .as_ref()
                                 .and_then(|(s, _)| s.modified_at().map(|x| x.to_string())),
-                            hash_strategy: HashStrategy::Flat,
+                            hash_strategy: HashStrategy::Schema,
                         })
                     }
                     "inboxes" => {
-                        let body_pair = queue_by_slug.get(it.slug.as_str()).and_then(|(q, ws_slug)| {
-                            catalog
-                                .inboxes_by_queue_id
-                                .get(&q.id)
-                                .map(|i| (i, ws_slug.clone()))
-                        });
+                        let body_pair =
+                            queue_by_slug
+                                .get(it.slug.as_str())
+                                .and_then(|(q, ws_slug)| {
+                                    catalog
+                                        .inboxes_by_queue_id
+                                        .get(&q.id)
+                                        .map(|i| (i, ws_slug.clone()))
+                                });
                         let local_path = match &body_pair {
                             Some((_, ws_slug)) => {
                                 ctx.paths.queue_dir(ws_slug, &it.slug).join("inbox.json")
                             }
-                            None => crate::cli::push::scan::find_queue_nested_path(ctx.paths, &it.slug, "inbox.json")
-                                .unwrap_or_else(|| {
-                                    ctx.paths
-                                        .workspaces_dir()
-                                        .join("__orphan__/queues")
-                                        .join(&it.slug)
-                                        .join("inbox.json")
-                                }),
+                            None => crate::cli::push::scan::find_queue_nested_path(
+                                ctx.paths,
+                                &it.slug,
+                                "inbox.json",
+                            )
+                            .unwrap_or_else(|| {
+                                ctx.paths
+                                    .workspaces_dir()
+                                    .join("__orphan__/queues")
+                                    .join(&it.slug)
+                                    .join("inbox.json")
+                            }),
                         };
+                        let restore = body_pair.as_ref().and_then(|(i, _)| {
+                            let codec = crate::snapshot::codec::codec("inboxes")?;
+                            let value = serde_json::to_value(*i).ok()?;
+                            let art = codec.disk_bytes(&value).ok()?;
+                            let ovl = ctx
+                                .overlay
+                                .as_ref()
+                                .and_then(|o| codec.overlay(o, &it.slug));
+                            let bytes = maybe_strip_overlay(art.json, ovl).ok()?;
+                            Some(bytes)
+                        });
                         Some(RemoteDeleteRefs {
                             local_path,
-                            restore_bytes: body_pair
-                                .as_ref()
-                                .and_then(|(i, _)| serde_json::to_vec_pretty(*i).ok())
-                                .map(|mut b| {
-                                    b.push(b'\n');
-                                    b
-                                }),
+                            restore_bytes: restore,
                             restore_code: None,
+                            restore_formulas: Vec::new(),
                             id: body_pair.as_ref().map(|(i, _)| i.id),
                             url: body_pair.as_ref().map(|(i, _)| i.url.clone()),
                             modified_at: body_pair
@@ -1971,15 +2319,22 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                                 .join(format!("{}.json", it.slug))
                         };
                         let body = email_template_by_compound.get(it.slug.as_str()).copied();
+                        let restore = body.and_then(|t| {
+                            let codec = crate::snapshot::codec::codec("email_templates")?;
+                            let value = serde_json::to_value(t).ok()?;
+                            let art = codec.disk_bytes(&value).ok()?;
+                            let ovl = ctx
+                                .overlay
+                                .as_ref()
+                                .and_then(|o| codec.overlay(o, &it.slug));
+                            let bytes = maybe_strip_overlay(art.json, ovl).ok()?;
+                            Some(bytes)
+                        });
                         Some(RemoteDeleteRefs {
                             local_path,
-                            restore_bytes: body
-                                .and_then(|t| serde_json::to_vec_pretty(t).ok())
-                                .map(|mut b| {
-                                    b.push(b'\n');
-                                    b
-                                }),
+                            restore_bytes: restore,
                             restore_code: None,
+                            restore_formulas: Vec::new(),
                             id: body.map(|t| t.id),
                             url: body.map(|t| t.url.clone()),
                             modified_at: body.and_then(|t| t.modified_at().map(|s| s.to_string())),
@@ -2013,19 +2368,28 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             // kinds, so the local restore is byte-complete.
                             // For hooks, the sidecar extension is
                             // derived from the restored JSON's runtime.
-                            if matches!(
-                                refs.hash_strategy,
-                                HashStrategy::Hook | HashStrategy::Rule
-                            )
-                                && let Some(code) = refs.restore_code.as_ref() {
-                                    let restored_code_path =
-                                        if matches!(refs.hash_strategy, HashStrategy::Hook) {
-                                            sidecar_path_for_remote(&local_path, bytes)
-                                        } else {
-                                            local_path.with_extension("py")
-                                        };
-                                    write_atomic(&restored_code_path, code.as_bytes())?;
+                            if matches!(refs.hash_strategy, HashStrategy::Hook | HashStrategy::Rule)
+                                && let Some(code) = refs.restore_code.as_ref()
+                            {
+                                let restored_code_path =
+                                    if matches!(refs.hash_strategy, HashStrategy::Hook) {
+                                        sidecar_path_for_remote(&local_path, bytes)
+                                    } else {
+                                        local_path.with_extension("py")
+                                    };
+                                write_atomic(&restored_code_path, code.as_bytes())?;
+                            }
+                            // Restore formula sidecars for schemas (bug e fix).
+                            if matches!(refs.hash_strategy, HashStrategy::Schema)
+                                && !refs.restore_formulas.is_empty()
+                            {
+                                let queue_dir = local_path.parent().unwrap_or(&local_path);
+                                let formulas_dir = queue_dir.join("formulas");
+                                std::fs::create_dir_all(&formulas_dir).ok();
+                                for (fid, fbytes) in &refs.restore_formulas {
+                                    write_atomic(&formulas_dir.join(format!("{fid}.py")), fbytes)?;
                                 }
+                            }
                         }
                         None => {
                             progress.event(Action::Warn, &format!(
@@ -2046,11 +2410,14 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     if local_path.exists() {
                         let marker = deleted_marker_path(&local_path, &env);
                         write_atomic(&marker, b"")?;
-                        progress.event(Action::Warn, &format!(
-                            "{}: env deletion deferred (non-tty); marker at {}",
-                            local_path.display(),
-                            marker.display(),
-                        ));
+                        progress.event(
+                            Action::Warn,
+                            &format!(
+                                "{}: env deletion deferred (non-tty); marker at {}",
+                                local_path.display(),
+                                marker.display(),
+                            ),
+                        );
                     }
                     continue;
                 }
@@ -2060,10 +2427,13 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     // file: the classifier saw a tombstone-flavored
                     // state but the file isn't there. Defensive — emit
                     // a warning and move on rather than panic.
-                    progress.event(Action::Warn, &format!(
-                        "{}: local file missing, cannot prompt; skipping",
-                        local_path.display(),
-                    ));
+                    progress.event(
+                        Action::Warn,
+                        &format!(
+                            "{}: local file missing, cannot prompt; skipping",
+                            local_path.display(),
+                        ),
+                    );
                     continue;
                 }
 
@@ -2103,16 +2473,18 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             // local bytes are removed so re-running the
                             // sync without explicit user intervention
                             // doesn't accidentally re-create the file.
-                            std::fs::remove_file(&local_path).with_context(|| {
-                                format!("removing {}", local_path.display())
-                            })?;
-                            progress.event(Action::Info, &format!(
-                                "{}: committing the local tombstone needs an \
+                            std::fs::remove_file(&local_path)
+                                .with_context(|| format!("removing {}", local_path.display()))?;
+                            progress.event(
+                                Action::Info,
+                                &format!(
+                                    "{}: committing the local tombstone needs an \
                                  explicit `rdc push --allow-deletes {}` follow-up; \
                                  the lockfile entry was retained so the deletion isn't lost",
-                                local_path.display(),
-                                env,
-                            ));
+                                    local_path.display(),
+                                    env,
+                                ),
+                            );
                         } else {
                             // Restore on env: drop the lockfile entry so
                             // the push pipeline's "missing lockfile
@@ -2134,7 +2506,14 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             // lockfile to the env hash so subsequent
                             // syncs see Clean state.
                             if let Some(bytes) = refs.restore_bytes.as_ref() {
-                                let h = refs.hash_strategy.hash(bytes, &refs.restore_code);
+                                // For schema kinds, use hash_schema so the
+                                // formula sidecars are included in the hash.
+                                let h = if matches!(refs.hash_strategy, HashStrategy::Schema) {
+                                    refs.hash_strategy
+                                        .hash_schema(bytes, &refs.restore_formulas)
+                                } else {
+                                    refs.hash_strategy.hash(bytes, &refs.restore_code)
+                                };
                                 if let (Some(id), url, modified_at) =
                                     (refs.id, refs.url.clone(), refs.modified_at.clone())
                                 {
@@ -2157,28 +2536,21 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             // extension from the local JSON's runtime
                             // before deleting the JSON itself. Also
                             // sweep a stale-other-extension sidecar.
-                            let sidecar = sidecar_path_for_conflict(
-                                &local_path,
-                                refs.hash_strategy,
-                            );
-                            let other_sidecar = if sidecar.extension().and_then(|s| s.to_str())
-                                == Some("js")
+                            let sidecar =
+                                sidecar_path_for_conflict(&local_path, refs.hash_strategy);
+                            let other_sidecar =
+                                if sidecar.extension().and_then(|s| s.to_str()) == Some("js") {
+                                    local_path.with_extension("py")
+                                } else {
+                                    local_path.with_extension("js")
+                                };
+                            std::fs::remove_file(&local_path)
+                                .with_context(|| format!("removing {}", local_path.display()))?;
+                            if matches!(refs.hash_strategy, HashStrategy::Hook | HashStrategy::Rule)
+                                && sidecar.exists()
                             {
-                                local_path.with_extension("py")
-                            } else {
-                                local_path.with_extension("js")
-                            };
-                            std::fs::remove_file(&local_path).with_context(|| {
-                                format!("removing {}", local_path.display())
-                            })?;
-                            if matches!(
-                                refs.hash_strategy,
-                                HashStrategy::Hook | HashStrategy::Rule
-                            ) && sidecar.exists()
-                            {
-                                std::fs::remove_file(&sidecar).with_context(|| {
-                                    format!("removing {}", sidecar.display())
-                                })?;
+                                std::fs::remove_file(&sidecar)
+                                    .with_context(|| format!("removing {}", sidecar.display()))?;
                             }
                             if matches!(refs.hash_strategy, HashStrategy::Hook)
                                 && other_sidecar.exists()
@@ -2187,25 +2559,36 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                                     format!("removing {}", other_sidecar.display())
                                 })?;
                             }
+                            // For schemas, also sweep the formulas/ directory
+                            // so locally-deleted schemas don't leave orphan
+                            // formula files behind.
+                            if matches!(refs.hash_strategy, HashStrategy::Schema) {
+                                let queue_dir = local_path.parent().unwrap_or(&local_path);
+                                let formulas_dir = queue_dir.join("formulas");
+                                if formulas_dir.exists() {
+                                    std::fs::remove_dir_all(&formulas_dir).ok();
+                                }
+                            }
                             drop_lockfile_entry(ctx, &it.kind, &it.slug);
                         }
                     }
                     Resolution::Skip => {
                         let marker = deleted_marker_path(&local_path, &env);
                         write_atomic(&marker, b"")?;
-                        progress.event(Action::Warn, &format!(
-                            "{}: env deletion deferred; marker at {}",
-                            local_path.display(),
-                            marker.display(),
-                        ));
+                        progress.event(
+                            Action::Warn,
+                            &format!(
+                                "{}: env deletion deferred; marker at {}",
+                                local_path.display(),
+                                marker.display(),
+                            ),
+                        );
                     }
                     // The remote-delete prompt never offers `[e]` or
                     // `[h]`; the helper's contract documents those
                     // variants as unreachable here. Fall through to
                     // Abort defensively.
-                    Resolution::Edit(_)
-                    | Resolution::EditWithMarkers(_)
-                    | Resolution::Abort => {
+                    Resolution::Edit(_) | Resolution::EditWithMarkers(_) | Resolution::Abort => {
                         return Err(anyhow::Error::new(PullAborted));
                     }
                 }
@@ -2236,6 +2619,9 @@ struct RemoteDeleteRefs {
     local_path: PathBuf,
     restore_bytes: Option<Vec<u8>>,
     restore_code: Option<String>,
+    /// Formula sidecars for `HashStrategy::Schema` restores. Each entry
+    /// is a `(field_id, bytes)` pair. For non-schema kinds this is empty.
+    restore_formulas: Vec<(String, Vec<u8>)>,
     id: Option<u64>,
     url: Option<String>,
     modified_at: Option<String>,
@@ -2443,7 +2829,10 @@ pub async fn run(
             })?;
             match confirm_out.into_inner().expect("with_prompt must populate") {
                 crate::cli::push::deletes::ConfirmOutcome::Aborted => {
-                    progress.event(Action::Info, "delete phase aborted at confirmation; remote unchanged.");
+                    progress.event(
+                        Action::Info,
+                        "delete phase aborted at confirmation; remote unchanged.",
+                    );
                 }
                 crate::cli::push::deletes::ConfirmOutcome::Proceed => {
                     delete_counts = crate::cli::push::deletes::run_deletes(
@@ -2468,9 +2857,7 @@ pub async fn run(
         .filter(|c| matches!(c.class, SyncClass::LocalDelete))
         .count();
     if !no_push && local_delete_planned > 0 {
-        outcome.items_pushed = outcome
-            .items_pushed
-            .saturating_sub(local_delete_planned)
+        outcome.items_pushed = outcome.items_pushed.saturating_sub(local_delete_planned)
             + delete_counts.total_deleted();
     }
 
@@ -2562,8 +2949,9 @@ pub async fn run(
         // lockfile entry so the next sync sees it as truly `Clean`.
         let mut subsets: BTreeMap<&str, BTreeSet<(String, String)>> = BTreeMap::new();
         for it in classified {
-            let needs_pull_dispatch = matches!(it.class, SyncClass::RemoteEdit | SyncClass::RemoteCreate)
-                || (matches!(it.class, SyncClass::Clean) && it.base_hash.is_none());
+            let needs_pull_dispatch =
+                matches!(it.class, SyncClass::RemoteEdit | SyncClass::RemoteCreate)
+                    || (matches!(it.class, SyncClass::Clean) && it.base_hash.is_none());
             if needs_pull_dispatch {
                 subsets
                     .entry(it.kind.as_str())
@@ -2576,7 +2964,8 @@ pub async fn run(
         // 14 ships the labels-only adapter; other kinds plug in as
         // their adapter coverage lands.
         if let Some(subset) = subsets.get("labels") {
-            crate::cli::pull::labels::process(ctx, catalog.labels.clone(), subset, progress).await?;
+            crate::cli::pull::labels::process(ctx, catalog.labels.clone(), subset, progress)
+                .await?;
         }
 
         // organization is a pull-only singleton. The classifier only
@@ -2585,17 +2974,25 @@ pub async fn run(
         // we want the driver to write the local file. The driver takes
         // the full Organization rather than a subset filter.
         if subsets.contains_key("organization") {
-            crate::cli::pull::organization::process(ctx, catalog.organization.clone(), progress).await?;
+            crate::cli::pull::organization::process(ctx, catalog.organization.clone(), progress)
+                .await?;
         }
 
         // workflows and workflow_steps are pull-only (read-only at the
         // Rossum API). Each driver respects the `(kind, slug)` subset,
         // so the executor stays a thin dispatcher.
         if let Some(subset) = subsets.get("workflows") {
-            crate::cli::pull::workflows::process(ctx, catalog.workflows.clone(), subset, progress).await?;
+            crate::cli::pull::workflows::process(ctx, catalog.workflows.clone(), subset, progress)
+                .await?;
         }
         if let Some(subset) = subsets.get("workflow_steps") {
-            crate::cli::pull::workflow_steps::process(ctx, catalog.workflow_steps.clone(), subset, progress).await?;
+            crate::cli::pull::workflow_steps::process(
+                ctx,
+                catalog.workflow_steps.clone(),
+                subset,
+                progress,
+            )
+            .await?;
         }
 
         // workspaces, engines, engine_fields, mdh — flat push-capable
@@ -2603,13 +3000,26 @@ pub async fn run(
         // `(kind, slug)` subset filter; the dispatcher hands off the
         // subset and lets the driver re-derive slugs.
         if let Some(subset) = subsets.get("workspaces") {
-            crate::cli::pull::workspaces::process(ctx, catalog.workspaces.clone(), subset, progress).await?;
+            crate::cli::pull::workspaces::process(
+                ctx,
+                catalog.workspaces.clone(),
+                subset,
+                progress,
+            )
+            .await?;
         }
         if let Some(subset) = subsets.get("engines") {
-            crate::cli::pull::engines::process(ctx, catalog.engines.clone(), subset, progress).await?;
+            crate::cli::pull::engines::process(ctx, catalog.engines.clone(), subset, progress)
+                .await?;
         }
         if let Some(subset) = subsets.get("engine_fields") {
-            crate::cli::pull::engine_fields::process(ctx, catalog.engine_fields.clone(), subset, progress).await?;
+            crate::cli::pull::engine_fields::process(
+                ctx,
+                catalog.engine_fields.clone(),
+                subset,
+                progress,
+            )
+            .await?;
         }
         if let Some(subset) = subsets.get("hooks") {
             crate::cli::pull::hooks::process(ctx, catalog.hooks.clone(), subset, progress).await?;
@@ -2625,10 +3035,8 @@ pub async fn run(
         // whose schema or inbox needs writing pulls the whole tree.
         // This matches the "queue-nested files travel as a unit" rule
         // documented on `pull::queues::process`.
-        let mut queue_subset: BTreeSet<(String, String)> = subsets
-            .get("queues")
-            .cloned()
-            .unwrap_or_default();
+        let mut queue_subset: BTreeSet<(String, String)> =
+            subsets.get("queues").cloned().unwrap_or_default();
         for it in classified {
             if matches!(it.class, SyncClass::RemoteEdit | SyncClass::RemoteCreate)
                 && (it.kind == "schemas" || it.kind == "inboxes")
@@ -2738,7 +3146,7 @@ mod tests {
     use crate::cli::pull::common::RemoteCatalog;
     use crate::model::Label;
     use crate::paths::Paths;
-    use crate::state::{Lockfile, ObjectEntry};
+    use crate::state::{Lockfile, ObjectEntry, content_hash};
     use serde_json::Value;
     use std::collections::BTreeMap;
     use std::io::Cursor;
@@ -2919,7 +3327,6 @@ mod tests {
             .expect("resolver should succeed on [k]")
         };
 
-
         // Outcome: one entry promoted to the push pipeline, naming the
         // label slug and its on-disk path.
         assert_eq!(outcome.promoted_to_push.len(), 1, "should promote 1 item");
@@ -2943,7 +3350,10 @@ mod tests {
             .and_then(|m| m.get("audit-hold"))
             .and_then(|e| e.content_hash.clone())
             .expect("lockfile entry must persist");
-        assert_eq!(recorded, remote_hash, "lockfile base should now equal remote hash");
+        assert_eq!(
+            recorded, remote_hash,
+            "lockfile base should now equal remote hash"
+        );
     }
 
     /// Scripted `r\n` ([r]use env): the resolver overwrites the local
@@ -2977,14 +3387,19 @@ mod tests {
             .expect("resolver should succeed on [r]")
         };
 
-
         // No push-side promotion — remote wins, no PATCH needed.
-        assert!(outcome.promoted_to_push.is_empty(), "no push items expected on [r]");
+        assert!(
+            outcome.promoted_to_push.is_empty(),
+            "no push items expected on [r]"
+        );
 
         // Local file overwritten with remote bytes.
         let remote_bytes = label_bytes(&fixture.remote_label);
         let local_after = std::fs::read(&fixture.local_path).unwrap();
-        assert_eq!(local_after, remote_bytes, "local file should be replaced by remote bytes");
+        assert_eq!(
+            local_after, remote_bytes,
+            "local file should be replaced by remote bytes"
+        );
 
         // Lockfile records the remote hash.
         let recorded = fixture
@@ -3039,18 +3454,27 @@ mod tests {
             .expect("resolver should succeed on [s]")
         };
 
-
-        assert!(outcome.promoted_to_push.is_empty(), "skip never promotes to push");
+        assert!(
+            outcome.promoted_to_push.is_empty(),
+            "skip never promotes to push"
+        );
 
         // Shadow file at `<local>.<env>` carries the remote bytes.
         let shadow = crate::paths::shadow_path_for(&fixture.local_path, "test");
-        assert!(shadow.exists(), "shadow file should be written at {}", shadow.display());
+        assert!(
+            shadow.exists(),
+            "shadow file should be written at {}",
+            shadow.display()
+        );
         let remote_bytes = label_bytes(&fixture.remote_label);
         assert_eq!(std::fs::read(&shadow).unwrap(), remote_bytes);
 
         // Local file untouched.
         let local_after = std::fs::read(&fixture.local_path).unwrap();
-        assert_eq!(local_after, local_before, "local file must not be modified by [s]");
+        assert_eq!(
+            local_after, local_before,
+            "local file must not be modified by [s]"
+        );
 
         // Lockfile entry MUST be pinned to the prior base — advancing it
         // would silently swallow the conflict on the next pull/sync.
@@ -3109,7 +3533,6 @@ mod tests {
             .expect("non-interactive resolver must succeed")
         };
 
-
         assert!(outcome.promoted_to_push.is_empty());
 
         let shadow = crate::paths::shadow_path_for(&fixture.local_path, "test");
@@ -3161,11 +3584,11 @@ mod tests {
             .expect_err("abort must surface as an error")
         };
 
-
         // Sentinel type lets the outer push/pull runner suppress
         // lockfile.save() — mirrors the apply_pull_action contract.
         assert!(
-            err.chain().any(|c| c.downcast_ref::<PullAborted>().is_some()),
+            err.chain()
+                .any(|c| c.downcast_ref::<PullAborted>().is_some()),
             "expected PullAborted in error chain, got: {err:?}",
         );
     }
@@ -3213,7 +3636,6 @@ mod tests {
             .await
             .expect("no-op resolver must succeed")
         };
-
 
         assert!(outcome.promoted_to_push.is_empty(), "no items to promote");
         assert_eq!(fixture.lockfile, lf_before, "lockfile must be untouched");
@@ -3318,7 +3740,6 @@ mod tests {
             .expect("resolver should succeed on [k]")
         };
 
-
         // Outcome: one entry promoted as a restore — push pipeline will
         // POST because the lockfile entry was dropped.
         assert_eq!(
@@ -3378,7 +3799,6 @@ mod tests {
             .expect("resolver should succeed on [r]")
         };
 
-
         assert!(
             outcome.promoted_to_push.is_empty(),
             "no push items expected on [r]"
@@ -3431,7 +3851,6 @@ mod tests {
             .await
             .expect("resolver should succeed on [s]")
         };
-
 
         assert!(outcome.promoted_to_push.is_empty(), "skip never promotes");
 
@@ -3489,7 +3908,6 @@ mod tests {
             .await
             .expect("non-tty resolver must succeed")
         };
-
 
         assert!(outcome.promoted_to_push.is_empty());
 
@@ -3575,7 +3993,6 @@ mod tests {
             .expect("LocalDeleteRemoteEdit resolver should succeed on [s]")
         };
 
-
         assert!(outcome.promoted_to_push.is_empty());
 
         // The dispatcher restored the local file from env-side bytes so
@@ -3636,7 +4053,6 @@ mod tests {
             .await
             .expect("BothDeleted resolver must succeed without reading stdin")
         };
-
 
         assert!(outcome.promoted_to_push.is_empty());
         assert!(
@@ -3742,8 +4158,7 @@ mod tests {
 
         let (remote_json_full, remote_code) =
             crate::snapshot::hook::serialize_hook(&remote_hook).unwrap();
-        let remote_combined =
-            crate::state::hook_combined_hash(&remote_json_full, &remote_code);
+        let remote_combined = crate::state::hook_combined_hash(&remote_json_full, &remote_code);
         let local_combined = crate::state::hook_combined_hash(
             &local_json_with_newline,
             &Some("def local_edit():\n    return 2\n".to_string()),
@@ -3814,7 +4229,6 @@ mod tests {
             .await
             .expect("resolver should succeed (even with empty stdin → Skip)")
         };
-
 
         assert!(
             outcome.promoted_to_push.is_empty(),
@@ -3891,7 +4305,6 @@ mod tests {
             .expect("resolver should succeed on [k]")
         };
 
-
         assert_eq!(
             outcome.promoted_to_push.len(),
             1,
@@ -3918,8 +4331,7 @@ mod tests {
         let remote_hook = &catalog.hooks[0];
         let (remote_json_full, remote_code) =
             crate::snapshot::hook::serialize_hook(remote_hook).unwrap();
-        let expected =
-            crate::state::hook_combined_hash(&remote_json_full, &remote_code);
+        let expected = crate::state::hook_combined_hash(&remote_json_full, &remote_code);
         assert_eq!(
             recorded, expected,
             "lockfile base should equal remote combined hash after [k]"
@@ -3963,7 +4375,6 @@ mod tests {
             .expect("resolver should succeed on [r]")
         };
 
-
         assert!(outcome.promoted_to_push.is_empty(), "no push on [r]");
 
         let py_after = std::fs::read(&py_path).unwrap();
@@ -3977,10 +4388,8 @@ mod tests {
         // bytes match either before or post-write (both acceptable
         // shapes).
         let json_after = std::fs::read(&json_path).unwrap();
-        let json_canon_before =
-            crate::snapshot::noise::canonicalize_for_hash(&json_before);
-        let json_canon_after =
-            crate::snapshot::noise::canonicalize_for_hash(&json_after);
+        let json_canon_before = crate::snapshot::noise::canonicalize_for_hash(&json_before);
+        let json_canon_after = crate::snapshot::noise::canonicalize_for_hash(&json_after);
         assert_eq!(
             json_canon_before, json_canon_after,
             "JSON canonical form must remain stable on [r] (was identical before)"
@@ -4071,8 +4480,7 @@ mod tests {
 
         let (remote_json_full, remote_code) =
             crate::snapshot::hook::serialize_hook(&remote_hook).unwrap();
-        let remote_combined =
-            crate::state::hook_combined_hash(&remote_json_full, &remote_code);
+        let remote_combined = crate::state::hook_combined_hash(&remote_json_full, &remote_code);
         let local_combined = crate::state::hook_combined_hash(
             &local_json_with_newline,
             &Some("def local_edit():\n    return 2\n".to_string()),
@@ -4086,7 +4494,16 @@ mod tests {
             base_hash: Some(base_combined.clone()),
         }];
 
-        (tmp, paths, lockfile, local_json_path, local_py_path, catalog, classified, base_combined)
+        (
+            tmp,
+            paths,
+            lockfile,
+            local_json_path,
+            local_py_path,
+            catalog,
+            classified,
+            base_combined,
+        )
     }
 
     /// Asymmetric: local has code, remote doesn't. With empty stdin
@@ -4129,7 +4546,6 @@ mod tests {
             .await
             .expect("resolver should succeed (Skip on empty stdin)")
         };
-
 
         assert!(
             outcome.promoted_to_push.is_empty(),
@@ -4226,11 +4642,9 @@ mod tests {
 
         let (remote_json_full, remote_code) =
             crate::snapshot::hook::serialize_hook(&remote_hook).unwrap();
-        let remote_combined =
-            crate::state::hook_combined_hash(&remote_json_full, &remote_code);
+        let remote_combined = crate::state::hook_combined_hash(&remote_json_full, &remote_code);
         // Local has no .py → local hash = `hook_combined_hash(json, None)`.
-        let local_combined =
-            crate::state::hook_combined_hash(&local_json_with_newline, &None);
+        let local_combined = crate::state::hook_combined_hash(&local_json_with_newline, &None);
         let classified = vec![ClassifiedItem {
             kind: "hooks".to_string(),
             slug: slug.to_string(),
@@ -4240,7 +4654,15 @@ mod tests {
             base_hash: Some(base_combined.clone()),
         }];
 
-        (tmp, paths, lockfile, local_json_path, catalog, classified, base_combined)
+        (
+            tmp,
+            paths,
+            lockfile,
+            local_json_path,
+            catalog,
+            classified,
+            base_combined,
+        )
     }
 
     #[tokio::test]
@@ -4274,7 +4696,6 @@ mod tests {
             .await
             .expect("resolver should succeed (Skip on empty stdin)")
         };
-
 
         assert!(
             outcome.promoted_to_push.is_empty(),
@@ -4355,8 +4776,7 @@ mod tests {
         let formula_path = queue_dir.join("formulas/amount_total.py");
         std::fs::write(&formula_path, &base_formulas[0].1).unwrap();
 
-        let base_combined =
-            crate::state::schema_combined_hash(&base_json_bytes, &base_formulas);
+        let base_combined = crate::state::schema_combined_hash(&base_json_bytes, &base_formulas);
         let mut lockfile = Lockfile::default();
         lockfile.upsert(
             "schemas",
@@ -4448,8 +4868,7 @@ mod tests {
         // Local hash uses scan-side formula bytes.
         let mut local_formulas = base_formulas.clone();
         local_formulas[0].1 = b"amount_due + amount_tax + amount_fee".to_vec();
-        let local_combined =
-            crate::state::schema_combined_hash(&base_json_bytes, &local_formulas);
+        let local_combined = crate::state::schema_combined_hash(&base_json_bytes, &local_formulas);
 
         let classified = vec![ClassifiedItem {
             kind: "schemas".to_string(),
@@ -4460,7 +4879,16 @@ mod tests {
             base_hash: Some(base_combined.clone()),
         }];
 
-        (tmp, paths, lockfile, schema_path, formula_path, catalog, classified, base_combined)
+        (
+            tmp,
+            paths,
+            lockfile,
+            schema_path,
+            formula_path,
+            catalog,
+            classified,
+            base_combined,
+        )
     }
 
     /// Regression for the schema bug: with formula-only divergence on
@@ -4473,8 +4901,16 @@ mod tests {
     /// pinned.
     #[tokio::test]
     async fn resolve_conflicts_schema_prompts_when_only_formula_differs() {
-        let (_tmp, paths, mut lockfile, _schema_path, formula_path, catalog, classified, base_combined) =
-            setup_schema_formula_only_conflict();
+        let (
+            _tmp,
+            paths,
+            mut lockfile,
+            _schema_path,
+            formula_path,
+            catalog,
+            classified,
+            base_combined,
+        ) = setup_schema_formula_only_conflict();
         let client = RossumClient::new(
             "https://unused.invalid/api/v1".to_string(),
             "TEST".to_string(),
@@ -4503,7 +4939,6 @@ mod tests {
             .expect("resolver should succeed (Skip on empty stdin)")
         };
 
-
         assert!(
             outcome.promoted_to_push.is_empty(),
             "formula-only schema divergence: resolver MUST NOT silently promote; \
@@ -4530,4 +4965,389 @@ mod tests {
         );
     }
 
+    // ----- Bug-d regression: overlay + conflict convergence ---------------
+    //
+    // An object with an overlay-managed field that resolves a conflict via
+    // [r] (keep-remote) must record the POST-overlay hash so the next sync
+    // classifies the object as Clean (converges). Before the fix the executor
+    // used the PRE-overlay bytes for `remote_bytes`, which produced a hash
+    // that never matched the pull driver's on-disk hash → perpetual conflict.
+
+    /// Bug-d repro: hook with an overlay-managed field, BothDiverged
+    /// conflict, resolved via `[r]` (keep-remote). The lockfile must
+    /// record `combined_hash(post_overlay_json, code_sidecar)`, not the
+    /// pre-overlay bytes, so the NEXT sync classifies the hook as Clean.
+    #[tokio::test]
+    async fn resolve_conflicts_hook_overlay_keep_remote_records_post_overlay_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+
+        let slug = "validator-hook";
+
+        // Hook served by remote: has a `description` field managed by the overlay.
+        let remote_hook: crate::model::Hook = serde_json::from_value(serde_json::json!({
+            "id": 555,
+            "url": "https://x.invalid/api/v1/hooks/555",
+            "name": "Validator hook",
+            "type": "function",
+            "queues": [],
+            "events": ["annotation_content"],
+            "config": {
+                "runtime": "python3.12",
+                "code": "def validate(payload):\n    pass\n"
+            },
+            "description": "PROD-specific description managed by overlay"
+        }))
+        .unwrap();
+
+        // Local file: same hook but user edited `events` (adds annotation_status).
+        // The overlay is in effect, so on-disk the file has no `description`.
+        let local_json_no_desc = serde_json::json!({
+            "id": 555,
+            "url": "https://x.invalid/api/v1/hooks/555",
+            "name": "Validator hook",
+            "type": "function",
+            "queues": [],
+            "events": ["annotation_content", "annotation_status"],
+            "config": { "runtime": "python3.12" }
+        });
+        let mut local_json_bytes = serde_json::to_vec_pretty(&local_json_no_desc).unwrap();
+        local_json_bytes.push(b'\n');
+        let local_json_path = paths.hooks_dir().join(format!("{slug}.json"));
+        let local_py_path = paths.hooks_dir().join(format!("{slug}.py"));
+        std::fs::write(&local_json_path, &local_json_bytes).unwrap();
+        std::fs::write(&local_py_path, b"def validate(payload):\n    pass\n").unwrap();
+
+        // Build the overlay that strips `description` from hooks/<slug>.
+        let overlay_toml = format!(
+            "version = 1\n\n[hooks.{}]\n\"description\" = \"PROD-specific description managed by overlay\"\n",
+            slug
+        );
+        let overlay: crate::overlay::Overlay = toml::from_str(&overlay_toml).unwrap();
+
+        // Compute the expected "correct" remote hash: post-overlay (no description)
+        // + code sidecar. This is what the pull driver records and what the next
+        // classifier would compute on the on-disk bytes.
+        let codec = crate::snapshot::codec::codec("hooks").unwrap();
+        let remote_value = serde_json::to_value(&remote_hook).unwrap();
+        let remote_art = codec.disk_bytes(&remote_value).unwrap();
+        let remote_ovl = overlay.hook(slug);
+        let remote_json_stripped =
+            crate::cli::pull::common::maybe_strip_overlay(remote_art.json, remote_ovl).unwrap();
+        let remote_code_bytes = remote_art
+            .sidecars
+            .iter()
+            .find(|(k, _)| k == "code")
+            .map(|(_, b)| b.clone())
+            .unwrap_or_default();
+        let expected_hash = combined_hash(
+            &remote_json_stripped,
+            &[("code".to_string(), remote_code_bytes)],
+        );
+
+        // Seed the lockfile with a base hash that differs from both local and
+        // remote (simulates a prior state before both sides diverged).
+        let base_json = serde_json::json!({
+            "id": 555,
+            "url": "https://x.invalid/api/v1/hooks/555",
+            "name": "Validator hook",
+            "type": "function",
+            "queues": [],
+            "events": ["annotation_content"],
+            "config": { "runtime": "python3.12" }
+        });
+        let mut base_bytes = serde_json::to_vec_pretty(&base_json).unwrap();
+        base_bytes.push(b'\n');
+        let base_code = "def validate(payload):\n    pass\n".to_string();
+        let base_hash = combined_hash(&base_bytes, &[("code".to_string(), base_code.into_bytes())]);
+        let mut lockfile = Lockfile::default();
+        lockfile.upsert(
+            "hooks",
+            slug,
+            ObjectEntry {
+                id: 555,
+                url: Some("https://x.invalid/api/v1/hooks/555".to_string()),
+                modified_at: None,
+                content_hash: Some(base_hash.clone()),
+                secrets_hash: None,
+            },
+        );
+
+        // Simulate the local hash: post-overlay (no description) + local code.
+        let local_code_str = "def validate(payload):\n    pass\n".to_string();
+        let local_hash = combined_hash(
+            &local_json_bytes,
+            &[("code".to_string(), local_code_str.into_bytes())],
+        );
+
+        // Remote hash via the codec (what the classifier would compute).
+        let remote_hash = expected_hash.clone();
+        let classified = vec![ClassifiedItem {
+            kind: "hooks".to_string(),
+            slug: slug.to_string(),
+            class: SyncClass::BothDiverged,
+            local_hash: Some(local_hash),
+            remote_hash: Some(remote_hash),
+            base_hash: Some(base_hash),
+        }];
+
+        let catalog = catalog_with_hooks(vec![remote_hook]);
+        let client = RossumClient::new(
+            "https://unused.invalid/api/v1".to_string(),
+            "TEST".to_string(),
+        )
+        .unwrap();
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+
+        // Resolve with `[r]` (keep-remote).
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &paths,
+                client: &client,
+                lockfile: &mut lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: Some(overlay),
+                interactive: true,
+            };
+            resolve_conflicts(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b"r\n"),
+                true,
+                &progress,
+            )
+            .await
+            .expect("resolver must succeed on [r]")
+        };
+
+        // No push promotion — remote wins.
+        assert!(
+            outcome.promoted_to_push.is_empty(),
+            "keep-remote must not promote to push"
+        );
+
+        // The recorded lockfile hash MUST be the post-overlay combined hash.
+        // Before the fix, this would be the pre-overlay hash (containing
+        // `description`), which would cause the next sync to re-conflict forever.
+        let recorded = lockfile
+            .objects
+            .get("hooks")
+            .and_then(|m| m.get(slug))
+            .and_then(|e| e.content_hash.clone())
+            .expect("lockfile must have entry after resolution");
+        assert_eq!(
+            recorded, expected_hash,
+            "bug-d: keep-remote must record the POST-overlay combined hash; \
+             before the fix the executor wrote the pre-overlay hash causing perpetual conflict. \
+             got {recorded}, expected {expected_hash}"
+        );
+
+        // The on-disk file must be the post-overlay bytes (no `description`).
+        let disk_json = std::fs::read_to_string(&local_json_path).unwrap();
+        assert!(
+            !disk_json.contains("description"),
+            "on-disk hook must not contain the overlay-managed field after keep-remote; got: {disk_json}"
+        );
+    }
+
+    // ----- Bug-e regression: schema restore with formulas -----------------
+    //
+    // A schema that is locally deleted and remotely edited with formula
+    // sidecars must be fully restored (schema.json + formulas/*.py) when
+    // the user chooses [r] (cancel tombstone / use env). Before the fix the
+    // executor dropped the formula sidecars and used HashStrategy::Flat,
+    // producing an incomplete restore and a wrong lockfile hash.
+
+    /// Build a minimal catalog that has a workspace + queue + schema with
+    /// one formula datapoint. Returns the catalog, the schema model, and
+    /// the queue/workspace models for lockfile seeding.
+    fn schema_restore_catalog() -> (
+        RemoteCatalog,
+        crate::model::Schema,
+        crate::model::Queue,
+        crate::model::Workspace,
+    ) {
+        let ws: crate::model::Workspace = serde_json::from_value(serde_json::json!({
+            "id": 900,
+            "url": "https://x.invalid/api/v1/workspaces/900",
+            "name": "AP Invoices WS",
+            "organization": "https://x.invalid/api/v1/organizations/1",
+            "queues": ["https://x.invalid/api/v1/queues/200"],
+            "modified_at": "2026-04-20T08:00:00Z"
+        }))
+        .unwrap();
+        let queue: crate::model::Queue = serde_json::from_value(serde_json::json!({
+            "id": 200,
+            "url": "https://x.invalid/api/v1/queues/200",
+            "name": "Cost Invoices Q",
+            "workspace": "https://x.invalid/api/v1/workspaces/900",
+            "schema": "https://x.invalid/api/v1/schemas/300",
+            "modified_at": "2026-04-20T08:00:00Z"
+        }))
+        .unwrap();
+        let schema: crate::model::Schema = serde_json::from_value(serde_json::json!({
+            "id": 300,
+            "url": "https://x.invalid/api/v1/schemas/300",
+            "name": "Cost Invoices Schema",
+            "queues": ["https://x.invalid/api/v1/queues/200"],
+            "content": [{
+                "category": "section",
+                "id": "header",
+                "label": "Header",
+                "children": [
+                    { "category": "datapoint", "id": "invoice_id", "type": "string" },
+                    { "category": "datapoint", "id": "amount_total", "type": "number",
+                      "formula": "amount_due + amount_tax" }
+                ]
+            }]
+        }))
+        .unwrap();
+
+        let mut catalog = catalog_with_labels(vec![]);
+        catalog.workspaces = vec![ws.clone()];
+        catalog.queues = vec![queue.clone()];
+        catalog.schemas_by_queue_id.insert(queue.id, schema.clone());
+
+        (catalog, schema, queue, ws)
+    }
+
+    /// Bug-e repro: schema with ≥1 formula that is locally deleted and
+    /// remotely edited. On `[r]` (cancel tombstone / use env), both
+    /// schema.json AND formulas/<field_id>.py must be written, and the
+    /// lockfile hash must be `combined_hash(json, framed_sidecars)` so
+    /// the NEXT sync sees Clean (no re-conflict).
+    #[tokio::test]
+    async fn resolve_remote_deletes_schema_restore_writes_formula_sidecars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        let (catalog, schema, queue, ws) = schema_restore_catalog();
+
+        let ws_slug = "ap-invoices-ws";
+        let q_slug = "cost-invoices-q";
+        let queue_dir = paths.queue_dir(ws_slug, q_slug);
+        std::fs::create_dir_all(&queue_dir).unwrap();
+
+        let schema_json_path = queue_dir.join("schema.json");
+        let formula_path = queue_dir.join("formulas/amount_total.py");
+
+        // Schema was locally deleted (file doesn't exist on disk).
+        // Remote still has it with edits (the formula exists on remote).
+
+        // Seed lockfile: entry exists (was there before user deleted it).
+        let codec = crate::snapshot::codec::codec("schemas").unwrap();
+        let schema_value = serde_json::to_value(&schema).unwrap();
+        let schema_art = codec.disk_bytes(&schema_value).unwrap();
+        let schema_hash = combined_hash(&schema_art.json, &schema_art.sidecars);
+
+        let mut lockfile = Lockfile::default();
+        // Workspace + queue entries so the slug resolver finds them.
+        lockfile.upsert(
+            "workspaces",
+            ws_slug,
+            ObjectEntry {
+                id: ws.id,
+                url: Some(ws.url.clone()),
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        lockfile.upsert(
+            "queues",
+            q_slug,
+            ObjectEntry {
+                id: queue.id,
+                url: Some(queue.url.clone()),
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        lockfile.upsert(
+            "schemas",
+            q_slug,
+            ObjectEntry {
+                id: schema.id,
+                url: Some(schema.url.clone()),
+                modified_at: None,
+                content_hash: Some(schema_hash),
+                secrets_hash: None,
+            },
+        );
+
+        // The classifier would emit LocalDeleteRemoteEdit:
+        let classified = vec![ClassifiedItem {
+            kind: "schemas".to_string(),
+            slug: q_slug.to_string(),
+            class: SyncClass::LocalDeleteRemoteEdit,
+            local_hash: None,
+            remote_hash: None,
+            base_hash: None,
+        }];
+
+        let client = RossumClient::new(
+            "https://unused.invalid/api/v1".to_string(),
+            "TEST".to_string(),
+        )
+        .unwrap();
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+
+        // Resolve with `[r]` (cancel tombstone — use env version).
+        {
+            let mut ctx = PullCtx {
+                paths: &paths,
+                client: &client,
+                lockfile: &mut lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: true,
+            };
+            resolve_remote_deletes(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b"r\n"),
+                true,
+                &progress,
+            )
+            .await
+            .expect("resolver must succeed on [r]");
+        }
+
+        // Bug-e fix: schema.json must exist after restore.
+        assert!(
+            schema_json_path.exists(),
+            "bug-e: schema.json must be restored on [r] (cancel tombstone)"
+        );
+
+        // Bug-e fix: formula sidecar must be restored too.
+        assert!(
+            formula_path.exists(),
+            "bug-e: formulas/amount_total.py must be restored on [r]; before the fix formula \
+             sidecars were dropped from the restore"
+        );
+        let formula_content = std::fs::read_to_string(&formula_path).unwrap();
+        assert_eq!(
+            formula_content, "amount_due + amount_tax",
+            "restored formula must match the remote schema's formula"
+        );
+
+        // The lockfile hash must be combined_hash(post-overlay json, framed sidecars)
+        // so the next sync sees Clean.
+        let expected_hash = codec.base_hash(&schema_value).unwrap();
+        let recorded = lockfile
+            .objects
+            .get("schemas")
+            .and_then(|m| m.get(q_slug))
+            .and_then(|e| e.content_hash.clone())
+            .expect("lockfile must have schema entry after restore");
+        assert_eq!(
+            recorded, expected_hash,
+            "bug-e: restored schema hash must be combined_hash(json, framed_sidecars); \
+             before the fix it used HashStrategy::Flat which dropped formulas from the hash. \
+             got {recorded}, expected {expected_hash}"
+        );
+    }
 }
