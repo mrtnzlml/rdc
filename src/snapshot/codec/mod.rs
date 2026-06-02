@@ -14,7 +14,11 @@
 
 mod engines;
 mod hooks;
+mod inboxes;
+mod labels;
 mod queues;
+mod rules;
+mod schemas;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -114,7 +118,11 @@ pub fn codec(kind: &str) -> Option<&'static dyn KindCodec> {
     match kind {
         "engines" => Some(&engines::Engines),
         "hooks" => Some(&hooks::Hooks),
+        "inboxes" => Some(&inboxes::Inboxes),
+        "labels" => Some(&labels::Labels),
         "queues" => Some(&queues::Queues),
+        "rules" => Some(&rules::Rules),
+        "schemas" => Some(&schemas::Schemas),
         _ => None,
     }
 }
