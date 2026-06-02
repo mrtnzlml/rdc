@@ -26,20 +26,53 @@
 
 use crate::api::RossumClient;
 use crate::cli::deploy::common::rewrite_urls;
-use crate::cli::deploy::store_extensions::{build_install_body, find_orphan, StorePlan};
+use crate::cli::deploy::store_extensions::{StorePlan, build_install_body, find_orphan};
+use crate::cli::pull::common::maybe_strip_overlay;
 use crate::log::{Action, Log};
 use crate::mapping::Mapping;
-use crate::overlay::{apply_overrides, Overlay};
+use crate::overlay::{Overlay, apply_overrides};
 use crate::paths::Paths;
+use crate::snapshot::codec::combined_hash;
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::email_template::{read_email_template, write_email_template};
 use crate::snapshot::hook::{read_hook_value, write_hook};
 use crate::snapshot::rule::{read_rule_value, serialize_rule, write_rule};
 use crate::snapshot::schema::{read_schema_value, serialize_schema, write_schema_bytes};
-use crate::state::{content_hash, hook_combined_hash, rule_combined_hash, schema_combined_hash, Lockfile, ObjectEntry};
-use anyhow::{anyhow, Context, Result};
+use crate::state::{
+    Lockfile, ObjectEntry, content_hash, hook_combined_hash, rule_combined_hash,
+    schema_combined_hash,
+};
+use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use std::sync::Arc;
+
+/// Shared helper: produce on-disk bytes + hash for a just-created object via
+/// the kind's [`KindCodec`].  Falls back to raw pretty-print for unregistered
+/// kinds (not expected in production, but keeps the caller simple).
+///
+/// Mirrors the logic in `write_back_flat` in `deploy/apply.rs`: run
+/// `codec.disk_bytes`, then `maybe_strip_overlay` so overlay-managed fields
+/// don't appear in the stored snapshot, then compute `combined_hash`.
+fn codec_bytes_and_hash(
+    kind: &str,
+    created: &Value,
+    overlay_paths: Option<&std::collections::BTreeMap<String, Value>>,
+) -> Result<(Vec<u8>, String)> {
+    let (disk_json, sidecars) = if let Some(c) = crate::snapshot::codec::codec(kind) {
+        let art = c
+            .disk_bytes(created)
+            .with_context(|| format!("codec disk_bytes for {kind}"))?;
+        (art.json, art.sidecars)
+    } else {
+        let mut b = serde_json::to_vec_pretty(created)
+            .with_context(|| format!("serializing created {kind}"))?;
+        b.push(b'\n');
+        (b, vec![])
+    };
+    let json_for_hash = maybe_strip_overlay(disk_json, overlay_paths)?;
+    let hash = combined_hash(&json_for_hash, &sidecars);
+    Ok((json_for_hash, hash))
+}
 
 /// Common bundle threaded through every per-kind create function. Keeps
 /// signatures readable.
@@ -80,7 +113,13 @@ fn shape_create_body(
     explicit_subs: &std::collections::BTreeMap<String, String>,
 ) -> Value {
     let mut payload = raw;
-    rewrite_urls(&mut payload, src_lockfile, tgt_lockfile, mapping, explicit_subs);
+    rewrite_urls(
+        &mut payload,
+        src_lockfile,
+        tgt_lockfile,
+        mapping,
+        explicit_subs,
+    );
     if let Some(p) = overlay_paths {
         apply_overrides(&mut payload, p);
     }
@@ -97,7 +136,15 @@ fn shape_create_body_no_subs(
     tgt_lockfile: &Lockfile,
     mapping: &Mapping,
 ) -> Value {
-    shape_create_body(raw, kind, overlay_paths, src_lockfile, tgt_lockfile, mapping, &std::collections::BTreeMap::new())
+    shape_create_body(
+        raw,
+        kind,
+        overlay_paths,
+        src_lockfile,
+        tgt_lockfile,
+        mapping,
+        &std::collections::BTreeMap::new(),
+    )
 }
 
 pub async fn create_workspace(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
@@ -108,14 +155,22 @@ pub async fn create_workspace(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()>
     .with_context(|| format!("parsing {}", path.display()))?;
     // Workspaces aren't a section in the overlay schema today, so no
     // per-workspace overrides apply on create.
-    let body = shape_create_body_no_subs(raw, "workspaces", None, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping);
+    let body = shape_create_body_no_subs(
+        raw,
+        "workspaces",
+        None,
+        ctx.src_lockfile,
+        ctx.tgt_lockfile,
+        ctx.mapping,
+    );
     let created = ctx
         .tgt_client
         .create_workspace(&body, None)
         .await
         .with_context(|| format!("POST /workspaces (creating '{slug}')"))?;
-    let mut bytes = serde_json::to_vec_pretty(&created).context("serializing created workspace")?;
-    bytes.push(b'\n');
+    let created_value = serde_json::to_value(&created).context("serializing created workspace")?;
+    // Workspaces have no overlay accessor today; pass None.
+    let (bytes, hash) = codec_bytes_and_hash("workspaces", &created_value, None)?;
     let tgt_file = ctx.tgt_paths.workspace_dir(slug).join("workspace.json");
     crate::state::base_cache::write_disk_and_cache(ctx.tgt_paths, &tgt_file, &bytes)?;
     ctx.tgt_lockfile.upsert(
@@ -125,11 +180,13 @@ pub async fn create_workspace(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()>
             id: created.id,
             url: Some(created.url.clone()),
             modified_at: created.modified_at().map(|s| s.to_string()),
-            content_hash: Some(content_hash(&bytes)),
+            content_hash: Some(hash),
             secrets_hash: None,
         },
     );
-    ctx.mapping.workspaces.insert(slug.to_string(), slug.to_string());
+    ctx.mapping
+        .workspaces
+        .insert(slug.to_string(), slug.to_string());
     Ok(())
 }
 
@@ -140,8 +197,18 @@ pub async fn create_schema(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<
     };
     let mut payload = read_schema_value(&src_queue_dir)
         .with_context(|| format!("reading src schema '{queue_slug}'"))?;
-    let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.schema(queue_slug));
-    payload = shape_create_body_no_subs(payload, "schemas", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping);
+    let overlay_paths = ctx
+        .tgt_overlay
+        .as_ref()
+        .and_then(|ov| ov.schema(queue_slug));
+    payload = shape_create_body_no_subs(
+        payload,
+        "schemas",
+        overlay_paths,
+        ctx.src_lockfile,
+        ctx.tgt_lockfile,
+        ctx.mapping,
+    );
     let created = ctx
         .tgt_client
         .create_schema(&payload, None)
@@ -173,8 +240,12 @@ pub async fn create_schema(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<
             secrets_hash: None,
         },
     );
-    ctx.mapping.schemas.insert(queue_slug.to_string(), queue_slug.to_string());
-    if let Some(p) = &ctx.progress { p.event(Action::Post, &format!("schema/{queue_slug}")); }
+    ctx.mapping
+        .schemas
+        .insert(queue_slug.to_string(), queue_slug.to_string());
+    if let Some(p) = &ctx.progress {
+        p.event(Action::Post, &format!("schema/{queue_slug}"));
+    }
     Ok(())
 }
 
@@ -188,7 +259,14 @@ pub async fn create_queue(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
     )
     .with_context(|| format!("parsing {}", queue_path.display()))?;
     let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.queue(queue_slug));
-    let body = shape_create_body_no_subs(raw, "queues", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping);
+    let body = shape_create_body_no_subs(
+        raw,
+        "queues",
+        overlay_paths,
+        ctx.src_lockfile,
+        ctx.tgt_lockfile,
+        ctx.mapping,
+    );
     let created = ctx
         .tgt_client
         .create_queue(&body, None)
@@ -204,8 +282,9 @@ pub async fn create_queue(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
     std::fs::create_dir_all(&tgt_queue_dir)
         .with_context(|| format!("creating {}", tgt_queue_dir.display()))?;
     let tgt_file = tgt_queue_dir.join("queue.json");
-    let mut bytes = serde_json::to_vec_pretty(&created).context("serializing created queue")?;
-    bytes.push(b'\n');
+    let created_value = serde_json::to_value(&created).context("serializing created queue")?;
+    let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.queue(queue_slug));
+    let (bytes, hash) = codec_bytes_and_hash("queues", &created_value, overlay_paths)?;
     crate::state::base_cache::write_disk_and_cache(ctx.tgt_paths, &tgt_file, &bytes)?;
     ctx.tgt_lockfile.upsert(
         "queues",
@@ -214,12 +293,16 @@ pub async fn create_queue(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
             id: created.id,
             url: Some(created.url.clone()),
             modified_at: created.modified_at().map(|s| s.to_string()),
-            content_hash: Some(content_hash(&bytes)),
+            content_hash: Some(hash),
             secrets_hash: None,
         },
     );
-    ctx.mapping.queues.insert(queue_slug.to_string(), queue_slug.to_string());
-    if let Some(p) = &ctx.progress { p.event(Action::Post, &format!("queue/{queue_slug}")); }
+    ctx.mapping
+        .queues
+        .insert(queue_slug.to_string(), queue_slug.to_string());
+    if let Some(p) = &ctx.progress {
+        p.event(Action::Post, &format!("queue/{queue_slug}"));
+    }
 
     // Rossum auto-creates 5 default email templates per new queue. Capture
     // them now so the later email-templates phase sees them as existing
@@ -245,7 +328,9 @@ async fn refresh_queue_email_templates(
     std::fs::create_dir_all(&templates_dir)
         .with_context(|| format!("creating {}", templates_dir.display()))?;
     for t in all {
-        let Some(q_url) = t.queue.as_deref() else { continue };
+        let Some(q_url) = t.queue.as_deref() else {
+            continue;
+        };
         if !q_url.contains(&queue_url_path) {
             continue;
         }
@@ -263,9 +348,7 @@ async fn refresh_queue_email_templates(
                 secrets_hash: None,
             },
         );
-        ctx.mapping
-            .email_templates
-            .insert(key.clone(), key);
+        ctx.mapping.email_templates.insert(key.clone(), key);
     }
     Ok(())
 }
@@ -280,7 +363,14 @@ pub async fn create_inbox(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
     )
     .with_context(|| format!("parsing {}", inbox_path.display()))?;
     let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.inbox(queue_slug));
-    let body = shape_create_body_no_subs(raw, "inboxes", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping);
+    let body = shape_create_body_no_subs(
+        raw,
+        "inboxes",
+        overlay_paths,
+        ctx.src_lockfile,
+        ctx.tgt_lockfile,
+        ctx.mapping,
+    );
     let created = ctx
         .tgt_client
         .create_inbox(&body, None)
@@ -292,9 +382,13 @@ pub async fn create_inbox(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
         .and_then(|p| p.file_name())
         .map(|s| s.to_string_lossy().into_owned())
         .context("locating src ws slug for inbox")?;
-    let tgt_inbox = ctx.tgt_paths.queue_dir(&ws_slug, queue_slug).join("inbox.json");
-    let mut bytes = serde_json::to_vec_pretty(&created).context("serializing created inbox")?;
-    bytes.push(b'\n');
+    let tgt_inbox = ctx
+        .tgt_paths
+        .queue_dir(&ws_slug, queue_slug)
+        .join("inbox.json");
+    let created_value = serde_json::to_value(&created).context("serializing created inbox")?;
+    let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.inbox(queue_slug));
+    let (bytes, hash) = codec_bytes_and_hash("inboxes", &created_value, overlay_paths)?;
     crate::state::base_cache::write_disk_and_cache(ctx.tgt_paths, &tgt_inbox, &bytes)?;
     ctx.tgt_lockfile.upsert(
         "inboxes",
@@ -303,12 +397,16 @@ pub async fn create_inbox(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
             id: created.id,
             url: Some(created.url.clone()),
             modified_at: created.modified_at().map(|s| s.to_string()),
-            content_hash: Some(content_hash(&bytes)),
+            content_hash: Some(hash),
             secrets_hash: None,
         },
     );
-    ctx.mapping.inboxes.insert(queue_slug.to_string(), queue_slug.to_string());
-    if let Some(p) = &ctx.progress { p.event(Action::Post, &format!("inbox/{queue_slug}")); }
+    ctx.mapping
+        .inboxes
+        .insert(queue_slug.to_string(), queue_slug.to_string());
+    if let Some(p) = &ctx.progress {
+        p.event(Action::Post, &format!("inbox/{queue_slug}"));
+    }
     Ok(())
 }
 
@@ -332,7 +430,13 @@ pub async fn create_hook(
         // server fields yet — we need the full body to build the install
         // payload and to send the follow-up PATCH.
         let mut body = payload.clone();
-        rewrite_urls(&mut body, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping, &explicit_subs);
+        rewrite_urls(
+            &mut body,
+            ctx.src_lockfile,
+            ctx.tgt_lockfile,
+            ctx.mapping,
+            &explicit_subs,
+        );
         if let Some(p) = overlay_paths {
             apply_overrides(&mut body, p);
         }
@@ -341,7 +445,10 @@ pub async fn create_hook(
         // picked it up. Confirm by inserting explicitly so we're robust
         // even when the overlay doesn't carry it yet:
         if let Some(obj) = body.as_object_mut() {
-            obj.insert("token_owner".into(), serde_json::Value::String(plan.token_owner_url.clone()));
+            obj.insert(
+                "token_owner".into(),
+                serde_json::Value::String(plan.token_owner_url.clone()),
+            );
         }
 
         // Orphan check: lazily list tgt hooks once and cache.
@@ -353,31 +460,39 @@ pub async fn create_hook(
                     .context("listing tgt hooks for store-extension orphan check")?,
             );
         }
-        let remote = remote_hooks_cache.as_ref().expect("remote_hooks_cache was just populated above");
-        let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let installed_id = match find_orphan(
-            remote,
-            &name,
-            &plan.tgt_template_url,
-        ) {
+        let remote = remote_hooks_cache
+            .as_ref()
+            .expect("remote_hooks_cache was just populated above");
+        let name = body
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let installed_id = match find_orphan(remote, &name, &plan.tgt_template_url) {
             Some(orphan) => {
                 match &ctx.progress {
-                    Some(p) => p.event(Action::Info, &format!("adopting orphan store-extension hooks/{slug} (id {}) on tgt", orphan.id)),
-                    None => eprintln!("adopting orphan store-extension hooks/{slug} (id {}) on tgt", orphan.id),
+                    Some(p) => p.event(
+                        Action::Info,
+                        &format!(
+                            "adopting orphan store-extension hooks/{slug} (id {}) on tgt",
+                            orphan.id
+                        ),
+                    ),
+                    None => eprintln!(
+                        "adopting orphan store-extension hooks/{slug} (id {}) on tgt",
+                        orphan.id
+                    ),
                 }
                 orphan.id
             }
             None => {
-                let install_body =
-                    build_install_body(&body)?;
+                let install_body = build_install_body(&body)?;
                 let installed = ctx
                     .tgt_client
                     .create_hook_via_install(&install_body, None)
                     .await
                     .with_context(|| {
-                        format!(
-                            "POST /hooks/create (installing store extension '{slug}' on tgt)"
-                        )
+                        format!("POST /hooks/create (installing store extension '{slug}' on tgt)")
                     })?;
                 installed.id
             }
@@ -388,12 +503,13 @@ pub async fn create_hook(
         // the right values from the very first PATCH (no second pass).
         let mut reconcile_body = body;
         if let Some(secrets) = ctx.hook_secrets_plan.for_slug(slug)
-            && let Some(obj) = reconcile_body.as_object_mut() {
-                obj.insert(
-                    "secrets".to_string(),
-                    serde_json::to_value(secrets).expect("BTreeMap<String,String> serializes"),
-                );
-            }
+            && let Some(obj) = reconcile_body.as_object_mut()
+        {
+            obj.insert(
+                "secrets".to_string(),
+                serde_json::to_value(secrets).expect("BTreeMap<String,String> serializes"),
+            );
+        }
         ctx.tgt_client
             .update_hook_value(installed_id, &reconcile_body, None)
             .await
@@ -433,12 +549,13 @@ pub async fn create_hook(
         // set; extras in the target file have already been filtered out
         // and warned about by `hook_secrets::precheck`.
         if let Some(secrets) = ctx.hook_secrets_plan.for_slug(slug)
-            && let Some(obj) = body.as_object_mut() {
-                obj.insert(
-                    "secrets".to_string(),
-                    serde_json::to_value(secrets).expect("BTreeMap<String,String> serializes"),
-                );
-            }
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.insert(
+                "secrets".to_string(),
+                serde_json::to_value(secrets).expect("BTreeMap<String,String> serializes"),
+            );
+        }
         ctx.tgt_client
             .create_hook(&body, None)
             .await
@@ -481,7 +598,14 @@ pub async fn create_rule(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
     let payload = read_rule_value(&ctx.src_paths.rules_dir(), slug)
         .with_context(|| format!("reading src rule '{slug}'"))?;
     let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.rule(slug));
-    let body = shape_create_body_no_subs(payload, "rules", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping);
+    let body = shape_create_body_no_subs(
+        payload,
+        "rules",
+        overlay_paths,
+        ctx.src_lockfile,
+        ctx.tgt_lockfile,
+        ctx.mapping,
+    );
     let created = ctx
         .tgt_client
         .create_rule(&body, None)
@@ -515,7 +639,14 @@ pub async fn create_label(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
     )
     .with_context(|| format!("parsing {}", path.display()))?;
     let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.label(slug));
-    let body = shape_create_body_no_subs(raw, "labels", overlay_paths, ctx.src_lockfile, ctx.tgt_lockfile, ctx.mapping);
+    let body = shape_create_body_no_subs(
+        raw,
+        "labels",
+        overlay_paths,
+        ctx.src_lockfile,
+        ctx.tgt_lockfile,
+        ctx.mapping,
+    );
     let created = ctx
         .tgt_client
         .create_label(&body, None)
@@ -525,8 +656,9 @@ pub async fn create_label(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
     std::fs::create_dir_all(&tgt_labels_dir)
         .with_context(|| format!("creating {}", tgt_labels_dir.display()))?;
     let tgt_file = tgt_labels_dir.join(format!("{slug}.json"));
-    let mut bytes = serde_json::to_vec_pretty(&created).context("serializing created label")?;
-    bytes.push(b'\n');
+    let created_value = serde_json::to_value(&created).context("serializing created label")?;
+    let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.label(slug));
+    let (bytes, hash) = codec_bytes_and_hash("labels", &created_value, overlay_paths)?;
     crate::state::base_cache::write_disk_and_cache(ctx.tgt_paths, &tgt_file, &bytes)?;
     ctx.tgt_lockfile.upsert(
         "labels",
@@ -535,11 +667,13 @@ pub async fn create_label(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
             id: created.id,
             url: Some(created.url.clone()),
             modified_at: created.modified_at().map(|s| s.to_string()),
-            content_hash: Some(content_hash(&bytes)),
+            content_hash: Some(hash),
             secrets_hash: None,
         },
     );
-    ctx.mapping.labels.insert(slug.to_string(), slug.to_string());
+    ctx.mapping
+        .labels
+        .insert(slug.to_string(), slug.to_string());
     Ok(())
 }
 
@@ -550,8 +684,7 @@ pub async fn create_email_template(ctx: &mut CreateCtx<'_>, key: &str) -> Result
     let templates_dir = ctx.src_paths.queue_email_templates_dir(ws, q);
     let template = read_email_template(&templates_dir, t)
         .with_context(|| format!("reading src email_template '{key}'"))?;
-    let raw = serde_json::to_value(&template)
-        .context("serializing src email_template to value")?;
+    let raw = serde_json::to_value(&template).context("serializing src email_template to value")?;
     let overlay_paths = ctx
         .tgt_overlay
         .as_ref()
@@ -616,9 +749,9 @@ pub async fn create_engine(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
     std::fs::create_dir_all(&tgt_engine_dir)
         .with_context(|| format!("creating {}", tgt_engine_dir.display()))?;
     let tgt_file = tgt_engine_dir.join("engine.json");
-    let mut bytes =
-        serde_json::to_vec_pretty(&created).context("serializing created engine")?;
-    bytes.push(b'\n');
+    let created_value = serde_json::to_value(&created).context("serializing created engine")?;
+    let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.engine(slug));
+    let (bytes, hash) = codec_bytes_and_hash("engines", &created_value, overlay_paths)?;
     crate::state::base_cache::write_disk_and_cache(ctx.tgt_paths, &tgt_file, &bytes)?;
     ctx.tgt_lockfile.upsert(
         "engines",
@@ -627,7 +760,7 @@ pub async fn create_engine(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
             id: created.id,
             url: Some(created.url.clone()),
             modified_at: created.modified_at().map(|s| s.to_string()),
-            content_hash: Some(content_hash(&bytes)),
+            content_hash: Some(hash),
             secrets_hash: None,
         },
     );
@@ -687,9 +820,13 @@ pub async fn create_engine_field(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<
     std::fs::create_dir_all(&tgt_fields_dir)
         .with_context(|| format!("creating {}", tgt_fields_dir.display()))?;
     let tgt_file = tgt_fields_dir.join(format!("{tgt_field_slug}.json"));
-    let mut bytes = serde_json::to_vec_pretty(&created)
-        .context("serializing created engine_field")?;
-    bytes.push(b'\n');
+    let created_value =
+        serde_json::to_value(&created).context("serializing created engine_field")?;
+    let overlay_paths = ctx
+        .tgt_overlay
+        .as_ref()
+        .and_then(|ov| ov.engine_field(slug));
+    let (bytes, hash) = codec_bytes_and_hash("engine_fields", &created_value, overlay_paths)?;
     crate::state::base_cache::write_disk_and_cache(ctx.tgt_paths, &tgt_file, &bytes)?;
     ctx.tgt_lockfile.upsert(
         "engine_fields",
@@ -698,7 +835,7 @@ pub async fn create_engine_field(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<
             id: created.id,
             url: Some(created.url.clone()),
             modified_at: created.modified_at().map(|s| s.to_string()),
-            content_hash: Some(content_hash(&bytes)),
+            content_hash: Some(hash),
             secrets_hash: None,
         },
     );
