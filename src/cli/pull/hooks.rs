@@ -12,22 +12,6 @@ use std::sync::Arc;
 
 const KIND: &str = "hooks";
 
-/// Compute the combined hash for a hook in codec format.
-///
-/// Uses the same algorithm as `KindCodec::base_hash` for hooks: the disk JSON
-/// bytes (with status sentinel) combined with the code sidecar under the label
-/// `"code"`. This replaces the legacy `hook_combined_hash` for both the remote
-/// hash (from API value) and local disk hash so that the three-way merge
-/// correctly detects changes after the one-time rehash.
-fn local_hook_combined_hash(json_bytes: &[u8], code: &Option<String>) -> String {
-    let sidecars: Vec<(String, Vec<u8>)> = if let Some(c) = code {
-        vec![("code".to_string(), c.as_bytes().to_vec())]
-    } else {
-        vec![]
-    };
-    crate::snapshot::codec::combined_hash(json_bytes, &sidecars)
-}
-
 /// Phase 1: list all hooks from the API.
 pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<Log>) -> Result<Vec<Hook>> {
     skip_on_permission_denied(
@@ -142,7 +126,8 @@ pub async fn process(
             // what is actually written to disk. Using codec.base_hash(&value)
             // (PRE-overlay) would diverge whenever an overlay is configured,
             // causing phantom drift on every subsequent pull.
-            let remote_combined_hash = local_hook_combined_hash(&proposed_json, &proposed_code);
+            let remote_combined_hash =
+                crate::state::hook_combined_hash(&proposed_json, &proposed_code);
 
             let base_hash = ctx
                 .lockfile
@@ -157,7 +142,8 @@ pub async fn process(
                     // Use codec-compatible combined_hash for local disk bytes
                     // so the three-way merge works correctly after the
                     // one-time rehash.
-                    let local_combined = local_hook_combined_hash(local_json, &pre_local_code);
+                    let local_combined =
+                        crate::state::hook_combined_hash(local_json, &pre_local_code);
                     let local_matches = local_combined == base;
                     let remote_matches = remote_combined_hash == base;
                     match (local_matches, remote_matches) {
@@ -215,7 +201,7 @@ pub async fn process(
                 }
                 PullAction::KeepLocal => {
                     let local_json = pre_local_json.as_ref().unwrap();
-                    local_hook_combined_hash(local_json, &pre_local_code)
+                    crate::state::hook_combined_hash(local_json, &pre_local_code)
                 }
                 PullAction::NoChange => {
                     // Combined hash is already equal — no file writes needed.
@@ -311,10 +297,12 @@ pub async fn process(
                         // a prior base).
                         match base_hash.as_deref() {
                             Some(prior) => prior.to_string(),
-                            None => local_hook_combined_hash(&resolved_json, &resolved_code),
+                            None => {
+                                crate::state::hook_combined_hash(&resolved_json, &resolved_code)
+                            }
                         }
                     } else {
-                        local_hook_combined_hash(&resolved_json, &resolved_code)
+                        crate::state::hook_combined_hash(&resolved_json, &resolved_code)
                     }
                 }
             };
