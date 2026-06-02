@@ -1,8 +1,8 @@
 use crate::api::{ApiError, RossumClient};
 use crate::log::{Action, Log};
 use crate::paths::Paths;
-use crate::state::{content_hash, Lockfile, ObjectEntry};
-use anyhow::{anyhow, Context, Result};
+use crate::state::{Lockfile, ObjectEntry, content_hash};
+use anyhow::{Context, Result, anyhow};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -24,7 +24,10 @@ pub fn skip_on_permission_denied<T>(
                     .unwrap_or(false)
             });
             if is_403 {
-                progress.event(Action::Skip, &format!("{kind} (403 — token lacks permission)"));
+                progress.event(
+                    Action::Skip,
+                    &format!("{kind} (403 — token lacks permission)"),
+                );
                 Ok(Vec::new())
             } else {
                 Err(e)
@@ -155,14 +158,35 @@ pub async fn list_remote(
 
     #[derive(Clone, Copy)]
     enum Kind {
-        Organization, Workspaces, Queues, Inboxes, Hooks, Rules, Labels,
-        Engines, EngineFields, Workflows, WorkflowSteps, EmailTemplates, Mdh,
+        Organization,
+        Workspaces,
+        Queues,
+        Inboxes,
+        Hooks,
+        Rules,
+        Labels,
+        Engines,
+        EngineFields,
+        Workflows,
+        WorkflowSteps,
+        EmailTemplates,
+        Mdh,
     }
 
     let kinds = [
-        Kind::Organization, Kind::Workspaces, Kind::Queues, Kind::Inboxes, Kind::Hooks,
-        Kind::Rules, Kind::Labels, Kind::Engines, Kind::EngineFields,
-        Kind::Workflows, Kind::WorkflowSteps, Kind::EmailTemplates, Kind::Mdh,
+        Kind::Organization,
+        Kind::Workspaces,
+        Kind::Queues,
+        Kind::Inboxes,
+        Kind::Hooks,
+        Kind::Rules,
+        Kind::Labels,
+        Kind::Engines,
+        Kind::EngineFields,
+        Kind::Workflows,
+        Kind::WorkflowSteps,
+        Kind::EmailTemplates,
+        Kind::Mdh,
     ];
 
     progress.start_phase(Action::List, "listing", 0);
@@ -178,26 +202,33 @@ pub async fn list_remote(
                 tokio::task::yield_now().await;
                 match kind {
                     Kind::Organization => {
-                        let r = crate::cli::pull::organization::list(ctx_ref, env_cfg.org_id, progress).await
-                            .with_context(|| format!("listing organization for env '{env}'"))?;
+                        let r =
+                            crate::cli::pull::organization::list(ctx_ref, env_cfg.org_id, progress)
+                                .await
+                                .with_context(|| format!("listing organization for env '{env}'"))?;
                         progress.event(Action::List, &format!("organization ({})", r.name));
                         anyhow::Ok(Listed::Organization(r))
                     }
                     Kind::Workspaces => {
-                        let r = crate::cli::pull::workspaces::list(ctx_ref, progress).await
+                        let r = crate::cli::pull::workspaces::list(ctx_ref, progress)
+                            .await
                             .with_context(|| format!("listing workspaces for env '{env}'"))?;
                         progress.event(Action::List, &format!("workspaces ({})", r.len()));
                         anyhow::Ok(Listed::Workspaces(r))
                     }
                     Kind::Queues => {
-                        let r = crate::cli::pull::queues::list(ctx_ref, progress).await
+                        let r = crate::cli::pull::queues::list(ctx_ref, progress)
+                            .await
                             .with_context(|| format!("listing queues for env '{env}'"))?;
                         progress.event(Action::List, &format!("queues ({})", r.len()));
                         anyhow::Ok(Listed::Queues(r))
                     }
                     Kind::Inboxes => {
                         let r = skip_on_permission_denied(
-                            ctx_ref.client.list_inboxes(Some(progress.clone())).await
+                            ctx_ref
+                                .client
+                                .list_inboxes(Some(progress.clone()))
+                                .await
                                 .with_context(|| format!("listing inboxes for env '{env}'")),
                             "inboxes",
                             progress,
@@ -206,57 +237,69 @@ pub async fn list_remote(
                         anyhow::Ok(Listed::Inboxes(r))
                     }
                     Kind::Hooks => {
-                        let r = crate::cli::pull::hooks::list(ctx_ref, progress).await
+                        let r = crate::cli::pull::hooks::list(ctx_ref, progress)
+                            .await
                             .with_context(|| format!("listing hooks for env '{env}'"))?;
                         progress.event(Action::List, &format!("hooks ({})", r.len()));
                         anyhow::Ok(Listed::Hooks(r))
                     }
                     Kind::Rules => {
-                        let r = crate::cli::pull::rules::list(ctx_ref, progress).await
+                        let r = crate::cli::pull::rules::list(ctx_ref, progress)
+                            .await
                             .with_context(|| format!("listing rules for env '{env}'"))?;
                         progress.event(Action::List, &format!("rules ({})", r.len()));
                         anyhow::Ok(Listed::Rules(r))
                     }
                     Kind::Labels => {
-                        let r = crate::cli::pull::labels::list(ctx_ref, progress).await
+                        let r = crate::cli::pull::labels::list(ctx_ref, progress)
+                            .await
                             .with_context(|| format!("listing labels for env '{env}'"))?;
                         progress.event(Action::List, &format!("labels ({})", r.len()));
                         anyhow::Ok(Listed::Labels(r))
                     }
                     Kind::Engines => {
-                        let r = crate::cli::pull::engines::list(ctx_ref, progress).await
+                        let r = crate::cli::pull::engines::list(ctx_ref, progress)
+                            .await
                             .with_context(|| format!("listing engines for env '{env}'"))?;
                         progress.event(Action::List, &format!("engines ({})", r.len()));
                         anyhow::Ok(Listed::Engines(r))
                     }
                     Kind::EngineFields => {
-                        let r = crate::cli::pull::engine_fields::list(ctx_ref, progress).await
+                        let r = crate::cli::pull::engine_fields::list(ctx_ref, progress)
+                            .await
                             .with_context(|| format!("listing engine fields for env '{env}'"))?;
                         progress.event(Action::List, &format!("engine_fields ({})", r.len()));
                         anyhow::Ok(Listed::EngineFields(r))
                     }
                     Kind::Workflows => {
-                        let r = crate::cli::pull::workflows::list(ctx_ref, progress).await
+                        let r = crate::cli::pull::workflows::list(ctx_ref, progress)
+                            .await
                             .with_context(|| format!("listing workflows for env '{env}'"))?;
                         progress.event(Action::List, &format!("workflows ({})", r.len()));
                         anyhow::Ok(Listed::Workflows(r))
                     }
                     Kind::WorkflowSteps => {
-                        let r = crate::cli::pull::workflow_steps::list(ctx_ref, progress).await
+                        let r = crate::cli::pull::workflow_steps::list(ctx_ref, progress)
+                            .await
                             .with_context(|| format!("listing workflow steps for env '{env}'"))?;
                         progress.event(Action::List, &format!("workflow_steps ({})", r.len()));
                         anyhow::Ok(Listed::WorkflowSteps(r))
                     }
                     Kind::EmailTemplates => {
-                        let r = crate::cli::pull::email_templates::list(ctx_ref, progress).await
+                        let r = crate::cli::pull::email_templates::list(ctx_ref, progress)
+                            .await
                             .with_context(|| format!("listing email templates for env '{env}'"))?;
                         progress.event(Action::List, &format!("email_templates ({})", r.len()));
                         anyhow::Ok(Listed::EmailTemplates(r))
                     }
                     Kind::Mdh => {
-                        let r = crate::cli::pull::mdh::list(env_cfg, token, progress).await
+                        let r = crate::cli::pull::mdh::list(env_cfg, token, progress)
+                            .await
                             .with_context(|| format!("listing MDH datasets for env '{env}'"))?;
-                        progress.event(Action::List, &format!("mdh_datasets ({})", r.collections.len()));
+                        progress.event(
+                            Action::List,
+                            &format!("mdh_datasets ({})", r.collections.len()),
+                        );
                         anyhow::Ok(Listed::Mdh(r))
                     }
                 }
@@ -322,15 +365,25 @@ pub async fn list_remote(
     //
     // Inboxes are now fetched via the bulk `/inboxes` list above and converted
     // to a queue-id map via `inboxes_by_queue`.
-    let schemas_by_queue_id =
-        prefetch_queue_schemas(ctx.client, &queues, progress).await
-            .with_context(|| format!("prefetching schemas for env '{env}'"))?;
+    let schemas_by_queue_id = prefetch_queue_schemas(ctx.client, &queues, progress)
+        .await
+        .with_context(|| format!("prefetching schemas for env '{env}'"))?;
 
     Ok(RemoteCatalog {
-        organization, workspaces, queues, schemas_by_queue_id, inboxes_by_queue_id,
-        hooks, rules, labels,
-        engines, engine_fields, workflows, workflow_steps,
-        email_templates, mdh,
+        organization,
+        workspaces,
+        queues,
+        schemas_by_queue_id,
+        inboxes_by_queue_id,
+        hooks,
+        rules,
+        labels,
+        engines,
+        engine_fields,
+        workflows,
+        workflow_steps,
+        email_templates,
+        mdh,
     })
 }
 
@@ -404,7 +457,10 @@ async fn prefetch_queue_schemas(
             schemas.insert(qid, s);
         }
     }
-    progress.event(Action::List, &format!("schemas ({} fetched)", schemas.len()));
+    progress.event(
+        Action::List,
+        &format!("schemas ({} fetched)", schemas.len()),
+    );
     Ok(schemas)
 }
 
@@ -416,15 +472,16 @@ pub fn maybe_strip_overlay(
     bytes: Vec<u8>,
     paths: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
 ) -> Result<Vec<u8>> {
-    let Some(paths) = paths else { return Ok(bytes); };
+    let Some(paths) = paths else {
+        return Ok(bytes);
+    };
     if paths.is_empty() {
         return Ok(bytes);
     }
-    let mut value: serde_json::Value = serde_json::from_slice(&bytes)
-        .context("parsing JSON for overlay strip")?;
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&bytes).context("parsing JSON for overlay strip")?;
     crate::overlay::strip_paths(&mut value, paths);
-    let mut out = serde_json::to_vec_pretty(&value)
-        .context("re-serializing post overlay strip")?;
+    let mut out = serde_json::to_vec_pretty(&value).context("re-serializing post overlay strip")?;
     out.push(b'\n');
     Ok(out)
 }
@@ -442,7 +499,13 @@ pub fn record_object(
     lockfile.upsert(
         kind,
         slug,
-        ObjectEntry { id, url, modified_at, content_hash, secrets_hash: None },
+        ObjectEntry {
+            id,
+            url,
+            modified_at,
+            content_hash,
+            secrets_hash: None,
+        },
     );
 }
 
@@ -515,8 +578,8 @@ pub fn decide_pull_action(
         return Ok((PullAction::Write, remote_hash));
     }
 
-    let local_bytes = std::fs::read(local_path)
-        .with_context(|| format!("reading {}", local_path.display()))?;
+    let local_bytes =
+        std::fs::read(local_path).with_context(|| format!("reading {}", local_path.display()))?;
     let local_hash = content_hash(&local_bytes);
 
     // Short-circuit: canonicalized local == canonicalized remote means
@@ -531,8 +594,24 @@ pub fn decide_pull_action(
         return Ok((PullAction::NoChange, remote_hash));
     }
 
-    // local_hash == remote_hash is already handled above as NoChange, so
-    // we only need to branch on which side diverged from the base.
+    // Format-migration safety for UNEDITED legacy snapshots:
+    //
+    // When rdc is upgraded to a version that changes the canonical on-disk
+    // form (e.g. engines `agenda_id` → sentinel, hooks `status` → sentinel,
+    // `modified_at` stripped), a user's existing disk file is in the OLD
+    // form and the lockfile `base_hash` was recorded from those OLD bytes.
+    // If the file is UNEDITED relative to that base, `local_hash == base`
+    // (because `content_hash` / `canonicalize_for_hash` already strips
+    // `modified_at` as a noise field — the stored hash and the live hash
+    // over the old bytes are equal). The branch below classifies this as
+    // `PullAction::Write`, which silently rewrites the file to the new
+    // codec form and advances the lockfile hash. No self-heal code is
+    // needed: the normal three-way logic handles this case correctly.
+    //
+    // For a LOCALLY-EDITED legacy snapshot (`local_hash != base`), both
+    // sides have diverged (local edit + codec-format migration from
+    // remote), so the action is `Conflict` — the user's real edits must
+    // be inspected manually.
     let local_matches_base = local_hash == base;
     let remote_matches_base = remote_hash == base;
 
@@ -599,7 +678,8 @@ pub fn apply_pull_action(
             // the disk bytes (whatever flavour the canonical form took)
             // so the next merge has them.
             if let Some(p) = paths
-                && let Ok(on_disk) = std::fs::read(local_path) {
+                && let Ok(on_disk) = std::fs::read(local_path)
+            {
                 crate::state::base_cache::write(p, local_path, &on_disk)?;
             }
             Ok(remote_hash)
@@ -623,7 +703,8 @@ pub fn apply_pull_action(
             // crucial, because the disk still holds LOCAL, not base.
             if let Some(p) = paths
                 && base_hash != Some(resolved_hash.as_str())
-                && let Ok(on_disk) = std::fs::read(local_path) {
+                && let Ok(on_disk) = std::fs::read(local_path)
+            {
                 crate::state::base_cache::write(p, local_path, &on_disk)?;
             }
             Ok(resolved_hash)
@@ -663,8 +744,8 @@ fn shadow_file_conflict(
     // Defensive fallback: no prior base recorded (shouldn't happen for a
     // real conflict; conflicts presuppose `(local != base, remote != base)`).
     // Use local hash so the lockfile still gets a sensible entry.
-    let local_bytes = std::fs::read(local_path)
-        .with_context(|| format!("reading {}", local_path.display()))?;
+    let local_bytes =
+        std::fs::read(local_path).with_context(|| format!("reading {}", local_path.display()))?;
     Ok(content_hash(&local_bytes))
 }
 
@@ -680,7 +761,7 @@ fn resolve_conflict_interactive(
     env: &str,
     base_hash: Option<&str>,
 ) -> Result<String> {
-    use crate::cli::resolve::{prompt_resolve, PullAborted, Resolution};
+    use crate::cli::resolve::{PullAborted, Resolution, prompt_resolve};
     use crate::snapshot::writer::write_atomic;
 
     // Read prompt input via the stdin coordinator (not `stdin().lock()`):
@@ -749,7 +830,8 @@ mod tests {
         let inbox: crate::model::Inbox = serde_json::from_value(serde_json::json!({
             "id": 5, "url": "https://x/api/v1/inboxes/5", "name": "n", "email": "e",
             "queues": ["https://x/api/v1/queues/42"]
-        })).unwrap();
+        }))
+        .unwrap();
         let map = inboxes_by_queue(vec![inbox]);
         assert_eq!(map.get(&42).map(|i| i.id), Some(5));
     }
@@ -759,13 +841,17 @@ mod tests {
         let inbox: crate::model::Inbox = serde_json::from_value(serde_json::json!({
             "id": 6, "url": "https://x/api/v1/inboxes/6", "name": "n", "email": "e",
             "queues": []
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(inboxes_by_queue(vec![inbox]).is_empty());
     }
 
     #[test]
     fn parse_id_basic() {
-        assert_eq!(parse_id_from_url("https://x/api/v1/schemas/1234").unwrap(), 1234);
+        assert_eq!(
+            parse_id_from_url("https://x/api/v1/schemas/1234").unwrap(),
+            1234
+        );
     }
 
     #[test]
@@ -833,7 +919,18 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
-        let h = apply_pull_action(PullAction::Write, &path, b"hello", "h".repeat(64), false, &p, "test", None, None).unwrap();
+        let h = apply_pull_action(
+            PullAction::Write,
+            &path,
+            b"hello",
+            "h".repeat(64),
+            false,
+            &p,
+            "test",
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(h, "h".repeat(64));
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
     }
@@ -845,7 +942,18 @@ mod tests {
         std::fs::write(&path, b"local").unwrap();
         // interactive=false → legacy shadow-file behavior.
         let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
-        let _ = apply_pull_action(PullAction::Conflict, &path, b"remote", "h".repeat(64), false, &p, "test", None, None).unwrap();
+        let _ = apply_pull_action(
+            PullAction::Conflict,
+            &path,
+            b"remote",
+            "h".repeat(64),
+            false,
+            &p,
+            "test",
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"local");
         assert_eq!(
             std::fs::read(dir.path().join("x.json.test")).unwrap(),
@@ -969,7 +1077,10 @@ mod tests {
         )
         .unwrap();
         // Lockfile must NOT advance — recorded hash equals prior base.
-        assert_eq!(recorded, prior_base, "shadow-skip must preserve lockfile base");
+        assert_eq!(
+            recorded, prior_base,
+            "shadow-skip must preserve lockfile base"
+        );
         // Shadow file carries remote bytes.
         let shadow = dir.path().join("x.json.test");
         assert!(shadow.exists(), "shadow file should be written");
@@ -1019,8 +1130,7 @@ mod tests {
         let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
 
         // First pull → conflict → shadow-skip.
-        let (action1, remote_hash1) =
-            decide_pull_action(&path, Some(&base_hash), remote).unwrap();
+        let (action1, remote_hash1) = decide_pull_action(&path, Some(&base_hash), remote).unwrap();
         assert_eq!(action1, PullAction::Conflict);
         let recorded1 = apply_pull_action(
             action1,

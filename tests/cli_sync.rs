@@ -6134,3 +6134,419 @@ async fn push_engine_patch_redacts_agenda_id_on_disk() {
         "lockfile content_hash after PATCH must equal codec combined_hash of the PATCH response"
     );
 }
+
+/// Migration-safety — unedited legacy snapshot converges silently on first sync.
+///
+/// Scenario: a user upgrades rdc to a version that introduces the codec-based
+/// on-disk format (agenda_id → sentinel, modified_at stripped). Their local
+/// `engine.json` is in the OLD form — raw agenda_id value and modified_at still
+/// present — and the lockfile content_hash was recorded from those old bytes.
+/// The local file was UNEDITED relative to that hash (no real user changes).
+///
+/// Expected behaviour on the next sync:
+/// 1. No conflict is reported.
+/// 2. `engine.json` is silently rewritten to the new canonical form (sentinel +
+///    no modified_at).
+/// 3. The lockfile content_hash is updated to the new codec hash.
+/// 4. A second sync immediately after is fully Clean (no further rewrites).
+///
+/// Mechanism: `decide_pull_action` computes `local_hash` from the old bytes
+/// via `content_hash()` which calls `canonicalize_for_hash()`. That function
+/// strips `modified_at` (a NOISE_FIELD) before hashing, so `local_hash` equals
+/// the OLD lockfile `base_hash` (both ignore modified_at). Since
+/// `local_matches_base = true`, the action is `PullAction::Write` — a silent
+/// rewrite of the remote (new-codec) bytes. No self-heal code is needed; the
+/// existing three-way logic already handles this case.
+#[tokio::test]
+async fn sync_legacy_unedited_engine_converges_silently() {
+    use rdc::snapshot::codec::combined_hash;
+    use rdc::state::lockfile::content_hash;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // Remote returns the engine with a live agenda_id (server-assigned, rotates
+    // on training). This is what the sync classifier will produce codec bytes
+    // from — the codec redacts it to the sentinel.
+    let remote_agenda_id = "tnt_remote_new_abc";
+    let engines_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 801,
+                "url": format!("{}/api/v1/engines/801", server.uri()),
+                "name": "Legacy Upgrade Engine",
+                "type": "extractor",
+                "agenda_id": remote_agenda_id,
+                "modified_at": "2026-05-10T12:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/engines"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&engines_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/engines"]).await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // Manufacture the legacy on-disk state BEFORE running any sync.
+    // The engine.json is in the OLD format: raw agenda_id value and modified_at
+    // present, exactly as the pre-codec pull would have written it.
+    let old_agenda_id = "tnt_old_from_previous_rdc";
+    let engine_dir = project
+        .path()
+        .join("envs/dev/engines/legacy-upgrade-engine");
+    std::fs::create_dir_all(&engine_dir).unwrap();
+    let engine_path = engine_dir.join("engine.json");
+    let old_engine_json = serde_json::json!({
+        "id": 801,
+        "url": format!("{}/api/v1/engines/801", server.uri()),
+        "name": "Legacy Upgrade Engine",
+        "type": "extractor",
+        "agenda_id": old_agenda_id,
+        "modified_at": "2026-04-01T10:00:00Z"
+    });
+    let old_bytes = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&old_engine_json).unwrap()
+    );
+    std::fs::write(&engine_path, &old_bytes).unwrap();
+
+    // Record the OLD-format hash in the lockfile — this is what a pre-codec
+    // rdc version would have written. `content_hash` strips `modified_at` via
+    // `canonicalize_for_hash`, so the stored hash is sensitive only to the real
+    // fields (`agenda_id: "tnt_old_from_previous_rdc"`, `name`, etc.).
+    let old_base_hash = content_hash(old_bytes.as_bytes());
+    let lockfile_path = project.path().join(".rdc/state/dev.lock.json");
+    // The lockfile may or may not exist (init doesn't create it). Build a valid
+    // v2 lockfile with the engine entry pre-populated.
+    let lf_json = serde_json::json!({
+        "version": 2,
+        "objects": {
+            "engines": {
+                "legacy-upgrade-engine": {
+                    "id": 801,
+                    "url": format!("{}/api/v1/engines/801", server.uri()),
+                    "modified_at": "2026-04-01T10:00:00Z",
+                    "content_hash": old_base_hash
+                }
+            }
+        }
+    });
+    std::fs::create_dir_all(project.path().join(".rdc/state")).unwrap();
+    std::fs::write(
+        &lockfile_path,
+        format!("{}\n", serde_json::to_string_pretty(&lf_json).unwrap()),
+    )
+    .unwrap();
+
+    // Run the first sync (non-interactive, no push, no pull suppression).
+    // Use an explicit block so the cwd_guard is dropped before we need to
+    // acquire it again for the second sync below — std::sync::Mutex is
+    // non-reentrant, so two acquisitions on the same thread without an
+    // intervening release deadlock.
+    let result = {
+        let _cwd_guard = cwd_lock();
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(project.path()).unwrap();
+        let r = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+        std::env::set_current_dir(&prev_cwd).unwrap();
+        r
+    };
+
+    result.expect("first sync on legacy snapshot must succeed without conflict");
+
+    // No API mutations — this is purely a pull-side migration rewrite.
+    for req in server.received_requests().await.unwrap_or_default() {
+        let p = req.url.path();
+        if p.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "legacy migration must not issue any mutating request: {} {}",
+            req.method,
+            p
+        );
+    }
+
+    // The engine.json must now be in the new canonical form: agenda_id is the
+    // sentinel, and modified_at is absent.
+    let new_disk = std::fs::read_to_string(&engine_path).unwrap();
+    assert!(
+        !new_disk.contains(old_agenda_id),
+        "after migration, engine.json must NOT contain the raw old agenda_id '{}'; got:\n{new_disk}",
+        old_agenda_id
+    );
+    assert!(
+        !new_disk.contains(remote_agenda_id),
+        "after migration, engine.json must NOT contain the raw remote agenda_id '{}'; got:\n{new_disk}",
+        remote_agenda_id
+    );
+    assert!(
+        new_disk.contains("refreshed live in Rossum"),
+        "after migration, engine.json must contain the redaction sentinel; got:\n{new_disk}"
+    );
+    assert!(
+        !new_disk.contains("\"modified_at\""),
+        "after migration, engine.json must NOT contain modified_at; got:\n{new_disk}"
+    );
+
+    // Lockfile content_hash must equal the new codec hash.
+    let lf_raw = std::fs::read_to_string(&lockfile_path).unwrap();
+    let lf: serde_json::Value = serde_json::from_str(&lf_raw).unwrap();
+    let recorded_hash = lf["objects"]["engines"]["legacy-upgrade-engine"]["content_hash"]
+        .as_str()
+        .expect("content_hash must be present after migration sync");
+
+    let codec = rdc::snapshot::codec::codec("engines").expect("engines codec registered");
+    let remote_value = engines_body["results"][0].clone();
+    let art = codec.disk_bytes(&remote_value).expect("codec disk_bytes");
+    let expected_hash = combined_hash(&art.json, &art.sidecars);
+
+    assert_eq!(
+        recorded_hash, expected_hash,
+        "after migration, lockfile content_hash must equal the codec hash of the remote body"
+    );
+
+    // A second sync must be fully Clean — no rewrites, no lockfile changes.
+    let lf_after_first = std::fs::read_to_string(&lockfile_path).unwrap();
+    let disk_after_first = std::fs::read_to_string(&engine_path).unwrap();
+
+    {
+        let _cwd_guard2 = cwd_lock();
+        let prev_cwd2 = std::env::current_dir().unwrap();
+        std::env::set_current_dir(project.path()).unwrap();
+        rdc::cli::sync::run("dev", false, false, false, false, false)
+            .await
+            .expect("second sync must succeed (fully clean after migration)");
+        std::env::set_current_dir(&prev_cwd2).unwrap();
+    }
+
+    let lf_after_second = std::fs::read_to_string(&lockfile_path).unwrap();
+    let disk_after_second = std::fs::read_to_string(&engine_path).unwrap();
+
+    assert_eq!(
+        lf_after_first, lf_after_second,
+        "lockfile must be identical on the second sync (fully clean after migration)"
+    );
+    assert_eq!(
+        disk_after_first, disk_after_second,
+        "engine.json must be identical on the second sync (fully clean after migration)"
+    );
+}
+
+/// Migration-safety — locally-edited legacy snapshot surfaces a conflict on sync.
+///
+/// Scenario: same legacy on-disk state as `sync_legacy_unedited_engine_converges_silently`,
+/// but the user has ALSO edited the `name` field of the engine (a real user
+/// change). The lockfile `base_hash` was recorded from the old pre-edit bytes.
+///
+/// Expected behaviour: the sync correctly detects a conflict (`local_hash !=
+/// base_hash` AND `remote_hash != base_hash`). The conflict is surfaced via the
+/// shadow-file mechanism (non-interactive), NOT silently swallowed.
+///
+/// A conflict here is acceptable and expected: the user has real local edits
+/// that diverge from the remote AND from the base — there is no safe automatic
+/// merge. The test documents and locks down this behaviour.
+#[tokio::test]
+async fn sync_legacy_edited_engine_surfaces_conflict() {
+    use rdc::state::lockfile::content_hash;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // Remote returns the engine with a different name than the local edit,
+    // and a live agenda_id — both sides have diverged from the base.
+    let engines_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 802,
+                "url": format!("{}/api/v1/engines/802", server.uri()),
+                "name": "Remote Name Engine",
+                "type": "extractor",
+                "agenda_id": "tnt_remote_xyz",
+                "modified_at": "2026-05-11T12:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/engines"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&engines_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/engines"]).await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // Legacy on-disk state: old format (raw agenda_id + modified_at).
+    // The user had the original name "Base Name Engine" at the time of the last
+    // pull (pre-codec rdc version).
+    let old_agenda_id = "tnt_old_base";
+    let engine_dir = project.path().join("envs/dev/engines/remote-name-engine");
+    std::fs::create_dir_all(&engine_dir).unwrap();
+    let engine_path = engine_dir.join("engine.json");
+
+    // The BASE bytes (before any user edit) — what the old rdc pull wrote.
+    let base_engine_json = serde_json::json!({
+        "id": 802,
+        "url": format!("{}/api/v1/engines/802", server.uri()),
+        "name": "Base Name Engine",
+        "type": "extractor",
+        "agenda_id": old_agenda_id,
+        "modified_at": "2026-04-01T10:00:00Z"
+    });
+    let base_bytes = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&base_engine_json).unwrap()
+    );
+    // Record the base hash in the lockfile (from the OLD bytes).
+    let base_hash = content_hash(base_bytes.as_bytes());
+
+    // The LOCAL bytes (user has edited the name field — a real change).
+    let mut edited = base_engine_json.clone();
+    edited["name"] = serde_json::Value::String("Locally Edited Name".to_string());
+    let edited_bytes = format!("{}\n", serde_json::to_string_pretty(&edited).unwrap());
+    std::fs::write(&engine_path, &edited_bytes).unwrap();
+
+    // Write lockfile with the PRE-EDIT base hash.
+    let lf_json = serde_json::json!({
+        "version": 2,
+        "objects": {
+            "engines": {
+                "remote-name-engine": {
+                    "id": 802,
+                    "url": format!("{}/api/v1/engines/802", server.uri()),
+                    "modified_at": "2026-04-01T10:00:00Z",
+                    "content_hash": base_hash
+                }
+            }
+        }
+    });
+    let lockfile_path = project.path().join(".rdc/state/dev.lock.json");
+    std::fs::create_dir_all(project.path().join(".rdc/state")).unwrap();
+    std::fs::write(
+        &lockfile_path,
+        format!("{}\n", serde_json::to_string_pretty(&lf_json).unwrap()),
+    )
+    .unwrap();
+
+    // Snapshot the local file and lockfile before the sync.
+    let local_before = std::fs::read_to_string(&engine_path).unwrap();
+    let lf_before = std::fs::read_to_string(&lockfile_path).unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    // Sync must succeed (conflicts are non-fatal in non-interactive mode; they
+    // surface as shadow files and a lockfile freeze, not an error return).
+    let result = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    result.expect("sync with locally-edited legacy engine must not return an error");
+
+    // No API mutations — conflicts don't push to the remote.
+    for req in server.received_requests().await.unwrap_or_default() {
+        let p = req.url.path();
+        if p.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "conflict must not issue any mutating request: {} {}",
+            req.method,
+            p
+        );
+    }
+
+    // The local file must be PRESERVED (not overwritten with remote bytes).
+    let local_after = std::fs::read_to_string(&engine_path).unwrap();
+    assert_eq!(
+        local_before, local_after,
+        "conflict: local file must be preserved unchanged"
+    );
+    assert!(
+        local_after.contains("Locally Edited Name"),
+        "conflict: user's local edit must survive; got:\n{local_after}"
+    );
+
+    // A shadow file must have been written next to the local file, containing
+    // the new-codec remote bytes (so the user can inspect the remote side).
+    let shadow_path = engine_path.with_extension("json.dev");
+    assert!(
+        shadow_path.exists(),
+        "conflict: shadow file must be created at {}",
+        shadow_path.display()
+    );
+    let shadow = std::fs::read_to_string(&shadow_path).unwrap();
+    assert!(
+        shadow.contains("Remote Name Engine"),
+        "shadow file must contain the remote name; got:\n{shadow}"
+    );
+    assert!(
+        shadow.contains("refreshed live in Rossum"),
+        "shadow file must contain the redaction sentinel (new codec form); got:\n{shadow}"
+    );
+
+    // Lockfile base_hash must be FROZEN — not advanced — so the conflict
+    // re-surfaces on the next sync.
+    let lf_after = std::fs::read_to_string(&lockfile_path).unwrap();
+    let lf_val: serde_json::Value = serde_json::from_str(&lf_after).unwrap();
+    let recorded_hash = lf_val["objects"]["engines"]["remote-name-engine"]["content_hash"]
+        .as_str()
+        .expect("content_hash must be present");
+    assert_eq!(
+        recorded_hash, base_hash,
+        "conflict: lockfile content_hash must be frozen at the prior base (not advanced)"
+    );
+    // The lockfile's other fields may have been updated (e.g. modified_at from
+    // the remote), but the base hash governs whether the conflict re-surfaces.
+    let _ = lf_before; // consumed; noted that lf may have changed in modified_at
+}
