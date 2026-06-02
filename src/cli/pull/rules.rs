@@ -98,13 +98,11 @@ pub async fn process(
                 None
             };
 
-            // Remote hash via KindCodec (byte-identical to legacy
-            // rule_combined_hash — no one-time rehash needed for rules).
-            let value = serde_json::to_value(r)?;
-            let remote_combined_hash = crate::snapshot::codec::codec(KIND)
-                .unwrap()
-                .base_hash(&value)
-                .context("hashing rule")?;
+            // Remote hash is computed over the POST-overlay bytes so it matches
+            // what is actually written to disk. Using codec.base_hash(&value)
+            // (PRE-overlay) would diverge whenever an overlay is configured,
+            // causing phantom drift on every subsequent pull.
+            let remote_combined_hash = local_rule_combined_hash(&proposed_json, &proposed_code);
 
             let base_hash = ctx
                 .lockfile

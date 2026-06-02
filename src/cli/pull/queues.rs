@@ -250,14 +250,12 @@ fn write_schema_for_queue(
         ctx.overlay.as_ref().and_then(|o| o.schema(&w.q_slug)),
     )?;
 
-    // Hash via KindCodec (byte-identical to legacy schema_combined_hash).
-    // The codec's base_hash over (json + formula sidecars) matches the legacy
-    // schema_combined_hash because the sidecar label format is `formulas/<id>.py`.
-    let value = serde_json::to_value(schema)?;
-    let remote_combined_hash = crate::snapshot::codec::codec(KIND_SCHEMAS)
-        .unwrap()
-        .base_hash(&value)
-        .context("hashing schema")?;
+    // Remote hash is computed over the POST-overlay bytes so it matches what
+    // is actually written to disk. Using codec.base_hash(&value) (PRE-overlay)
+    // would diverge whenever a schema overlay is configured, causing phantom
+    // drift on every subsequent pull.
+    let remote_combined_hash =
+        crate::state::schema_combined_hash(&remote_json_bytes, &remote_formulas);
 
     let schema_base = ctx
         .lockfile
