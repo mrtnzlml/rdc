@@ -5983,3 +5983,154 @@ async fn sync_workspace_modified_at_change_is_clean() {
         "on-disk workspace must be unchanged after second sync (phantom drift fix)"
     );
 }
+
+/// Bug-c regression: after a push-PATCH of an existing engine, the on-disk
+/// `engine.json` must contain the sentinel string for `agenda_id` (NOT the
+/// raw live value returned by the server), and the lockfile content_hash must
+/// equal `codec("engines").base_hash(patch_response)` — i.e. the post-overlay
+/// KindCodec hash.
+///
+/// Before the fix, the post-PATCH write used raw `serde_json::to_vec_pretty`
+/// which re-emitted the live `agenda_id`; the lockfile hash was recorded from
+/// those un-redacted bytes, causing a hash mismatch on the next pull.
+#[tokio::test]
+async fn push_engine_patch_redacts_agenda_id_on_disk() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // Seed pull: the engine exists remotely with a live agenda_id.
+    let live_agenda_id = "tnt_seed_abc999";
+    let engines_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 901,
+                "url": format!("{}/api/v1/engines/901", server.uri()),
+                "name": "Seed Engine",
+                "type": "extractor",
+                "agenda_id": live_agenda_id,
+                "modified_at": "2026-05-01T08:00:00Z"
+            }
+        ]
+    });
+    // The second GET /engines (drift check before PATCH) returns the same body.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/engines"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&engines_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/engines"]).await;
+
+    // PATCH response carries a fresh live agenda_id (as the server would in
+    // reality). The push driver must NOT write this verbatim.
+    let patched_agenda_id = "tnt_patched_xyz777";
+    let patch_response = serde_json::json!({
+        "id": 901,
+        "url": format!("{}/api/v1/engines/901", server.uri()),
+        "name": "Patched Engine",
+        "type": "extractor",
+        "agenda_id": patched_agenda_id,
+        "modified_at": "2026-05-02T08:00:00Z"
+    });
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/engines/901"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&patch_response))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // Seed sync: pulls the engine and records the lockfile baseline.
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("seed sync should succeed");
+
+    let engine_path = project
+        .path()
+        .join("envs/dev/engines/seed-engine/engine.json");
+    assert!(engine_path.exists(), "seed sync must write engine.json");
+
+    // Verify seed state: agenda_id must already be redacted on disk.
+    let seed_disk = std::fs::read_to_string(&engine_path).unwrap();
+    assert!(
+        !seed_disk.contains(live_agenda_id),
+        "seed pull must redact agenda_id; found raw value in:\n{seed_disk}"
+    );
+    assert!(
+        seed_disk.contains("refreshed live in Rossum"),
+        "seed pull must write sentinel; got:\n{seed_disk}"
+    );
+
+    // Mutate the local file to trigger a LocalEdit → push path.
+    let mut v: serde_json::Value = serde_json::from_str(&seed_disk).unwrap();
+    v["name"] = serde_json::Value::String("Patched Engine".to_string());
+    std::fs::write(
+        &engine_path,
+        format!("{}\n", serde_json::to_string_pretty(&v).unwrap()),
+    )
+    .unwrap();
+
+    // Second sync: LocalEdit → push PATCH; must write codec bytes + redacted
+    // agenda_id to disk, not the raw `patched_agenda_id` from the server.
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("push sync should succeed");
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    // Post-PATCH disk assertion (bug-c fix).
+    let post_patch_disk = std::fs::read_to_string(&engine_path).unwrap();
+    assert!(
+        !post_patch_disk.contains(patched_agenda_id),
+        "post-PATCH engine.json must NOT contain the raw agenda_id '{}'; got:\n{post_patch_disk}",
+        patched_agenda_id
+    );
+    assert!(
+        post_patch_disk.contains("refreshed live in Rossum"),
+        "post-PATCH engine.json must contain the redaction sentinel; got:\n{post_patch_disk}"
+    );
+
+    // Lockfile hash must equal the codec hash of the PATCH response
+    // (without overlay, since no overlay.toml exists for this env).
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    let lf: serde_json::Value = serde_json::from_str(&lf_raw).unwrap();
+    let recorded_hash = lf["objects"]["engines"]["seed-engine"]["content_hash"]
+        .as_str()
+        .expect("content_hash must be present after push");
+
+    let codec = rdc::snapshot::codec::codec("engines").expect("engines codec must be registered");
+    let expected_art = codec
+        .disk_bytes(&patch_response)
+        .expect("codec disk_bytes for patch_response");
+    // No overlay → combined_hash of just the json (no sidecars for engines).
+    let expected_hash =
+        rdc::snapshot::codec::combined_hash(&expected_art.json, &expected_art.sidecars);
+
+    assert_eq!(
+        recorded_hash, expected_hash,
+        "lockfile content_hash after PATCH must equal codec combined_hash of the PATCH response"
+    );
+}

@@ -6,12 +6,13 @@
 use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::log::{Action, Log};
-use crate::overlay::{apply_overrides, Overlay};
+use crate::overlay::{Overlay, apply_overrides};
 use crate::paths::Paths;
 
+use crate::snapshot::codec::combined_hash;
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::writer::write_atomic;
-use crate::state::{content_hash, Lockfile, ObjectEntry};
+use crate::state::{Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -40,23 +41,33 @@ pub async fn push(
         let _ = overlay;
 
         // CREATE — no lockfile entry yet.
-        if lockfile.objects.get("workspaces").and_then(|m| m.get(ws_slug.as_str())).is_none() {
-            let disk_bytes = std::fs::read(ws_path)
-                .with_context(|| format!("reading {}", ws_path.display()))?;
+        if lockfile
+            .objects
+            .get("workspaces")
+            .and_then(|m| m.get(ws_slug.as_str()))
+            .is_none()
+        {
+            let disk_bytes =
+                std::fs::read(ws_path).with_context(|| format!("reading {}", ws_path.display()))?;
             let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
                 .with_context(|| format!("parsing {}", ws_path.display()))?;
             if let Some(p) = overlay_paths {
                 apply_overrides(&mut payload, p);
             }
             strip_for_create(&mut payload, "workspaces");
-            let create_result = client.create_workspace(&payload, Some(progress.clone())).await
+            let create_result = client
+                .create_workspace(&payload, Some(progress.clone()))
+                .await
                 .with_context(|| format!("POST /workspaces (creating '{ws_slug}')"));
             let created = create_result?;
-            let mut created_bytes = serde_json::to_vec_pretty(&created)
-                .context("serializing created workspace")?;
-            created_bytes.push(b'\n');
-            let created_bytes = maybe_strip_overlay(created_bytes, overlay_paths)?;
-            let created_hash = content_hash(&created_bytes);
+            let codec = crate::snapshot::codec::codec("workspaces").unwrap();
+            let created_art = codec
+                .disk_bytes(
+                    &serde_json::to_value(&created).context("serializing created workspace")?,
+                )
+                .context("codec disk_bytes for created workspace")?;
+            let created_bytes = maybe_strip_overlay(created_art.json, overlay_paths)?;
+            let created_hash = combined_hash(&created_bytes, &created_art.sidecars);
             write_atomic(ws_path, &created_bytes)
                 .with_context(|| format!("writing post-create canonical form for '{ws_slug}'"))?;
             lockfile.upsert(
@@ -70,23 +81,33 @@ pub async fn push(
                     secrets_hash: None,
                 },
             );
-            progress.event(Action::Post, &format!("workspace/{ws_slug} id={}", created.id));
+            progress.event(
+                Action::Post,
+                &format!("workspace/{ws_slug} id={}", created.id),
+            );
             pushed += 1;
             continue;
         }
 
         // UPDATE — existing workspace, PATCH the diff with drift detection.
-        let entry = lockfile.objects.get("workspaces").and_then(|m| m.get(ws_slug.as_str())).unwrap();
+        let entry = lockfile
+            .objects
+            .get("workspaces")
+            .and_then(|m| m.get(ws_slug.as_str()))
+            .unwrap();
         let Some(base) = &entry.content_hash else {
-            progress.event(Action::Skip, &format!("workspace/{ws_slug} (no content_hash)"));
+            progress.event(
+                Action::Skip,
+                &format!("workspace/{ws_slug} (no content_hash)"),
+            );
             skipped += 1;
             continue;
         };
         let base = base.clone();
         let id = entry.id;
 
-        let disk_bytes = std::fs::read(ws_path)
-            .with_context(|| format!("reading {}", ws_path.display()))?;
+        let disk_bytes =
+            std::fs::read(ws_path).with_context(|| format!("reading {}", ws_path.display()))?;
         let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
             .with_context(|| format!("parsing {}", ws_path.display()))?;
         if let Some(p) = overlay_paths {
@@ -96,21 +117,28 @@ pub async fn push(
             .with_context(|| format!("deserializing overlay-applied workspace '{ws_slug}'"))?;
 
         // Drift check.
-        let remote_workspace = client.get_workspace(id, Some(progress.clone())).await
+        let remote_workspace = client
+            .get_workspace(id, Some(progress.clone()))
+            .await
             .with_context(|| format!("fetching workspace {id} to verify drift before push"))?;
-        let mut remote_bytes = serde_json::to_vec_pretty(&remote_workspace)
-            .context("serializing remote workspace")?;
-        remote_bytes.push(b'\n');
-        let remote_bytes = maybe_strip_overlay(remote_bytes, overlay_paths)?;
-        let remote_combined = content_hash(&remote_bytes);
+        let codec = crate::snapshot::codec::codec("workspaces").unwrap();
+        let remote_art = codec
+            .disk_bytes(
+                &serde_json::to_value(&remote_workspace)
+                    .context("serializing remote workspace for drift check")?,
+            )
+            .context("codec disk_bytes for remote workspace")?;
+        let remote_bytes = maybe_strip_overlay(remote_art.json, overlay_paths)?;
+        let remote_combined = combined_hash(&remote_bytes, &remote_art.sidecars);
         let mut payload_to_send = payload_workspace;
         if remote_combined != base {
-            use crate::cli::resolve::{resolve_push_drift, PushDriftOutcome};
+            use crate::cli::resolve::{PushDriftOutcome, resolve_push_drift};
             match resolve_push_drift(interactive, ws_path, &remote_bytes, env)? {
                 PushDriftOutcome::Patch { payload_override } => {
                     if let Some(bytes) = payload_override {
-                        payload_to_send = serde_json::from_slice(&bytes)
-                            .with_context(|| format!("re-deserializing edited workspace '{ws_slug}'"))?;
+                        payload_to_send = serde_json::from_slice(&bytes).with_context(|| {
+                            format!("re-deserializing edited workspace '{ws_slug}'")
+                        })?;
                     }
                 }
                 PushDriftOutcome::Adopt => {
@@ -127,26 +155,38 @@ pub async fn push(
                             secrets_hash: None,
                         },
                     );
-                    progress.event(Action::Warn, &format!("workspace/{ws_slug} adopted remote (drift)"));
+                    progress.event(
+                        Action::Warn,
+                        &format!("workspace/{ws_slug} adopted remote (drift)"),
+                    );
                     skipped += 1;
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    progress.event(Action::Skip, &format!("workspace/{ws_slug} (remote changed; rdc sync first)"));
+                    progress.event(
+                        Action::Skip,
+                        &format!("workspace/{ws_slug} (remote changed; rdc sync first)"),
+                    );
                     skipped += 1;
                     continue;
                 }
             }
         }
 
-        let patch_result = client.update_workspace(id, &payload_to_send, Some(progress.clone())).await
+        let patch_result = client
+            .update_workspace(id, &payload_to_send, Some(progress.clone()))
+            .await
             .with_context(|| format!("PATCH /workspaces/{id}"));
         let updated = patch_result?;
-        let mut updated_bytes = serde_json::to_vec_pretty(&updated)
-            .context("serializing updated workspace")?;
-        updated_bytes.push(b'\n');
-        let updated_bytes = maybe_strip_overlay(updated_bytes, overlay_paths)?;
-        let updated_hash = content_hash(&updated_bytes);
+        let codec = crate::snapshot::codec::codec("workspaces").unwrap();
+        let updated_art = codec
+            .disk_bytes(
+                &serde_json::to_value(&updated)
+                    .context("serializing updated workspace for disk write")?,
+            )
+            .context("codec disk_bytes for updated workspace")?;
+        let updated_bytes = maybe_strip_overlay(updated_art.json, overlay_paths)?;
+        let updated_hash = combined_hash(&updated_bytes, &updated_art.sidecars);
         crate::state::base_cache::write_disk_and_cache(paths, ws_path, &updated_bytes)
             .with_context(|| format!("writing post-push canonical form for '{ws_slug}'"))?;
         lockfile.upsert(
