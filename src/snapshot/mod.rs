@@ -1,3 +1,4 @@
+pub mod codec;
 pub mod create;
 pub mod email_template;
 pub mod engine;
