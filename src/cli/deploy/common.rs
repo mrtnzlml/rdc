@@ -4,9 +4,10 @@
 
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::mapping::Mapping;
+use crate::snapshot::codec::combined_hash;
 use crate::snapshot::create::strip_for_cross_env_patch;
 use crate::snapshot::noise::{sort_keys_recursive, sort_string_arrays, strip_noise_fields};
-use crate::state::{content_hash, Lockfile};
+use crate::state::Lockfile;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -29,14 +30,13 @@ use std::collections::BTreeMap;
 /// (`pull` vs the queue-auto-create email-template capture, say) end up
 /// with their `extra` IndexMaps populated in different orders.
 pub fn normalize_for_cross_env_compare(bytes: &[u8], kind: &str) -> Result<Vec<u8>> {
-    let mut value: Value = serde_json::from_slice(bytes)
-        .context("parsing JSON for cross-env normalisation")?;
+    let mut value: Value =
+        serde_json::from_slice(bytes).context("parsing JSON for cross-env normalisation")?;
     strip_for_cross_env_patch(&mut value, kind);
     strip_noise_fields(&mut value);
     sort_string_arrays(&mut value);
     sort_keys_recursive(&mut value);
-    let mut out = serde_json::to_vec_pretty(&value)
-        .context("re-serialising normalised JSON")?;
+    let mut out = serde_json::to_vec_pretty(&value).context("re-serialising normalised JSON")?;
     out.push(b'\n');
     Ok(out)
 }
@@ -254,14 +254,20 @@ pub fn rewrite_urls(
             *s = tgt.clone();
             return;
         }
-        let Some((kind, src_slug)) = src_lockfile.lookup_url(s) else { return };
+        let Some((kind, src_slug)) = src_lockfile.lookup_url(s) else {
+            return;
+        };
         let tgt_slug = if kind == "organization" {
             src_slug
         } else {
-            let Some(s2) = mapping.lookup_tgt_slug(kind, src_slug) else { return };
+            let Some(s2) = mapping.lookup_tgt_slug(kind, src_slug) else {
+                return;
+            };
             s2
         };
-        let Some(tgt_url) = tgt_lockfile.url_for_slug(kind, tgt_slug) else { return };
+        let Some(tgt_url) = tgt_lockfile.url_for_slug(kind, tgt_slug) else {
+            return;
+        };
         *s = tgt_url.to_string();
     });
 }
@@ -283,41 +289,27 @@ fn walk_strings_mut(value: &mut Value, f: &mut dyn FnMut(&mut String)) {
     }
 }
 
-/// Whether the kind's pull driver writes the on-disk file (and the
-/// lockfile baseline) through `redacted_disk_bytes`. The drift hash MUST
-/// mirror this — if pull redacts but drift doesn't (or vice versa), the
-/// two paths produce different hashes and the kind phantom-drifts on
-/// every deploy.
-///
-/// Today only `queues` runs through `redacted_disk_bytes` in
-/// `pull/queues.rs`. `engines` and `hooks` both have entries in
-/// `redact_on_pull` per the design intent (`agenda_id` rotates on
-/// training; `status` cycles `pending → ready`), but their pull drivers
-/// still use `to_vec_pretty` / `serialize_hook` directly. Hooks are
-/// hash-neutral anyway — `hook_combined_hash` strips `status` via
-/// `canonicalize_with_extra_strips` — so the inconsistency is invisible
-/// there; engines aren't, so any drift-side redaction must wait until
-/// `pull/engines.rs` is aligned with the queue pattern (one-time
-/// on-disk migration).
-fn pull_redacts_kind(kind: &str) -> bool {
-    matches!(kind, "queues")
-}
-
-/// Drift check: hash the post-overlay-strip remote bytes (post-redaction
-/// for kinds where pull also redacts on disk) and compare to the tgt
-/// lockfile's recorded `content_hash`. Returns `(in_sync,
+/// Drift check: hash the remote bytes through the kind's [`KindCodec`]
+/// (which applies the same redaction that pull/sync record as the
+/// baseline — e.g. `agenda_id` → sentinel for engines, `counts` →
+/// sentinel for queues, `status` → sentinel for hooks) and compare to
+/// the tgt lockfile's recorded `content_hash`. Returns `(in_sync,
 /// current_remote_hash)`. Use the hash to refresh the lockfile entry
 /// when adopting out-of-band changes.
 ///
-/// The conditional redaction mirrors what `pull/queues.rs` writes as the
-/// baseline: skipping it makes queues phantom-drift on every deploy
-/// (`counts` is live numeric on the wire but a sentinel string on
-/// disk); applying it for kinds whose pull driver doesn't redact (e.g.
-/// engines) would cause the opposite mismatch. See `pull_redacts_kind`
-/// for the per-kind contract.
+/// Using the codec guarantees the drift hash always agrees with what
+/// pull/sync write as the baseline: a single code path handles the
+/// per-kind redaction instead of a hand-maintained lookup table
+/// (`pull_redacts_kind`, now deleted). Overlay paths are stripped from
+/// the JSON before hashing, mirroring the pull driver's post-overlay
+/// hash.
 ///
 /// Lockfile entries with no `content_hash` (older snapshots) yield
 /// `in_sync = true` so deploys don't spuriously block on legacy state.
+///
+/// For kinds with no registered codec (defensive — all deployed kinds
+/// should be registered), falls back to `content_hash` over the raw
+/// overlay-stripped bytes.
 pub fn tgt_drift_status(
     remote_bytes: Vec<u8>,
     overlay_paths: Option<&BTreeMap<String, Value>>,
@@ -325,25 +317,19 @@ pub fn tgt_drift_status(
     kind: &str,
     tgt_slug: &str,
 ) -> Result<(bool, String)> {
-    let stripped = maybe_strip_overlay(remote_bytes, overlay_paths)?;
-    let canonical = if pull_redacts_kind(kind) {
-        match serde_json::from_slice::<Value>(&stripped) {
-            Ok(mut v) => {
-                crate::snapshot::create::redact_for_disk(&mut v, kind);
-                let mut out = serde_json::to_vec_pretty(&v)
-                    .context("re-serialising remote JSON for drift hash")?;
-                out.push(b'\n');
-                out
-            }
-            // Non-JSON input (defensive — every caller passes JSON).
-            // Fall back to the raw bytes; `content_hash` also tolerates
-            // non-JSON.
-            Err(_) => stripped,
-        }
+    let remote_value: Value =
+        serde_json::from_slice(&remote_bytes).context("parsing remote JSON for drift hash")?;
+    let remote_hash = if let Some(c) = crate::snapshot::codec::codec(kind) {
+        let art = c
+            .disk_bytes(&remote_value)
+            .with_context(|| format!("codec disk_bytes for {kind}/{tgt_slug}"))?;
+        let json_for_hash = maybe_strip_overlay(art.json, overlay_paths)?;
+        combined_hash(&json_for_hash, &art.sidecars)
     } else {
-        stripped
+        // No codec registered — fall back to overlay-stripped content_hash.
+        let stripped = maybe_strip_overlay(remote_bytes, overlay_paths)?;
+        crate::state::content_hash(&stripped)
     };
-    let remote_hash = content_hash(&canonical);
     let base = tgt_lockfile
         .objects
         .get(kind)
@@ -356,7 +342,7 @@ pub fn tgt_drift_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::ObjectEntry;
+    use crate::state::{ObjectEntry, content_hash};
 
     fn lf_with(entries: &[(&str, &str, u64, &str)]) -> Lockfile {
         let mut lf = Lockfile::default();
@@ -378,10 +364,22 @@ mod tests {
 
     #[test]
     fn rewrite_urls_swaps_known_src_url() {
-        let src = lf_with(&[("queues", "cost-invoices", 100, "https://test/api/v1/queues/100")]);
-        let tgt = lf_with(&[("queues", "cost-invoices", 700, "https://prod/api/v1/queues/700")]);
+        let src = lf_with(&[(
+            "queues",
+            "cost-invoices",
+            100,
+            "https://test/api/v1/queues/100",
+        )]);
+        let tgt = lf_with(&[(
+            "queues",
+            "cost-invoices",
+            700,
+            "https://prod/api/v1/queues/700",
+        )]);
         let mut mapping = Mapping::default();
-        mapping.queues.insert("cost-invoices".into(), "cost-invoices".into());
+        mapping
+            .queues
+            .insert("cost-invoices".into(), "cost-invoices".into());
         let mut payload = serde_json::json!({
             "queues": ["https://test/api/v1/queues/100"]
         });
@@ -395,15 +393,25 @@ mod tests {
     #[test]
     fn rewrite_urls_handles_mapping_with_renamed_slug() {
         let src = lf_with(&[("hooks", "validator", 1, "https://test/api/v1/hooks/1")]);
-        let tgt = lf_with(&[("hooks", "validator-prod", 99, "https://prod/api/v1/hooks/99")]);
+        let tgt = lf_with(&[(
+            "hooks",
+            "validator-prod",
+            99,
+            "https://prod/api/v1/hooks/99",
+        )]);
         let mut mapping = Mapping::default();
-        mapping.hooks.insert("validator".into(), "validator-prod".into());
+        mapping
+            .hooks
+            .insert("validator".into(), "validator-prod".into());
         let mut payload = serde_json::json!({
             "ref": "https://test/api/v1/hooks/1",
             "label": "stays unchanged",
         });
         rewrite_urls(&mut payload, &src, &tgt, &mapping, &BTreeMap::new());
-        assert_eq!(payload["ref"].as_str().unwrap(), "https://prod/api/v1/hooks/99");
+        assert_eq!(
+            payload["ref"].as_str().unwrap(),
+            "https://prod/api/v1/hooks/99"
+        );
         assert_eq!(payload["label"].as_str().unwrap(), "stays unchanged");
     }
 
@@ -414,7 +422,10 @@ mod tests {
         let mapping = Mapping::default();
         let mut payload = serde_json::json!({"description": "see https://docs.rossum.ai"});
         rewrite_urls(&mut payload, &src, &tgt, &mapping, &BTreeMap::new());
-        assert_eq!(payload["description"].as_str().unwrap(), "see https://docs.rossum.ai");
+        assert_eq!(
+            payload["description"].as_str().unwrap(),
+            "see https://docs.rossum.ai"
+        );
     }
 
     #[test]
@@ -443,8 +454,18 @@ mod tests {
         // entry). API responded with 400 "Invalid hyperlink - Object does
         // not exist." Fix: bypass mapping for the organization kind and
         // look up the tgt URL directly from tgt_lockfile.
-        let src = lf_with(&[("organization", "self", 1, "https://test/api/v1/organizations/1")]);
-        let tgt = lf_with(&[("organization", "self", 214757, "https://prod/api/v1/organizations/214757")]);
+        let src = lf_with(&[(
+            "organization",
+            "self",
+            1,
+            "https://test/api/v1/organizations/1",
+        )]);
+        let tgt = lf_with(&[(
+            "organization",
+            "self",
+            214757,
+            "https://prod/api/v1/organizations/214757",
+        )]);
         let mapping = Mapping::default();
         let mut payload = serde_json::json!({
             "name": "AP",
@@ -473,8 +494,14 @@ mod tests {
             "unrelated": "https://docs.rossum.ai"
         });
         rewrite_urls(&mut payload, &src, &tgt, &mapping, &subs);
-        assert_eq!(payload["hook_template"].as_str().unwrap(), "https://prod/api/v1/hook_templates/41");
-        assert_eq!(payload["unrelated"].as_str().unwrap(), "https://docs.rossum.ai");
+        assert_eq!(
+            payload["hook_template"].as_str().unwrap(),
+            "https://prod/api/v1/hook_templates/41"
+        );
+        assert_eq!(
+            payload["unrelated"].as_str().unwrap(),
+            "https://docs.rossum.ai"
+        );
     }
 
     fn lf_with_hash(kind: &str, slug: &str, hash: &str) -> Lockfile {
@@ -520,32 +547,67 @@ mod tests {
     }
 
     #[test]
-    fn tgt_drift_status_engine_with_unchanged_agenda_id_is_in_sync() {
-        // Regression guard: a previous version of this fix unconditionally
-        // applied `redact_for_disk` to the drift hash, which broke engines
-        // because `pull/engines.rs` uses `to_vec_pretty` directly (no
-        // redaction). Baselines are recorded from raw bytes, so the drift
-        // hash must also be raw — anything else phantom-drifts every
-        // engine on every deploy. The design intent is to redact
-        // `agenda_id`; that requires aligning the pull driver too.
-        let value = serde_json::json!({
+    fn tgt_drift_status_engine_agenda_id_churn_does_not_phantom_drift() {
+        // Bug-a regression: `pull_redacts_kind` returned false for engines,
+        // so `tgt_drift_status` hashed the raw remote bytes (live agenda_id)
+        // while pull/sync wrote the baseline from redacted bytes (sentinel).
+        // Result: every engine phantom-drifted on every deploy.
+        //
+        // Fix: route the drift hash through the engine KindCodec, which
+        // calls `redact_for_disk("engines")` — the same path that pull and
+        // write_back_flat use. The baseline must therefore be built the
+        // same way (via the codec), not from raw bytes.
+        //
+        // Assert 1: a different live agenda_id value does NOT drift.
+        let value_at_pull = serde_json::json!({
             "id": 7,
             "name": "training-engine",
             "url": "https://test/api/v1/engines/7",
-            "agenda_id": "stable-abc123",
+            "agenda_id": "original-id-at-pull-time",
         });
-        let raw_bytes = {
-            let mut b = serde_json::to_vec_pretty(&value).unwrap();
+        // Simulate baseline: what write_back_flat (= codec) would record.
+        let codec = crate::snapshot::codec::codec("engines").expect("engines codec must exist");
+        let art = codec.disk_bytes(&value_at_pull).unwrap();
+        let baseline_hash = crate::snapshot::codec::combined_hash(&art.json, &art.sidecars);
+        let lf = lf_with_hash("engines", "training", &baseline_hash);
+
+        // Remote now has a rotated agenda_id (training completed) — only
+        // agenda_id changed, everything else is identical.
+        let remote_value = serde_json::json!({
+            "id": 7,
+            "name": "training-engine",
+            "url": "https://test/api/v1/engines/7",
+            "agenda_id": "new-rotated-id-after-training",
+        });
+        let remote_bytes = {
+            let mut b = serde_json::to_vec_pretty(&remote_value).unwrap();
             b.push(b'\n');
             b
         };
-        let baseline_hash = content_hash(&raw_bytes);
-        let lf = lf_with_hash("engines", "training", &baseline_hash);
         let (in_sync, _) =
-            tgt_drift_status(raw_bytes.clone(), None, &lf, "engines", "training").unwrap();
+            tgt_drift_status(remote_bytes, None, &lf, "engines", "training").unwrap();
         assert!(
             in_sync,
-            "engine with stable agenda_id should be in_sync against raw baseline"
+            "engine agenda_id churn must NOT phantom-drift (codec redacts agenda_id to sentinel)"
+        );
+
+        // Assert 2: a real change to a non-redacted field DOES drift.
+        let remote_changed = serde_json::json!({
+            "id": 7,
+            "name": "training-engine-renamed",
+            "url": "https://test/api/v1/engines/7",
+            "agenda_id": "new-rotated-id-after-training",
+        });
+        let changed_bytes = {
+            let mut b = serde_json::to_vec_pretty(&remote_changed).unwrap();
+            b.push(b'\n');
+            b
+        };
+        let (in_sync_changed, _) =
+            tgt_drift_status(changed_bytes, None, &lf, "engines", "training").unwrap();
+        assert!(
+            !in_sync_changed,
+            "a real name change on the engine must still register as drift"
         );
     }
 
