@@ -1,12 +1,13 @@
-use crate::api::{anyhow_has_status, RossumClient};
+use crate::api::{RossumClient, anyhow_has_status};
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::log::{Action, Log};
-use crate::overlay::{apply_overrides, Overlay};
+use crate::overlay::{Overlay, apply_overrides};
 use crate::paths::Paths;
 
+use crate::snapshot::codec::combined_hash;
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::writer::write_atomic;
-use crate::state::{content_hash, Lockfile, ObjectEntry};
+use crate::state::{Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -31,23 +32,33 @@ pub async fn push(
         let overlay_paths = overlay.as_ref().and_then(|ov| ov.engine(slug));
 
         // Missing lockfile entry → new engine, POST.
-        if lockfile.objects.get("engines").and_then(|m| m.get(slug.as_str())).is_none() {
-            let disk_bytes = std::fs::read(path)
-                .with_context(|| format!("reading {}", path.display()))?;
+        if lockfile
+            .objects
+            .get("engines")
+            .and_then(|m| m.get(slug.as_str()))
+            .is_none()
+        {
+            let disk_bytes =
+                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
             let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
                 .with_context(|| format!("parsing {}", path.display()))?;
             if let Some(p) = overlay_paths {
                 apply_overrides(&mut payload, p);
             }
             strip_for_create(&mut payload, "engines");
-            let create_result = client.create_engine(&payload, Some(progress.clone())).await
+            let create_result = client
+                .create_engine(&payload, Some(progress.clone()))
+                .await
                 .with_context(|| format!("POST /engines (creating '{slug}')"));
             let created = create_result?;
-            let mut created_bytes = serde_json::to_vec_pretty(&created)
-                .context("serializing created engine")?;
-            created_bytes.push(b'\n');
-            let created_bytes = maybe_strip_overlay(created_bytes, overlay_paths)?;
-            let created_hash = content_hash(&created_bytes);
+            // Canonical on-disk bytes via KindCodec: redacts `agenda_id` and
+            // strips hidden fields — matching exactly what pull produces.
+            let codec = crate::snapshot::codec::codec("engines").unwrap();
+            let created_art = codec
+                .disk_bytes(&serde_json::to_value(&created).context("serializing created engine")?)
+                .context("codec disk_bytes for created engine")?;
+            let created_bytes = maybe_strip_overlay(created_art.json, overlay_paths)?;
+            let created_hash = combined_hash(&created_bytes, &created_art.sidecars);
             write_atomic(path, &created_bytes)
                 .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
             lockfile.upsert(
@@ -66,9 +77,13 @@ pub async fn push(
             continue;
         }
 
-        let disk_bytes = std::fs::read(path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let entry = lockfile.objects.get("engines").and_then(|m| m.get(slug.as_str())).unwrap();
+        let disk_bytes =
+            std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let entry = lockfile
+            .objects
+            .get("engines")
+            .and_then(|m| m.get(slug.as_str()))
+            .unwrap();
         let Some(base) = &entry.content_hash else {
             progress.event(Action::Skip, &format!("engine/{slug} (no content_hash)"));
             skipped += 1;
@@ -86,22 +101,36 @@ pub async fn push(
 
         let id = entry.id;
         if remote_cache.is_none() {
-            remote_cache = Some(client.list_engines(Some(progress.clone())).await
-                .context("listing engines to verify no drift before push")?);
+            remote_cache = Some(
+                client
+                    .list_engines(Some(progress.clone()))
+                    .await
+                    .context("listing engines to verify no drift before push")?,
+            );
         }
         let Some(remote_engine) = remote_cache.as_ref().unwrap().iter().find(|e| e.id == id) else {
-            progress.event(Action::Skip, &format!("engine/{slug} (remote id {id} missing)"));
+            progress.event(
+                Action::Skip,
+                &format!("engine/{slug} (remote id {id} missing)"),
+            );
             skipped += 1;
             continue;
         };
-        let mut remote_bytes = serde_json::to_vec_pretty(remote_engine)
-            .context("serializing remote engine")?;
-        remote_bytes.push(b'\n');
-        let remote_bytes = maybe_strip_overlay(remote_bytes, overlay_paths)?;
-        let remote_combined = content_hash(&remote_bytes);
+        // Drift compare: use the same KindCodec path the pull driver uses so
+        // the hash matches the lockfile baseline (redacts `agenda_id`, strips
+        // hidden fields).
+        let codec = crate::snapshot::codec::codec("engines").unwrap();
+        let remote_art = codec
+            .disk_bytes(
+                &serde_json::to_value(remote_engine)
+                    .context("serializing remote engine for drift check")?,
+            )
+            .context("codec disk_bytes for remote engine")?;
+        let remote_bytes = maybe_strip_overlay(remote_art.json, overlay_paths)?;
+        let remote_combined = combined_hash(&remote_bytes, &remote_art.sidecars);
         let mut payload_to_send = payload_engine;
         if remote_combined != base {
-            use crate::cli::resolve::{resolve_push_drift, PushDriftOutcome};
+            use crate::cli::resolve::{PushDriftOutcome, resolve_push_drift};
             match resolve_push_drift(interactive, path, &remote_bytes, env)? {
                 PushDriftOutcome::Patch { payload_override } => {
                     if let Some(bytes) = payload_override {
@@ -123,24 +152,35 @@ pub async fn push(
                             secrets_hash: None,
                         },
                     );
-                    progress.event(Action::Warn, &format!("engine/{slug} adopted remote (drift)"));
+                    progress.event(
+                        Action::Warn,
+                        &format!("engine/{slug} adopted remote (drift)"),
+                    );
                     skipped += 1;
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    progress.event(Action::Skip, &format!("engine/{slug} (remote changed; rdc sync first)"));
+                    progress.event(
+                        Action::Skip,
+                        &format!("engine/{slug} (remote changed; rdc sync first)"),
+                    );
                     skipped += 1;
                     continue;
                 }
             }
         }
 
-        let patch_result = client.update_engine(id, &payload_to_send, Some(progress.clone())).await
+        let patch_result = client
+            .update_engine(id, &payload_to_send, Some(progress.clone()))
+            .await
             .with_context(|| format!("PATCH /engines/{id}"));
         let updated = match patch_result {
             Ok(u) => u,
             Err(e) if anyhow_has_status(&e, 405) => {
-                progress.event(Action::Skip, &format!("engine/{slug} (PATCH 405 — engines read-only on this plan)"));
+                progress.event(
+                    Action::Skip,
+                    &format!("engine/{slug} (PATCH 405 — engines read-only on this plan)"),
+                );
                 skipped += 1;
                 break;
             }
@@ -149,11 +189,18 @@ pub async fn push(
             }
         };
 
-        let mut updated_bytes = serde_json::to_vec_pretty(&updated)
-            .context("serializing updated engine")?;
-        updated_bytes.push(b'\n');
-        let updated_bytes = maybe_strip_overlay(updated_bytes, overlay_paths)?;
-        let updated_hash = content_hash(&updated_bytes);
+        // Post-PATCH disk write via KindCodec so `agenda_id` is redacted to
+        // the sentinel (bug c fix: previously used raw to_vec_pretty, which
+        // re-emitted the live agenda_id into engine.json after each PATCH).
+        let codec = crate::snapshot::codec::codec("engines").unwrap();
+        let updated_art = codec
+            .disk_bytes(
+                &serde_json::to_value(&updated)
+                    .context("serializing updated engine for disk write")?,
+            )
+            .context("codec disk_bytes for updated engine")?;
+        let updated_bytes = maybe_strip_overlay(updated_art.json, overlay_paths)?;
+        let updated_hash = combined_hash(&updated_bytes, &updated_art.sidecars);
         crate::state::base_cache::write_disk_and_cache(paths, path, &updated_bytes)
             .with_context(|| format!("writing post-push canonical form for engine '{slug}'"))?;
 

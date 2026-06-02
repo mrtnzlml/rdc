@@ -1,12 +1,13 @@
 use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::log::{Action, Log};
-use crate::overlay::{apply_overrides, Overlay};
+use crate::overlay::{Overlay, apply_overrides};
 use crate::paths::Paths;
 
+use crate::snapshot::codec::combined_hash;
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::writer::write_atomic;
-use crate::state::{content_hash, Lockfile, ObjectEntry};
+use crate::state::{Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -34,7 +35,12 @@ pub async fn push(
         // Missing lockfile entry → new queue, POST. User must already have
         // POSTed the referenced workspace + schema (linear push); if not,
         // the server will reject with a clear error.
-        if lockfile.objects.get("queues").and_then(|m| m.get(q_slug.as_str())).is_none() {
+        if lockfile
+            .objects
+            .get("queues")
+            .and_then(|m| m.get(q_slug.as_str()))
+            .is_none()
+        {
             let disk_bytes = std::fs::read(queue_path)
                 .with_context(|| format!("reading {}", queue_path.display()))?;
             let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
@@ -43,17 +49,19 @@ pub async fn push(
                 apply_overrides(&mut payload, p);
             }
             strip_for_create(&mut payload, "queues");
-            let create_result = client.create_queue(&payload, Some(progress.clone())).await
+            let create_result = client
+                .create_queue(&payload, Some(progress.clone()))
+                .await
                 .with_context(|| format!("POST /queues (creating '{q_slug}')"));
             let created = create_result?;
-            // Canonical on-disk bytes (redact `counts` etc.) so the file we
-            // write and the hash we record match what a pull would produce —
-            // otherwise the next sync sees the redacted remote drift from this
-            // raw-counts base. Same helper as the pull driver.
-            let created_bytes = crate::snapshot::create::redacted_disk_bytes(&created, "queues")
-                .context("serializing created queue")?;
-            let created_bytes = maybe_strip_overlay(created_bytes, overlay_paths)?;
-            let created_hash = content_hash(&created_bytes);
+            // Canonical on-disk bytes via KindCodec: redacts `counts` and
+            // strips hidden fields — matching exactly what pull produces.
+            let codec = crate::snapshot::codec::codec("queues").unwrap();
+            let created_art = codec
+                .disk_bytes(&serde_json::to_value(&created).context("serializing created queue")?)
+                .context("codec disk_bytes for created queue")?;
+            let created_bytes = maybe_strip_overlay(created_art.json, overlay_paths)?;
+            let created_hash = combined_hash(&created_bytes, &created_art.sidecars);
             write_atomic(queue_path, &created_bytes)
                 .with_context(|| format!("writing post-create canonical form for '{q_slug}'"))?;
             lockfile.upsert(
@@ -74,7 +82,11 @@ pub async fn push(
 
         let disk_bytes = std::fs::read(queue_path)
             .with_context(|| format!("reading {}", queue_path.display()))?;
-        let entry = lockfile.objects.get("queues").and_then(|m| m.get(q_slug.as_str())).unwrap();
+        let entry = lockfile
+            .objects
+            .get("queues")
+            .and_then(|m| m.get(q_slug.as_str()))
+            .unwrap();
         let Some(base) = &entry.content_hash else {
             progress.event(Action::Skip, &format!("queue/{q_slug} (no content_hash)"));
             skipped += 1;
@@ -92,28 +104,36 @@ pub async fn push(
 
         let id = entry.id;
         if remote_cache.is_empty() {
-            let remotes = client.list_queues(Some(progress.clone())).await
+            let remotes = client
+                .list_queues(Some(progress.clone()))
+                .await
                 .context("listing queues to verify no drift before push")?;
             for r in remotes {
                 remote_cache.insert(r.id, r);
             }
         }
         let Some(remote_queue) = remote_cache.get(&id).cloned() else {
-            progress.event(Action::Skip, &format!("queue/{q_slug} (remote id {id} missing)"));
+            progress.event(
+                Action::Skip,
+                &format!("queue/{q_slug} (remote id {id} missing)"),
+            );
             skipped += 1;
             continue;
         };
-        // Redact `counts` before hashing the remote for the drift check; the
-        // lockfile base was recorded from redacted bytes, so comparing raw
-        // bytes here would flag live counts churn as drift and pop a spurious
-        // push-drift prompt.
-        let remote_bytes = crate::snapshot::create::redacted_disk_bytes(&remote_queue, "queues")
-            .context("serializing remote queue")?;
-        let remote_bytes = maybe_strip_overlay(remote_bytes, overlay_paths)?;
-        let remote_combined = content_hash(&remote_bytes);
+        // Drift check: use KindCodec so the hash matches the lockfile baseline
+        // (redacts `counts`, strips hidden fields).
+        let codec = crate::snapshot::codec::codec("queues").unwrap();
+        let remote_art = codec
+            .disk_bytes(
+                &serde_json::to_value(&remote_queue)
+                    .context("serializing remote queue for drift check")?,
+            )
+            .context("codec disk_bytes for remote queue")?;
+        let remote_bytes = maybe_strip_overlay(remote_art.json, overlay_paths)?;
+        let remote_combined = combined_hash(&remote_bytes, &remote_art.sidecars);
         let mut payload_to_send = payload_queue;
         if remote_combined != base {
-            use crate::cli::resolve::{resolve_push_drift, PushDriftOutcome};
+            use crate::cli::resolve::{PushDriftOutcome, resolve_push_drift};
             match resolve_push_drift(interactive, queue_path, &remote_bytes, env)? {
                 PushDriftOutcome::Patch { payload_override } => {
                     if let Some(bytes) = payload_override {
@@ -122,8 +142,9 @@ pub async fn push(
                     }
                 }
                 PushDriftOutcome::Adopt => {
-                    write_atomic(queue_path, &remote_bytes)
-                        .with_context(|| format!("adopting remote into {}", queue_path.display()))?;
+                    write_atomic(queue_path, &remote_bytes).with_context(|| {
+                        format!("adopting remote into {}", queue_path.display())
+                    })?;
                     lockfile.upsert(
                         "queues",
                         q_slug,
@@ -135,26 +156,39 @@ pub async fn push(
                             secrets_hash: None,
                         },
                     );
-                    progress.event(Action::Warn, &format!("queue/{q_slug} adopted remote (drift)"));
+                    progress.event(
+                        Action::Warn,
+                        &format!("queue/{q_slug} adopted remote (drift)"),
+                    );
                     skipped += 1;
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    progress.event(Action::Skip, &format!("queue/{q_slug} (remote changed; rdc sync first)"));
+                    progress.event(
+                        Action::Skip,
+                        &format!("queue/{q_slug} (remote changed; rdc sync first)"),
+                    );
                     skipped += 1;
                     continue;
                 }
             }
         }
 
-        let patch_result = client.update_queue(id, &payload_to_send, Some(progress.clone())).await
+        let patch_result = client
+            .update_queue(id, &payload_to_send, Some(progress.clone()))
+            .await
             .with_context(|| format!("PATCH /queues/{id}"));
         let updated = patch_result?;
 
-        let updated_bytes = crate::snapshot::create::redacted_disk_bytes(&updated, "queues")
-            .context("serializing updated queue")?;
-        let updated_bytes = maybe_strip_overlay(updated_bytes, overlay_paths)?;
-        let updated_hash = content_hash(&updated_bytes);
+        let codec = crate::snapshot::codec::codec("queues").unwrap();
+        let updated_art = codec
+            .disk_bytes(
+                &serde_json::to_value(&updated)
+                    .context("serializing updated queue for disk write")?,
+            )
+            .context("codec disk_bytes for updated queue")?;
+        let updated_bytes = maybe_strip_overlay(updated_art.json, overlay_paths)?;
+        let updated_hash = combined_hash(&updated_bytes, &updated_art.sidecars);
         crate::state::base_cache::write_disk_and_cache(paths, queue_path, &updated_bytes)
             .with_context(|| format!("writing post-push canonical form for queue '{q_slug}'"))?;
 
