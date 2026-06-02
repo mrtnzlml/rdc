@@ -113,10 +113,10 @@ use crate::api::RossumClient;
 use crate::config::ProjectConfig;
 use crate::log::{Action, Log};
 use crate::paths::Paths;
-use std::sync::Arc;
 use crate::secrets::resolve_token;
 use crate::state::Lockfile;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
+use std::sync::Arc;
 
 /// Aggregate counts from one sync cycle, used for the watch-loop summary line.
 /// For one-shot sync, callers usually don't read this — they look at the
@@ -360,12 +360,15 @@ pub(crate) async fn run_cycle(
         }
 
         if !renderer_was_supplied {
-            progress.event(Action::Done, &format!(
-                "Dry run: {} would push, {} would pull, {} would prompt (no writes)",
-                push_items.len(),
-                pull_items.len(),
-                prompt_items.len(),
-            ));
+            progress.event(
+                Action::Done,
+                &format!(
+                    "Dry run: {} would push, {} would pull, {} would prompt (no writes)",
+                    push_items.len(),
+                    pull_items.len(),
+                    prompt_items.len(),
+                ),
+            );
         }
         return Ok(CycleOutcome::default());
     }
@@ -418,10 +421,13 @@ pub(crate) async fn run_cycle(
     let elapsed = started.elapsed();
     let total_changed = outcome.items_pushed + outcome.items_pulled;
     if !renderer_was_supplied {
-        progress.event(Action::Done, &format!(
-            "Synced envs/{env} ({total_changed} changed, {:.1}s)",
-            elapsed.as_secs_f32()
-        ));
+        progress.event(
+            Action::Done,
+            &format!(
+                "Synced envs/{env} ({total_changed} changed, {:.1}s)",
+                elapsed.as_secs_f32()
+            ),
+        );
     } else {
         // Watch mode: reset the header to "idle" so the user can see the
         // cycle completed (transitioning out of "executing" or similar
@@ -468,10 +474,11 @@ pub fn from_catalog_scan_lockfile(
     let mut locked: BTreeMap<(String, String), String> = BTreeMap::new();
 
     // --- labels --------------------------------------------------------
-    // Catalog hash: re-run `pull::labels::process`'s pre-record_object
-    // sequence — serialize → optional overlay strip → push newline →
-    // `content_hash`. Slug picks up the lockfile-anchored id mapping so
-    // remote renames don't churn slugs.
+    // Catalog hash: route through the KindCodec so the adapter hash equals
+    // the hash of the bytes actually written to disk by the pull driver.
+    // This prevents phantom drift when fields like `modified_at` differ
+    // between what the API returns and what the codec writes to disk.
+    let labels_codec = crate::snapshot::codec::codec("labels").expect("labels codec must exist");
     let mut used_label_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for l in &catalog.labels {
         let slug = match lockfile.slug_for_id("labels", l.id) {
@@ -480,23 +487,22 @@ pub fn from_catalog_scan_lockfile(
         };
         used_label_slugs.insert(slug.clone());
 
-        let mut proposed = match serde_json::to_vec_pretty(l) {
-            Ok(b) => b,
-            // If a single body fails to serialize, skip it — better than
-            // tanking the whole classifier. The pull driver itself would
-            // also have errored, so the lockfile won't contain a hash and
-            // we'll get a spurious RemoteCreate. Acceptable.
+        let value = match serde_json::to_value(l) {
+            Ok(v) => v,
             Err(_) => continue,
         };
-        proposed.push(b'\n');
-        let proposed = match crate::cli::pull::common::maybe_strip_overlay(
-            proposed,
-            overlay.and_then(|o| o.label(&slug)),
+        let art = match labels_codec.disk_bytes(&value) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        let json = match crate::cli::pull::common::maybe_strip_overlay(
+            art.json,
+            overlay.and_then(|o| labels_codec.overlay(o, &slug)),
         ) {
             Ok(b) => b,
             Err(_) => continue,
         };
-        let hash = crate::state::content_hash(&proposed);
+        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
         remote_hashes.insert(("labels".to_string(), slug), hash);
     }
 
@@ -527,17 +533,26 @@ pub fn from_catalog_scan_lockfile(
     }
 
     // --- organization (pull-only singleton) ---------------------------
-    // The org is a singleton — slug is always "self", matching
-    // `pull::organization::process`'s `record_object` key. Hash
-    // computation mirrors that driver: `serde_json::to_vec_pretty` →
-    // push `\n` → `content_hash`. Push side never touches the org, so
-    // there's no `scan_changes` / tombstones lookup here.
+    // The org is a singleton — slug is always "self". Route through the
+    // KindCodec so the adapter hash matches the pull baseline (the codec
+    // strips `modified_at` before hashing).
     {
+        let org_codec =
+            crate::snapshot::codec::codec("organization").expect("organization codec must exist");
         let org = &catalog.organization;
-        if let Ok(mut proposed) = serde_json::to_vec_pretty(org) {
-            proposed.push(b'\n');
-            let hash = crate::state::content_hash(&proposed);
-            remote_hashes.insert(("organization".to_string(), "self".to_string()), hash);
+        if let Ok(value) = serde_json::to_value(org)
+            && let Ok(art) = org_codec.disk_bytes(&value)
+        {
+            // Organization has no overlay (codec.overlay returns None).
+            let json = crate::cli::pull::common::maybe_strip_overlay(
+                art.json,
+                overlay.and_then(|o| org_codec.overlay(o, "self")),
+            )
+            .unwrap_or_else(|_| vec![]);
+            if !json.is_empty() {
+                let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
+                remote_hashes.insert(("organization".to_string(), "self".to_string()), hash);
+            }
         }
         if let Some(map) = lockfile.objects.get("organization") {
             for (slug, entry) in map {
@@ -549,15 +564,17 @@ pub fn from_catalog_scan_lockfile(
     }
 
     // --- workflows (pull-only) ----------------------------------------
-    // Slug derivation mirrors `pull::workflows::process`: prefer the
-    // lockfile-anchored id mapping, else `slugify_unique(name, used)`.
-    // Hash computation matches the driver byte-for-byte.
+    // Slug derivation mirrors `pull::workflows::process`. Route through
+    // the KindCodec for hash parity with the pull baseline.
     //
     // `workflow_url_to_slug` is populated here so the workflow_steps
     // block below can resolve `step.workflow` (a URL) to the workflow
     // slug even on a fresh lockfile where `slug_for_url` would
     // otherwise return `None`.
-    let mut used_workflow_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let workflows_codec =
+        crate::snapshot::codec::codec("workflows").expect("workflows codec must exist");
+    let mut used_workflow_slugs: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     let mut workflow_url_to_slug: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for w in &catalog.workflows {
@@ -568,12 +585,22 @@ pub fn from_catalog_scan_lockfile(
         used_workflow_slugs.insert(slug.clone());
         workflow_url_to_slug.insert(w.url.clone(), slug.clone());
 
-        let mut proposed = match serde_json::to_vec_pretty(w) {
+        let value = match serde_json::to_value(w) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let art = match workflows_codec.disk_bytes(&value) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        let json = match crate::cli::pull::common::maybe_strip_overlay(
+            art.json,
+            overlay.and_then(|o| workflows_codec.overlay(o, &slug)),
+        ) {
             Ok(b) => b,
             Err(_) => continue,
         };
-        proposed.push(b'\n');
-        let hash = crate::state::content_hash(&proposed);
+        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
         remote_hashes.insert(("workflows".to_string(), slug), hash);
     }
     if let Some(map) = lockfile.objects.get("workflows") {
@@ -586,15 +613,14 @@ pub fn from_catalog_scan_lockfile(
 
     // --- workflow_steps (pull-only) -----------------------------------
     // Steps nest under workflows; the lockfile key is composite
-    // `<workflow_slug>/<step_slug>` so per-workflow slugs stay clean
-    // (the same per-parent scoping as engine_fields and email_templates).
-    // The driver skips orphan steps (no parent workflow); here we emit
-    // composite keys for every step that has a known parent, and silently
-    // drop orphans (their absence from `remote_hashes` means the
-    // classifier never schedules them — which matches the prior
-    // behavior of "warn-and-skip at apply time").
-    let mut per_workflow_used_step: std::collections::HashMap<String, std::collections::HashSet<String>> =
-        std::collections::HashMap::new();
+    // `<workflow_slug>/<step_slug>`. Route through the KindCodec for
+    // hash parity with the pull baseline.
+    let workflow_steps_codec =
+        crate::snapshot::codec::codec("workflow_steps").expect("workflow_steps codec must exist");
+    let mut per_workflow_used_step: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
     for s in &catalog.workflow_steps {
         let Some(workflow_slug) = lockfile
             .slug_for_url("workflows", &s.workflow)
@@ -616,12 +642,22 @@ pub fn from_catalog_scan_lockfile(
         used.insert(step_slug.clone());
         let composite_key = format!("{workflow_slug}/{step_slug}");
 
-        let mut proposed = match serde_json::to_vec_pretty(s) {
+        let value = match serde_json::to_value(s) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let art = match workflow_steps_codec.disk_bytes(&value) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        let json = match crate::cli::pull::common::maybe_strip_overlay(
+            art.json,
+            overlay.and_then(|o| workflow_steps_codec.overlay(o, &composite_key)),
+        ) {
             Ok(b) => b,
             Err(_) => continue,
         };
-        proposed.push(b'\n');
-        let hash = crate::state::content_hash(&proposed);
+        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
         remote_hashes.insert(("workflow_steps".to_string(), composite_key), hash);
     }
     if let Some(map) = lockfile.objects.get("workflow_steps") {
@@ -635,16 +671,28 @@ pub fn from_catalog_scan_lockfile(
     // --- workspaces ---------------------------------------------------
     // Push-capable flat kind. Slug derivation mirrors
     // `pull::workspaces::process`: lockfile-anchored id mapping first,
-    // else `slugify_unique(name, used)`. Hash matches the driver's
-    // canonical form (`serde_json::to_vec_pretty` → `\n` → content_hash);
-    // workspaces have no overlay so no strip step.
+    // else `slugify_unique(name, used)`.
+    //
+    // BUG FIX: the previous adapter hashed workspaces with raw
+    // `serde_json::to_vec_pretty` (which keeps `modified_at`), while the
+    // pull driver writes via the KindCodec which strips `modified_at`
+    // recursively. This caused a workspace whose remote `modified_at`
+    // changed to phantom-drift (RemoteEdit / BothDiverged) even when no
+    // meaningful content changed. Routing through the codec fixes this.
+    //
+    // Workspaces have no overlay (the codec's `overlay()` returns None),
+    // so `maybe_strip_overlay` is a no-op here.
+    //
     // Build a freshly-computed workspace URL → slug map alongside the
     // hash insertion. Queue derivation below uses this map so a
     // first-pull sync can resolve queue.workspace → ws_slug even when
     // the lockfile is still empty (the workspace was just emitted as
     // RemoteCreate one block above; its entry won't land in the
     // lockfile until the executor runs).
-    let mut used_workspace_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let workspaces_codec =
+        crate::snapshot::codec::codec("workspaces").expect("workspaces codec must exist");
+    let mut used_workspace_slugs: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     let mut ws_url_to_slug: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for w in &catalog.workspaces {
@@ -655,12 +703,22 @@ pub fn from_catalog_scan_lockfile(
         used_workspace_slugs.insert(slug.clone());
         ws_url_to_slug.insert(w.url.clone(), slug.clone());
 
-        let mut proposed = match serde_json::to_vec_pretty(w) {
+        let value = match serde_json::to_value(w) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let art = match workspaces_codec.disk_bytes(&value) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        let json = match crate::cli::pull::common::maybe_strip_overlay(
+            art.json,
+            overlay.and_then(|o| workspaces_codec.overlay(o, &slug)),
+        ) {
             Ok(b) => b,
             Err(_) => continue,
         };
-        proposed.push(b'\n');
-        let hash = crate::state::content_hash(&proposed);
+        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
         remote_hashes.insert(("workspaces".to_string(), slug), hash);
     }
     for (slug, path) in &changes.workspaces {
@@ -683,15 +741,16 @@ pub fn from_catalog_scan_lockfile(
     }
 
     // --- engines ------------------------------------------------------
-    // Push-capable flat kind. Engines have an overlay; the pull driver
-    // calls `maybe_strip_overlay` before hashing. The adapter mirrors
-    // that strip so the recomputed remote hash matches the lockfile
-    // base for unchanged envs.
+    // Push-capable flat kind. Engines have an overlay and server-set
+    // fields (`agenda_id`) that are redacted before hashing. Route
+    // through the KindCodec for parity with the pull baseline (the codec
+    // applies both redaction and `modified_at` strip internally).
     //
     // `engine_url_to_slug` is populated here so the engine_fields block
     // below can resolve `field.engine` (a URL) to the engine slug even
     // on a fresh lockfile where `slug_for_url` would otherwise return
     // `None`.
+    let engines_codec = crate::snapshot::codec::codec("engines").expect("engines codec must exist");
     let mut used_engine_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut engine_url_to_slug: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -703,19 +762,22 @@ pub fn from_catalog_scan_lockfile(
         used_engine_slugs.insert(slug.clone());
         engine_url_to_slug.insert(e.url.clone(), slug.clone());
 
-        let mut proposed = match serde_json::to_vec_pretty(e) {
-            Ok(b) => b,
+        let value = match serde_json::to_value(e) {
+            Ok(v) => v,
             Err(_) => continue,
         };
-        proposed.push(b'\n');
-        let proposed = match crate::cli::pull::common::maybe_strip_overlay(
-            proposed,
-            overlay.and_then(|o| o.engine(&slug)),
+        let art = match engines_codec.disk_bytes(&value) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        let json = match crate::cli::pull::common::maybe_strip_overlay(
+            art.json,
+            overlay.and_then(|o| engines_codec.overlay(o, &slug)),
         ) {
             Ok(b) => b,
             Err(_) => continue,
         };
-        let hash = crate::state::content_hash(&proposed);
+        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
         remote_hashes.insert(("engines".to_string(), slug), hash);
     }
     for (slug, path) in &changes.engines {
@@ -739,17 +801,14 @@ pub fn from_catalog_scan_lockfile(
 
     // --- engine_fields ------------------------------------------------
     // Push-capable kind nested under engines. Lockfile key is the composite
-    // `<engine_slug>/<field_slug>` so per-engine slugs stay clean (two
-    // engines can both carry an `Amount` field). Path is
-    // `engines/<engine>/fields/<slug>.json`. The pull driver also skips
-    // orphan fields (no parent engine in the lockfile), but the adapter
-    // emits a key regardless; classifier emits RemoteCreate and the driver
-    // later skips with a warning.
-    //
-    // Overlay strip matches the pull driver so the recomputed remote hash
-    // lines up with the lockfile base for unchanged envs.
-    let mut per_engine_used_ef: std::collections::HashMap<String, std::collections::HashSet<String>> =
-        std::collections::HashMap::new();
+    // `<engine_slug>/<field_slug>`. Route through the KindCodec for hash
+    // parity with the pull baseline.
+    let engine_fields_codec =
+        crate::snapshot::codec::codec("engine_fields").expect("engine_fields codec must exist");
+    let mut per_engine_used_ef: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
     for f in &catalog.engine_fields {
         let Some(engine_slug) = lockfile
             .slug_for_url("engines", &f.engine)
@@ -769,19 +828,22 @@ pub fn from_catalog_scan_lockfile(
         used.insert(field_slug.clone());
         let composite_key = format!("{engine_slug}/{field_slug}");
 
-        let mut proposed = match serde_json::to_vec_pretty(f) {
-            Ok(b) => b,
+        let value = match serde_json::to_value(f) {
+            Ok(v) => v,
             Err(_) => continue,
         };
-        proposed.push(b'\n');
-        let proposed = match crate::cli::pull::common::maybe_strip_overlay(
-            proposed,
-            overlay.and_then(|o| o.engine_field(&composite_key)),
+        let art = match engine_fields_codec.disk_bytes(&value) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        let json = match crate::cli::pull::common::maybe_strip_overlay(
+            art.json,
+            overlay.and_then(|o| engine_fields_codec.overlay(o, &composite_key)),
         ) {
             Ok(b) => b,
             Err(_) => continue,
         };
-        let hash = crate::state::content_hash(&proposed);
+        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
         remote_hashes.insert(("engine_fields".to_string(), composite_key), hash);
     }
     for (slug, path) in &changes.engine_fields {
@@ -815,18 +877,11 @@ pub fn from_catalog_scan_lockfile(
 
     // --- hooks --------------------------------------------------------
     // Push-capable split-file kind: `<slug>.json` + optional `<slug>.py`
-    // (the extracted `config.code`). The canonical hash combines both —
-    // `hook_combined_hash(json_bytes, code)` — and is what both the pull
-    // driver and the push scanner record. Slug derivation mirrors
-    // `pull::hooks::process`: lockfile-anchored id mapping first, else
-    // `slugify_unique(name, used)`.
-    //
-    // Overlay strip mirrors `pull::hooks::process`: serialize → strip
-    // overlay-managed paths from JSON → hash json+code. Without the
-    // strip, an env with any hook overlay configured would always see
-    // the recomputed remote hash differ from the lockfile base (which
-    // was recorded post-strip) and the classifier would emit spurious
-    // RemoteEdit / BothDiverged.
+    // (the extracted `config.code`). Route through the KindCodec for hash
+    // parity with the pull baseline. The codec extracts the code sidecar
+    // and `combined_hash` folds it in, matching the combined hash the pull
+    // driver records.
+    let hooks_codec = crate::snapshot::codec::codec("hooks").expect("hooks codec must exist");
     let mut used_hook_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for h in &catalog.hooks {
         let slug = match lockfile.slug_for_id("hooks", h.id) {
@@ -835,21 +890,22 @@ pub fn from_catalog_scan_lockfile(
         };
         used_hook_slugs.insert(slug.clone());
 
-        // Reproduce the pull driver's canonical bytes: serialize → strip
-        // `config.code` into `code` → strip overlay paths from JSON →
-        // trailing newline already applied by serialize.
-        let (json_bytes, code) = match crate::snapshot::hook::serialize_hook(h) {
-            Ok(pair) => pair,
+        let value = match serde_json::to_value(h) {
+            Ok(v) => v,
             Err(_) => continue,
         };
-        let json_bytes = match crate::cli::pull::common::maybe_strip_overlay(
-            json_bytes,
-            overlay.and_then(|o| o.hook(&slug)),
+        let art = match hooks_codec.disk_bytes(&value) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        let json = match crate::cli::pull::common::maybe_strip_overlay(
+            art.json,
+            overlay.and_then(|o| hooks_codec.overlay(o, &slug)),
         ) {
             Ok(b) => b,
             Err(_) => continue,
         };
-        let hash = crate::state::hook_combined_hash(&json_bytes, &code);
+        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
         remote_hashes.insert(("hooks".to_string(), slug), hash);
     }
     for (slug, json_path) in &changes.hooks {
@@ -888,10 +944,9 @@ pub fn from_catalog_scan_lockfile(
 
     // --- rules --------------------------------------------------------
     // Push-capable split-file kind, identical shape to hooks except the
-    // code lives in `trigger_condition` (top-level) rather than
-    // `config.code`. The canonical hash is `rule_combined_hash`. Slug
-    // derivation mirrors `pull::rules::process`. Overlay strip applied
-    // for the same parity-with-pull reason as hooks.
+    // code lives in `trigger_condition`. Route through the KindCodec for
+    // hash parity with the pull baseline.
+    let rules_codec = crate::snapshot::codec::codec("rules").expect("rules codec must exist");
     let mut used_rule_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for r in &catalog.rules {
         let slug = match lockfile.slug_for_id("rules", r.id) {
@@ -900,18 +955,22 @@ pub fn from_catalog_scan_lockfile(
         };
         used_rule_slugs.insert(slug.clone());
 
-        let (json_bytes, code) = match crate::snapshot::rule::serialize_rule(r) {
-            Ok(pair) => pair,
+        let value = match serde_json::to_value(r) {
+            Ok(v) => v,
             Err(_) => continue,
         };
-        let json_bytes = match crate::cli::pull::common::maybe_strip_overlay(
-            json_bytes,
-            overlay.and_then(|o| o.rule(&slug)),
+        let art = match rules_codec.disk_bytes(&value) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        let json = match crate::cli::pull::common::maybe_strip_overlay(
+            art.json,
+            overlay.and_then(|o| rules_codec.overlay(o, &slug)),
         ) {
             Ok(b) => b,
             Err(_) => continue,
         };
-        let hash = crate::state::rule_combined_hash(&json_bytes, &code);
+        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
         remote_hashes.insert(("rules".to_string(), slug), hash);
     }
     for (slug, json_path) in &changes.rules {
@@ -940,35 +999,24 @@ pub fn from_catalog_scan_lockfile(
     }
 
     // --- queues / schemas / inboxes / email_templates -----------------
-    // Queue-nested kinds share a slug-derivation pass: the queue slug
-    // (lockfile id lookup → `slugify_unique(name, per_ws_used)`) keys
-    // `queues`, `schemas`, and `inboxes` in the lockfile. Email templates
-    // use a compound `<ws>/<q>/<tpl>` slug per `pull::email_templates::process`.
-    //
-    // The remote hash for each kind mirrors the pull driver's canonical
-    // bytes:
-    //   queues   → `redacted_disk_bytes(q)` (redact `counts`) + strip + `content_hash`
-    //   schemas  → `serialize_schema` → strip → `schema_combined_hash(json, formulas)`
-    //   inboxes  → `serde_json::to_vec_pretty(i)` + `\n` + strip + `content_hash`
-    //   email_tpl→ `serde_json::to_vec_pretty(t)` + `\n` + strip + `content_hash`
-    //
-    // The `catalog.schemas_by_queue_id` / `inboxes_by_queue_id` maps were
-    // populated in `list_remote`; we look up by queue id. Schema bodies are
-    // fetched per id (the `/schemas` list omits `content`); inboxes come from
-    // the bulk `/inboxes` list.
-    //
-    // Overlay strip on each branch keeps the recomputed remote hash in
-    // parity with the lockfile base (which was recorded post-strip on
-    // last pull).
-    let mut per_ws_used_q_slugs: std::collections::HashMap<String, std::collections::HashSet<String>> =
-        std::collections::HashMap::new();
+    // Queue-nested kinds share a slug-derivation pass. All remote hashes
+    // route through the KindCodec for parity with the pull baseline.
+    let queues_codec = crate::snapshot::codec::codec("queues").expect("queues codec must exist");
+    let schemas_codec = crate::snapshot::codec::codec("schemas").expect("schemas codec must exist");
+    let inboxes_codec = crate::snapshot::codec::codec("inboxes").expect("inboxes codec must exist");
+    let mut per_ws_used_q_slugs: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
     // Build per-queue (ws_slug, q_slug, q.id, q.url) tuples so the
     // email_templates block can look up its compound key without
     // re-deriving slugs.
     let mut q_url_to_ws_q: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
     for q in &catalog.queues {
-        let Some(ws_url) = q.workspace.as_ref() else { continue };
+        let Some(ws_url) = q.workspace.as_ref() else {
+            continue;
+        };
         // Prefer the freshly-computed catalog mapping (so first-pull syncs
         // resolve queue.workspace even when the lockfile is empty); fall
         // back to the lockfile for cross-env re-attribution scenarios where
@@ -994,49 +1042,46 @@ pub fn from_catalog_scan_lockfile(
         used.insert(q_slug.clone());
         q_url_to_ws_q.insert(q.url.clone(), (ws_slug.clone(), q_slug.clone()));
 
-        // queues — flat JSON. Must mirror the pull driver's canonical on-disk
-        // bytes, which redact server-set runtime fields (`counts`). Serializing
-        // the raw queue here instead made live `counts` churn read as remote
-        // drift, surfacing a spurious queue.json conflict.
-        let q_proposed = match crate::snapshot::create::redacted_disk_bytes(q, "queues") {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let q_proposed = match crate::cli::pull::common::maybe_strip_overlay(
-            q_proposed,
-            overlay.and_then(|o| o.queue(&q_slug)),
-        ) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let q_hash = crate::state::content_hash(&q_proposed);
-        remote_hashes.insert(("queues".to_string(), q_slug.clone()), q_hash);
+        // queues — route through the KindCodec (redacts `counts`,
+        // strips `modified_at`) for hash parity with the pull baseline.
+        if let Ok(q_value) = serde_json::to_value(q)
+            && let Ok(q_art) = queues_codec.disk_bytes(&q_value)
+            && let Ok(q_json) = crate::cli::pull::common::maybe_strip_overlay(
+                q_art.json,
+                overlay.and_then(|o| queues_codec.overlay(o, &q_slug)),
+            )
+        {
+            let q_hash = crate::snapshot::codec::combined_hash(&q_json, &q_art.sidecars);
+            remote_hashes.insert(("queues".to_string(), q_slug.clone()), q_hash);
+        }
 
-        // schemas — combined (json + formulas). Pre-fetched in `list_remote`.
+        // schemas — combined (json + formulas). The composite slug for
+        // schemas is `<ws_slug>/<q_slug>` (matching the lockfile key).
+        let schema_composite = format!("{ws_slug}/{q_slug}");
         if let Some(schema) = catalog.schemas_by_queue_id.get(&q.id)
-            && let Ok((schema_json_bytes, schema_formulas)) =
-                crate::snapshot::schema::serialize_schema(schema)
-                && let Ok(schema_json_bytes) = crate::cli::pull::common::maybe_strip_overlay(
-                    schema_json_bytes,
-                    overlay.and_then(|o| o.schema(&q_slug)),
-                ) {
-                    let schema_hash =
-                        crate::state::schema_combined_hash(&schema_json_bytes, &schema_formulas);
-                    remote_hashes.insert(("schemas".to_string(), q_slug.clone()), schema_hash);
-                }
+            && let Ok(s_value) = serde_json::to_value(schema)
+            && let Ok(s_art) = schemas_codec.disk_bytes(&s_value)
+            && let Ok(s_json) = crate::cli::pull::common::maybe_strip_overlay(
+                s_art.json,
+                overlay.and_then(|o| schemas_codec.overlay(o, &schema_composite)),
+            )
+        {
+            let s_hash = crate::snapshot::codec::combined_hash(&s_json, &s_art.sidecars);
+            remote_hashes.insert(("schemas".to_string(), q_slug.clone()), s_hash);
+        }
 
-        // inboxes — flat JSON. Only present for queues that have an inbox.
+        // inboxes — route through the KindCodec for hash parity.
         if let Some(inbox) = catalog.inboxes_by_queue_id.get(&q.id)
-            && let Ok(mut inbox_proposed) = serde_json::to_vec_pretty(inbox) {
-                inbox_proposed.push(b'\n');
-                if let Ok(inbox_proposed) = crate::cli::pull::common::maybe_strip_overlay(
-                    inbox_proposed,
-                    overlay.and_then(|o| o.inbox(&q_slug)),
-                ) {
-                    let inbox_hash = crate::state::content_hash(&inbox_proposed);
-                    remote_hashes.insert(("inboxes".to_string(), q_slug.clone()), inbox_hash);
-                }
-            }
+            && let Ok(i_value) = serde_json::to_value(inbox)
+            && let Ok(i_art) = inboxes_codec.disk_bytes(&i_value)
+            && let Ok(i_json) = crate::cli::pull::common::maybe_strip_overlay(
+                i_art.json,
+                overlay.and_then(|o| inboxes_codec.overlay(o, &q_slug)),
+            )
+        {
+            let i_hash = crate::snapshot::codec::combined_hash(&i_json, &i_art.sidecars);
+            remote_hashes.insert(("inboxes".to_string(), q_slug.clone()), i_hash);
+        }
     }
 
     // Scan-side hashes for queues / inboxes (flat) and schemas (combined).
@@ -1059,7 +1104,9 @@ pub fn from_catalog_scan_lockfile(
     for (slug, schema_path) in &changes.schemas {
         // The push scanner stores the path to `schema.json`; the formulas
         // sit in a sibling `formulas/` dir. Mirror `scan_schemas`.
-        let Ok(json_bytes) = std::fs::read(schema_path) else { continue };
+        let Ok(json_bytes) = std::fs::read(schema_path) else {
+            continue;
+        };
         let queue_dir = match schema_path.parent() {
             Some(p) => p,
             None => continue,
@@ -1101,44 +1148,47 @@ pub fn from_catalog_scan_lockfile(
         }
     }
 
-    // email_templates — compound slug `<ws>/<q>/<tpl>`. Mirrors
-    // `pull::email_templates::process`'s `lockfile_key` derivation:
-    // look up the queue's (ws_slug, q_slug) by queue URL, then pick the
-    // template slug (lockfile id lookup → `slugify_unique` per queue).
+    // email_templates — compound slug `<ws>/<q>/<tpl>`. Route through the
+    // KindCodec for hash parity with the pull baseline.
+    let email_templates_codec =
+        crate::snapshot::codec::codec("email_templates").expect("email_templates codec must exist");
     let mut per_queue_used_t_slugs: std::collections::HashMap<
         (String, String),
         std::collections::HashSet<String>,
     > = std::collections::HashMap::new();
     for t in &catalog.email_templates {
-        let Some(queue_url) = t.queue.as_ref() else { continue };
-        let Some((ws_slug, q_slug)) = q_url_to_ws_q.get(queue_url).cloned() else { continue };
+        let Some(queue_url) = t.queue.as_ref() else {
+            continue;
+        };
+        let Some((ws_slug, q_slug)) = q_url_to_ws_q.get(queue_url).cloned() else {
+            continue;
+        };
         let used = per_queue_used_t_slugs
             .entry((ws_slug.clone(), q_slug.clone()))
             .or_default();
         let template_slug = match lockfile.slug_for_id("email_templates", t.id) {
-            Some(existing) => existing
-                .rsplit('/')
-                .next()
-                .unwrap_or(existing)
-                .to_string(),
+            Some(existing) => existing.rsplit('/').next().unwrap_or(existing).to_string(),
             None => crate::slug::slugify_unique(&t.name, used),
         };
         used.insert(template_slug.clone());
         let compound = format!("{ws_slug}/{q_slug}/{template_slug}");
 
-        let mut proposed = match serde_json::to_vec_pretty(t) {
-            Ok(b) => b,
+        let value = match serde_json::to_value(t) {
+            Ok(v) => v,
             Err(_) => continue,
         };
-        proposed.push(b'\n');
-        let proposed = match crate::cli::pull::common::maybe_strip_overlay(
-            proposed,
-            overlay.and_then(|o| o.email_template(&compound)),
+        let art = match email_templates_codec.disk_bytes(&value) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        let json = match crate::cli::pull::common::maybe_strip_overlay(
+            art.json,
+            overlay.and_then(|o| email_templates_codec.overlay(o, &compound)),
         ) {
             Ok(b) => b,
             Err(_) => continue,
         };
-        let hash = crate::state::content_hash(&proposed);
+        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
         remote_hashes.insert(("email_templates".to_string(), compound), hash);
     }
     for (slug, path) in &changes.email_templates {
@@ -1171,7 +1221,7 @@ mod tests {
     use crate::model::Hook;
     use crate::paths::Paths;
     use crate::snapshot::hook::serialize_hook;
-    use crate::state::{hook_combined_hash, Lockfile, ObjectEntry};
+    use crate::state::{Lockfile, ObjectEntry, hook_combined_hash};
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -1228,9 +1278,13 @@ mod tests {
     /// Hash a hook the way the pull driver does (serialize + optional
     /// overlay strip + `hook_combined_hash`) so the test seeds the
     /// lockfile with the same base hash production would have written.
-    fn pull_driver_hash(h: &Hook, overlay_paths: Option<&BTreeMap<String, serde_json::Value>>) -> String {
+    fn pull_driver_hash(
+        h: &Hook,
+        overlay_paths: Option<&BTreeMap<String, serde_json::Value>>,
+    ) -> String {
         let (json_bytes, code) = serialize_hook(h).unwrap();
-        let stripped = crate::cli::pull::common::maybe_strip_overlay(json_bytes, overlay_paths).unwrap();
+        let stripped =
+            crate::cli::pull::common::maybe_strip_overlay(json_bytes, overlay_paths).unwrap();
         hook_combined_hash(&stripped, &code)
     }
 
@@ -1446,7 +1500,10 @@ mod tests {
             item.class,
             SyncClass::Clean,
             "no-op env must classify as Clean; got {:?} (local_hash={:?}, remote_hash={:?}, base_hash={:?})",
-            item.class, item.local_hash, item.remote_hash, item.base_hash,
+            item.class,
+            item.local_hash,
+            item.remote_hash,
+            item.base_hash,
         );
     }
 
@@ -1561,7 +1618,10 @@ mod tests {
             SyncClass::BothDiverged,
             "with overlay configured and both sides edited, must classify as BothDiverged; \
              got {:?} (local_hash={:?}, remote_hash={:?}, base_hash={:?})",
-            item.class, item.local_hash, item.remote_hash, item.base_hash,
+            item.class,
+            item.local_hash,
+            item.remote_hash,
+            item.base_hash,
         );
     }
 }

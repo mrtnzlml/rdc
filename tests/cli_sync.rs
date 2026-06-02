@@ -5827,3 +5827,159 @@ async fn sync_hook_with_overlay_no_phantom_drift() {
         "on-disk hook file must be unchanged after second sync (no phantom drift)"
     );
 }
+
+/// Regression (bug b): workspace phantom drift when `modified_at` changes.
+///
+/// Before the fix, the sync adapter hashed workspaces using raw
+/// `serde_json::to_vec_pretty` (which keeps `modified_at`), while the pull
+/// driver writes via the `KindCodec` which strips `modified_at` recursively.
+/// The result: a workspace whose remote `modified_at` changed (a normal API
+/// side-effect, e.g. after updating a queue) would be classified `RemoteEdit`
+/// or `BothDiverged` on the next sync even though no meaningful content
+/// changed — phantom drift.
+///
+/// After the fix, the adapter routes through the same KindCodec as the pull
+/// driver, so `modified_at` is stripped before hashing on both sides.
+///
+/// Test strategy: sync once to record the baseline, then serve the same
+/// workspace body with a bumped `modified_at` and assert the second sync
+/// classifies it `Clean` (no writes, no file rewrites, no lockfile changes).
+#[tokio::test]
+async fn sync_workspace_modified_at_change_is_clean() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // Initial workspace served on the first sync. The `modified_at` is
+    // deliberately included — the pull driver strips it before hashing.
+    let workspace_body_v1 = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 900,
+                "url": format!("{}/api/v1/workspaces/900", server.uri()),
+                "name": "Phantom Drift Test",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "queues": [],
+                "modified_at": "2026-01-01T10:00:00Z"
+            }
+        ]
+    });
+    // Second listing: same workspace, bumped `modified_at` only. No other
+    // content change. The classifier MUST see this as Clean.
+    let workspace_body_v2 = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 900,
+                "url": format!("{}/api/v1/workspaces/900", server.uri()),
+                "name": "Phantom Drift Test",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "queues": [],
+                "modified_at": "2026-06-01T20:00:00Z"
+            }
+        ]
+    });
+
+    // First call returns v1, second call returns v2 (bumped modified_at).
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&workspace_body_v1))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&workspace_body_v2))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/workspaces"]).await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // First sync: pull writes the workspace (modified_at stripped) and
+    // records the post-strip hash in the lockfile.
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("first sync should succeed");
+
+    let ws_path = project
+        .path()
+        .join("envs/dev/workspaces/phantom-drift-test/workspace.json");
+    assert!(
+        ws_path.exists(),
+        "workspace file must exist after first sync"
+    );
+
+    // Verify `modified_at` is absent from the on-disk file (the codec strips it).
+    let disk_json = std::fs::read_to_string(&ws_path).unwrap();
+    assert!(
+        !disk_json.contains("modified_at"),
+        "on-disk workspace must not contain modified_at; got: {disk_json}"
+    );
+
+    // Snapshot lockfile and on-disk file bytes for the post-second-sync diff.
+    let lf_before =
+        std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    let disk_before = std::fs::read_to_string(&ws_path).unwrap();
+
+    // Second sync: API now serves the workspace with a bumped `modified_at`.
+    // The classifier MUST see Clean (no RemoteEdit, no file rewrite, no
+    // lockfile mutation). This is the phantom-drift regression.
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("second sync should succeed (clean state despite bumped modified_at)");
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    // No mutating requests on either sync.
+    for req in server.received_requests().await.unwrap_or_default() {
+        let p = req.url.path();
+        if p.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "unexpected mutating request: {} {} — bumped modified_at must not cause phantom drift",
+            req.method,
+            p
+        );
+    }
+
+    // Lockfile and on-disk file are unchanged after the second sync.
+    let lf_after =
+        std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    let disk_after = std::fs::read_to_string(&ws_path).unwrap();
+    assert_eq!(
+        lf_before, lf_after,
+        "lockfile must be unchanged after second sync (workspace modified_at bump is not a change)"
+    );
+    assert_eq!(
+        disk_before, disk_after,
+        "on-disk workspace must be unchanged after second sync (phantom drift fix)"
+    );
+}
