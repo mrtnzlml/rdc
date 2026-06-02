@@ -1,12 +1,13 @@
 use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::log::{Action, Log};
-use crate::overlay::{apply_overrides, Overlay};
+use crate::overlay::{Overlay, apply_overrides};
 use crate::paths::Paths;
 
+use crate::snapshot::codec::combined_hash;
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::writer::write_atomic;
-use crate::state::{content_hash, Lockfile, ObjectEntry};
+use crate::state::{Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -32,23 +33,31 @@ pub async fn push(
         let overlay_paths = overlay.as_ref().and_then(|ov| ov.label(slug));
 
         // Missing lockfile entry → new label, POST.
-        if lockfile.objects.get("labels").and_then(|m| m.get(slug.as_str())).is_none() {
-            let disk_bytes = std::fs::read(path)
-                .with_context(|| format!("reading {}", path.display()))?;
+        if lockfile
+            .objects
+            .get("labels")
+            .and_then(|m| m.get(slug.as_str()))
+            .is_none()
+        {
+            let disk_bytes =
+                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
             let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
                 .with_context(|| format!("parsing {}", path.display()))?;
             if let Some(p) = overlay_paths {
                 apply_overrides(&mut payload, p);
             }
             strip_for_create(&mut payload, "labels");
-            let result = client.create_label(&payload, Some(progress.clone())).await
+            let result = client
+                .create_label(&payload, Some(progress.clone()))
+                .await
                 .with_context(|| format!("POST /labels (creating '{slug}')"));
             let created = result?;
-            let mut created_bytes = serde_json::to_vec_pretty(&created)
-                .context("serializing created label")?;
-            created_bytes.push(b'\n');
-            let created_bytes = maybe_strip_overlay(created_bytes, overlay_paths)?;
-            let created_hash = content_hash(&created_bytes);
+            let codec = crate::snapshot::codec::codec("labels").unwrap();
+            let created_art = codec
+                .disk_bytes(&serde_json::to_value(&created).context("serializing created label")?)
+                .context("codec disk_bytes for created label")?;
+            let created_bytes = maybe_strip_overlay(created_art.json, overlay_paths)?;
+            let created_hash = combined_hash(&created_bytes, &created_art.sidecars);
             write_atomic(path, &created_bytes)
                 .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
             lockfile.upsert(
@@ -67,9 +76,13 @@ pub async fn push(
             continue;
         }
 
-        let disk_bytes = std::fs::read(path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let entry = lockfile.objects.get("labels").and_then(|m| m.get(slug.as_str())).unwrap();
+        let disk_bytes =
+            std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let entry = lockfile
+            .objects
+            .get("labels")
+            .and_then(|m| m.get(slug.as_str()))
+            .unwrap();
         let Some(base) = &entry.content_hash else {
             progress.event(Action::Skip, &format!("label/{slug} (no content_hash)"));
             skipped += 1;
@@ -88,25 +101,36 @@ pub async fn push(
             .with_context(|| format!("deserializing overlay-applied label '{slug}'"))?;
 
         if remote_labels.is_none() {
-            remote_labels = Some(client.list_labels(Some(progress.clone())).await
-                .context("listing labels to verify no drift before push")?);
+            remote_labels = Some(
+                client
+                    .list_labels(Some(progress.clone()))
+                    .await
+                    .context("listing labels to verify no drift before push")?,
+            );
         }
         let remote_list = remote_labels.as_ref().unwrap();
         let Some(remote_label) = remote_list.iter().find(|l| l.id == id) else {
-            progress.event(Action::Skip, &format!("label/{slug} (remote id {id} missing)"));
+            progress.event(
+                Action::Skip,
+                &format!("label/{slug} (remote id {id} missing)"),
+            );
             skipped += 1;
             continue;
         };
-        let mut remote_bytes = serde_json::to_vec_pretty(remote_label)
-            .context("serializing remote label")?;
-        remote_bytes.push(b'\n');
-        let remote_bytes = maybe_strip_overlay(remote_bytes, overlay_paths)?;
-        let remote_combined = content_hash(&remote_bytes);
+        let codec = crate::snapshot::codec::codec("labels").unwrap();
+        let remote_art = codec
+            .disk_bytes(
+                &serde_json::to_value(remote_label)
+                    .context("serializing remote label for drift check")?,
+            )
+            .context("codec disk_bytes for remote label")?;
+        let remote_bytes = maybe_strip_overlay(remote_art.json, overlay_paths)?;
+        let remote_combined = combined_hash(&remote_bytes, &remote_art.sidecars);
         let mut payload_to_send = payload_label;
         if remote_combined != base {
             // Drift detected. Spec §7.3 step 5: prompt on TTY; fall back
             // to legacy skip+warn otherwise.
-            use crate::cli::resolve::{resolve_push_drift, PushDriftOutcome};
+            use crate::cli::resolve::{PushDriftOutcome, resolve_push_drift};
             match resolve_push_drift(interactive, path, &remote_bytes, env)? {
                 PushDriftOutcome::Patch { payload_override } => {
                     if let Some(bytes) = payload_override {
@@ -129,27 +153,39 @@ pub async fn push(
                             secrets_hash: None,
                         },
                     );
-                    progress.event(Action::Warn, &format!("label/{slug} adopted remote (drift)"));
+                    progress.event(
+                        Action::Warn,
+                        &format!("label/{slug} adopted remote (drift)"),
+                    );
                     skipped += 1;
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    progress.event(Action::Skip, &format!("label/{slug} (remote changed; rdc sync first)"));
+                    progress.event(
+                        Action::Skip,
+                        &format!("label/{slug} (remote changed; rdc sync first)"),
+                    );
                     skipped += 1;
                     continue;
                 }
             }
         }
 
-        let result = client.update_label(id, &payload_to_send, Some(progress.clone())).await
+        let result = client
+            .update_label(id, &payload_to_send, Some(progress.clone()))
+            .await
             .with_context(|| format!("PATCH /labels/{id}"));
         let updated = result?;
 
-        let mut updated_bytes = serde_json::to_vec_pretty(&updated)
-            .context("serializing updated label")?;
-        updated_bytes.push(b'\n');
-        let updated_bytes = maybe_strip_overlay(updated_bytes, overlay_paths)?;
-        let updated_hash = content_hash(&updated_bytes);
+        let codec = crate::snapshot::codec::codec("labels").unwrap();
+        let updated_art = codec
+            .disk_bytes(
+                &serde_json::to_value(&updated)
+                    .context("serializing updated label for disk write")?,
+            )
+            .context("codec disk_bytes for updated label")?;
+        let updated_bytes = maybe_strip_overlay(updated_art.json, overlay_paths)?;
+        let updated_hash = combined_hash(&updated_bytes, &updated_art.sidecars);
         crate::state::base_cache::write_disk_and_cache(paths, path, &updated_bytes)
             .with_context(|| format!("writing post-push canonical form for '{slug}'"))?;
 

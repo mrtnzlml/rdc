@@ -1,12 +1,13 @@
 use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::log::{Action, Log};
-use crate::overlay::{apply_overrides, Overlay};
+use crate::overlay::{Overlay, apply_overrides};
 use crate::paths::Paths;
 
+use crate::snapshot::codec::combined_hash;
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::writer::write_atomic;
-use crate::state::{content_hash, Lockfile, ObjectEntry};
+use crate::state::{Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -30,7 +31,12 @@ pub async fn push(
         let overlay_paths = overlay.as_ref().and_then(|ov| ov.inbox(q_slug));
 
         // Missing lockfile entry → new inbox, POST.
-        if lockfile.objects.get("inboxes").and_then(|m| m.get(q_slug.as_str())).is_none() {
+        if lockfile
+            .objects
+            .get("inboxes")
+            .and_then(|m| m.get(q_slug.as_str()))
+            .is_none()
+        {
             let disk_bytes = std::fs::read(inbox_path)
                 .with_context(|| format!("reading {}", inbox_path.display()))?;
             let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
@@ -39,16 +45,20 @@ pub async fn push(
                 apply_overrides(&mut payload, p);
             }
             strip_for_create(&mut payload, "inboxes");
-            let create_result = client.create_inbox(&payload, Some(progress.clone())).await
+            let create_result = client
+                .create_inbox(&payload, Some(progress.clone()))
+                .await
                 .with_context(|| format!("POST /inboxes (creating for queue '{q_slug}')"));
             let created = create_result?;
-            let mut created_bytes = serde_json::to_vec_pretty(&created)
-                .context("serializing created inbox")?;
-            created_bytes.push(b'\n');
-            let created_bytes = maybe_strip_overlay(created_bytes, overlay_paths)?;
-            let created_hash = content_hash(&created_bytes);
-            write_atomic(inbox_path, &created_bytes)
-                .with_context(|| format!("writing post-create canonical form for inbox '{q_slug}'"))?;
+            let codec = crate::snapshot::codec::codec("inboxes").unwrap();
+            let created_art = codec
+                .disk_bytes(&serde_json::to_value(&created).context("serializing created inbox")?)
+                .context("codec disk_bytes for created inbox")?;
+            let created_bytes = maybe_strip_overlay(created_art.json, overlay_paths)?;
+            let created_hash = combined_hash(&created_bytes, &created_art.sidecars);
+            write_atomic(inbox_path, &created_bytes).with_context(|| {
+                format!("writing post-create canonical form for inbox '{q_slug}'")
+            })?;
             lockfile.upsert(
                 "inboxes",
                 q_slug,
@@ -67,7 +77,11 @@ pub async fn push(
 
         let disk_bytes = std::fs::read(inbox_path)
             .with_context(|| format!("reading {}", inbox_path.display()))?;
-        let entry = lockfile.objects.get("inboxes").and_then(|m| m.get(q_slug.as_str())).unwrap();
+        let entry = lockfile
+            .objects
+            .get("inboxes")
+            .and_then(|m| m.get(q_slug.as_str()))
+            .unwrap();
         let Some(base) = &entry.content_hash else {
             progress.event(Action::Skip, &format!("inbox/{q_slug} (no content_hash)"));
             skipped += 1;
@@ -84,16 +98,22 @@ pub async fn push(
             .with_context(|| format!("deserializing overlay-applied inbox '{q_slug}'"))?;
 
         let id = entry.id;
-        let remote_inbox = client.get_inbox(id, Some(progress.clone())).await
+        let remote_inbox = client
+            .get_inbox(id, Some(progress.clone()))
+            .await
             .with_context(|| format!("fetching inbox {id} to verify drift before push"))?;
-        let mut remote_bytes = serde_json::to_vec_pretty(&remote_inbox)
-            .context("serializing remote inbox")?;
-        remote_bytes.push(b'\n');
-        let remote_bytes = maybe_strip_overlay(remote_bytes, overlay_paths)?;
-        let remote_combined = content_hash(&remote_bytes);
+        let codec = crate::snapshot::codec::codec("inboxes").unwrap();
+        let remote_art = codec
+            .disk_bytes(
+                &serde_json::to_value(&remote_inbox)
+                    .context("serializing remote inbox for drift check")?,
+            )
+            .context("codec disk_bytes for remote inbox")?;
+        let remote_bytes = maybe_strip_overlay(remote_art.json, overlay_paths)?;
+        let remote_combined = combined_hash(&remote_bytes, &remote_art.sidecars);
         let mut payload_to_send = payload_inbox;
         if remote_combined != base {
-            use crate::cli::resolve::{resolve_push_drift, PushDriftOutcome};
+            use crate::cli::resolve::{PushDriftOutcome, resolve_push_drift};
             match resolve_push_drift(interactive, inbox_path, &remote_bytes, env)? {
                 PushDriftOutcome::Patch { payload_override } => {
                     if let Some(bytes) = payload_override {
@@ -102,8 +122,9 @@ pub async fn push(
                     }
                 }
                 PushDriftOutcome::Adopt => {
-                    write_atomic(inbox_path, &remote_bytes)
-                        .with_context(|| format!("adopting remote into {}", inbox_path.display()))?;
+                    write_atomic(inbox_path, &remote_bytes).with_context(|| {
+                        format!("adopting remote into {}", inbox_path.display())
+                    })?;
                     lockfile.upsert(
                         "inboxes",
                         q_slug,
@@ -115,27 +136,39 @@ pub async fn push(
                             secrets_hash: None,
                         },
                     );
-                    progress.event(Action::Warn, &format!("inbox/{q_slug} adopted remote (drift)"));
+                    progress.event(
+                        Action::Warn,
+                        &format!("inbox/{q_slug} adopted remote (drift)"),
+                    );
                     skipped += 1;
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    progress.event(Action::Skip, &format!("inbox/{q_slug} (remote changed; rdc sync first)"));
+                    progress.event(
+                        Action::Skip,
+                        &format!("inbox/{q_slug} (remote changed; rdc sync first)"),
+                    );
                     skipped += 1;
                     continue;
                 }
             }
         }
 
-        let patch_result = client.update_inbox(id, &payload_to_send, Some(progress.clone())).await
+        let patch_result = client
+            .update_inbox(id, &payload_to_send, Some(progress.clone()))
+            .await
             .with_context(|| format!("PATCH /inboxes/{id}"));
         let updated = patch_result?;
 
-        let mut updated_bytes = serde_json::to_vec_pretty(&updated)
-            .context("serializing updated inbox")?;
-        updated_bytes.push(b'\n');
-        let updated_bytes = maybe_strip_overlay(updated_bytes, overlay_paths)?;
-        let updated_hash = content_hash(&updated_bytes);
+        let codec = crate::snapshot::codec::codec("inboxes").unwrap();
+        let updated_art = codec
+            .disk_bytes(
+                &serde_json::to_value(&updated)
+                    .context("serializing updated inbox for disk write")?,
+            )
+            .context("codec disk_bytes for updated inbox")?;
+        let updated_bytes = maybe_strip_overlay(updated_art.json, overlay_paths)?;
+        let updated_hash = combined_hash(&updated_bytes, &updated_art.sidecars);
         crate::state::base_cache::write_disk_and_cache(paths, inbox_path, &updated_bytes)
             .with_context(|| format!("writing post-push canonical form for inbox '{q_slug}'"))?;
 
