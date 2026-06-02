@@ -9,8 +9,8 @@
 //! (lockfile, queue_locations, conflict counts).
 
 use super::common::{
-    apply_pull_action, decide_pull_action, maybe_strip_overlay,
-    record_object, skip_on_permission_denied, PullAction, PullCtx,
+    PullAction, PullCtx, apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
+    skip_on_permission_denied,
 };
 use crate::log::{Action, Log};
 use crate::model::{Inbox, Queue, Schema};
@@ -18,6 +18,10 @@ use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+
+const KIND_QUEUES: &str = "queues";
+const KIND_SCHEMAS: &str = "schemas";
+const KIND_INBOXES: &str = "inboxes";
 
 /// Counts of objects pulled by the queues driver.
 pub struct QueueCounts {
@@ -41,8 +45,11 @@ struct QueueWork<'a> {
 /// Phase 1: list all queues from the API.
 pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<Log>) -> Result<Vec<Queue>> {
     skip_on_permission_denied(
-        ctx.client.list_queues(Some(progress.clone())).await.context("listing queues"),
-        "queues",
+        ctx.client
+            .list_queues(Some(progress.clone()))
+            .await
+            .context("listing queues"),
+        KIND_QUEUES,
         progress,
     )
 }
@@ -77,7 +84,12 @@ pub async fn process(
     progress: &Arc<Log>,
 ) -> Result<QueueCounts> {
     let mut per_ws_used_slugs: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut counts = QueueCounts { queues: 0, schemas: 0, inboxes: 0, conflicts: 0 };
+    let mut counts = QueueCounts {
+        queues: 0,
+        schemas: 0,
+        inboxes: 0,
+        conflicts: 0,
+    };
 
     // === Sub-phase A: filter, slug, queue.json write, build work list ===
     let mut work: Vec<QueueWork> = Vec::new();
@@ -92,74 +104,93 @@ pub async fn process(
         };
 
         let used = per_ws_used_slugs.entry(ws_slug.clone()).or_default();
-        let q_slug = match ctx.lockfile.slug_for_id("queues", q.id) {
+        let q_slug = match ctx.lockfile.slug_for_id(KIND_QUEUES, q.id) {
             Some(existing) => existing.to_string(),
             None => slugify_unique(&q.name, used),
         };
         used.insert(q_slug.clone());
 
-        if !subset.contains(&("queues".to_string(), q_slug.clone())) {
+        if !subset.contains(&(KIND_QUEUES.to_string(), q_slug.clone())) {
             continue;
         }
 
         let queue_result: Result<()> = (|| {
+            let queue_dir = ctx.paths.queue_dir(&ws_slug, &q_slug);
+            std::fs::create_dir_all(&queue_dir)
+                .with_context(|| format!("creating {}", queue_dir.display()))?;
 
-        let queue_dir = ctx.paths.queue_dir(&ws_slug, &q_slug);
-        std::fs::create_dir_all(&queue_dir)
-            .with_context(|| format!("creating {}", queue_dir.display()))?;
+            ctx.queue_locations
+                .insert(q.url.clone(), (ws_slug.clone(), q_slug.clone()));
 
-        ctx.queue_locations.insert(q.url.clone(), (ws_slug.clone(), q_slug.clone()));
+            // queue.json — three-way write via KindCodec (strips modified_at +
+            // redacts counts).
+            let queue_path = queue_dir.join("queue.json");
+            let value = serde_json::to_value(q)?;
+            let art = crate::snapshot::codec::codec(KIND_QUEUES)
+                .unwrap()
+                .disk_bytes(&value)
+                .context("serializing queue")?;
+            let codec_q = crate::snapshot::codec::codec(KIND_QUEUES).unwrap();
+            let queue_proposed = maybe_strip_overlay(
+                art.json,
+                ctx.overlay
+                    .as_ref()
+                    .and_then(|o| codec_q.overlay(o, &q_slug)),
+            )?;
+            let queue_base = ctx
+                .lockfile
+                .objects
+                .get(KIND_QUEUES)
+                .and_then(|m| m.get(&q_slug))
+                .and_then(|e| e.content_hash.clone());
+            let (q_action, q_remote_hash) =
+                decide_pull_action(&queue_path, queue_base.as_deref(), &queue_proposed)?;
+            if q_action == PullAction::Conflict {
+                counts.conflicts += 1;
+            }
+            let q_recorded = apply_pull_action(
+                q_action,
+                &queue_path,
+                &queue_proposed,
+                q_remote_hash,
+                ctx.interactive,
+                progress,
+                ctx.paths.env(),
+                queue_base.as_deref(),
+                Some(ctx.paths),
+            )?;
+            record_object(
+                ctx.lockfile,
+                KIND_QUEUES,
+                &q_slug,
+                q.id,
+                Some(q.url.clone()),
+                q.modified_at().map(|s| s.to_string()),
+                Some(q_recorded),
+            );
+            counts.queues += 1;
 
-        // queue.json — three-way write (local-only, no fetch).
-        let queue_path = queue_dir.join("queue.json");
-        // Canonical on-disk bytes: redact noisy server-set runtime fields
-        // (e.g. `counts`) to a stable sentinel so re-pulls produce
-        // byte-identical files and git diffs stay quiet. The same helper
-        // feeds the `rdc sync` classifier so the recomputed hash matches the
-        // base recorded here. See `snapshot::create::redacted_disk_bytes`.
-        let queue_proposed = crate::snapshot::create::redacted_disk_bytes(q, "queues")
-            .context("serializing queue")?;
-        let queue_proposed = maybe_strip_overlay(
-            queue_proposed,
-            ctx.overlay.as_ref().and_then(|o| o.queue(&q_slug)),
-        )?;
-        let queue_base = ctx
-            .lockfile
-            .objects
-            .get("queues")
-            .and_then(|m| m.get(&q_slug))
-            .and_then(|e| e.content_hash.clone());
-        let (q_action, q_remote_hash) =
-            decide_pull_action(&queue_path, queue_base.as_deref(), &queue_proposed)?;
-        if q_action == PullAction::Conflict {
-            counts.conflicts += 1;
-        }
-        let q_recorded = apply_pull_action(q_action, &queue_path, &queue_proposed, q_remote_hash, ctx.interactive, progress, ctx.paths.env(), queue_base.as_deref(), Some(ctx.paths))?;
-        record_object(
-            ctx.lockfile,
-            "queues",
-            &q_slug,
-            q.id,
-            Some(q.url.clone()),
-            q.modified_at().map(|s| s.to_string()),
-            Some(q_recorded),
-        );
-        counts.queues += 1;
+            // Preserve the legacy "no schema" notice. Inbox-absence is normal
+            // and intentionally silent. The actual schema / inbox bytes come
+            // from `schemas_by_queue_id` / `inboxes_by_queue_id` in Sub-phase
+            // B below — no URL parsing is needed here because the maps are
+            // keyed by `q.id`.
+            if q.schema.is_none() {
+                progress.event(
+                    Action::Skip,
+                    &format!(
+                        "queue '{}' (id {}) has no schema; skipping schema + inbox",
+                        q.name, q.id,
+                    ),
+                );
+            }
 
-        // Preserve the legacy "no schema" notice. Inbox-absence is normal
-        // and intentionally silent. The actual schema / inbox bytes come
-        // from `schemas_by_queue_id` / `inboxes_by_queue_id` in Sub-phase
-        // B below — no URL parsing is needed here because the maps are
-        // keyed by `q.id`.
-        if q.schema.is_none() {
-            progress.event(Action::Skip, &format!(
-                "queue '{}' (id {}) has no schema; skipping schema + inbox",
-                q.name, q.id,
-            ));
-        }
-
-        work.push(QueueWork { q, q_slug: q_slug.clone(), queue_dir });
-        Ok(())
+            work.push(QueueWork {
+                q,
+                q_slug: q_slug.clone(),
+                queue_dir,
+            });
+            Ok(())
         })();
         queue_result?;
     }
@@ -182,10 +213,13 @@ pub async fn process(
     }
 
     if counts.queues > 0 {
-        progress.event(Action::Pull, &format!(
-            "queues ({} pulled, schemas {}, inboxes {})",
-            counts.queues, counts.schemas, counts.inboxes,
-        ));
+        progress.event(
+            Action::Pull,
+            &format!(
+                "queues ({} pulled, schemas {}, inboxes {})",
+                counts.queues, counts.schemas, counts.inboxes,
+            ),
+        );
     }
 
     Ok(counts)
@@ -201,26 +235,34 @@ fn write_schema_for_queue(
     let queue_dir = &w.queue_dir;
     let schema_path = queue_dir.join("schema.json");
     let pre_local_json = if schema_path.exists() {
-        Some(std::fs::read(&schema_path)
-            .with_context(|| format!("reading {}", schema_path.display()))?)
+        Some(
+            std::fs::read(&schema_path)
+                .with_context(|| format!("reading {}", schema_path.display()))?,
+        )
     } else {
         None
     };
     let pre_local_formulas = crate::snapshot::schema::read_local_formulas(queue_dir)?;
 
-    let (remote_json_bytes, remote_formulas) =
-        crate::snapshot::schema::serialize_schema(schema)?;
+    let (remote_json_bytes, remote_formulas) = crate::snapshot::schema::serialize_schema(schema)?;
     let remote_json_bytes = maybe_strip_overlay(
         remote_json_bytes,
         ctx.overlay.as_ref().and_then(|o| o.schema(&w.q_slug)),
     )?;
-    let remote_combined_hash =
-        crate::state::schema_combined_hash(&remote_json_bytes, &remote_formulas);
+
+    // Hash via KindCodec (byte-identical to legacy schema_combined_hash).
+    // The codec's base_hash over (json + formula sidecars) matches the legacy
+    // schema_combined_hash because the sidecar label format is `formulas/<id>.py`.
+    let value = serde_json::to_value(schema)?;
+    let remote_combined_hash = crate::snapshot::codec::codec(KIND_SCHEMAS)
+        .unwrap()
+        .base_hash(&value)
+        .context("hashing schema")?;
 
     let schema_base = ctx
         .lockfile
         .objects
-        .get("schemas")
+        .get(KIND_SCHEMAS)
         .and_then(|m| m.get(&w.q_slug))
         .and_then(|e| e.content_hash.clone());
     let s_action = match (schema_base.as_deref(), &pre_local_json) {
@@ -242,8 +284,12 @@ fn write_schema_for_queue(
     let schema_recorded = match s_action {
         PullAction::Write => {
             crate::snapshot::schema::write_schema_bytes_with_cache(
-                queue_dir, &remote_json_bytes, &remote_formulas, Some(ctx.paths),
-            ).with_context(|| format!("writing schema for queue '{}'", w.q.name))?;
+                queue_dir,
+                &remote_json_bytes,
+                &remote_formulas,
+                Some(ctx.paths),
+            )
+            .with_context(|| format!("writing schema for queue '{}'", w.q.name))?;
             remote_combined_hash
         }
         PullAction::KeepLocal => {
@@ -263,8 +309,10 @@ fn write_schema_for_queue(
             // formula sets (added/removed formulas) fall back to the
             // shadow-file flow — modeling adds/deletes isn't
             // a [k]/[r]/[e]/[s]/[a] decision shape.
-            let local_ids: std::collections::BTreeSet<&str> =
-                pre_local_formulas.iter().map(|(id, _)| id.as_str()).collect();
+            let local_ids: std::collections::BTreeSet<&str> = pre_local_formulas
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect();
             let remote_ids: std::collections::BTreeSet<&str> =
                 remote_formulas.iter().map(|(id, _)| id.as_str()).collect();
             let symmetric = local_ids == remote_ids;
@@ -272,7 +320,8 @@ fn write_schema_for_queue(
             if ctx.interactive && symmetric {
                 let total = 1 + remote_formulas.len();
                 let json_outcome = crate::cli::resolve::resolve_combined_file(
-                    1, total,
+                    1,
+                    total,
                     &schema_path,
                     local_json,
                     &remote_json_bytes,
@@ -283,14 +332,20 @@ fn write_schema_for_queue(
                 let resolved_json = json_outcome.into_bytes();
                 let mut resolved_formulas: Vec<(String, Vec<u8>)> =
                     Vec::with_capacity(remote_formulas.len());
-                let local_by_id: std::collections::BTreeMap<&str, &Vec<u8>> =
-                    pre_local_formulas.iter().map(|(id, b)| (id.as_str(), b)).collect();
+                let local_by_id: std::collections::BTreeMap<&str, &Vec<u8>> = pre_local_formulas
+                    .iter()
+                    .map(|(id, b)| (id.as_str(), b))
+                    .collect();
                 for (i, (field_id, remote_bytes)) in remote_formulas.iter().enumerate() {
-                    let local_bytes = local_by_id.get(field_id.as_str()).copied()
-                        .cloned().unwrap_or_default();
+                    let local_bytes = local_by_id
+                        .get(field_id.as_str())
+                        .copied()
+                        .cloned()
+                        .unwrap_or_default();
                     let formula_path = queue_dir.join("formulas").join(format!("{field_id}.py"));
                     let outcome = crate::cli::resolve::resolve_combined_file(
-                        i + 2, total,
+                        i + 2,
+                        total,
                         &formula_path,
                         &local_bytes,
                         remote_bytes,
@@ -303,10 +358,9 @@ fn write_schema_for_queue(
                 if preserve_base {
                     match schema_base.as_deref() {
                         Some(prior) => prior.to_string(),
-                        None => crate::state::schema_combined_hash(
-                            &resolved_json,
-                            &resolved_formulas,
-                        ),
+                        None => {
+                            crate::state::schema_combined_hash(&resolved_json, &resolved_formulas)
+                        }
                     }
                 } else {
                     crate::state::schema_combined_hash(&resolved_json, &resolved_formulas)
@@ -342,7 +396,7 @@ fn write_schema_for_queue(
     };
     record_object(
         ctx.lockfile,
-        "schemas",
+        KIND_SCHEMAS,
         &w.q_slug,
         schema.id,
         Some(schema.url.clone()),
@@ -361,16 +415,25 @@ fn write_inbox_for_queue(
     progress: &Arc<Log>,
 ) -> Result<()> {
     let inbox_path = w.queue_dir.join("inbox.json");
-    let mut inbox_proposed = serde_json::to_vec_pretty(inbox).context("serializing inbox")?;
-    inbox_proposed.push(b'\n');
+
+    // Canonical on-disk bytes via KindCodec: strips `modified_at`.
+    let value = serde_json::to_value(inbox)?;
+    let art = crate::snapshot::codec::codec(KIND_INBOXES)
+        .unwrap()
+        .disk_bytes(&value)
+        .context("serializing inbox")?;
+    let codec_i = crate::snapshot::codec::codec(KIND_INBOXES).unwrap();
     let inbox_proposed = maybe_strip_overlay(
-        inbox_proposed,
-        ctx.overlay.as_ref().and_then(|o| o.inbox(&w.q_slug)),
+        art.json,
+        ctx.overlay
+            .as_ref()
+            .and_then(|o| codec_i.overlay(o, &w.q_slug)),
     )?;
+
     let inbox_base = ctx
         .lockfile
         .objects
-        .get("inboxes")
+        .get(KIND_INBOXES)
         .and_then(|m| m.get(&w.q_slug))
         .and_then(|e| e.content_hash.clone());
     let (i_action, i_remote_hash) =
@@ -378,10 +441,20 @@ fn write_inbox_for_queue(
     if i_action == PullAction::Conflict {
         counts.conflicts += 1;
     }
-    let i_recorded = apply_pull_action(i_action, &inbox_path, &inbox_proposed, i_remote_hash, ctx.interactive, progress, ctx.paths.env(), inbox_base.as_deref(), Some(ctx.paths))?;
+    let i_recorded = apply_pull_action(
+        i_action,
+        &inbox_path,
+        &inbox_proposed,
+        i_remote_hash,
+        ctx.interactive,
+        progress,
+        ctx.paths.env(),
+        inbox_base.as_deref(),
+        Some(ctx.paths),
+    )?;
     record_object(
         ctx.lockfile,
-        "inboxes",
+        KIND_INBOXES,
         &w.q_slug,
         inbox.id,
         Some(inbox.url.clone()),
