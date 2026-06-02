@@ -12,11 +12,14 @@
 //!
 //! Call [`codec`] to look up the registry by kind string.
 
+mod email_templates;
 mod engine_fields;
 mod engines;
 mod hooks;
 mod inboxes;
 mod labels;
+mod mdh;
+mod organization;
 mod queues;
 mod rules;
 mod schemas;
@@ -120,11 +123,14 @@ fn to_hex(digest: &[u8]) -> String {
 /// Look up the codec for `kind`. Returns `None` for unregistered kinds.
 pub fn codec(kind: &str) -> Option<&'static dyn KindCodec> {
     match kind {
+        "email_templates" => Some(&email_templates::EmailTemplates),
         "engine_fields" => Some(&engine_fields::EngineFields),
         "engines" => Some(&engines::Engines),
         "hooks" => Some(&hooks::Hooks),
         "inboxes" => Some(&inboxes::Inboxes),
         "labels" => Some(&labels::Labels),
+        "mdh" => Some(&mdh::Mdh),
+        "organization" => Some(&organization::Organization),
         "queues" => Some(&queues::Queues),
         "rules" => Some(&rules::Rules),
         "schemas" => Some(&schemas::Schemas),
