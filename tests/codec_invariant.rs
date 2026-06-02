@@ -158,15 +158,63 @@ fn sample_workflow_step() -> serde_json::Value {
     })
 }
 
+fn sample_email_template() -> serde_json::Value {
+    json!({
+        "id": 9001,
+        "url": "https://x/api/v1/email_templates/9001",
+        "name": "Rejection Notice",
+        "subject": "Your invoice was rejected",
+        "queue": "https://x/api/v1/queues/300",
+        "body_template": "Hello,\nYour document was rejected.\n",
+        "triggers": ["https://x/api/v1/triggers/55"],
+        "modified_at": "2026-04-20T08:00:00Z"
+    })
+}
+
+fn sample_organization() -> serde_json::Value {
+    json!({
+        "id": 285704,
+        "url": "https://x/api/v1/organizations/285704",
+        "name": "Acme Corp",
+        "modified_at": "2026-03-01T08:00:00Z",
+        "settings": { "ui_settings": { "language": "en" } },
+        "users": ["https://x/api/v1/users/1"]
+    })
+}
+
+fn sample_mdh_index_set() -> serde_json::Value {
+    json!({
+        "regular": [
+            { "name": "_id_", "key": { "_id": 1 }, "v": 2 },
+            { "name": "ix_vendor_id", "key": { "vendor_id": 1 }, "unique": true, "v": 2 }
+        ],
+        "search": [
+            {
+                "name": "vendor_search",
+                "type": "search",
+                "status": "READY",
+                "queryable": true,
+                "latest_definition": {
+                    "mappings": { "dynamic": true },
+                    "analyzers": []
+                }
+            }
+        ]
+    })
+}
+
 /// Run the consistency + idempotency invariants against every registered codec
 /// that can be exercised with the sample values defined above.
 fn codec_cases() -> Vec<(&'static str, serde_json::Value)> {
     vec![
+        ("email_templates", sample_email_template()),
         ("engine_fields", sample_engine_field()),
         ("engines", sample_engine()),
         ("hooks", sample_hook()),
         ("inboxes", sample_inbox()),
         ("labels", sample_label()),
+        ("mdh", sample_mdh_index_set()),
+        ("organization", sample_organization()),
         ("queues", sample_queue()),
         ("rules", sample_rule()),
         ("schemas", sample_schema()),
@@ -631,4 +679,139 @@ fn inboxes_invariants() {
         body.get("email").is_none(),
         "create_body must strip the server-assigned email field"
     );
+}
+
+/// Email templates: no redaction, no sidecars, modified_at stripped,
+/// triggers stripped by create_body.
+#[test]
+fn email_templates_invariants() {
+    let c = codec("email_templates").expect("email_templates codec must be registered");
+    let v = sample_email_template();
+
+    let art = c.disk_bytes(&v).expect("disk_bytes");
+    let disk_str = std::str::from_utf8(&art.json).expect("disk bytes must be UTF-8");
+
+    assert!(
+        !disk_str.contains("modified_at"),
+        "modified_at must be stripped from email_templates disk bytes; got:\n{disk_str}"
+    );
+    assert!(
+        !disk_str.contains("refreshed live in Rossum"),
+        "email_templates must not have any redaction sentinel; got:\n{disk_str}"
+    );
+    assert!(
+        art.sidecars.is_empty(),
+        "email_templates must produce no sidecars"
+    );
+
+    // Verify create_body strips triggers.
+    let mut body = v.clone();
+    c.create_body(&mut body);
+    assert!(
+        body.get("triggers").is_none(),
+        "create_body must strip the non-deployable triggers sub-resource"
+    );
+}
+
+/// Organization: no redaction, no sidecars, modified_at stripped recursively,
+/// create_body and cross_env_body are no-ops.
+#[test]
+fn organization_invariants() {
+    let c = codec("organization").expect("organization codec must be registered");
+    let v = sample_organization();
+
+    let art = c.disk_bytes(&v).expect("disk_bytes");
+    let disk_str = std::str::from_utf8(&art.json).expect("disk bytes must be UTF-8");
+
+    assert!(
+        !disk_str.contains("modified_at"),
+        "modified_at must be stripped from organization disk bytes; got:\n{disk_str}"
+    );
+    assert!(
+        !disk_str.contains("refreshed live in Rossum"),
+        "organization must not have any redaction sentinel; got:\n{disk_str}"
+    );
+    assert!(
+        art.sidecars.is_empty(),
+        "organization must produce no sidecars"
+    );
+
+    // Pull-only: create_body and cross_env_body must not change the value.
+    let mut body = v.clone();
+    c.create_body(&mut body);
+    assert_eq!(
+        body, v,
+        "create_body must be a no-op for the pull-only organization kind"
+    );
+    c.cross_env_body(&mut body);
+    assert_eq!(
+        body, v,
+        "cross_env_body must be a no-op for the pull-only organization kind"
+    );
+}
+
+/// MDH: `_id_` and `v` stripped from disk bytes; no sidecars; no-op
+/// create/cross_env bodies.
+#[test]
+fn mdh_invariants() {
+    let c = codec("mdh").expect("mdh codec must be registered");
+    let v = sample_mdh_index_set();
+
+    let art = c.disk_bytes(&v).expect("disk_bytes");
+    let disk_str = std::str::from_utf8(&art.json).expect("disk bytes must be UTF-8");
+
+    assert!(
+        !disk_str.contains("\"_id_\""),
+        "_id_ index must be stripped from mdh disk bytes; got:\n{disk_str}"
+    );
+    assert!(
+        !disk_str.contains("\"v\""),
+        "v field must be stripped from mdh disk bytes; got:\n{disk_str}"
+    );
+    assert!(
+        !disk_str.contains("latest_definition"),
+        "latest_definition envelope must be stripped from mdh disk bytes; got:\n{disk_str}"
+    );
+    assert!(art.sidecars.is_empty(), "mdh must produce no sidecars");
+
+    // Pull-only: create_body and cross_env_body must not change the value.
+    let mut body = v.clone();
+    c.create_body(&mut body);
+    assert_eq!(
+        body, v,
+        "create_body must be a no-op for the pull-only mdh kind"
+    );
+    c.cross_env_body(&mut body);
+    assert_eq!(
+        body, v,
+        "cross_env_body must be a no-op for the pull-only mdh kind"
+    );
+}
+
+/// Every known kind must have a registered codec. This is the completeness
+/// gate: adding a new kind without registering its codec breaks this test.
+#[test]
+fn every_known_kind_has_a_codec() {
+    let known_kinds = [
+        "engines",
+        "engine_fields",
+        "queues",
+        "schemas",
+        "inboxes",
+        "hooks",
+        "rules",
+        "workspaces",
+        "labels",
+        "workflows",
+        "workflow_steps",
+        "email_templates",
+        "organization",
+        "mdh",
+    ];
+    for kind in &known_kinds {
+        assert!(
+            codec(kind).is_some(),
+            "codec({kind}) returned None — register it in snapshot/codec/mod.rs"
+        );
+    }
 }
