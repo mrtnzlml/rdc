@@ -12,6 +12,7 @@
 //!
 //! Call [`codec`] to look up the registry by kind string.
 
+mod engine_fields;
 mod engines;
 mod hooks;
 mod inboxes;
@@ -19,6 +20,9 @@ mod labels;
 mod queues;
 mod rules;
 mod schemas;
+mod workflow_steps;
+mod workflows;
+mod workspaces;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -116,6 +120,7 @@ fn to_hex(digest: &[u8]) -> String {
 /// Look up the codec for `kind`. Returns `None` for unregistered kinds.
 pub fn codec(kind: &str) -> Option<&'static dyn KindCodec> {
     match kind {
+        "engine_fields" => Some(&engine_fields::EngineFields),
         "engines" => Some(&engines::Engines),
         "hooks" => Some(&hooks::Hooks),
         "inboxes" => Some(&inboxes::Inboxes),
@@ -123,6 +128,9 @@ pub fn codec(kind: &str) -> Option<&'static dyn KindCodec> {
         "queues" => Some(&queues::Queues),
         "rules" => Some(&rules::Rules),
         "schemas" => Some(&schemas::Schemas),
+        "workflow_steps" => Some(&workflow_steps::WorkflowSteps),
+        "workflows" => Some(&workflows::Workflows),
+        "workspaces" => Some(&workspaces::Workspaces),
         _ => None,
     }
 }
