@@ -203,8 +203,14 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
         BTreeMap::new();
     let mut q_url_to_ws_q: BTreeMap<String, (String, String)> = BTreeMap::new();
     {
-        let mut per_ws: std::collections::HashMap<String, HashSet<String>> =
-            std::collections::HashMap::new();
+        // Global, id-pinned queue slugs (mirror pull::queues::process): dedup
+        // globally, pre-seeded with the already-pinned slugs.
+        let mut used_q: HashSet<String> = ctx
+            .lockfile
+            .objects
+            .get("queues")
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
         for q in &catalog.queues {
             let Some(ws_url) = q.workspace.as_ref() else {
                 continue;
@@ -219,12 +225,11 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 .map(|s| s.to_string())
                 .or_else(|| ws_url_to_slug.get(ws_url).cloned());
             let Some(ws_slug) = ws_slug else { continue };
-            let used = per_ws.entry(ws_slug.clone()).or_default();
             let q_slug = match ctx.lockfile.slug_for_id("queues", q.id) {
                 Some(existing) => existing.to_string(),
-                None => slugify_unique(&q.name, used),
+                None => slugify_unique(&q.name, &used_q),
             };
-            used.insert(q_slug.clone());
+            used_q.insert(q_slug.clone());
             q_url_to_ws_q.insert(q.url.clone(), (ws_slug.clone(), q_slug.clone()));
             queue_by_slug.insert(q_slug, (q, ws_slug));
         }
@@ -1858,8 +1863,14 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
         BTreeMap::new();
     let mut q_url_to_ws_q: BTreeMap<String, (String, String)> = BTreeMap::new();
     {
-        let mut per_ws: std::collections::HashMap<String, HashSet<String>> =
-            std::collections::HashMap::new();
+        // Global, id-pinned queue slugs (mirror pull::queues::process): dedup
+        // globally, pre-seeded with the already-pinned slugs.
+        let mut used_q: HashSet<String> = ctx
+            .lockfile
+            .objects
+            .get("queues")
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
         for q in &catalog.queues {
             let Some(ws_url) = q.workspace.as_ref() else {
                 continue;
@@ -1870,12 +1881,11 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                 .map(|s| s.to_string())
                 .or_else(|| ws_url_to_slug.get(ws_url).cloned());
             let Some(ws_slug) = ws_slug else { continue };
-            let used = per_ws.entry(ws_slug.clone()).or_default();
             let q_slug = match ctx.lockfile.slug_for_id("queues", q.id) {
                 Some(existing) => existing.to_string(),
-                None => slugify_unique(&q.name, used),
+                None => slugify_unique(&q.name, &used_q),
             };
-            used.insert(q_slug.clone());
+            used_q.insert(q_slug.clone());
             q_url_to_ws_q.insert(q.url.clone(), (ws_slug.clone(), q_slug.clone()));
             queue_by_slug.insert(q_slug, (q, ws_slug));
         }

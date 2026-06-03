@@ -6551,15 +6551,13 @@ async fn sync_legacy_edited_engine_surfaces_conflict() {
     let _ = lf_before; // consumed; noted that lf may have changed in modified_at
 }
 
-/// Identity-collision guard: two queues with the SAME name in DIFFERENT
-/// workspaces both derive the bare slug `shared-queue`. Because rdc keys
-/// queue-nested kinds (queues/schemas/inboxes) by that bare slug, the two
-/// collapse onto one identity — which previously let a sync silently
-/// cross-attribute one queue's schema/formulas onto the other's remote
-/// object. `sync` MUST now detect this and abort loudly BEFORE any write,
-/// naming the contested slug and both queue ids.
+/// Two queues with the SAME name in DIFFERENT workspaces are kept fully
+/// distinct: queue slug assignment is GLOBAL and pinned by id, so each gets
+/// its own slug (`shared-queue` / `shared-queue-2`), its own dir, and its own
+/// lockfile entry — no collapse, no cross-attribution. (Before the fix, both
+/// took the bare slug `shared-queue` and one silently overwrote the other.)
 #[tokio::test]
-async fn sync_errors_on_cross_workspace_queue_name_collision() {
+async fn sync_keeps_same_named_queues_distinct_across_workspaces() {
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
@@ -6662,17 +6660,35 @@ async fn sync_errors_on_cross_workspace_queue_name_collision() {
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
 
-    let err = result
-        .expect_err("sync must fail loud on a cross-workspace queue name collision, not collapse");
-    let msg = format!("{err:#}");
-    assert!(msg.contains("collision"), "error must name the collision: {msg}");
-    assert!(msg.contains("shared-queue"), "error must name the contested slug: {msg}");
-    assert!(
-        msg.contains("200") && msg.contains("201"),
-        "error must list BOTH colliding queue ids: {msg}"
+    result.expect("sync must succeed: same-named queues across workspaces are now distinct");
+
+    let lf: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap(),
+    )
+    .unwrap();
+    // Both queues tracked under DISTINCT slugs — no collapse.
+    let queues = lf["objects"]["queues"].as_object().expect("queues map");
+    assert_eq!(queues.len(), 2, "both queues must be tracked distinctly: {lf}");
+    let mut ids: Vec<u64> = queues.values().map(|e| e["id"].as_u64().unwrap()).collect();
+    ids.sort();
+    assert_eq!(ids, vec![200, 201], "both queue ids present: {lf}");
+    // Schemas likewise distinct (keyed by their queue's slug).
+    assert_eq!(
+        lf["objects"]["schemas"].as_object().unwrap().len(),
+        2,
+        "both schemas tracked distinctly: {lf}"
     );
 
-    // No API mutations were attempted — the guard fires before execute.
+    // Each queue's files landed in its OWN workspace dir with a distinct slug.
+    let alpha = project.path().join("envs/dev/workspaces/workspace-alpha/queues");
+    let beta = project.path().join("envs/dev/workspaces/workspace-beta/queues");
+    assert_eq!(std::fs::read_dir(&alpha).unwrap().count(), 1, "one queue dir under alpha");
+    assert_eq!(std::fs::read_dir(&beta).unwrap().count(), 1, "one queue dir under beta");
+    let alpha_q = std::fs::read_dir(&alpha).unwrap().next().unwrap().unwrap().file_name();
+    let beta_q = std::fs::read_dir(&beta).unwrap().next().unwrap().unwrap().file_name();
+    assert_ne!(alpha_q, beta_q, "the two same-named queues got distinct slugs/dirs");
+
+    // Pull-side only: no remote mutations.
     for req in server.received_requests().await.unwrap_or_default() {
         let p = req.url.path();
         if p.contains("/svc/data-storage/") {
@@ -6683,7 +6699,7 @@ async fn sync_errors_on_cross_workspace_queue_name_collision() {
                 req.method,
                 http::Method::POST | http::Method::PATCH | http::Method::DELETE
             ),
-            "guard must abort before any mutating request: {} {}",
+            "pull-side only: unexpected mutation {} {}",
             req.method,
             p
         );

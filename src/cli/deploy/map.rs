@@ -441,3 +441,51 @@ fn collect_email_template_keys(paths: &Paths) -> Result<Vec<String>> {
     out.dedup();
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mapping::Mapping;
+
+    fn write_queue(paths: &Paths, ws_slug: &str, q_slug: &str) {
+        let dir = paths.queue_dir(ws_slug, q_slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("queue.json"), b"{}").unwrap();
+        std::fs::write(dir.join("schema.json"), b"{}").unwrap();
+    }
+
+    /// Two queues with the same NAME live in different workspaces. The sync
+    /// fix assigns them globally-unique slugs (`shared-queue` /
+    /// `shared-queue-2`) and distinct dirs. `auto_match` must then map BOTH
+    /// distinctly across envs — never collapse them via the `dedup()` in
+    /// `collect_queue_slugs` (the pre-fix cross-workspace deploy hazard).
+    #[test]
+    fn auto_match_keeps_same_named_queues_distinct_across_workspaces() {
+        let src = tempfile::TempDir::new().unwrap();
+        let tgt = tempfile::TempDir::new().unwrap();
+        let src_paths = Paths::for_env(src.path(), "src");
+        let tgt_paths = Paths::for_env(tgt.path(), "tgt");
+
+        // Post-fix on-disk layout: same-named queues get distinct slugs in
+        // their own workspaces.
+        for paths in [&src_paths, &tgt_paths] {
+            write_queue(paths, "workspace-alpha", "shared-queue");
+            write_queue(paths, "workspace-beta", "shared-queue-2");
+        }
+
+        let mut mapping = Mapping::default();
+        auto_match(&mut mapping, &src_paths, &tgt_paths).unwrap();
+
+        // BOTH queues mapped, distinctly — no collapse.
+        assert_eq!(mapping.queues.len(), 2, "both same-named queues must map: {:?}", mapping.queues);
+        assert_eq!(mapping.queues.get("shared-queue").map(String::as_str), Some("shared-queue"));
+        assert_eq!(
+            mapping.queues.get("shared-queue-2").map(String::as_str),
+            Some("shared-queue-2")
+        );
+        // Schemas (keyed by queue slug) likewise both mapped.
+        assert_eq!(mapping.schemas.len(), 2, "both schemas must map: {:?}", mapping.schemas);
+        assert!(mapping.schemas.contains_key("shared-queue"));
+        assert!(mapping.schemas.contains_key("shared-queue-2"));
+    }
+}

@@ -1010,10 +1010,15 @@ pub fn from_catalog_scan_lockfile(
     let queues_codec = crate::snapshot::codec::codec("queues").expect("queues codec must exist");
     let schemas_codec = crate::snapshot::codec::codec("schemas").expect("schemas codec must exist");
     let inboxes_codec = crate::snapshot::codec::codec("inboxes").expect("inboxes codec must exist");
-    let mut per_ws_used_q_slugs: std::collections::HashMap<
-        String,
-        std::collections::HashSet<String>,
-    > = std::collections::HashMap::new();
+    // Queue slug identity is GLOBAL (single lockfile/classifier namespace).
+    // Dedup globally, pre-seeded with already-pinned slugs (kept stable by
+    // slug_for_id), so two same-named queues in different workspaces never
+    // collapse onto one bare slug.
+    let mut used_q_slugs: std::collections::HashSet<String> = lockfile
+        .objects
+        .get("queues")
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
     // Build per-queue (ws_slug, q_slug, q.id, q.url) tuples so the
     // email_templates block can look up its compound key without
     // re-deriving slugs.
@@ -1047,12 +1052,11 @@ pub fn from_catalog_scan_lockfile(
                 }
             },
         };
-        let used = per_ws_used_q_slugs.entry(ws_slug.clone()).or_default();
         let q_slug = match lockfile.slug_for_id("queues", q.id) {
             Some(existing) => existing.to_string(),
-            None => crate::slug::slugify_unique(&q.name, used),
+            None => crate::slug::slugify_unique(&q.name, &used_q_slugs),
         };
-        used.insert(q_slug.clone());
+        used_q_slugs.insert(q_slug.clone());
         q_url_to_ws_q.insert(q.url.clone(), (ws_slug.clone(), q_slug.clone()));
         qdetect.observe("queues", &q_slug, q.id, &q.name, &ws_slug);
 
