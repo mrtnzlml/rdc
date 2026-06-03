@@ -34,7 +34,15 @@ fn kind_specific_strip(kind: &str) -> &'static [&'static str] {
         // membership lists (every entry references this queue from the *other*
         // side), and a cross-env PATCH can't rewrite their src URLs reliably
         // because users/workflows aren't deployable kinds in rdc.
-        "queues" => &["hooks", "webhooks", "rules", "inbox", "counts", "users", "workflows"],
+        //
+        // `rir_url` is a server-managed, per-cluster internal RIR service URL
+        // (e.g. `http://…svc.cluster.local`) that Rossum assigns; sending it
+        // back 400s with "Invalid URL" (it doesn't resolve on another cluster
+        // and is read-only), so strip it from POST and cross-env PATCH bodies
+        // like `counts`. The server re-fills it on create.
+        "queues" => &[
+            "hooks", "webhooks", "rules", "inbox", "counts", "users", "workflows", "rir_url",
+        ],
         // server fills `queues` from each queue's `schema` URL
         "schemas" => &["queues"],
         // server assigns the inbox's email address
@@ -336,6 +344,34 @@ mod tests {
         let obj = v.as_object().unwrap();
         assert!(!obj.contains_key("email"));
         assert!(obj.contains_key("queues"));
+    }
+
+    #[test]
+    fn strips_queue_rir_url_on_create_and_cross_env() {
+        // `rir_url` is a server-managed, per-cluster internal RIR service URL
+        // ("http://…svc.cluster.local"). Sending it on POST/PATCH 400s with
+        // "Invalid URL", and it's meaningless across orgs — strip it from both
+        // the create body and the cross-env PATCH body.
+        let body = json!({
+            "id": 0,
+            "name": "q",
+            "workspace": "https://x/api/v1/workspaces/1",
+            "schema": "https://x/api/v1/schemas/9",
+            "rir_url": "http://rir.internal.svc.cluster.local",
+        });
+        let mut a = body.clone();
+        strip_for_create(&mut a, "queues");
+        assert!(
+            !a.as_object().unwrap().contains_key("rir_url"),
+            "create body must strip server-managed rir_url"
+        );
+        assert!(a.as_object().unwrap().contains_key("name"), "legit fields kept");
+        let mut b = body.clone();
+        strip_for_cross_env_patch(&mut b, "queues");
+        assert!(
+            !b.as_object().unwrap().contains_key("rir_url"),
+            "cross-env PATCH body must strip server-managed rir_url"
+        );
     }
 
     #[test]
