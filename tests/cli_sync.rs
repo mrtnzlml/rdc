@@ -6550,3 +6550,142 @@ async fn sync_legacy_edited_engine_surfaces_conflict() {
     // the remote), but the base hash governs whether the conflict re-surfaces.
     let _ = lf_before; // consumed; noted that lf may have changed in modified_at
 }
+
+/// Identity-collision guard: two queues with the SAME name in DIFFERENT
+/// workspaces both derive the bare slug `shared-queue`. Because rdc keys
+/// queue-nested kinds (queues/schemas/inboxes) by that bare slug, the two
+/// collapse onto one identity — which previously let a sync silently
+/// cross-attribute one queue's schema/formulas onto the other's remote
+/// object. `sync` MUST now detect this and abort loudly BEFORE any write,
+/// naming the contested slug and both queue ids.
+#[tokio::test]
+async fn sync_errors_on_cross_workspace_queue_name_collision() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // Two workspaces with DISTINCT names (so the workspaces themselves do
+    // not collide) — each owns a queue named identically.
+    let workspaces_body = serde_json::json!({
+        "pagination": { "total": 2, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 100,
+                "url": format!("{}/api/v1/workspaces/100", server.uri()),
+                "name": "Workspace Alpha",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "queues": [format!("{}/api/v1/queues/200", server.uri())]
+            },
+            {
+                "id": 101,
+                "url": format!("{}/api/v1/workspaces/101", server.uri()),
+                "name": "Workspace Beta",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "queues": [format!("{}/api/v1/queues/201", server.uri())]
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(workspaces_body))
+        .mount(&server)
+        .await;
+
+    // Two queues, SAME name, different workspaces, different schemas.
+    let queues_body = serde_json::json!({
+        "pagination": { "total": 2, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 200,
+                "url": format!("{}/api/v1/queues/200", server.uri()),
+                "name": "Shared Queue",
+                "workspace": format!("{}/api/v1/workspaces/100", server.uri()),
+                "schema": format!("{}/api/v1/schemas/300", server.uri())
+            },
+            {
+                "id": 201,
+                "url": format!("{}/api/v1/queues/201", server.uri()),
+                "name": "Shared Queue",
+                "workspace": format!("{}/api/v1/workspaces/101", server.uri()),
+                "schema": format!("{}/api/v1/schemas/301", server.uri())
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(queues_body))
+        .mount(&server)
+        .await;
+
+    // Schema bodies fetched per-queue by id during prefetch.
+    for (sid, sname, qid) in [(300, "Schema Alpha", 200), (301, "Schema Beta", 201)] {
+        let schema_body = serde_json::json!({
+            "id": sid,
+            "url": format!("{}/api/v1/schemas/{sid}", server.uri()),
+            "name": sname,
+            "queues": [format!("{}/api/v1/queues/{qid}", server.uri())],
+            "content": []
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/schemas/{sid}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(schema_body))
+            .mount(&server)
+            .await;
+    }
+
+    mock_empty_lists_except(&server, &["/api/v1/workspaces", "/api/v1/queues"]).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    let err = result
+        .expect_err("sync must fail loud on a cross-workspace queue name collision, not collapse");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("collision"), "error must name the collision: {msg}");
+    assert!(msg.contains("shared-queue"), "error must name the contested slug: {msg}");
+    assert!(
+        msg.contains("200") && msg.contains("201"),
+        "error must list BOTH colliding queue ids: {msg}"
+    );
+
+    // No API mutations were attempted — the guard fires before execute.
+    for req in server.received_requests().await.unwrap_or_default() {
+        let p = req.url.path();
+        if p.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "guard must abort before any mutating request: {} {}",
+            req.method,
+            p
+        );
+    }
+}

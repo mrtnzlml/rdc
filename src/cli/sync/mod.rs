@@ -104,6 +104,7 @@
 //!   accepting force-push is the only sanctioned escape hatch).
 
 pub mod classify;
+pub mod collision;
 pub mod embed;
 pub mod execute;
 pub mod lock;
@@ -271,7 +272,7 @@ pub(crate) async fn run_cycle(
     // canonical hashing (including overlay strip) so the recomputed
     // remote hashes match what the lockfile recorded on last pull.
     let classified =
-        from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile, overlay.as_ref());
+        from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile, overlay.as_ref())?;
 
     // Classification computed; grid renderer rebuild handled elsewhere.
 
@@ -407,13 +408,18 @@ pub(crate) async fn run_cycle(
         crate::cli::push::scan::scan(&paths, &lockfile)?;
     let overlay_after = crate::overlay::Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
+    // Post-execute repaint re-classify. Collisions were already caught
+    // pre-execute (above), so any error here would be spurious — discard it
+    // and fall back to an empty repaint set rather than abort after a
+    // successful sync.
     let _classified_after = from_catalog_scan_lockfile(
         &catalog,
         &changes_after,
         &tombstones_after,
         &lockfile,
         overlay_after.as_ref(),
-    );
+    )
+    .unwrap_or_default();
     lockfile.save(&paths.lockfile())?;
     crate::cli::index::generate(&paths, &lockfile)
         .with_context(|| format!("generating _index.md for env '{env}'"))?;
@@ -466,7 +472,7 @@ pub fn from_catalog_scan_lockfile(
     tombstones: &crate::cli::push::scan::Tombstones,
     lockfile: &crate::state::Lockfile,
     overlay: Option<&crate::overlay::Overlay>,
-) -> Vec<crate::cli::sync::classify::ClassifiedItem> {
+) -> anyhow::Result<Vec<crate::cli::sync::classify::ClassifiedItem>> {
     use std::collections::{BTreeMap, BTreeSet};
     let mut remote_hashes: BTreeMap<(String, String), String> = BTreeMap::new();
     let mut scan_changes: BTreeMap<(String, String), String> = BTreeMap::new();
@@ -1013,6 +1019,13 @@ pub fn from_catalog_scan_lockfile(
     // re-deriving slugs.
     let mut q_url_to_ws_q: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
+    // Defense-in-depth: detect when two distinct remote queues would be
+    // assigned the same bare `(kind, slug)` identity key (e.g. same-named
+    // queues in different workspaces). Such a collision silently collapses
+    // them in the lockfile/classifier and cross-attributes one queue's
+    // schema/formulas/inbox onto the other on the next sync. We abort loudly
+    // below instead. Covers schemas + inboxes too — they share this slug.
+    let mut qdetect = crate::cli::sync::collision::CollisionDetector::new();
     for q in &catalog.queues {
         let Some(ws_url) = q.workspace.as_ref() else {
             continue;
@@ -1041,6 +1054,7 @@ pub fn from_catalog_scan_lockfile(
         };
         used.insert(q_slug.clone());
         q_url_to_ws_q.insert(q.url.clone(), (ws_slug.clone(), q_slug.clone()));
+        qdetect.observe("queues", &q_slug, q.id, &q.name, &ws_slug);
 
         // queues — route through the KindCodec (redacts `counts`,
         // strips `modified_at`) for hash parity with the pull baseline.
@@ -1082,6 +1096,13 @@ pub fn from_catalog_scan_lockfile(
             let i_hash = crate::snapshot::codec::combined_hash(&i_json, &i_art.sidecars);
             remote_hashes.insert(("inboxes".to_string(), q_slug.clone()), i_hash);
         }
+    }
+
+    // Abort BEFORE classify/execute (no writes have happened yet) if two
+    // distinct queues collapsed onto one identity key.
+    let collisions = qdetect.collisions();
+    if !collisions.is_empty() {
+        anyhow::bail!("{}", crate::cli::sync::collision::format_collisions(&collisions));
     }
 
     // Scan-side hashes for queues / inboxes (flat) and schemas (combined).
@@ -1210,7 +1231,7 @@ pub fn from_catalog_scan_lockfile(
         }
     }
 
-    crate::cli::sync::classify::classify(&remote_hashes, &scan_changes, &scan_tombstones, &locked)
+    Ok(crate::cli::sync::classify::classify(&remote_hashes, &scan_changes, &scan_tombstones, &locked))
 }
 
 #[cfg(test)]
@@ -1369,7 +1390,7 @@ mod tests {
 
         // --- act ----------------------------------------------------------
         let classified =
-            from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile, None);
+            from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile, None).unwrap();
 
         // --- assert -------------------------------------------------------
         let item = classified
@@ -1491,7 +1512,8 @@ mod tests {
             &tombstones,
             &lockfile,
             overlay.as_ref(),
-        );
+        )
+        .unwrap();
         let item = classified
             .iter()
             .find(|c| c.kind == "hooks" && c.slug == slug)
@@ -1608,7 +1630,8 @@ mod tests {
             &tombstones,
             &lockfile,
             overlay.as_ref(),
-        );
+        )
+        .unwrap();
         let item = classified
             .iter()
             .find(|c| c.kind == "hooks" && c.slug == slug)
