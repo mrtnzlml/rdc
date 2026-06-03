@@ -16,7 +16,7 @@ use crate::log::{Action, Log};
 use crate::model::{Inbox, Queue, Schema};
 use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 const KIND_QUEUES: &str = "queues";
@@ -83,7 +83,19 @@ pub async fn process(
     subset: &BTreeSet<(String, String)>,
     progress: &Arc<Log>,
 ) -> Result<QueueCounts> {
-    let mut per_ws_used_slugs: HashMap<String, HashSet<String>> = HashMap::new();
+    // Queue slug identity is GLOBAL, not per-workspace. The lockfile and the
+    // sync classifier key queue-nested kinds (queues/schemas/inboxes) in a
+    // single namespace, so a per-workspace used-set let two same-named queues
+    // in different workspaces both claim the bare slug and collapse onto one
+    // identity (silent cross-attribution). Dedup globally, pre-seeded with the
+    // slugs already pinned in the lockfile (kept stable by `slug_for_id`) so a
+    // newly-seen queue never steals an existing slug regardless of list order.
+    let mut used_q_slugs: HashSet<String> = ctx
+        .lockfile
+        .objects
+        .get(KIND_QUEUES)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
     let mut counts = QueueCounts {
         queues: 0,
         schemas: 0,
@@ -103,12 +115,11 @@ pub async fn process(
             None => continue,
         };
 
-        let used = per_ws_used_slugs.entry(ws_slug.clone()).or_default();
         let q_slug = match ctx.lockfile.slug_for_id(KIND_QUEUES, q.id) {
             Some(existing) => existing.to_string(),
-            None => slugify_unique(&q.name, used),
+            None => slugify_unique(&q.name, &used_q_slugs),
         };
-        used.insert(q_slug.clone());
+        used_q_slugs.insert(q_slug.clone());
 
         if !subset.contains(&(KIND_QUEUES.to_string(), q_slug.clone())) {
             continue;

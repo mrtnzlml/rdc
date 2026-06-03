@@ -1,13 +1,47 @@
 # Identity keying: re-key on stable server `id` — Design + Implementation Plan
 
-## Status
+## Status — SHIPPED (global, id-pinned slugs)
 
-- **Phase 0 (shipped):** fail-loud collision guard in `rdc sync`. See
-  `src/cli/sync/collision.rs` + `from_catalog_scan_lockfile`. Converts the
-  silent corruption into an actionable abort. This is the safety net, **not**
-  the fix.
-- **Phases 1–5 (this plan):** the architectural fix — make identity the
-  server `id`, not the name-derived slug.
+The fix that shipped is **simpler than the id-keyed-lockfile plan sketched
+below**, and was chosen after an adversarial audit showed the id-keyed `nested`
+map (explored on this branch, then dropped) was *redundant* and a *new bug
+source* (every slug-mutating path — `realign`, deploy write-back, drift-adopt,
+url-lookup — would have to maintain a second map; several didn't → split-brain).
+
+Root cause, precisely: queue-nested slugs (`queues`/`schemas`/`inboxes`) were
+deduplicated **per workspace** but stored/matched in **one global namespace**
+(`lockfile.objects[kind]` + the classifier's `(kind, slug)` keys). Two
+same-named queues in different workspaces both claimed the bare slug and
+collapsed onto one identity → cross-attribution.
+
+**The fix:** make queue slug assignment **global** (matching the namespace it
+is keyed in) and **pinned by id** via the existing `slug_for_id` (sticky local
+slug across remote renames). Applied in `pull::queues::process`,
+`from_catalog_scan_lockfile`, and both `execute.rs` slug builders, each
+pre-seeding the global used-set with already-pinned slugs so a newly-seen queue
+never steals one. Two same-named queues now get distinct slugs
+(`shared-queue` / `shared-queue-2`), distinct dirs, distinct lockfile entries;
+stable across renames and list order. No lockfile format change (still v2).
+
+**This fixes `rdc deploy` too, with no deploy code change:** deploy matches by
+the on-disk queue slug, which is now globally unique, so `collect_queue_slugs`'
+`dedup()` is a no-op and `locate_queue_dir`'s first-match has a single match.
+Verified by `deploy::map::tests::auto_match_keeps_same_named_queues_distinct_across_workspaces`.
+
+**Kept:** the Phase-0 fail-loud collision guard (`src/cli/sync/collision.rs`),
+now a defensive backstop that never fires (global dedup makes the collision
+impossible). **Not a bug:** `index.rs` lists a per-engine field's bare slug in
+the human-readable `_index.md` — unambiguous within its engine, output-only.
+
+Verified live on the TEST API (sync: two same-named cross-workspace queues →
+two distinct entries; edit to one queue's schema PATCHed its OWN remote schema,
+the other untouched) and by the full test suite.
+
+---
+
+> The sections below are the **original id-keyed-lockfile plan** that was
+> explored and **rejected** in favour of the simpler global-dedup fix above.
+> Retained for context; not the shipped design.
 
 ## Problem (verified)
 
