@@ -5,7 +5,7 @@ use crate::overlay::{Overlay, apply_overrides};
 use crate::paths::Paths;
 
 use crate::snapshot::codec::combined_hash;
-use crate::snapshot::create::strip_for_create;
+use crate::snapshot::create::{strip_for_create, strip_patch_extra};
 use crate::snapshot::writer::write_atomic;
 use crate::state::{Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
@@ -171,6 +171,9 @@ pub async fn push(
             }
         }
 
+        // Strip server-managed fields from `extra` so the PATCH matches the
+        // CREATE contract.
+        strip_patch_extra(&mut payload_to_send.extra, "labels", false);
         let result = client
             .update_label(id, &payload_to_send, Some(progress.clone()))
             .await

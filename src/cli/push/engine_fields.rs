@@ -5,7 +5,7 @@ use crate::overlay::{Overlay, apply_overrides};
 use crate::paths::Paths;
 
 use crate::snapshot::codec::combined_hash;
-use crate::snapshot::create::strip_for_create;
+use crate::snapshot::create::{strip_for_create, strip_patch_extra};
 use crate::snapshot::writer::write_atomic;
 use crate::state::{Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
@@ -174,6 +174,10 @@ pub async fn push(
             }
         }
 
+        // Strip server-managed fields from `extra` so the PATCH matches the
+        // CREATE contract. (`name` is immutable cross-env but editable
+        // within-env, so within-env strip leaves it intact.)
+        strip_patch_extra(&mut payload_to_send.extra, "engine_fields", false);
         let patch_result = client
             .update_engine_field(id, &payload_to_send, Some(progress.clone()))
             .await
