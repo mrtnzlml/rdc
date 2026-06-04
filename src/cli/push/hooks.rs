@@ -172,6 +172,10 @@ pub async fn push(
                 };
                 let mut body = serde_json::to_value(&typed)
                     .with_context(|| format!("serializing hook '{slug}' for store-extension PATCH"))?;
+                // Strip server-managed fields (`status`, `test`, …) so the
+                // PATCH matches the CREATE contract and never echoes the
+                // redacted sentinel back to the API.
+                strip_for_create(&mut body, "hooks");
                 inject_hook_secrets(&mut body, slug, &hook_secrets);
                 client
                     .update_hook_value(installed_id, &body, Some(progress.clone()))
@@ -351,6 +355,11 @@ pub async fn push(
         // have no place on the typed `Hook` model) can ride this PATCH.
         let mut body = serde_json::to_value(&payload_to_send)
             .with_context(|| format!("serializing hook '{slug}' for PATCH"))?;
+        // `status` is a read-only server health field that's redacted to the
+        // sentinel on disk; strip it (and the other server fields) so the
+        // PATCH body matches the CREATE contract instead of echoing the
+        // sentinel back. Done before secret injection so secrets survive.
+        strip_for_create(&mut body, "hooks");
         let updated_secrets_hash = inject_hook_secrets(&mut body, slug, &hook_secrets);
         let patch_result = client
             .update_hook_value(id, &body, Some(progress.clone()))

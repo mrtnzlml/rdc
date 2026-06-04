@@ -2865,3 +2865,195 @@ async fn deploy_create_engine_records_codec_baseline() {
          codec baseline must be consistent between create-path and pull/sync"
     );
 }
+
+/// A cross-env deploy that PATCHes an existing target engine must NOT echo
+/// `agenda_id` in the PATCH body: it's a read-only, per-env identifier, and
+/// the source value on disk is the redaction sentinel. Sending it back is at
+/// best ignored and at worst overwrites the target engine's identifier with
+/// the sentinel (or 400s). `strip_patch_extra` must remove it before the PATCH.
+#[tokio::test]
+async fn deploy_patch_engine_body_omits_agenda_id() {
+    let src_server = MockServer::start().await;
+    let tgt_server = MockServer::start().await;
+    let src_uri = src_server.uri();
+    let tgt_uri = tgt_server.uri();
+
+    // src engine: a `description` differs from the tgt's so the deploy is a
+    // real PATCH (not an idempotent skip — agenda_id is stripped from the
+    // drift comparison, so the two must differ on a NON-stripped field).
+    let src_engine = serde_json::json!({
+        "id": 501,
+        "url": format!("{src_uri}/api/v1/engines/501"),
+        "name": "Invoice Engine",
+        "type": "extractor",
+        "description": "src-side description",
+        "agenda_id": "tnt_src_live_agenda",
+        "modified_at": "2026-05-01T12:00:00Z"
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 1, "url": format!("{src_uri}/api/v1/organizations/1"),
+            "name": "Src Org", "modified_at": "2026-01-01T00:00:00Z",
+            "settings": {}, "users": []
+        })))
+        .mount(&src_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/engines"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [src_engine.clone()]
+        })))
+        .mount(&src_server)
+        .await;
+    for ep in [
+        "/api/v1/workspaces",
+        "/api/v1/queues",
+        "/api/v1/inboxes",
+        "/api/v1/hooks",
+        "/api/v1/rules",
+        "/api/v1/labels",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&src_server)
+            .await;
+    }
+
+    // tgt env: org 2 already has a matching engine (id 701) with its OWN
+    // agenda_id and a different description.
+    let tgt_engine = serde_json::json!({
+        "id": 701,
+        "url": format!("{tgt_uri}/api/v1/engines/701"),
+        "name": "Invoice Engine",
+        "type": "extractor",
+        "description": "tgt-side description",
+        "agenda_id": "tnt_tgt_live_agenda",
+        "modified_at": "2026-05-02T08:00:00Z"
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 2, "url": format!("{tgt_uri}/api/v1/organizations/2"),
+            "name": "Tgt Org", "modified_at": "2026-01-01T00:00:00Z",
+            "settings": {}, "users": []
+        })))
+        .mount(&tgt_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/engines"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [tgt_engine.clone()]
+        })))
+        .mount(&tgt_server)
+        .await;
+    for ep in [
+        "/api/v1/workspaces",
+        "/api/v1/queues",
+        "/api/v1/inboxes",
+        "/api/v1/hooks",
+        "/api/v1/rules",
+        "/api/v1/labels",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_list()))
+            .mount(&tgt_server)
+            .await;
+    }
+
+    // The PATCH the deploy issues against the existing tgt engine.
+    let tgt_uri_c = tgt_uri.clone();
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/engines/701"))
+        .respond_with(move |_req: &wiremock::Request| {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 701,
+                "url": format!("{tgt_uri_c}/api/v1/engines/701"),
+                "name": "Invoice Engine",
+                "type": "extractor",
+                "description": "src-side description",
+                "agenda_id": "tnt_tgt_live_agenda",
+                "modified_at": "2026-05-03T08:00:00Z"
+            }))
+        })
+        .expect(1)
+        .mount(&tgt_server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args([
+            "init",
+            "--env",
+            &format!("src={src_uri}/api/v1:1"),
+            "--env",
+            &format!("tgt={tgt_uri}/api/v1:2"),
+        ])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/src.secrets.json"),
+        r#"{"api_token":"SRC"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("secrets/tgt.secrets.json"),
+        r#"{"api_token":"TGT"}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "src", "--no-push"])
+        .assert()
+        .success();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "tgt", "--no-push"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["deploy", "src", "tgt", "--yes"])
+        .assert()
+        .success();
+
+    // The PATCH body must NOT carry agenda_id.
+    let patch_bodies: Vec<serde_json::Value> = tgt_server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.method == http::Method::PATCH && r.url.path() == "/api/v1/engines/701")
+        .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+        .collect();
+    assert_eq!(
+        patch_bodies.len(),
+        1,
+        "expected exactly one engine PATCH during deploy; got {}",
+        patch_bodies.len()
+    );
+    assert!(
+        patch_bodies[0].get("agenda_id").is_none(),
+        "deploy engine PATCH body must NOT contain `agenda_id`; got:\n{}",
+        serde_json::to_string_pretty(&patch_bodies[0]).unwrap()
+    );
+}

@@ -4,7 +4,7 @@ use crate::log::{Action, Log};
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
 
-use crate::snapshot::create::strip_for_create;
+use crate::snapshot::create::{strip_for_create, strip_patch_extra};
 use crate::snapshot::rule::{read_rule_value, serialize_rule, write_rule_code};
 use crate::snapshot::writer::write_atomic;
 use crate::state::{rule_combined_hash, Lockfile, ObjectEntry};
@@ -145,6 +145,9 @@ pub async fn push(
             }
         }
 
+        // Strip server-managed fields from `extra` so the PATCH matches the
+        // CREATE contract.
+        strip_patch_extra(&mut payload_to_send.extra, "rules", false);
         let patch_result = client.update_rule(id, &payload_to_send, Some(progress.clone())).await
             .with_context(|| format!("PATCH /rules/{id}"));
         let updated = patch_result?;

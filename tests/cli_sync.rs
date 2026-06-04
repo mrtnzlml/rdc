@@ -5984,6 +5984,130 @@ async fn sync_workspace_modified_at_change_is_clean() {
     );
 }
 
+/// A hook's `status` is a read-only, server-managed health field ("ready" /
+/// "failed" / …). It's redacted to the sentinel on disk; a push-PATCH must NOT
+/// echo it back — sending the sentinel is at best ignored, at worst a 400 on
+/// the status enum. `strip_patch_extra` must drop it from the PATCH body,
+/// exactly as `strip_for_create` does for POST bodies.
+#[tokio::test]
+async fn push_hook_patch_body_omits_status() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let hook_id = 7007u64;
+    let server_uri = server.uri();
+    let hooks_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": hook_id,
+                "url": format!("{server_uri}/api/v1/hooks/{hook_id}"),
+                "name": "status-hook",
+                "type": "webhook",
+                "queues": [],
+                "events": ["annotation_content"],
+                "config": { "url": "https://hook.example.com/run" },
+                "status": "ready",
+                "modified_at": "2026-04-01T10:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&hooks_body))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &["/api/v1/hooks"]).await;
+
+    let patch_response = serde_json::json!({
+        "id": hook_id,
+        "url": format!("{server_uri}/api/v1/hooks/{hook_id}"),
+        "name": "status-hook",
+        "type": "webhook",
+        "queues": [],
+        "events": ["annotation_content"],
+        "config": { "url": "https://hook.example.com/run-v2" },
+        "status": "ready",
+        "modified_at": "2026-04-02T10:00:00Z"
+    });
+    Mock::given(method("PATCH"))
+        .and(path(format!("/api/v1/hooks/{hook_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&patch_response))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("seed sync should succeed");
+
+    let hook_json = project.path().join("envs/dev/hooks/status-hook.json");
+    assert!(hook_json.exists(), "seed sync must write the hook json");
+    let seed_disk = std::fs::read_to_string(&hook_json).unwrap();
+    assert!(
+        !seed_disk.contains("\"ready\""),
+        "seed pull must redact hook status, not write raw 'ready':\n{seed_disk}"
+    );
+
+    // Edit a config value so the hook is a LocalEdit → push PATCH.
+    let mut v: serde_json::Value = serde_json::from_str(&seed_disk).unwrap();
+    v["config"]["url"] = serde_json::Value::String("https://hook.example.com/run-v2".to_string());
+    std::fs::write(
+        &hook_json,
+        format!("{}\n", serde_json::to_string_pretty(&v).unwrap()),
+    )
+    .unwrap();
+
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("push sync should succeed");
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    let patch_bodies: Vec<serde_json::Value> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| {
+            r.method == http::Method::PATCH && r.url.path() == format!("/api/v1/hooks/{hook_id}")
+        })
+        .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+        .collect();
+    assert_eq!(
+        patch_bodies.len(),
+        1,
+        "expected exactly one hook PATCH; got {}",
+        patch_bodies.len()
+    );
+    assert!(
+        patch_bodies[0].get("status").is_none(),
+        "hook PATCH body must NOT contain the redacted `status`; got:\n{}",
+        serde_json::to_string_pretty(&patch_bodies[0]).unwrap()
+    );
+}
+
 /// Bug-c regression: after a push-PATCH of an existing engine, the on-disk
 /// `engine.json` must contain the sentinel string for `agenda_id` (NOT the
 /// raw live value returned by the server), and the lockfile content_hash must
@@ -6132,6 +6256,31 @@ async fn push_engine_patch_redacts_agenda_id_on_disk() {
     assert_eq!(
         recorded_hash, expected_hash,
         "lockfile content_hash after PATCH must equal codec combined_hash of the PATCH response"
+    );
+
+    // The PATCH body itself must NOT carry `agenda_id`. It's a read-only,
+    // server-managed identifier; echoing the redaction sentinel (or any src
+    // value) is at best ignored and at worst overwrites/400s the engine's
+    // identifier on the remote. `strip_patch_extra` must remove it before the
+    // PATCH, exactly as `strip_for_create` does for POST bodies.
+    let engine_patch_bodies: Vec<serde_json::Value> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.method == http::Method::PATCH && r.url.path() == "/api/v1/engines/901")
+        .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+        .collect();
+    assert_eq!(
+        engine_patch_bodies.len(),
+        1,
+        "expected exactly one engine PATCH; got {}",
+        engine_patch_bodies.len()
+    );
+    assert!(
+        engine_patch_bodies[0].get("agenda_id").is_none(),
+        "engine PATCH body must NOT contain `agenda_id`; got:\n{}",
+        serde_json::to_string_pretty(&engine_patch_bodies[0]).unwrap()
     );
 }
 

@@ -5,7 +5,7 @@ use crate::overlay::{Overlay, apply_overrides};
 use crate::paths::Paths;
 
 use crate::snapshot::codec::combined_hash;
-use crate::snapshot::create::strip_for_create;
+use crate::snapshot::create::{strip_for_create, strip_patch_extra};
 use crate::snapshot::writer::write_atomic;
 use crate::state::{Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
@@ -170,6 +170,12 @@ pub async fn push(
             }
         }
 
+        // A PATCH must not echo server-managed fields. `agenda_id` is a
+        // read-only, per-env identifier that Rossum refreshes on training;
+        // echoing the redacted sentinel back is ignored at best and
+        // overwrites/400s the engine's identifier at worst. Strip it (and the
+        // other server fields) off `extra`, matching the CREATE contract.
+        strip_patch_extra(&mut payload_to_send.extra, "engines", false);
         let patch_result = client
             .update_engine(id, &payload_to_send, Some(progress.clone()))
             .await

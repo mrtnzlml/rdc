@@ -5,7 +5,7 @@ use crate::overlay::{Overlay, apply_overrides};
 use crate::paths::Paths;
 
 use crate::snapshot::codec::combined_hash;
-use crate::snapshot::create::strip_for_create;
+use crate::snapshot::create::{strip_for_create, strip_patch_extra};
 use crate::snapshot::writer::write_atomic;
 use crate::state::{Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
@@ -174,6 +174,11 @@ pub async fn push(
             }
         }
 
+        // Strip server-managed fields from `extra` so the PATCH matches the
+        // CREATE contract. Critically, `rir_url` is a per-cluster internal
+        // service URL the API 400s ("Invalid URL") if echoed back, and
+        // `counts` is redacted to the sentinel on disk.
+        strip_patch_extra(&mut payload_to_send.extra, "queues", false);
         let patch_result = client
             .update_queue(id, &payload_to_send, Some(progress.clone()))
             .await

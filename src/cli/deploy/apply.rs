@@ -8,7 +8,9 @@ use crate::overlay::{Overlay, apply_overrides};
 use crate::paths::Paths;
 use crate::secrets::resolve_token;
 use crate::snapshot::codec::combined_hash;
-use crate::snapshot::create::{redact_for_disk, strip_for_cross_env_patch};
+use crate::snapshot::create::{
+    redact_for_disk, strip_for_create, strip_for_cross_env_patch, strip_patch_extra,
+};
 use crate::snapshot::email_template::{read_email_template, write_email_template};
 use crate::snapshot::hook::{read_hook_value, write_hook};
 use crate::snapshot::rule::write_rule;
@@ -565,6 +567,12 @@ pub(crate) async fn run(
         if !dry_run {
             let mut body = serde_json::to_value(&payload_hook)
                 .with_context(|| format!("serializing hook '{src_slug}' for PATCH"))?;
+            // Strip server-managed fields (notably the redacted `status`
+            // sentinel) so the cross-env PATCH matches the CREATE contract.
+            // `strip_for_create` (not the cross-env variant) is deliberate: it
+            // leaves the resolved tgt `token_owner` (set on `payload` above)
+            // and `organization` intact, matching the long-standing flow.
+            strip_for_create(&mut body, "hooks");
             if let Some(secrets) = hook_secrets_plan.for_slug(src_slug)
                 && let Some(obj) = body.as_object_mut()
             {
@@ -638,7 +646,7 @@ pub(crate) async fn run(
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }
-        let payload_rule: crate::model::Rule = match serde_json::from_value(payload) {
+        let mut payload_rule: crate::model::Rule = match serde_json::from_value(payload) {
             Ok(v) => v,
             Err(e) => {
                 warn(
@@ -718,6 +726,10 @@ pub(crate) async fn run(
             }
         }
         if !dry_run {
+            // Cross-env PATCH must not echo server-managed fields (org,
+            // universal, server-computed back-refs); strip them off `extra`
+            // to honour the same contract as a CREATE.
+            strip_patch_extra(&mut payload_rule.extra, "rules", true);
             let updated = tgt_client
                 .update_rule(tgt_id, &payload_rule, None)
                 .await
@@ -777,7 +789,7 @@ pub(crate) async fn run(
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }
-        let payload_label: crate::model::Label = match serde_json::from_value(payload) {
+        let mut payload_label: crate::model::Label = match serde_json::from_value(payload) {
             Ok(v) => v,
             Err(e) => {
                 warn(
@@ -847,6 +859,9 @@ pub(crate) async fn run(
             )?;
         }
         if !dry_run {
+            // Cross-env PATCH must not echo server-managed fields (org,
+            // universal); strip them off `extra` per the CREATE contract.
+            strip_patch_extra(&mut payload_label.extra, "labels", true);
             let updated = tgt_client
                 .update_label(tgt_id, &payload_label, None)
                 .await
@@ -1043,7 +1058,7 @@ pub(crate) async fn run(
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }
-        let payload_schema: crate::model::Schema = match serde_json::from_value(payload) {
+        let mut payload_schema: crate::model::Schema = match serde_json::from_value(payload) {
             Ok(s) => s,
             Err(e) => {
                 warn(
@@ -1122,6 +1137,10 @@ pub(crate) async fn run(
             }
         }
         if !dry_run {
+            // Cross-env PATCH must not echo server-managed fields (org,
+            // universal, the server-computed `queues` back-ref); strip them
+            // off `extra` per the CREATE contract.
+            strip_patch_extra(&mut payload_schema.extra, "schemas", true);
             let updated = tgt_client
                 .update_schema(tgt_id, &payload_schema, None)
                 .await
@@ -1458,7 +1477,7 @@ pub(crate) async fn run(
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }
-        let payload_engine: crate::model::Engine = match serde_json::from_value(payload) {
+        let mut payload_engine: crate::model::Engine = match serde_json::from_value(payload) {
             Ok(e) => e,
             Err(e) => {
                 warn(
@@ -1528,6 +1547,11 @@ pub(crate) async fn run(
                 p.event(Action::Patch, &format!("engine/{tgt_slug}"));
             }
         } else {
+            // Cross-env PATCH must not echo `agenda_id` (read-only, per-env,
+            // refreshes on training) or org/universal fields — that would try
+            // to overwrite the target engine's identifier with the source's
+            // sentinel. Strip them off `extra`, matching the CREATE contract.
+            strip_patch_extra(&mut payload_engine.extra, "engines", true);
             match tgt_client
                 .update_engine(tgt_id, &payload_engine, None)
                 .await

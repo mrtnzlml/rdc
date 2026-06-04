@@ -6,6 +6,7 @@
 //! clean — the user's placeholder `id: 0` / `url: ""` (or missing fields)
 //! never reach the server.
 
+use indexmap::IndexMap;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -194,10 +195,110 @@ pub fn strip_for_cross_env_patch(body: &mut Value, kind: &str) {
     }
 }
 
+/// Partial-update analogue of [`strip_for_create`] / [`strip_for_cross_env_patch`].
+///
+/// The typed `update_<kind>` API endpoints take a typed struct whose
+/// server-managed fields (`agenda_id`, `status`, `rir_url`, `counts`, …) land
+/// in `#[serde(flatten)] extra`. CREATE bodies are stripped via the
+/// Value-based [`strip_for_create`], but PATCH bodies built straight from the
+/// typed struct were *not* — so the redacted sentinel (or a read-only server
+/// value) was echoed back on every PATCH and at best ignored, at worst 400'd
+/// (queue `rir_url` does the latter). This strips the same fields off `extra`
+/// so a PATCH honours the identical contract as a CREATE.
+///
+/// Typed columns (`id`, `url`, `name`, and refs the caller has already remapped
+/// such as queue `workspace`/`schema`) are intentionally left intact: the
+/// server ignores `id`/`url` on PATCH, and remapped refs *must* be sent.
+///
+/// `cross_env` mirrors [`strip_for_cross_env_patch`]: it additionally drops
+/// `organization` (and a hook's per-env `token_owner`).
+pub fn strip_patch_extra(extra: &mut IndexMap<String, Value>, kind: &str, cross_env: bool) {
+    for f in UNIVERSAL_SERVER_FIELDS {
+        extra.shift_remove(*f);
+    }
+    for f in kind_specific_strip(kind) {
+        extra.shift_remove(*f);
+    }
+    if cross_env {
+        extra.shift_remove("organization");
+        // Mirror `strip_for_cross_env_patch`: a hook's `token_owner` is a
+        // per-env user URL with no cross-env mapping; deploy sets the correct
+        // target owner explicitly before PATCH.
+        if kind == "hooks" {
+            extra.shift_remove("token_owner");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn strip_patch_extra_removes_server_fields_like_create() {
+        // engines: `agenda_id` (kind_specific) + `modified_at` (universal)
+        // must go; `organization` is kept within-env, dropped cross-env; an
+        // ordinary field survives untouched.
+        let mut e: IndexMap<String, Value> = serde_json::from_value(json!({
+            "type": "extractor",
+            "agenda_id": "tnt_live_xyz",
+            "modified_at": "2026-01-01T00:00:00Z",
+            "organization": "https://x/api/v1/organizations/1",
+        }))
+        .unwrap();
+        strip_patch_extra(&mut e, "engines", false);
+        assert!(!e.contains_key("agenda_id"), "agenda_id must be stripped");
+        assert!(!e.contains_key("modified_at"), "modified_at must be stripped");
+        assert!(
+            e.contains_key("organization"),
+            "within-env PATCH keeps organization"
+        );
+        assert!(e.contains_key("type"), "non-server field must survive");
+        strip_patch_extra(&mut e, "engines", true);
+        assert!(
+            !e.contains_key("organization"),
+            "cross-env PATCH drops organization"
+        );
+
+        // hooks: `status` (the field this whole change is about) must be
+        // stripped in both modes; `token_owner` only cross-env.
+        let mut h: IndexMap<String, Value> = serde_json::from_value(json!({
+            "status": "ready",
+            "token_owner": "https://x/api/v1/users/9",
+        }))
+        .unwrap();
+        strip_patch_extra(&mut h, "hooks", false);
+        assert!(
+            !h.contains_key("status"),
+            "hook status must be stripped from a PATCH body"
+        );
+        assert!(
+            h.contains_key("token_owner"),
+            "within-env PATCH keeps token_owner"
+        );
+        strip_patch_extra(&mut h, "hooks", true);
+        assert!(
+            !h.contains_key("token_owner"),
+            "cross-env PATCH drops token_owner"
+        );
+
+        // queues: the proven-400 `rir_url` plus `counts` must be stripped.
+        let mut q: IndexMap<String, Value> = serde_json::from_value(json!({
+            "rir_url": "http://rir.svc.cluster.local",
+            "counts": { "to_review": 1 },
+        }))
+        .unwrap();
+        strip_patch_extra(&mut q, "queues", false);
+        assert!(
+            !q.contains_key("rir_url"),
+            "queue rir_url must be stripped from a PATCH body"
+        );
+        assert!(
+            !q.contains_key("counts"),
+            "queue counts must be stripped from a PATCH body"
+        );
+    }
 
     #[test]
     fn strips_universal_fields() {
