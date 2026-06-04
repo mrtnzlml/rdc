@@ -96,7 +96,12 @@ pub fn strip_for_create(body: &mut Value, kind: &str) {
 ///
 /// Add a new field here when a runtime aggregate (or other server-set
 /// "live" data) shows up in `git diff` noise.
-fn redact_on_pull(kind: &str) -> &'static [&'static str] {
+///
+/// `pub` so the cross-kind codec invariant test can introspect the spec and
+/// assert that every codec's `disk_bytes` actually redacts these fields — the
+/// systematic guard against a codec silently omitting redaction (as the hooks
+/// codec did before the fix).
+pub fn redact_on_pull(kind: &str) -> &'static [&'static str] {
     match kind {
         "queues" => &["counts"],
         // `status` is the runtime health of the hook; Rossum updates it

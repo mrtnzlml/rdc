@@ -96,6 +96,13 @@ pub fn serialize_hook(hook: &Hook) -> Result<(Vec<u8>, Option<String>)> {
 
     let code = split_hook_code(&mut json_value);
 
+    // Redact the server-managed runtime `status` to a constant sentinel so it
+    // doesn't churn on disk or surface as a spurious sync conflict — Rossum
+    // flips it pending→ready→failed live, independent of any local edit.
+    // Mirrors the queue `counts` redaction; the push path strips `status`
+    // entirely via `strip_for_create`, so the sentinel is never sent back.
+    crate::snapshot::create::redact_for_disk(&mut json_value, "hooks");
+
     sort_queues(&mut json_value);
 
     crate::snapshot::key_order::strip_hidden_fields_recursive(&mut json_value);

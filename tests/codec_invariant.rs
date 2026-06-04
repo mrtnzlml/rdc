@@ -461,6 +461,48 @@ fn queues_redaction_correct() {
     assert!(art.sidecars.is_empty(), "queues must produce no sidecars");
 }
 
+/// SYSTEMATIC redaction invariant — the framework-level guard.
+///
+/// For EVERY registered codec, `disk_bytes` must redact each field named in
+/// `redact_on_pull(kind)` to the sentinel. This makes it impossible for a codec
+/// to silently omit redaction (as the hooks codec did — its `serialize_hook`
+/// dropped the `redact_for_disk` call, leaking a live `status` that churned and
+/// caused spurious sync conflicts). The per-kind tests above are explicit
+/// documentation; this one enforces the rule across all kinds at once,
+/// including any kind added in the future.
+#[test]
+fn every_codec_redacts_its_redact_on_pull_fields() {
+    use rdc::snapshot::create::{redact_on_pull, REDACTED_VALUE_SENTINEL};
+    for (kind, value) in codec_cases() {
+        let fields = redact_on_pull(kind);
+        if fields.is_empty() {
+            continue;
+        }
+        let art = codec(kind)
+            .unwrap_or_else(|| panic!("{kind}: codec must be registered"))
+            .disk_bytes(&value)
+            .unwrap_or_else(|e| panic!("{kind}: disk_bytes failed: {e}"));
+        let disk: serde_json::Value = serde_json::from_slice(&art.json)
+            .unwrap_or_else(|e| panic!("{kind}: on-disk json must parse: {e}"));
+        for f in fields {
+            // The sample MUST carry the field, else the invariant passes
+            // vacuously and a regression could slip through.
+            assert!(
+                value.get(*f).is_some(),
+                "{kind}: codec_cases() sample must include redactable field `{f}` \
+                 so this invariant actually exercises it",
+            );
+            assert_eq!(
+                disk.get(*f).and_then(|v| v.as_str()),
+                Some(REDACTED_VALUE_SENTINEL),
+                "{kind}: field `{f}` must be redacted to the sentinel on disk — \
+                 its codec's disk_bytes is missing redact_for_disk. disk:\n{}",
+                String::from_utf8_lossy(&art.json),
+            );
+        }
+    }
+}
+
 /// Labels: no redaction, no sidecars, modified_at stripped.
 #[test]
 fn labels_invariants() {
