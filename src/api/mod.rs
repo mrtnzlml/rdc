@@ -400,20 +400,26 @@ impl RossumClient {
             // Offset fan-out for pages 2..=total_pages (parallel, paced by the limiter).
             // NOTE: these page futures borrow `self` and are not `'static`; they must be
             // driven by `buffer_unordered` on the current task, never `tokio::spawn`ed.
-            let rest: Vec<Vec<Value>> = futures::stream::iter(2..=total_pages)
+            let mut rest: Vec<(u64, Vec<Value>)> = futures::stream::iter(2..=total_pages)
                 .map(|n| {
                     let url = page_url(n);
                     let progress = progress.clone();
                     async move {
                         let pg: Page<Value> = self.get_json(&url, progress.clone()).await?;
                         if let Some(p) = &progress { p.bump(pg.results.len() as u64); }
-                        anyhow::Ok(pg.results)
+                        anyhow::Ok((n, pg.results))
                     }
                 })
                 .buffer_unordered(LIST_PAGE_FANOUT)
                 .try_collect()
                 .await?;
-            for page in rest {
+            // `buffer_unordered` yields pages in COMPLETION order; restore the
+            // API's page order (each page is itself `ordering=id`) so the merged
+            // list is a deterministic, id-ordered sequence. Without this, a
+            // same-named object's name-derived slug `-2` suffix would depend on
+            // response timing on a first pull / `rdc doctor --rebuild-lock`.
+            rest.sort_by_key(|(n, _)| *n);
+            for (_, page) in rest {
                 raw.extend(page);
             }
         } else if total_pages == 0 {

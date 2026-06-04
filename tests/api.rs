@@ -3,7 +3,7 @@
 #![allow(clippy::await_holding_lock)]
 
 use rdc::api::{DataStorageClient, RossumClient};
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn fixture(name: &str) -> serde_json::Value {
@@ -60,6 +60,54 @@ async fn list_hooks_paginates_until_done() {
     assert_eq!(hooks.len(), 2);
     assert_eq!(hooks[0].name, "Validator: invoices");
     assert_eq!(hooks[1].name, "SFTP import");
+}
+
+/// Multi-page list: pages 2..N are fetched concurrently (`buffer_unordered`),
+/// so they can COMPLETE out of order. The merged result must still be in page
+/// order (= the API's `ordering=id` order), otherwise name-derived slug `-2`
+/// suffixes for same-named objects spanning a page boundary become
+/// timing-dependent on a first pull / `rdc doctor --rebuild-lock`. Here page 3
+/// responds immediately while page 2 is delayed, so completion order is [3, 2];
+/// the returned ids must still be [1, 2, 3].
+#[tokio::test]
+async fn list_paginated_preserves_page_order_under_out_of_order_completion() {
+    let server = MockServer::start().await;
+    let uri = server.uri();
+    let body = |total: u64, items: Vec<(u64, &str)>| {
+        serde_json::json!({
+            "pagination": { "total_pages": total, "next": null },
+            "results": items.iter().map(|(id, name)| serde_json::json!({
+                "id": id,
+                "url": format!("{uri}/api/v1/queues/{id}"),
+                "name": name,
+            })).collect::<Vec<_>>()
+        })
+    };
+    // Page 1 establishes total_pages = 3.
+    Mock::given(method("GET")).and(path("/api/v1/queues")).and(query_param("page", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body(3, vec![(1, "q1")])))
+        .mount(&server).await;
+    // Page 2 is SLOW — it will complete LAST.
+    Mock::given(method("GET")).and(path("/api/v1/queues")).and(query_param("page", "2"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(400))
+                .set_body_json(body(3, vec![(2, "q2")])),
+        )
+        .mount(&server).await;
+    // Page 3 is immediate — it will complete BEFORE page 2.
+    Mock::given(method("GET")).and(path("/api/v1/queues")).and(query_param("page", "3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body(3, vec![(3, "q3")])))
+        .mount(&server).await;
+
+    let client = RossumClient::new(format!("{uri}/api/v1"), "TEST_TOKEN".into()).unwrap();
+    let queues = client.list_queues(None).await.unwrap();
+    let ids: Vec<u64> = queues.iter().map(|q| q.id).collect();
+    assert_eq!(
+        ids,
+        vec![1, 2, 3],
+        "pages must be merged in page order regardless of completion timing"
+    );
 }
 
 #[tokio::test]
