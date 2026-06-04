@@ -4,7 +4,7 @@ use crate::log::{Action, Log};
 use crate::overlay::{apply_overrides, Overlay};
 use crate::paths::Paths;
 
-use crate::snapshot::create::strip_for_create;
+use crate::snapshot::create::{strip_for_create, strip_patch_extra};
 use crate::snapshot::schema::{read_schema_value, serialize_schema, write_schema_bytes};
 use crate::state::{schema_combined_hash, Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
@@ -139,6 +139,9 @@ pub async fn push(
             }
         }
 
+        // Strip server-managed fields from `extra` so the PATCH matches the
+        // CREATE contract (e.g. the server-computed `queues` back-ref).
+        strip_patch_extra(&mut payload_to_send.extra, "schemas", false);
         let patch_result = client.update_schema(id, &payload_to_send, Some(progress.clone())).await
             .with_context(|| format!("PATCH /schemas/{id}"));
         let updated = patch_result?;
