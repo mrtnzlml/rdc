@@ -12,11 +12,11 @@ use serde_json::Value;
 /// `rdc://` URI prefix.
 pub const RDC_SCHEME: &str = "rdc://";
 
-/// Kinds whose object URLs are rewritten to `rdc://` on pull. A kind is
-/// portable iff rdc snapshots it as a deployable object. `organization`
-/// (per-env singleton) and `mdh_indexes` (no `/api/v1/` URL) are excluded;
-/// their URLs stay verbatim. Non-snapshotted targets (users, hook_templates)
-/// never resolve via the lockfile, so they are left alone regardless.
+/// Returns `true` for every kind whose URLs are rewritten to portable `rdc://`
+/// refs on pull. The two excluded kinds are `organization` (per-env singleton)
+/// and `mdh_indexes` (no `/api/v1/` URL); their URLs stay verbatim. All other
+/// kinds are portable. Non-snapshotted targets (users, hook_templates) never
+/// resolve via the lockfile, so they are left alone regardless.
 pub fn is_portable_kind(kind: &str) -> bool {
     !matches!(kind, "organization" | "mdh_indexes")
 }
@@ -34,9 +34,10 @@ pub fn parse_rdc_ref(s: &str) -> Option<(&str, &str)> {
     Some((kind, slug))
 }
 
-/// Recursively apply `f` to every string leaf in a JSON tree (objects and
-/// array elements, at any depth). Lifted from `deploy/common.rs` so both
-/// the portable-ref conversion and the (soon-removed) URL rewriter share it.
+/// Recursively apply `f` to every string leaf in a JSON tree (object values
+/// and array elements, at any depth). Object keys are not visited. This is the
+/// shared string walker for reference conversion; a later task points
+/// `deploy/common.rs`'s URL rewriter at it too.
 pub fn walk_strings_mut(value: &mut Value, f: &mut dyn FnMut(&mut String)) {
     match value {
         Value::String(s) => f(s),
@@ -119,12 +120,13 @@ mod tests {
             Some(("queues", "invoices"))
         );
         assert_eq!(
-            parse_rdc_ref("rdc://engine_fields/mtr/code"),
-            Some(("engine_fields", "mtr/code"))
+            parse_rdc_ref("rdc://engine_fields/extractor/code"),
+            Some(("engine_fields", "extractor/code"))
         );
         assert_eq!(parse_rdc_ref("https://x.rossum.app/api/v1/queues/1"), None);
         assert_eq!(parse_rdc_ref("not a ref"), None);
-        assert_eq!(parse_rdc_ref("rdc://queues"), None);
+        assert_eq!(parse_rdc_ref("rdc://queues"), None); // no slug
+        assert_eq!(parse_rdc_ref("rdc:///slug"), None); // empty kind
     }
 
     #[test]
@@ -138,7 +140,7 @@ mod tests {
 
     #[test]
     fn url_round_trips_through_rdc() {
-        let url = "https://ferguson-dev.rossum.app/api/v1/workspaces/1054061";
+        let url = "https://example.rossum.app/api/v1/workspaces/1054061";
         let lf = lf_with("workspaces", "demo", 1054061, url);
         let rdc = url_to_rdc(url, &lf).unwrap();
         assert_eq!(rdc, "rdc://workspaces/demo");
@@ -147,9 +149,9 @@ mod tests {
 
     #[test]
     fn organization_and_unknown_urls_are_left_as_urls() {
-        let org = "https://ferguson-dev.rossum.app/api/v1/organizations/418975";
+        let org = "https://example.rossum.app/api/v1/organizations/418975";
         let mut lf = lf_with("organization", "self", 418975, org);
-        let user = "https://ferguson-dev.rossum.app/api/v1/users/499604";
+        let user = "https://example.rossum.app/api/v1/users/499604";
         assert_eq!(url_to_rdc(org, &lf), None);
         assert_eq!(url_to_rdc(user, &lf), None);
         lf.upsert(
@@ -172,5 +174,20 @@ mod tests {
         assert_eq!(v["queue"], "rdc://queues/invoices");
         assert_eq!(v["actions"][0]["payload"]["queue"], "rdc://queues/invoices");
         assert_eq!(v["organization"], org);
+    }
+
+    #[test]
+    fn resolve_value_rewrites_rdc_refs_and_leaves_dangling_intact() {
+        let url = "https://example.rossum.app/api/v1/queues/10";
+        let lf = lf_with("queues", "invoices", 10, url);
+        let mut v = serde_json::json!({
+            "queue": "rdc://queues/invoices",
+            "other": "rdc://queues/unknown-slug", // dangling — must survive
+            "plain": "https://example.com/",
+        });
+        resolve_value(&mut v, &lf);
+        assert_eq!(v["queue"], url);
+        assert_eq!(v["other"], "rdc://queues/unknown-slug");
+        assert_eq!(v["plain"], "https://example.com/");
     }
 }
