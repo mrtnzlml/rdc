@@ -249,7 +249,7 @@ pub fn rewrite_urls(
     mapping: &Mapping,
     explicit_subs: &std::collections::BTreeMap<String, String>,
 ) {
-    walk_strings_mut(value, &mut |s| {
+    crate::snapshot::refs::walk_strings_mut(value, &mut |s| {
         if let Some(tgt) = explicit_subs.get(s.as_str()) {
             *s = tgt.clone();
             return;
@@ -270,23 +270,6 @@ pub fn rewrite_urls(
         };
         *s = tgt_url.to_string();
     });
-}
-
-fn walk_strings_mut(value: &mut Value, f: &mut dyn FnMut(&mut String)) {
-    match value {
-        Value::String(s) => f(s),
-        Value::Array(arr) => {
-            for item in arr {
-                walk_strings_mut(item, f);
-            }
-        }
-        Value::Object(obj) => {
-            for (_k, v) in obj.iter_mut() {
-                walk_strings_mut(v, f);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Drift check: hash the remote bytes through the kind's [`KindCodec`]
@@ -538,8 +521,7 @@ mod tests {
         let baseline_hash = content_hash(&baseline_bytes);
         let lf = lf_with_hash("queues", "invoices", &baseline_hash);
         let remote_bytes = serde_json::to_vec_pretty(&value).unwrap();
-        let (in_sync, _) =
-            tgt_drift_status(remote_bytes, None, &lf, "queues", "invoices").unwrap();
+        let (in_sync, _) = tgt_drift_status(remote_bytes, None, &lf, "queues", "invoices").unwrap();
         assert!(
             in_sync,
             "queue with live counts should be in_sync against redacted baseline"
