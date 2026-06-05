@@ -35,9 +35,8 @@ pub fn parse_rdc_ref(s: &str) -> Option<(&str, &str)> {
 }
 
 /// Recursively apply `f` to every string leaf in a JSON tree (object values
-/// and array elements, at any depth). Object keys are not visited. This is the
-/// shared string walker for reference conversion; a later task points
-/// `deploy/common.rs`'s URL rewriter at it too.
+/// and array elements, at any depth). Object keys are not visited. Shared by the
+/// portable-ref conversion here and `deploy/common.rs`'s URL rewriter.
 pub fn walk_strings_mut(value: &mut Value, f: &mut dyn FnMut(&mut String)) {
     match value {
         Value::String(s) => f(s),
