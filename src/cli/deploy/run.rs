@@ -107,6 +107,14 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
         .with_env_label(src);
 
     let tgt_token = resolve_token(&cwd, tgt, &tgt_cfg.api_base).await?;
+    // Target Data Storage (MDH) client — MDH lives on a separate service
+    // (bare host + /svc/data-storage/api), so it needs its own client; it
+    // reuses the same target token.
+    let tgt_data_client = crate::api::DataStorageClient::new(
+        tgt_cfg.data_storage_base(),
+        tgt_token.clone(),
+    )
+    .context("constructing target Data Storage client")?;
     let tgt_client = RossumClient::new(tgt_cfg.api_base.clone(), tgt_token)
         .context("constructing tgt API client")?
         .with_env_label(tgt);
@@ -333,6 +341,31 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
                  (or require --force-overwrite-drift in non-TTY mode)."
             );
         }
+        // MDH index deploy preview (read-only list calls; full deploys only).
+        let mdh_dry = if selection.is_none() {
+            crate::cli::deploy::mdh::deploy_mdh_indexes(
+                &src_paths,
+                &tgt_data_client,
+                mirror,
+                true,
+                None,
+            )
+            .await?
+        } else {
+            crate::cli::deploy::mdh::MdhApplied::default()
+        };
+        if mdh_dry.ops > 0 || mdh_dry.skipped > 0 {
+            println!(
+                "MDH (dry-run): would apply {} index op(s) across {} dataset(s){}",
+                mdh_dry.ops,
+                mdh_dry.datasets,
+                if mdh_dry.skipped > 0 {
+                    format!(", {} dataset(s) skipped (no target collection)", mdh_dry.skipped)
+                } else {
+                    String::new()
+                },
+            );
+        }
         println!(
             "\nDry run ({src} -> {tgt}){scope}: {} would be created, {} would be deleted, \
              {:.1}s; no remote changes made.",
@@ -531,6 +564,24 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
         tgt_lockfile.save(&tgt_paths.lockfile())?;
     }
 
+    // 11b. Deploy MDH dataset indexes (regular + Atlas Search) to the target.
+    // Scoped (--only) deploys skip MDH for now. Datasets match by slug; a
+    // missing target collection is warned + skipped (don't block the deploy on
+    // data not yet imported there). Prunes target-only indexes only under
+    // --mirror, consistent with every other kind.
+    let mdh_applied = if selection.is_none() {
+        crate::cli::deploy::mdh::deploy_mdh_indexes(
+            &src_paths,
+            &tgt_data_client,
+            mirror,
+            false,
+            progress.clone(),
+        )
+        .await?
+    } else {
+        crate::cli::deploy::mdh::MdhApplied::default()
+    };
+
     // 12. Final summary.
     let elapsed = started.elapsed();
     let scope = selection.as_ref()
@@ -543,6 +594,18 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
         ));
     }
     println!("{apply_summary}");
+    if mdh_applied.ops > 0 || mdh_applied.skipped > 0 {
+        println!(
+            "MDH: applied {} index op(s) across {} dataset(s){}",
+            mdh_applied.ops,
+            mdh_applied.datasets,
+            if mdh_applied.skipped > 0 {
+                format!(", {} dataset(s) skipped (no target collection)", mdh_applied.skipped)
+            } else {
+                String::new()
+            },
+        );
+    }
     println!(
         "\nDeployed {src} -> {tgt}{scope}: {creates_done} created, {deletes_done} deleted, \
          {} API calls, {:.1}s",

@@ -3,6 +3,7 @@ pub(crate) mod common;
 pub mod create;
 pub mod hook_secrets;
 pub mod map;
+pub mod mdh;
 pub mod realign;
 pub mod run;
 pub mod store_extensions;

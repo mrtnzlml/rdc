@@ -83,99 +83,7 @@ pub async fn push_dataset(
         &remote_search,
     );
 
-    let mut ops = 0usize;
-    // Track which names we just dropped so creates that reuse the same
-    // name know to wait for the async drop to complete before issuing
-    // the create. Without this gate the drop-then-create-same-name
-    // sequence races: the drop is queued, the create either fails on
-    // "already exists" or — worse for Atlas Search — succeeds and is
-    // then clobbered when the queued drop finally fires. Cross-name
-    // drop+create pairs don't race (different namespaces).
-    let mut dropped_regular: BTreeSet<String> = BTreeSet::new();
-    let mut dropped_search: BTreeSet<String> = BTreeSet::new();
-    for name in &plan.drop_regular {
-        client
-            .drop_index(collection_name, name, Some(progress.clone()))
-            .await
-            .with_context(|| format!("dropping regular index '{name}' on '{collection_name}'"))?;
-        progress.event(
-            Action::Delete,
-            &format!("mdh/{slug} regular index '{name}'"),
-        );
-        dropped_regular.insert(name.clone());
-        ops += 1;
-    }
-    for name in &plan.drop_search {
-        client
-            .drop_search_index(collection_name, name, Some(progress.clone()))
-            .await
-            .with_context(|| {
-                format!("dropping search index '{name}' on '{collection_name}'")
-            })?;
-        progress.event(
-            Action::Delete,
-            &format!("mdh/{slug} search index '{name}'"),
-        );
-        dropped_search.insert(name.clone());
-        ops += 1;
-    }
-    for def in &plan.create_regular {
-        let name = def
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("regular index def missing `name` field: {def}"))?;
-        if dropped_regular.contains(name) {
-            wait_for_regular_drop(client, collection_name, name, progress).await?;
-        }
-        let keys = def
-            .get("key")
-            .ok_or_else(|| anyhow!("regular index '{name}' missing `key` field"))?;
-        let options = def_options_only(def);
-        client
-            .create_index(collection_name, name, keys, &options, Some(progress.clone()))
-            .await
-            .with_context(|| {
-                format!("creating regular index '{name}' on '{collection_name}'")
-            })?;
-        progress.event(
-            Action::Post,
-            &format!("mdh/{slug} regular index '{name}'"),
-        );
-        ops += 1;
-    }
-    for def in &plan.create_search {
-        let name = def
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("search index def missing `name` field: {def}"))?;
-        if dropped_search.contains(name) {
-            wait_for_search_drop(client, collection_name, name, progress).await?;
-        }
-        let mappings = def
-            .get("mappings")
-            .ok_or_else(|| anyhow!("search index '{name}' missing `mappings` field"))?;
-        let analyzers = def
-            .get("analyzers")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!([]));
-        client
-            .create_search_index(
-                collection_name,
-                name,
-                mappings,
-                &analyzers,
-                Some(progress.clone()),
-            )
-            .await
-            .with_context(|| {
-                format!("creating search index '{name}' on '{collection_name}'")
-            })?;
-        progress.event(
-            Action::Post,
-            &format!("mdh/{slug} search index '{name}'"),
-        );
-        ops += 1;
-    }
+    let ops = apply_diff(client, collection_name, slug, &plan, progress).await?;
 
     // Push fully applied — refresh the lockfile content_hash to the
     // canonical hash of the local bytes. The next pull-driver pass
@@ -199,6 +107,90 @@ pub async fn push_dataset(
         );
     }
 
+    Ok(ops)
+}
+
+/// Apply a computed [`DiffPlan`] to `collection_name` on `client`: drops
+/// first (so a changed definition frees its name), then creates — waiting
+/// for any same-name drop to finish before re-creating, since Data Storage
+/// drops are async. Returns the number of API write ops performed. Shared by
+/// within-env push (`push_dataset`) and cross-env deploy.
+pub(crate) async fn apply_diff(
+    client: &DataStorageClient,
+    collection_name: &str,
+    slug: &str,
+    plan: &DiffPlan,
+    progress: &Arc<Log>,
+) -> Result<usize> {
+    let mut ops = 0usize;
+    // Track which names we just dropped so creates that reuse the same
+    // name know to wait for the async drop to complete before issuing
+    // the create. Without this gate the drop-then-create-same-name
+    // sequence races: the drop is queued, the create either fails on
+    // "already exists" or — worse for Atlas Search — succeeds and is
+    // then clobbered when the queued drop finally fires. Cross-name
+    // drop+create pairs don't race (different namespaces).
+    let mut dropped_regular: BTreeSet<String> = BTreeSet::new();
+    let mut dropped_search: BTreeSet<String> = BTreeSet::new();
+    for name in &plan.drop_regular {
+        client
+            .drop_index(collection_name, name, Some(progress.clone()))
+            .await
+            .with_context(|| format!("dropping regular index '{name}' on '{collection_name}'"))?;
+        progress.event(Action::Delete, &format!("mdh/{slug} regular index '{name}'"));
+        dropped_regular.insert(name.clone());
+        ops += 1;
+    }
+    for name in &plan.drop_search {
+        client
+            .drop_search_index(collection_name, name, Some(progress.clone()))
+            .await
+            .with_context(|| format!("dropping search index '{name}' on '{collection_name}'"))?;
+        progress.event(Action::Delete, &format!("mdh/{slug} search index '{name}'"));
+        dropped_search.insert(name.clone());
+        ops += 1;
+    }
+    for def in &plan.create_regular {
+        let name = def
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("regular index def missing `name` field: {def}"))?;
+        if dropped_regular.contains(name) {
+            wait_for_regular_drop(client, collection_name, name, progress).await?;
+        }
+        let keys = def
+            .get("key")
+            .ok_or_else(|| anyhow!("regular index '{name}' missing `key` field"))?;
+        let options = def_options_only(def);
+        client
+            .create_index(collection_name, name, keys, &options, Some(progress.clone()))
+            .await
+            .with_context(|| format!("creating regular index '{name}' on '{collection_name}'"))?;
+        progress.event(Action::Post, &format!("mdh/{slug} regular index '{name}'"));
+        ops += 1;
+    }
+    for def in &plan.create_search {
+        let name = def
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("search index def missing `name` field: {def}"))?;
+        if dropped_search.contains(name) {
+            wait_for_search_drop(client, collection_name, name, progress).await?;
+        }
+        let mappings = def
+            .get("mappings")
+            .ok_or_else(|| anyhow!("search index '{name}' missing `mappings` field"))?;
+        let analyzers = def
+            .get("analyzers")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]));
+        client
+            .create_search_index(collection_name, name, mappings, &analyzers, Some(progress.clone()))
+            .await
+            .with_context(|| format!("creating search index '{name}' on '{collection_name}'"))?;
+        progress.event(Action::Post, &format!("mdh/{slug} search index '{name}'"));
+        ops += 1;
+    }
     Ok(ops)
 }
 
@@ -278,18 +270,39 @@ async fn wait_for_search_drop(
 /// `_id_` regular index is filtered from both sides — server-managed,
 /// can't be dropped.
 #[derive(Debug, Default)]
-struct DiffPlan {
-    drop_regular: Vec<String>,
-    drop_search: Vec<String>,
-    create_regular: Vec<Value>,
-    create_search: Vec<Value>,
+pub(crate) struct DiffPlan {
+    pub drop_regular: Vec<String>,
+    pub drop_search: Vec<String>,
+    pub create_regular: Vec<Value>,
+    pub create_search: Vec<Value>,
 }
 
+/// Always-mirror diff for the within-env push driver (make the remote index
+/// set exactly match the local edit). Thin wrapper over [`diff_indexes`].
 fn diff_for_dataset(
     local_regular: &[Value],
     local_search: &[Value],
     remote_regular: &[Value],
     remote_search: &[Value],
+) -> DiffPlan {
+    diff_indexes(local_regular, local_search, remote_regular, remote_search, true)
+}
+
+/// Pure index-set diff. `mirror` controls only the pruning of entries that
+/// exist remotely but not locally:
+///   - `mirror == true`  → drop remote-only entries (make remote == local
+///     exactly; within-env `rdc sync` push, and `rdc deploy --mirror`).
+///   - `mirror == false` → leave remote-only entries in place (additive;
+///     `rdc deploy` without `--mirror`).
+/// A *changed* entry (same name, diverging definition) is ALWAYS a drop +
+/// create regardless of `mirror`, because the Data Storage API has no
+/// in-place update verb.
+pub(crate) fn diff_indexes(
+    local_regular: &[Value],
+    local_search: &[Value],
+    remote_regular: &[Value],
+    remote_search: &[Value],
+    mirror: bool,
 ) -> DiffPlan {
     fn index_by_name(items: &[Value], filter_id_index: bool) -> BTreeMap<String, &Value> {
         let mut out: BTreeMap<String, &Value> = BTreeMap::new();
@@ -314,7 +327,13 @@ fn diff_for_dataset(
     // creates pass).
     for (name, remote_def) in &remote_reg {
         match local_reg.get(name) {
-            None => plan.drop_regular.push(name.clone()),
+            // Remote-only: prune only when mirroring.
+            None => {
+                if mirror {
+                    plan.drop_regular.push(name.clone());
+                }
+            }
+            // Same name, changed definition: always drop+recreate.
             Some(local_def) => {
                 if !defs_equivalent(local_def, remote_def) {
                     plan.drop_regular.push(name.clone());
@@ -334,7 +353,13 @@ fn diff_for_dataset(
     }
     for (name, remote_def) in &remote_search_map {
         match local_search_map.get(name) {
-            None => plan.drop_search.push(name.clone()),
+            // Remote-only: prune only when mirroring.
+            None => {
+                if mirror {
+                    plan.drop_search.push(name.clone());
+                }
+            }
+            // Same name, changed definition: always drop+recreate.
             Some(local_def) => {
                 if !defs_equivalent(local_def, remote_def) {
                     plan.drop_search.push(name.clone());
@@ -496,5 +521,49 @@ mod tests {
         assert!(!obj.contains_key("v"));
         assert_eq!(obj.get("unique"), Some(&json!(true)));
         assert_eq!(obj.get("sparse"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn diff_remote_only_not_dropped_without_mirror() {
+        // Additive (deploy default): an index that exists only on the
+        // target is left in place — NOT pruned.
+        let plan =
+            diff_indexes(&[], &[], &[ix("ix_orphan", json!({"orphan": 1}))], &[], false);
+        assert!(
+            plan.drop_regular.is_empty(),
+            "remote-only index must survive without mirror: {plan:?}"
+        );
+        assert!(plan.create_regular.is_empty());
+    }
+
+    #[test]
+    fn diff_remote_only_dropped_with_mirror() {
+        let plan = diff_indexes(&[], &[], &[ix("ix_orphan", json!({"orphan": 1}))], &[], true);
+        assert_eq!(plan.drop_regular, vec!["ix_orphan".to_string()]);
+    }
+
+    #[test]
+    fn diff_changed_def_drops_even_without_mirror() {
+        // A changed definition is always drop+create (no in-place update),
+        // independent of mirror.
+        let plan = diff_indexes(
+            &[ix("ix_x", json!({"x": -1}))],
+            &[],
+            &[ix("ix_x", json!({"x": 1}))],
+            &[],
+            false,
+        );
+        assert_eq!(plan.drop_regular, vec!["ix_x".to_string()]);
+        assert_eq!(plan.create_regular.len(), 1);
+    }
+
+    #[test]
+    fn diff_remote_only_search_not_dropped_without_mirror() {
+        let remote = json!({"name": "s_orphan", "mappings": {"dynamic": true}});
+        let plan = diff_indexes(&[], &[], &[], &[remote], false);
+        assert!(
+            plan.drop_search.is_empty(),
+            "remote-only search index must survive without mirror: {plan:?}"
+        );
     }
 }
