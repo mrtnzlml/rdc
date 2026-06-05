@@ -175,6 +175,17 @@ pub async fn run(src: &str, tgt: &str, mirror: bool, interactive: bool, dry_run:
     // updates" even when same-slug pairs exist in both envs.
     mapping.save(&src_paths.mapping_file(src, tgt))?;
 
+    // Fail fast if the mapping references a source object that no longer
+    // exists in the src snapshot (a typo or a stale cross-env rename in the
+    // mapping file). Runs before any remote writes so a bad mapping aborts
+    // cleanly with the full list, instead of silently warn-and-skipping the
+    // entry deep in the apply loop (and never deploying what the user meant).
+    crate::cli::deploy::map::validate_mapping_sources(
+        &mapping,
+        &src_paths,
+        &src_paths.mapping_file(src, tgt),
+    )?;
+
     // Resolve --only selectors against the local snapshots, then run a
     // cross-ref dep check. On TTY with missing deps, prompt to include
     // them. Non-TTY (--yes / CI) with missing deps → refuse.
