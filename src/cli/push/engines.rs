@@ -45,6 +45,7 @@ pub async fn push(
             if let Some(p) = overlay_paths {
                 apply_overrides(&mut payload, p);
             }
+            crate::snapshot::refs::resolve_value(&mut payload, lockfile);
             strip_for_create(&mut payload, "engines");
             let create_result = client
                 .create_engine(&payload, Some(progress.clone()))
@@ -96,6 +97,7 @@ pub async fn push(
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }
+        crate::snapshot::refs::resolve_value(&mut payload, lockfile);
         let payload_engine: crate::model::Engine = serde_json::from_value(payload)
             .with_context(|| format!("deserializing overlay-applied engine '{slug}'"))?;
 

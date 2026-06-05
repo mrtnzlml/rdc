@@ -54,6 +54,7 @@ pub async fn push(
             if let Some(p) = overlay_paths {
                 apply_overrides(&mut payload, p);
             }
+            crate::snapshot::refs::resolve_value(&mut payload, lockfile);
             strip_for_create(&mut payload, "workspaces");
             let create_result = client
                 .create_workspace(&payload, Some(progress.clone()))
@@ -113,6 +114,7 @@ pub async fn push(
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }
+        crate::snapshot::refs::resolve_value(&mut payload, lockfile);
         let payload_workspace: crate::model::Workspace = serde_json::from_value(payload)
             .with_context(|| format!("deserializing overlay-applied workspace '{ws_slug}'"))?;
 

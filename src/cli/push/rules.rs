@@ -1,13 +1,13 @@
 use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::log::{Action, Log};
-use crate::overlay::{apply_overrides, Overlay};
+use crate::overlay::{Overlay, apply_overrides};
 use crate::paths::Paths;
 
 use crate::snapshot::create::{strip_for_create, strip_patch_extra};
 use crate::snapshot::rule::{read_rule_value, serialize_rule, write_rule_code};
 use crate::snapshot::writer::write_atomic;
-use crate::state::{rule_combined_hash, Lockfile, ObjectEntry};
+use crate::state::{Lockfile, ObjectEntry, rule_combined_hash};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -35,14 +35,22 @@ pub async fn push(
         let overlay_paths = overlay.as_ref().and_then(|ov| ov.rule(slug));
 
         // CREATE — no lockfile entry yet.
-        if lockfile.objects.get("rules").and_then(|m| m.get(slug.as_str())).is_none() {
+        if lockfile
+            .objects
+            .get("rules")
+            .and_then(|m| m.get(slug.as_str()))
+            .is_none()
+        {
             let mut payload = read_rule_value(&rules_dir, slug)
                 .with_context(|| format!("reading local rule '{slug}' for create"))?;
             if let Some(p) = overlay_paths {
                 apply_overrides(&mut payload, p);
             }
+            crate::snapshot::refs::resolve_value(&mut payload, lockfile);
             strip_for_create(&mut payload, "rules");
-            let create_result = client.create_rule(&payload, Some(progress.clone())).await
+            let create_result = client
+                .create_rule(&payload, Some(progress.clone()))
+                .await
                 .with_context(|| format!("POST /rules (creating '{slug}')"));
             let created = create_result?;
             let (created_json_full, created_code) = serialize_rule(&created)?;
@@ -71,7 +79,11 @@ pub async fn push(
         }
 
         // UPDATE — read JSON+.py, splice, drift-check, PATCH.
-        let entry = lockfile.objects.get("rules").and_then(|m| m.get(slug.as_str())).unwrap();
+        let entry = lockfile
+            .objects
+            .get("rules")
+            .and_then(|m| m.get(slug.as_str()))
+            .unwrap();
         let Some(base) = &entry.content_hash else {
             progress.event(Action::Skip, &format!("rule/{slug} (no content_hash)"));
             skipped += 1;
@@ -85,17 +97,25 @@ pub async fn push(
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }
+        crate::snapshot::refs::resolve_value(&mut payload, lockfile);
         let payload_rule: crate::model::Rule = serde_json::from_value(payload)
             .with_context(|| format!("deserializing overlay-applied rule '{slug}'"))?;
 
         // Drift check.
         if remote_rules.is_none() {
-            remote_rules = Some(client.list_rules(Some(progress.clone())).await
-                .context("listing rules to verify no drift before push")?);
+            remote_rules = Some(
+                client
+                    .list_rules(Some(progress.clone()))
+                    .await
+                    .context("listing rules to verify no drift before push")?,
+            );
         }
         let remote_list = remote_rules.as_ref().unwrap();
         let Some(remote_rule) = remote_list.iter().find(|r| r.id == id) else {
-            progress.event(Action::Skip, &format!("rule/{slug} (remote id {id} missing)"));
+            progress.event(
+                Action::Skip,
+                &format!("rule/{slug} (remote id {id} missing)"),
+            );
             skipped += 1;
             continue;
         };
@@ -104,7 +124,7 @@ pub async fn push(
         let remote_combined = rule_combined_hash(&remote_json_stripped, &remote_code);
         let mut payload_to_send = payload_rule;
         if remote_combined != base {
-            use crate::cli::resolve::{resolve_push_drift, PushDriftOutcome};
+            use crate::cli::resolve::{PushDriftOutcome, resolve_push_drift};
             match resolve_push_drift(interactive, local_json_path, &remote_json_stripped, env)? {
                 PushDriftOutcome::Patch { payload_override } => {
                     if let Some(bytes) = payload_override {
@@ -113,14 +133,16 @@ pub async fn push(
                     }
                 }
                 PushDriftOutcome::Adopt => {
-                    write_atomic(local_json_path, &remote_json_stripped)
-                        .with_context(|| format!("adopting remote into {}", local_json_path.display()))?;
+                    write_atomic(local_json_path, &remote_json_stripped).with_context(|| {
+                        format!("adopting remote into {}", local_json_path.display())
+                    })?;
                     if let Some(code) = &remote_code {
                         write_rule_code(&rules_dir, slug, code)
                             .with_context(|| format!("adopting remote rule code for '{slug}'"))?;
                     } else if local_py_path.exists() {
-                        std::fs::remove_file(&local_py_path)
-                            .with_context(|| format!("removing stale {}", local_py_path.display()))?;
+                        std::fs::remove_file(&local_py_path).with_context(|| {
+                            format!("removing stale {}", local_py_path.display())
+                        })?;
                     }
                     lockfile.upsert(
                         "rules",
@@ -138,7 +160,10 @@ pub async fn push(
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    progress.event(Action::Skip, &format!("rule/{slug} (remote changed; rdc sync first)"));
+                    progress.event(
+                        Action::Skip,
+                        &format!("rule/{slug} (remote changed; rdc sync first)"),
+                    );
                     skipped += 1;
                     continue;
                 }
@@ -148,7 +173,9 @@ pub async fn push(
         // Strip server-managed fields from `extra` so the PATCH matches the
         // CREATE contract.
         strip_patch_extra(&mut payload_to_send.extra, "rules", false);
-        let patch_result = client.update_rule(id, &payload_to_send, Some(progress.clone())).await
+        let patch_result = client
+            .update_rule(id, &payload_to_send, Some(progress.clone()))
+            .await
             .with_context(|| format!("PATCH /rules/{id}"));
         let updated = patch_result?;
 
@@ -156,8 +183,12 @@ pub async fn push(
         let (updated_json_full, updated_code) = serialize_rule(&updated)?;
         let updated_json_stripped = maybe_strip_overlay(updated_json_full, overlay_paths)?;
         let updated_hash = rule_combined_hash(&updated_json_stripped, &updated_code);
-        crate::state::base_cache::write_disk_and_cache(paths, local_json_path, &updated_json_stripped)
-            .with_context(|| format!("writing post-push canonical form for '{slug}'"))?;
+        crate::state::base_cache::write_disk_and_cache(
+            paths,
+            local_json_path,
+            &updated_json_stripped,
+        )
+        .with_context(|| format!("writing post-push canonical form for '{slug}'"))?;
         if let Some(code) = &updated_code {
             write_rule_code(&rules_dir, slug, code)
                 .with_context(|| format!("writing rule code for '{slug}'"))?;
