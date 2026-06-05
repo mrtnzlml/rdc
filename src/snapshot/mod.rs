@@ -11,6 +11,7 @@ pub mod label;
 pub mod noise;
 pub mod organization;
 pub mod queue;
+pub mod refs;
 pub mod rule;
 pub mod schema;
 pub mod workflow;
