@@ -128,7 +128,10 @@ pub async fn push(
             match resolve_push_drift(interactive, local_json_path, &remote_json_stripped, env)? {
                 PushDriftOutcome::Patch { payload_override } => {
                     if let Some(bytes) = payload_override {
-                        payload_to_send = serde_json::from_slice(&bytes)
+                        let mut ov: serde_json::Value = serde_json::from_slice(&bytes)
+                            .with_context(|| format!("re-deserializing edited rule '{slug}'"))?;
+                        crate::snapshot::refs::resolve_value(&mut ov, lockfile);
+                        payload_to_send = serde_json::from_value(ov)
                             .with_context(|| format!("re-deserializing edited rule '{slug}'"))?;
                     }
                 }
