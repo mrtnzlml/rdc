@@ -22,8 +22,8 @@
 use crate::api::DataStorageClient;
 use crate::log::{Action, Log};
 use crate::model::IndexSet;
-use crate::state::{content_hash, Lockfile, ObjectEntry};
-use anyhow::{anyhow, Context, Result};
+use crate::state::{Lockfile, ObjectEntry, content_hash};
+use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -137,7 +137,10 @@ pub(crate) async fn apply_diff(
             .drop_index(collection_name, name, Some(progress.clone()))
             .await
             .with_context(|| format!("dropping regular index '{name}' on '{collection_name}'"))?;
-        progress.event(Action::Delete, &format!("mdh/{slug} regular index '{name}'"));
+        progress.event(
+            Action::Delete,
+            &format!("mdh/{slug} regular index '{name}'"),
+        );
         dropped_regular.insert(name.clone());
         ops += 1;
     }
@@ -163,7 +166,13 @@ pub(crate) async fn apply_diff(
             .ok_or_else(|| anyhow!("regular index '{name}' missing `key` field"))?;
         let options = def_options_only(def);
         client
-            .create_index(collection_name, name, keys, &options, Some(progress.clone()))
+            .create_index(
+                collection_name,
+                name,
+                keys,
+                &options,
+                Some(progress.clone()),
+            )
             .await
             .with_context(|| format!("creating regular index '{name}' on '{collection_name}'"))?;
         progress.event(Action::Post, &format!("mdh/{slug} regular index '{name}'"));
@@ -185,7 +194,13 @@ pub(crate) async fn apply_diff(
             .cloned()
             .unwrap_or_else(|| serde_json::json!([]));
         client
-            .create_search_index(collection_name, name, mappings, &analyzers, Some(progress.clone()))
+            .create_search_index(
+                collection_name,
+                name,
+                mappings,
+                &analyzers,
+                Some(progress.clone()),
+            )
             .await
             .with_context(|| format!("creating search index '{name}' on '{collection_name}'"))?;
         progress.event(Action::Post, &format!("mdh/{slug} search index '{name}'"));
@@ -285,7 +300,13 @@ fn diff_for_dataset(
     remote_regular: &[Value],
     remote_search: &[Value],
 ) -> DiffPlan {
-    diff_indexes(local_regular, local_search, remote_regular, remote_search, true)
+    diff_indexes(
+        local_regular,
+        local_search,
+        remote_regular,
+        remote_search,
+        true,
+    )
 }
 
 /// Pure index-set diff. `mirror` controls only the pruning of entries that
@@ -294,6 +315,7 @@ fn diff_for_dataset(
 ///     exactly; within-env `rdc sync` push, and `rdc deploy --mirror`).
 ///   - `mirror == false` → leave remote-only entries in place (additive;
 ///     `rdc deploy` without `--mirror`).
+///
 /// A *changed* entry (same name, diverging definition) is ALWAYS a drop +
 /// create regardless of `mirror`, because the Data Storage API has no
 /// in-place update verb.
@@ -393,12 +415,10 @@ fn defs_equivalent(a: &Value, b: &Value) -> bool {
     if let Value::Object(obj) = &mut b {
         obj.remove("v");
     }
-    let canon_a = crate::snapshot::noise::canonicalize_for_hash(
-        &serde_json::to_vec(&a).unwrap_or_default(),
-    );
-    let canon_b = crate::snapshot::noise::canonicalize_for_hash(
-        &serde_json::to_vec(&b).unwrap_or_default(),
-    );
+    let canon_a =
+        crate::snapshot::noise::canonicalize_for_hash(&serde_json::to_vec(&a).unwrap_or_default());
+    let canon_b =
+        crate::snapshot::noise::canonicalize_for_hash(&serde_json::to_vec(&b).unwrap_or_default());
     canon_a == canon_b
 }
 
@@ -459,12 +479,7 @@ mod tests {
 
     #[test]
     fn diff_remote_only_index_is_dropped() {
-        let plan = diff_for_dataset(
-            &[],
-            &[],
-            &[ix("ix_orphan", json!({"orphan": 1}))],
-            &[],
-        );
+        let plan = diff_for_dataset(&[], &[], &[ix("ix_orphan", json!({"orphan": 1}))], &[]);
         assert_eq!(plan.drop_regular, vec!["ix_orphan".to_string()]);
         assert!(plan.create_regular.is_empty());
     }
@@ -488,8 +503,14 @@ mod tests {
         let local = json!({"name": "ix_y", "key": {"y": 1}});
         let remote = json!({"name": "ix_y", "key": {"y": 1}, "v": 2});
         let plan = diff_for_dataset(&[local], &[], &[remote], &[]);
-        assert!(plan.drop_regular.is_empty(), "should not drop on v-only diff");
-        assert!(plan.create_regular.is_empty(), "should not create on v-only diff");
+        assert!(
+            plan.drop_regular.is_empty(),
+            "should not drop on v-only diff"
+        );
+        assert!(
+            plan.create_regular.is_empty(),
+            "should not create on v-only diff"
+        );
     }
 
     #[test]
@@ -527,8 +548,13 @@ mod tests {
     fn diff_remote_only_not_dropped_without_mirror() {
         // Additive (deploy default): an index that exists only on the
         // target is left in place — NOT pruned.
-        let plan =
-            diff_indexes(&[], &[], &[ix("ix_orphan", json!({"orphan": 1}))], &[], false);
+        let plan = diff_indexes(
+            &[],
+            &[],
+            &[ix("ix_orphan", json!({"orphan": 1}))],
+            &[],
+            false,
+        );
         assert!(
             plan.drop_regular.is_empty(),
             "remote-only index must survive without mirror: {plan:?}"
@@ -538,7 +564,13 @@ mod tests {
 
     #[test]
     fn diff_remote_only_dropped_with_mirror() {
-        let plan = diff_indexes(&[], &[], &[ix("ix_orphan", json!({"orphan": 1}))], &[], true);
+        let plan = diff_indexes(
+            &[],
+            &[],
+            &[ix("ix_orphan", json!({"orphan": 1}))],
+            &[],
+            true,
+        );
         assert_eq!(plan.drop_regular, vec!["ix_orphan".to_string()]);
     }
 
