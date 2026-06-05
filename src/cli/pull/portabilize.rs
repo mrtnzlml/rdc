@@ -39,11 +39,10 @@ pub fn portabilize_refs(paths: &Paths, lockfile: &mut Lockfile) -> Result<()> {
             continue;
         }
 
-        // Read and parse.
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
+        // Read and parse. A read error on a file we just confirmed exists is a
+        // real I/O problem (permissions, races) and should surface, not be
+        // silently skipped — consistent with how the sidecar reads below fail.
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         let mut value: serde_json::Value = match serde_json::from_slice(&bytes) {
             Ok(v) => v,
             Err(_) => continue, // defensive: skip unparseable files
@@ -140,7 +139,8 @@ fn compute_hash_for_kind(
         }
         "hooks" => {
             // Derive the code sidecar extension from the JSON we just wrote.
-            let value: serde_json::Value = serde_json::from_slice(json_bytes).unwrap_or_default();
+            let value: serde_json::Value = serde_json::from_slice(json_bytes)
+                .with_context(|| format!("re-parsing just-written hook JSON for {slug}"))?;
             let ext = crate::snapshot::hook::hook_code_extension_from_value(&value);
             let code_path = paths.hooks_dir().join(format!("{slug}.{ext}"));
             // Also check the other extension (stale sidecar, runtime changed).
