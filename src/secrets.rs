@@ -85,7 +85,7 @@ pub fn save_password_credentials(
 /// credential field. `suffix` is `TOKEN`, `USER`, or `PASS`.
 ///
 /// POSIX env-var identifiers are `[A-Za-z_][A-Za-z0-9_]*`, but
-/// rdc env names accept `-` and `_` (e.g. `dev-ap`). To produce a
+/// rdc env names accept `-` and `_` (e.g. `dev-us`). To produce a
 /// name the shell can actually export, every non-alphanumeric
 /// character in the env name is mapped to `_` and the whole thing
 /// uppercased.
@@ -93,11 +93,11 @@ pub fn save_password_credentials(
 /// | env name   | suffix  | env-var               |
 /// |------------|---------|-----------------------|
 /// | `dev`      | `TOKEN` | `RDC_TOKEN_DEV`       |
-/// | `dev-ap`   | `USER`  | `RDC_USER_DEV_AP`     |
+/// | `dev-us`   | `USER`  | `RDC_USER_DEV_US`     |
 /// | `prod_eu`  | `PASS`  | `RDC_PASS_PROD_EU`    |
 ///
 /// The hyphen-vs-underscore collision documented for `env_token_var`
-/// still applies (e.g. `dev-ap` and `dev_ap` normalize to the same
+/// still applies (e.g. `dev-us` and `dev_us` normalize to the same
 /// suffix). The `rdc init` wizard prevents this collision at project
 /// creation time.
 pub fn env_var_for(env: &str, suffix: &str) -> String {
@@ -593,15 +593,15 @@ mod tests {
 
     #[test]
     fn env_token_var_maps_hyphen_to_underscore() {
-        // The motivating case: real env names like `dev-ap` need to
+        // The motivating case: real env names like `dev-us` need to
         // produce a valid POSIX env-var identifier.
-        assert_eq!(env_var_for("dev-ap", "TOKEN"), "RDC_TOKEN_DEV_AP");
+        assert_eq!(env_var_for("dev-us", "TOKEN"), "RDC_TOKEN_DEV_US");
         assert_eq!(env_var_for("prod-eu-west-1", "TOKEN"), "RDC_TOKEN_PROD_EU_WEST_1");
     }
 
     #[test]
     fn env_token_var_preserves_existing_underscores() {
-        assert_eq!(env_var_for("dev_ap", "TOKEN"), "RDC_TOKEN_DEV_AP");
+        assert_eq!(env_var_for("dev_us", "TOKEN"), "RDC_TOKEN_DEV_US");
     }
 
     #[test]
@@ -609,7 +609,7 @@ mod tests {
         // This is the known footgun; the init wizard refuses the
         // second one of these pairs to prevent it inside a project.
         // Documented here so a future change can't silently break it.
-        assert_eq!(env_var_for("dev-ap", "TOKEN"), env_var_for("dev_ap", "TOKEN"));
+        assert_eq!(env_var_for("dev-us", "TOKEN"), env_var_for("dev_us", "TOKEN"));
     }
 
     #[test]
@@ -617,17 +617,17 @@ mod tests {
         assert_eq!(env_var_for("dev", "TOKEN"), "RDC_TOKEN_DEV");
         assert_eq!(env_var_for("dev", "USER"), "RDC_USER_DEV");
         assert_eq!(env_var_for("dev", "PASS"), "RDC_PASS_DEV");
-        assert_eq!(env_var_for("dev-ap", "USER"), "RDC_USER_DEV_AP");
+        assert_eq!(env_var_for("dev-us", "USER"), "RDC_USER_DEV_US");
         assert_eq!(env_var_for("prod-eu-west-1", "PASS"), "RDC_PASS_PROD_EU_WEST_1");
     }
 
     #[test]
     fn resolve_token_uses_normalized_env_var_for_hyphenated_env() {
-        // `dev-ap` env must resolve via `$RDC_TOKEN_DEV_AP`, not the
-        // invalid `$RDC_TOKEN_DEV-AP` (which no shell can export).
+        // `dev-us` env must resolve via `$RDC_TOKEN_DEV_US`, not the
+        // invalid `$RDC_TOKEN_DEV-US` (which no shell can export).
         let dir = TempDir::new().unwrap();
-        let lookup = resolve_token_lookup_from(dir.path(), "dev-ap", |k| {
-            (k == "RDC_TOKEN_DEV_AP").then(|| "from-env".to_string())
+        let lookup = resolve_token_lookup_from(dir.path(), "dev-us", |k| {
+            (k == "RDC_TOKEN_DEV_US").then(|| "from-env".to_string())
         })
         .unwrap();
         assert!(matches!(lookup, TokenLookup::Cached { ref token, .. } if token == "from-env"));
@@ -636,11 +636,11 @@ mod tests {
     #[test]
     fn resolve_token_missing_message_quotes_normalized_var_name() {
         let dir = TempDir::new().unwrap();
-        let lookup = resolve_token_lookup_from(dir.path(), "dev-ap", |_| None).unwrap();
+        let lookup = resolve_token_lookup_from(dir.path(), "dev-us", |_| None).unwrap();
         match lookup {
             TokenLookup::Missing { message } => {
-                assert!(message.contains("RDC_TOKEN_DEV_AP"), "must point at actual env-var name: {message}");
-                assert!(!message.contains("RDC_TOKEN_DEV-AP"), "must not mention hyphenated form: {message}");
+                assert!(message.contains("RDC_TOKEN_DEV_US"), "must point at actual env-var name: {message}");
+                assert!(!message.contains("RDC_TOKEN_DEV-US"), "must not mention hyphenated form: {message}");
             }
             other => panic!("expected Missing, got {other:?}"),
         }
@@ -762,10 +762,10 @@ mod tests {
             ("notify-slack", &["signing_secret"]),
         ]);
         let existing = HookSecrets::default();
-        let path = write_hook_secrets_template(dir.path(), "test-mtr", &req, &existing).unwrap();
-        assert_eq!(path, hook_secrets_path(dir.path(), "test-mtr"));
+        let path = write_hook_secrets_template(dir.path(), "test-eu", &req, &existing).unwrap();
+        assert_eq!(path, hook_secrets_path(dir.path(), "test-eu"));
 
-        let v = read_template(dir.path(), "test-mtr");
+        let v = read_template(dir.path(), "test-eu");
         assert_eq!(
             v,
             serde_json::json!({
@@ -790,18 +790,18 @@ mod tests {
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
         std::fs::write(
-            dir.path().join("secrets/test-mtr.hook-secrets.json"),
+            dir.path().join("secrets/test-eu.hook-secrets.json"),
             r#"{ "hooks": { "master-data-hub": { "mdh_api_token": "kept-by-user" } } }"#,
         )
         .unwrap();
-        let existing = load_hook_secrets(dir.path(), "test-mtr").unwrap();
+        let existing = load_hook_secrets(dir.path(), "test-eu").unwrap();
         let req = required(&[
             ("master-data-hub", &["mdh_api_token", "mdh_endpoint"]),
             ("notify-slack", &["signing_secret"]),
         ]);
-        write_hook_secrets_template(dir.path(), "test-mtr", &req, &existing).unwrap();
+        write_hook_secrets_template(dir.path(), "test-eu", &req, &existing).unwrap();
 
-        let v = read_template(dir.path(), "test-mtr");
+        let v = read_template(dir.path(), "test-eu");
         assert_eq!(v["hooks"]["master-data-hub"]["mdh_api_token"], "kept-by-user");
         assert_eq!(v["hooks"]["master-data-hub"]["mdh_endpoint"], UNFILLED_SENTINEL);
         assert_eq!(v["hooks"]["notify-slack"]["signing_secret"], UNFILLED_SENTINEL);
@@ -814,15 +814,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
         std::fs::write(
-            dir.path().join("secrets/test-mtr.hook-secrets.json"),
+            dir.path().join("secrets/test-eu.hook-secrets.json"),
             r#"{ "hooks": { "old-hook": { "legacy_token": "still-here" } } }"#,
         )
         .unwrap();
-        let existing = load_hook_secrets(dir.path(), "test-mtr").unwrap();
+        let existing = load_hook_secrets(dir.path(), "test-eu").unwrap();
         let req = required(&[("new-hook", &["new_key"])]);
-        write_hook_secrets_template(dir.path(), "test-mtr", &req, &existing).unwrap();
+        write_hook_secrets_template(dir.path(), "test-eu", &req, &existing).unwrap();
 
-        let v = read_template(dir.path(), "test-mtr");
+        let v = read_template(dir.path(), "test-eu");
         assert_eq!(v["hooks"]["old-hook"]["legacy_token"], "still-here");
         assert_eq!(v["hooks"]["new-hook"]["new_key"], UNFILLED_SENTINEL);
     }
@@ -835,8 +835,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let req = required(&[("h", &["k"])]);
         let existing = HookSecrets::default();
-        write_hook_secrets_template(dir.path(), "test-mtr", &req, &existing).unwrap();
-        assert!(hook_secrets_path(dir.path(), "test-mtr").exists());
+        write_hook_secrets_template(dir.path(), "test-eu", &req, &existing).unwrap();
+        assert!(hook_secrets_path(dir.path(), "test-eu").exists());
     }
 
     #[cfg(unix)]
@@ -846,7 +846,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let req = required(&[("h", &["k"])]);
         let existing = HookSecrets::default();
-        let path = write_hook_secrets_template(dir.path(), "test-mtr", &req, &existing).unwrap();
+        let path = write_hook_secrets_template(dir.path(), "test-eu", &req, &existing).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "hook-secrets template must be owner-only");
     }
@@ -1047,8 +1047,8 @@ mod tests {
             ("beta", &["bk"]),
         ]);
         let existing = HookSecrets::default();
-        write_hook_secrets_template(dir.path(), "test-mtr", &req, &existing).unwrap();
-        let loaded = load_hook_secrets(dir.path(), "test-mtr").unwrap();
+        write_hook_secrets_template(dir.path(), "test-eu", &req, &existing).unwrap();
+        let loaded = load_hook_secrets(dir.path(), "test-eu").unwrap();
         assert!(loaded.was_loaded());
         let alpha = loaded.for_slug("alpha").expect("alpha entry");
         assert_eq!(alpha.get("k1").map(String::as_str), Some(UNFILLED_SENTINEL));
@@ -1087,14 +1087,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let req = required(&[("h", &["password", "type"])]);
         let existing = HookSecrets::default();
-        write_hook_secrets_template(dir.path(), "test-mtr", &req, &existing).unwrap();
+        write_hook_secrets_template(dir.path(), "test-eu", &req, &existing).unwrap();
 
         // Reload from disk + re-write template. The merge step must
         // preserve sentinel values exactly so re-runs are idempotent.
-        let reloaded = load_hook_secrets(dir.path(), "test-mtr").unwrap();
-        write_hook_secrets_template(dir.path(), "test-mtr", &req, &reloaded).unwrap();
+        let reloaded = load_hook_secrets(dir.path(), "test-eu").unwrap();
+        write_hook_secrets_template(dir.path(), "test-eu", &req, &reloaded).unwrap();
 
-        let v = read_template(dir.path(), "test-mtr");
+        let v = read_template(dir.path(), "test-eu");
         assert_eq!(v["hooks"]["h"]["password"], UNFILLED_SENTINEL);
         assert_eq!(v["hooks"]["h"]["type"], UNFILLED_SENTINEL);
     }

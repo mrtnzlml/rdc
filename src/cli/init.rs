@@ -42,8 +42,8 @@ pub async fn run(env_specs: Vec<String>) -> Result<()> {
             ));
         }
         // Reject names that normalize to the same `RDC_TOKEN_<...>`
-        // variable as an existing env. E.g. adding `dev_ap` when
-        // `dev-ap` is already defined would silently share env-var
+        // variable as an existing env. E.g. adding `dev_us` when
+        // `dev-us` is already defined would silently share env-var
         // resolution; refuse rather than let one steal the other's
         // token.
         let candidate_var = crate::secrets::env_var_for(&env_name, "TOKEN");

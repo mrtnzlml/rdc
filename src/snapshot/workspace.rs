@@ -33,7 +33,7 @@ mod tests {
         let v = json!({
             "id": 1,
             "url": "https://x/api/v1/workspaces/1",
-            "name": "AP",
+            "name": "Demo",
             "organization": "https://x/api/v1/organizations/1",
             "queues": []
         });

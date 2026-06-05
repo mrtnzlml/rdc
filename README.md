@@ -223,7 +223,7 @@ Every command that writes to the remote takes `--dry-run`. Use `rdc <command> --
 2. `secrets/<env>.secrets.json` — cached token from a previous `rdc auth` or auto-login.
 3. `RDC_USER_<ENV>` + `RDC_PASS_<ENV>` — used for an auto-login when the cached token is missing or expired.
 
-`<ENV>` is the env name from `rdc.toml`, uppercased, with non-alphanumerics replaced by `_`. So `test` → `RDC_TOKEN_TEST`, `dev-ap` → `RDC_TOKEN_DEV_AP`.
+`<ENV>` is the env name from `rdc.toml`, uppercased, with non-alphanumerics replaced by `_`. So `test` → `RDC_TOKEN_TEST`, `dev-us` → `RDC_TOKEN_DEV_US`.
 
 ### Set or rotate manually
 

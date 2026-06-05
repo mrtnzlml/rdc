@@ -463,18 +463,18 @@ mod tests {
         let tgt = lf_with(&[(
             "organization",
             "self",
-            214757,
-            "https://prod/api/v1/organizations/214757",
+            99999,
+            "https://prod/api/v1/organizations/99999",
         )]);
         let mapping = Mapping::default();
         let mut payload = serde_json::json!({
-            "name": "AP",
+            "name": "Demo",
             "organization": "https://test/api/v1/organizations/1"
         });
         rewrite_urls(&mut payload, &src, &tgt, &mapping, &BTreeMap::new());
         assert_eq!(
             payload["organization"].as_str().unwrap(),
-            "https://prod/api/v1/organizations/214757"
+            "https://prod/api/v1/organizations/99999"
         );
     }
 
@@ -529,17 +529,17 @@ mod tests {
         // `redact_for_disk` to match.
         let value = serde_json::json!({
             "id": 1,
-            "name": "Inbox sorting",
+            "name": "Invoices",
             "url": "https://test/api/v1/queues/1",
             "counts": { "document_status": { "to_review": 7, "exported": 12 } },
         });
         let baseline_bytes =
             crate::snapshot::create::redacted_disk_bytes(&value, "queues").unwrap();
         let baseline_hash = content_hash(&baseline_bytes);
-        let lf = lf_with_hash("queues", "inbox-sorting", &baseline_hash);
+        let lf = lf_with_hash("queues", "invoices", &baseline_hash);
         let remote_bytes = serde_json::to_vec_pretty(&value).unwrap();
         let (in_sync, _) =
-            tgt_drift_status(remote_bytes, None, &lf, "queues", "inbox-sorting").unwrap();
+            tgt_drift_status(remote_bytes, None, &lf, "queues", "invoices").unwrap();
         assert!(
             in_sync,
             "queue with live counts should be in_sync against redacted baseline"

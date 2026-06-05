@@ -571,7 +571,7 @@ fn compute_plan(
                 // named) tgt object; the update phase in apply.rs
                 // iterates `mapping.<kind>` and PATCHes that pair. Without
                 // this check, slug renames (e.g. `engines` mapping
-                // `3-valve-mtr-duplicate` -> `3-valve-mtr`) plan a phantom
+                // `2-invoices-duplicate` -> `2-invoices`) plan a phantom
                 // duplicate create alongside the legitimate update.
                 if mapping.lookup_tgt_slug(kind, slug).is_some() {
                     continue;
@@ -1368,36 +1368,36 @@ mod tests {
 
     #[test]
     fn topo_sort_orders_dependency_before_dependent() {
-        // mtr-export-to-sftp depends on pipe-and-fitting-mtr-template and
-        // valve-mtr-template. Alphabetical order puts m < p < v so the
-        // export hook would otherwise be created before its prereqs.
+        // export-hook depends on template-one and template-two.
+        // Alphabetical order puts e < t so the export hook would otherwise
+        // be created before its prereqs.
         let tmp = TempDir::new().unwrap();
         let src_paths = crate::paths::Paths::for_env(tmp.path(), "dev");
         let hooks_dir = src_paths.hooks_dir();
         write_hook_file(
             &hooks_dir,
-            "mtr-export-to-sftp",
+            "export-hook",
             &[
                 "https://x/api/v1/hooks/1147775",
                 "https://x/api/v1/hooks/1147776",
             ],
         );
-        write_hook_file(&hooks_dir, "pipe-and-fitting-mtr-template", &[]);
-        write_hook_file(&hooks_dir, "valve-mtr-template", &[]);
+        write_hook_file(&hooks_dir, "template-one", &[]);
+        write_hook_file(&hooks_dir, "template-two", &[]);
         let lf = lf_with_hooks(&[
-            ("pipe-and-fitting-mtr-template", 1147775, "https://x/api/v1/hooks/1147775"),
-            ("valve-mtr-template", 1147776, "https://x/api/v1/hooks/1147776"),
-            ("mtr-export-to-sftp", 1147777, "https://x/api/v1/hooks/1147777"),
+            ("template-one", 1147775, "https://x/api/v1/hooks/1147775"),
+            ("template-two", 1147776, "https://x/api/v1/hooks/1147776"),
+            ("export-hook", 1147777, "https://x/api/v1/hooks/1147777"),
         ]);
         let slugs = vec![
-            "mtr-export-to-sftp".to_string(),
-            "pipe-and-fitting-mtr-template".to_string(),
-            "valve-mtr-template".to_string(),
+            "export-hook".to_string(),
+            "template-one".to_string(),
+            "template-two".to_string(),
         ];
         let out = topo_sort_hooks_to_create(&slugs, &src_paths, &lf);
         let pos = |s: &str| out.iter().position(|x| x == s).unwrap();
-        assert!(pos("pipe-and-fitting-mtr-template") < pos("mtr-export-to-sftp"));
-        assert!(pos("valve-mtr-template") < pos("mtr-export-to-sftp"));
+        assert!(pos("template-one") < pos("export-hook"));
+        assert!(pos("template-two") < pos("export-hook"));
         assert_eq!(out.len(), 3);
     }
 

@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn workspace_dir_path() {
-        assert_eq!(p().workspace_dir("dev-ap"), Path::new("/proj/envs/dev/workspaces/dev-ap"));
+        assert_eq!(p().workspace_dir("dev-us"), Path::new("/proj/envs/dev/workspaces/dev-us"));
     }
 
     #[test]
