@@ -159,10 +159,14 @@ pub(crate) fn sort_url_arrays(value: &mut serde_json::Value) {
     }
 }
 
-/// An element counts as a URL only if it is an absolute http(s) URL — the form
-/// every Rossum cross-reference takes (`https://<host>/api/v1/<kind>/<id>`).
+/// An element counts as a URL when it is an absolute http(s) URL — the form a
+/// raw Rossum cross-reference takes (`https://<host>/api/v1/<kind>/<id>`) — or a
+/// portable `rdc://<kind>/<slug>` reference (the form refs take on disk after
+/// pull converts them). Both must be recognized so set-like reference arrays
+/// (`hook.queues`, `engine.training_queues`) stay order-insensitive in the hash
+/// before and after conversion.
 fn is_url(s: &str) -> bool {
-    s.starts_with("https://") || s.starts_with("http://")
+    s.starts_with("https://") || s.starts_with("http://") || s.starts_with("rdc://")
 }
 
 #[cfg(test)]
@@ -328,6 +332,15 @@ mod tests {
             canonicalize_for_hash(b),
             "set-like URL back-reference order must not affect the content hash"
         );
+    }
+
+    #[test]
+    fn canonicalize_is_rdc_ref_array_order_insensitive() {
+        // After pull converts refs to rdc://, set-like reference arrays must
+        // stay order-insensitive in the hash, exactly as raw URL arrays do.
+        let a = br#"{"queues":["rdc://queues/b","rdc://queues/a"]}"#;
+        let b = br#"{"queues":["rdc://queues/a","rdc://queues/b"]}"#;
+        assert_eq!(canonicalize_for_hash(a), canonicalize_for_hash(b));
     }
 
     #[test]
