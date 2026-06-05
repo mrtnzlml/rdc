@@ -151,18 +151,39 @@ mod action_tests {
     }
 }
 
-/// UTC HH:MM:SS — small standalone formatter so we don't add a `chrono`
-/// dep. Mirrors the helper that previously lived in `cli::sync::watch`.
+/// Local-time HH:MM:SS for the event-log prefix. Mirrors the helper that
+/// previously lived in `cli::sync::watch`.
 pub(crate) fn now_hhmmss() -> String {
-    format_hhmmss(std::time::SystemTime::now())
+    format_hhmmss_with_offset(std::time::SystemTime::now(), local_offset_secs())
 }
 
+/// Seconds east of UTC for the system's current local time (e.g. CEST = +7200,
+/// PST = -28800). Uses chrono's `Local`, which resolves the zone soundly in a
+/// multi-threaded process (the `time` crate's local-offset API refuses to off
+/// the main thread; rdc's runtime is multi-threaded).
+fn local_offset_secs() -> i64 {
+    chrono::Local::now().offset().local_minus_utc() as i64
+}
+
+/// UTC HH:MM:SS (offset 0). Test-only: production goes through
+/// `format_hhmmss_with_offset` with the live local offset, but the
+/// deterministic fixed-clock test path and the formatter unit tests want a
+/// fixed (UTC) projection.
+#[cfg(test)]
 fn format_hhmmss(t: std::time::SystemTime) -> String {
+    format_hhmmss_with_offset(t, 0)
+}
+
+/// Format `t` as `HH:MM:SS` after shifting by `offset_east_secs` (seconds
+/// east of UTC). Wraps within the day; `offset_east_secs == 0` yields UTC.
+fn format_hhmmss_with_offset(t: std::time::SystemTime, offset_east_secs: i64) -> String {
     let secs = t
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let secs_today = secs % 86400;
+    // `rem_euclid` keeps the result in 0..86400 even when the offset pushes
+    // the local time across a day boundary (e.g. a negative/western offset).
+    let secs_today = (secs as i64 + offset_east_secs).rem_euclid(86400);
     let h = secs_today / 3600;
     let m = (secs_today % 3600) / 60;
     let s = secs_today % 60;
@@ -190,6 +211,30 @@ mod time_tests {
     fn format_hhmmss_pads_single_digits() {
         let t = UNIX_EPOCH + Duration::from_secs(5);
         assert_eq!(format_hhmmss(t), "00:00:05");
+    }
+
+    #[test]
+    fn offset_zero_is_utc() {
+        assert_eq!(format_hhmmss_with_offset(UNIX_EPOCH, 0), "00:00:00");
+    }
+
+    #[test]
+    fn offset_shifts_forward() {
+        // +1h east of UTC at the epoch -> 01:00:00 local.
+        assert_eq!(format_hhmmss_with_offset(UNIX_EPOCH, 3600), "01:00:00");
+    }
+
+    #[test]
+    fn offset_applies_on_top_of_time() {
+        // 05:00:00 UTC, +2h (e.g. CEST) -> 07:00:00 local.
+        let t = UNIX_EPOCH + Duration::from_secs(5 * 3600);
+        assert_eq!(format_hhmmss_with_offset(t, 2 * 3600), "07:00:00");
+    }
+
+    #[test]
+    fn negative_offset_wraps_to_previous_day() {
+        // Epoch minus 1h (west of UTC) wraps to 23:00:00 the prior day.
+        assert_eq!(format_hhmmss_with_offset(UNIX_EPOCH, -3600), "23:00:00");
     }
 }
 
