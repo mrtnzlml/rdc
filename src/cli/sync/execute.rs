@@ -3144,6 +3144,12 @@ pub async fn run(
             };
             crate::cli::pull::mdh::process(ctx, listed, &subset, progress).await?;
         }
+
+        // Post-pass: rewrite portable-kind URLs in every snapshotted file to
+        // `rdc://<kind>/<slug>` form and re-record the lockfile `content_hash`
+        // so the next `sync` sees the object as Clean (no phantom drift).
+        crate::cli::pull::portabilize::portabilize_refs(ctx.paths, ctx.lockfile)
+            .context("portabilizing snapshot references")?;
     }
 
     Ok(outcome)
