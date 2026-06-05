@@ -1,12 +1,12 @@
 use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::log::{Action, Log};
-use crate::overlay::{apply_overrides, Overlay};
+use crate::overlay::{Overlay, apply_overrides};
 use crate::paths::Paths;
 
 use crate::snapshot::create::{strip_for_create, strip_patch_extra};
 use crate::snapshot::schema::{read_schema_value, serialize_schema, write_schema_bytes};
-use crate::state::{schema_combined_hash, Lockfile, ObjectEntry};
+use crate::state::{Lockfile, ObjectEntry, schema_combined_hash};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -35,26 +35,36 @@ pub async fn push(
 
     for (q_slug, schema_path) in changes {
         // queue_dir is the parent of schema.json
-        let queue_dir = schema_path.parent()
+        let queue_dir = schema_path
+            .parent()
             .with_context(|| format!("schema path has no parent: {}", schema_path.display()))?;
         let overlay_paths = overlay.as_ref().and_then(|ov| ov.schema(q_slug));
 
         // Missing lockfile entry → new schema, POST.
-        if lockfile.objects.get("schemas").and_then(|m| m.get(q_slug.as_str())).is_none() {
+        if lockfile
+            .objects
+            .get("schemas")
+            .and_then(|m| m.get(q_slug.as_str()))
+            .is_none()
+        {
             let mut payload = read_schema_value(queue_dir)
                 .with_context(|| format!("reading local schema for queue '{q_slug}' to create"))?;
             if let Some(p) = overlay_paths {
                 apply_overrides(&mut payload, p);
             }
+            crate::snapshot::refs::resolve_value(&mut payload, lockfile);
             strip_for_create(&mut payload, "schemas");
-            let create_result = client.create_schema(&payload, Some(progress.clone())).await
+            let create_result = client
+                .create_schema(&payload, Some(progress.clone()))
+                .await
                 .with_context(|| format!("POST /schemas (creating for queue '{q_slug}')"));
             let created = create_result?;
             let (created_json, created_formulas) = serialize_schema(&created)?;
             let created_json = maybe_strip_overlay(created_json, overlay_paths)?;
             let created_hash = schema_combined_hash(&created_json, &created_formulas);
-            write_schema_bytes(queue_dir, &created_json, &created_formulas)
-                .with_context(|| format!("writing post-create canonical form for schema '{q_slug}'"))?;
+            write_schema_bytes(queue_dir, &created_json, &created_formulas).with_context(|| {
+                format!("writing post-create canonical form for schema '{q_slug}'")
+            })?;
             lockfile.upsert(
                 "schemas",
                 q_slug,
@@ -71,7 +81,11 @@ pub async fn push(
             continue;
         }
 
-        let entry = lockfile.objects.get("schemas").and_then(|m| m.get(q_slug.as_str())).unwrap();
+        let entry = lockfile
+            .objects
+            .get("schemas")
+            .and_then(|m| m.get(q_slug.as_str()))
+            .unwrap();
         let Some(base) = &entry.content_hash else {
             progress.event(Action::Skip, &format!("schema/{q_slug} (no content_hash)"));
             skipped += 1;
@@ -86,6 +100,7 @@ pub async fn push(
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }
+        crate::snapshot::refs::resolve_value(&mut payload, lockfile);
         let payload_schema: crate::model::Schema = serde_json::from_value(payload)
             .with_context(|| format!("deserializing overlay-applied schema '{q_slug}'"))?;
 
@@ -93,7 +108,9 @@ pub async fn push(
         let remote_schema = if let Some(s) = remote_cache.get(&id) {
             s.clone()
         } else {
-            let s = client.get_schema(id, Some(progress.clone())).await
+            let s = client
+                .get_schema(id, Some(progress.clone()))
+                .await
                 .with_context(|| format!("fetching schema {id} to verify drift before push"))?;
             remote_cache.insert(id, s.clone());
             s
@@ -103,12 +120,13 @@ pub async fn push(
         let remote_combined = schema_combined_hash(&remote_json, &remote_formulas);
         let mut payload_to_send = payload_schema;
         if remote_combined != base {
-            use crate::cli::resolve::{resolve_push_drift, PushDriftOutcome};
+            use crate::cli::resolve::{PushDriftOutcome, resolve_push_drift};
             match resolve_push_drift(interactive, schema_path, &remote_json, env)? {
                 PushDriftOutcome::Patch { payload_override } => {
                     if let Some(bytes) = payload_override {
-                        payload_to_send = serde_json::from_slice(&bytes)
-                            .with_context(|| format!("re-deserializing edited schema for queue '{q_slug}'"))?;
+                        payload_to_send = serde_json::from_slice(&bytes).with_context(|| {
+                            format!("re-deserializing edited schema for queue '{q_slug}'")
+                        })?;
                     }
                 }
                 PushDriftOutcome::Adopt => {
@@ -127,12 +145,18 @@ pub async fn push(
                             secrets_hash: None,
                         },
                     );
-                    progress.event(Action::Warn, &format!("schema/{q_slug} adopted remote (drift)"));
+                    progress.event(
+                        Action::Warn,
+                        &format!("schema/{q_slug} adopted remote (drift)"),
+                    );
                     skipped += 1;
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    progress.event(Action::Skip, &format!("schema/{q_slug} (remote changed; rdc sync first)"));
+                    progress.event(
+                        Action::Skip,
+                        &format!("schema/{q_slug} (remote changed; rdc sync first)"),
+                    );
                     skipped += 1;
                     continue;
                 }
@@ -142,7 +166,9 @@ pub async fn push(
         // Strip server-managed fields from `extra` so the PATCH matches the
         // CREATE contract (e.g. the server-computed `queues` back-ref).
         strip_patch_extra(&mut payload_to_send.extra, "schemas", false);
-        let patch_result = client.update_schema(id, &payload_to_send, Some(progress.clone())).await
+        let patch_result = client
+            .update_schema(id, &payload_to_send, Some(progress.clone()))
+            .await
             .with_context(|| format!("PATCH /schemas/{id}"));
         let updated = patch_result?;
 

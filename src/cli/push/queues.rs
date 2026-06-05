@@ -48,6 +48,7 @@ pub async fn push(
             if let Some(p) = overlay_paths {
                 apply_overrides(&mut payload, p);
             }
+            crate::snapshot::refs::resolve_value(&mut payload, lockfile);
             strip_for_create(&mut payload, "queues");
             let create_result = client
                 .create_queue(&payload, Some(progress.clone()))
@@ -99,6 +100,7 @@ pub async fn push(
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }
+        crate::snapshot::refs::resolve_value(&mut payload, lockfile);
         let payload_queue: crate::model::Queue = serde_json::from_value(payload)
             .with_context(|| format!("deserializing overlay-applied queue '{q_slug}'"))?;
 
@@ -213,4 +215,30 @@ pub async fn push(
     }
 
     Ok((pushed, skipped))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn resolve_value_rewrites_rdc_refs_to_env_urls() {
+        use crate::state::{Lockfile, ObjectEntry};
+        let mut lf = Lockfile::default();
+        lf.upsert(
+            "workspaces",
+            "main",
+            ObjectEntry {
+                id: 7,
+                url: Some("https://example.rossum.app/api/v1/workspaces/7".into()),
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        let mut payload = serde_json::json!({ "name": "Q", "workspace": "rdc://workspaces/main" });
+        crate::snapshot::refs::resolve_value(&mut payload, &lf);
+        assert_eq!(
+            payload["workspace"],
+            "https://example.rossum.app/api/v1/workspaces/7"
+        );
+    }
 }

@@ -1,17 +1,17 @@
 use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::log::{Action, Log};
-use crate::overlay::{apply_overrides, Overlay};
+use crate::overlay::{Overlay, apply_overrides};
 use crate::paths::Paths;
 
+use crate::secrets::{HookSecrets, load_hook_secrets};
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::hook::{
     hook_code_extension, hook_code_extension_from_value, read_hook_value, serialize_hook,
     write_hook_code,
 };
 use crate::snapshot::writer::write_atomic;
-use crate::secrets::{load_hook_secrets, HookSecrets};
-use crate::state::{hook_combined_hash, hook_secrets_hash, Lockfile, ObjectEntry};
+use crate::state::{Lockfile, ObjectEntry, hook_combined_hash, hook_secrets_hash};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -31,12 +31,13 @@ fn inject_hook_secrets(body: &mut Value, slug: &str, secrets: &HookSecrets) -> S
     let kv = secrets.filled_kv_for_slug(slug);
     let hash = hook_secrets_hash(&kv);
     if !kv.is_empty()
-        && let Some(obj) = body.as_object_mut() {
-            obj.insert(
-                "secrets".to_string(),
-                serde_json::to_value(&kv).expect("BTreeMap<String,String> serializes"),
-            );
-        }
+        && let Some(obj) = body.as_object_mut()
+    {
+        obj.insert(
+            "secrets".to_string(),
+            serde_json::to_value(&kv).expect("BTreeMap<String,String> serializes"),
+        );
+    }
     hash
 }
 
@@ -109,13 +110,19 @@ pub async fn push(
         // Missing lockfile entry = new hook → POST. Local file becomes the
         // create payload; server response (with id/url assigned) overwrites
         // disk; lockfile gets a fresh entry.
-        if lockfile.objects.get("hooks").and_then(|m| m.get(slug.as_str())).is_none() {
+        if lockfile
+            .objects
+            .get("hooks")
+            .and_then(|m| m.get(slug.as_str()))
+            .is_none()
+        {
             // Read + overlay-apply once; reused by both paths.
             let mut payload = read_hook_value(&hooks_dir, slug)
                 .with_context(|| format!("reading local hook '{slug}' for create"))?;
             if let Some(p) = overlay_paths {
                 apply_overrides(&mut payload, p);
             }
+            crate::snapshot::refs::resolve_value(&mut payload, lockfile);
 
             // Anomaly guard, then dispatch on extension type.
             let typed: crate::model::Hook = serde_json::from_value(payload.clone())
@@ -127,8 +134,7 @@ pub async fn push(
             // regardless of which branch creates the hook. Filtered map
             // strips the sentinel so an unedited template doesn't shift
             // the hash and trigger a spurious force-push.
-            let created_secrets_hash =
-                hook_secrets_hash(&hook_secrets.filled_kv_for_slug(slug));
+            let created_secrets_hash = hook_secrets_hash(&hook_secrets.filled_kv_for_slug(slug));
 
             let post_result: Result<crate::model::Hook> = async {
             let created = if typed.is_store_extension() {
@@ -236,7 +242,11 @@ pub async fn push(
             continue;
         }
 
-        let entry = lockfile.objects.get("hooks").and_then(|m| m.get(slug.as_str())).unwrap();
+        let entry = lockfile
+            .objects
+            .get("hooks")
+            .and_then(|m| m.get(slug.as_str()))
+            .unwrap();
         let Some(base) = &entry.content_hash else {
             progress.event(Action::Skip, &format!("hook/{slug} (no content_hash)"));
             skipped += 1;
@@ -258,6 +268,7 @@ pub async fn push(
         if let Some(p) = overlay_paths {
             apply_overrides(&mut payload, p);
         }
+        crate::snapshot::refs::resolve_value(&mut payload, lockfile);
         let payload_hook: crate::model::Hook = serde_json::from_value(payload)
             .with_context(|| format!("deserializing overlay-applied hook '{slug}'"))?;
 
@@ -267,13 +278,20 @@ pub async fn push(
         // of N updates only pays one list call here.
         if drift_hooks.is_none() {
             drift_hooks = Some(
-                client.list_hooks(Some(progress.clone())).await
+                client
+                    .list_hooks(Some(progress.clone()))
+                    .await
                     .context("listing hooks to verify no drift before push")?,
             );
         }
-        let remote_list = drift_hooks.as_ref().expect("drift_hooks was just populated above");
+        let remote_list = drift_hooks
+            .as_ref()
+            .expect("drift_hooks was just populated above");
         let Some(remote_hook) = remote_list.iter().find(|h| h.id == id) else {
-            progress.event(Action::Skip, &format!("hook/{slug} (remote id {id} missing)"));
+            progress.event(
+                Action::Skip,
+                &format!("hook/{slug} (remote id {id} missing)"),
+            );
             skipped += 1;
             continue;
         };
@@ -286,7 +304,7 @@ pub async fn push(
             // the resolver prompt shows json bytes for the diff (most
             // common case). On Adopt, we write both .json and .py from
             // the remote so disk + lockfile stay aligned.
-            use crate::cli::resolve::{resolve_push_drift, PushDriftOutcome};
+            use crate::cli::resolve::{PushDriftOutcome, resolve_push_drift};
             match resolve_push_drift(interactive, local_json_path, &remote_json_stripped, env)? {
                 PushDriftOutcome::Patch { payload_override } => {
                     if let Some(bytes) = payload_override {
@@ -295,8 +313,9 @@ pub async fn push(
                     }
                 }
                 PushDriftOutcome::Adopt => {
-                    write_atomic(local_json_path, &remote_json_stripped)
-                        .with_context(|| format!("adopting remote into {}", local_json_path.display()))?;
+                    write_atomic(local_json_path, &remote_json_stripped).with_context(|| {
+                        format!("adopting remote into {}", local_json_path.display())
+                    })?;
                     // Adopt uses the remote runtime to decide the
                     // sidecar extension — the remote is now the source
                     // of truth. Sweep any sidecar of the other
@@ -344,7 +363,10 @@ pub async fn push(
                     continue;
                 }
                 PushDriftOutcome::Skip => {
-                    progress.event(Action::Skip, &format!("hook/{slug} (remote changed; rdc sync first)"));
+                    progress.event(
+                        Action::Skip,
+                        &format!("hook/{slug} (remote changed; rdc sync first)"),
+                    );
                     skipped += 1;
                     continue;
                 }
@@ -373,8 +395,12 @@ pub async fn push(
         let updated_json_stripped = maybe_strip_overlay(updated_json_full, overlay_paths)?;
         let updated_hash = hook_combined_hash(&updated_json_stripped, &updated_code);
         let updated_ext = hook_code_extension(&updated);
-        crate::state::base_cache::write_disk_and_cache(paths, local_json_path, &updated_json_stripped)
-            .with_context(|| format!("writing post-push canonical form for '{slug}'"))?;
+        crate::state::base_cache::write_disk_and_cache(
+            paths,
+            local_json_path,
+            &updated_json_stripped,
+        )
+        .with_context(|| format!("writing post-push canonical form for '{slug}'"))?;
         if let Some(code) = &updated_code {
             write_hook_code(&hooks_dir, slug, code, updated_ext)
                 .with_context(|| format!("writing hook code for '{slug}'"))?;
@@ -425,7 +451,10 @@ pub async fn push(
         // literal `"<unfilled>"` into Rossum.
         let local_kv = hook_secrets.filled_kv_for_slug(slug);
         let local_hash = hook_secrets_hash(&local_kv);
-        let entry = lockfile.objects.get("hooks").and_then(|m| m.get(slug.as_str()));
+        let entry = lockfile
+            .objects
+            .get("hooks")
+            .and_then(|m| m.get(slug.as_str()));
         let Some(entry) = entry else {
             // No lockfile entry → either the hook hasn't been synced yet
             // (legitimate, will sync next) or the slug is a typo. Either
