@@ -25,7 +25,7 @@ pub struct RossumClient {
     base_url: String,
     token: String,
     http: Client,
-    /// Env name (e.g. `"dev-mtr"`) attached to errors via [`EnvTag`] so a
+    /// Env name (e.g. `"dev-eu"`) attached to errors via [`EnvTag`] so a
     /// caller juggling multiple clients (notably `rdc deploy`, which holds
     /// src+tgt) can attribute a 401 back to the right env and refresh its
     /// token. `None` means errors are not env-tagged.

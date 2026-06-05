@@ -540,7 +540,7 @@ fn init_without_env_var_in_ci_skips_auth() {
     );
 }
 
-/// Real env names contain hyphens (`dev-ap`, `prod-eu`, …). The
+/// Real env names contain hyphens (`dev-us`, `prod-eu`, …). The
 /// `RDC_TOKEN_<UPPER>` convention must normalize non-alphanumerics to
 /// `_` so the shell can actually export the variable, and the
 /// next-steps hint must quote the normalized form.
@@ -560,19 +560,19 @@ async fn init_with_hyphenated_env_uses_normalized_env_var() {
         .unwrap()
         .current_dir(project.path())
         // The motivating real-world example.
-        .env("RDC_TOKEN_DEV_AP", "TOKEN_FROM_ENV")
-        .args(["init", "--env", &format!("dev-ap={}/api/v1:1", server.uri())])
+        .env("RDC_TOKEN_DEV_US", "TOKEN_FROM_ENV")
+        .args(["init", "--env", &format!("dev-us={}/api/v1:1", server.uri())])
         .assert()
         .success()
         .stderr(predicate::str::contains("validated against org"));
 
     assert!(
-        project.path().join("secrets/dev-ap.secrets.json").exists(),
+        project.path().join("secrets/dev-us.secrets.json").exists(),
         "secrets file path keeps the original env name (with hyphen)"
     );
 }
 
-/// If `RDC_TOKEN_DEV_AP` isn't set, the printed "Next steps" must
+/// If `RDC_TOKEN_DEV_US` isn't set, the printed "Next steps" must
 /// suggest the normalized var name — not the invalid hyphenated form
 /// (which is what previous versions emitted).
 #[test]
@@ -581,12 +581,12 @@ fn init_next_steps_quotes_normalized_env_var_for_hyphenated_env() {
     Command::cargo_bin("rdc")
         .unwrap()
         .current_dir(project.path())
-        .env_remove("RDC_TOKEN_DEV_AP")
-        .args(["init", "--env", "dev-ap=https://x.rossum.app/api/v1:1"])
+        .env_remove("RDC_TOKEN_DEV_US")
+        .args(["init", "--env", "dev-us=https://x.rossum.app/api/v1:1"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("RDC_TOKEN_DEV_AP"))
-        .stdout(predicate::str::contains("RDC_TOKEN_DEV-AP").not());
+        .stdout(predicate::str::contains("RDC_TOKEN_DEV_US"))
+        .stdout(predicate::str::contains("RDC_TOKEN_DEV-US").not());
 }
 
 /// Two env names that normalize to the same shell variable can't
@@ -599,17 +599,17 @@ fn init_refuses_env_name_that_collides_with_existing_env_var() {
     Command::cargo_bin("rdc")
         .unwrap()
         .current_dir(project.path())
-        .args(["init", "--env", "dev-ap=https://x.rossum.app/api/v1:1"])
+        .args(["init", "--env", "dev-us=https://x.rossum.app/api/v1:1"])
         .assert()
         .success();
 
     Command::cargo_bin("rdc")
         .unwrap()
         .current_dir(project.path())
-        .args(["init", "--env", "dev_ap=https://x.rossum.app/api/v1:2"])
+        .args(["init", "--env", "dev_us=https://x.rossum.app/api/v1:2"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("RDC_TOKEN_DEV_AP"))
-        .stderr(predicate::str::contains("dev-ap"))
-        .stderr(predicate::str::contains("dev_ap"));
+        .stderr(predicate::str::contains("RDC_TOKEN_DEV_US"))
+        .stderr(predicate::str::contains("dev-us"))
+        .stderr(predicate::str::contains("dev_us"));
 }

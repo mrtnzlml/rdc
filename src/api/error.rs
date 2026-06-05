@@ -5,7 +5,7 @@ pub enum ApiError {
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
 
-    /// HTTP failure. `env` is the rdc env name (e.g. `"dev-mtr"`) the
+    /// HTTP failure. `env` is the rdc env name (e.g. `"dev-eu"`) the
     /// failing call was made against, when the client knows it; it's
     /// `None` for code paths that don't carry an env label. Surfacing the
     /// env lets multi-env commands (notably `rdc deploy`, holding both
@@ -84,10 +84,10 @@ mod tests {
         let err: anyhow::Error = anyhow!(ApiError::Status {
             status: 401,
             body: "Invalid token.".into(),
-            env: Some("test-mtr".into()),
+            env: Some("test-eu".into()),
         });
         let wrapped = err.context("listing tgt hook templates for plan output");
-        assert_eq!(anyhow_status_env(&wrapped, 401).as_deref(), Some("test-mtr"));
+        assert_eq!(anyhow_status_env(&wrapped, 401).as_deref(), Some("test-eu"));
         assert_eq!(anyhow_status_env(&wrapped, 403), None);
     }
 

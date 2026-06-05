@@ -378,11 +378,11 @@ mod tests {
         // Defensive form — callers that haven't pre-populated still get a
         // useful message pointing at the conventional path.
         let msg = format_missing_keys_message(
-            "test-mtr",
+            "test-eu",
             &[("h".to_string(), vec!["k".to_string()])],
             None,
         );
-        assert!(msg.contains("secrets/test-mtr.hook-secrets.json"));
+        assert!(msg.contains("secrets/test-eu.hook-secrets.json"));
         assert!(msg.contains("populate"));
     }
 }
