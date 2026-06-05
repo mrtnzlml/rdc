@@ -47,6 +47,78 @@ pub fn auto_match(mapping: &mut Mapping, src_paths: &Paths, tgt_paths: &Paths) -
     Ok(added)
 }
 
+/// Fail if any source slug referenced by the mapping is absent from the src
+/// snapshot. Auto-matched entries always exist (they're listed off disk), so
+/// in practice this only catches hand-curated mapping-file entries — a typo or
+/// a stale cross-env rename whose source object was renamed/removed. The deploy
+/// used to warn and silently skip such entries deep in the apply loops (so the
+/// object the user meant to deploy never got deployed); this stops the deploy
+/// up front, before any remote writes, with the full list of offenders.
+///
+/// `hook_templates` is intentionally excluded — it pairs cross-cluster URLs,
+/// not on-disk source objects.
+pub fn validate_mapping_sources(
+    mapping: &Mapping,
+    src_paths: &Paths,
+    mapping_file: &Path,
+) -> Result<()> {
+    use std::collections::HashSet;
+    let env = src_paths.env();
+
+    // Existing source slugs per kind, computed with the SAME enumerators
+    // `auto_match` uses, so existence is judged identically.
+    let workspaces: HashSet<String> = list_workspace_slugs(src_paths)?.into_iter().collect();
+    let hooks: HashSet<String> = list_flat_slugs(&src_paths.hooks_dir(), env)?.into_iter().collect();
+    let rules: HashSet<String> = list_flat_slugs(&src_paths.rules_dir(), env)?.into_iter().collect();
+    let labels: HashSet<String> =
+        list_flat_slugs(&src_paths.labels_dir(), env)?.into_iter().collect();
+    let queues: HashSet<String> = collect_queue_slugs(src_paths)?.into_iter().collect();
+    let schemas: HashSet<String> =
+        collect_queue_slugs_with_file(src_paths, "schema.json")?.into_iter().collect();
+    let inboxes: HashSet<String> =
+        collect_queue_slugs_with_file(src_paths, "inbox.json")?.into_iter().collect();
+    let email_templates: HashSet<String> =
+        collect_email_template_keys(src_paths)?.into_iter().collect();
+    let engines: HashSet<String> = list_engine_slugs(src_paths)?.into_iter().collect();
+    let engine_fields: HashSet<String> = list_engine_field_slugs(src_paths)?.into_iter().collect();
+
+    // `hook_templates` is excluded on purpose: it maps cross-cluster URLs,
+    // not on-disk source objects.
+    let kinds: [(&str, &BTreeMap<String, String>, &HashSet<String>); 10] = [
+        ("workspaces", &mapping.workspaces, &workspaces),
+        ("hooks", &mapping.hooks, &hooks),
+        ("rules", &mapping.rules, &rules),
+        ("labels", &mapping.labels, &labels),
+        ("queues", &mapping.queues, &queues),
+        ("schemas", &mapping.schemas, &schemas),
+        ("inboxes", &mapping.inboxes, &inboxes),
+        ("email_templates", &mapping.email_templates, &email_templates),
+        ("engines", &mapping.engines, &engines),
+        ("engine_fields", &mapping.engine_fields, &engine_fields),
+    ];
+
+    let mut missing: Vec<String> = Vec::new();
+    for (kind, map, existing) in kinds {
+        for (src_slug, tgt_slug) in map {
+            if !existing.contains(src_slug) {
+                missing.push(format!("  {kind}/{src_slug} -> {tgt_slug}"));
+            }
+        }
+    }
+    if !missing.is_empty() {
+        missing.sort();
+        anyhow::bail!(
+            "deploy mapping references {} source object(s) that don't exist in '{}':\n{}\n\n\
+             Fix the mapping file ({}): remove the stale entries or correct the source slugs, then re-run.",
+            missing.len(),
+            env,
+            missing.join("\n"),
+            mapping_file.display(),
+        );
+    }
+    Ok(())
+}
+
 fn match_kind(
     existing: &mut BTreeMap<String, String>,
     src_dir: &Path,
@@ -452,6 +524,49 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("queue.json"), b"{}").unwrap();
         std::fs::write(dir.join("schema.json"), b"{}").unwrap();
+    }
+
+    fn write_engine(paths: &Paths, slug: &str) {
+        let dir = paths.engines_dir().join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("engine.json"), b"{}").unwrap();
+    }
+
+    #[test]
+    fn validate_mapping_sources_errors_on_missing_source() {
+        let src = tempfile::TempDir::new().unwrap();
+        let src_paths = Paths::for_env(src.path(), "src");
+        write_queue(&src_paths, "ws", "real-q"); // queue.json + schema.json
+        write_engine(&src_paths, "real-engine");
+
+        let mut mapping = Mapping::default();
+        mapping.queues.insert("real-q".into(), "real-q".into()); // exists
+        mapping.queues.insert("ghost-q".into(), "renamed-q".into()); // missing source
+        mapping.engines.insert("ghost-engine".into(), "x".into()); // missing source
+
+        let mf = src.path().join("map.toml");
+        let err = validate_mapping_sources(&mapping, &src_paths, &mf).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("ghost-q"), "must name the missing queue: {msg}");
+        assert!(msg.contains("ghost-engine"), "must name the missing engine: {msg}");
+        assert!(
+            !msg.contains("real-q") && !msg.contains("real-engine"),
+            "must not flag sources that DO exist: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_mapping_sources_ok_when_all_present() {
+        let src = tempfile::TempDir::new().unwrap();
+        let src_paths = Paths::for_env(src.path(), "src");
+        write_queue(&src_paths, "ws", "real-q");
+
+        let mut mapping = Mapping::default();
+        mapping.queues.insert("real-q".into(), "renamed-on-tgt".into());
+        mapping.schemas.insert("real-q".into(), "real-q".into());
+
+        let mf = src.path().join("map.toml");
+        assert!(validate_mapping_sources(&mapping, &src_paths, &mf).is_ok());
     }
 
     /// Two queues with the same NAME live in different workspaces. The sync
