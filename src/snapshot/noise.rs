@@ -35,9 +35,9 @@ pub fn strip_noise_fields(value: &mut serde_json::Value) {
 }
 
 /// Produce a canonical byte projection of `bytes` for hashing:
-/// parse as JSON, strip noise fields, sort keys, re-serialize. Returns
-/// `bytes` unchanged if parsing fails (e.g., non-JSON inputs from tests
-/// or raw formula bytes used inside combined hashes).
+/// parse as JSON, strip noise fields, sort set-like URL arrays, sort keys,
+/// re-serialize. Returns `bytes` unchanged if parsing fails (e.g., non-JSON
+/// inputs from tests or raw formula bytes used inside combined hashes).
 ///
 /// With `preserve_order` enabled on serde_json, `Value::Object` is an
 /// IndexMap, so the bytes we serialize would reflect input order — which
@@ -49,6 +49,7 @@ pub fn canonicalize_for_hash(bytes: &[u8]) -> Vec<u8> {
         return bytes.to_vec();
     };
     strip_noise_fields(&mut value);
+    sort_url_arrays(&mut value);
     sort_keys_recursive(&mut value);
     serde_json::to_vec(&value).unwrap_or_else(|_| bytes.to_vec())
 }
@@ -110,6 +111,58 @@ pub(crate) fn sort_string_arrays(value: &mut serde_json::Value) {
         }
         _ => {}
     }
+}
+
+/// Recursively sort arrays whose elements are **all absolute http(s) URLs**.
+///
+/// Unlike [`sort_string_arrays`], this is deliberately conservative: it only
+/// reorders an array when *every* element is a URL. Rossum returns a queue's
+/// server-computed back-reference arrays (`hooks`, `webhooks`, `rules`,
+/// `users`, `workflows`, `queues`, `run_after`, `triggers`, …) in
+/// non-deterministic per-env / per-endpoint order, so without this the queue
+/// `content_hash` churns on every fetch and the object perpetually "drifts
+/// from baseline". Sorting these set-like URL arrays makes the hash
+/// order-insensitive (symmetrically for the recorded baseline and the drift
+/// check, since both route through [`canonicalize_for_hash`]).
+///
+/// String arrays that are **not** all URLs are left untouched on purpose,
+/// because their order is frequently meaningful: formula operands
+/// (`$subtract`, `$divide`, `$gte`), `selectors`, multiline template bodies,
+/// mime-type preference lists, etc. The predicate keys on element *content*
+/// (is-URL), never on the array's name — `$in`, for instance, appears both as
+/// a URL set and as a value set in real payloads.
+pub(crate) fn sort_url_arrays(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(arr) => {
+            let all_urls = !arr.is_empty()
+                && arr.iter().all(|v| match v {
+                    serde_json::Value::String(s) => is_url(s),
+                    _ => false,
+                });
+            if all_urls {
+                arr.sort_by(|a, b| match (a, b) {
+                    (serde_json::Value::String(s1), serde_json::Value::String(s2)) => s1.cmp(s2),
+                    _ => std::cmp::Ordering::Equal,
+                });
+            } else {
+                for v in arr.iter_mut() {
+                    sort_url_arrays(v);
+                }
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            for v in obj.values_mut() {
+                sort_url_arrays(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// An element counts as a URL only if it is an absolute http(s) URL — the form
+/// every Rossum cross-reference takes (`https://<host>/api/v1/<kind>/<id>`).
+fn is_url(s: &str) -> bool {
+    s.starts_with("https://") || s.starts_with("http://")
 }
 
 #[cfg(test)]
@@ -207,5 +260,86 @@ mod tests {
         let a = b"{\"name\":\"x\",\"modifier\":\"u1\"}";
         let b = b"{\"name\":\"x\",\"modifier\":\"u2\"}";
         assert_eq!(canonicalize_for_hash(a), canonicalize_for_hash(b));
+    }
+
+    #[test]
+    fn sort_url_arrays_sorts_only_url_arrays() {
+        let mut v = json!({
+            // set-like URL back-reference: must be sorted
+            "hooks": ["https://x/api/v1/hooks/9", "https://x/api/v1/hooks/1"],
+            // formula operands: ($unitCost - $amount); order is SEMANTIC
+            "$subtract": ["$unitCost", "$amount"],
+            // non-URL strings (event types): order left as-is
+            "events": ["b.event", "a.event"],
+            // mixed (one URL, one literal) -> NOT all-URL -> untouched
+            "mixed": ["https://x/api/v1/hooks/2", "literal"],
+            // empty array -> untouched
+            "empty": [],
+        });
+        sort_url_arrays(&mut v);
+        assert_eq!(
+            v["hooks"],
+            json!(["https://x/api/v1/hooks/1", "https://x/api/v1/hooks/9"]),
+            "all-URL array must be sorted"
+        );
+        assert_eq!(
+            v["$subtract"],
+            json!(["$unitCost", "$amount"]),
+            "formula operands must keep their order"
+        );
+        assert_eq!(
+            v["events"],
+            json!(["b.event", "a.event"]),
+            "non-URL string array must keep its order"
+        );
+        assert_eq!(
+            v["mixed"],
+            json!(["https://x/api/v1/hooks/2", "literal"]),
+            "mixed array (not all URLs) must keep its order"
+        );
+        assert_eq!(v["empty"], json!([]), "empty array stays empty");
+    }
+
+    #[test]
+    fn sort_url_arrays_recurses_into_nested_structures() {
+        let mut v = json!({
+            "q": { "webhooks": ["https://x/api/v1/webhooks/5", "https://x/api/v1/webhooks/2"] },
+            "list": [{ "users": ["https://x/api/v1/users/8", "https://x/api/v1/users/3"] }],
+        });
+        sort_url_arrays(&mut v);
+        assert_eq!(
+            v["q"]["webhooks"],
+            json!(["https://x/api/v1/webhooks/2", "https://x/api/v1/webhooks/5"])
+        );
+        assert_eq!(
+            v["list"][0]["users"],
+            json!(["https://x/api/v1/users/3", "https://x/api/v1/users/8"])
+        );
+    }
+
+    #[test]
+    fn canonicalize_is_url_array_order_insensitive() {
+        // The bug: a queue's `hooks`/`webhooks` back-references come back in a
+        // different order each fetch, churning the content hash -> phantom drift.
+        let a = br#"{"hooks":["https://x/api/v1/hooks/9","https://x/api/v1/hooks/1"]}"#;
+        let b = br#"{"hooks":["https://x/api/v1/hooks/1","https://x/api/v1/hooks/9"]}"#;
+        assert_eq!(
+            canonicalize_for_hash(a),
+            canonicalize_for_hash(b),
+            "set-like URL back-reference order must not affect the content hash"
+        );
+    }
+
+    #[test]
+    fn canonicalize_preserves_non_url_array_order() {
+        // Guard against over-sorting: `$subtract` is (a - b); swapping the
+        // operands is a REAL change and must stay visible in the hash.
+        let a = br#"{"$subtract":["$unitCost","$amount"]}"#;
+        let b = br#"{"$subtract":["$amount","$unitCost"]}"#;
+        assert_ne!(
+            canonicalize_for_hash(a),
+            canonicalize_for_hash(b),
+            "non-URL array order is semantic and must remain significant in the hash"
+        );
     }
 }
