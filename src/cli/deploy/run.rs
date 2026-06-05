@@ -571,7 +571,7 @@ fn compute_plan(
                 // named) tgt object; the update phase in apply.rs
                 // iterates `mapping.<kind>` and PATCHes that pair. Without
                 // this check, slug renames (e.g. `engines` mapping
-                // `3-stapler-ops-duplicate` -> `3-stapler-ops`) plan a phantom
+                // `2-invoices-duplicate` -> `2-invoices`) plan a phantom
                 // duplicate create alongside the legitimate update.
                 if mapping.lookup_tgt_slug(kind, slug).is_some() {
                     continue;
@@ -1368,36 +1368,36 @@ mod tests {
 
     #[test]
     fn topo_sort_orders_dependency_before_dependent() {
-        // ops-export-to-sftp depends on paper-and-toner-ops-template and
-        // stapler-ops-template. Alphabetical order puts o < p < s so the
-        // export hook would otherwise be created before its prereqs.
+        // export-hook depends on template-one and template-two.
+        // Alphabetical order puts e < t so the export hook would otherwise
+        // be created before its prereqs.
         let tmp = TempDir::new().unwrap();
         let src_paths = crate::paths::Paths::for_env(tmp.path(), "dev");
         let hooks_dir = src_paths.hooks_dir();
         write_hook_file(
             &hooks_dir,
-            "ops-export-to-sftp",
+            "export-hook",
             &[
                 "https://x/api/v1/hooks/5557775",
                 "https://x/api/v1/hooks/5557776",
             ],
         );
-        write_hook_file(&hooks_dir, "paper-and-toner-ops-template", &[]);
-        write_hook_file(&hooks_dir, "stapler-ops-template", &[]);
+        write_hook_file(&hooks_dir, "template-one", &[]);
+        write_hook_file(&hooks_dir, "template-two", &[]);
         let lf = lf_with_hooks(&[
-            ("paper-and-toner-ops-template", 5557775, "https://x/api/v1/hooks/5557775"),
-            ("stapler-ops-template", 5557776, "https://x/api/v1/hooks/5557776"),
-            ("ops-export-to-sftp", 5557777, "https://x/api/v1/hooks/5557777"),
+            ("template-one", 5557775, "https://x/api/v1/hooks/5557775"),
+            ("template-two", 5557776, "https://x/api/v1/hooks/5557776"),
+            ("export-hook", 5557777, "https://x/api/v1/hooks/5557777"),
         ]);
         let slugs = vec![
-            "ops-export-to-sftp".to_string(),
-            "paper-and-toner-ops-template".to_string(),
-            "stapler-ops-template".to_string(),
+            "export-hook".to_string(),
+            "template-one".to_string(),
+            "template-two".to_string(),
         ];
         let out = topo_sort_hooks_to_create(&slugs, &src_paths, &lf);
         let pos = |s: &str| out.iter().position(|x| x == s).unwrap();
-        assert!(pos("paper-and-toner-ops-template") < pos("ops-export-to-sftp"));
-        assert!(pos("stapler-ops-template") < pos("ops-export-to-sftp"));
+        assert!(pos("template-one") < pos("export-hook"));
+        assert!(pos("template-two") < pos("export-hook"));
         assert_eq!(out.len(), 3);
     }
 
