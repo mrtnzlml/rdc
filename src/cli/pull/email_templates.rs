@@ -1,6 +1,6 @@
 use super::common::{
-    PullAction, PullCtx, apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
-    skip_on_permission_denied,
+    apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
+    skip_on_permission_denied, PullAction, PullCtx,
 };
 use crate::log::{Action, Log};
 use crate::model::EmailTemplate;
@@ -108,6 +108,8 @@ pub async fn process(
                 .and_then(|m| m.get(&lockfile_key))
                 .and_then(|x| x.content_hash.clone());
 
+            let proposed =
+                crate::cli::pull::common::portabilize_proposed(&proposed, &*ctx.lockfile);
             let (action, remote_hash) =
                 decide_pull_action(&local_path, base_hash.as_deref(), &proposed)?;
             if action == PullAction::Conflict {

@@ -254,6 +254,10 @@ pub fn rewrite_urls(
             *s = tgt.clone();
             return;
         }
+        // `lookup_url` resolves BOTH portable `rdc://<kind>/<slug>` refs (the
+        // on-disk form) and raw API URLs (e.g. external `organization`), so a
+        // single path below handles src snapshots whether or not their refs
+        // have been portabilized.
         let Some((kind, src_slug)) = src_lockfile.lookup_url(s) else {
             return;
         };
@@ -270,6 +274,17 @@ pub fn rewrite_urls(
         };
         *s = tgt_url.to_string();
     });
+}
+
+/// Rewrite internal-kind URLs in `json` to `rdc://<kind>/<slug>` form using
+/// `lockfile`, returning the re-serialized bytes. Mirrors the pull post-pass so
+/// a hash computed here matches the portabilized lockfile baseline. Byte
+/// formatting is irrelevant: `content_hash`/`combined_hash` canonicalize first.
+pub(crate) fn portabilize_for_hash(json: Vec<u8>, lockfile: &Lockfile) -> Result<Vec<u8>> {
+    let mut value: Value =
+        serde_json::from_slice(&json).context("parsing remote JSON for portabilized drift hash")?;
+    crate::snapshot::refs::portabilize_value(&mut value, lockfile);
+    serde_json::to_vec(&value).context("re-serializing portabilized drift hash input")
 }
 
 /// Drift check: hash the remote bytes through the kind's [`KindCodec`]
@@ -307,6 +322,10 @@ pub fn tgt_drift_status(
             .disk_bytes(&remote_value)
             .with_context(|| format!("codec disk_bytes for {kind}/{tgt_slug}"))?;
         let json_for_hash = maybe_strip_overlay(art.json, overlay_paths)?;
+        // The pull post-pass rewrites internal refs to `rdc://` and re-records
+        // the lockfile baseline over that portabilized form, so the drift hash
+        // must portabilize the remote body the same way to compare like-for-like.
+        let json_for_hash = portabilize_for_hash(json_for_hash, tgt_lockfile)?;
         combined_hash(&json_for_hash, &art.sidecars)
     } else {
         // No codec registered — fall back to overlay-stripped content_hash.
@@ -516,15 +535,25 @@ mod tests {
             "url": "https://test/api/v1/queues/1",
             "counts": { "document_status": { "to_review": 7, "exported": 12 } },
         });
-        let baseline_bytes =
-            crate::snapshot::create::redacted_disk_bytes(&value, "queues").unwrap();
+        // The pull post-pass records the baseline over the redacted AND
+        // portabilized (rdc://) form, so build the baseline the same way: the
+        // lockfile entry carries the queue's own URL, so its self-ref resolves
+        // to `rdc://queues/invoices`.
+        let mut lf = lf_with_hash("queues", "invoices", "");
+        let baseline_bytes = crate::snapshot::create::redacted_disk_bytes(&value, "queues").unwrap();
+        let baseline_bytes = portabilize_for_hash(baseline_bytes, &lf).unwrap();
         let baseline_hash = content_hash(&baseline_bytes);
-        let lf = lf_with_hash("queues", "invoices", &baseline_hash);
+        lf.objects
+            .get_mut("queues")
+            .unwrap()
+            .get_mut("invoices")
+            .unwrap()
+            .content_hash = Some(baseline_hash);
         let remote_bytes = serde_json::to_vec_pretty(&value).unwrap();
         let (in_sync, _) = tgt_drift_status(remote_bytes, None, &lf, "queues", "invoices").unwrap();
         assert!(
             in_sync,
-            "queue with live counts should be in_sync against redacted baseline"
+            "queue with live counts should be in_sync against redacted+portabilized baseline"
         );
     }
 

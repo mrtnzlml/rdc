@@ -9,8 +9,8 @@
 //! (lockfile, queue_locations, conflict counts).
 
 use super::common::{
-    PullAction, PullCtx, apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
-    skip_on_permission_denied,
+    apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
+    skip_on_permission_denied, PullAction, PullCtx,
 };
 use crate::log::{Action, Log};
 use crate::model::{Inbox, Queue, Schema};
@@ -154,6 +154,8 @@ pub async fn process(
                 .get(KIND_QUEUES)
                 .and_then(|m| m.get(&q_slug))
                 .and_then(|e| e.content_hash.clone());
+            let queue_proposed =
+                crate::cli::pull::common::portabilize_proposed(&queue_proposed, &*ctx.lockfile);
             let (q_action, q_remote_hash) =
                 decide_pull_action(&queue_path, queue_base.as_deref(), &queue_proposed)?;
             if q_action == PullAction::Conflict {
@@ -260,6 +262,8 @@ fn write_schema_for_queue(
         remote_json_bytes,
         ctx.overlay.as_ref().and_then(|o| o.schema(&w.q_slug)),
     )?;
+    let remote_json_bytes =
+        crate::cli::pull::common::portabilize_proposed(&remote_json_bytes, &*ctx.lockfile);
 
     // Remote hash is computed over the POST-overlay bytes so it matches what
     // is actually written to disk. Using codec.base_hash(&value) (PRE-overlay)
@@ -445,6 +449,8 @@ fn write_inbox_for_queue(
         .get(KIND_INBOXES)
         .and_then(|m| m.get(&w.q_slug))
         .and_then(|e| e.content_hash.clone());
+    let inbox_proposed =
+        crate::cli::pull::common::portabilize_proposed(&inbox_proposed, &*ctx.lockfile);
     let (i_action, i_remote_hash) =
         decide_pull_action(&inbox_path, inbox_base.as_deref(), &inbox_proposed)?;
     if i_action == PullAction::Conflict {

@@ -1,4 +1,4 @@
-use super::common::{PullAction, PullCtx, apply_pull_action, decide_pull_action, record_object};
+use super::common::{apply_pull_action, decide_pull_action, record_object, PullAction, PullCtx};
 use crate::log::{Action, Log};
 use crate::model::Organization;
 use anyhow::{Context, Result};
@@ -43,6 +43,7 @@ pub async fn process(
             .and_then(|m| m.get("self"))
             .and_then(|e| e.content_hash.clone());
 
+        let proposed = crate::cli::pull::common::portabilize_proposed(&proposed, &*ctx.lockfile);
         let (action, remote_hash) = decide_pull_action(&path, base_hash.as_deref(), &proposed)?;
         let conflicts = if action == PullAction::Conflict { 1 } else { 0 };
         let recorded_hash = apply_pull_action(

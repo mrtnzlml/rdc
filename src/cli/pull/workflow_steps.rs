@@ -103,6 +103,8 @@ pub async fn process(
                 })
                 .and_then(|x| x.content_hash.clone());
 
+            let proposed =
+                crate::cli::pull::common::portabilize_proposed(&proposed, &*ctx.lockfile);
             let (action, remote_hash) =
                 decide_pull_action(&local_path, base_hash.as_deref(), &proposed)?;
             if action == PullAction::Conflict {

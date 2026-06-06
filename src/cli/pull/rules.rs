@@ -1,6 +1,6 @@
 use super::common::{
-    PullAction, PullCtx, apply_pull_action, maybe_strip_overlay, record_object,
-    skip_on_permission_denied,
+    apply_pull_action, maybe_strip_overlay, record_object, skip_on_permission_denied, PullAction,
+    PullCtx,
 };
 use crate::log::{Action, Log};
 use crate::model::Rule;
@@ -78,6 +78,8 @@ pub async fn process(
                 proposed_json,
                 ctx.overlay.as_ref().and_then(|o| o.rule(&slug)),
             )?;
+            let proposed_json =
+                crate::cli::pull::common::portabilize_proposed(&proposed_json, &*ctx.lockfile);
 
             let local_path = ctx.paths.rules_dir().join(format!("{slug}.json"));
             let py_path = ctx.paths.rules_dir().join(format!("{slug}.py"));
