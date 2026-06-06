@@ -555,6 +555,34 @@ pub enum PullAction {
     NoChange,
 }
 
+/// Rewrite portable-kind URLs in just-serialized object JSON to `rdc://<kind>/<slug>`
+/// form using `lockfile`. Every pull driver runs this on its remote/proposed
+/// JSON BEFORE the three-way merge + write, so the on-disk snapshot, the lockfile
+/// baseline, and the remote candidate are all `rdc://`-native — the three-way
+/// comparison then sees no spurious change and re-pulls are idempotent.
+///
+/// Refs whose target isn't in `lockfile` yet (cyclic/forward refs encountered
+/// mid-pull, e.g. `hook.run_after`, `queue` ↔ `engine`/`inbox`) are left as URLs
+/// here and finished by the `portabilize` post-pass once every slug is known; by
+/// the next pull the persisted lockfile is complete, so this resolves them and
+/// the merge stays Clean.
+///
+/// Key order and the trailing newline are preserved (only ref strings change),
+/// and `content_hash` canonicalizes regardless, so written bytes stay stable.
+pub(crate) fn portabilize_proposed(bytes: &[u8], lockfile: &Lockfile) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return bytes.to_vec();
+    };
+    crate::snapshot::refs::portabilize_value(&mut value, lockfile);
+    let Ok(mut out) = serde_json::to_vec_pretty(&value) else {
+        return bytes.to_vec();
+    };
+    if bytes.last() == Some(&b'\n') {
+        out.push(b'\n');
+    }
+    out
+}
+
 /// Decide what to do on pull for a single object.
 ///
 /// `local_path` — the on-disk JSON file path (may not exist).

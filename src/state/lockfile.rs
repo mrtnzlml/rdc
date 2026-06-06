@@ -115,6 +115,13 @@ impl Lockfile {
     /// Returns None if no entry matches.
     pub fn slug_for_url(&self, kind: &str, url: &str) -> Option<&str> {
         let by_kind = self.objects.get(kind)?;
+        // A portable `rdc://<kind>/<slug>` reference carries its slug directly.
+        if let Some((ref_kind, slug)) = crate::snapshot::refs::parse_rdc_ref(url) {
+            if ref_kind != kind {
+                return None;
+            }
+            return by_kind.get_key_value(slug).map(|(sl, _)| sl.as_str());
+        }
         for (slug, entry) in by_kind.iter() {
             if entry.url.as_deref() == Some(url) {
                 return Some(slug.as_str());
@@ -142,6 +149,13 @@ impl Lockfile {
     /// owns it. Used by `rdc deploy` to rewrite cross-references in a
     /// payload from src URLs to tgt URLs.
     pub fn lookup_url(&self, url: &str) -> Option<(&str, &str)> {
+        // A portable `rdc://<kind>/<slug>` reference resolves directly to its
+        // (kind, slug) coordinate when that object is tracked here.
+        if let Some((kind, slug)) = crate::snapshot::refs::parse_rdc_ref(url) {
+            let (k, entries) = self.objects.get_key_value(kind)?;
+            let (sl, _) = entries.get_key_value(slug)?;
+            return Some((k.as_str(), sl.as_str()));
+        }
         for (kind, entries) in &self.objects {
             for (slug, entry) in entries {
                 if entry.url.as_deref() == Some(url) {
