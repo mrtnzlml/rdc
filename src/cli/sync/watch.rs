@@ -17,8 +17,12 @@ fn polling_bar(elapsed: u64, total: u64) -> String {
         .map_or(SEGMENTS, |f| f.min(SEGMENTS));
     let empty = SEGMENTS - filled;
     let mut bar = String::with_capacity((SEGMENTS as usize) * 3);
-    for _ in 0..filled { bar.push('▰'); }
-    for _ in 0..empty  { bar.push('▱'); }
+    for _ in 0..filled {
+        bar.push('▰');
+    }
+    for _ in 0..empty {
+        bar.push('▱');
+    }
     bar
 }
 
@@ -70,10 +74,8 @@ pub async fn run_watch(
 
     // Initial reconcile.
     {
-        let _lock = crate::cli::sync::lock::EnvLock::acquire(
-            &paths.env_lock(),
-            Duration::from_secs(30),
-        )?;
+        let _lock =
+            crate::cli::sync::lock::EnvLock::acquire(&paths.env_lock(), Duration::from_secs(30))?;
         crate::cli::sync::run_cycle(
             env,
             interactive,
@@ -90,7 +92,10 @@ pub async fn run_watch(
 
     renderer.event(crate::log::Action::Watch, &format!("start envs/{env}"));
     if let Some(d) = poll_interval {
-        renderer.event(crate::log::Action::Watch, &format!("polling every {}s", d.as_secs()));
+        renderer.event(
+            crate::log::Action::Watch,
+            &format!("polling every {}s", d.as_secs()),
+        );
     } else {
         renderer.event(crate::log::Action::Watch, "polling disabled");
     }
@@ -459,9 +464,9 @@ mod tests {
     #[test]
     fn polling_bar_tenths() {
         // Within a 60s interval, each segment is 6 seconds.
-        assert_eq!(polling_bar(0, 60),  "▱▱▱▱▱▱▱▱▱▱");
-        assert_eq!(polling_bar(5, 60),  "▱▱▱▱▱▱▱▱▱▱");
-        assert_eq!(polling_bar(6, 60),  "▰▱▱▱▱▱▱▱▱▱");
+        assert_eq!(polling_bar(0, 60), "▱▱▱▱▱▱▱▱▱▱");
+        assert_eq!(polling_bar(5, 60), "▱▱▱▱▱▱▱▱▱▱");
+        assert_eq!(polling_bar(6, 60), "▰▱▱▱▱▱▱▱▱▱");
         assert_eq!(polling_bar(24, 60), "▰▰▰▰▱▱▱▱▱▱");
         assert_eq!(polling_bar(30, 60), "▰▰▰▰▰▱▱▱▱▱");
         assert_eq!(polling_bar(54, 60), "▰▰▰▰▰▰▰▰▰▱");
@@ -471,7 +476,7 @@ mod tests {
     #[test]
     fn polling_bar_handles_overflow_and_zero_interval() {
         // elapsed >= total: full bar.
-        assert_eq!(polling_bar(60, 60),  "▰▰▰▰▰▰▰▰▰▰");
+        assert_eq!(polling_bar(60, 60), "▰▰▰▰▰▰▰▰▰▰");
         assert_eq!(polling_bar(120, 60), "▰▰▰▰▰▰▰▰▰▰");
         // total = 0 (defensive): return the full bar instead of dividing.
         assert_eq!(polling_bar(0, 0), "▰▰▰▰▰▰▰▰▰▰");
@@ -493,11 +498,21 @@ mod tests {
 
         sh_tx.send(()).unwrap(); // shutdown before any event
         let result = event_loop(
-            "test", false, false, false, false, false, rx, sh_rx,
-            None, std::path::PathBuf::new(), None,
+            "test",
+            false,
+            false,
+            false,
+            false,
+            false,
+            rx,
+            sh_rx,
+            None,
+            std::path::PathBuf::new(),
+            None,
             Arc::new(AtomicBool::new(false)),
             Arc::new(tokio::sync::Notify::new()),
-        ).await;
+        )
+        .await;
 
         std::env::set_current_dir(saved_cwd).unwrap();
         assert!(result.is_ok(), "{result:?}");
