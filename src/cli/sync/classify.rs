@@ -126,7 +126,10 @@ mod tests {
     }
 
     fn m(items: &[(&str, &str, &str)]) -> BTreeMap<(String, String), String> {
-        items.iter().map(|(k, s, h)| (key(k, s), h.to_string())).collect()
+        items
+            .iter()
+            .map(|(k, s, h)| (key(k, s), h.to_string()))
+            .collect()
     }
 
     fn st(items: &[(&str, &str)]) -> BTreeSet<(String, String)> {
@@ -134,7 +137,11 @@ mod tests {
     }
 
     fn class_of<'a>(items: &'a [ClassifiedItem], slug: &str) -> &'a SyncClass {
-        &items.iter().find(|c| c.slug == slug).expect("item present").class
+        &items
+            .iter()
+            .find(|c| c.slug == slug)
+            .expect("item present")
+            .class
     }
 
     #[test]

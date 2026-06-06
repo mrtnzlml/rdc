@@ -128,8 +128,20 @@ mod tests {
     #[test]
     fn detects_two_distinct_ids_on_one_identity_key() {
         let mut d = CollisionDetector::new();
-        d.observe("queues", "shared-queue", 100, "Shared Queue", "workspace-alpha");
-        d.observe("queues", "shared-queue", 200, "Shared Queue", "workspace-beta");
+        d.observe(
+            "queues",
+            "shared-queue",
+            100,
+            "Shared Queue",
+            "workspace-alpha",
+        );
+        d.observe(
+            "queues",
+            "shared-queue",
+            200,
+            "Shared Queue",
+            "workspace-beta",
+        );
         let collisions = d.collisions();
         assert_eq!(collisions.len(), 1, "one identity key is contested");
         let c = &collisions[0];
@@ -167,14 +179,25 @@ mod tests {
             kind: "queues".to_string(),
             slug: "shared-queue".to_string(),
             members: vec![
-                CollisionMember { id: 100, name: "Shared Queue".to_string(), parent: "workspace-alpha".to_string() },
-                CollisionMember { id: 200, name: "Shared Queue".to_string(), parent: "workspace-beta".to_string() },
+                CollisionMember {
+                    id: 100,
+                    name: "Shared Queue".to_string(),
+                    parent: "workspace-alpha".to_string(),
+                },
+                CollisionMember {
+                    id: 200,
+                    name: "Shared Queue".to_string(),
+                    parent: "workspace-beta".to_string(),
+                },
             ],
         };
         let msg = format_collisions(&[c]);
         assert!(msg.contains("identity collision"), "msg: {msg}");
         assert!(msg.contains("shared-queue"), "msg: {msg}");
         assert!(msg.contains("100") && msg.contains("200"), "msg: {msg}");
-        assert!(msg.contains("workspace-alpha") && msg.contains("workspace-beta"), "msg: {msg}");
+        assert!(
+            msg.contains("workspace-alpha") && msg.contains("workspace-beta"),
+            "msg: {msg}"
+        );
     }
 }
