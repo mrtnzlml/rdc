@@ -269,7 +269,14 @@ async fn reinstall_as_store_extension(
         .with_context(|| format!("PATCH /hooks/{installed_id} (mirror old settings)"))?;
 
     // 4. Rewire dependents' run_after.
-    let old_url = old_hook.url.clone();
+    // `old_hook` comes from the local snapshot, whose refs are portabilized to
+    // `rdc://` form, but dependents reference the old hook by its remote URL.
+    // Resolve the remote URL by id from the freshly-listed remote hooks.
+    let old_url = remote_hooks
+        .iter()
+        .find(|h| h.id == old_hook.id)
+        .map(|h| h.url.clone())
+        .unwrap_or_else(|| old_hook.url.clone());
     let new_url = updated.url.clone();
     let mut rewired = 0usize;
     for h in &remote_hooks {

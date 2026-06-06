@@ -1,6 +1,6 @@
 use super::common::{
-    PullAction, PullCtx, apply_pull_action, maybe_strip_overlay, record_object,
-    skip_on_permission_denied,
+    apply_pull_action, maybe_strip_overlay, record_object, skip_on_permission_denied, PullAction,
+    PullCtx,
 };
 use crate::log::{Action, Log};
 use crate::model::Hook;
@@ -57,12 +57,15 @@ pub async fn process(
         // hook in the listing surfaces, even when the current cycle
         // only writes a narrower subset.
         if hook.is_store_extension() && hook.hook_template().is_none() {
-            progress.event(Action::Warn, &format!(
+            progress.event(
+                Action::Warn,
+                &format!(
                 "hook/{slug} (id {}): extension_source=rossum_store but hook_template is null — \
                  run `rdc doctor {env}` to fix",
                 hook.id,
                 env = ctx.paths.env(),
-            ));
+            ),
+            );
         }
 
         if !subset.contains(&(KIND.to_string(), slug.clone())) {
@@ -84,6 +87,8 @@ pub async fn process(
                 proposed_json,
                 ctx.overlay.as_ref().and_then(|o| o.hook(&slug)),
             )?;
+            let proposed_json =
+                crate::cli::pull::common::portabilize_proposed(&proposed_json, &*ctx.lockfile);
 
             // Derive the sidecar extension from the hook's runtime — Node.js
             // hooks land in `<slug>.js`, Python (and any unknown runtime) in

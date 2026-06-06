@@ -1,5 +1,7 @@
 use crate::api::{RossumClient, anyhow_has_status};
-use crate::cli::deploy::common::{bytes_equal_after_strip, rewrite_urls, tgt_drift_status};
+use crate::cli::deploy::common::{
+    bytes_equal_after_strip, portabilize_for_hash, rewrite_urls, tgt_drift_status,
+};
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::config::ProjectConfig;
 use crate::log::{Action, Log};
@@ -503,6 +505,9 @@ pub(crate) async fn run(
         // bytes. Drift check must use the same framing or it falsely fires on
         // every deploy for hooks with overlays.
         let remote_json_for_hash = maybe_strip_overlay(remote_json_full.clone(), overlay_paths)?;
+        // The lockfile baseline is recorded over the portabilized (rdc://) form
+        // by the pull post-pass, so the remote must be portabilized to compare.
+        let remote_json_for_hash = portabilize_for_hash(remote_json_for_hash, tgt_lockfile)?;
         let remote_combined_hash = {
             let sidecars: Vec<(String, Vec<u8>)> = if let Some(c) = &remote_code {
                 vec![("code".to_string(), c.as_bytes().to_vec())]
@@ -681,6 +686,7 @@ pub(crate) async fn run(
         };
         let (remote_json_full, remote_code) = crate::snapshot::rule::serialize_rule(remote)?;
         let stripped = maybe_strip_overlay(remote_json_full.clone(), overlay_paths)?;
+        let stripped = portabilize_for_hash(stripped, tgt_lockfile)?;
         let remote_combined_hash = crate::state::rule_combined_hash(&stripped, &remote_code);
         let in_sync = tgt_lockfile
             .objects
@@ -1080,6 +1086,7 @@ pub(crate) async fn run(
         let (remote_json_full, remote_formulas) =
             crate::snapshot::schema::serialize_schema(&remote_schema)?;
         let stripped = maybe_strip_overlay(remote_json_full.clone(), overlay_paths)?;
+        let stripped = portabilize_for_hash(stripped, tgt_lockfile)?;
         let remote_combined_hash = crate::state::schema_combined_hash(&stripped, &remote_formulas);
         let in_sync = tgt_lockfile
             .objects
