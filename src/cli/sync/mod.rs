@@ -508,6 +508,7 @@ pub fn from_catalog_scan_lockfile(
             Ok(b) => b,
             Err(_) => continue,
         };
+        let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
         let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
         remote_hashes.insert(("labels".to_string(), slug), hash);
     }
@@ -606,6 +607,7 @@ pub fn from_catalog_scan_lockfile(
             Ok(b) => b,
             Err(_) => continue,
         };
+        let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
         let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
         remote_hashes.insert(("workflows".to_string(), slug), hash);
     }
@@ -663,6 +665,7 @@ pub fn from_catalog_scan_lockfile(
             Ok(b) => b,
             Err(_) => continue,
         };
+        let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
         let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
         remote_hashes.insert(("workflow_steps".to_string(), composite_key), hash);
     }
@@ -724,6 +727,7 @@ pub fn from_catalog_scan_lockfile(
             Ok(b) => b,
             Err(_) => continue,
         };
+        let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
         let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
         remote_hashes.insert(("workspaces".to_string(), slug), hash);
     }
@@ -783,6 +787,7 @@ pub fn from_catalog_scan_lockfile(
             Ok(b) => b,
             Err(_) => continue,
         };
+        let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
         let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
         remote_hashes.insert(("engines".to_string(), slug), hash);
     }
@@ -849,6 +854,7 @@ pub fn from_catalog_scan_lockfile(
             Ok(b) => b,
             Err(_) => continue,
         };
+        let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
         let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
         remote_hashes.insert(("engine_fields".to_string(), composite_key), hash);
     }
@@ -911,6 +917,7 @@ pub fn from_catalog_scan_lockfile(
             Ok(b) => b,
             Err(_) => continue,
         };
+        let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
         let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
         remote_hashes.insert(("hooks".to_string(), slug), hash);
     }
@@ -976,6 +983,7 @@ pub fn from_catalog_scan_lockfile(
             Ok(b) => b,
             Err(_) => continue,
         };
+        let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
         let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
         remote_hashes.insert(("rules".to_string(), slug), hash);
     }
@@ -1069,6 +1077,7 @@ pub fn from_catalog_scan_lockfile(
                 overlay.and_then(|o| queues_codec.overlay(o, &q_slug)),
             )
         {
+            let q_json = crate::cli::pull::common::portabilize_proposed(&q_json, lockfile);
             let q_hash = crate::snapshot::codec::combined_hash(&q_json, &q_art.sidecars);
             remote_hashes.insert(("queues".to_string(), q_slug.clone()), q_hash);
         }
@@ -1084,6 +1093,7 @@ pub fn from_catalog_scan_lockfile(
                 overlay.and_then(|o| schemas_codec.overlay(o, &schema_composite)),
             )
         {
+            let s_json = crate::cli::pull::common::portabilize_proposed(&s_json, lockfile);
             let s_hash = crate::snapshot::codec::combined_hash(&s_json, &s_art.sidecars);
             remote_hashes.insert(("schemas".to_string(), q_slug.clone()), s_hash);
         }
@@ -1097,6 +1107,7 @@ pub fn from_catalog_scan_lockfile(
                 overlay.and_then(|o| inboxes_codec.overlay(o, &q_slug)),
             )
         {
+            let i_json = crate::cli::pull::common::portabilize_proposed(&i_json, lockfile);
             let i_hash = crate::snapshot::codec::combined_hash(&i_json, &i_art.sidecars);
             remote_hashes.insert(("inboxes".to_string(), q_slug.clone()), i_hash);
         }
@@ -1106,7 +1117,10 @@ pub fn from_catalog_scan_lockfile(
     // distinct queues collapsed onto one identity key.
     let collisions = qdetect.collisions();
     if !collisions.is_empty() {
-        anyhow::bail!("{}", crate::cli::sync::collision::format_collisions(&collisions));
+        anyhow::bail!(
+            "{}",
+            crate::cli::sync::collision::format_collisions(&collisions)
+        );
     }
 
     // Scan-side hashes for queues / inboxes (flat) and schemas (combined).
@@ -1213,6 +1227,7 @@ pub fn from_catalog_scan_lockfile(
             Ok(b) => b,
             Err(_) => continue,
         };
+        let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
         let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
         remote_hashes.insert(("email_templates".to_string(), compound), hash);
     }
@@ -1235,7 +1250,12 @@ pub fn from_catalog_scan_lockfile(
         }
     }
 
-    Ok(crate::cli::sync::classify::classify(&remote_hashes, &scan_changes, &scan_tombstones, &locked))
+    Ok(crate::cli::sync::classify::classify(
+        &remote_hashes,
+        &scan_changes,
+        &scan_tombstones,
+        &locked,
+    ))
 }
 
 #[cfg(test)]
