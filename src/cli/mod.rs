@@ -451,6 +451,7 @@ pub mod deploy;
 pub mod env_picker;
 pub mod index;
 pub mod init;
+pub mod migrate;
 pub mod pull;
 pub mod push;
 pub mod doctor;
