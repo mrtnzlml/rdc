@@ -1,6 +1,6 @@
 use super::common::{
-    apply_pull_action, decide_pull_action, record_object, skip_on_permission_denied, PullAction,
-    PullCtx,
+    PullAction, PullCtx, apply_pull_action, decide_pull_action, record_object,
+    skip_on_permission_denied,
 };
 use crate::log::{Action, Log};
 use crate::model::Workflow;
@@ -95,7 +95,6 @@ pub async fn process(
                 KIND,
                 &slug,
                 w.id,
-                Some(w.url.clone()),
                 w.modified_at().map(|s| s.to_string()),
                 Some(recorded_hash),
             );

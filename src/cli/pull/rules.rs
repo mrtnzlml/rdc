@@ -253,7 +253,6 @@ pub async fn process(
                 KIND,
                 &slug,
                 r.id,
-                Some(r.url.clone()),
                 r.modified_at().map(|s| s.to_string()),
                 Some(recorded_hash),
             );

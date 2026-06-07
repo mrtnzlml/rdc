@@ -133,7 +133,6 @@ pub async fn process(
                 KIND,
                 &composite_key,
                 s.id,
-                Some(s.url.clone()),
                 s.modified_at().map(|x| x.to_string()),
                 Some(recorded_hash),
             );

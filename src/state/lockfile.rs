@@ -5,7 +5,12 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Current lockfile schema version.
-pub const LOCKFILE_VERSION: u32 = 2;
+///
+/// v3 dropped the redundant per-object `url` field: the URL is now DERIVED
+/// from `id` + the env's `api_base` (see [`Lockfile::url_for_slug`]). The
+/// slug remains the portable identity; `id` is the single source of truth
+/// for the live URL.
+pub const LOCKFILE_VERSION: u32 = 3;
 
 /// rdc lockfile contents. One file per environment, stored at
 /// `.rdc/state/<env>.lock.json`. Records the slug↔ID mapping plus
@@ -13,6 +18,14 @@ pub const LOCKFILE_VERSION: u32 = 2;
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Lockfile {
     pub version: u32,
+    /// The env's API base (e.g. `https://api.elis.rossum.ai/v1`). Used to
+    /// DERIVE each object's live URL from its `id` + kind. Defaults to the
+    /// empty string when absent (v1/v2 lockfiles); every production loader
+    /// sets it from the env's [`crate::config::EnvConfig::api_base`] right
+    /// after `load`. An empty `api_base` makes [`Lockfile::url_for_slug`]
+    /// return `None` (fail-loud) rather than emit a malformed URL.
+    #[serde(default)]
+    pub api_base: String,
     /// Per object-type, a map of slug -> entry.
     pub objects: BTreeMap<String, BTreeMap<String, ObjectEntry>>,
 }
@@ -20,12 +33,11 @@ pub struct Lockfile {
 /// One row in the lockfile.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct ObjectEntry {
-    /// Numeric Rossum ID.
+    /// Numeric Rossum ID. Also the single source of truth for the object's
+    /// live URL, which is derived as `{api_base}/{endpoint(kind)}/{id}` —
+    /// see [`Lockfile::url_for_slug`]. An `id` of `0` means "no URL"
+    /// (currently only `mdh_indexes`, recorded as `id: 0`).
     pub id: u64,
-    /// Canonical Rossum URL for the object. Powers cross-reference
-    /// resolution (e.g. queue.workspace → workspace slug).
-    #[serde(default)]
-    pub url: Option<String>,
     /// ISO 8601 server timestamp from `modified_at`, if present.
     #[serde(default)]
     pub modified_at: Option<String>,
@@ -50,15 +62,55 @@ impl Default for Lockfile {
     fn default() -> Self {
         Self {
             version: LOCKFILE_VERSION,
+            api_base: String::new(),
             objects: BTreeMap::new(),
         }
     }
 }
 
+/// Map a lockfile `kind` to the API endpoint segment that appears in its
+/// URLs. Identity for every kind except `organization`, whose URLs use the
+/// plural `organizations`. Verified empirically against the live TEST org
+/// for all 297 url-bearing lockfile entries across 11 kinds.
+fn endpoint_for(kind: &str) -> &str {
+    if kind == "organization" {
+        "organizations"
+    } else {
+        kind
+    }
+}
+
+/// Inverse of [`endpoint_for`]: map a URL endpoint segment back to its
+/// lockfile `kind`.
+fn kind_for_endpoint(ep: &str) -> &str {
+    if ep == "organizations" {
+        "organization"
+    } else {
+        ep
+    }
+}
+
+/// Parse the trailing `/<endpoint>/<id>` of a Rossum API URL into
+/// `(endpoint, id)`. Returns `None` for any URL that doesn't end in
+/// `/<segment>/<digits>` (e.g. `rdc://` refs, malformed URLs).
+fn split_endpoint_id(url: &str) -> Option<(&str, u64)> {
+    let trimmed = url.trim_end_matches('/');
+    let (rest, id_str) = trimmed.rsplit_once('/')?;
+    let id: u64 = id_str.parse().ok()?;
+    let endpoint = rest.rsplit('/').next()?;
+    if endpoint.is_empty() {
+        return None;
+    }
+    Some((endpoint, id))
+}
+
 impl Lockfile {
     /// Load a lockfile from disk, returning the default value if the file
-    /// does not exist. v1 lockfiles are silently migrated to v2 (the new
-    /// fields default to None and will be populated on the next pull).
+    /// does not exist. v1 and v2 lockfiles are silently migrated to v3:
+    /// the legacy per-object `url` field is dropped (serde ignores it —
+    /// there is no `#[serde(deny_unknown_fields)]`), the URL is now derived
+    /// from `id` + `api_base`, and `api_base` defaults to `""` until a
+    /// production caller sets it from the env config.
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -69,10 +121,11 @@ impl Lockfile {
             serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
 
         match lf.version {
-            1 => {
-                // v1 → v2: same top-level shape, but ObjectEntry's new fields
-                // default to None thanks to #[serde(default)]. Just bump the
-                // version field; the next pull will populate url and content_hash.
+            1 | 2 => {
+                // v1/v2 → v3: same top-level shape. v2's per-object `url`
+                // field is silently dropped (no `deny_unknown_fields`), the
+                // URL is now derived, and `api_base` defaults to `""` until
+                // the caller sets it. Just bump the version field.
                 lf.version = LOCKFILE_VERSION;
             }
             v if v == LOCKFILE_VERSION => {}
@@ -122,12 +175,15 @@ impl Lockfile {
             }
             return by_kind.get_key_value(slug).map(|(sl, _)| sl.as_str());
         }
-        for (slug, entry) in by_kind.iter() {
-            if entry.url.as_deref() == Some(url) {
-                return Some(slug.as_str());
-            }
+        // A live API URL: parse its `/<endpoint>/<id>` and match by id
+        // within this kind (the URL is no longer stored — `id` is canonical).
+        // The endpoint must map to the requested `kind`, so a URL for a
+        // different kind never matches here even if ids happen to collide.
+        let (endpoint, id) = split_endpoint_id(url)?;
+        if kind_for_endpoint(endpoint) != kind {
+            return None;
         }
-        None
+        self.slug_for_id(kind, id)
     }
 
     /// Find the slug of an object by its numeric ID within a kind.
@@ -156,20 +212,33 @@ impl Lockfile {
             let (sl, _) = entries.get_key_value(slug)?;
             return Some((k.as_str(), sl.as_str()));
         }
-        for (kind, entries) in &self.objects {
-            for (slug, entry) in entries {
-                if entry.url.as_deref() == Some(url) {
-                    return Some((kind.as_str(), slug.as_str()));
-                }
-            }
-        }
-        None
+        // A live API URL: parse `/<endpoint>/<id>`, map the endpoint back to
+        // its kind, and find the slug by id. Borrow the real key str from
+        // `self.objects` so the returned `&str` outlives this call.
+        let (endpoint, id) = split_endpoint_id(url)?;
+        let kind = kind_for_endpoint(endpoint);
+        let (k, _entries) = self.objects.get_key_value(kind)?;
+        let slug = self.slug_for_id(kind, id)?;
+        Some((k.as_str(), slug))
     }
 
-    /// Recover the URL for a given `(kind, slug)`. Returns `None` if
-    /// either the kind isn't tracked or the entry has no URL recorded.
-    pub fn url_for_slug(&self, kind: &str, slug: &str) -> Option<&str> {
-        self.objects.get(kind)?.get(slug)?.url.as_deref()
+    /// Derive the live URL for a given `(kind, slug)` from its `id` and the
+    /// env's `api_base`: `{api_base}/{endpoint(kind)}/{id}`. Returns `None`
+    /// (fail-loud — never a malformed URL) when the kind/slug isn't tracked,
+    /// when `api_base` is unset (a v1/v2 load whose caller forgot to set it),
+    /// or when the entry's `id` is `0` (the `mdh_indexes` sentinel: index
+    /// sets are never URL-resolved).
+    pub fn url_for_slug(&self, kind: &str, slug: &str) -> Option<String> {
+        let entry = self.objects.get(kind)?.get(slug)?;
+        if entry.id == 0 || self.api_base.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{}/{}/{}",
+            self.api_base.trim_end_matches('/'),
+            endpoint_for(kind),
+            entry.id
+        ))
     }
 }
 
@@ -312,16 +381,18 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_v2() {
+    fn round_trip_v3() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("dev.lock.json");
-        let mut lf = Lockfile::default();
+        let mut lf = Lockfile {
+            api_base: "https://x.rossum.app/api/v1".to_string(),
+            ..Lockfile::default()
+        };
         lf.upsert(
             "hooks",
             "validator-invoices",
             ObjectEntry {
                 id: 1,
-                url: Some("https://x.rossum.app/api/v1/hooks/1".to_string()),
                 modified_at: Some("2026-04-01T10:00:00Z".to_string()),
                 content_hash: Some("a".repeat(64)),
                 secrets_hash: None,
@@ -342,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_lockfile_migrates_to_v2_in_memory() {
+    fn v1_lockfile_migrates_to_v3_in_memory() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("dev.lock.json");
         // Hand-write a v1 lockfile (no url, no content_hash).
@@ -365,11 +436,173 @@ mod tests {
 
         let lf = Lockfile::load(&path).unwrap();
         assert_eq!(lf.version, LOCKFILE_VERSION);
+        // api_base defaults to empty until a caller sets it.
+        assert_eq!(lf.api_base, "");
         let entry = &lf.objects["hooks"]["old-hook"];
         assert_eq!(entry.id, 7);
         assert_eq!(entry.modified_at.as_deref(), Some("2026-03-01T09:00:00Z"));
-        assert!(entry.url.is_none());
         assert!(entry.content_hash.is_none());
+    }
+
+    /// A v2 lockfile carries a per-object `url` field that v3 dropped.
+    /// `load` must migrate it to v3 (version bumped, `api_base` defaulting to
+    /// empty) and silently ignore the legacy `url` — there is no
+    /// `#[serde(deny_unknown_fields)]`, so the entry still deserializes.
+    #[test]
+    fn v2_lockfile_migrates_to_v3_and_drops_legacy_url() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dev.lock.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "version": 2,
+  "objects": {
+    "queues": {
+      "invoices": {
+        "id": 123,
+        "url": "https://api.elis.rossum.ai/v1/queues/123",
+        "modified_at": "2026-03-01T09:00:00Z",
+        "content_hash": "abc"
+      }
+    },
+    "organization": {
+      "self": {
+        "id": 5,
+        "url": "https://api.elis.rossum.ai/v1/organizations/5"
+      }
+    }
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let mut lf = Lockfile::load(&path).unwrap();
+        assert_eq!(lf.version, LOCKFILE_VERSION);
+        assert_eq!(lf.api_base, "", "api_base defaults to empty on migration");
+        let q = &lf.objects["queues"]["invoices"];
+        assert_eq!(q.id, 123);
+        assert_eq!(q.modified_at.as_deref(), Some("2026-03-01T09:00:00Z"));
+        assert_eq!(q.content_hash.as_deref(), Some("abc"));
+        assert_eq!(lf.objects["organization"]["self"].id, 5);
+
+        // Once a caller supplies api_base, the URL is derived (not read from
+        // the dropped legacy field).
+        lf.api_base = "https://api.elis.rossum.ai/v1".to_string();
+        assert_eq!(
+            lf.url_for_slug("queues", "invoices").as_deref(),
+            Some("https://api.elis.rossum.ai/v1/queues/123")
+        );
+        assert_eq!(
+            lf.url_for_slug("organization", "self").as_deref(),
+            Some("https://api.elis.rossum.ai/v1/organizations/5")
+        );
+    }
+
+    /// Empirical-gate: the derivation rule verified against the live TEST org
+    /// for all 297 url-bearing entries across 11 kinds —
+    /// `{api_base}/{endpoint(kind)}/{id}`, where `endpoint == kind` for every
+    /// kind except `organization` → `organizations`, and `id == 0`
+    /// (`mdh_indexes`) yields no URL. An empty `api_base` fails loud.
+    #[test]
+    fn url_for_slug_derivation_matches_empirical_rule() {
+        let mut lf = Lockfile {
+            api_base: "https://api.elis.rossum.ai/v1".to_string(),
+            ..Lockfile::default()
+        };
+        lf.upsert(
+            "queues",
+            "q",
+            ObjectEntry {
+                id: 123,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        lf.upsert(
+            "organization",
+            "org",
+            ObjectEntry {
+                id: 5,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        lf.upsert(
+            "mdh_indexes",
+            "ds",
+            ObjectEntry {
+                id: 0,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+
+        // queues: endpoint == kind.
+        assert_eq!(
+            lf.url_for_slug("queues", "q").as_deref(),
+            Some("https://api.elis.rossum.ai/v1/queues/123")
+        );
+        // organization: the one kind whose endpoint is pluralized.
+        assert_eq!(
+            lf.url_for_slug("organization", "org").as_deref(),
+            Some("https://api.elis.rossum.ai/v1/organizations/5")
+        );
+        // mdh_indexes: id == 0 → no URL.
+        assert_eq!(lf.url_for_slug("mdh_indexes", "ds"), None);
+        // Unknown kind/slug → None.
+        assert_eq!(lf.url_for_slug("queues", "nope"), None);
+
+        // Empty api_base fails loud (never a malformed URL).
+        lf.api_base = String::new();
+        assert_eq!(lf.url_for_slug("queues", "q"), None);
+    }
+
+    /// Round-trip: a derived URL fed back through `lookup_url` resolves to the
+    /// original `(kind, slug)`, including the pluralized `organization`
+    /// endpoint.
+    #[test]
+    fn lookup_url_round_trips_derived_urls() {
+        let mut lf = Lockfile {
+            api_base: "https://api.elis.rossum.ai/v1".to_string(),
+            ..Lockfile::default()
+        };
+        lf.upsert(
+            "queues",
+            "q",
+            ObjectEntry {
+                id: 123,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        lf.upsert(
+            "organization",
+            "org",
+            ObjectEntry {
+                id: 5,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        assert_eq!(
+            lf.lookup_url("https://api.elis.rossum.ai/v1/queues/123"),
+            Some(("queues", "q"))
+        );
+        assert_eq!(
+            lf.lookup_url("https://api.elis.rossum.ai/v1/organizations/5"),
+            Some(("organization", "org"))
+        );
+        // A URL whose id isn't tracked → None.
+        assert_eq!(
+            lf.lookup_url("https://api.elis.rossum.ai/v1/queues/999"),
+            None
+        );
     }
 
     #[test]
@@ -566,7 +799,6 @@ mod tests {
             "validator-invoices",
             ObjectEntry {
                 id: 42,
-                url: None,
                 modified_at: None,
                 content_hash: None,
                 secrets_hash: None,
@@ -585,17 +817,19 @@ mod tests {
             "invoices-ap",
             ObjectEntry {
                 id: 1,
-                url: Some("https://x/api/v1/workspaces/1".to_string()),
                 modified_at: None,
                 content_hash: None,
                 secrets_hash: None,
             },
         );
+        // The URL is matched by its trailing id, not by a stored string.
         assert_eq!(
             lf.slug_for_url("workspaces", "https://x/api/v1/workspaces/1"),
             Some("invoices-ap"),
         );
         assert_eq!(lf.slug_for_url("workspaces", "https://nope"), None);
+        // A workspaces URL must not resolve within `hooks` even if ids
+        // collide — the endpoint segment is checked against the kind.
         assert_eq!(
             lf.slug_for_url("hooks", "https://x/api/v1/workspaces/1"),
             None

@@ -291,7 +291,6 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                     remote_formulas: Vec::new(),
                     local_path,
                     id: l.id,
-                    url: Some(l.url.clone()),
                     modified_at: l.modified_at().map(|s| s.to_string()),
                     hash_strategy: HashStrategy::Flat,
                 })
@@ -315,7 +314,6 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                         remote_formulas: Vec::new(),
                         local_path,
                         id: w.id,
-                        url: Some(w.url.clone()),
                         modified_at: w.modified_at().map(|s| s.to_string()),
                         hash_strategy: HashStrategy::Flat,
                     })
@@ -336,7 +334,6 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                     remote_formulas: Vec::new(),
                     local_path,
                     id: e.id,
-                    url: Some(e.url.clone()),
                     modified_at: e.modified_at().map(|s| s.to_string()),
                     hash_strategy: HashStrategy::Flat,
                 })
@@ -370,7 +367,6 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                             remote_formulas: Vec::new(),
                             local_path,
                             id: f.id,
-                            url: Some(f.url.clone()),
                             modified_at: f.modified_at().map(|s| s.to_string()),
                             hash_strategy: HashStrategy::Flat,
                         })
@@ -400,7 +396,6 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                     remote_formulas: Vec::new(),
                     local_path,
                     id: h.id,
-                    url: Some(h.url.clone()),
                     modified_at: h.modified_at().map(|s| s.to_string()),
                     hash_strategy: HashStrategy::Hook,
                 })
@@ -426,7 +421,6 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                     remote_formulas: Vec::new(),
                     local_path,
                     id: r.id,
-                    url: Some(r.url.clone()),
                     modified_at: r.modified_at().map(|s| s.to_string()),
                     hash_strategy: HashStrategy::Rule,
                 })
@@ -452,7 +446,6 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                         remote_formulas: Vec::new(),
                         local_path,
                         id: q.id,
-                        url: Some(q.url.clone()),
                         modified_at: q.modified_at().map(|s| s.to_string()),
                         hash_strategy: HashStrategy::Flat,
                     })
@@ -495,7 +488,6 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                             remote_formulas: formulas,
                             local_path,
                             id: schema.id,
-                            url: Some(schema.url.clone()),
                             modified_at: schema.modified_at().map(|s| s.to_string()),
                             hash_strategy: HashStrategy::Schema,
                         })
@@ -520,7 +512,6 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                         remote_formulas: Vec::new(),
                         local_path,
                         id: inbox.id,
-                        url: Some(inbox.url.clone()),
                         modified_at: inbox.modified_at().map(|s| s.to_string()),
                         hash_strategy: HashStrategy::Flat,
                     })
@@ -553,7 +544,6 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                             remote_formulas: Vec::new(),
                             local_path,
                             id: t.id,
-                            url: Some(t.url.clone()),
                             modified_at: t.modified_at().map(|s| s.to_string()),
                             hash_strategy: HashStrategy::Flat,
                         })
@@ -624,7 +614,6 @@ struct ConflictRefs {
     remote_formulas: Vec<(String, Vec<u8>)>,
     local_path: PathBuf,
     id: u64,
-    url: Option<String>,
     modified_at: Option<String>,
     /// How to fold `(remote_bytes, remote_code)` into the lockfile
     /// `content_hash`. Flat kinds use `Flat` (just `content_hash`);
@@ -1091,7 +1080,6 @@ fn resolve_one_conflict<R: BufRead>(
         remote_formulas,
         local_path,
         id,
-        url,
         modified_at,
         hash_strategy,
     } = refs;
@@ -1194,7 +1182,6 @@ fn resolve_one_conflict<R: BufRead>(
             &it.kind,
             &it.slug,
             id,
-            url,
             modified_at,
             Some(canonical_local_hash),
         );
@@ -1246,7 +1233,6 @@ fn resolve_one_conflict<R: BufRead>(
             &it.kind,
             &it.slug,
             id,
-            url,
             modified_at,
             Some(merged_combined_hash),
         );
@@ -1344,7 +1330,6 @@ fn resolve_one_conflict<R: BufRead>(
             &it.kind,
             &it.slug,
             id,
-            url,
             modified_at,
             preserved_hash,
         );
@@ -1488,7 +1473,6 @@ fn resolve_one_conflict<R: BufRead>(
                 &it.kind,
                 &it.slug,
                 id,
-                url,
                 modified_at,
                 Some(canonical_remote_hash.clone()),
             );
@@ -1554,7 +1538,6 @@ fn resolve_one_conflict<R: BufRead>(
                 &it.kind,
                 &it.slug,
                 id,
-                url,
                 modified_at,
                 Some(canonical_remote_hash.clone()),
             );
@@ -1580,7 +1563,6 @@ fn resolve_one_conflict<R: BufRead>(
                 &it.kind,
                 &it.slug,
                 id,
-                url,
                 modified_at,
                 Some(canonical_remote_hash.clone()),
             );
@@ -1620,7 +1602,6 @@ fn resolve_one_conflict<R: BufRead>(
                 &it.kind,
                 &it.slug,
                 id,
-                url,
                 modified_at,
                 preserved_hash,
             );
@@ -1652,7 +1633,6 @@ fn resolve_one_conflict<R: BufRead>(
                 &it.kind,
                 &it.slug,
                 id,
-                url,
                 modified_at,
                 preserved_hash,
             );
@@ -1996,7 +1976,6 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             restore_code: None,
                             restore_formulas: Vec::new(),
                             id: body.map(|l| l.id),
-                            url: body.map(|l| l.url.clone()),
                             modified_at: body.and_then(|l| l.modified_at().map(|s| s.to_string())),
                             hash_strategy: HashStrategy::Flat,
                         })
@@ -2021,7 +2000,6 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             restore_code: None,
                             restore_formulas: Vec::new(),
                             id: body.map(|w| w.id),
-                            url: body.map(|w| w.url.clone()),
                             modified_at: body.and_then(|w| w.modified_at().map(|s| s.to_string())),
                             hash_strategy: HashStrategy::Flat,
                         })
@@ -2046,7 +2024,6 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             restore_code: None,
                             restore_formulas: Vec::new(),
                             id: body.map(|e| e.id),
-                            url: body.map(|e| e.url.clone()),
                             modified_at: body.and_then(|e| e.modified_at().map(|s| s.to_string())),
                             hash_strategy: HashStrategy::Flat,
                         })
@@ -2092,7 +2069,6 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             restore_code: None,
                             restore_formulas: Vec::new(),
                             id: body.map(|f| f.id),
-                            url: body.map(|f| f.url.clone()),
                             modified_at: body.and_then(|f| f.modified_at().map(|s| s.to_string())),
                             hash_strategy: HashStrategy::Flat,
                         })
@@ -2128,7 +2104,6 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             restore_code,
                             restore_formulas: Vec::new(),
                             id: body.map(|h| h.id),
-                            url: body.map(|h| h.url.clone()),
                             modified_at: body.and_then(|h| h.modified_at().map(|s| s.to_string())),
                             hash_strategy: HashStrategy::Hook,
                         })
@@ -2161,7 +2136,6 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             restore_code,
                             restore_formulas: Vec::new(),
                             id: body.map(|r| r.id),
-                            url: body.map(|r| r.url.clone()),
                             modified_at: body.and_then(|r| r.modified_at().map(|s| s.to_string())),
                             hash_strategy: HashStrategy::Rule,
                         })
@@ -2205,7 +2179,6 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             restore_code: None,
                             restore_formulas: Vec::new(),
                             id: body.map(|(q, _)| q.id),
-                            url: body.map(|(q, _)| q.url.clone()),
                             modified_at: body
                                 .and_then(|(q, _)| q.modified_at().map(|s| s.to_string())),
                             hash_strategy: HashStrategy::Flat,
@@ -2277,7 +2250,6 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             restore_code: None,
                             restore_formulas,
                             id: body_pair.as_ref().map(|(s, _)| s.id),
-                            url: body_pair.as_ref().map(|(s, _)| s.url.clone()),
                             modified_at: body_pair
                                 .as_ref()
                                 .and_then(|(s, _)| s.modified_at().map(|x| x.to_string())),
@@ -2328,7 +2300,6 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             restore_code: None,
                             restore_formulas: Vec::new(),
                             id: body_pair.as_ref().map(|(i, _)| i.id),
-                            url: body_pair.as_ref().map(|(i, _)| i.url.clone()),
                             modified_at: body_pair
                                 .as_ref()
                                 .and_then(|(i, _)| i.modified_at().map(|x| x.to_string())),
@@ -2367,7 +2338,6 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             restore_code: None,
                             restore_formulas: Vec::new(),
                             id: body.map(|t| t.id),
-                            url: body.map(|t| t.url.clone()),
                             modified_at: body.and_then(|t| t.modified_at().map(|s| s.to_string())),
                             hash_strategy: HashStrategy::Flat,
                         })
@@ -2552,15 +2522,13 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                                         &crate::state::Lockfile::default(),
                                     )
                                 };
-                                if let (Some(id), url, modified_at) =
-                                    (refs.id, refs.url.clone(), refs.modified_at.clone())
+                                if let (Some(id), modified_at) = (refs.id, refs.modified_at.clone())
                                 {
                                     crate::cli::pull::common::record_object(
                                         ctx.lockfile,
                                         &it.kind,
                                         &it.slug,
                                         id,
-                                        url,
                                         modified_at,
                                         Some(h),
                                     );
@@ -2661,7 +2629,6 @@ struct RemoteDeleteRefs {
     /// is a `(field_id, bytes)` pair. For non-schema kinds this is empty.
     restore_formulas: Vec<(String, Vec<u8>)>,
     id: Option<u64>,
-    url: Option<String>,
     modified_at: Option<String>,
     hash_strategy: HashStrategy,
 }
@@ -3295,7 +3262,6 @@ mod tests {
             "audit-hold",
             ObjectEntry {
                 id: 99,
-                url: Some(remote_label.url.clone()),
                 modified_at: None,
                 content_hash: Some(base_hash),
                 secrets_hash: None,
@@ -3720,7 +3686,6 @@ mod tests {
             "audit-hold",
             ObjectEntry {
                 id: 42,
-                url: Some(local_label.url.clone()),
                 modified_at: None,
                 content_hash: Some(base_hash),
                 secrets_hash: None,
@@ -3995,7 +3960,6 @@ mod tests {
             "audit-hold",
             ObjectEntry {
                 id: 42,
-                url: Some(remote_label.url.clone()),
                 modified_at: None,
                 content_hash: Some("base".to_string()),
                 secrets_hash: None,
@@ -4197,7 +4161,6 @@ mod tests {
             slug,
             ObjectEntry {
                 id: 42,
-                url: Some("https://x.invalid/api/v1/hooks/42".to_string()),
                 modified_at: Some("2026-05-14T08:00:00Z".to_string()),
                 content_hash: Some(base_combined.clone()),
                 secrets_hash: None,
@@ -4526,7 +4489,6 @@ mod tests {
             slug,
             ObjectEntry {
                 id: 42,
-                url: Some("https://x.invalid/api/v1/hooks/42".to_string()),
                 modified_at: Some("2026-05-14T08:00:00Z".to_string()),
                 content_hash: Some(base_combined.clone()),
                 secrets_hash: None,
@@ -4693,7 +4655,6 @@ mod tests {
             slug,
             ObjectEntry {
                 id: 42,
-                url: Some("https://x.invalid/api/v1/hooks/42".to_string()),
                 modified_at: Some("2026-05-14T08:00:00Z".to_string()),
                 content_hash: Some(base_combined.clone()),
                 secrets_hash: None,
@@ -4851,7 +4812,6 @@ mod tests {
             q_slug,
             ObjectEntry {
                 id: schema_id,
-                url: Some(schema_url.clone()),
                 modified_at: Some("2026-04-10T09:00:00Z".to_string()),
                 content_hash: Some(base_combined.clone()),
                 secrets_hash: None,
@@ -4913,7 +4873,6 @@ mod tests {
             ws_slug,
             ObjectEntry {
                 id: 800,
-                url: Some("https://x.invalid/api/v1/workspaces/800".to_string()),
                 modified_at: Some("2026-04-20T08:00:00Z".to_string()),
                 content_hash: None,
                 secrets_hash: None,
@@ -4924,7 +4883,6 @@ mod tests {
             q_slug,
             ObjectEntry {
                 id: 100,
-                url: Some(queue.url.clone()),
                 modified_at: Some("2026-04-20T08:00:00Z".to_string()),
                 content_hash: None,
                 secrets_hash: None,
@@ -5111,7 +5069,6 @@ mod tests {
             slug,
             ObjectEntry {
                 id: 555,
-                url: Some("https://x.invalid/api/v1/hooks/555".to_string()),
                 modified_at: None,
                 content_hash: Some(String::new()), // placeholder, replaced below
                 secrets_hash: None,
@@ -5141,7 +5098,6 @@ mod tests {
             slug,
             ObjectEntry {
                 id: 555,
-                url: Some("https://x.invalid/api/v1/hooks/555".to_string()),
                 modified_at: None,
                 content_hash: Some(base_hash.clone()),
                 secrets_hash: None,
@@ -5345,7 +5301,6 @@ mod tests {
             ws_slug,
             ObjectEntry {
                 id: ws.id,
-                url: Some(ws.url.clone()),
                 modified_at: None,
                 content_hash: None,
                 secrets_hash: None,
@@ -5356,7 +5311,6 @@ mod tests {
             q_slug,
             ObjectEntry {
                 id: queue.id,
-                url: Some(queue.url.clone()),
                 modified_at: None,
                 content_hash: None,
                 secrets_hash: None,
@@ -5367,7 +5321,6 @@ mod tests {
             q_slug,
             ObjectEntry {
                 id: schema.id,
-                url: Some(schema.url.clone()),
                 modified_at: None,
                 content_hash: Some(schema_hash),
                 secrets_hash: None,

@@ -216,13 +216,12 @@ mod tests {
     use tempfile::TempDir;
 
     /// Seed the lockfile with a single object entry.
-    fn seed_entry(lockfile: &mut Lockfile, kind: &str, slug: &str, id: u64, url: &str) {
+    fn seed_entry(lockfile: &mut Lockfile, kind: &str, slug: &str, id: u64) {
         lockfile.upsert(
             kind,
             slug,
             ObjectEntry {
                 id,
-                url: Some(url.to_string()),
                 modified_at: None,
                 content_hash: Some("placeholder-hash".to_string()),
                 secrets_hash: None,
@@ -262,12 +261,11 @@ mod tests {
         const WS_URL: &str = "https://example.rossum.app/api/v1/workspaces/1001";
         const LABEL_ID: u64 = 42;
         const LABEL_SLUG: &str = "ap-label";
-        const LABEL_URL: &str = "https://example.rossum.app/api/v1/labels/42";
 
         // Build the initial lockfile with both objects registered.
         let mut lockfile = Lockfile::default();
-        seed_entry(&mut lockfile, "workspaces", WS_SLUG, WS_ID, WS_URL);
-        seed_entry(&mut lockfile, "labels", LABEL_SLUG, LABEL_ID, LABEL_URL);
+        seed_entry(&mut lockfile, "workspaces", WS_SLUG, WS_ID);
+        seed_entry(&mut lockfile, "labels", LABEL_SLUG, LABEL_ID);
 
         // Write a label JSON that contains a raw workspace URL.
         let label_value = label_json_with_workspace_url(WS_URL);
@@ -361,13 +359,11 @@ mod tests {
         let paths = Paths::for_env(tmp.path(), "dev");
 
         const WS_SLUG: &str = "demo-ws";
-        const WS_URL: &str = "https://example.rossum.app/api/v1/workspaces/2002";
         const LABEL_SLUG: &str = "demo-label";
-        const LABEL_URL: &str = "https://example.rossum.app/api/v1/labels/99";
 
         let mut lockfile = Lockfile::default();
-        seed_entry(&mut lockfile, "workspaces", WS_SLUG, 2002, WS_URL);
-        seed_entry(&mut lockfile, "labels", LABEL_SLUG, 99, LABEL_URL);
+        seed_entry(&mut lockfile, "workspaces", WS_SLUG, 2002);
+        seed_entry(&mut lockfile, "labels", LABEL_SLUG, 99);
 
         // Write a label that already uses rdc:// for the workspace cross-ref
         // AND uses rdc:// for its own url — should not be changed.
@@ -421,13 +417,7 @@ mod tests {
 
         let mut lockfile = Lockfile::default();
         // Register a label that has NO corresponding file on disk.
-        seed_entry(
-            &mut lockfile,
-            "labels",
-            "ghost-label",
-            777,
-            "https://example.rossum.app/api/v1/labels/777",
-        );
+        seed_entry(&mut lockfile, "labels", "ghost-label", 777);
 
         // Must not panic or error.
         portabilize_refs(&paths, &mut lockfile)
