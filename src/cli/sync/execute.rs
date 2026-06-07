@@ -1143,14 +1143,15 @@ fn resolve_one_conflict<R: BufRead>(
     // canonicalize-equal JSON pair which short-circuits to
     // `KeepLocal` — silently routing the item to push.
     let local_json_bytes = std::fs::read(&local_path).unwrap_or_default();
-    let local_json_canon = crate::snapshot::noise::canonicalize_for_hash(
-        &local_json_bytes,
-        &crate::state::Lockfile::default(),
-    );
-    let remote_json_canon = crate::snapshot::noise::canonicalize_for_hash(
-        &remote_bytes,
-        &crate::state::Lockfile::default(),
-    );
+    // Use the env lockfile (not an empty one) so reference normalization is
+    // applied symmetrically: the on-disk local is in rdc:// form while the
+    // remote is in URL form, and only `ctx.lockfile` lets them canonicalize
+    // equal. Without it a code-only divergence is mis-read as a JSON divergence
+    // and the shadow lands next to the .json instead of the .py.
+    let local_json_canon =
+        crate::snapshot::noise::canonicalize_for_hash(&local_json_bytes, ctx.lockfile);
+    let remote_json_canon =
+        crate::snapshot::noise::canonicalize_for_hash(&remote_bytes, ctx.lockfile);
     let json_canonicalize_equal = local_json_canon == remote_json_canon;
     let sidecar_diverges = match hash_strategy {
         HashStrategy::Hook | HashStrategy::Rule => local_code.as_deref() != remote_code.as_deref(),
@@ -1167,31 +1168,19 @@ fn resolve_one_conflict<R: BufRead>(
     // is what the classifier compares; the prompt should reflect the
     // same view of state.
     let canonical_remote_hash = match hash_strategy {
-        HashStrategy::Schema => hash_strategy.hash_schema(
-            &remote_bytes,
-            &remote_formulas,
-            &crate::state::Lockfile::default(),
-        ),
-        _ => hash_strategy.hash(
-            &remote_bytes,
-            &remote_code,
-            &crate::state::Lockfile::default(),
-        ),
+        HashStrategy::Schema => {
+            hash_strategy.hash_schema(&remote_bytes, &remote_formulas, ctx.lockfile)
+        }
+        _ => hash_strategy.hash(&remote_bytes, &remote_code, ctx.lockfile),
     };
     let canonical_local_hash = match hash_strategy {
-        HashStrategy::Schema => hash_strategy.hash_schema(
-            &local_json_bytes,
-            &local_formulas,
-            &crate::state::Lockfile::default(),
-        ),
-        HashStrategy::Hook | HashStrategy::Rule => hash_strategy.hash(
-            &local_json_bytes,
-            &local_code,
-            &crate::state::Lockfile::default(),
-        ),
-        HashStrategy::Flat => {
-            hash_strategy.hash(&local_json_bytes, &None, &crate::state::Lockfile::default())
+        HashStrategy::Schema => {
+            hash_strategy.hash_schema(&local_json_bytes, &local_formulas, ctx.lockfile)
         }
+        HashStrategy::Hook | HashStrategy::Rule => {
+            hash_strategy.hash(&local_json_bytes, &local_code, ctx.lockfile)
+        }
+        HashStrategy::Flat => hash_strategy.hash(&local_json_bytes, &None, ctx.lockfile),
     };
 
     // Defensive sanity: if the canonical hashes already match, the
