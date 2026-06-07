@@ -229,6 +229,10 @@ pub(crate) async fn run_cycle(
         .context("constructing Rossum API client")?;
 
     let mut lockfile = Lockfile::load(&paths.lockfile())?;
+    // Set the env's api_base so the lockfile can DERIVE object URLs from
+    // ids (push ref resolution, deploy cross-ref rewriting). Without this an
+    // empty api_base makes `url_for_slug` return None and push refs fail loud.
+    lockfile.api_base = env_cfg.api_base.clone();
     let overlay = crate::overlay::Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
@@ -488,7 +492,7 @@ pub fn from_catalog_scan_lockfile(
     // the object (the normal path), so it can't affect a populated env.
     let augmented = {
         let mut lf = lockfile.clone();
-        let mut add = |kind: &str, id: u64, url: &str, name: &str| {
+        let mut add = |kind: &str, id: u64, name: &str| {
             if lf.slug_for_id(kind, id).is_none() {
                 // Allocate a UNIQUE slug (against slugs already in this kind)
                 // so a same-name sibling never clobbers an existing entry.
@@ -508,7 +512,6 @@ pub fn from_catalog_scan_lockfile(
                     &slug,
                     crate::state::ObjectEntry {
                         id,
-                        url: Some(url.to_string()),
                         modified_at: None,
                         content_hash: None,
                         secrets_hash: None,
@@ -517,31 +520,31 @@ pub fn from_catalog_scan_lockfile(
             }
         };
         for x in &catalog.labels {
-            add("labels", x.id, &x.url, &x.name);
+            add("labels", x.id, &x.name);
         }
         for x in &catalog.hooks {
-            add("hooks", x.id, &x.url, &x.name);
+            add("hooks", x.id, &x.name);
         }
         for x in &catalog.rules {
-            add("rules", x.id, &x.url, &x.name);
+            add("rules", x.id, &x.name);
         }
         for x in &catalog.engines {
-            add("engines", x.id, &x.url, &x.name);
+            add("engines", x.id, &x.name);
         }
         for x in &catalog.workspaces {
-            add("workspaces", x.id, &x.url, &x.name);
+            add("workspaces", x.id, &x.name);
         }
         for x in &catalog.queues {
-            add("queues", x.id, &x.url, &x.name);
+            add("queues", x.id, &x.name);
         }
         for x in catalog.schemas_by_queue_id.values() {
-            add("schemas", x.id, &x.url, &x.name);
+            add("schemas", x.id, &x.name);
         }
         for x in catalog.inboxes_by_queue_id.values() {
-            add("inboxes", x.id, &x.url, &x.name);
+            add("inboxes", x.id, &x.name);
         }
         for x in &catalog.workflows {
-            add("workflows", x.id, &x.url, &x.name);
+            add("workflows", x.id, &x.name);
         }
         lf
     };
@@ -1420,7 +1423,6 @@ mod tests {
             &crate::slug::slugify(&h.name),
             ObjectEntry {
                 id: h.id,
-                url: Some(h.url.clone()),
                 modified_at: None,
                 content_hash: None,
                 secrets_hash: None,
@@ -1489,7 +1491,6 @@ mod tests {
             slug,
             ObjectEntry {
                 id: 42,
-                url: Some("https://x.invalid/api/v1/hooks/42".to_string()),
                 modified_at: Some("2026-05-14T08:00:00Z".to_string()),
                 content_hash: Some(base_hash.clone()),
                 secrets_hash: None,
@@ -1674,7 +1675,6 @@ mod tests {
             &crate::slug::slugify(slug),
             ObjectEntry {
                 id: 42,
-                url: Some(base_hook.url.clone()),
                 modified_at: None,
                 content_hash: None,
                 secrets_hash: None,
@@ -1694,7 +1694,6 @@ mod tests {
             slug,
             ObjectEntry {
                 id: 42,
-                url: Some("https://x.invalid/api/v1/hooks/42".to_string()),
                 modified_at: Some("2026-05-14T08:00:00Z".to_string()),
                 content_hash: Some(base_hash.clone()),
                 secrets_hash: None,
@@ -1815,7 +1814,6 @@ mod tests {
             slug,
             ObjectEntry {
                 id: 42,
-                url: Some("https://x.invalid/api/v1/hooks/42".to_string()),
                 modified_at: Some("2026-05-14T08:00:00Z".to_string()),
                 content_hash: Some(base_hash.clone()),
                 secrets_hash: None,

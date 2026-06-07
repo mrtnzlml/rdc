@@ -278,15 +278,7 @@ pub async fn process(
                 ix_base.as_deref(),
                 Some(ctx.paths),
             )?;
-            record_object(
-                ctx.lockfile,
-                "mdh_indexes",
-                slug,
-                0,
-                None,
-                None,
-                Some(i_recorded),
-            );
+            record_object(ctx.lockfile, "mdh_indexes", slug, 0, None, Some(i_recorded));
             Ok(())
         })();
         ix_result?;

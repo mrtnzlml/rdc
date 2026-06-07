@@ -121,8 +121,10 @@ struct IndexCtx<'a> {
 impl<'a> IndexCtx<'a> {
     fn build(paths: &'a Paths, lockfile: &'a Lockfile) -> Self {
         let queue_to_ws_slug = build_queue_to_ws(paths);
-        let queue_to_hooks = build_queue_back_refs(paths.hooks_dir(), lockfile, "queues", paths.env());
-        let queue_to_rules = build_queue_back_refs(paths.rules_dir(), lockfile, "queues", paths.env());
+        let queue_to_hooks =
+            build_queue_back_refs(paths.hooks_dir(), lockfile, "queues", paths.env());
+        let queue_to_rules =
+            build_queue_back_refs(paths.rules_dir(), lockfile, "queues", paths.env());
         let queue_to_email_templates = build_queue_to_email_templates(lockfile);
         let engine_to_fields = build_engine_to_fields(paths, lockfile);
         Self {
@@ -143,16 +145,24 @@ impl<'a> IndexCtx<'a> {
 fn build_queue_to_ws(paths: &Paths) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let ws_root = paths.workspaces_dir();
-    let Ok(ws_entries) = std::fs::read_dir(&ws_root) else { return out };
+    let Ok(ws_entries) = std::fs::read_dir(&ws_root) else {
+        return out;
+    };
     for ws in ws_entries.flatten() {
         let Ok(ft) = ws.file_type() else { continue };
-        if !ft.is_dir() { continue }
+        if !ft.is_dir() {
+            continue;
+        }
         let ws_slug = ws.file_name().to_string_lossy().to_string();
         let queues_dir = paths.queues_dir(&ws_slug);
-        let Ok(q_entries) = std::fs::read_dir(&queues_dir) else { continue };
+        let Ok(q_entries) = std::fs::read_dir(&queues_dir) else {
+            continue;
+        };
         for q in q_entries.flatten() {
             let Ok(ft) = q.file_type() else { continue };
-            if !ft.is_dir() { continue }
+            if !ft.is_dir() {
+                continue;
+            }
             let q_slug = q.file_name().to_string_lossy().to_string();
             out.insert(q_slug, ws_slug.clone());
         }
@@ -169,12 +179,20 @@ fn build_queue_back_refs(
     env: &str,
 ) -> BTreeMap<String, Vec<String>> {
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let Ok(entries) = std::fs::read_dir(&dir) else { return out };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return out;
+    };
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
-        if crate::paths::is_shadow_artifact(&name, env) { continue }
-        let Some(slug) = name.strip_suffix(".json") else { continue };
-        let Some(v) = read_json(&e.path()) else { continue };
+        if crate::paths::is_shadow_artifact(&name, env) {
+            continue;
+        }
+        let Some(slug) = name.strip_suffix(".json") else {
+            continue;
+        };
+        let Some(v) = read_json(&e.path()) else {
+            continue;
+        };
         let queue_slugs = urls_to_slugs(&v, field, "queues", lockfile);
         for q in queue_slugs {
             out.entry(q.to_string()).or_default().push(slug.to_string());
@@ -207,21 +225,41 @@ fn build_queue_to_email_templates(lockfile: &Lockfile) -> BTreeMap<String, Vec<S
 fn build_engine_to_fields(paths: &Paths, lockfile: &Lockfile) -> BTreeMap<String, Vec<String>> {
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let engines_dir = paths.engines_dir();
-    let Ok(entries) = std::fs::read_dir(&engines_dir) else { return out };
+    let Ok(entries) = std::fs::read_dir(&engines_dir) else {
+        return out;
+    };
     for e_entry in entries.flatten() {
-        let Ok(ft) = e_entry.file_type() else { continue };
-        if !ft.is_dir() { continue }
+        let Ok(ft) = e_entry.file_type() else {
+            continue;
+        };
+        if !ft.is_dir() {
+            continue;
+        }
         let e_slug = e_entry.file_name().to_string_lossy().to_string();
         let fields_dir = paths.engine_fields_dir(&e_slug);
-        let Ok(field_entries) = std::fs::read_dir(&fields_dir) else { continue };
+        let Ok(field_entries) = std::fs::read_dir(&fields_dir) else {
+            continue;
+        };
         for f in field_entries.flatten() {
             let name = f.file_name().to_string_lossy().to_string();
-            if crate::paths::is_shadow_artifact(&name, paths.env()) { continue }
-            let Some(slug) = name.strip_suffix(".json") else { continue };
-            let Some(v) = read_json(&f.path()) else { continue };
-            let Some(engine_url) = v.get("engine").and_then(|u| u.as_str()) else { continue };
-            let Some(engine_slug) = lockfile.slug_for_url("engines", engine_url) else { continue };
-            out.entry(engine_slug.to_string()).or_default().push(slug.to_string());
+            if crate::paths::is_shadow_artifact(&name, paths.env()) {
+                continue;
+            }
+            let Some(slug) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let Some(v) = read_json(&f.path()) else {
+                continue;
+            };
+            let Some(engine_url) = v.get("engine").and_then(|u| u.as_str()) else {
+                continue;
+            };
+            let Some(engine_slug) = lockfile.slug_for_url("engines", engine_url) else {
+                continue;
+            };
+            out.entry(engine_slug.to_string())
+                .or_default()
+                .push(slug.to_string());
         }
     }
     for v in out.values_mut() {
@@ -241,7 +279,9 @@ fn emit_unknown_kinds(md: &mut String, lockfile: &Lockfile) {
     extras.sort();
     for kind in extras {
         if let Some(entries) = lockfile.objects.get(kind) {
-            if entries.is_empty() { continue }
+            if entries.is_empty() {
+                continue;
+            }
             md.push_str(&format!("## {}\n\n", kind));
             for slug in entries.keys() {
                 let entry = &entries[slug];
@@ -259,8 +299,12 @@ fn emit_unknown_kinds(md: &mut String, lockfile: &Lockfile) {
 // ----- Per-kind emitters ----------------------------------------------
 
 fn emit_organization(md: &mut String, ctx: &IndexCtx<'_>) {
-    let Some(entries) = ctx.lockfile.objects.get("organization") else { return };
-    if entries.is_empty() { return }
+    let Some(entries) = ctx.lockfile.objects.get("organization") else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
     md.push_str("## organization\n\n");
     for (slug, entry) in entries.iter() {
         let path = ctx.paths.organization_file();
@@ -274,8 +318,12 @@ fn emit_organization(md: &mut String, ctx: &IndexCtx<'_>) {
 }
 
 fn emit_workspaces(md: &mut String, ctx: &IndexCtx<'_>) {
-    let Some(entries) = ctx.lockfile.objects.get("workspaces") else { return };
-    if entries.is_empty() { return }
+    let Some(entries) = ctx.lockfile.objects.get("workspaces") else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
     md.push_str("## workspaces\n\n");
     for (slug, entry) in entries.iter() {
         let path = ctx.paths.workspace_dir(slug).join("workspace.json");
@@ -295,8 +343,12 @@ fn emit_workspaces(md: &mut String, ctx: &IndexCtx<'_>) {
 }
 
 fn emit_queues(md: &mut String, ctx: &IndexCtx<'_>) {
-    let Some(entries) = ctx.lockfile.objects.get("queues") else { return };
-    if entries.is_empty() { return }
+    let Some(entries) = ctx.lockfile.objects.get("queues") else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
     md.push_str("## queues\n\n");
     for (slug, entry) in entries.iter() {
         let Some(ws_slug) = ctx.queue_to_ws_slug.get(slug) else {
@@ -334,8 +386,12 @@ fn emit_queues(md: &mut String, ctx: &IndexCtx<'_>) {
 }
 
 fn emit_schemas(md: &mut String, ctx: &IndexCtx<'_>) {
-    let Some(entries) = ctx.lockfile.objects.get("schemas") else { return };
-    if entries.is_empty() { return }
+    let Some(entries) = ctx.lockfile.objects.get("schemas") else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
     md.push_str("## schemas\n\n");
     for (slug, entry) in entries.iter() {
         // Schema lives next to its queue (slug == queue slug by snapshot
@@ -369,8 +425,12 @@ fn emit_schemas(md: &mut String, ctx: &IndexCtx<'_>) {
 }
 
 fn emit_inboxes(md: &mut String, ctx: &IndexCtx<'_>) {
-    let Some(entries) = ctx.lockfile.objects.get("inboxes") else { return };
-    if entries.is_empty() { return }
+    let Some(entries) = ctx.lockfile.objects.get("inboxes") else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
     md.push_str("## inboxes\n\n");
     for (slug, entry) in entries.iter() {
         let Some(ws_slug) = ctx.queue_to_ws_slug.get(slug) else {
@@ -385,17 +445,24 @@ fn emit_inboxes(md: &mut String, ctx: &IndexCtx<'_>) {
             "  - path: workspaces/{ws_slug}/queues/{slug}/inbox.json\n"
         ));
         md.push_str(&format!("  - queue: `{slug}`\n"));
-        if let Some(email) = v.as_ref().and_then(|v| v.get("email").and_then(|e| e.as_str()))
-            && !email.is_empty() {
-                md.push_str(&format!("  - email: {email}\n"));
-            }
+        if let Some(email) = v
+            .as_ref()
+            .and_then(|v| v.get("email").and_then(|e| e.as_str()))
+            && !email.is_empty()
+        {
+            md.push_str(&format!("  - email: {email}\n"));
+        }
     }
     md.push('\n');
 }
 
 fn emit_hooks(md: &mut String, ctx: &IndexCtx<'_>) {
-    let Some(entries) = ctx.lockfile.objects.get("hooks") else { return };
-    if entries.is_empty() { return }
+    let Some(entries) = ctx.lockfile.objects.get("hooks") else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
     md.push_str("## hooks\n\n");
     for (slug, entry) in entries.iter() {
         let path = ctx.paths.hooks_dir().join(format!("{slug}.json"));
@@ -406,10 +473,7 @@ fn emit_hooks(md: &mut String, ctx: &IndexCtx<'_>) {
             .as_ref()
             .map(crate::snapshot::hook::hook_code_extension_from_value)
             .unwrap_or("py");
-        let code_path = ctx
-            .paths
-            .hooks_dir()
-            .join(format!("{slug}.{code_ext}"));
+        let code_path = ctx.paths.hooks_dir().join(format!("{slug}.{code_ext}"));
         write_header(md, slug, entry.id);
         write_name(md, v.as_ref());
         if let Some(v) = v.as_ref() {
@@ -425,9 +489,7 @@ fn emit_hooks(md: &mut String, ctx: &IndexCtx<'_>) {
                     events.join(", ")
                 )),
                 (Some(t), true) => md.push_str(&format!("  - type: {t}\n")),
-                (None, false) => {
-                    md.push_str(&format!("  - events: [{}]\n", events.join(", ")))
-                }
+                (None, false) => md.push_str(&format!("  - events: [{}]\n", events.join(", "))),
                 _ => {}
             }
         }
@@ -449,8 +511,12 @@ fn emit_hooks(md: &mut String, ctx: &IndexCtx<'_>) {
 }
 
 fn emit_rules(md: &mut String, ctx: &IndexCtx<'_>) {
-    let Some(entries) = ctx.lockfile.objects.get("rules") else { return };
-    if entries.is_empty() { return }
+    let Some(entries) = ctx.lockfile.objects.get("rules") else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
     md.push_str("## rules\n\n");
     for (slug, entry) in entries.iter() {
         let path = ctx.paths.rules_dir().join(format!("{slug}.json"));
@@ -459,7 +525,9 @@ fn emit_rules(md: &mut String, ctx: &IndexCtx<'_>) {
         write_header(md, slug, entry.id);
         write_name(md, v.as_ref());
         if py_path.exists() {
-            md.push_str(&format!("  - path: rules/{slug}.json (+ rules/{slug}.py)\n"));
+            md.push_str(&format!(
+                "  - path: rules/{slug}.json (+ rules/{slug}.py)\n"
+            ));
         } else {
             md.push_str(&format!("  - path: rules/{slug}.json\n"));
         }
@@ -474,8 +542,12 @@ fn emit_rules(md: &mut String, ctx: &IndexCtx<'_>) {
 }
 
 fn emit_labels(md: &mut String, ctx: &IndexCtx<'_>) {
-    let Some(entries) = ctx.lockfile.objects.get("labels") else { return };
-    if entries.is_empty() { return }
+    let Some(entries) = ctx.lockfile.objects.get("labels") else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
     md.push_str("## labels\n\n");
     for (slug, entry) in entries.iter() {
         let path = ctx.paths.labels_dir().join(format!("{slug}.json"));
@@ -488,8 +560,12 @@ fn emit_labels(md: &mut String, ctx: &IndexCtx<'_>) {
 }
 
 fn emit_engines(md: &mut String, ctx: &IndexCtx<'_>) {
-    let Some(entries) = ctx.lockfile.objects.get("engines") else { return };
-    if entries.is_empty() { return }
+    let Some(entries) = ctx.lockfile.objects.get("engines") else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
     md.push_str("## engines\n\n");
     for (slug, entry) in entries.iter() {
         let path = ctx.paths.engine_dir(slug).join("engine.json");
@@ -505,14 +581,23 @@ fn emit_engines(md: &mut String, ctx: &IndexCtx<'_>) {
 }
 
 fn emit_engine_fields(md: &mut String, ctx: &IndexCtx<'_>) {
-    let Some(entries) = ctx.lockfile.objects.get("engine_fields") else { return };
-    if entries.is_empty() { return }
+    let Some(entries) = ctx.lockfile.objects.get("engine_fields") else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
     md.push_str("## engine_fields\n\n");
     for (slug, entry) in entries.iter() {
         // Look up the field's parent engine via lockfile URL → slug.
         // Without a known parent we can't compute the on-disk path,
         // so emit a terse line and move on.
-        let Some(field_entry) = ctx.lockfile.objects.get("engine_fields").and_then(|m| m.get(slug)) else {
+        let Some(field_entry) = ctx
+            .lockfile
+            .objects
+            .get("engine_fields")
+            .and_then(|m| m.get(slug))
+        else {
             write_header(md, slug, entry.id);
             continue;
         };
@@ -523,14 +608,16 @@ fn emit_engine_fields(md: &mut String, ctx: &IndexCtx<'_>) {
         write_header(md, slug, entry.id);
         write_name(md, v.as_ref());
         if let Some(p) = path.as_ref()
-            && let Ok(rel) = p.strip_prefix(ctx.paths.env_root()) {
-                md.push_str(&format!("  - path: {}\n", rel.display()));
-            }
+            && let Ok(rel) = p.strip_prefix(ctx.paths.env_root())
+        {
+            md.push_str(&format!("  - path: {}\n", rel.display()));
+        }
         let _ = field_entry;
         if let Some(v) = v.as_ref()
-            && let Some(engine_slug) = url_to_slug(v, "engine", "engines", ctx.lockfile) {
-                md.push_str(&format!("  - engine: `{engine_slug}`\n"));
-            }
+            && let Some(engine_slug) = url_to_slug(v, "engine", "engines", ctx.lockfile)
+        {
+            md.push_str(&format!("  - engine: `{engine_slug}`\n"));
+        }
     }
     md.push('\n');
 }
@@ -540,7 +627,10 @@ fn emit_engine_fields(md: &mut String, ctx: &IndexCtx<'_>) {
 /// walk for legacy flat keys.
 fn find_engine_field_path(ctx: &IndexCtx<'_>, composite_key: &str) -> Option<std::path::PathBuf> {
     if let Some((e_slug, f_slug)) = composite_key.split_once('/') {
-        let candidate = ctx.paths.engine_fields_dir(e_slug).join(format!("{f_slug}.json"));
+        let candidate = ctx
+            .paths
+            .engine_fields_dir(e_slug)
+            .join(format!("{f_slug}.json"));
         if candidate.exists() {
             return Some(candidate);
         }
@@ -548,9 +638,14 @@ fn find_engine_field_path(ctx: &IndexCtx<'_>, composite_key: &str) -> Option<std
     let entries = std::fs::read_dir(ctx.paths.engines_dir()).ok()?;
     for e in entries.flatten() {
         let Ok(ft) = e.file_type() else { continue };
-        if !ft.is_dir() { continue }
+        if !ft.is_dir() {
+            continue;
+        }
         let e_slug = e.file_name().to_string_lossy().to_string();
-        let p = ctx.paths.engine_fields_dir(&e_slug).join(format!("{composite_key}.json"));
+        let p = ctx
+            .paths
+            .engine_fields_dir(&e_slug)
+            .join(format!("{composite_key}.json"));
         if p.exists() {
             return Some(p);
         }
@@ -559,8 +654,12 @@ fn find_engine_field_path(ctx: &IndexCtx<'_>, composite_key: &str) -> Option<std
 }
 
 fn emit_workflows(md: &mut String, ctx: &IndexCtx<'_>) {
-    let Some(entries) = ctx.lockfile.objects.get("workflows") else { return };
-    if entries.is_empty() { return }
+    let Some(entries) = ctx.lockfile.objects.get("workflows") else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
     md.push_str("## workflows\n\n");
     for (slug, entry) in entries.iter() {
         let path = ctx.paths.workflow_dir(slug).join("workflow.json");
@@ -579,8 +678,12 @@ fn emit_workflows(md: &mut String, ctx: &IndexCtx<'_>) {
 }
 
 fn emit_workflow_steps(md: &mut String, ctx: &IndexCtx<'_>) {
-    let Some(entries) = ctx.lockfile.objects.get("workflow_steps") else { return };
-    if entries.is_empty() { return }
+    let Some(entries) = ctx.lockfile.objects.get("workflow_steps") else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
     md.push_str("## workflow_steps\n\n");
     for (slug, entry) in entries.iter() {
         let path = find_workflow_step_path(ctx, slug);
@@ -588,13 +691,15 @@ fn emit_workflow_steps(md: &mut String, ctx: &IndexCtx<'_>) {
         write_header(md, slug, entry.id);
         write_name(md, v.as_ref());
         if let Some(p) = path.as_ref()
-            && let Ok(rel) = p.strip_prefix(ctx.paths.env_root()) {
-                md.push_str(&format!("  - path: {}\n", rel.display()));
-            }
+            && let Ok(rel) = p.strip_prefix(ctx.paths.env_root())
+        {
+            md.push_str(&format!("  - path: {}\n", rel.display()));
+        }
         if let Some(v) = v.as_ref()
-            && let Some(wf_slug) = url_to_slug(v, "workflow", "workflows", ctx.lockfile) {
-                md.push_str(&format!("  - workflow: `{wf_slug}`\n"));
-            }
+            && let Some(wf_slug) = url_to_slug(v, "workflow", "workflows", ctx.lockfile)
+        {
+            md.push_str(&format!("  - workflow: `{wf_slug}`\n"));
+        }
     }
     md.push('\n');
 }
@@ -604,7 +709,10 @@ fn emit_workflow_steps(md: &mut String, ctx: &IndexCtx<'_>) {
 /// walk for legacy flat keys.
 fn find_workflow_step_path(ctx: &IndexCtx<'_>, composite_key: &str) -> Option<std::path::PathBuf> {
     if let Some((w_slug, s_slug)) = composite_key.split_once('/') {
-        let candidate = ctx.paths.workflow_steps_dir(w_slug).join(format!("{s_slug}.json"));
+        let candidate = ctx
+            .paths
+            .workflow_steps_dir(w_slug)
+            .join(format!("{s_slug}.json"));
         if candidate.exists() {
             return Some(candidate);
         }
@@ -612,9 +720,14 @@ fn find_workflow_step_path(ctx: &IndexCtx<'_>, composite_key: &str) -> Option<st
     let entries = std::fs::read_dir(ctx.paths.workflows_dir()).ok()?;
     for w in entries.flatten() {
         let Ok(ft) = w.file_type() else { continue };
-        if !ft.is_dir() { continue }
+        if !ft.is_dir() {
+            continue;
+        }
         let w_slug = w.file_name().to_string_lossy().to_string();
-        let p = ctx.paths.workflow_steps_dir(&w_slug).join(format!("{composite_key}.json"));
+        let p = ctx
+            .paths
+            .workflow_steps_dir(&w_slug)
+            .join(format!("{composite_key}.json"));
         if p.exists() {
             return Some(p);
         }
@@ -623,8 +736,12 @@ fn find_workflow_step_path(ctx: &IndexCtx<'_>, composite_key: &str) -> Option<st
 }
 
 fn emit_email_templates(md: &mut String, ctx: &IndexCtx<'_>) {
-    let Some(entries) = ctx.lockfile.objects.get("email_templates") else { return };
-    if entries.is_empty() { return }
+    let Some(entries) = ctx.lockfile.objects.get("email_templates") else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
     md.push_str("## email_templates\n\n");
     for (key, entry) in entries.iter() {
         let mut parts = key.splitn(3, '/');
@@ -637,7 +754,10 @@ fn emit_email_templates(md: &mut String, ctx: &IndexCtx<'_>) {
                 continue;
             }
         };
-        let path = ctx.paths.queue_email_templates_dir(ws, q).join(format!("{t}.json"));
+        let path = ctx
+            .paths
+            .queue_email_templates_dir(ws, q)
+            .join(format!("{t}.json"));
         let v = read_json(&path);
         write_header(md, key, entry.id);
         write_name(md, v.as_ref());
@@ -645,10 +765,13 @@ fn emit_email_templates(md: &mut String, ctx: &IndexCtx<'_>) {
             "  - path: workspaces/{ws}/queues/{q}/email-templates/{t}.json\n"
         ));
         md.push_str(&format!("  - queue: `{q}`\n"));
-        if let Some(subject) = v.as_ref().and_then(|v| v.get("subject").and_then(|s| s.as_str()))
-            && !subject.is_empty() {
-                md.push_str(&format!("  - subject: {}\n", quote_for_md(subject)));
-            }
+        if let Some(subject) = v
+            .as_ref()
+            .and_then(|v| v.get("subject").and_then(|s| s.as_str()))
+            && !subject.is_empty()
+        {
+            md.push_str(&format!("  - subject: {}\n", quote_for_md(subject)));
+        }
     }
     md.push('\n');
 }
@@ -665,8 +788,12 @@ fn write_header(md: &mut String, slug: &str, id: u64) {
 
 fn write_name(md: &mut String, v: Option<&Value>) {
     let Some(v) = v else { return };
-    let Some(name) = v.get("name").and_then(|n| n.as_str()) else { return };
-    if name.is_empty() { return }
+    let Some(name) = v.get("name").and_then(|n| n.as_str()) else {
+        return;
+    };
+    if name.is_empty() {
+        return;
+    }
     md.push_str(&format!("  - name: {}\n", quote_for_md(name)));
 }
 
@@ -693,21 +820,36 @@ fn urls_to_slugs<'a>(v: &Value, key: &str, kind: &str, lf: &'a Lockfile) -> Vec<
 }
 
 fn join_slugs(slugs: &[&str]) -> String {
-    slugs.iter().map(|s| format!("`{s}`")).collect::<Vec<_>>().join(", ")
+    slugs
+        .iter()
+        .map(|s| format!("`{s}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn join_slugs_owned(slugs: &[String]) -> String {
-    slugs.iter().map(|s| format!("`{s}`")).collect::<Vec<_>>().join(", ")
+    slugs
+        .iter()
+        .map(|s| format!("`{s}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// List `<queue_dir>/formulas/*.py` field IDs, sorted. Empty if the
 /// directory doesn't exist.
 fn list_formula_fields(queue_dir: &Path) -> Vec<String> {
     let formulas_dir = queue_dir.join("formulas");
-    let Ok(entries) = std::fs::read_dir(&formulas_dir) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(&formulas_dir) else {
+        return Vec::new();
+    };
     let mut out: Vec<String> = entries
         .flatten()
-        .filter_map(|e| e.file_name().to_string_lossy().strip_suffix(".py").map(String::from))
+        .filter_map(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .strip_suffix(".py")
+                .map(String::from)
+        })
         .collect();
     out.sort();
     out
@@ -731,8 +873,13 @@ mod tests {
     use super::*;
     use crate::state::ObjectEntry;
 
-    fn entry(id: u64, url: &str) -> ObjectEntry {
-        ObjectEntry { id, url: Some(url.into()), modified_at: None, content_hash: None, secrets_hash: None }
+    fn entry(id: u64) -> ObjectEntry {
+        ObjectEntry {
+            id,
+            modified_at: None,
+            content_hash: None,
+            secrets_hash: None,
+        }
     }
 
     #[test]
@@ -742,8 +889,8 @@ mod tests {
         std::fs::create_dir_all(paths.env_root()).unwrap();
 
         let mut lf = Lockfile::default();
-        lf.upsert("hooks", "validator", entry(1, "https://x/api/v1/hooks/1"));
-        lf.upsert("rules", "validation", entry(3, "https://x/api/v1/rules/3"));
+        lf.upsert("hooks", "validator", entry(1));
+        lf.upsert("rules", "validation", entry(3));
 
         generate(&paths, &lf).unwrap();
 
@@ -753,8 +900,14 @@ mod tests {
         // The Inventory section is intentionally absent — totals add no
         // value for an agent walking the file. Per-kind sections carry
         // the actual data.
-        assert!(!body.contains("## Inventory"), "Inventory section must not appear: {body}");
-        assert!(!body.contains("- hooks: 1"), "per-kind count line must not appear: {body}");
+        assert!(
+            !body.contains("## Inventory"),
+            "Inventory section must not appear: {body}"
+        );
+        assert!(
+            !body.contains("- hooks: 1"),
+            "per-kind count line must not appear: {body}"
+        );
         assert!(body.contains("## hooks"));
         assert!(body.contains("## rules"));
         assert!(body.contains("`validator` (id 1)"));
@@ -780,21 +933,38 @@ mod tests {
             r#"{"id":1,"url":"https://x/api/v1/hooks/1","name":"Validator: invoices","type":"function","events":["annotation_content"],"queues":["https://x/api/v1/queues/100"]}"#,
         ).unwrap();
         // Hook has a sibling .py.
-        std::fs::write(paths.hooks_dir().join("validator.py"), b"def x():\n    pass\n").unwrap();
+        std::fs::write(
+            paths.hooks_dir().join("validator.py"),
+            b"def x():\n    pass\n",
+        )
+        .unwrap();
 
         let mut lf = Lockfile::default();
-        lf.upsert("hooks", "validator", entry(1, "https://x/api/v1/hooks/1"));
-        lf.upsert("queues", "cost-invoices", entry(100, "https://x/api/v1/queues/100"));
+        lf.upsert("hooks", "validator", entry(1));
+        lf.upsert("queues", "cost-invoices", entry(100));
 
         generate(&paths, &lf).unwrap();
         let body = std::fs::read_to_string(paths.env_root().join("_index.md")).unwrap();
-        assert!(body.contains("`validator` (id 1)"), "missing header: {body}");
-        assert!(body.contains("name: \"Validator: invoices\""), "missing name: {body}");
-        assert!(body.contains("type: function · events: [annotation_content]"),
-            "missing type/events line: {body}");
-        assert!(body.contains("path: hooks/validator.json (+ hooks/validator.py)"),
-            "missing path with .py: {body}");
-        assert!(body.contains("queues: `cost-invoices`"), "missing queues line: {body}");
+        assert!(
+            body.contains("`validator` (id 1)"),
+            "missing header: {body}"
+        );
+        assert!(
+            body.contains("name: \"Validator: invoices\""),
+            "missing name: {body}"
+        );
+        assert!(
+            body.contains("type: function · events: [annotation_content]"),
+            "missing type/events line: {body}"
+        );
+        assert!(
+            body.contains("path: hooks/validator.json (+ hooks/validator.py)"),
+            "missing path with .py: {body}"
+        );
+        assert!(
+            body.contains("queues: `cost-invoices`"),
+            "missing queues line: {body}"
+        );
     }
 
     #[test]
@@ -803,30 +973,45 @@ mod tests {
         let paths = Paths::for_env(dir.path(), "dev");
         let q_dir = paths.queue_dir("invoices-ap", "cost-invoices");
         std::fs::create_dir_all(&q_dir).unwrap();
-        std::fs::write(q_dir.join("queue.json"), r#"{
+        std::fs::write(
+            q_dir.join("queue.json"),
+            r#"{
             "id":100,"url":"https://x/api/v1/queues/100","name":"Cost Invoices",
             "workspace":"https://x/api/v1/workspaces/700","schema":"https://x/api/v1/schemas/200",
-            "inbox":"https://x/api/v1/inboxes/100"}"#).unwrap();
+            "inbox":"https://x/api/v1/inboxes/100"}"#,
+        )
+        .unwrap();
         // Hook attached to this queue.
         std::fs::create_dir_all(paths.hooks_dir()).unwrap();
         std::fs::write(paths.hooks_dir().join("validator.json"),
             r#"{"id":1,"url":"https://x/api/v1/hooks/1","name":"V","type":"function","events":[],"queues":["https://x/api/v1/queues/100"]}"#).unwrap();
 
         let mut lf = Lockfile::default();
-        lf.upsert("workspaces", "invoices-ap", entry(700, "https://x/api/v1/workspaces/700"));
-        lf.upsert("queues", "cost-invoices", entry(100, "https://x/api/v1/queues/100"));
-        lf.upsert("schemas", "cost-invoices", entry(200, "https://x/api/v1/schemas/200"));
-        lf.upsert("inboxes", "cost-invoices", entry(100, "https://x/api/v1/inboxes/100"));
-        lf.upsert("hooks", "validator", entry(1, "https://x/api/v1/hooks/1"));
+        lf.upsert("workspaces", "invoices-ap", entry(700));
+        lf.upsert("queues", "cost-invoices", entry(100));
+        lf.upsert("schemas", "cost-invoices", entry(200));
+        lf.upsert("inboxes", "cost-invoices", entry(100));
+        lf.upsert("hooks", "validator", entry(1));
 
         generate(&paths, &lf).unwrap();
         let body = std::fs::read_to_string(paths.env_root().join("_index.md")).unwrap();
-        assert!(body.contains("path: workspaces/invoices-ap/queues/cost-invoices/queue.json"),
-            "missing queue path: {body}");
-        assert!(body.contains("workspace: `invoices-ap`"), "missing workspace ref");
-        assert!(body.contains("schema: `cost-invoices`"), "missing schema ref");
+        assert!(
+            body.contains("path: workspaces/invoices-ap/queues/cost-invoices/queue.json"),
+            "missing queue path: {body}"
+        );
+        assert!(
+            body.contains("workspace: `invoices-ap`"),
+            "missing workspace ref"
+        );
+        assert!(
+            body.contains("schema: `cost-invoices`"),
+            "missing schema ref"
+        );
         assert!(body.contains("inbox: `cost-invoices`"), "missing inbox ref");
-        assert!(body.contains("hooks: `validator`"), "missing reverse hook ref");
+        assert!(
+            body.contains("hooks: `validator`"),
+            "missing reverse hook ref"
+        );
     }
 
     #[test]
@@ -835,18 +1020,23 @@ mod tests {
         let paths = Paths::for_env(dir.path(), "dev");
         let q_dir = paths.queue_dir("invoices-ap", "cost-invoices");
         std::fs::create_dir_all(q_dir.join("formulas")).unwrap();
-        std::fs::write(q_dir.join("schema.json"),
-            r#"{"id":200,"url":"https://x/api/v1/schemas/200","name":"Cost Schema","content":[]}"#).unwrap();
+        std::fs::write(
+            q_dir.join("schema.json"),
+            r#"{"id":200,"url":"https://x/api/v1/schemas/200","name":"Cost Schema","content":[]}"#,
+        )
+        .unwrap();
         std::fs::write(q_dir.join("formulas/amount_total.py"), b"a+b").unwrap();
         std::fs::write(q_dir.join("formulas/invoice_id.py"), b"x").unwrap();
 
         let mut lf = Lockfile::default();
-        lf.upsert("schemas", "cost-invoices", entry(200, "https://x/api/v1/schemas/200"));
+        lf.upsert("schemas", "cost-invoices", entry(200));
 
         generate(&paths, &lf).unwrap();
         let body = std::fs::read_to_string(paths.env_root().join("_index.md")).unwrap();
-        assert!(body.contains("formulas: `amount_total`, `invoice_id`"),
-            "missing formula list (sorted): {body}");
+        assert!(
+            body.contains("formulas: `amount_total`, `invoice_id`"),
+            "missing formula list (sorted): {body}"
+        );
     }
 
     #[test]
@@ -855,31 +1045,51 @@ mod tests {
         let paths = Paths::for_env(dir.path(), "dev");
         // Nest the workflow + its steps.
         std::fs::create_dir_all(paths.workflow_steps_dir("ap-flow")).unwrap();
-        std::fs::write(paths.workflow_dir("ap-flow").join("workflow.json"), r#"{
+        std::fs::write(
+            paths.workflow_dir("ap-flow").join("workflow.json"),
+            r#"{
             "id":5,"url":"https://x/api/v1/workflows/5","name":"AP Flow",
-            "steps":["https://x/api/v1/workflow_steps/9","https://x/api/v1/workflow_steps/10"]}"#).unwrap();
-        std::fs::write(paths.workflow_steps_dir("ap-flow").join("manager-approval.json"), r#"{
+            "steps":["https://x/api/v1/workflow_steps/9","https://x/api/v1/workflow_steps/10"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            paths
+                .workflow_steps_dir("ap-flow")
+                .join("manager-approval.json"),
+            r#"{
             "id":9,"url":"https://x/api/v1/workflow_steps/9","name":"Manager Approval",
-            "workflow":"https://x/api/v1/workflows/5"}"#).unwrap();
-        std::fs::write(paths.workflow_steps_dir("ap-flow").join("finance-approval.json"), r#"{
+            "workflow":"https://x/api/v1/workflows/5"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            paths
+                .workflow_steps_dir("ap-flow")
+                .join("finance-approval.json"),
+            r#"{
             "id":10,"url":"https://x/api/v1/workflow_steps/10","name":"Finance Approval",
-            "workflow":"https://x/api/v1/workflows/5"}"#).unwrap();
+            "workflow":"https://x/api/v1/workflows/5"}"#,
+        )
+        .unwrap();
 
         let mut lf = Lockfile::default();
-        lf.upsert("workflows", "ap-flow", entry(5, "https://x/api/v1/workflows/5"));
-        lf.upsert("workflow_steps", "manager-approval",
-            entry(9, "https://x/api/v1/workflow_steps/9"));
-        lf.upsert("workflow_steps", "finance-approval",
-            entry(10, "https://x/api/v1/workflow_steps/10"));
+        lf.upsert("workflows", "ap-flow", entry(5));
+        lf.upsert("workflow_steps", "manager-approval", entry(9));
+        lf.upsert("workflow_steps", "finance-approval", entry(10));
 
         generate(&paths, &lf).unwrap();
         let body = std::fs::read_to_string(paths.env_root().join("_index.md")).unwrap();
-        assert!(body.contains("steps: `manager-approval`, `finance-approval`"),
-            "missing step refs: {body}");
-        assert!(body.contains("path: workflows/ap-flow/steps/manager-approval.json"),
-            "missing nested step path: {body}");
-        assert!(body.contains("workflow: `ap-flow`"),
-            "missing workflow back-ref: {body}");
+        assert!(
+            body.contains("steps: `manager-approval`, `finance-approval`"),
+            "missing step refs: {body}"
+        );
+        assert!(
+            body.contains("path: workflows/ap-flow/steps/manager-approval.json"),
+            "missing nested step path: {body}"
+        );
+        assert!(
+            body.contains("workflow: `ap-flow`"),
+            "missing workflow back-ref: {body}"
+        );
     }
 
     #[test]
@@ -888,25 +1098,43 @@ mod tests {
         let paths = Paths::for_env(dir.path(), "dev");
         // Nest under engines/invoice/fields/.
         std::fs::create_dir_all(paths.engine_fields_dir("invoice")).unwrap();
-        std::fs::write(paths.engine_fields_dir("invoice").join("invoice-id.json"), r#"{
+        std::fs::write(
+            paths.engine_fields_dir("invoice").join("invoice-id.json"),
+            r#"{
             "id":11,"url":"https://x/api/v1/engine_fields/11","name":"Invoice ID",
-            "engine":"https://x/api/v1/engines/3"}"#).unwrap();
+            "engine":"https://x/api/v1/engines/3"}"#,
+        )
+        .unwrap();
         // Engine.json so emit_engines finds the engine dir.
-        std::fs::write(paths.engine_dir("invoice").join("engine.json"), r#"{
-            "id":3,"url":"https://x/api/v1/engines/3","name":"Invoice"}"#).unwrap();
+        std::fs::write(
+            paths.engine_dir("invoice").join("engine.json"),
+            r#"{
+            "id":3,"url":"https://x/api/v1/engines/3","name":"Invoice"}"#,
+        )
+        .unwrap();
 
         let mut lf = Lockfile::default();
-        lf.upsert("engines", "invoice", entry(3, "https://x/api/v1/engines/3"));
-        lf.upsert("engine_fields", "invoice-id", entry(11, "https://x/api/v1/engine_fields/11"));
+        lf.upsert("engines", "invoice", entry(3));
+        lf.upsert("engine_fields", "invoice-id", entry(11));
 
         generate(&paths, &lf).unwrap();
         let body = std::fs::read_to_string(paths.env_root().join("_index.md")).unwrap();
-        assert!(body.contains("fields: `invoice-id`"), "missing reverse field list: {body}");
-        assert!(body.contains("engine: `invoice`"), "missing engine ref on field: {body}");
-        assert!(body.contains("path: engines/invoice/engine.json"),
-            "missing engine path: {body}");
-        assert!(body.contains("path: engines/invoice/fields/invoice-id.json"),
-            "missing nested field path: {body}");
+        assert!(
+            body.contains("fields: `invoice-id`"),
+            "missing reverse field list: {body}"
+        );
+        assert!(
+            body.contains("engine: `invoice`"),
+            "missing engine ref on field: {body}"
+        );
+        assert!(
+            body.contains("path: engines/invoice/engine.json"),
+            "missing engine path: {body}"
+        );
+        assert!(
+            body.contains("path: engines/invoice/fields/invoice-id.json"),
+            "missing nested field path: {body}"
+        );
     }
 
     #[test]
@@ -917,7 +1145,7 @@ mod tests {
         std::fs::write(paths.hooks_dir().join("broken.json"), b"not valid json").unwrap();
 
         let mut lf = Lockfile::default();
-        lf.upsert("hooks", "broken", entry(7, "https://x/api/v1/hooks/7"));
+        lf.upsert("hooks", "broken", entry(7));
 
         generate(&paths, &lf).unwrap();
         let body = std::fs::read_to_string(paths.env_root().join("_index.md")).unwrap();
@@ -927,9 +1155,16 @@ mod tests {
         assert!(body.contains("path: hooks/broken.json"));
         // No `name:` line because JSON parse failed.
         let hook_section = body
-            .split("## hooks").nth(1).unwrap_or("")
-            .split("## ").next().unwrap_or("");
-        assert!(!hook_section.contains("- name:"), "should skip name line on parse fail");
+            .split("## hooks")
+            .nth(1)
+            .unwrap_or("")
+            .split("## ")
+            .next()
+            .unwrap_or("");
+        assert!(
+            !hook_section.contains("- name:"),
+            "should skip name line on parse fail"
+        );
     }
 
     #[test]
@@ -943,8 +1178,8 @@ mod tests {
             r#"{"id":2,"url":"https://x/api/v1/hooks/2","name":"B","type":"function","events":[],"queues":[]}"#).unwrap();
 
         let mut lf = Lockfile::default();
-        lf.upsert("hooks", "a", entry(1, "https://x/api/v1/hooks/1"));
-        lf.upsert("hooks", "b", entry(2, "https://x/api/v1/hooks/2"));
+        lf.upsert("hooks", "a", entry(1));
+        lf.upsert("hooks", "b", entry(2));
 
         generate(&paths, &lf).unwrap();
         let body1 = std::fs::read_to_string(paths.env_root().join("_index.md")).unwrap();
@@ -959,23 +1194,42 @@ mod tests {
         let paths = Paths::for_env(dir.path(), "dev");
         let et_dir = paths.queue_email_templates_dir("invoices-ap", "cost-invoices");
         std::fs::create_dir_all(&et_dir).unwrap();
-        std::fs::write(et_dir.join("rejection.json"), r#"{
+        std::fs::write(
+            et_dir.join("rejection.json"),
+            r#"{
             "id":5,"url":"https://x/api/v1/email_templates/5","name":"Rejection",
-            "subject":"Your document was rejected","queue":"https://x/api/v1/queues/100"}"#).unwrap();
+            "subject":"Your document was rejected","queue":"https://x/api/v1/queues/100"}"#,
+        )
+        .unwrap();
 
         let mut lf = Lockfile::default();
-        lf.upsert("email_templates", "invoices-ap/cost-invoices/rejection",
-            entry(5, "https://x/api/v1/email_templates/5"));
-        lf.upsert("queues", "cost-invoices", entry(100, "https://x/api/v1/queues/100"));
+        lf.upsert(
+            "email_templates",
+            "invoices-ap/cost-invoices/rejection",
+            entry(5),
+        );
+        lf.upsert("queues", "cost-invoices", entry(100));
 
         generate(&paths, &lf).unwrap();
         let body = std::fs::read_to_string(paths.env_root().join("_index.md")).unwrap();
-        assert!(body.contains("`invoices-ap/cost-invoices/rejection` (id 5)"),
-            "missing compound key: {body}");
-        assert!(body.contains("path: workspaces/invoices-ap/queues/cost-invoices/email-templates/rejection.json"),
-            "missing nested path: {body}");
-        assert!(body.contains("queue: `cost-invoices`"), "missing queue ref: {body}");
-        assert!(body.contains("subject: \"Your document was rejected\""), "missing subject: {body}");
+        assert!(
+            body.contains("`invoices-ap/cost-invoices/rejection` (id 5)"),
+            "missing compound key: {body}"
+        );
+        assert!(
+            body.contains(
+                "path: workspaces/invoices-ap/queues/cost-invoices/email-templates/rejection.json"
+            ),
+            "missing nested path: {body}"
+        );
+        assert!(
+            body.contains("queue: `cost-invoices`"),
+            "missing queue ref: {body}"
+        );
+        assert!(
+            body.contains("subject: \"Your document was rejected\""),
+            "missing subject: {body}"
+        );
     }
 
     #[test]
@@ -997,8 +1251,10 @@ mod tests {
         let lf = Lockfile::default();
         generate(&paths, &lf).unwrap();
         let body = std::fs::read_to_string(paths.env_root().join("_index.md")).unwrap();
-        assert!(body.contains("[`../../CLAUDE.md`](../../CLAUDE.md)"),
-            "should link to CLAUDE.md when present: {body}");
+        assert!(
+            body.contains("[`../../CLAUDE.md`](../../CLAUDE.md)"),
+            "should link to CLAUDE.md when present: {body}"
+        );
     }
 
     #[test]
@@ -1009,8 +1265,10 @@ mod tests {
         let lf = Lockfile::default();
         generate(&paths, &lf).unwrap();
         let body = std::fs::read_to_string(paths.env_root().join("_index.md")).unwrap();
-        assert!(!body.contains("CLAUDE.md"),
-            "should not mention CLAUDE.md when file doesn't exist: {body}");
+        assert!(
+            !body.contains("CLAUDE.md"),
+            "should not mention CLAUDE.md when file doesn't exist: {body}"
+        );
     }
 
     #[test]
@@ -1019,8 +1277,7 @@ mod tests {
         let paths = Paths::for_env(dir.path(), "dev");
         std::fs::create_dir_all(paths.env_root()).unwrap();
         let mut lf = Lockfile::default();
-        lf.upsert("mdh_collections", "vendors",
-            entry(0, "https://x/api/v1/mdh_collections/vendors"));
+        lf.upsert("mdh_collections", "vendors", entry(0));
         generate(&paths, &lf).unwrap();
         let body = std::fs::read_to_string(paths.env_root().join("_index.md")).unwrap();
         // No inventory section any more, but the kind still gets its

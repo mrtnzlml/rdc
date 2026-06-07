@@ -99,7 +99,6 @@ pub async fn push_dataset(
             slug.to_string(),
             ObjectEntry {
                 id: 0,
-                url: None,
                 modified_at: None,
                 content_hash: Some(hash),
                 secrets_hash: None,

@@ -41,16 +41,49 @@ use std::io::{BufRead, IsTerminal, Write};
 /// A single rename the user can choose to apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingRename {
-    Workspace { old: String, new: String },
-    Queue { ws: String, old: String, new: String },
-    EmailTemplate { ws: String, q: String, old: String, new: String },
-    Hook { old: String, new: String },
-    Rule { old: String, new: String },
-    Label { old: String, new: String },
-    Engine { old: String, new: String },
-    EngineField { old: String, new: String },
-    Workflow { old: String, new: String },
-    WorkflowStep { old: String, new: String },
+    Workspace {
+        old: String,
+        new: String,
+    },
+    Queue {
+        ws: String,
+        old: String,
+        new: String,
+    },
+    EmailTemplate {
+        ws: String,
+        q: String,
+        old: String,
+        new: String,
+    },
+    Hook {
+        old: String,
+        new: String,
+    },
+    Rule {
+        old: String,
+        new: String,
+    },
+    Label {
+        old: String,
+        new: String,
+    },
+    Engine {
+        old: String,
+        new: String,
+    },
+    EngineField {
+        old: String,
+        new: String,
+    },
+    Workflow {
+        old: String,
+        new: String,
+    },
+    WorkflowStep {
+        old: String,
+        new: String,
+    },
 }
 
 impl PendingRename {
@@ -111,16 +144,17 @@ pub fn detect(paths: &Paths, lockfile: &Lockfile) -> Vec<PendingRename> {
     if let Some(q_map) = lockfile.objects.get("queues") {
         for slug in q_map.keys() {
             if let Some((ws, q_path)) = locate_queue_dir(paths, lockfile, slug)
-                && let Some(name) = read_name(&q_path.join("queue.json")) {
-                    let proposed = slugify(&name);
-                    if proposed != *slug && !q_map.contains_key(&proposed) {
-                        out.push(PendingRename::Queue {
-                            ws,
-                            old: slug.clone(),
-                            new: proposed,
-                        });
-                    }
+                && let Some(name) = read_name(&q_path.join("queue.json"))
+            {
+                let proposed = slugify(&name);
+                if proposed != *slug && !q_map.contains_key(&proposed) {
+                    out.push(PendingRename::Queue {
+                        ws,
+                        old: slug.clone(),
+                        new: proposed,
+                    });
                 }
+            }
         }
     }
 
@@ -140,11 +174,15 @@ pub fn detect(paths: &Paths, lockfile: &Lockfile) -> Vec<PendingRename> {
 
     if let Some(t_map) = lockfile.objects.get("email_templates") {
         for compound in t_map.keys() {
-            let Some((ws, q, t)) = split_compound(compound) else { continue };
+            let Some((ws, q, t)) = split_compound(compound) else {
+                continue;
+            };
             let tpl_path = paths
                 .queue_email_templates_dir(&ws, &q)
                 .join(format!("{t}.json"));
-            let Some(name) = read_name(&tpl_path) else { continue };
+            let Some(name) = read_name(&tpl_path) else {
+                continue;
+            };
             let proposed = slugify(&name);
             if proposed != t {
                 let new_compound = format!("{ws}/{q}/{proposed}");
@@ -171,10 +209,14 @@ fn detect_flat_kind(
     out: &mut Vec<PendingRename>,
     make: impl Fn(String, String) -> PendingRename,
 ) {
-    let Some(by_slug) = lockfile.objects.get(kind) else { return };
+    let Some(by_slug) = lockfile.objects.get(kind) else {
+        return;
+    };
     for slug in by_slug.keys() {
         let file = dir.join(format!("{slug}.json"));
-        let Some(name) = read_name(&file) else { continue };
+        let Some(name) = read_name(&file) else {
+            continue;
+        };
         let proposed = slugify(&name);
         if proposed != *slug && !by_slug.contains_key(&proposed) {
             out.push(make(slug.clone(), proposed));
@@ -187,7 +229,9 @@ fn detect_flat_kind(
 fn read_name(path: &std::path::Path) -> Option<String> {
     let raw = std::fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())
+    v.get("name")
+        .and_then(|n| n.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Detect stale engine slugs: read `engines/<slug>/engine.json` and
@@ -195,10 +239,14 @@ fn read_name(path: &std::path::Path) -> Option<String> {
 /// different than `<slug>`. Engines own a directory on disk, so a
 /// rename moves the whole subtree (engine.json + fields/).
 fn detect_engines(paths: &Paths, lockfile: &Lockfile, out: &mut Vec<PendingRename>) {
-    let Some(by_slug) = lockfile.objects.get("engines") else { return };
+    let Some(by_slug) = lockfile.objects.get("engines") else {
+        return;
+    };
     for slug in by_slug.keys() {
         let file = paths.engine_dir(slug).join("engine.json");
-        let Some(name) = read_name(&file) else { continue };
+        let Some(name) = read_name(&file) else {
+            continue;
+        };
         let proposed = slugify(&name);
         if proposed != *slug && !by_slug.contains_key(&proposed) {
             out.push(PendingRename::Engine {
@@ -213,10 +261,16 @@ fn detect_engines(paths: &Paths, lockfile: &Lockfile, out: &mut Vec<PendingRenam
 /// engine; lockfile keys are composite `<engine>/<field>`, so we slugify
 /// just the field portion and recompose with the unchanged engine prefix.
 fn detect_engine_fields(paths: &Paths, lockfile: &Lockfile, out: &mut Vec<PendingRename>) {
-    let Some(by_slug) = lockfile.objects.get("engine_fields") else { return };
+    let Some(by_slug) = lockfile.objects.get("engine_fields") else {
+        return;
+    };
     for key in by_slug.keys() {
-        let Some(file) = locate_engine_field_file(paths, key) else { continue };
-        let Some(name) = read_name(&file) else { continue };
+        let Some(file) = locate_engine_field_file(paths, key) else {
+            continue;
+        };
+        let Some(name) = read_name(&file) else {
+            continue;
+        };
         let proposed_field = slugify(&name);
         let proposed_key = match key.split_once('/') {
             Some((engine, _)) => format!("{engine}/{proposed_field}"),
@@ -233,10 +287,14 @@ fn detect_engine_fields(paths: &Paths, lockfile: &Lockfile, out: &mut Vec<Pendin
 
 /// Detect stale workflow slugs. Same pattern as engines.
 fn detect_workflows(paths: &Paths, lockfile: &Lockfile, out: &mut Vec<PendingRename>) {
-    let Some(by_slug) = lockfile.objects.get("workflows") else { return };
+    let Some(by_slug) = lockfile.objects.get("workflows") else {
+        return;
+    };
     for slug in by_slug.keys() {
         let file = paths.workflow_dir(slug).join("workflow.json");
-        let Some(name) = read_name(&file) else { continue };
+        let Some(name) = read_name(&file) else {
+            continue;
+        };
         let proposed = slugify(&name);
         if proposed != *slug && !by_slug.contains_key(&proposed) {
             out.push(PendingRename::Workflow {
@@ -250,10 +308,16 @@ fn detect_workflows(paths: &Paths, lockfile: &Lockfile, out: &mut Vec<PendingRen
 /// Detect stale workflow-step slugs. Same composite-key pattern as
 /// engine_fields: lockfile keys are `<workflow>/<step>`.
 fn detect_workflow_steps(paths: &Paths, lockfile: &Lockfile, out: &mut Vec<PendingRename>) {
-    let Some(by_slug) = lockfile.objects.get("workflow_steps") else { return };
+    let Some(by_slug) = lockfile.objects.get("workflow_steps") else {
+        return;
+    };
     for key in by_slug.keys() {
-        let Some(file) = locate_workflow_step_file(paths, key) else { continue };
-        let Some(name) = read_name(&file) else { continue };
+        let Some(file) = locate_workflow_step_file(paths, key) else {
+            continue;
+        };
+        let Some(name) = read_name(&file) else {
+            continue;
+        };
         let proposed_step = slugify(&name);
         let proposed_key = match key.split_once('/') {
             Some((wf, _)) => format!("{wf}/{proposed_step}"),
@@ -273,7 +337,9 @@ fn detect_workflow_steps(paths: &Paths, lockfile: &Lockfile, out: &mut Vec<Pendi
 /// walk for legacy flat keys that haven't migrated yet.
 fn locate_engine_field_file(paths: &Paths, key: &str) -> Option<std::path::PathBuf> {
     if let Some((e_slug, f_slug)) = key.split_once('/') {
-        let candidate = paths.engine_fields_dir(e_slug).join(format!("{f_slug}.json"));
+        let candidate = paths
+            .engine_fields_dir(e_slug)
+            .join(format!("{f_slug}.json"));
         if candidate.exists() {
             return Some(candidate);
         }
@@ -298,7 +364,9 @@ fn locate_engine_field_file(paths: &Paths, key: &str) -> Option<std::path::PathB
 /// mirrors `locate_engine_field_file`.
 fn locate_workflow_step_file(paths: &Paths, key: &str) -> Option<std::path::PathBuf> {
     if let Some((w_slug, s_slug)) = key.split_once('/') {
-        let candidate = paths.workflow_steps_dir(w_slug).join(format!("{s_slug}.json"));
+        let candidate = paths
+            .workflow_steps_dir(w_slug)
+            .join(format!("{s_slug}.json"));
         if candidate.exists() {
             return Some(candidate);
         }
@@ -310,7 +378,9 @@ fn locate_workflow_step_file(paths: &Paths, key: &str) -> Option<std::path::Path
             continue;
         }
         let w_slug = w_entry.file_name().to_string_lossy().to_string();
-        let p = paths.workflow_steps_dir(&w_slug).join(format!("{key}.json"));
+        let p = paths
+            .workflow_steps_dir(&w_slug)
+            .join(format!("{key}.json"));
         if p.exists() {
             return Some(p);
         }
@@ -333,7 +403,11 @@ fn locate_queue_dir(
         let candidate = entry.path().join("queues").join(q_slug);
         if candidate.is_dir() {
             // Sanity: parent ws_slug should exist in lockfile.
-            if lockfile.objects.get("workspaces").is_some_and(|m| m.contains_key(&ws_slug)) {
+            if lockfile
+                .objects
+                .get("workspaces")
+                .is_some_and(|m| m.contains_key(&ws_slug))
+            {
                 return Some((ws_slug, candidate));
             }
         }
@@ -346,7 +420,11 @@ fn split_compound(key: &str) -> Option<(String, String, String)> {
     if parts.len() != 3 {
         return None;
     }
-    Some((parts[0].to_string(), parts[1].to_string(), parts[2].to_string()))
+    Some((
+        parts[0].to_string(),
+        parts[1].to_string(),
+        parts[2].to_string(),
+    ))
 }
 
 /// Stats produced by `apply`.
@@ -426,9 +504,10 @@ fn cascade_pending(rest: &mut [PendingRename], applied: &PendingRename) {
         PendingRename::Queue { old, new, .. } => {
             for p in rest.iter_mut() {
                 if let PendingRename::EmailTemplate { q, .. } = p
-                    && q == old {
-                        *q = new.clone();
-                    }
+                    && q == old
+                {
+                    *q = new.clone();
+                }
             }
         }
         _ => {}
@@ -465,15 +544,14 @@ fn prompt_rename(p: &PendingRename, n: usize, total: usize) -> Result<bool> {
     }
 }
 
-fn apply_one(
-    paths: &Paths,
-    lockfile: &mut Lockfile,
-    p: &PendingRename,
-) -> Result<Vec<String>> {
+fn apply_one(paths: &Paths, lockfile: &mut Lockfile, p: &PendingRename) -> Result<Vec<String>> {
     let mut orphans: Vec<String> = Vec::new();
     match p {
         PendingRename::Hook { old, new } => {
-            move_file(&paths.hooks_dir().join(format!("{old}.json")), &paths.hooks_dir().join(format!("{new}.json")))?;
+            move_file(
+                &paths.hooks_dir().join(format!("{old}.json")),
+                &paths.hooks_dir().join(format!("{new}.json")),
+            )?;
             // Sidecar may be `.py` (Python) or `.js` (Node.js) — move
             // whichever happens to exist. Both extensions are a no-op
             // when absent thanks to `move_optional`.
@@ -491,7 +569,10 @@ fn apply_one(
         PendingRename::Rule { old, new } => {
             // Rules are a combined-form kind (json + optional
             // trigger_condition .py). Move both files when present.
-            move_file(&paths.rules_dir().join(format!("{old}.json")), &paths.rules_dir().join(format!("{new}.json")))?;
+            move_file(
+                &paths.rules_dir().join(format!("{old}.json")),
+                &paths.rules_dir().join(format!("{new}.json")),
+            )?;
             move_optional(
                 &paths.rules_dir().join(format!("{old}.py")),
                 &paths.rules_dir().join(format!("{new}.py")),
@@ -500,7 +581,10 @@ fn apply_one(
             collect_orphans(paths, "rules", old, &mut orphans);
         }
         PendingRename::Label { old, new } => {
-            move_file(&paths.labels_dir().join(format!("{old}.json")), &paths.labels_dir().join(format!("{new}.json")))?;
+            move_file(
+                &paths.labels_dir().join(format!("{old}.json")),
+                &paths.labels_dir().join(format!("{new}.json")),
+            )?;
             rename_lockfile_key(lockfile, "labels", old, new);
             collect_orphans(paths, "labels", old, &mut orphans);
         }
@@ -515,10 +599,11 @@ fn apply_one(
             // `old` / `new` are composite `<engine>/<field>` lockfile
             // keys; the on-disk filename uses just the field portion.
             if let Some(old_path) = locate_engine_field_file(paths, old)
-                && let Some(parent) = old_path.parent() {
-                    let new_field = new.split_once('/').map(|(_, f)| f).unwrap_or(new);
-                    move_file(&old_path, &parent.join(format!("{new_field}.json")))?;
-                }
+                && let Some(parent) = old_path.parent()
+            {
+                let new_field = new.split_once('/').map(|(_, f)| f).unwrap_or(new);
+                move_file(&old_path, &parent.join(format!("{new_field}.json")))?;
+            }
             rename_lockfile_key(lockfile, "engine_fields", old, new);
             collect_orphans(paths, "engine_fields", old, &mut orphans);
         }
@@ -531,15 +616,19 @@ fn apply_one(
         }
         PendingRename::WorkflowStep { old, new } => {
             if let Some(old_path) = locate_workflow_step_file(paths, old)
-                && let Some(parent) = old_path.parent() {
-                    let new_step = new.split_once('/').map(|(_, s)| s).unwrap_or(new);
-                    move_file(&old_path, &parent.join(format!("{new_step}.json")))?;
-                }
+                && let Some(parent) = old_path.parent()
+            {
+                let new_step = new.split_once('/').map(|(_, s)| s).unwrap_or(new);
+                move_file(&old_path, &parent.join(format!("{new_step}.json")))?;
+            }
             rename_lockfile_key(lockfile, "workflow_steps", old, new);
         }
         PendingRename::EmailTemplate { ws, q, old, new } => {
             let dir = paths.queue_email_templates_dir(ws, q);
-            move_file(&dir.join(format!("{old}.json")), &dir.join(format!("{new}.json")))?;
+            move_file(
+                &dir.join(format!("{old}.json")),
+                &dir.join(format!("{new}.json")),
+            )?;
             let old_compound = format!("{ws}/{q}/{old}");
             let new_compound = format!("{ws}/{q}/{new}");
             rename_lockfile_key(lockfile, "email_templates", &old_compound, &new_compound);
@@ -592,7 +681,9 @@ fn move_dir(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
 
 /// Move a slug-keyed entry within a lockfile kind.
 fn rename_lockfile_key(lockfile: &mut Lockfile, kind: &str, old: &str, new: &str) {
-    let Some(by_slug) = lockfile.objects.get_mut(kind) else { return };
+    let Some(by_slug) = lockfile.objects.get_mut(kind) else {
+        return;
+    };
     if let Some(entry) = by_slug.remove(old) {
         by_slug.insert(new.to_string(), entry);
     }
@@ -606,7 +697,9 @@ fn rewrite_email_template_compound_prefix(
     old: &str,
     new: &str,
 ) {
-    let Some(by_key) = lockfile.objects.get_mut("email_templates") else { return };
+    let Some(by_key) = lockfile.objects.get_mut("email_templates") else {
+        return;
+    };
     let to_rewrite: Vec<String> = by_key
         .keys()
         .filter(|k| {
@@ -640,7 +733,9 @@ fn collect_orphans(paths: &Paths, kind: &str, old: &str, out: &mut Vec<String>) 
         if !path.exists() {
             continue;
         }
-        let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
         if raw.contains(&needle) || raw.contains(&dotted) {
             let msg = format!(
                 "  {} references {kind}/{old}; update manually",
@@ -655,7 +750,9 @@ fn collect_orphans(paths: &Paths, kind: &str, old: &str, out: &mut Vec<String>) 
 
 fn list_mapping_files(paths: &Paths) -> Vec<std::path::PathBuf> {
     let dir = paths.mapping_dir();
-    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
     entries
         .flatten()
         .map(|e| e.path())
@@ -668,10 +765,13 @@ pub async fn run_within_env(env: &str, check: bool, yes: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let paths = Paths::for_env(&cwd, env);
     let cfg = crate::config::ProjectConfig::load(&paths.project_config())?;
-    if !cfg.envs.contains_key(env) {
-        anyhow::bail!("env '{env}' is not defined in rdc.toml");
-    }
+    let env_cfg = cfg
+        .envs
+        .get(env)
+        .ok_or_else(|| anyhow::anyhow!("env '{env}' is not defined in rdc.toml"))?;
     let mut lockfile = Lockfile::load(&paths.lockfile())?;
+    // Derive object URLs from ids — set the env's api_base on the lockfile.
+    lockfile.api_base = env_cfg.api_base.clone();
 
     let pending = detect(&paths, &lockfile);
     if pending.is_empty() {
@@ -714,9 +814,19 @@ mod tests {
 
     #[test]
     fn priority_orders_workspaces_first() {
-        let h = PendingRename::Hook { old: "a".into(), new: "b".into() };
-        let q = PendingRename::Queue { ws: "ws".into(), old: "a".into(), new: "b".into() };
-        let w = PendingRename::Workspace { old: "a".into(), new: "b".into() };
+        let h = PendingRename::Hook {
+            old: "a".into(),
+            new: "b".into(),
+        };
+        let q = PendingRename::Queue {
+            ws: "ws".into(),
+            old: "a".into(),
+            new: "b".into(),
+        };
+        let w = PendingRename::Workspace {
+            old: "a".into(),
+            new: "b".into(),
+        };
         let mut v = vec![h.clone(), q.clone(), w.clone()];
         v.sort_by_key(priority);
         assert_eq!(v, vec![w, q, h]);
@@ -743,13 +853,26 @@ mod tests {
     #[test]
     fn cascade_workspace_rename_propagates() {
         let mut rest = vec![
-            PendingRename::Queue { ws: "old-ws".into(), old: "q1".into(), new: "q1-new".into() },
-            PendingRename::EmailTemplate {
-                ws: "old-ws".into(), q: "q1".into(), old: "t1".into(), new: "t1-new".into(),
+            PendingRename::Queue {
+                ws: "old-ws".into(),
+                old: "q1".into(),
+                new: "q1-new".into(),
             },
-            PendingRename::Hook { old: "h1".into(), new: "h1-new".into() },
+            PendingRename::EmailTemplate {
+                ws: "old-ws".into(),
+                q: "q1".into(),
+                old: "t1".into(),
+                new: "t1-new".into(),
+            },
+            PendingRename::Hook {
+                old: "h1".into(),
+                new: "h1-new".into(),
+            },
         ];
-        let applied = PendingRename::Workspace { old: "old-ws".into(), new: "new-ws".into() };
+        let applied = PendingRename::Workspace {
+            old: "old-ws".into(),
+            new: "new-ws".into(),
+        };
         cascade_pending(&mut rest, &applied);
         match &rest[0] {
             PendingRename::Queue { ws, .. } => assert_eq!(ws, "new-ws"),
@@ -764,9 +887,16 @@ mod tests {
     #[test]
     fn cascade_queue_rename_propagates_to_email_templates() {
         let mut rest = vec![PendingRename::EmailTemplate {
-            ws: "ws".into(), q: "q-old".into(), old: "t1".into(), new: "t1-new".into(),
+            ws: "ws".into(),
+            q: "q-old".into(),
+            old: "t1".into(),
+            new: "t1-new".into(),
         }];
-        let applied = PendingRename::Queue { ws: "ws".into(), old: "q-old".into(), new: "q-new".into() };
+        let applied = PendingRename::Queue {
+            ws: "ws".into(),
+            old: "q-old".into(),
+            new: "q-new".into(),
+        };
         cascade_pending(&mut rest, &applied);
         match &rest[0] {
             PendingRename::EmailTemplate { q, .. } => assert_eq!(q, "q-new"),
@@ -778,9 +908,36 @@ mod tests {
     fn rewrite_email_template_compound_prefix_ws_segment() {
         use crate::state::ObjectEntry;
         let mut lf = Lockfile::default();
-        lf.upsert("email_templates", "ws-old/q1/t1", ObjectEntry { id: 1, url: None, modified_at: None, content_hash: None, secrets_hash: None });
-        lf.upsert("email_templates", "ws-old/q2/t2", ObjectEntry { id: 2, url: None, modified_at: None, content_hash: None, secrets_hash: None });
-        lf.upsert("email_templates", "ws-other/q3/t3", ObjectEntry { id: 3, url: None, modified_at: None, content_hash: None, secrets_hash: None });
+        lf.upsert(
+            "email_templates",
+            "ws-old/q1/t1",
+            ObjectEntry {
+                id: 1,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        lf.upsert(
+            "email_templates",
+            "ws-old/q2/t2",
+            ObjectEntry {
+                id: 2,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        lf.upsert(
+            "email_templates",
+            "ws-other/q3/t3",
+            ObjectEntry {
+                id: 3,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
         rewrite_email_template_compound_prefix(&mut lf, 0, "ws-old", "ws-new");
         let keys: Vec<&String> = lf.objects.get("email_templates").unwrap().keys().collect();
         assert!(keys.contains(&&"ws-new/q1/t1".to_string()));
@@ -793,8 +950,26 @@ mod tests {
     fn rewrite_email_template_compound_prefix_q_segment() {
         use crate::state::ObjectEntry;
         let mut lf = Lockfile::default();
-        lf.upsert("email_templates", "ws/q-old/t1", ObjectEntry { id: 1, url: None, modified_at: None, content_hash: None, secrets_hash: None });
-        lf.upsert("email_templates", "ws/q-other/t2", ObjectEntry { id: 2, url: None, modified_at: None, content_hash: None, secrets_hash: None });
+        lf.upsert(
+            "email_templates",
+            "ws/q-old/t1",
+            ObjectEntry {
+                id: 1,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        lf.upsert(
+            "email_templates",
+            "ws/q-other/t2",
+            ObjectEntry {
+                id: 2,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
         rewrite_email_template_compound_prefix(&mut lf, 1, "q-old", "q-new");
         let keys: Vec<&String> = lf.objects.get("email_templates").unwrap().keys().collect();
         assert!(keys.contains(&&"ws/q-new/t1".to_string()));
@@ -805,7 +980,12 @@ mod tests {
     fn rename_lockfile_key_moves_entry() {
         use crate::state::ObjectEntry;
         let mut lf = Lockfile::default();
-        let entry = ObjectEntry { id: 42, url: None, modified_at: None, content_hash: Some("abc".into()), secrets_hash: None };
+        let entry = ObjectEntry {
+            id: 42,
+            modified_at: None,
+            content_hash: Some("abc".into()),
+            secrets_hash: None,
+        };
         lf.upsert("hooks", "old", entry.clone());
         rename_lockfile_key(&mut lf, "hooks", "old", "new");
         assert!(!lf.objects.get("hooks").unwrap().contains_key("old"));
@@ -816,11 +996,23 @@ mod tests {
 
     #[test]
     fn describe_formats_each_kind() {
-        let h = PendingRename::Hook { old: "a".into(), new: "b".into() };
+        let h = PendingRename::Hook {
+            old: "a".into(),
+            new: "b".into(),
+        };
         assert_eq!(h.describe(), "hooks/a -> b");
-        let q = PendingRename::Queue { ws: "ws".into(), old: "a".into(), new: "b".into() };
+        let q = PendingRename::Queue {
+            ws: "ws".into(),
+            old: "a".into(),
+            new: "b".into(),
+        };
         assert_eq!(q.describe(), "queues/ws/a -> b");
-        let t = PendingRename::EmailTemplate { ws: "ws".into(), q: "q".into(), old: "t".into(), new: "t2".into() };
+        let t = PendingRename::EmailTemplate {
+            ws: "ws".into(),
+            q: "q".into(),
+            old: "t".into(),
+            new: "t2".into(),
+        };
         assert_eq!(t.describe(), "email_templates/ws/q/t -> t2");
     }
 
@@ -835,34 +1027,61 @@ mod tests {
         std::fs::write(
             paths.hooks_dir().join("validator-invoices.json"),
             r#"{"id":1,"name":"Validator Invoices v2","queues":[]}"#,
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(
             paths.hooks_dir().join("validator-invoices.py"),
             b"def run(p): return p",
-        ).unwrap();
+        )
+        .unwrap();
 
         let mut lockfile = Lockfile::default();
         lockfile.upsert(
             "hooks",
             "validator-invoices",
-            ObjectEntry { id: 1, url: None, modified_at: None, content_hash: Some("h".into()), secrets_hash: None },
+            ObjectEntry {
+                id: 1,
+                modified_at: None,
+                content_hash: Some("h".into()),
+                secrets_hash: None,
+            },
         );
 
         let pending = detect(&paths, &lockfile);
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0], PendingRename::Hook {
-            old: "validator-invoices".into(),
-            new: "validator-invoices-v2".into(),
-        });
+        assert_eq!(
+            pending[0],
+            PendingRename::Hook {
+                old: "validator-invoices".into(),
+                new: "validator-invoices-v2".into(),
+            }
+        );
 
         let stats = apply(&paths, &mut lockfile, pending, false).unwrap();
         assert_eq!(stats.applied, 1);
-        assert!(paths.hooks_dir().join("validator-invoices-v2.json").exists());
+        assert!(
+            paths
+                .hooks_dir()
+                .join("validator-invoices-v2.json")
+                .exists()
+        );
         assert!(paths.hooks_dir().join("validator-invoices-v2.py").exists());
         assert!(!paths.hooks_dir().join("validator-invoices.json").exists());
         assert!(!paths.hooks_dir().join("validator-invoices.py").exists());
-        assert!(lockfile.objects.get("hooks").unwrap().contains_key("validator-invoices-v2"));
-        assert!(!lockfile.objects.get("hooks").unwrap().contains_key("validator-invoices"));
+        assert!(
+            lockfile
+                .objects
+                .get("hooks")
+                .unwrap()
+                .contains_key("validator-invoices-v2")
+        );
+        assert!(
+            !lockfile
+                .objects
+                .get("hooks")
+                .unwrap()
+                .contains_key("validator-invoices")
+        );
     }
 
     /// Workspace rename cascade: ws dir moves AND every email_template
@@ -876,24 +1095,49 @@ mod tests {
         std::fs::write(
             paths.workspace_dir("old-ws").join("workspace.json"),
             r#"{"id":1,"name":"New Workspace","queues":[]}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let mut lockfile = Lockfile::default();
         lockfile.upsert(
-            "workspaces", "old-ws",
-            ObjectEntry { id: 1, url: None, modified_at: None, content_hash: None, secrets_hash: None },
+            "workspaces",
+            "old-ws",
+            ObjectEntry {
+                id: 1,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
         );
         lockfile.upsert(
-            "email_templates", "old-ws/q1/t1",
-            ObjectEntry { id: 10, url: None, modified_at: None, content_hash: None, secrets_hash: None },
+            "email_templates",
+            "old-ws/q1/t1",
+            ObjectEntry {
+                id: 10,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
         );
         lockfile.upsert(
-            "email_templates", "old-ws/q1/t2",
-            ObjectEntry { id: 11, url: None, modified_at: None, content_hash: None, secrets_hash: None },
+            "email_templates",
+            "old-ws/q1/t2",
+            ObjectEntry {
+                id: 11,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
         );
         lockfile.upsert(
-            "email_templates", "other-ws/q9/t9",
-            ObjectEntry { id: 99, url: None, modified_at: None, content_hash: None, secrets_hash: None },
+            "email_templates",
+            "other-ws/q9/t9",
+            ObjectEntry {
+                id: 99,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
         );
 
         let pending = detect(&paths, &lockfile);
@@ -903,7 +1147,12 @@ mod tests {
         assert_eq!(stats.applied, 1);
         assert!(paths.workspace_dir("new-workspace").exists());
         assert!(!paths.workspace_dir("old-ws").exists());
-        let et_keys: Vec<&String> = lockfile.objects.get("email_templates").unwrap().keys().collect();
+        let et_keys: Vec<&String> = lockfile
+            .objects
+            .get("email_templates")
+            .unwrap()
+            .keys()
+            .collect();
         assert!(et_keys.contains(&&"new-workspace/q1/t1".to_string()));
         assert!(et_keys.contains(&&"new-workspace/q1/t2".to_string()));
         // Other-ws templates untouched.
@@ -923,28 +1172,78 @@ mod tests {
         std::fs::write(
             queue_dir.join("queue.json"),
             r#"{"id":1,"name":"AP Invoices","queues":[],"workspace":null,"schema":null}"#,
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(queue_dir.join("schema.json"), b"{}").unwrap();
         std::fs::write(queue_dir.join("inbox.json"), b"{}").unwrap();
         // Need workspace dir for lockfile consistency check in detect.
         std::fs::create_dir_all(paths.workspace_dir("ws1")).unwrap();
 
         let mut lockfile = Lockfile::default();
-        lockfile.upsert("workspaces", "ws1",
-            ObjectEntry { id: 9, url: None, modified_at: None, content_hash: None, secrets_hash: None });
-        lockfile.upsert("queues", "cost-invoices",
-            ObjectEntry { id: 1, url: None, modified_at: None, content_hash: None, secrets_hash: None });
-        lockfile.upsert("schemas", "cost-invoices",
-            ObjectEntry { id: 2, url: None, modified_at: None, content_hash: None, secrets_hash: None });
-        lockfile.upsert("inboxes", "cost-invoices",
-            ObjectEntry { id: 3, url: None, modified_at: None, content_hash: None, secrets_hash: None });
-        lockfile.upsert("email_templates", "ws1/cost-invoices/welcome",
-            ObjectEntry { id: 4, url: None, modified_at: None, content_hash: None, secrets_hash: None });
-        lockfile.upsert("email_templates", "ws1/cost-invoices/rejected",
-            ObjectEntry { id: 5, url: None, modified_at: None, content_hash: None, secrets_hash: None });
+        lockfile.upsert(
+            "workspaces",
+            "ws1",
+            ObjectEntry {
+                id: 9,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        lockfile.upsert(
+            "queues",
+            "cost-invoices",
+            ObjectEntry {
+                id: 1,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        lockfile.upsert(
+            "schemas",
+            "cost-invoices",
+            ObjectEntry {
+                id: 2,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        lockfile.upsert(
+            "inboxes",
+            "cost-invoices",
+            ObjectEntry {
+                id: 3,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        lockfile.upsert(
+            "email_templates",
+            "ws1/cost-invoices/welcome",
+            ObjectEntry {
+                id: 4,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        lockfile.upsert(
+            "email_templates",
+            "ws1/cost-invoices/rejected",
+            ObjectEntry {
+                id: 5,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
 
         let pending = detect(&paths, &lockfile);
-        let queue_pending: Vec<_> = pending.iter()
+        let queue_pending: Vec<_> = pending
+            .iter()
             .filter(|p| matches!(p, PendingRename::Queue { .. }))
             .collect();
         assert_eq!(queue_pending.len(), 1);
@@ -954,15 +1253,56 @@ mod tests {
         assert!(paths.queue_dir("ws1", "ap-invoices").exists());
         assert!(!paths.queue_dir("ws1", "cost-invoices").exists());
         // All three queue-keyed lockfile entries moved.
-        assert!(lockfile.objects.get("queues").unwrap().contains_key("ap-invoices"));
-        assert!(lockfile.objects.get("schemas").unwrap().contains_key("ap-invoices"));
-        assert!(lockfile.objects.get("inboxes").unwrap().contains_key("ap-invoices"));
+        assert!(
+            lockfile
+                .objects
+                .get("queues")
+                .unwrap()
+                .contains_key("ap-invoices")
+        );
+        assert!(
+            lockfile
+                .objects
+                .get("schemas")
+                .unwrap()
+                .contains_key("ap-invoices")
+        );
+        assert!(
+            lockfile
+                .objects
+                .get("inboxes")
+                .unwrap()
+                .contains_key("ap-invoices")
+        );
         // Old keys gone.
-        assert!(!lockfile.objects.get("queues").unwrap().contains_key("cost-invoices"));
-        assert!(!lockfile.objects.get("schemas").unwrap().contains_key("cost-invoices"));
-        assert!(!lockfile.objects.get("inboxes").unwrap().contains_key("cost-invoices"));
+        assert!(
+            !lockfile
+                .objects
+                .get("queues")
+                .unwrap()
+                .contains_key("cost-invoices")
+        );
+        assert!(
+            !lockfile
+                .objects
+                .get("schemas")
+                .unwrap()
+                .contains_key("cost-invoices")
+        );
+        assert!(
+            !lockfile
+                .objects
+                .get("inboxes")
+                .unwrap()
+                .contains_key("cost-invoices")
+        );
         // Email_template compound middle segment rewritten.
-        let et_keys: Vec<&String> = lockfile.objects.get("email_templates").unwrap().keys().collect();
+        let et_keys: Vec<&String> = lockfile
+            .objects
+            .get("email_templates")
+            .unwrap()
+            .keys()
+            .collect();
         assert!(et_keys.contains(&&"ws1/ap-invoices/welcome".to_string()));
         assert!(et_keys.contains(&&"ws1/ap-invoices/rejected".to_string()));
     }
@@ -976,18 +1316,39 @@ mod tests {
         std::fs::write(
             paths.hooks_dir().join("hook-a.json"),
             r#"{"id":1,"name":"Hook B","queues":[]}"#,
-        ).unwrap();
+        )
+        .unwrap();
         // hook-b already exists in the lockfile (some other hook).
         std::fs::write(
             paths.hooks_dir().join("hook-b.json"),
             r#"{"id":2,"name":"Hook B","queues":[]}"#,
-        ).unwrap();
+        )
+        .unwrap();
         let mut lockfile = Lockfile::default();
-        lockfile.upsert("hooks", "hook-a",
-            ObjectEntry { id: 1, url: None, modified_at: None, content_hash: None, secrets_hash: None });
-        lockfile.upsert("hooks", "hook-b",
-            ObjectEntry { id: 2, url: None, modified_at: None, content_hash: None, secrets_hash: None });
+        lockfile.upsert(
+            "hooks",
+            "hook-a",
+            ObjectEntry {
+                id: 1,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        lockfile.upsert(
+            "hooks",
+            "hook-b",
+            ObjectEntry {
+                id: 2,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
         let pending = detect(&paths, &lockfile);
-        assert!(pending.is_empty(), "expected no rename (would collide), got {pending:?}");
+        assert!(
+            pending.is_empty(),
+            "expected no rename (would collide), got {pending:?}"
+        );
     }
 }

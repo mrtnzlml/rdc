@@ -33,19 +33,22 @@ use crate::config::ProjectConfig;
 use crate::log::{Action, Log};
 use crate::paths::Paths;
 use crate::state::Lockfile;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 pub async fn run(env: &str, rebuild_lock: bool, check: bool, yes: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let cfg = ProjectConfig::load(&cwd.join("rdc.toml"))?;
-    if !cfg.envs.contains_key(env) {
-        return Err(anyhow!("env '{env}' is not defined in rdc.toml"));
-    }
+    let api_base = cfg
+        .envs
+        .get(env)
+        .ok_or_else(|| anyhow!("env '{env}' is not defined in rdc.toml"))?
+        .api_base
+        .clone();
     let paths = Paths::for_env(&cwd, env);
     let log = Log::new(crate::cli::resolve::detect_color_mode(false));
 
     // 1. Pre-flight: local changes not yet pushed to the remote (offline).
-    let unpushed = count_unpushed(&paths)?;
+    let unpushed = count_unpushed(&paths, &api_base)?;
     if unpushed > 0 {
         log.event(
             Action::Warn,
@@ -55,7 +58,10 @@ pub async fn run(env: &str, rebuild_lock: bool, check: bool, yes: bool) -> Resul
             ),
         );
     } else {
-        log.event(Action::Info, &format!("env '{env}': no unpushed local changes"));
+        log.event(
+            Action::Info,
+            &format!("env '{env}': no unpushed local changes"),
+        );
     }
 
     // Slug-realign and store-anomaly both read (and the cure mutates) the
@@ -64,7 +70,10 @@ pub async fn run(env: &str, rebuild_lock: bool, check: bool, yes: bool) -> Resul
     if paths.lockfile().exists() {
         // 2. Slug renames — mechanical, applied automatically.
         log.event(Action::Doctor, "checking slug alignment");
-        rename_slugs::run(env, check, /* yes = auto-apply, no per-rename prompt */ true).await?;
+        rename_slugs::run(
+            env, check, /* yes = auto-apply, no per-rename prompt */ true,
+        )
+        .await?;
 
         // 3. Canonical key order — mechanical, applied automatically.
         //    Hash-invariant, so it can run independently of the lockfile
@@ -107,7 +116,7 @@ pub async fn run(env: &str, rebuild_lock: bool, check: bool, yes: bool) -> Resul
 
     // 4. Rebuild lockfile — destructive; explicit confirm, or `--rebuild-lock`
     //    to authorize it directly.
-    maybe_rebuild_lock(env, &paths, rebuild_lock, check, yes, &log).await?;
+    maybe_rebuild_lock(env, &paths, &api_base, rebuild_lock, check, yes, &log).await?;
 
     log.event(Action::Done, &format!("doctor finished for env '{env}'"));
     Ok(())
@@ -117,12 +126,13 @@ pub async fn run(env: &str, rebuild_lock: bool, check: bool, yes: bool) -> Resul
 /// content differs from the lockfile base (edits/creates) plus tombstones
 /// (local deletes). Returns 0 when there's no lockfile yet — nothing is
 /// tracked, so nothing is "unpushed".
-fn count_unpushed(paths: &Paths) -> Result<usize> {
+fn count_unpushed(paths: &Paths, api_base: &str) -> Result<usize> {
     let lockfile_path = paths.lockfile();
     if !lockfile_path.exists() {
         return Ok(0);
     }
-    let lockfile = Lockfile::load(&lockfile_path)?;
+    let mut lockfile = Lockfile::load(&lockfile_path)?;
+    lockfile.api_base = api_base.to_string();
     let (_scanned, changes, tombstones) = crate::cli::push::scan::scan(paths, &lockfile)?;
     Ok(changes.total() + tombstones.total())
 }
@@ -136,6 +146,7 @@ fn count_unpushed(paths: &Paths) -> Result<usize> {
 async fn maybe_rebuild_lock(
     env: &str,
     paths: &Paths,
+    api_base: &str,
     force: bool,
     check: bool,
     yes: bool,
@@ -149,7 +160,7 @@ async fn maybe_rebuild_lock(
         return Ok(());
     }
 
-    let unpushed = count_unpushed(paths)?;
+    let unpushed = count_unpushed(paths, api_base)?;
     let loss = if unpushed > 0 {
         format!(" — {unpushed} unpushed local change(s) will be LOST")
     } else {
@@ -159,7 +170,10 @@ async fn maybe_rebuild_lock(
     // `--rebuild-lock` is explicit authorization: run it directly, no confirm
     // (it works under --yes / non-TTY precisely because the flag is consent).
     if force {
-        log.event(Action::Doctor, &format!("rebuilding lockfile (--rebuild-lock){loss}"));
+        log.event(
+            Action::Doctor,
+            &format!("rebuilding lockfile (--rebuild-lock){loss}"),
+        );
         return rebuild_lock::run(env).await;
     }
     // No flag: only offer it interactively. Under --yes / non-TTY there's no
@@ -178,7 +192,9 @@ async fn maybe_rebuild_lock(
     );
     let proceed = match inquire::Confirm::new(&prompt)
         .with_default(false)
-        .with_help_message("discards local edits not present on the remote; backs up the old lockfile first")
+        .with_help_message(
+            "discards local edits not present on the remote; backs up the old lockfile first",
+        )
         .prompt()
     {
         Ok(b) => b,
