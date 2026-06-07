@@ -2858,8 +2858,11 @@ async fn deploy_create_engine_records_codec_baseline() {
         .expect("content_hash must be present in tgt lockfile for engine");
 
     let disk_bytes = std::fs::read(&engine_json_path).unwrap();
-    let lf_loaded = rdc::state::Lockfile::load(&lf_path).unwrap();
-    let expected_hash = rdc::snapshot::codec::combined_hash(&disk_bytes, &[], &lf_loaded);
+    // The deploy create-path records the baseline BEFORE the engine is in the tgt
+    // lockfile, so its self-url is not yet normalized (URL form). Match that with
+    // an empty lockfile; a subsequent `sync tgt` rebaselines to rdc:// form.
+    let expected_hash =
+        rdc::snapshot::codec::combined_hash(&disk_bytes, &[], &rdc::state::Lockfile::default());
     assert_eq!(
         recorded_hash, expected_hash,
         "lockfile content_hash must equal combined_hash(disk_bytes, &[]) — \
