@@ -220,3 +220,51 @@ fn migrate_errors_on_stale_mapping_source() {
         "no target files written when validation fails"
     );
 }
+
+/// A4 — the `rdc migrate <src> <tgt>` binary subcommand transforms the
+/// snapshot and exits 0, with no network server in sight.
+#[test]
+fn migrate_binary_subcommand_transforms_snapshot() {
+    let project = init_two_env_project();
+    let root = project.path();
+
+    write(
+        &root.join("envs/test/hooks/extractor.json"),
+        &serde_json::json!({ "name": "Extractor", "type": "function" }),
+    );
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(root)
+        .args(["migrate", "test", "prod"])
+        .assert()
+        .success();
+
+    let migrated = read_json(&root.join("envs/prod/hooks/extractor.json"));
+    assert_eq!(migrated["name"], "Extractor");
+    assert_eq!(migrated["type"], "function");
+}
+
+/// A4 — `--dry-run` via the binary writes nothing.
+#[test]
+fn migrate_binary_dry_run_writes_nothing() {
+    let project = init_two_env_project();
+    let root = project.path();
+
+    write(
+        &root.join("envs/test/hooks/extractor.json"),
+        &serde_json::json!({ "name": "Extractor" }),
+    );
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(root)
+        .args(["migrate", "test", "prod", "--dry-run"])
+        .assert()
+        .success();
+
+    assert!(
+        !root.join("envs/prod/hooks/extractor.json").exists(),
+        "binary --dry-run must not write target files"
+    );
+}
