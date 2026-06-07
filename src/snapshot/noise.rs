@@ -65,12 +65,9 @@ pub fn canonicalize_for_hash(bytes: &[u8], lockfile: &crate::state::Lockfile) ->
 
 /// Recursively sort the keys of every JSON object alphabetically. Used
 /// to canonicalise for hashing so on-disk key order doesn't affect
-/// `content_hash`. Also reused by `normalize_for_cross_env_compare` so
-/// the deploy idempotency check and `rdc deploy --dry-run` previews are
-/// equally insensitive to key order — the Rossum API doesn't guarantee stable
-/// key order across endpoints, so two byte-different bodies with the
-/// same content would otherwise diff (or trigger a spurious PATCH on
-/// re-deploy).
+/// `content_hash` — the Rossum API doesn't guarantee stable key order
+/// across endpoints, so two byte-different bodies with the same content
+/// would otherwise produce different hashes.
 pub(crate) fn sort_keys_recursive(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
@@ -91,40 +88,9 @@ pub(crate) fn sort_keys_recursive(value: &mut serde_json::Value) {
     }
 }
 
-/// Recursively sort every all-string array in the tree alphabetically.
-/// Set-like URL arrays (a hook's `queues`, `events`, `run_after`) come
-/// back from Rossum in per-env id order; sorting makes cross-env compares
-/// order-insensitive. Mixed-type arrays (objects/numbers) are left alone —
-/// `content[]` field order is meaningful.
-pub(crate) fn sort_string_arrays(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Array(arr) => {
-            let all_strings = arr
-                .iter()
-                .all(|v| matches!(v, serde_json::Value::String(_)));
-            if all_strings {
-                arr.sort_by(|a, b| match (a, b) {
-                    (serde_json::Value::String(s1), serde_json::Value::String(s2)) => s1.cmp(s2),
-                    _ => std::cmp::Ordering::Equal,
-                });
-            } else {
-                for v in arr.iter_mut() {
-                    sort_string_arrays(v);
-                }
-            }
-        }
-        serde_json::Value::Object(obj) => {
-            for v in obj.values_mut() {
-                sort_string_arrays(v);
-            }
-        }
-        _ => {}
-    }
-}
-
 /// Recursively sort arrays whose elements are **all absolute http(s) URLs**.
 ///
-/// Unlike [`sort_string_arrays`], this is deliberately conservative: it only
+/// This is deliberately conservative: it only
 /// reorders an array when *every* element is a URL. Rossum returns a queue's
 /// server-computed back-reference arrays (`hooks`, `webhooks`, `rules`,
 /// `users`, `workflows`, `queues`, `run_after`, `triggers`, …) in

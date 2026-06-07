@@ -42,7 +42,14 @@ fn kind_specific_strip(kind: &str) -> &'static [&'static str] {
         // and is read-only), so strip it from POST and cross-env PATCH bodies
         // like `counts`. The server re-fills it on create.
         "queues" => &[
-            "hooks", "webhooks", "rules", "inbox", "counts", "users", "workflows", "rir_url",
+            "hooks",
+            "webhooks",
+            "rules",
+            "inbox",
+            "counts",
+            "users",
+            "workflows",
+            "rir_url",
         ],
         // server fills `queues` from each queue's `schema` URL
         "schemas" => &["queues"],
@@ -73,7 +80,9 @@ fn kind_specific_strip(kind: &str) -> &'static [&'static str] {
 /// Mutate `body` to remove server-managed fields for the given kind.
 /// Idempotent: calling twice is the same as once.
 pub fn strip_for_create(body: &mut Value, kind: &str) {
-    let Some(obj) = body.as_object_mut() else { return };
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
     for f in UNIVERSAL_SERVER_FIELDS {
         obj.remove(*f);
     }
@@ -127,7 +136,9 @@ pub const REDACTED_VALUE_SENTINEL: &str = "<refreshed live in Rossum; not synced
 /// Each redacted key's value is replaced by [`REDACTED_VALUE_SENTINEL`];
 /// keys that aren't present are left alone (no insertion). Idempotent.
 pub fn redact_for_disk(body: &mut Value, kind: &str) {
-    let Some(obj) = body.as_object_mut() else { return };
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
     for field in redact_on_pull(kind) {
         if obj.contains_key(*field) {
             obj.insert(
@@ -152,7 +163,10 @@ pub fn redact_for_disk(body: &mut Value, kind: &str) {
 ///
 /// Note: any per-object overlay strip is layered on top by the caller
 /// (`maybe_strip_overlay`); it's kind-agnostic and orthogonal to redaction.
-pub fn redacted_disk_bytes<T: Serialize>(value: &T, kind: &str) -> Result<Vec<u8>, serde_json::Error> {
+pub fn redacted_disk_bytes<T: Serialize>(
+    value: &T,
+    kind: &str,
+) -> Result<Vec<u8>, serde_json::Error> {
     let mut v = serde_json::to_value(value)?;
     redact_for_disk(&mut v, kind);
     let mut bytes = serde_json::to_vec_pretty(&v)?;
@@ -170,15 +184,16 @@ pub fn redacted_disk_bytes<T: Serialize>(value: &T, kind: &str) -> Result<Vec<u8
 /// to specify the org), plus `organization`.
 pub fn strip_for_cross_env_patch(body: &mut Value, kind: &str) {
     strip_for_create(body, kind);
-    let Some(obj) = body.as_object_mut() else { return };
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
     obj.remove("organization");
     // A hook's `token_owner` is a per-env user URL: each env's hooks point at
     // that env's users, which aren't a deployable kind in rdc (no cross-env
     // mapping). It always differs across envs and is never meaningful cross-env
     // drift, so strip it from cross-env comparisons — exactly like
-    // `organization`. Deploy still sets the correct target owner explicitly via
-    // `store_extension_token_owner` before PATCH (see deploy::apply), which is
-    // independent of this strip.
+    // `organization`. The sync push sets the correct target owner explicitly
+    // via the overlay's `store_extension_token_owner`, independent of this strip.
     if kind == "hooks" {
         obj.remove("token_owner");
     }
@@ -249,7 +264,10 @@ mod tests {
         .unwrap();
         strip_patch_extra(&mut e, "engines", false);
         assert!(!e.contains_key("agenda_id"), "agenda_id must be stripped");
-        assert!(!e.contains_key("modified_at"), "modified_at must be stripped");
+        assert!(
+            !e.contains_key("modified_at"),
+            "modified_at must be stripped"
+        );
         assert!(
             e.contains_key("organization"),
             "within-env PATCH keeps organization"
@@ -342,7 +360,10 @@ mod tests {
         });
         strip_for_create(&mut v, "hooks");
         let obj = v.as_object().unwrap();
-        assert!(!obj.contains_key("test"), "test sub-resource must be stripped");
+        assert!(
+            !obj.contains_key("test"),
+            "test sub-resource must be stripped"
+        );
         assert!(
             !obj.contains_key("status"),
             "runtime status must be stripped (Rossum sets/updates it server-side)",
@@ -471,7 +492,10 @@ mod tests {
             !a.as_object().unwrap().contains_key("rir_url"),
             "create body must strip server-managed rir_url"
         );
-        assert!(a.as_object().unwrap().contains_key("name"), "legit fields kept");
+        assert!(
+            a.as_object().unwrap().contains_key("name"),
+            "legit fields kept"
+        );
         let mut b = body.clone();
         strip_for_cross_env_patch(&mut b, "queues");
         assert!(
@@ -598,7 +622,10 @@ mod tests {
         });
         let ba = redacted_disk_bytes(&a, "queues").unwrap();
         let bb = redacted_disk_bytes(&b, "queues").unwrap();
-        assert_eq!(ba, bb, "counts-only differences must redact to identical bytes");
+        assert_eq!(
+            ba, bb,
+            "counts-only differences must redact to identical bytes"
+        );
         assert!(String::from_utf8_lossy(&ba).contains(REDACTED_VALUE_SENTINEL));
         // Trailing newline like every on-disk snapshot file.
         assert_eq!(ba.last(), Some(&b'\n'));

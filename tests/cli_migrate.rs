@@ -221,6 +221,77 @@ fn migrate_errors_on_stale_mapping_source() {
     );
 }
 
+/// `--only <selector>` restricts the migration to matching objects; objects
+/// outside the selection are not written to the target snapshot. This
+/// preserves the coverage of the former `deploy_only_*` tests now that the
+/// `--only` filter lives on `migrate` (it reuses deploy's pure-fs selection
+/// machinery — `deploy::selection::resolve`).
+#[test]
+fn migrate_only_restricts_to_selected_object() {
+    let project = init_two_env_project();
+    let root = project.path();
+    let test_root = root.join("envs/test");
+
+    // Two hooks on disk; only one is selected.
+    write(
+        &test_root.join("hooks/keeper.json"),
+        &serde_json::json!({ "name": "Keeper", "type": "function" }),
+    );
+    write(
+        &test_root.join("hooks/skipped.json"),
+        &serde_json::json!({ "name": "Skipped", "type": "function" }),
+    );
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec!["hooks/keeper".into()]);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("migrate --only should succeed");
+
+    let prod_root = root.join("envs/prod");
+    assert!(
+        prod_root.join("hooks/keeper.json").exists(),
+        "selected hook must be migrated"
+    );
+    assert!(
+        !prod_root.join("hooks/skipped.json").exists(),
+        "unselected hook must NOT be migrated under --only"
+    );
+}
+
+/// An `--only` selector that matches nothing aborts loudly rather than
+/// silently producing an empty migration (preserves the coverage of the
+/// former `deploy_only_with_unknown_selector_errors`).
+#[test]
+fn migrate_only_unknown_selector_errors() {
+    let project = init_two_env_project();
+    let root = project.path();
+    write(
+        &root.join("envs/test/hooks/keeper.json"),
+        &serde_json::json!({ "name": "Keeper", "type": "function" }),
+    );
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run(
+        "test",
+        "prod",
+        false,
+        false,
+        vec!["hooks/does-not-exist".into()],
+    );
+    std::env::set_current_dir(&prev).unwrap();
+
+    let err = result.expect_err("an --only selector matching nothing must abort");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("matched 0 objects"),
+        "error must explain the selector matched nothing: {msg}"
+    );
+}
+
 /// A4 — the `rdc migrate <src> <tgt>` binary subcommand transforms the
 /// snapshot and exits 0, with no network server in sight.
 #[test]
