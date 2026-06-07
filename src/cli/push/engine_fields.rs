@@ -67,7 +67,6 @@ pub async fn push(
                 slug,
                 ObjectEntry {
                     id: created.id,
-                    url: Some(created.url.clone()),
                     modified_at: created.modified_at().map(|s| s.to_string()),
                     content_hash: Some(created_hash),
                     secrets_hash: None,
@@ -157,7 +156,6 @@ pub async fn push(
                         slug,
                         ObjectEntry {
                             id,
-                            url: Some(remote_field.url.clone()),
                             modified_at: remote_field.modified_at().map(|s| s.to_string()),
                             content_hash: Some(remote_combined),
                             secrets_hash: None,
@@ -224,7 +222,6 @@ pub async fn push(
             slug,
             ObjectEntry {
                 id: updated.id,
-                url: Some(updated.url.clone()),
                 modified_at: updated.modified_at().map(|s| s.to_string()),
                 content_hash: Some(updated_hash),
                 secrets_hash: None,

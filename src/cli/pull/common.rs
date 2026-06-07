@@ -487,12 +487,15 @@ pub fn maybe_strip_overlay(
 }
 
 /// Record an object in the lockfile under the given kind/slug.
+///
+/// The object's URL is no longer stored — it is derived from `id` +
+/// `api_base` (see [`crate::state::Lockfile::url_for_slug`]), so callers no
+/// longer pass it.
 pub fn record_object(
     lockfile: &mut Lockfile,
     kind: &str,
     slug: &str,
     id: u64,
-    url: Option<String>,
     modified_at: Option<String>,
     content_hash: Option<String>,
 ) {
@@ -501,7 +504,6 @@ pub fn record_object(
         slug,
         ObjectEntry {
             id,
-            url,
             modified_at,
             content_hash,
             secrets_hash: None,

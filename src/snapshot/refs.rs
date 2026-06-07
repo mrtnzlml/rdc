@@ -70,7 +70,7 @@ pub fn url_to_rdc(url: &str, lockfile: &Lockfile) -> Option<String> {
 /// the lockfile (a dangling ref — left as-is so the API surfaces a clear error).
 pub fn rdc_to_url(s: &str, lockfile: &Lockfile) -> Option<String> {
     let (kind, slug) = parse_rdc_ref(s)?;
-    lockfile.url_for_slug(kind, slug).map(|u| u.to_string())
+    lockfile.url_for_slug(kind, slug)
 }
 
 /// Pull side: rewrite every portable-kind URL in `value` to `rdc://` form.
@@ -96,14 +96,19 @@ mod tests {
     use super::*;
     use crate::state::{Lockfile, ObjectEntry};
 
-    fn lf_with(kind: &str, slug: &str, id: u64, url: &str) -> Lockfile {
-        let mut lf = Lockfile::default();
+    /// Build a single-entry lockfile whose `api_base` is set so derived URLs
+    /// resolve. The URL is no longer stored — it is `{api_base}/{kind}/{id}`
+    /// (or `/organizations/{id}` for `organization`).
+    fn lf_with(api_base: &str, kind: &str, slug: &str, id: u64) -> Lockfile {
+        let mut lf = Lockfile {
+            api_base: api_base.to_string(),
+            ..Lockfile::default()
+        };
         lf.upsert(
             kind,
             slug,
             ObjectEntry {
                 id,
-                url: Some(url.into()),
                 modified_at: None,
                 content_hash: None,
                 secrets_hash: None,
@@ -139,8 +144,9 @@ mod tests {
 
     #[test]
     fn url_round_trips_through_rdc() {
+        let api_base = "https://example.rossum.app/api/v1";
         let url = "https://example.rossum.app/api/v1/workspaces/1054061";
-        let lf = lf_with("workspaces", "demo", 1054061, url);
+        let lf = lf_with(api_base, "workspaces", "demo", 1054061);
         let rdc = url_to_rdc(url, &lf).unwrap();
         assert_eq!(rdc, "rdc://workspaces/demo");
         assert_eq!(rdc_to_url(&rdc, &lf).as_deref(), Some(url));
@@ -148,8 +154,9 @@ mod tests {
 
     #[test]
     fn organization_and_unknown_urls_are_left_as_urls() {
+        let api_base = "https://example.rossum.app/api/v1";
         let org = "https://example.rossum.app/api/v1/organizations/418975";
-        let mut lf = lf_with("organization", "self", 418975, org);
+        let mut lf = lf_with(api_base, "organization", "self", 418975);
         let user = "https://example.rossum.app/api/v1/users/499604";
         assert_eq!(url_to_rdc(org, &lf), None);
         assert_eq!(url_to_rdc(user, &lf), None);
@@ -158,16 +165,16 @@ mod tests {
             "invoices",
             ObjectEntry {
                 id: 10,
-                url: Some("https://x/api/v1/queues/10".into()),
                 modified_at: None,
                 content_hash: None,
                 secrets_hash: None,
             },
         );
+        let queue_url = "https://example.rossum.app/api/v1/queues/10";
         let mut v = serde_json::json!({
-            "queue": "https://x/api/v1/queues/10",
+            "queue": queue_url,
             "organization": org,
-            "actions": [{ "payload": { "queue": "https://x/api/v1/queues/10" } }],
+            "actions": [{ "payload": { "queue": queue_url } }],
         });
         portabilize_value(&mut v, &lf);
         assert_eq!(v["queue"], "rdc://queues/invoices");
@@ -177,8 +184,9 @@ mod tests {
 
     #[test]
     fn resolve_value_rewrites_rdc_refs_and_leaves_dangling_intact() {
+        let api_base = "https://example.rossum.app/api/v1";
         let url = "https://example.rossum.app/api/v1/queues/10";
-        let lf = lf_with("queues", "invoices", 10, url);
+        let lf = lf_with(api_base, "queues", "invoices", 10);
         let mut v = serde_json::json!({
             "queue": "rdc://queues/invoices",
             "other": "rdc://queues/unknown-slug", // dangling — must survive

@@ -82,7 +82,6 @@ pub async fn process(
                 KIND,
                 &slug,
                 ws.id,
-                Some(ws.url.clone()),
                 ws.modified_at().map(|s| s.to_string()),
                 Some(hash),
             );

@@ -323,7 +323,6 @@ pub async fn process(
                 KIND,
                 &slug,
                 hook.id,
-                Some(hook.url.clone()),
                 hook.modified_at().map(|s| s.to_string()),
                 Some(recorded_hash),
             );

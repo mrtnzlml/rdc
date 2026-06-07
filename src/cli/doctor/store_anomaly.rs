@@ -95,6 +95,8 @@ pub async fn run(env: &str, check: bool, yes: bool) -> Result<()> {
         RossumClient::new(env_cfg.api_base.clone(), token).context("constructing API client")?;
     let mut lockfile = Lockfile::load(&paths.lockfile())
         .with_context(|| format!("loading lockfile from {}", paths.lockfile().display()))?;
+    // Derive object URLs from ids — set the env's api_base on the lockfile.
+    lockfile.api_base = env_cfg.api_base.clone();
 
     let interactive = crate::cli::resolve::is_interactive(yes);
 
@@ -184,7 +186,6 @@ async fn convert_to_custom(
         slug,
         crate::state::ObjectEntry {
             id: updated.id,
-            url: Some(updated.url.clone()),
             modified_at: updated.modified_at().map(|s| s.to_string()),
             content_hash: Some(hash),
             secrets_hash: prior.and_then(|p| p.secrets_hash),
@@ -433,7 +434,6 @@ async fn reinstall_as_store_extension(
         slug,
         crate::state::ObjectEntry {
             id: updated.id,
-            url: Some(updated.url.clone()),
             modified_at: updated.modified_at().map(|s| s.to_string()),
             content_hash: Some(hash),
             secrets_hash: prior.and_then(|p| p.secrets_hash),
@@ -483,7 +483,6 @@ async fn reinstall_as_store_extension(
             &dep_slug,
             crate::state::ObjectEntry {
                 id: fresh.id,
-                url: Some(fresh.url.clone()),
                 modified_at: fresh.modified_at().map(|s| s.to_string()),
                 content_hash: Some(hh),
                 secrets_hash: dep_prior.and_then(|p| p.secrets_hash),

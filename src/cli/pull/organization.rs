@@ -1,4 +1,4 @@
-use super::common::{apply_pull_action, decide_pull_action, record_object, PullAction, PullCtx};
+use super::common::{PullAction, PullCtx, apply_pull_action, decide_pull_action, record_object};
 use crate::log::{Action, Log};
 use crate::model::Organization;
 use anyhow::{Context, Result};
@@ -63,7 +63,6 @@ pub async fn process(
             KIND,
             "self",
             org.id,
-            Some(org.url.clone()),
             org.modified_at().map(|s| s.to_string()),
             Some(recorded_hash),
         );

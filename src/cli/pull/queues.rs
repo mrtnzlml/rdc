@@ -177,7 +177,6 @@ pub async fn process(
                 KIND_QUEUES,
                 &q_slug,
                 q.id,
-                Some(q.url.clone()),
                 q.modified_at().map(|s| s.to_string()),
                 Some(q_recorded),
             );
@@ -422,7 +421,6 @@ fn write_schema_for_queue(
         KIND_SCHEMAS,
         &w.q_slug,
         schema.id,
-        Some(schema.url.clone()),
         schema.modified_at().map(|s| s.to_string()),
         Some(schema_recorded),
     );
@@ -482,7 +480,6 @@ fn write_inbox_for_queue(
         KIND_INBOXES,
         &w.q_slug,
         inbox.id,
-        Some(inbox.url.clone()),
         inbox.modified_at().map(|s| s.to_string()),
         Some(i_recorded),
     );

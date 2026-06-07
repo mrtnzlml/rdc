@@ -70,7 +70,6 @@ pub async fn push(
                 q_slug,
                 ObjectEntry {
                     id: created.id,
-                    url: Some(created.url.clone()),
                     modified_at: created.modified_at().map(|s| s.to_string()),
                     content_hash: Some(created_hash),
                     secrets_hash: None,
@@ -155,7 +154,6 @@ pub async fn push(
                         q_slug,
                         ObjectEntry {
                             id,
-                            url: Some(remote_queue.url.clone()),
                             modified_at: remote_queue.modified_at().map(|s| s.to_string()),
                             content_hash: Some(remote_combined),
                             secrets_hash: None,
@@ -207,7 +205,6 @@ pub async fn push(
             q_slug,
             ObjectEntry {
                 id: updated.id,
-                url: Some(updated.url.clone()),
                 modified_at: updated.modified_at().map(|s| s.to_string()),
                 content_hash: Some(updated_hash),
                 secrets_hash: None,
@@ -225,13 +222,16 @@ mod tests {
     #[test]
     fn resolve_value_rewrites_rdc_refs_to_env_urls() {
         use crate::state::{Lockfile, ObjectEntry};
-        let mut lf = Lockfile::default();
+        // api_base is set so the env URL can be DERIVED from id (v3).
+        let mut lf = Lockfile {
+            api_base: "https://example.rossum.app/api/v1".to_string(),
+            ..Lockfile::default()
+        };
         lf.upsert(
             "workspaces",
             "main",
             ObjectEntry {
                 id: 7,
-                url: Some("https://example.rossum.app/api/v1/workspaces/7".into()),
                 modified_at: None,
                 content_hash: None,
                 secrets_hash: None,
