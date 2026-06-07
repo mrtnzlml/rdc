@@ -38,6 +38,14 @@ pub fn portabilize_refs(paths: &Paths, lockfile: &mut Lockfile) -> Result<()> {
         if !path.exists() {
             continue;
         }
+        // A conflicted object has a shadow file (`<file>.<env>`) alongside it —
+        // the local was kept verbatim for the user to resolve against the
+        // remote shadow. Leave it byte-untouched: don't migrate its refs while
+        // the user is mid-resolution. It converges on the next sync once the
+        // conflict is resolved.
+        if crate::paths::shadow_path_for(&path, paths.env()).exists() {
+            continue;
+        }
 
         // Read and parse. A read error on a file we just confirmed exists is a
         // real I/O problem (permissions, races) and should surface, not be
