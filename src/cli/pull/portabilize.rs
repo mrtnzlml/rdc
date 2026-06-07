@@ -135,7 +135,11 @@ fn compute_hash_for_kind(
                 .with_context(|| format!("locating queue dir for schema re-hash ({slug})"))?;
             let formulas = crate::snapshot::schema::read_local_formulas(&queue_dir)
                 .with_context(|| format!("reading formulas for schema re-hash ({slug})"))?;
-            Ok(crate::state::schema_combined_hash(json_bytes, &formulas))
+            Ok(crate::state::schema_combined_hash(
+                json_bytes,
+                &formulas,
+                &crate::state::Lockfile::default(),
+            ))
         }
         "hooks" => {
             // Derive the code sidecar extension from the JSON we just wrote.
@@ -160,7 +164,11 @@ fn compute_hash_for_kind(
             } else {
                 None
             };
-            Ok(crate::state::hook_combined_hash(json_bytes, &code))
+            Ok(crate::state::hook_combined_hash(
+                json_bytes,
+                &code,
+                &crate::state::Lockfile::default(),
+            ))
         }
         "rules" => {
             let py_path = paths.rules_dir().join(format!("{slug}.py"));
@@ -172,13 +180,20 @@ fn compute_hash_for_kind(
             } else {
                 None
             };
-            Ok(crate::state::rule_combined_hash(json_bytes, &code))
+            Ok(crate::state::rule_combined_hash(
+                json_bytes,
+                &code,
+                &crate::state::Lockfile::default(),
+            ))
         }
         _ => {
             // All remaining kinds (queues, inboxes, workspaces, labels,
             // engines, engine_fields, email_templates, etc.) are single-file
             // and use content_hash.
-            Ok(crate::state::content_hash(json_bytes))
+            Ok(crate::state::content_hash(
+                json_bytes,
+                &crate::state::Lockfile::default(),
+            ))
         }
     }
 }
@@ -267,7 +282,7 @@ mod tests {
         write_file(&ws_path, &ws_bytes);
 
         // Record the pre-portabilize hash for the label.
-        let pre_hash = content_hash(&label_bytes);
+        let pre_hash = content_hash(&label_bytes, &Lockfile::default());
         lockfile
             .objects
             .get_mut("labels")
@@ -301,7 +316,10 @@ mod tests {
             .content_hash
             .as_deref()
             .unwrap();
-        let expected_hash = content_hash(fs::read(&label_path).unwrap().as_slice());
+        let expected_hash = content_hash(
+            fs::read(&label_path).unwrap().as_slice(),
+            &Lockfile::default(),
+        );
         assert_eq!(
             new_hash, expected_hash,
             "lockfile hash must match content_hash of the new file bytes"
@@ -322,7 +340,7 @@ mod tests {
             .as_deref()
             .unwrap();
         let ws_on_disk_bytes = fs::read(&ws_path).unwrap();
-        let expected_ws_hash = content_hash(ws_on_disk_bytes.as_slice());
+        let expected_ws_hash = content_hash(ws_on_disk_bytes.as_slice(), &Lockfile::default());
         assert_eq!(
             ws_hash, expected_ws_hash,
             "workspace lockfile hash must match the portabilized on-disk bytes"
@@ -357,7 +375,7 @@ mod tests {
         write_file(&label_path, &bytes);
 
         // Seed a stable content_hash for this label.
-        let stable_hash = content_hash(&bytes);
+        let stable_hash = content_hash(&bytes, &Lockfile::default());
         lockfile
             .objects
             .get_mut("labels")

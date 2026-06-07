@@ -210,7 +210,7 @@ pub async fn push(
             // different runtime.
             let (created_json_full, created_code) = serialize_hook(&created)?;
             let created_json_stripped = maybe_strip_overlay(created_json_full, overlay_paths)?;
-            let created_hash = hook_combined_hash(&created_json_stripped, &created_code);
+            let created_hash = hook_combined_hash(&created_json_stripped, &created_code, lockfile);
             let created_ext = hook_code_extension(&created);
             write_atomic(local_json_path, &created_json_stripped)
                 .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
@@ -297,7 +297,7 @@ pub async fn push(
         };
         let (remote_json_full, remote_code) = serialize_hook(remote_hook)?;
         let remote_json_stripped = maybe_strip_overlay(remote_json_full, overlay_paths)?;
-        let remote_combined = hook_combined_hash(&remote_json_stripped, &remote_code);
+        let remote_combined = hook_combined_hash(&remote_json_stripped, &remote_code, lockfile);
         let mut payload_to_send = payload_hook;
         if remote_combined != base {
             // Drift detected. The hook is a combined-hash kind (json + py);
@@ -396,7 +396,7 @@ pub async fn push(
         // what next pull would write) and update lockfile to match.
         let (updated_json_full, updated_code) = serialize_hook(&updated)?;
         let updated_json_stripped = maybe_strip_overlay(updated_json_full, overlay_paths)?;
-        let updated_hash = hook_combined_hash(&updated_json_stripped, &updated_code);
+        let updated_hash = hook_combined_hash(&updated_json_stripped, &updated_code, lockfile);
         let updated_ext = hook_code_extension(&updated);
         crate::state::base_cache::write_disk_and_cache(
             paths,

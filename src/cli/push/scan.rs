@@ -96,10 +96,23 @@ pub fn scan(paths: &Paths, lockfile: &Lockfile) -> Result<(usize, ChangeList, To
     scanned += scan_workspaces(paths, lockfile, &mut changes.workspaces)?;
     scanned += scan_hooks(paths, lockfile, &mut changes.hooks)?;
     scanned += scan_rules(paths, lockfile, &mut changes.rules)?;
-    scanned += scan_flat_kind(paths, lockfile, "labels", paths.labels_dir(), &mut changes.labels)?;
-    scanned += scan_queue_nested_json(paths, lockfile, "queues", "queue.json", &mut changes.queues)?;
+    scanned += scan_flat_kind(
+        paths,
+        lockfile,
+        "labels",
+        paths.labels_dir(),
+        &mut changes.labels,
+    )?;
+    scanned +=
+        scan_queue_nested_json(paths, lockfile, "queues", "queue.json", &mut changes.queues)?;
     scanned += scan_schemas(paths, lockfile, &mut changes.schemas)?;
-    scanned += scan_queue_nested_json(paths, lockfile, "inboxes", "inbox.json", &mut changes.inboxes)?;
+    scanned += scan_queue_nested_json(
+        paths,
+        lockfile,
+        "inboxes",
+        "inbox.json",
+        &mut changes.inboxes,
+    )?;
     scanned += scan_email_templates(paths, lockfile, &mut changes.email_templates)?;
     scanned += scan_engines(paths, lockfile, &mut changes.engines)?;
     scanned += scan_engine_fields(paths, lockfile, &mut changes.engine_fields)?;
@@ -187,7 +200,9 @@ fn detect_flat(
     dir: &std::path::Path,
     out: &mut BTreeMap<String, u64>,
 ) {
-    let Some(map) = lockfile.objects.get(kind) else { return };
+    let Some(map) = lockfile.objects.get(kind) else {
+        return;
+    };
     for (slug, entry) in map {
         let path = dir.join(format!("{slug}.json"));
         if !path.exists() {
@@ -203,7 +218,9 @@ fn detect_queue_nested(
     file_name: &str,
     out: &mut BTreeMap<String, u64>,
 ) {
-    let Some(map) = lockfile.objects.get(kind) else { return };
+    let Some(map) = lockfile.objects.get(kind) else {
+        return;
+    };
     for (slug, entry) in map {
         if !queue_nested_file_exists(paths, slug, file_name) {
             out.insert(slug.clone(), entry.id);
@@ -216,12 +233,20 @@ fn queue_nested_file_exists(paths: &Paths, q_slug: &str, file_name: &str) -> boo
     if !ws_dir.exists() {
         return false;
     }
-    let Ok(entries) = std::fs::read_dir(&ws_dir) else { return false };
+    let Ok(entries) = std::fs::read_dir(&ws_dir) else {
+        return false;
+    };
     for entry in entries.flatten() {
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
-        if entry.path().join("queues").join(q_slug).join(file_name).exists() {
+        if entry
+            .path()
+            .join("queues")
+            .join(q_slug)
+            .join(file_name)
+            .exists()
+        {
             return true;
         }
     }
@@ -243,12 +268,19 @@ fn engine_field_file_exists(paths: &Paths, composite_key: &str) -> bool {
     if !engines_dir.exists() {
         return false;
     }
-    let Ok(entries) = std::fs::read_dir(&engines_dir) else { return false };
+    let Ok(entries) = std::fs::read_dir(&engines_dir) else {
+        return false;
+    };
     for entry in entries.flatten() {
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
-        if entry.path().join("fields").join(format!("{composite_key}.json")).exists() {
+        if entry
+            .path()
+            .join("fields")
+            .join(format!("{composite_key}.json"))
+            .exists()
+        {
             return true;
         }
     }
@@ -279,7 +311,7 @@ fn scan_engines(
             continue;
         }
         let bytes = std::fs::read(&e_json_path)?;
-        let local_hash = content_hash(&bytes);
+        let local_hash = content_hash(&bytes, &crate::state::Lockfile::default());
         scanned += 1;
         let base_hash = lockfile
             .objects
@@ -329,10 +361,12 @@ fn scan_engine_fields(
             if f_path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            let Some(f_slug) = f_path.file_stem().and_then(|s| s.to_str()) else { continue };
+            let Some(f_slug) = f_path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
             let composite_key = format!("{e_slug}/{f_slug}");
             let bytes = std::fs::read(&f_path)?;
-            let local_hash = content_hash(&bytes);
+            let local_hash = content_hash(&bytes, &crate::state::Lockfile::default());
             scanned += 1;
             let base_hash = lockfile
                 .objects
@@ -377,7 +411,9 @@ fn scan_rules(
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        let Some(slug) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        let Some(slug) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
         let json_bytes = std::fs::read(&path)?;
         let py_path = path.with_extension("py");
         let code = if py_path.exists() {
@@ -385,7 +421,7 @@ fn scan_rules(
         } else {
             None
         };
-        let local_hash = rule_combined_hash(&json_bytes, &code);
+        let local_hash = rule_combined_hash(&json_bytes, &code, &crate::state::Lockfile::default());
         scanned += 1;
         let base_hash = lockfile
             .objects
@@ -421,7 +457,7 @@ fn scan_workspaces(
             continue;
         }
         let bytes = std::fs::read(&ws_json_path)?;
-        let local_hash = content_hash(&bytes);
+        let local_hash = content_hash(&bytes, &crate::state::Lockfile::default());
         scanned += 1;
         let base_hash = lockfile
             .objects
@@ -458,7 +494,9 @@ fn scan_hooks(
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        let Some(slug) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        let Some(slug) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
         let json_bytes = std::fs::read(&path)?;
         // Sidecar extension derives from the JSON's `config.runtime`:
         // `.js` for Node.js runtimes, `.py` otherwise. Fall back to the
@@ -480,7 +518,7 @@ fn scan_hooks(
         } else {
             None
         };
-        let local_hash = hook_combined_hash(&json_bytes, &code);
+        let local_hash = hook_combined_hash(&json_bytes, &code, &crate::state::Lockfile::default());
         scanned += 1;
         let base_hash = lockfile
             .objects
@@ -512,9 +550,11 @@ fn scan_flat_kind(
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        let Some(slug) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        let Some(slug) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
         let bytes = std::fs::read(&path)?;
-        let local_hash = content_hash(&bytes);
+        let local_hash = content_hash(&bytes, &crate::state::Lockfile::default());
         scanned += 1;
         let base_hash = lockfile
             .objects
@@ -561,9 +601,11 @@ fn scan_queue_nested_json(
             if !target.exists() {
                 continue;
             }
-            let Some(q_slug) = q_path.file_name().and_then(|s| s.to_str()) else { continue };
+            let Some(q_slug) = q_path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
             let bytes = std::fs::read(&target)?;
-            let local_hash = content_hash(&bytes);
+            let local_hash = content_hash(&bytes, &crate::state::Lockfile::default());
             scanned += 1;
             let base_hash = lockfile
                 .objects
@@ -610,10 +652,13 @@ fn scan_schemas(
             if !schema_path.exists() {
                 continue;
             }
-            let Some(q_slug) = q_path.file_name().and_then(|s| s.to_str()) else { continue };
+            let Some(q_slug) = q_path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
             let json_bytes = std::fs::read(&schema_path)?;
             let formulas = read_local_formulas(&q_path).unwrap_or_default();
-            let local_hash = schema_combined_hash(&json_bytes, &formulas);
+            let local_hash =
+                schema_combined_hash(&json_bytes, &formulas, &crate::state::Lockfile::default());
             scanned += 1;
             let base_hash = lockfile
                 .objects
@@ -665,10 +710,12 @@ fn scan_email_templates(
                 if t_path.extension().and_then(|s| s.to_str()) != Some("json") {
                     continue;
                 }
-                let Some(t_slug) = t_path.file_stem().and_then(|s| s.to_str()) else { continue };
+                let Some(t_slug) = t_path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
                 let compound = format!("{ws_slug}/{q_slug}/{t_slug}");
                 let bytes = std::fs::read(&t_path)?;
-                let local_hash = content_hash(&bytes);
+                let local_hash = content_hash(&bytes, &crate::state::Lockfile::default());
                 scanned += 1;
                 let base_hash = lockfile
                     .objects
@@ -714,24 +761,34 @@ pub fn change_list_from_classified(
         }
         match it.kind.as_str() {
             "workspaces" => {
-                cl.workspaces
-                    .insert(it.slug.clone(), paths.workspace_dir(&it.slug).join("workspace.json"));
+                cl.workspaces.insert(
+                    it.slug.clone(),
+                    paths.workspace_dir(&it.slug).join("workspace.json"),
+                );
             }
             "hooks" => {
-                cl.hooks
-                    .insert(it.slug.clone(), paths.hooks_dir().join(format!("{}.json", it.slug)));
+                cl.hooks.insert(
+                    it.slug.clone(),
+                    paths.hooks_dir().join(format!("{}.json", it.slug)),
+                );
             }
             "rules" => {
-                cl.rules
-                    .insert(it.slug.clone(), paths.rules_dir().join(format!("{}.json", it.slug)));
+                cl.rules.insert(
+                    it.slug.clone(),
+                    paths.rules_dir().join(format!("{}.json", it.slug)),
+                );
             }
             "labels" => {
-                cl.labels
-                    .insert(it.slug.clone(), paths.labels_dir().join(format!("{}.json", it.slug)));
+                cl.labels.insert(
+                    it.slug.clone(),
+                    paths.labels_dir().join(format!("{}.json", it.slug)),
+                );
             }
             "engines" => {
-                cl.engines
-                    .insert(it.slug.clone(), paths.engine_dir(&it.slug).join("engine.json"));
+                cl.engines.insert(
+                    it.slug.clone(),
+                    paths.engine_dir(&it.slug).join("engine.json"),
+                );
             }
             "engine_fields" => {
                 if let Some(p) = find_engine_field_path(paths, &it.slug) {
@@ -873,7 +930,11 @@ mod tests {
         ];
 
         let cl = change_list_from_classified(&paths, &items);
-        assert_eq!(cl.hooks.len(), 1, "only the LocalEdit hook should be in the list");
+        assert_eq!(
+            cl.hooks.len(),
+            1,
+            "only the LocalEdit hook should be in the list"
+        );
         assert!(cl.hooks.contains_key("h1"));
         assert_eq!(cl.labels.len(), 1);
         assert!(cl.labels.contains_key("l1"));

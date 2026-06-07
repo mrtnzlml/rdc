@@ -326,11 +326,11 @@ pub fn tgt_drift_status(
         // the lockfile baseline over that portabilized form, so the drift hash
         // must portabilize the remote body the same way to compare like-for-like.
         let json_for_hash = portabilize_for_hash(json_for_hash, tgt_lockfile)?;
-        combined_hash(&json_for_hash, &art.sidecars)
+        combined_hash(&json_for_hash, &art.sidecars, tgt_lockfile)
     } else {
         // No codec registered — fall back to overlay-stripped content_hash.
         let stripped = maybe_strip_overlay(remote_bytes, overlay_paths)?;
-        crate::state::content_hash(&stripped)
+        crate::state::content_hash(&stripped, tgt_lockfile)
     };
     let base = tgt_lockfile
         .objects
@@ -540,9 +540,10 @@ mod tests {
         // lockfile entry carries the queue's own URL, so its self-ref resolves
         // to `rdc://queues/invoices`.
         let mut lf = lf_with_hash("queues", "invoices", "");
-        let baseline_bytes = crate::snapshot::create::redacted_disk_bytes(&value, "queues").unwrap();
+        let baseline_bytes =
+            crate::snapshot::create::redacted_disk_bytes(&value, "queues").unwrap();
         let baseline_bytes = portabilize_for_hash(baseline_bytes, &lf).unwrap();
-        let baseline_hash = content_hash(&baseline_bytes);
+        let baseline_hash = content_hash(&baseline_bytes, &Lockfile::default());
         lf.objects
             .get_mut("queues")
             .unwrap()
@@ -579,7 +580,8 @@ mod tests {
         // Simulate baseline: what write_back_flat (= codec) would record.
         let codec = crate::snapshot::codec::codec("engines").expect("engines codec must exist");
         let art = codec.disk_bytes(&value_at_pull).unwrap();
-        let baseline_hash = crate::snapshot::codec::combined_hash(&art.json, &art.sidecars);
+        let baseline_hash =
+            crate::snapshot::codec::combined_hash(&art.json, &art.sidecars, &Lockfile::default());
         let lf = lf_with_hash("engines", "training", &baseline_hash);
 
         // Remote now has a rotated agenda_id (training completed) — only
@@ -634,7 +636,7 @@ mod tests {
         });
         let baseline_bytes =
             crate::snapshot::create::redacted_disk_bytes(&value, "queues").unwrap();
-        let baseline_hash = content_hash(&baseline_bytes);
+        let baseline_hash = content_hash(&baseline_bytes, &Lockfile::default());
         let lf = lf_with_hash("queues", "q1", &baseline_hash);
         let mut changed = value.clone();
         changed["name"] = serde_json::Value::String("New name".into());

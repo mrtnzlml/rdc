@@ -9,8 +9,8 @@
 //! (lockfile, queue_locations, conflict counts).
 
 use super::common::{
-    apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
-    skip_on_permission_denied, PullAction, PullCtx,
+    PullAction, PullCtx, apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
+    skip_on_permission_denied,
 };
 use crate::log::{Action, Log};
 use crate::model::{Inbox, Queue, Schema};
@@ -270,7 +270,7 @@ fn write_schema_for_queue(
     // would diverge whenever a schema overlay is configured, causing phantom
     // drift on every subsequent pull.
     let remote_combined_hash =
-        crate::state::schema_combined_hash(&remote_json_bytes, &remote_formulas);
+        crate::state::schema_combined_hash(&remote_json_bytes, &remote_formulas, ctx.lockfile);
 
     let schema_base = ctx
         .lockfile
@@ -283,7 +283,7 @@ fn write_schema_for_queue(
         (_, None) => PullAction::Write,
         (Some(base), Some(local_json)) => {
             let local_combined =
-                crate::state::schema_combined_hash(local_json, &pre_local_formulas);
+                crate::state::schema_combined_hash(local_json, &pre_local_formulas, ctx.lockfile);
             let local_matches = local_combined == base;
             let remote_matches = remote_combined_hash == base;
             match (local_matches, remote_matches) {
@@ -307,7 +307,7 @@ fn write_schema_for_queue(
         }
         PullAction::KeepLocal => {
             let local_json = pre_local_json.as_ref().unwrap();
-            crate::state::schema_combined_hash(local_json, &pre_local_formulas)
+            crate::state::schema_combined_hash(local_json, &pre_local_formulas, ctx.lockfile)
         }
         PullAction::NoChange => {
             // Combined hash is already equal — no file writes needed.
@@ -371,12 +371,18 @@ fn write_schema_for_queue(
                 if preserve_base {
                     match schema_base.as_deref() {
                         Some(prior) => prior.to_string(),
-                        None => {
-                            crate::state::schema_combined_hash(&resolved_json, &resolved_formulas)
-                        }
+                        None => crate::state::schema_combined_hash(
+                            &resolved_json,
+                            &resolved_formulas,
+                            ctx.lockfile,
+                        ),
                     }
                 } else {
-                    crate::state::schema_combined_hash(&resolved_json, &resolved_formulas)
+                    crate::state::schema_combined_hash(
+                        &resolved_json,
+                        &resolved_formulas,
+                        ctx.lockfile,
+                    )
                 }
             } else {
                 // Legacy shadow-file flow — unresolved by construction.
@@ -402,7 +408,11 @@ fn write_schema_for_queue(
                 ));
                 match schema_base.as_deref() {
                     Some(prior) => prior.to_string(),
-                    None => crate::state::schema_combined_hash(local_json, &pre_local_formulas),
+                    None => crate::state::schema_combined_hash(
+                        local_json,
+                        &pre_local_formulas,
+                        ctx.lockfile,
+                    ),
                 }
             }
         }

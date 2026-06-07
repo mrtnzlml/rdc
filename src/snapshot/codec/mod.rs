@@ -62,9 +62,13 @@ pub trait KindCodec: Sync {
     /// The default implementation delegates to [`combined_hash`] over the
     /// artifact produced by [`Self::disk_bytes`], so the hash and the on-disk
     /// bytes always agree.
-    fn base_hash(&self, value: &Value) -> anyhow::Result<String> {
+    fn base_hash(
+        &self,
+        value: &Value,
+        lockfile: &crate::state::Lockfile,
+    ) -> anyhow::Result<String> {
         let art = self.disk_bytes(value)?;
-        Ok(combined_hash(&art.json, &art.sidecars))
+        Ok(combined_hash(&art.json, &art.sidecars, lockfile))
     }
 
     /// Strip server-managed fields from `body` before a create POST.
@@ -99,9 +103,13 @@ pub trait KindCodec: Sync {
 /// 3. Hex-encode the digest.
 ///
 /// This is the canonical hash function for all `KindCodec` implementations.
-pub fn combined_hash(json: &[u8], sidecars: &[(String, Vec<u8>)]) -> String {
+pub fn combined_hash(
+    json: &[u8],
+    sidecars: &[(String, Vec<u8>)],
+    lockfile: &crate::state::Lockfile,
+) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(canonicalize_for_hash(json));
+    hasher.update(canonicalize_for_hash(json, lockfile));
     for (path, bytes) in sidecars {
         hasher.update([0x00u8]);
         hasher.update(path.as_bytes());

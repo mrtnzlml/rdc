@@ -61,7 +61,7 @@ pub async fn push(
             let created = create_result?;
             let (created_json, created_formulas) = serialize_schema(&created)?;
             let created_json = maybe_strip_overlay(created_json, overlay_paths)?;
-            let created_hash = schema_combined_hash(&created_json, &created_formulas);
+            let created_hash = schema_combined_hash(&created_json, &created_formulas, lockfile);
             write_schema_bytes(queue_dir, &created_json, &created_formulas).with_context(|| {
                 format!("writing post-create canonical form for schema '{q_slug}'")
             })?;
@@ -117,7 +117,7 @@ pub async fn push(
         };
         let (remote_json, remote_formulas) = serialize_schema(&remote_schema)?;
         let remote_json = maybe_strip_overlay(remote_json, overlay_paths)?;
-        let remote_combined = schema_combined_hash(&remote_json, &remote_formulas);
+        let remote_combined = schema_combined_hash(&remote_json, &remote_formulas, lockfile);
         let mut payload_to_send = payload_schema;
         if remote_combined != base {
             use crate::cli::resolve::{PushDriftOutcome, resolve_push_drift};
@@ -179,7 +179,7 @@ pub async fn push(
 
         let (updated_json, updated_formulas) = serialize_schema(&updated)?;
         let updated_json = maybe_strip_overlay(updated_json, overlay_paths)?;
-        let updated_hash = schema_combined_hash(&updated_json, &updated_formulas);
+        let updated_hash = schema_combined_hash(&updated_json, &updated_formulas, lockfile);
         write_schema_bytes(queue_dir, &updated_json, &updated_formulas)
             .with_context(|| format!("writing post-push canonical form for schema '{q_slug}'"))?;
 
