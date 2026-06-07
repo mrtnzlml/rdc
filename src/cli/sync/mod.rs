@@ -479,6 +479,61 @@ pub fn from_catalog_scan_lockfile(
     let mut scan_tombstones: BTreeSet<(String, String)> = BTreeSet::new();
     let mut locked: BTreeMap<(String, String), String> = BTreeMap::new();
 
+    // Augment the lockfile with any catalog objects it's missing (e.g. after
+    // `doctor --rebuild-lock` wipes it). Reference normalization needs the
+    // object's URL in the lockfile to rewrite a remote URL to its `rdc://`
+    // form; without this the remote (URL) and the on-disk snapshot (rdc://)
+    // canonicalize differently and an unchanged object false-conflicts on the
+    // post-rebuild sync. This is a NO-OP whenever the lockfile already tracks
+    // the object (the normal path), so it can't affect a populated env.
+    let augmented = {
+        let mut lf = lockfile.clone();
+        let mut add = |kind: &str, id: u64, url: &str, name: &str| {
+            if lf.slug_for_id(kind, id).is_none() {
+                lf.upsert(
+                    kind,
+                    &crate::slug::slugify(name),
+                    crate::state::ObjectEntry {
+                        id,
+                        url: Some(url.to_string()),
+                        modified_at: None,
+                        content_hash: None,
+                        secrets_hash: None,
+                    },
+                );
+            }
+        };
+        for x in &catalog.labels {
+            add("labels", x.id, &x.url, &x.name);
+        }
+        for x in &catalog.hooks {
+            add("hooks", x.id, &x.url, &x.name);
+        }
+        for x in &catalog.rules {
+            add("rules", x.id, &x.url, &x.name);
+        }
+        for x in &catalog.engines {
+            add("engines", x.id, &x.url, &x.name);
+        }
+        for x in &catalog.workspaces {
+            add("workspaces", x.id, &x.url, &x.name);
+        }
+        for x in &catalog.queues {
+            add("queues", x.id, &x.url, &x.name);
+        }
+        for x in catalog.schemas_by_queue_id.values() {
+            add("schemas", x.id, &x.url, &x.name);
+        }
+        for x in catalog.inboxes_by_queue_id.values() {
+            add("inboxes", x.id, &x.url, &x.name);
+        }
+        for x in &catalog.workflows {
+            add("workflows", x.id, &x.url, &x.name);
+        }
+        lf
+    };
+    let lockfile = &augmented;
+
     // --- labels --------------------------------------------------------
     // Catalog hash: route through the KindCodec so the adapter hash equals
     // the hash of the bytes actually written to disk by the pull driver.
