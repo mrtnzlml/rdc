@@ -6250,8 +6250,12 @@ async fn push_engine_patch_redacts_agenda_id_on_disk() {
         .disk_bytes(&patch_response)
         .expect("codec disk_bytes for patch_response");
     // No overlay → combined_hash of just the json (no sidecars for engines).
+    // Reference-form-agnostic hashing normalizes the engine's self-url via the
+    // lockfile, so the expected hash must use the same (production) lockfile.
+    let lf_loaded =
+        rdc::state::Lockfile::load(&project.path().join(".rdc/state/dev.lock.json")).unwrap();
     let expected_hash =
-        rdc::snapshot::codec::combined_hash(&expected_art.json, &expected_art.sidecars);
+        rdc::snapshot::codec::combined_hash(&expected_art.json, &expected_art.sidecars, &lf_loaded);
 
     assert_eq!(
         recorded_hash, expected_hash,
@@ -6386,7 +6390,9 @@ async fn sync_legacy_unedited_engine_converges_silently() {
     // rdc version would have written. `content_hash` strips `modified_at` via
     // `canonicalize_for_hash`, so the stored hash is sensitive only to the real
     // fields (`agenda_id: "tnt_old_from_previous_rdc"`, `name`, etc.).
-    let old_base_hash = content_hash(old_bytes.as_bytes());
+    // Pre-B (legacy) lockfile: hash recorded in URL form, so seed with an empty
+    // lockfile (no ref normalization) to faithfully simulate the old baseline.
+    let old_base_hash = content_hash(old_bytes.as_bytes(), &rdc::state::Lockfile::default());
     let lockfile_path = project.path().join(".rdc/state/dev.lock.json");
     // The lockfile may or may not exist (init doesn't create it). Build a valid
     // v2 lockfile with the engine entry pre-populated.
@@ -6475,7 +6481,10 @@ async fn sync_legacy_unedited_engine_converges_silently() {
     let codec = rdc::snapshot::codec::codec("engines").expect("engines codec registered");
     let remote_value = engines_body["results"][0].clone();
     let art = codec.disk_bytes(&remote_value).expect("codec disk_bytes");
-    let expected_hash = combined_hash(&art.json, &art.sidecars);
+    // Production recorded the hash with the (post-migration) lockfile, which
+    // normalizes the engine's self-url; match it here.
+    let lf_loaded = rdc::state::Lockfile::load(&lockfile_path).unwrap();
+    let expected_hash = combined_hash(&art.json, &art.sidecars, &lf_loaded);
 
     assert_eq!(
         recorded_hash, expected_hash,
@@ -6593,8 +6602,9 @@ async fn sync_legacy_edited_engine_surfaces_conflict() {
         "{}\n",
         serde_json::to_string_pretty(&base_engine_json).unwrap()
     );
-    // Record the base hash in the lockfile (from the OLD bytes).
-    let base_hash = content_hash(base_bytes.as_bytes());
+    // Record the base hash in the lockfile (from the OLD bytes). Legacy/pre-B
+    // baseline → empty lockfile (URL form, no ref normalization).
+    let base_hash = content_hash(base_bytes.as_bytes(), &rdc::state::Lockfile::default());
 
     // The LOCAL bytes (user has edited the name field — a real change).
     let mut edited = base_engine_json.clone();
@@ -6817,7 +6827,11 @@ async fn sync_keeps_same_named_queues_distinct_across_workspaces() {
     .unwrap();
     // Both queues tracked under DISTINCT slugs — no collapse.
     let queues = lf["objects"]["queues"].as_object().expect("queues map");
-    assert_eq!(queues.len(), 2, "both queues must be tracked distinctly: {lf}");
+    assert_eq!(
+        queues.len(),
+        2,
+        "both queues must be tracked distinctly: {lf}"
+    );
     let mut ids: Vec<u64> = queues.values().map(|e| e["id"].as_u64().unwrap()).collect();
     ids.sort();
     assert_eq!(ids, vec![200, 201], "both queue ids present: {lf}");
@@ -6829,13 +6843,38 @@ async fn sync_keeps_same_named_queues_distinct_across_workspaces() {
     );
 
     // Each queue's files landed in its OWN workspace dir with a distinct slug.
-    let alpha = project.path().join("envs/dev/workspaces/workspace-alpha/queues");
-    let beta = project.path().join("envs/dev/workspaces/workspace-beta/queues");
-    assert_eq!(std::fs::read_dir(&alpha).unwrap().count(), 1, "one queue dir under alpha");
-    assert_eq!(std::fs::read_dir(&beta).unwrap().count(), 1, "one queue dir under beta");
-    let alpha_q = std::fs::read_dir(&alpha).unwrap().next().unwrap().unwrap().file_name();
-    let beta_q = std::fs::read_dir(&beta).unwrap().next().unwrap().unwrap().file_name();
-    assert_ne!(alpha_q, beta_q, "the two same-named queues got distinct slugs/dirs");
+    let alpha = project
+        .path()
+        .join("envs/dev/workspaces/workspace-alpha/queues");
+    let beta = project
+        .path()
+        .join("envs/dev/workspaces/workspace-beta/queues");
+    assert_eq!(
+        std::fs::read_dir(&alpha).unwrap().count(),
+        1,
+        "one queue dir under alpha"
+    );
+    assert_eq!(
+        std::fs::read_dir(&beta).unwrap().count(),
+        1,
+        "one queue dir under beta"
+    );
+    let alpha_q = std::fs::read_dir(&alpha)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name();
+    let beta_q = std::fs::read_dir(&beta)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name();
+    assert_ne!(
+        alpha_q, beta_q,
+        "the two same-named queues got distinct slugs/dirs"
+    );
 
     // Pull-side only: no remote mutations.
     for req in server.received_requests().await.unwrap_or_default() {

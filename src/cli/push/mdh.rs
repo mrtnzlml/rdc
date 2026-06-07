@@ -90,7 +90,7 @@ pub async fn push_dataset(
     // will see remote (after our writes) canonicalize-equal to local
     // and run NoChange, so no spurious overwrite.
     if ops > 0 {
-        let hash = content_hash(&local_raw);
+        let hash = content_hash(&local_raw, &crate::state::Lockfile::default());
         let map = lockfile
             .objects
             .entry("mdh_indexes".to_string())
@@ -415,10 +415,14 @@ fn defs_equivalent(a: &Value, b: &Value) -> bool {
     if let Value::Object(obj) = &mut b {
         obj.remove("v");
     }
-    let canon_a =
-        crate::snapshot::noise::canonicalize_for_hash(&serde_json::to_vec(&a).unwrap_or_default());
-    let canon_b =
-        crate::snapshot::noise::canonicalize_for_hash(&serde_json::to_vec(&b).unwrap_or_default());
+    let canon_a = crate::snapshot::noise::canonicalize_for_hash(
+        &serde_json::to_vec(&a).unwrap_or_default(),
+        &crate::state::Lockfile::default(),
+    );
+    let canon_b = crate::snapshot::noise::canonicalize_for_hash(
+        &serde_json::to_vec(&b).unwrap_or_default(),
+        &crate::state::Lockfile::default(),
+    );
     canon_a == canon_b
 }
 

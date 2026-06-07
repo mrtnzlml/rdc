@@ -664,16 +664,21 @@ impl HashStrategy {
     /// For `Schema`, `code` is unused (the formulas sidecar list is
     /// derived from the queue dir by the caller); use `hash_schema`
     /// instead.
-    fn hash(self, json_bytes: &[u8], code: &Option<String>) -> String {
+    fn hash(
+        self,
+        json_bytes: &[u8],
+        code: &Option<String>,
+        lockfile: &crate::state::Lockfile,
+    ) -> String {
         match self {
-            HashStrategy::Flat => combined_hash(json_bytes, &[]),
+            HashStrategy::Flat => combined_hash(json_bytes, &[], lockfile),
             HashStrategy::Hook => {
                 let sidecars: Vec<(String, Vec<u8>)> = if let Some(c) = code {
                     vec![("code".to_string(), c.as_bytes().to_vec())]
                 } else {
                     vec![]
                 };
-                combined_hash(json_bytes, &sidecars)
+                combined_hash(json_bytes, &sidecars, lockfile)
             }
             HashStrategy::Rule => {
                 let sidecars: Vec<(String, Vec<u8>)> = if let Some(c) = code {
@@ -681,20 +686,25 @@ impl HashStrategy {
                 } else {
                     vec![]
                 };
-                combined_hash(json_bytes, &sidecars)
+                combined_hash(json_bytes, &sidecars, lockfile)
             }
             // For Schema the caller must use `hash_schema` so the
             // formulas sidecar list is included. Falling back to the
             // bare json-only hash here would silently drop the
             // formulas from the canonical hash — exactly the bug
             // this strategy exists to fix.
-            HashStrategy::Schema => combined_hash(json_bytes, &[]),
+            HashStrategy::Schema => combined_hash(json_bytes, &[], lockfile),
         }
     }
 
     /// Compute the canonical lockfile hash for schema items, including
     /// formulas. Use this for `HashStrategy::Schema` instead of `hash`.
-    fn hash_schema(self, json_bytes: &[u8], formulas: &[(String, Vec<u8>)]) -> String {
+    fn hash_schema(
+        self,
+        json_bytes: &[u8],
+        formulas: &[(String, Vec<u8>)],
+        lockfile: &crate::state::Lockfile,
+    ) -> String {
         debug_assert!(matches!(self, HashStrategy::Schema));
         // Frame each formula as `"formulas/<field_id>.py"` to match the
         // labels used by the schemas codec and `schema_combined_hash`.
@@ -702,7 +712,7 @@ impl HashStrategy {
             .iter()
             .map(|(id, b)| (format!("formulas/{id}.py"), b.clone()))
             .collect();
-        combined_hash(json_bytes, &sidecars)
+        combined_hash(json_bytes, &sidecars, lockfile)
     }
 }
 
@@ -803,7 +813,7 @@ fn try_auto_merge(
         HashStrategy::Flat => {
             // Single-file merge. cache_matches_base is exact: the
             // cached JSON bytes hash to the lockfile combined_hash.
-            if &combined_hash(&base_json_bytes, &[]) != base_hash {
+            if &combined_hash(&base_json_bytes, &[], ctx.lockfile) != base_hash {
                 return Ok(None);
             }
             let crate::merge::MergeOutcome::Merged {
@@ -831,7 +841,7 @@ fn try_auto_merge(
             };
             crate::snapshot::writer::write_atomic(local_path, &merged_bytes)?;
             crate::state::base_cache::write(ctx.paths, local_path, &merged_bytes)?;
-            let merged_hash = combined_hash(&merged_bytes, &[]);
+            let merged_hash = combined_hash(&merged_bytes, &[], ctx.lockfile);
             Ok(Some((merged_hash, local_paths, remote_paths)))
         }
         HashStrategy::Hook | HashStrategy::Rule => {
@@ -856,7 +866,7 @@ fn try_auto_merge(
             } else {
                 vec![]
             };
-            let cached_combined = combined_hash(&base_json_bytes, &base_sidecars);
+            let cached_combined = combined_hash(&base_json_bytes, &base_sidecars, ctx.lockfile);
             if &cached_combined != base_hash {
                 return Ok(None);
             }
@@ -923,7 +933,7 @@ fn try_auto_merge(
             } else {
                 vec![]
             };
-            let merged_combined = combined_hash(&merged_json_bytes, &final_sidecars);
+            let merged_combined = combined_hash(&merged_json_bytes, &final_sidecars, ctx.lockfile);
             Ok(Some((merged_combined, local_paths, remote_paths)))
         }
         HashStrategy::Schema => {
@@ -958,7 +968,7 @@ fn try_auto_merge(
                 .iter()
                 .map(|(id, b)| (format!("formulas/{id}.py"), b.clone()))
                 .collect();
-            let cached_combined = combined_hash(&base_json_bytes, &base_framed);
+            let cached_combined = combined_hash(&base_json_bytes, &base_framed, ctx.lockfile);
             if &cached_combined != base_hash {
                 return Ok(None);
             }
@@ -1047,7 +1057,7 @@ fn try_auto_merge(
                 .iter()
                 .map(|(id, b)| (format!("formulas/{id}.py"), b.clone()))
                 .collect();
-            let merged_combined = combined_hash(&merged_json_bytes, &merged_framed);
+            let merged_combined = combined_hash(&merged_json_bytes, &merged_framed, ctx.lockfile);
             Ok(Some((merged_combined, local_paths, remote_paths)))
         }
     }
@@ -1133,8 +1143,14 @@ fn resolve_one_conflict<R: BufRead>(
     // canonicalize-equal JSON pair which short-circuits to
     // `KeepLocal` — silently routing the item to push.
     let local_json_bytes = std::fs::read(&local_path).unwrap_or_default();
-    let local_json_canon = crate::snapshot::noise::canonicalize_for_hash(&local_json_bytes);
-    let remote_json_canon = crate::snapshot::noise::canonicalize_for_hash(&remote_bytes);
+    let local_json_canon = crate::snapshot::noise::canonicalize_for_hash(
+        &local_json_bytes,
+        &crate::state::Lockfile::default(),
+    );
+    let remote_json_canon = crate::snapshot::noise::canonicalize_for_hash(
+        &remote_bytes,
+        &crate::state::Lockfile::default(),
+    );
     let json_canonicalize_equal = local_json_canon == remote_json_canon;
     let sidecar_diverges = match hash_strategy {
         HashStrategy::Hook | HashStrategy::Rule => local_code.as_deref() != remote_code.as_deref(),
@@ -1151,15 +1167,31 @@ fn resolve_one_conflict<R: BufRead>(
     // is what the classifier compares; the prompt should reflect the
     // same view of state.
     let canonical_remote_hash = match hash_strategy {
-        HashStrategy::Schema => hash_strategy.hash_schema(&remote_bytes, &remote_formulas),
-        _ => hash_strategy.hash(&remote_bytes, &remote_code),
+        HashStrategy::Schema => hash_strategy.hash_schema(
+            &remote_bytes,
+            &remote_formulas,
+            &crate::state::Lockfile::default(),
+        ),
+        _ => hash_strategy.hash(
+            &remote_bytes,
+            &remote_code,
+            &crate::state::Lockfile::default(),
+        ),
     };
     let canonical_local_hash = match hash_strategy {
-        HashStrategy::Schema => hash_strategy.hash_schema(&local_json_bytes, &local_formulas),
-        HashStrategy::Hook | HashStrategy::Rule => {
-            hash_strategy.hash(&local_json_bytes, &local_code)
+        HashStrategy::Schema => hash_strategy.hash_schema(
+            &local_json_bytes,
+            &local_formulas,
+            &crate::state::Lockfile::default(),
+        ),
+        HashStrategy::Hook | HashStrategy::Rule => hash_strategy.hash(
+            &local_json_bytes,
+            &local_code,
+            &crate::state::Lockfile::default(),
+        ),
+        HashStrategy::Flat => {
+            hash_strategy.hash(&local_json_bytes, &None, &crate::state::Lockfile::default())
         }
-        HashStrategy::Flat => hash_strategy.hash(&local_json_bytes, &None),
     };
 
     // Defensive sanity: if the canonical hashes already match, the
@@ -2519,10 +2551,17 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                                 // For schema kinds, use hash_schema so the
                                 // formula sidecars are included in the hash.
                                 let h = if matches!(refs.hash_strategy, HashStrategy::Schema) {
-                                    refs.hash_strategy
-                                        .hash_schema(bytes, &refs.restore_formulas)
+                                    refs.hash_strategy.hash_schema(
+                                        bytes,
+                                        &refs.restore_formulas,
+                                        &crate::state::Lockfile::default(),
+                                    )
                                 } else {
-                                    refs.hash_strategy.hash(bytes, &refs.restore_code)
+                                    refs.hash_strategy.hash(
+                                        bytes,
+                                        &refs.restore_code,
+                                        &crate::state::Lockfile::default(),
+                                    )
                                 };
                                 if let (Some(id), url, modified_at) =
                                     (refs.id, refs.url.clone(), refs.modified_at.clone())
@@ -3111,7 +3150,10 @@ pub async fn run(
                         Ok(b) => b,
                         Err(_) => continue,
                     };
-                    let local_hash = crate::state::content_hash(&local_bytes);
+                    let local_hash = crate::state::content_hash(
+                        &local_bytes,
+                        &crate::state::Lockfile::default(),
+                    );
                     let base = ctx
                         .lockfile
                         .objects
@@ -3245,7 +3287,7 @@ mod tests {
         // BASE bytes — what the lockfile records.
         let base = mk_label(99, "Audit Hold", "#aabbcc");
         let base_bytes = label_bytes(&base);
-        let base_hash = content_hash(&base_bytes);
+        let base_hash = content_hash(&base_bytes, &Lockfile::default());
 
         // LOCAL edit — different color from base; lives on disk.
         let local_edit = mk_label(99, "Audit Hold", "#ff0000");
@@ -3289,8 +3331,8 @@ mod tests {
     }
 
     fn classified_for(fixture: &ConflictFixture) -> Vec<ClassifiedItem> {
-        let local_hash = content_hash(&label_bytes(&fixture.local_edit));
-        let remote_hash = content_hash(&label_bytes(&fixture.remote_label));
+        let local_hash = content_hash(&label_bytes(&fixture.local_edit), &Lockfile::default());
+        let remote_hash = content_hash(&label_bytes(&fixture.remote_label), &Lockfile::default());
         let base_hash = fixture
             .lockfile
             .objects
@@ -3358,7 +3400,7 @@ mod tests {
         // Lockfile aligned to remote hash so the push driver's drift
         // check accepts the force-push.
         let remote_bytes = label_bytes(&fixture.remote_label);
-        let remote_hash = content_hash(&remote_bytes);
+        let remote_hash = content_hash(&remote_bytes, &Lockfile::default());
         let recorded = fixture
             .lockfile
             .objects
@@ -3425,7 +3467,7 @@ mod tests {
             .and_then(|m| m.get("audit-hold"))
             .and_then(|e| e.content_hash.clone())
             .unwrap();
-        assert_eq!(recorded, content_hash(&remote_bytes));
+        assert_eq!(recorded, content_hash(&remote_bytes, &Lockfile::default()));
     }
 
     /// Scripted `s\n` ([s]kip): the resolver writes a shadow file next
@@ -3681,7 +3723,7 @@ mod tests {
         let local_bytes = label_bytes(&local_label);
         let local_path = paths.labels_dir().join("audit-hold.json");
         std::fs::write(&local_path, &local_bytes).unwrap();
-        let base_hash = content_hash(&local_bytes);
+        let base_hash = content_hash(&local_bytes, &Lockfile::default());
 
         let mut lockfile = Lockfile::default();
         lockfile.upsert(
@@ -3983,7 +4025,7 @@ mod tests {
             slug: "audit-hold".to_string(),
             class: SyncClass::LocalDeleteRemoteEdit,
             local_hash: None,
-            remote_hash: Some(content_hash(&remote_bytes)),
+            remote_hash: Some(content_hash(&remote_bytes, &Lockfile::default())),
             base_hash: Some("base".to_string()),
         }];
         let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
@@ -4155,8 +4197,11 @@ mod tests {
         .unwrap();
 
         let base_code = "def base():\n    return 1\n".to_string();
-        let base_combined =
-            crate::state::hook_combined_hash(&local_json_with_newline, &Some(base_code));
+        let base_combined = crate::state::hook_combined_hash(
+            &local_json_with_newline,
+            &Some(base_code),
+            &Lockfile::default(),
+        );
         let mut lockfile = Lockfile::default();
         lockfile.upsert(
             "hooks",
@@ -4174,10 +4219,12 @@ mod tests {
 
         let (remote_json_full, remote_code) =
             crate::snapshot::hook::serialize_hook(&remote_hook).unwrap();
-        let remote_combined = crate::state::hook_combined_hash(&remote_json_full, &remote_code);
+        let remote_combined =
+            crate::state::hook_combined_hash(&remote_json_full, &remote_code, &Lockfile::default());
         let local_combined = crate::state::hook_combined_hash(
             &local_json_with_newline,
             &Some("def local_edit():\n    return 2\n".to_string()),
+            &Lockfile::default(),
         );
         let classified = vec![ClassifiedItem {
             kind: "hooks".to_string(),
@@ -4347,7 +4394,8 @@ mod tests {
         let remote_hook = &catalog.hooks[0];
         let (remote_json_full, remote_code) =
             crate::snapshot::hook::serialize_hook(remote_hook).unwrap();
-        let expected = crate::state::hook_combined_hash(&remote_json_full, &remote_code);
+        let expected =
+            crate::state::hook_combined_hash(&remote_json_full, &remote_code, &Lockfile::default());
         assert_eq!(
             recorded, expected,
             "lockfile base should equal remote combined hash after [k]"
@@ -4404,8 +4452,10 @@ mod tests {
         // bytes match either before or post-write (both acceptable
         // shapes).
         let json_after = std::fs::read(&json_path).unwrap();
-        let json_canon_before = crate::snapshot::noise::canonicalize_for_hash(&json_before);
-        let json_canon_after = crate::snapshot::noise::canonicalize_for_hash(&json_after);
+        let json_canon_before =
+            crate::snapshot::noise::canonicalize_for_hash(&json_before, &Lockfile::default());
+        let json_canon_after =
+            crate::snapshot::noise::canonicalize_for_hash(&json_after, &Lockfile::default());
         assert_eq!(
             json_canon_before, json_canon_after,
             "JSON canonical form must remain stable on [r] (was identical before)"
@@ -4477,8 +4527,11 @@ mod tests {
 
         // Base: hook had code = "base" — both sides have since diverged.
         let base_code = "def base():\n    return 1\n".to_string();
-        let base_combined =
-            crate::state::hook_combined_hash(&local_json_with_newline, &Some(base_code));
+        let base_combined = crate::state::hook_combined_hash(
+            &local_json_with_newline,
+            &Some(base_code),
+            &Lockfile::default(),
+        );
         let mut lockfile = Lockfile::default();
         lockfile.upsert(
             "hooks",
@@ -4496,10 +4549,12 @@ mod tests {
 
         let (remote_json_full, remote_code) =
             crate::snapshot::hook::serialize_hook(&remote_hook).unwrap();
-        let remote_combined = crate::state::hook_combined_hash(&remote_json_full, &remote_code);
+        let remote_combined =
+            crate::state::hook_combined_hash(&remote_json_full, &remote_code, &Lockfile::default());
         let local_combined = crate::state::hook_combined_hash(
             &local_json_with_newline,
             &Some("def local_edit():\n    return 2\n".to_string()),
+            &Lockfile::default(),
         );
         let classified = vec![ClassifiedItem {
             kind: "hooks".to_string(),
@@ -4639,8 +4694,11 @@ mod tests {
 
         // Base: hook had code = "base" — both sides have since diverged.
         let base_code = "def base():\n    return 1\n".to_string();
-        let base_combined =
-            crate::state::hook_combined_hash(&local_json_with_newline, &Some(base_code));
+        let base_combined = crate::state::hook_combined_hash(
+            &local_json_with_newline,
+            &Some(base_code),
+            &Lockfile::default(),
+        );
         let mut lockfile = Lockfile::default();
         lockfile.upsert(
             "hooks",
@@ -4658,9 +4716,11 @@ mod tests {
 
         let (remote_json_full, remote_code) =
             crate::snapshot::hook::serialize_hook(&remote_hook).unwrap();
-        let remote_combined = crate::state::hook_combined_hash(&remote_json_full, &remote_code);
+        let remote_combined =
+            crate::state::hook_combined_hash(&remote_json_full, &remote_code, &Lockfile::default());
         // Local has no .py → local hash = `hook_combined_hash(json, None)`.
-        let local_combined = crate::state::hook_combined_hash(&local_json_with_newline, &None);
+        let local_combined =
+            crate::state::hook_combined_hash(&local_json_with_newline, &None, &Lockfile::default());
         let classified = vec![ClassifiedItem {
             kind: "hooks".to_string(),
             slug: slug.to_string(),
@@ -4792,7 +4852,11 @@ mod tests {
         let formula_path = queue_dir.join("formulas/amount_total.py");
         std::fs::write(&formula_path, &base_formulas[0].1).unwrap();
 
-        let base_combined = crate::state::schema_combined_hash(&base_json_bytes, &base_formulas);
+        let base_combined = crate::state::schema_combined_hash(
+            &base_json_bytes,
+            &base_formulas,
+            &Lockfile::default(),
+        );
         let mut lockfile = Lockfile::default();
         lockfile.upsert(
             "schemas",
@@ -4830,8 +4894,11 @@ mod tests {
         .unwrap();
         let (remote_json_bytes, remote_formulas) =
             crate::snapshot::schema::serialize_schema(&remote_schema).unwrap();
-        let remote_combined =
-            crate::state::schema_combined_hash(&remote_json_bytes, &remote_formulas);
+        let remote_combined = crate::state::schema_combined_hash(
+            &remote_json_bytes,
+            &remote_formulas,
+            &Lockfile::default(),
+        );
 
         // Construct a queue + workspace + catalog so resolve_conflicts'
         // schema lookup arm finds the entry.
@@ -4884,7 +4951,11 @@ mod tests {
         // Local hash uses scan-side formula bytes.
         let mut local_formulas = base_formulas.clone();
         local_formulas[0].1 = b"amount_due + amount_tax + amount_fee".to_vec();
-        let local_combined = crate::state::schema_combined_hash(&base_json_bytes, &local_formulas);
+        let local_combined = crate::state::schema_combined_hash(
+            &base_json_bytes,
+            &local_formulas,
+            &Lockfile::default(),
+        );
 
         let classified = vec![ClassifiedItem {
             kind: "schemas".to_string(),
@@ -5060,6 +5131,7 @@ mod tests {
         let expected_hash = combined_hash(
             &remote_json_stripped,
             &[("code".to_string(), remote_code_bytes)],
+            &Lockfile::default(),
         );
 
         // Seed the lockfile with a base hash that differs from both local and
@@ -5076,7 +5148,11 @@ mod tests {
         let mut base_bytes = serde_json::to_vec_pretty(&base_json).unwrap();
         base_bytes.push(b'\n');
         let base_code = "def validate(payload):\n    pass\n".to_string();
-        let base_hash = combined_hash(&base_bytes, &[("code".to_string(), base_code.into_bytes())]);
+        let base_hash = combined_hash(
+            &base_bytes,
+            &[("code".to_string(), base_code.into_bytes())],
+            &Lockfile::default(),
+        );
         let mut lockfile = Lockfile::default();
         lockfile.upsert(
             "hooks",
@@ -5095,6 +5171,7 @@ mod tests {
         let local_hash = combined_hash(
             &local_json_bytes,
             &[("code".to_string(), local_code_str.into_bytes())],
+            &Lockfile::default(),
         );
 
         // Remote hash via the codec (what the classifier would compute).
@@ -5255,7 +5332,8 @@ mod tests {
         let codec = crate::snapshot::codec::codec("schemas").unwrap();
         let schema_value = serde_json::to_value(&schema).unwrap();
         let schema_art = codec.disk_bytes(&schema_value).unwrap();
-        let schema_hash = combined_hash(&schema_art.json, &schema_art.sidecars);
+        let schema_hash =
+            combined_hash(&schema_art.json, &schema_art.sidecars, &Lockfile::default());
 
         let mut lockfile = Lockfile::default();
         // Workspace + queue entries so the slug resolver finds them.
@@ -5352,7 +5430,9 @@ mod tests {
 
         // The lockfile hash must be combined_hash(post-overlay json, framed sidecars)
         // so the next sync sees Clean.
-        let expected_hash = codec.base_hash(&schema_value).unwrap();
+        let expected_hash = codec
+            .base_hash(&schema_value, &Lockfile::default())
+            .unwrap();
         let recorded = lockfile
             .objects
             .get("schemas")

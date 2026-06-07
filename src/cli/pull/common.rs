@@ -596,7 +596,7 @@ pub fn decide_pull_action(
     base_hash: Option<&str>,
     remote_bytes: &[u8],
 ) -> Result<(PullAction, String)> {
-    let remote_hash = content_hash(remote_bytes);
+    let remote_hash = content_hash(remote_bytes, &Lockfile::default());
 
     let Some(base) = base_hash else {
         return Ok((PullAction::Write, remote_hash));
@@ -608,7 +608,7 @@ pub fn decide_pull_action(
 
     let local_bytes =
         std::fs::read(local_path).with_context(|| format!("reading {}", local_path.display()))?;
-    let local_hash = content_hash(&local_bytes);
+    let local_hash = content_hash(&local_bytes, &Lockfile::default());
 
     // Short-circuit: canonicalized local == canonicalized remote means
     // any difference is noise (modifier etc.). Don't rewrite the file —
@@ -698,7 +698,7 @@ pub fn apply_pull_action(
             if let Some(p) = paths {
                 crate::state::base_cache::write(p, local_path, &local_bytes)?;
             }
-            Ok(content_hash(&local_bytes))
+            Ok(content_hash(&local_bytes, &Lockfile::default()))
         }
         PullAction::NoChange => {
             // Local and remote canonicalize equal — preserve disk bytes.
@@ -774,7 +774,7 @@ fn shadow_file_conflict(
     // Use local hash so the lockfile still gets a sensible entry.
     let local_bytes =
         std::fs::read(local_path).with_context(|| format!("reading {}", local_path.display()))?;
-    Ok(content_hash(&local_bytes))
+    Ok(content_hash(&local_bytes, &Lockfile::default()))
 }
 
 /// Drive the spec §8.3 resolver TUI on stdin/stderr. On
@@ -813,7 +813,7 @@ fn resolve_conflict_interactive(
         Resolution::KeepLocal => {
             let local_bytes = std::fs::read(local_path)
                 .with_context(|| format!("reading {}", local_path.display()))?;
-            Ok(content_hash(&local_bytes))
+            Ok(content_hash(&local_bytes, &Lockfile::default()))
         }
         Resolution::KeepRemote => {
             write_atomic(local_path, remote_bytes)?;
@@ -821,7 +821,7 @@ fn resolve_conflict_interactive(
         }
         Resolution::Edit(edited) => {
             write_atomic(local_path, &edited)?;
-            Ok(content_hash(&edited))
+            Ok(content_hash(&edited, &Lockfile::default()))
         }
         Resolution::EditWithMarkers(edited) => {
             // Hunk-by-hunk walker with at least one skipped hunk — bytes
@@ -839,7 +839,7 @@ fn resolve_conflict_interactive(
                 ));
                 Ok(prior.to_string())
             } else {
-                Ok(content_hash(&edited))
+                Ok(content_hash(&edited, &Lockfile::default()))
             }
         }
         Resolution::Skip => {
@@ -914,7 +914,7 @@ mod tests {
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"{ \"local\": true }").unwrap();
         let remote = b"{}";
-        let base = content_hash(remote);
+        let base = content_hash(remote, &Lockfile::default());
         let (action, _hash) = decide_pull_action(&path, Some(&base), remote).unwrap();
         assert_eq!(action, PullAction::KeepLocal);
     }
@@ -925,7 +925,7 @@ mod tests {
         let path = dir.path().join("x.json");
         let original = b"{ \"original\": true }";
         std::fs::write(&path, original).unwrap();
-        let base = content_hash(original);
+        let base = content_hash(original, &Lockfile::default());
         let remote = b"{ \"updated\": true }";
         let (action, _hash) = decide_pull_action(&path, Some(&base), remote).unwrap();
         assert_eq!(action, PullAction::Write);
@@ -1033,7 +1033,7 @@ mod tests {
         // Remote has modified_at = t2 (newer); same other content
         let remote = b"{\"name\":\"x\",\"modified_at\":\"t2\"}";
         // Base hash matches both (canonical strips modified_at)
-        let base = content_hash(remote);
+        let base = content_hash(remote, &Lockfile::default());
         let (action, _hash) = decide_pull_action(&path, Some(&base), remote).unwrap();
         assert_eq!(action, PullAction::Write);
     }
@@ -1048,7 +1048,7 @@ mod tests {
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"{\"name\":\"x\"}").unwrap();
         let remote = b"{\"name\":\"x\",\"modified_at\":\"t2\"}";
-        let base = content_hash(remote);
+        let base = content_hash(remote, &Lockfile::default());
         let (action, _hash) = decide_pull_action(&path, Some(&base), remote).unwrap();
         assert_eq!(action, PullAction::NoChange);
     }
@@ -1096,7 +1096,7 @@ mod tests {
             PullAction::Conflict,
             &path,
             remote,
-            content_hash(remote),
+            content_hash(remote, &Lockfile::default()),
             false, // non-interactive → shadow_file_conflict
             &p,
             "test",
@@ -1133,7 +1133,7 @@ mod tests {
             PullAction::Conflict,
             &path,
             remote,
-            content_hash(remote),
+            content_hash(remote, &Lockfile::default()),
             false,
             &p,
             "test",
@@ -1141,7 +1141,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(recorded, content_hash(local));
+        assert_eq!(recorded, content_hash(local, &Lockfile::default()));
     }
 
     /// Re-running the same conflict pull twice with shadow-skip must keep

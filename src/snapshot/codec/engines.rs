@@ -24,7 +24,10 @@ impl KindCodec for Engines {
         strip_hidden_fields_recursive(&mut v);
         let mut json = serde_json::to_vec_pretty(&v)?;
         json.push(b'\n');
-        Ok(DiskArtifact { json, sidecars: vec![] })
+        Ok(DiskArtifact {
+            json,
+            sidecars: vec![],
+        })
     }
 
     fn create_body(&self, body: &mut Value) {

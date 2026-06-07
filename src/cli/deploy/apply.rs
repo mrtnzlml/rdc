@@ -514,7 +514,7 @@ pub(crate) async fn run(
             } else {
                 vec![]
             };
-            crate::snapshot::codec::combined_hash(&remote_json_for_hash, &sidecars)
+            crate::snapshot::codec::combined_hash(&remote_json_for_hash, &sidecars, tgt_lockfile)
         };
         let in_sync = tgt_lockfile
             .objects
@@ -687,7 +687,8 @@ pub(crate) async fn run(
         let (remote_json_full, remote_code) = crate::snapshot::rule::serialize_rule(remote)?;
         let stripped = maybe_strip_overlay(remote_json_full.clone(), overlay_paths)?;
         let stripped = portabilize_for_hash(stripped, tgt_lockfile)?;
-        let remote_combined_hash = crate::state::rule_combined_hash(&stripped, &remote_code);
+        let remote_combined_hash =
+            crate::state::rule_combined_hash(&stripped, &remote_code, tgt_lockfile);
         let in_sync = tgt_lockfile
             .objects
             .get("rules")
@@ -1087,7 +1088,8 @@ pub(crate) async fn run(
             crate::snapshot::schema::serialize_schema(&remote_schema)?;
         let stripped = maybe_strip_overlay(remote_json_full.clone(), overlay_paths)?;
         let stripped = portabilize_for_hash(stripped, tgt_lockfile)?;
-        let remote_combined_hash = crate::state::schema_combined_hash(&stripped, &remote_formulas);
+        let remote_combined_hash =
+            crate::state::schema_combined_hash(&stripped, &remote_formulas, tgt_lockfile);
         let in_sync = tgt_lockfile
             .objects
             .get("schemas")
@@ -2060,7 +2062,7 @@ fn write_back_flat<T: serde::Serialize>(
     // Strip overlay paths so the recorded hash matches what `tgt_drift_status`
     // (and the pull driver) would compute from the same remote response.
     let json_for_hash = maybe_strip_overlay(disk_json.clone(), overlay_paths)?;
-    let hash = combined_hash(&json_for_hash, &sidecars);
+    let hash = combined_hash(&json_for_hash, &sidecars, tgt_lockfile);
     // Write the post-overlay bytes to disk (overlay fields are tgt-specific
     // overrides, so they must NOT appear in the stored snapshot either).
     crate::state::base_cache::write_disk_and_cache(tgt_paths, file_path, &json_for_hash)?;
@@ -2243,7 +2245,7 @@ fn write_back_hook(
         } else {
             vec![]
         };
-        crate::snapshot::codec::combined_hash(&json_for_hash, &sidecars)
+        crate::snapshot::codec::combined_hash(&json_for_hash, &sidecars, tgt_lockfile)
     };
     upsert_after_write_back(
         tgt_lockfile,
@@ -2271,7 +2273,7 @@ fn write_back_rule(
     // Hash over POST-overlay bytes so it matches what pull::rules records in
     // the lockfile (same framing as the drift check above).
     let json_for_hash = maybe_strip_overlay(json_bytes, overlay_paths)?;
-    let hash = rule_combined_hash(&json_for_hash, &code);
+    let hash = rule_combined_hash(&json_for_hash, &code, tgt_lockfile);
     upsert_after_write_back(
         tgt_lockfile,
         "rules",
@@ -2299,7 +2301,7 @@ fn write_back_schema(
     // Hash over POST-overlay bytes so it matches what pull::queues records in
     // the lockfile (same framing as the drift check above).
     let json_for_hash = maybe_strip_overlay(json_bytes, overlay_paths)?;
-    let hash = schema_combined_hash(&json_for_hash, &formula_parts);
+    let hash = schema_combined_hash(&json_for_hash, &formula_parts, tgt_lockfile);
     upsert_after_write_back(
         tgt_lockfile,
         "schemas",
@@ -2335,7 +2337,7 @@ fn write_back_email_template(
         response.id,
         &response.url,
         response.modified_at(),
-        combined_hash(&bytes_for_hash, &[]),
+        combined_hash(&bytes_for_hash, &[], tgt_lockfile),
     );
     Ok(())
 }
@@ -2394,7 +2396,7 @@ mod tests {
             crate::snapshot::codec::codec("engines").expect("engines codec must be registered");
         let art = codec.disk_bytes(&response_value).unwrap();
         // No overlay → maybe_strip_overlay is a no-op.
-        let expected_hash = combined_hash(&art.json, &art.sidecars);
+        let expected_hash = combined_hash(&art.json, &art.sidecars, &Lockfile::default());
 
         let recorded_hash = lockfile
             .objects
@@ -2471,7 +2473,7 @@ mod tests {
         let art = codec.disk_bytes(&response_value).unwrap();
         let post_overlay =
             crate::cli::pull::common::maybe_strip_overlay(art.json, Some(&overlay_paths)).unwrap();
-        let expected_hash = combined_hash(&post_overlay, &art.sidecars);
+        let expected_hash = combined_hash(&post_overlay, &art.sidecars, &Lockfile::default());
 
         let recorded_hash = lockfile
             .objects
@@ -2487,7 +2489,11 @@ mod tests {
 
         // The hash must differ from the pre-overlay hash (regression guard).
         let pre_overlay_art = codec.disk_bytes(&response_value).unwrap();
-        let pre_overlay_hash = combined_hash(&pre_overlay_art.json, &pre_overlay_art.sidecars);
+        let pre_overlay_hash = combined_hash(
+            &pre_overlay_art.json,
+            &pre_overlay_art.sidecars,
+            &Lockfile::default(),
+        );
         assert_ne!(
             recorded_hash, pre_overlay_hash,
             "pre-overlay hash must differ from post-overlay hash (overlay strip must be effective)"

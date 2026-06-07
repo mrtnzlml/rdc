@@ -509,7 +509,7 @@ pub fn from_catalog_scan_lockfile(
             Err(_) => continue,
         };
         let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
-        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
+        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
         remote_hashes.insert(("labels".to_string(), slug), hash);
     }
 
@@ -521,7 +521,7 @@ pub fn from_catalog_scan_lockfile(
             Ok(b) => b,
             Err(_) => continue,
         };
-        let hash = crate::state::content_hash(&bytes);
+        let hash = crate::state::content_hash(&bytes, &crate::state::Lockfile::default());
         scan_changes.insert(("labels".to_string(), slug.clone()), hash);
     }
 
@@ -557,7 +557,7 @@ pub fn from_catalog_scan_lockfile(
             )
             .unwrap_or_else(|_| vec![]);
             if !json.is_empty() {
-                let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
+                let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
                 remote_hashes.insert(("organization".to_string(), "self".to_string()), hash);
             }
         }
@@ -608,7 +608,7 @@ pub fn from_catalog_scan_lockfile(
             Err(_) => continue,
         };
         let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
-        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
+        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
         remote_hashes.insert(("workflows".to_string(), slug), hash);
     }
     if let Some(map) = lockfile.objects.get("workflows") {
@@ -666,7 +666,7 @@ pub fn from_catalog_scan_lockfile(
             Err(_) => continue,
         };
         let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
-        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
+        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
         remote_hashes.insert(("workflow_steps".to_string(), composite_key), hash);
     }
     if let Some(map) = lockfile.objects.get("workflow_steps") {
@@ -728,14 +728,14 @@ pub fn from_catalog_scan_lockfile(
             Err(_) => continue,
         };
         let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
-        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
+        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
         remote_hashes.insert(("workspaces".to_string(), slug), hash);
     }
     for (slug, path) in &changes.workspaces {
         if let Ok(bytes) = std::fs::read(path) {
             scan_changes.insert(
                 ("workspaces".to_string(), slug.clone()),
-                crate::state::content_hash(&bytes),
+                crate::state::content_hash(&bytes, &crate::state::Lockfile::default()),
             );
         }
     }
@@ -788,14 +788,14 @@ pub fn from_catalog_scan_lockfile(
             Err(_) => continue,
         };
         let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
-        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
+        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
         remote_hashes.insert(("engines".to_string(), slug), hash);
     }
     for (slug, path) in &changes.engines {
         if let Ok(bytes) = std::fs::read(path) {
             scan_changes.insert(
                 ("engines".to_string(), slug.clone()),
-                crate::state::content_hash(&bytes),
+                crate::state::content_hash(&bytes, &crate::state::Lockfile::default()),
             );
         }
     }
@@ -855,14 +855,14 @@ pub fn from_catalog_scan_lockfile(
             Err(_) => continue,
         };
         let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
-        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
+        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
         remote_hashes.insert(("engine_fields".to_string(), composite_key), hash);
     }
     for (slug, path) in &changes.engine_fields {
         if let Ok(bytes) = std::fs::read(path) {
             scan_changes.insert(
                 ("engine_fields".to_string(), slug.clone()),
-                crate::state::content_hash(&bytes),
+                crate::state::content_hash(&bytes, &crate::state::Lockfile::default()),
             );
         }
     }
@@ -918,7 +918,7 @@ pub fn from_catalog_scan_lockfile(
             Err(_) => continue,
         };
         let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
-        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
+        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
         remote_hashes.insert(("hooks".to_string(), slug), hash);
     }
     for (slug, json_path) in &changes.hooks {
@@ -941,7 +941,11 @@ pub fn from_catalog_scan_lockfile(
         } else {
             None
         };
-        let hash = crate::state::hook_combined_hash(&json_bytes, &code);
+        let hash = crate::state::hook_combined_hash(
+            &json_bytes,
+            &code,
+            &crate::state::Lockfile::default(),
+        );
         scan_changes.insert(("hooks".to_string(), slug.clone()), hash);
     }
     for slug in tombstones.hooks.keys() {
@@ -984,7 +988,7 @@ pub fn from_catalog_scan_lockfile(
             Err(_) => continue,
         };
         let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
-        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
+        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
         remote_hashes.insert(("rules".to_string(), slug), hash);
     }
     for (slug, json_path) in &changes.rules {
@@ -998,7 +1002,11 @@ pub fn from_catalog_scan_lockfile(
         } else {
             None
         };
-        let hash = crate::state::rule_combined_hash(&json_bytes, &code);
+        let hash = crate::state::rule_combined_hash(
+            &json_bytes,
+            &code,
+            &crate::state::Lockfile::default(),
+        );
         scan_changes.insert(("rules".to_string(), slug.clone()), hash);
     }
     for slug in tombstones.rules.keys() {
@@ -1078,7 +1086,7 @@ pub fn from_catalog_scan_lockfile(
             )
         {
             let q_json = crate::cli::pull::common::portabilize_proposed(&q_json, lockfile);
-            let q_hash = crate::snapshot::codec::combined_hash(&q_json, &q_art.sidecars);
+            let q_hash = crate::snapshot::codec::combined_hash(&q_json, &q_art.sidecars, lockfile);
             remote_hashes.insert(("queues".to_string(), q_slug.clone()), q_hash);
         }
 
@@ -1094,7 +1102,7 @@ pub fn from_catalog_scan_lockfile(
             )
         {
             let s_json = crate::cli::pull::common::portabilize_proposed(&s_json, lockfile);
-            let s_hash = crate::snapshot::codec::combined_hash(&s_json, &s_art.sidecars);
+            let s_hash = crate::snapshot::codec::combined_hash(&s_json, &s_art.sidecars, lockfile);
             remote_hashes.insert(("schemas".to_string(), q_slug.clone()), s_hash);
         }
 
@@ -1108,7 +1116,7 @@ pub fn from_catalog_scan_lockfile(
             )
         {
             let i_json = crate::cli::pull::common::portabilize_proposed(&i_json, lockfile);
-            let i_hash = crate::snapshot::codec::combined_hash(&i_json, &i_art.sidecars);
+            let i_hash = crate::snapshot::codec::combined_hash(&i_json, &i_art.sidecars, lockfile);
             remote_hashes.insert(("inboxes".to_string(), q_slug.clone()), i_hash);
         }
     }
@@ -1128,7 +1136,7 @@ pub fn from_catalog_scan_lockfile(
         if let Ok(bytes) = std::fs::read(path) {
             scan_changes.insert(
                 ("queues".to_string(), slug.clone()),
-                crate::state::content_hash(&bytes),
+                crate::state::content_hash(&bytes, &crate::state::Lockfile::default()),
             );
         }
     }
@@ -1136,7 +1144,7 @@ pub fn from_catalog_scan_lockfile(
         if let Ok(bytes) = std::fs::read(path) {
             scan_changes.insert(
                 ("inboxes".to_string(), slug.clone()),
-                crate::state::content_hash(&bytes),
+                crate::state::content_hash(&bytes, &crate::state::Lockfile::default()),
             );
         }
     }
@@ -1151,7 +1159,11 @@ pub fn from_catalog_scan_lockfile(
             None => continue,
         };
         let formulas = crate::snapshot::schema::read_local_formulas(queue_dir).unwrap_or_default();
-        let hash = crate::state::schema_combined_hash(&json_bytes, &formulas);
+        let hash = crate::state::schema_combined_hash(
+            &json_bytes,
+            &formulas,
+            &crate::state::Lockfile::default(),
+        );
         scan_changes.insert(("schemas".to_string(), slug.clone()), hash);
     }
 
@@ -1228,14 +1240,14 @@ pub fn from_catalog_scan_lockfile(
             Err(_) => continue,
         };
         let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
-        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars);
+        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
         remote_hashes.insert(("email_templates".to_string(), compound), hash);
     }
     for (slug, path) in &changes.email_templates {
         if let Ok(bytes) = std::fs::read(path) {
             scan_changes.insert(
                 ("email_templates".to_string(), slug.clone()),
-                crate::state::content_hash(&bytes),
+                crate::state::content_hash(&bytes, &crate::state::Lockfile::default()),
             );
         }
     }
@@ -1330,7 +1342,7 @@ mod tests {
         let (json_bytes, code) = serialize_hook(h).unwrap();
         let stripped =
             crate::cli::pull::common::maybe_strip_overlay(json_bytes, overlay_paths).unwrap();
-        hook_combined_hash(&stripped, &code)
+        hook_combined_hash(&stripped, &code, &Lockfile::default())
     }
 
     /// Regression for the conflict-resolution bypass: when both local

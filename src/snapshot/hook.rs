@@ -91,8 +91,7 @@ fn split_hook_code(json_value: &mut Value) -> Option<String> {
 /// code string. Used by pull/push drivers to compute `hook_combined_hash`
 /// before deciding whether to write or send.
 pub fn serialize_hook(hook: &Hook) -> Result<(Vec<u8>, Option<String>)> {
-    let mut json_value = serde_json::to_value(hook)
-        .context("serializing hook to value")?;
+    let mut json_value = serde_json::to_value(hook).context("serializing hook to value")?;
 
     let code = split_hook_code(&mut json_value);
 
@@ -111,8 +110,7 @@ pub fn serialize_hook(hook: &Hook) -> Result<(Vec<u8>, Option<String>)> {
         crate::snapshot::key_order::HOOK_KEY_ORDER,
     );
 
-    let mut bytes = serde_json::to_vec_pretty(&json_value)
-        .context("serializing hook json")?;
+    let mut bytes = serde_json::to_vec_pretty(&json_value).context("serializing hook json")?;
     bytes.push(b'\n');
     Ok((bytes, code))
 }
@@ -132,8 +130,12 @@ pub fn serialize_hook(hook: &Hook) -> Result<(Vec<u8>, Option<String>)> {
 /// (which shouldn't happen for `queues` but might if someone hand-edits
 /// the file) pass through untouched rather than panicking.
 fn sort_queues(value: &mut Value) {
-    let Some(obj) = value.as_object_mut() else { return };
-    let Some(Value::Array(queues)) = obj.get_mut("queues") else { return };
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let Some(Value::Array(queues)) = obj.get_mut("queues") else {
+        return;
+    };
     if !queues.iter().all(|v| matches!(v, Value::String(_))) {
         return;
     }
@@ -170,8 +172,8 @@ pub fn read_hook_value(dir: &Path, slug: &str) -> Result<Value> {
     let json_path = dir.join(format!("{slug}.json"));
     let raw = std::fs::read_to_string(&json_path)
         .with_context(|| format!("reading {}", json_path.display()))?;
-    let mut value: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("parsing {}", json_path.display()))?;
+    let mut value: Value =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", json_path.display()))?;
 
     let ext = hook_code_extension_from_value(&value);
     let primary = dir.join(format!("{slug}.{ext}"));
@@ -186,8 +188,8 @@ pub fn read_hook_value(dir: &Path, slug: &str) -> Result<Value> {
         if alt.exists() { Some(alt) } else { None }
     };
     if let Some(p) = code_path {
-        let code = std::fs::read_to_string(&p)
-            .with_context(|| format!("reading {}", p.display()))?;
+        let code =
+            std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
         // The sidecar file is the byte-exact canonical form (write_hook
         // preserves bytes). No trailing-newline normalization on read either.
         if let Some(config) = value.get_mut("config").and_then(|c| c.as_object_mut()) {
@@ -349,7 +351,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write_hook(dir.path(), "sample", &js_hook()).unwrap();
         assert!(dir.path().join("sample.json").exists());
-        assert!(dir.path().join("sample.js").exists(), "JS hook should write .js sidecar");
+        assert!(
+            dir.path().join("sample.js").exists(),
+            "JS hook should write .js sidecar"
+        );
         assert!(
             !dir.path().join("sample.py").exists(),
             "JS hook must not write a .py sidecar"
@@ -373,7 +378,10 @@ mod tests {
         // Pre-create a leftover .py sidecar from a previous python run.
         std::fs::write(dir.path().join("sample.py"), b"# old\n").unwrap();
         write_hook(dir.path(), "sample", &js_hook()).unwrap();
-        assert!(!dir.path().join("sample.py").exists(), ".py should be swept");
+        assert!(
+            !dir.path().join("sample.py").exists(),
+            ".py should be swept"
+        );
         assert!(dir.path().join("sample.js").exists());
     }
 
@@ -383,7 +391,10 @@ mod tests {
         // Pre-create a leftover .js sidecar from a previous nodejs run.
         std::fs::write(dir.path().join("sample.js"), b"// old\n").unwrap();
         write_hook(dir.path(), "sample", &sample_hook()).unwrap();
-        assert!(!dir.path().join("sample.js").exists(), ".js should be swept");
+        assert!(
+            !dir.path().join("sample.js").exists(),
+            ".js should be swept"
+        );
         assert!(dir.path().join("sample.py").exists());
     }
 
@@ -410,15 +421,26 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write_hook(dir.path(), "h", &hook).unwrap();
         let raw = std::fs::read_to_string(dir.path().join("h.json")).unwrap();
-        let p = |k: &str| raw.find(&format!("\"{k}\":")).unwrap_or_else(|| panic!("missing {k}"));
+        let p = |k: &str| {
+            raw.find(&format!("\"{k}\":"))
+                .unwrap_or_else(|| panic!("missing {k}"))
+        };
         // Listed keys: id, name, events, queues come first (in HOOK_KEY_ORDER).
         // Then unlisted typed fields in struct decl order: url, type, config.
         // Then unlisted extras in API order: sideload, guide,
         // extension_image_url, metadata.
         let order = [
-            "id", "name", "events", "queues",
-            "url", "type", "config",
-            "sideload", "guide", "extension_image_url", "metadata",
+            "id",
+            "name",
+            "events",
+            "queues",
+            "url",
+            "type",
+            "config",
+            "sideload",
+            "guide",
+            "extension_image_url",
+            "metadata",
         ];
         let mut last = 0;
         for k in order {
@@ -448,9 +470,15 @@ mod tests {
         let hook: Hook = serde_json::from_value(v).unwrap();
         write_hook(dir.path(), "h", &hook).unwrap();
         let raw = std::fs::read_to_string(dir.path().join("h.json")).unwrap();
-        assert!(!raw.contains("modified_at"), "modified_at must not appear on disk: {raw}");
+        assert!(
+            !raw.contains("modified_at"),
+            "modified_at must not appear on disk: {raw}"
+        );
         // modifier stays — only modified_at is in HIDDEN_FIELDS today.
-        assert!(raw.contains("modifier"), "modifier must still appear on disk: {raw}");
+        assert!(
+            raw.contains("modifier"),
+            "modifier must still appear on disk: {raw}"
+        );
     }
 
     #[test]
@@ -480,13 +508,24 @@ mod tests {
         // assert the prescribed ordering. Using `find` on quoted form
         // avoids matching the same substring inside an unrelated value.
         let q = |k: &str| format!("\"{k}\":");
-        let pos = |k: &str| raw.find(&q(k)).unwrap_or_else(|| panic!("missing key {k} in: {raw}"));
+        let pos = |k: &str| {
+            raw.find(&q(k))
+                .unwrap_or_else(|| panic!("missing key {k} in: {raw}"))
+        };
         let order = [
-            "id", "name", "description", "active",
-            "events", "settings", "queues", "run_after",
+            "id",
+            "name",
+            "description",
+            "active",
+            "events",
+            "settings",
+            "queues",
+            "run_after",
             // Then unlisted-typed-fields in struct decl order,
             // then alphabetical extras.
-            "url", "type", "config",
+            "url",
+            "type",
+            "config",
             "metadata",
         ];
         let mut last = 0;
@@ -506,9 +545,12 @@ mod tests {
         // canonicalize_for_hash must produce the same bytes for both.
         let ordered = br#"{"id":1,"name":"n","events":[],"queues":[]}"#;
         let scrambled = br#"{"queues":[],"name":"n","id":1,"events":[]}"#;
-        let h1 = crate::state::content_hash(ordered);
-        let h2 = crate::state::content_hash(scrambled);
-        assert_eq!(h1, h2, "content_hash must be invariant under key reordering");
+        let h1 = crate::state::content_hash(ordered, &crate::state::Lockfile::default());
+        let h2 = crate::state::content_hash(scrambled, &crate::state::Lockfile::default());
+        assert_eq!(
+            h1, h2,
+            "content_hash must be invariant under key reordering"
+        );
     }
 
     #[test]
@@ -612,7 +654,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let err = read_hook(dir.path(), "nope").unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("nope.json"), "error should name the path: {msg}");
+        assert!(
+            msg.contains("nope.json"),
+            "error should name the path: {msg}"
+        );
     }
 
     #[test]

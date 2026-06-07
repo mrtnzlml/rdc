@@ -1,6 +1,6 @@
 use super::common::{
-    apply_pull_action, maybe_strip_overlay, record_object, skip_on_permission_denied, PullAction,
-    PullCtx,
+    PullAction, PullCtx, apply_pull_action, maybe_strip_overlay, record_object,
+    skip_on_permission_denied,
 };
 use crate::log::{Action, Log};
 use crate::model::Rule;
@@ -17,13 +17,17 @@ const KIND: &str = "rules";
 ///
 /// Uses `combined_hash(json, [("trigger_condition", bytes)])` which matches
 /// the sidecar label the rules codec uses, reproducing the legacy formula.
-fn local_rule_combined_hash(json_bytes: &[u8], code: &Option<String>) -> String {
+fn local_rule_combined_hash(
+    json_bytes: &[u8],
+    code: &Option<String>,
+    lockfile: &crate::state::Lockfile,
+) -> String {
     let sidecars: Vec<(String, Vec<u8>)> = if let Some(c) = code {
         vec![("trigger_condition".to_string(), c.as_bytes().to_vec())]
     } else {
         vec![]
     };
-    crate::snapshot::codec::combined_hash(json_bytes, &sidecars)
+    crate::snapshot::codec::combined_hash(json_bytes, &sidecars, lockfile)
 }
 
 /// Phase 1: list all rules from the API.
@@ -104,7 +108,8 @@ pub async fn process(
             // what is actually written to disk. Using codec.base_hash(&value)
             // (PRE-overlay) would diverge whenever an overlay is configured,
             // causing phantom drift on every subsequent pull.
-            let remote_combined_hash = local_rule_combined_hash(&proposed_json, &proposed_code);
+            let remote_combined_hash =
+                local_rule_combined_hash(&proposed_json, &proposed_code, ctx.lockfile);
 
             let base_hash = ctx
                 .lockfile
@@ -116,7 +121,8 @@ pub async fn process(
                 (None, _) => PullAction::Write,
                 (_, None) => PullAction::Write,
                 (Some(base), Some(local_json)) => {
-                    let local_combined = local_rule_combined_hash(local_json, &pre_local_code);
+                    let local_combined =
+                        local_rule_combined_hash(local_json, &pre_local_code, ctx.lockfile);
                     let local_matches = local_combined == base;
                     let remote_matches = remote_combined_hash == base;
                     match (local_matches, remote_matches) {
@@ -162,7 +168,7 @@ pub async fn process(
                 }
                 PullAction::KeepLocal => {
                     let local_json = pre_local_json.as_ref().unwrap();
-                    local_rule_combined_hash(local_json, &pre_local_code)
+                    local_rule_combined_hash(local_json, &pre_local_code, ctx.lockfile)
                 }
                 PullAction::NoChange => remote_combined_hash,
                 PullAction::Conflict => {
@@ -230,10 +236,14 @@ pub async fn process(
                     if preserve_base {
                         match base_hash.as_deref() {
                             Some(prior) => prior.to_string(),
-                            None => local_rule_combined_hash(&resolved_json, &resolved_code),
+                            None => local_rule_combined_hash(
+                                &resolved_json,
+                                &resolved_code,
+                                ctx.lockfile,
+                            ),
                         }
                     } else {
-                        local_rule_combined_hash(&resolved_json, &resolved_code)
+                        local_rule_combined_hash(&resolved_json, &resolved_code, ctx.lockfile)
                     }
                 }
             };

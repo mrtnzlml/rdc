@@ -1,6 +1,6 @@
 use super::common::{
-    apply_pull_action, maybe_strip_overlay, record_object, skip_on_permission_denied, PullAction,
-    PullCtx,
+    PullAction, PullCtx, apply_pull_action, maybe_strip_overlay, record_object,
+    skip_on_permission_denied,
 };
 use crate::log::{Action, Log};
 use crate::model::Hook;
@@ -132,7 +132,7 @@ pub async fn process(
             // (PRE-overlay) would diverge whenever an overlay is configured,
             // causing phantom drift on every subsequent pull.
             let remote_combined_hash =
-                crate::state::hook_combined_hash(&proposed_json, &proposed_code);
+                crate::state::hook_combined_hash(&proposed_json, &proposed_code, ctx.lockfile);
 
             let base_hash = ctx
                 .lockfile
@@ -148,7 +148,7 @@ pub async fn process(
                     // so the three-way merge works correctly after the
                     // one-time rehash.
                     let local_combined =
-                        crate::state::hook_combined_hash(local_json, &pre_local_code);
+                        crate::state::hook_combined_hash(local_json, &pre_local_code, ctx.lockfile);
                     let local_matches = local_combined == base;
                     let remote_matches = remote_combined_hash == base;
                     match (local_matches, remote_matches) {
@@ -206,7 +206,7 @@ pub async fn process(
                 }
                 PullAction::KeepLocal => {
                     let local_json = pre_local_json.as_ref().unwrap();
-                    crate::state::hook_combined_hash(local_json, &pre_local_code)
+                    crate::state::hook_combined_hash(local_json, &pre_local_code, ctx.lockfile)
                 }
                 PullAction::NoChange => {
                     // Combined hash is already equal — no file writes needed.
@@ -302,12 +302,18 @@ pub async fn process(
                         // a prior base).
                         match base_hash.as_deref() {
                             Some(prior) => prior.to_string(),
-                            None => {
-                                crate::state::hook_combined_hash(&resolved_json, &resolved_code)
-                            }
+                            None => crate::state::hook_combined_hash(
+                                &resolved_json,
+                                &resolved_code,
+                                ctx.lockfile,
+                            ),
                         }
                     } else {
-                        crate::state::hook_combined_hash(&resolved_json, &resolved_code)
+                        crate::state::hook_combined_hash(
+                            &resolved_json,
+                            &resolved_code,
+                            ctx.lockfile,
+                        )
                     }
                 }
             };

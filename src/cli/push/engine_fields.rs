@@ -59,7 +59,7 @@ pub async fn push(
                 )
                 .context("codec disk_bytes for created engine field")?;
             let created_bytes = maybe_strip_overlay(created_art.json, overlay_paths)?;
-            let created_hash = combined_hash(&created_bytes, &created_art.sidecars);
+            let created_hash = combined_hash(&created_bytes, &created_art.sidecars, lockfile);
             write_atomic(path, &created_bytes)
                 .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
             lockfile.upsert(
@@ -132,7 +132,7 @@ pub async fn push(
             )
             .context("codec disk_bytes for remote engine field")?;
         let remote_bytes = maybe_strip_overlay(remote_art.json, overlay_paths)?;
-        let remote_combined = combined_hash(&remote_bytes, &remote_art.sidecars);
+        let remote_combined = combined_hash(&remote_bytes, &remote_art.sidecars, lockfile);
         let mut payload_to_send = payload_field;
         if remote_combined != base {
             use crate::cli::resolve::{PushDriftOutcome, resolve_push_drift};
@@ -214,7 +214,7 @@ pub async fn push(
             )
             .context("codec disk_bytes for updated engine field")?;
         let updated_bytes = maybe_strip_overlay(updated_art.json, overlay_paths)?;
-        let updated_hash = combined_hash(&updated_bytes, &updated_art.sidecars);
+        let updated_hash = combined_hash(&updated_bytes, &updated_art.sidecars, lockfile);
         crate::state::base_cache::write_disk_and_cache(paths, path, &updated_bytes).with_context(
             || format!("writing post-push canonical form for engine field '{slug}'"),
         )?;

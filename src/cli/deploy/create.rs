@@ -57,6 +57,7 @@ fn codec_bytes_and_hash(
     kind: &str,
     created: &Value,
     overlay_paths: Option<&std::collections::BTreeMap<String, Value>>,
+    lockfile: &Lockfile,
 ) -> Result<(Vec<u8>, String)> {
     let (disk_json, sidecars) = if let Some(c) = crate::snapshot::codec::codec(kind) {
         let art = c
@@ -70,7 +71,7 @@ fn codec_bytes_and_hash(
         (b, vec![])
     };
     let json_for_hash = maybe_strip_overlay(disk_json, overlay_paths)?;
-    let hash = combined_hash(&json_for_hash, &sidecars);
+    let hash = combined_hash(&json_for_hash, &sidecars, lockfile);
     Ok((json_for_hash, hash))
 }
 
@@ -170,7 +171,7 @@ pub async fn create_workspace(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()>
         .with_context(|| format!("POST /workspaces (creating '{slug}')"))?;
     let created_value = serde_json::to_value(&created).context("serializing created workspace")?;
     // Workspaces have no overlay accessor today; pass None.
-    let (bytes, hash) = codec_bytes_and_hash("workspaces", &created_value, None)?;
+    let (bytes, hash) = codec_bytes_and_hash("workspaces", &created_value, None, ctx.tgt_lockfile)?;
     let tgt_file = ctx.tgt_paths.workspace_dir(slug).join("workspace.json");
     crate::state::base_cache::write_disk_and_cache(ctx.tgt_paths, &tgt_file, &bytes)?;
     ctx.tgt_lockfile.upsert(
@@ -228,7 +229,7 @@ pub async fn create_schema(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<
         .with_context(|| format!("creating {}", tgt_queue_dir.display()))?;
     let (json_bytes, formula_parts) = serialize_schema(&created)?;
     write_schema_bytes(&tgt_queue_dir, &json_bytes, &formula_parts)?;
-    let h = schema_combined_hash(&json_bytes, &formula_parts);
+    let h = schema_combined_hash(&json_bytes, &formula_parts, ctx.tgt_lockfile);
     ctx.tgt_lockfile.upsert(
         "schemas",
         queue_slug,
@@ -284,7 +285,8 @@ pub async fn create_queue(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
     let tgt_file = tgt_queue_dir.join("queue.json");
     let created_value = serde_json::to_value(&created).context("serializing created queue")?;
     let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.queue(queue_slug));
-    let (bytes, hash) = codec_bytes_and_hash("queues", &created_value, overlay_paths)?;
+    let (bytes, hash) =
+        codec_bytes_and_hash("queues", &created_value, overlay_paths, ctx.tgt_lockfile)?;
     crate::state::base_cache::write_disk_and_cache(ctx.tgt_paths, &tgt_file, &bytes)?;
     ctx.tgt_lockfile.upsert(
         "queues",
@@ -344,7 +346,7 @@ async fn refresh_queue_email_templates(
                 id: t.id,
                 url: Some(t.url.clone()),
                 modified_at: t.modified_at().map(|s| s.to_string()),
-                content_hash: Some(content_hash(&bytes)),
+                content_hash: Some(content_hash(&bytes, ctx.tgt_lockfile)),
                 secrets_hash: None,
             },
         );
@@ -388,7 +390,8 @@ pub async fn create_inbox(ctx: &mut CreateCtx<'_>, queue_slug: &str) -> Result<(
         .join("inbox.json");
     let created_value = serde_json::to_value(&created).context("serializing created inbox")?;
     let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.inbox(queue_slug));
-    let (bytes, hash) = codec_bytes_and_hash("inboxes", &created_value, overlay_paths)?;
+    let (bytes, hash) =
+        codec_bytes_and_hash("inboxes", &created_value, overlay_paths, ctx.tgt_lockfile)?;
     crate::state::base_cache::write_disk_and_cache(ctx.tgt_paths, &tgt_inbox, &bytes)?;
     ctx.tgt_lockfile.upsert(
         "inboxes",
@@ -572,7 +575,7 @@ pub async fn create_hook(
         .get("code")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let h = hook_combined_hash(&json_bytes, &code);
+    let h = hook_combined_hash(&json_bytes, &code, ctx.tgt_lockfile);
     // Record the hash of what we just injected so a subsequent `rdc sync`
     // on the target env sees the secrets as already synced (no spurious
     // second PATCH).
@@ -616,7 +619,7 @@ pub async fn create_rule(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
         .with_context(|| format!("creating {}", tgt_rules_dir.display()))?;
     let (json_bytes, code) = serialize_rule(&created)?;
     write_rule(&tgt_rules_dir, slug, &created)?;
-    let h = rule_combined_hash(&json_bytes, &code);
+    let h = rule_combined_hash(&json_bytes, &code, ctx.tgt_lockfile);
     ctx.tgt_lockfile.upsert(
         "rules",
         slug,
@@ -658,7 +661,8 @@ pub async fn create_label(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
     let tgt_file = tgt_labels_dir.join(format!("{slug}.json"));
     let created_value = serde_json::to_value(&created).context("serializing created label")?;
     let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.label(slug));
-    let (bytes, hash) = codec_bytes_and_hash("labels", &created_value, overlay_paths)?;
+    let (bytes, hash) =
+        codec_bytes_and_hash("labels", &created_value, overlay_paths, ctx.tgt_lockfile)?;
     crate::state::base_cache::write_disk_and_cache(ctx.tgt_paths, &tgt_file, &bytes)?;
     ctx.tgt_lockfile.upsert(
         "labels",
@@ -715,7 +719,7 @@ pub async fn create_email_template(ctx: &mut CreateCtx<'_>, key: &str) -> Result
             id: created.id,
             url: Some(created.url.clone()),
             modified_at: created.modified_at().map(|s| s.to_string()),
-            content_hash: Some(content_hash(&bytes)),
+            content_hash: Some(content_hash(&bytes, ctx.tgt_lockfile)),
             secrets_hash: None,
         },
     );
@@ -751,7 +755,8 @@ pub async fn create_engine(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<()> {
     let tgt_file = tgt_engine_dir.join("engine.json");
     let created_value = serde_json::to_value(&created).context("serializing created engine")?;
     let overlay_paths = ctx.tgt_overlay.as_ref().and_then(|ov| ov.engine(slug));
-    let (bytes, hash) = codec_bytes_and_hash("engines", &created_value, overlay_paths)?;
+    let (bytes, hash) =
+        codec_bytes_and_hash("engines", &created_value, overlay_paths, ctx.tgt_lockfile)?;
     crate::state::base_cache::write_disk_and_cache(ctx.tgt_paths, &tgt_file, &bytes)?;
     ctx.tgt_lockfile.upsert(
         "engines",
@@ -826,7 +831,12 @@ pub async fn create_engine_field(ctx: &mut CreateCtx<'_>, slug: &str) -> Result<
         .tgt_overlay
         .as_ref()
         .and_then(|ov| ov.engine_field(slug));
-    let (bytes, hash) = codec_bytes_and_hash("engine_fields", &created_value, overlay_paths)?;
+    let (bytes, hash) = codec_bytes_and_hash(
+        "engine_fields",
+        &created_value,
+        overlay_paths,
+        ctx.tgt_lockfile,
+    )?;
     crate::state::base_cache::write_disk_and_cache(ctx.tgt_paths, &tgt_file, &bytes)?;
     ctx.tgt_lockfile.upsert(
         "engine_fields",

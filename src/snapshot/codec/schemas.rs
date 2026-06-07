@@ -142,9 +142,15 @@ mod tests {
         let v = schema_value_with_formula();
         let schema: crate::model::Schema = serde_json::from_value(v.clone()).unwrap();
         let (json, formulas) = crate::snapshot::schema::serialize_schema(&schema).unwrap();
-        let legacy = crate::state::schema_combined_hash(&json, &formulas);
+        let legacy = crate::state::schema_combined_hash(
+            &json,
+            &formulas,
+            &crate::state::Lockfile::default(),
+        );
 
-        let codec_hash = Schemas.base_hash(&v).unwrap();
+        let codec_hash = Schemas
+            .base_hash(&v, &crate::state::Lockfile::default())
+            .unwrap();
         assert_eq!(
             codec_hash, legacy,
             "codec hash must match legacy schema_combined_hash"
