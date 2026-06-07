@@ -490,9 +490,22 @@ pub fn from_catalog_scan_lockfile(
         let mut lf = lockfile.clone();
         let mut add = |kind: &str, id: u64, url: &str, name: &str| {
             if lf.slug_for_id(kind, id).is_none() {
+                // Allocate a UNIQUE slug (against slugs already in this kind)
+                // so a same-name sibling never clobbers an existing entry.
+                // Plain `slugify` + `upsert` would overwrite the tracked
+                // object's id + base hash and collapse both objects onto one
+                // slug — dropping one and making the survivor false-classify
+                // as RemoteCreate every sync (perpetual non-idempotency).
+                // Mirrors the per-kind `slugify_unique` the classify loops use.
+                let used: std::collections::HashSet<String> = lf
+                    .objects
+                    .get(kind)
+                    .map(|m| m.keys().cloned().collect())
+                    .unwrap_or_default();
+                let slug = crate::slug::slugify_unique(name, &used);
                 lf.upsert(
                     kind,
-                    &crate::slug::slugify(name),
+                    &slug,
                     crate::state::ObjectEntry {
                         id,
                         url: Some(url.to_string()),
@@ -1514,6 +1527,76 @@ mod tests {
             item.remote_hash,
             item.base_hash,
         );
+    }
+
+    /// Regression for the catalog-augment slug-collision clobber: two
+    /// objects of the same kind share a name (→ same base slug), and only
+    /// the first is already tracked in the lockfile. The pre-rebuild augment
+    /// (which seeds catalog objects missing from the lockfile so URL→rdc://
+    /// normalization works) MUST allocate a *unique* slug for the untracked
+    /// sibling instead of `slugify(name)` + clobbering `upsert`. Before the
+    /// fix the augment overwrote the tracked object's entry (id + base hash)
+    /// with the sibling at the same slug key, which (a) dropped the tracked
+    /// object's base hash so an unchanged object false-classified as
+    /// RemoteCreate every sync (perpetual non-idempotency) and (b) collapsed
+    /// both siblings onto one slug so the second object was lost. Verified
+    /// live against org 214757: `Trial vendor` ×2 (labels) plus seeded
+    /// `Collision Hook/Rule/Queue/Workspace` pairs churned forever.
+    #[test]
+    fn from_catalog_scan_lockfile_same_name_collision_yields_distinct_slugs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+
+        // Two distinct remote hooks share a name → both slugify to the same
+        // base slug "collision-hook". Fresh env: the lockfile is empty, so the
+        // augment seeds BOTH (neither is tracked yet).
+        let hook_a = mk_hook(
+            100,
+            "Collision Hook",
+            "def a():\n    return 1\n",
+            "2026-05-14T08:00:00Z",
+        );
+        let hook_b = mk_hook(
+            200,
+            "Collision Hook",
+            "def b():\n    return 2\n",
+            "2026-05-14T08:00:00Z",
+        );
+
+        let lockfile = Lockfile::default();
+        let (_scanned, changes, tombstones) =
+            crate::cli::push::scan::scan(&paths, &lockfile).unwrap();
+
+        let catalog = catalog_with_hooks(vec![hook_a, hook_b]);
+        let classified =
+            from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile, None).unwrap();
+
+        // Both siblings must surface as DISTINCT RemoteCreate items. Before the
+        // fix the augment used `slugify(name)` + clobbering `upsert`, collapsing
+        // both onto "collision-hook" so only one survived (the other object was
+        // silently lost and the survivor re-pulled forever).
+        let hooks: Vec<_> = classified.iter().filter(|c| c.kind == "hooks").collect();
+        assert_eq!(
+            hooks.len(),
+            2,
+            "two same-name remote hooks must classify as two items, got {}: {:?}",
+            hooks.len(),
+            hooks
+                .iter()
+                .map(|c| (&c.slug, &c.class))
+                .collect::<Vec<_>>()
+        );
+        let first = classified
+            .iter()
+            .find(|c| c.kind == "hooks" && c.slug == "collision-hook")
+            .expect("first sibling keeps the base slug");
+        let second = classified
+            .iter()
+            .find(|c| c.kind == "hooks" && c.slug == "collision-hook-2")
+            .expect("second sibling must get a deduped slug (collision-hook-2), not collapse");
+        assert_eq!(first.class, SyncClass::RemoteCreate);
+        assert_eq!(second.class, SyncClass::RemoteCreate);
     }
 
     /// Regression for hypothesis A (overlay-strip parity): when the env has
