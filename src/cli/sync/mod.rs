@@ -1342,7 +1342,23 @@ mod tests {
         let (json_bytes, code) = serialize_hook(h).unwrap();
         let stripped =
             crate::cli::pull::common::maybe_strip_overlay(json_bytes, overlay_paths).unwrap();
-        hook_combined_hash(&stripped, &code, &Lockfile::default())
+        // Simulate the pull driver's FINAL recorded base (after the portabilize
+        // post-pass): the hook is in the lockfile, so its self-url normalizes to
+        // `rdc://`. Hash with a minimal lockfile holding this hook so the base
+        // matches the classifier's reference-form-agnostic remote hash.
+        let mut lf = Lockfile::default();
+        lf.upsert(
+            "hooks",
+            &crate::slug::slugify(&h.name),
+            ObjectEntry {
+                id: h.id,
+                url: Some(h.url.clone()),
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        hook_combined_hash(&stripped, &code, &lf)
     }
 
     /// Regression for the conflict-resolution bypass: when both local
@@ -1507,11 +1523,27 @@ mod tests {
         let overlay_paths = overlay.as_ref().and_then(|o| o.hook(slug));
         let base_hash = pull_driver_hash(&base_hook, overlay_paths);
 
-        // Local file: the disk form is the post-strip canonical (matches
-        // what pull would have written).
+        // Local file: the disk form is the post-strip canonical AND
+        // portabilized to `rdc://` form — matching what the pull post-pass
+        // writes to disk in production. A minimal lockfile holding this hook
+        // lets the self-url normalize identically to base/remote.
         let (base_json_full, base_code) = serialize_hook(&base_hook).unwrap();
         let base_json_stripped =
             crate::cli::pull::common::maybe_strip_overlay(base_json_full, overlay_paths).unwrap();
+        let mut local_lf = Lockfile::default();
+        local_lf.upsert(
+            "hooks",
+            &crate::slug::slugify(slug),
+            ObjectEntry {
+                id: 42,
+                url: Some(base_hook.url.clone()),
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        let base_json_stripped =
+            crate::cli::pull::common::portabilize_proposed(&base_json_stripped, &local_lf);
         let local_json_path = paths.hooks_dir().join(format!("{slug}.json"));
         let local_py_path = paths.hooks_dir().join(format!("{slug}.py"));
         std::fs::write(&local_json_path, &base_json_stripped).unwrap();
