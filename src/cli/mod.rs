@@ -193,6 +193,38 @@ pub enum Command {
         #[arg(long = "only", value_name = "SELECTOR", action = clap::ArgAction::Append)]
         only: Vec<String>,
     },
+    /// Migrate a source env's snapshot into a target env's snapshot, locally.
+    ///
+    /// Pure-local, ZERO remote calls: copies `envs/<src>/` into `envs/<tgt>/`,
+    /// renaming slugs per the auto-matched mapping, rewriting portable
+    /// `rdc://<kind>/<slug>` references from src slugs to tgt slugs, and
+    /// applying the target env's overlay. Afterwards review the changes with
+    /// `git diff` and run `rdc sync <tgt>` to push them (sync creates objects
+    /// in dependency order). This replaces the remote half of `rdc deploy`
+    /// with an offline, reviewable file transform.
+    Migrate {
+        /// Source environment (e.g. `test`). Picks interactively when omitted.
+        #[arg(add = ArgValueCandidates::new(env_name_candidates))]
+        src: Option<String>,
+        /// Target environment (e.g. `prod`). Picks interactively when omitted.
+        #[arg(add = ArgValueCandidates::new(env_name_candidates))]
+        tgt: Option<String>,
+        /// Mirror semantics: delete tgt snapshot objects that don't exist in
+        /// src. Default is additive (extras in tgt are left intact). The
+        /// deletions are local file removals — review `git diff` before sync.
+        #[arg(long)]
+        mirror: bool,
+        /// Print the plan (per-file source -> target remap, prunes) and exit
+        /// without writing anything.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Limit the migration to the given `<kind>/<slug>` selectors.
+        /// Repeatable. Globs: `*` matches within the slug segment (e.g.
+        /// `hooks/*`, `schemas/cost-*`). Cross-kind: `*/cost-invoices`.
+        /// Without any `--only`, migrate operates on the whole snapshot.
+        #[arg(long = "only", value_name = "SELECTOR", action = clap::ArgAction::Append)]
+        only: Vec<String>,
+    },
     /// Set or refresh an env's API token. Validates the token before
     /// writing to `secrets/<env>.secrets.json` (mode 0600 on Unix).
     ///
@@ -324,6 +356,16 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 crate::cli::deploy::run::run(&src, &tgt, mirror, interactive, dry_run, force_overwrite_drift, only)
             })
             .await
+        }
+        Some(Command::Migrate { src, tgt, mirror, dry_run, only }) => {
+            let src = crate::cli::env_picker::pick_env("Migrate from which env (source)?", src)?;
+            let tgt = crate::cli::env_picker::pick_env_excluding(
+                "Migrate to which env (target)?",
+                tgt,
+                &[&src],
+            )?;
+            // Pure-local: no remote calls, so no 401-retry wrapper needed.
+            crate::cli::migrate::run(&src, &tgt, mirror, dry_run, only)
         }
         Some(Command::Auth { env, token, username }) => {
             let env = crate::cli::env_picker::pick_env("Set token for which env?", env)?;
