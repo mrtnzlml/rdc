@@ -146,50 +146,28 @@ pub enum Command {
         #[arg(short = 'v', long = "verbose", requires = "watch")]
         verbose: bool,
     },
-    /// Deploy a source env to a target env in one shot.
+    /// Removed: replaced by `rdc migrate <src> <tgt>` + `rdc sync <tgt>`.
     ///
-    /// First-class cross-env operation: bootstraps a fresh target (POSTing
-    /// missing resources in dependency order, rewriting cross-references
-    /// from src URLs to tgt URLs as it goes) AND patches existing ones for
-    /// field-level deltas. Diff-before-apply: the full per-object diff
-    /// (create bodies, update diffs, delete bodies) prints before the
-    /// confirmation prompt so the user commits with the actual delta in
-    /// hand. Idempotent: re-running on an in-sync target performs zero
-    /// write API calls.
+    /// Hidden from help. Invoking it emits a guiding error pointing at the
+    /// replacement workflow rather than a generic "unrecognized subcommand".
+    /// Accepts (and ignores) the former positionals/flags so the error is
+    /// reached regardless of how the old command was invoked.
+    #[command(hide = true)]
     Deploy {
-        /// Source environment (e.g. `test`). Picks interactively when omitted.
-        #[arg(add = ArgValueCandidates::new(env_name_candidates))]
+        /// Former source environment (ignored).
         src: Option<String>,
-        /// Target environment (e.g. `prod`). Picks interactively when omitted.
-        #[arg(add = ArgValueCandidates::new(env_name_candidates))]
+        /// Former target environment (ignored).
         tgt: Option<String>,
-        /// Mirror semantics: delete tgt objects that don't exist in src.
-        /// Default is additive (extras in tgt are left intact). Mirror is
-        /// always gated behind an explicit confirmation, regardless of
-        /// `--yes`, because the deletions are irreversible.
+        /// Former `--mirror` flag (ignored).
         #[arg(long)]
         mirror: bool,
-        /// Print the full diff and exit without making any remote changes.
-        /// Useful for previewing a promotion in CI or before promoting
-        /// to a sensitive environment. The same code paths run that
-        /// would run in a real deploy (URL rewriting, drift checks,
-        /// overlay application) — only the actual POST/PATCH/DELETE
-        /// calls are suppressed.
+        /// Former `--dry-run` flag (ignored).
         #[arg(long = "dry-run")]
         dry_run: bool,
-        /// Auto-overwrite target objects that have been edited out-of-band
-        /// since the last `rdc sync <tgt>`. Without this flag, the deploy
-        /// prompts per-object [k]/[o]/[s]/[a] on TTY, or refuses on
-        /// non-TTY / `--yes` to prevent a CI script from silently blowing
-        /// away ad-hoc edits made via the Rossum UI.
+        /// Former `--force-overwrite-drift` flag (ignored).
         #[arg(long = "force-overwrite-drift")]
         force_overwrite_drift: bool,
-        /// Limit the deploy to the given `<kind>/<slug>` selectors. Repeatable.
-        /// Globs: `*` matches within the slug segment (e.g. `hooks/*`,
-        /// `schemas/cost-*`). Cross-kind: `*/cost-invoices` matches any kind.
-        /// Email templates use the compound `<ws>/<q>/<tpl>` slug, e.g.
-        /// `email_templates/main/cost-invoices/rejection`. Without any
-        /// `--only`, deploy operates on the whole snapshot (default).
+        /// Former `--only` selectors (ignored).
         #[arg(long = "only", value_name = "SELECTOR", action = clap::ArgAction::Append)]
         only: Vec<String>,
     },
@@ -343,19 +321,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 .await
             }
         }
-        Some(Command::Deploy { src, tgt, mirror, dry_run, force_overwrite_drift, only }) => {
-            let src = crate::cli::env_picker::pick_env("Deploy from which env (source)?", src)?;
-            let tgt = crate::cli::env_picker::pick_env_excluding(
-                "Deploy to which env (target)?",
-                tgt,
-                &[&src],
-            )?;
-            let interactive = crate::cli::resolve::is_interactive(cli.yes);
-            with_401_retry_envs(&[&src, &tgt], || {
-                let only = only.clone();
-                crate::cli::deploy::run::run(&src, &tgt, mirror, interactive, dry_run, force_overwrite_drift, only)
-            })
-            .await
+        Some(Command::Deploy { .. }) => {
+            anyhow::bail!(
+                "`rdc deploy` has been replaced. Run `rdc migrate <src> <tgt>` to produce \
+                 the target snapshot locally, review the diff, then `rdc sync <tgt>` to push it."
+            )
         }
         Some(Command::Migrate { src, tgt, mirror, dry_run, only }) => {
             let src = crate::cli::env_picker::pick_env("Migrate from which env (source)?", src)?;
@@ -410,62 +380,6 @@ where
         }
         other => other,
     }
-}
-
-/// Like [`with_401_retry`] but for commands that juggle more than one env
-/// (notably `rdc deploy`, which holds clients for both src and tgt).
-///
-/// On a 401 we use the [`EnvTag`](crate::api::EnvTag) that the failing
-/// client attached to the error chain to refresh the right env's token,
-/// then retry the operation once. If no tag is present (a 401 from an
-/// untagged code path), we fall back to prompting the user which env to
-/// refresh — that keeps the "never fail with a raw 401" promise even for
-/// callers that haven't opted into env-tagging yet.
-async fn with_401_retry_envs<F, Fut>(envs: &[&str], op: F) -> anyhow::Result<()>
-where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<()>>,
-{
-    let first = op().await;
-    match first {
-        Err(e) if crate::api::anyhow_has_status(&e, 401) => {
-            let target_env = match crate::api::anyhow_status_env(&e, 401) {
-                Some(env_from_tag) => env_from_tag,
-                None => prompt_pick_env_for_401(envs)?,
-            };
-            crate::cli::auth::refresh_token_for_401(&target_env).await?;
-            op().await
-        }
-        other => other,
-    }
-}
-
-/// Interactive fallback when a 401 isn't tagged with an env. Lets the
-/// user pick which env's token to refresh. Bails (with the original 401
-/// hint) on non-TTY contexts.
-fn prompt_pick_env_for_401(envs: &[&str]) -> anyhow::Result<String> {
-    use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() {
-        anyhow::bail!(
-            "Rossum API returned 401 for one of: {}. \
-             Re-run on a TTY to refresh interactively, or run \
-             `rdc auth <env> --token <new-token>` for the affected env.",
-            envs.join(", ")
-        );
-    }
-    if envs.len() == 1 {
-        return Ok(envs[0].to_string());
-    }
-    let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
-    log.event(
-        crate::log::Action::Auth,
-        "token rejected (401); which env's token needs refreshing?",
-    );
-    let choices: Vec<String> = envs.iter().map(|s| s.to_string()).collect();
-    let picked = inquire::Select::new("Refresh token for which env?", choices)
-        .prompt()
-        .map_err(|e| anyhow::anyhow!("env prompt failed: {e}"))?;
-    Ok(picked)
 }
 
 /// Parse a human-friendly duration string (`30s`, `2m`, `5m`, `1h`) into
