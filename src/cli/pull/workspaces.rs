@@ -74,7 +74,7 @@ pub async fn process(
 
             let hash = crate::snapshot::codec::codec(KIND)
                 .unwrap()
-                .base_hash(&value)
+                .base_hash(&value, ctx.lockfile)
                 .context("hashing workspace")?;
 
             record_object(

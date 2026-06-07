@@ -144,10 +144,13 @@ mod tests {
         let v = sample_rule_with_condition();
         let rule: crate::model::Rule = serde_json::from_value(v.clone()).unwrap();
         let (json, code) = crate::snapshot::rule::serialize_rule(&rule).unwrap();
-        let legacy = crate::state::rule_combined_hash(&json, &code);
+        let legacy =
+            crate::state::rule_combined_hash(&json, &code, &crate::state::Lockfile::default());
 
         let codec = Rules;
-        let codec_hash = codec.base_hash(&v).unwrap();
+        let codec_hash = codec
+            .base_hash(&v, &crate::state::Lockfile::default())
+            .unwrap();
         assert_eq!(
             codec_hash, legacy,
             "codec base_hash must match legacy rule_combined_hash"
@@ -159,10 +162,13 @@ mod tests {
         let v = sample_rule_without_condition();
         let rule: crate::model::Rule = serde_json::from_value(v.clone()).unwrap();
         let (json, code) = crate::snapshot::rule::serialize_rule(&rule).unwrap();
-        let legacy = crate::state::rule_combined_hash(&json, &code);
+        let legacy =
+            crate::state::rule_combined_hash(&json, &code, &crate::state::Lockfile::default());
 
         let codec = Rules;
-        let codec_hash = codec.base_hash(&v).unwrap();
+        let codec_hash = codec
+            .base_hash(&v, &crate::state::Lockfile::default())
+            .unwrap();
         assert_eq!(
             codec_hash, legacy,
             "codec base_hash must match legacy rule_combined_hash (no condition)"

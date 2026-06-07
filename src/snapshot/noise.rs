@@ -44,10 +44,19 @@ pub fn strip_noise_fields(value: &mut serde_json::Value) {
 /// makes the hash sensitive to key reordering. Sorting every object's
 /// keys alphabetically (recursively) ensures two byte streams representing
 /// the same logical content hash to the same value.
-pub fn canonicalize_for_hash(bytes: &[u8]) -> Vec<u8> {
+pub fn canonicalize_for_hash(bytes: &[u8], lockfile: &crate::state::Lockfile) -> Vec<u8> {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
         return bytes.to_vec();
     };
+    // Reference-form normalization (the keystone of env-portable snapshots):
+    // rewrite every cross-reference to its canonical `rdc://<kind>/<slug>` form
+    // using `lockfile`, so a URL-form body (fresh from the API) and the
+    // `rdc://`-form body (on disk) of the SAME object hash IDENTICALLY. This is
+    // what lets portable snapshots coexist with the URL-based three-way merge
+    // without portabilizing at every comparison site. An empty lockfile (e.g.
+    // `Lockfile::default()` in tests, or ref-free sidecar bytes) makes this a
+    // no-op, preserving prior behavior.
+    crate::snapshot::refs::portabilize_value(&mut value, lockfile);
     strip_noise_fields(&mut value);
     sort_url_arrays(&mut value);
     sort_keys_recursive(&mut value);
@@ -240,15 +249,15 @@ mod tests {
     fn canonicalize_strips_modified_at() {
         let with = b"{\"name\":\"x\",\"modified_at\":\"t\"}";
         let without = b"{\"name\":\"x\"}";
-        let c1 = canonicalize_for_hash(with);
-        let c2 = canonicalize_for_hash(without);
+        let c1 = canonicalize_for_hash(with, &crate::state::Lockfile::default());
+        let c2 = canonicalize_for_hash(without, &crate::state::Lockfile::default());
         assert_eq!(c1, c2);
     }
 
     #[test]
     fn canonicalize_falls_back_on_non_json_bytes() {
         let raw = b"hello";
-        let out = canonicalize_for_hash(raw);
+        let out = canonicalize_for_hash(raw, &crate::state::Lockfile::default());
         assert_eq!(out, raw.to_vec());
     }
 
@@ -256,14 +265,20 @@ mod tests {
     fn canonicalize_real_content_change_differs() {
         let a = b"{\"name\":\"foo\",\"modified_at\":\"t\"}";
         let b = b"{\"name\":\"bar\",\"modified_at\":\"t\"}";
-        assert_ne!(canonicalize_for_hash(a), canonicalize_for_hash(b));
+        assert_ne!(
+            canonicalize_for_hash(a, &crate::state::Lockfile::default()),
+            canonicalize_for_hash(b, &crate::state::Lockfile::default())
+        );
     }
 
     #[test]
     fn canonicalize_modifier_only_difference_collapses() {
         let a = b"{\"name\":\"x\",\"modifier\":\"u1\"}";
         let b = b"{\"name\":\"x\",\"modifier\":\"u2\"}";
-        assert_eq!(canonicalize_for_hash(a), canonicalize_for_hash(b));
+        assert_eq!(
+            canonicalize_for_hash(a, &crate::state::Lockfile::default()),
+            canonicalize_for_hash(b, &crate::state::Lockfile::default())
+        );
     }
 
     #[test]
@@ -328,8 +343,8 @@ mod tests {
         let a = br#"{"hooks":["https://x/api/v1/hooks/9","https://x/api/v1/hooks/1"]}"#;
         let b = br#"{"hooks":["https://x/api/v1/hooks/1","https://x/api/v1/hooks/9"]}"#;
         assert_eq!(
-            canonicalize_for_hash(a),
-            canonicalize_for_hash(b),
+            canonicalize_for_hash(a, &crate::state::Lockfile::default()),
+            canonicalize_for_hash(b, &crate::state::Lockfile::default()),
             "set-like URL back-reference order must not affect the content hash"
         );
     }
@@ -340,7 +355,10 @@ mod tests {
         // stay order-insensitive in the hash, exactly as raw URL arrays do.
         let a = br#"{"queues":["rdc://queues/b","rdc://queues/a"]}"#;
         let b = br#"{"queues":["rdc://queues/a","rdc://queues/b"]}"#;
-        assert_eq!(canonicalize_for_hash(a), canonicalize_for_hash(b));
+        assert_eq!(
+            canonicalize_for_hash(a, &crate::state::Lockfile::default()),
+            canonicalize_for_hash(b, &crate::state::Lockfile::default())
+        );
     }
 
     #[test]
@@ -350,8 +368,8 @@ mod tests {
         let a = br#"{"$subtract":["$unitCost","$amount"]}"#;
         let b = br#"{"$subtract":["$amount","$unitCost"]}"#;
         assert_ne!(
-            canonicalize_for_hash(a),
-            canonicalize_for_hash(b),
+            canonicalize_for_hash(a, &crate::state::Lockfile::default()),
+            canonicalize_for_hash(b, &crate::state::Lockfile::default()),
             "non-URL array order is semantic and must remain significant in the hash"
         );
     }

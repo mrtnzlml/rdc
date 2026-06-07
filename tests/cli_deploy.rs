@@ -2858,7 +2858,8 @@ async fn deploy_create_engine_records_codec_baseline() {
         .expect("content_hash must be present in tgt lockfile for engine");
 
     let disk_bytes = std::fs::read(&engine_json_path).unwrap();
-    let expected_hash = rdc::snapshot::codec::combined_hash(&disk_bytes, &[]);
+    let lf_loaded = rdc::state::Lockfile::load(&lf_path).unwrap();
+    let expected_hash = rdc::snapshot::codec::combined_hash(&disk_bytes, &[], &lf_loaded);
     assert_eq!(
         recorded_hash, expected_hash,
         "lockfile content_hash must equal combined_hash(disk_bytes, &[]) — \

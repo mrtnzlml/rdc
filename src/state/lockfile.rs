@@ -176,8 +176,8 @@ impl Lockfile {
 /// Compute a stable SHA-256 over canonical JSON bytes (with noise fields
 /// stripped). Falls back to raw-byte SHA-256 for inputs that aren't valid
 /// JSON. Hex-encoded output.
-pub fn content_hash(bytes: &[u8]) -> String {
-    let canonical = crate::snapshot::noise::canonicalize_for_hash(bytes);
+pub fn content_hash(bytes: &[u8], lockfile: &Lockfile) -> String {
+    let canonical = crate::snapshot::noise::canonicalize_for_hash(bytes, lockfile);
     let mut hasher = Sha256::new();
     hasher.update(&canonical);
     to_hex(&hasher.finalize())
@@ -222,8 +222,12 @@ fn to_hex(digest: &[u8]) -> String {
 ///     || ...   (continued for every formula, in field_id order)
 /// )
 /// ```
-pub fn schema_combined_hash(json_bytes: &[u8], formulas: &[(String, Vec<u8>)]) -> String {
-    let canonical = crate::snapshot::noise::canonicalize_for_hash(json_bytes);
+pub fn schema_combined_hash(
+    json_bytes: &[u8],
+    formulas: &[(String, Vec<u8>)],
+    lockfile: &Lockfile,
+) -> String {
+    let canonical = crate::snapshot::noise::canonicalize_for_hash(json_bytes, lockfile);
     let mut hasher = Sha256::new();
     hasher.update(&canonical);
     for (field_id, bytes) in formulas {
@@ -255,8 +259,8 @@ pub fn schema_combined_hash(json_bytes: &[u8], formulas: &[(String, Vec<u8>)]) -
 /// `crate::snapshot::codec::combined_hash(json, &[("code", code_bytes)])`,
 /// which is what `KindCodec::base_hash` computes — aligning pull, push,
 /// sync, deploy, and doctor on a single hash definition.
-pub fn hook_combined_hash(json_bytes: &[u8], code: &Option<String>) -> String {
-    let canonical = crate::snapshot::noise::canonicalize_for_hash(json_bytes);
+pub fn hook_combined_hash(json_bytes: &[u8], code: &Option<String>, lockfile: &Lockfile) -> String {
+    let canonical = crate::snapshot::noise::canonicalize_for_hash(json_bytes, lockfile);
     let mut hasher = Sha256::new();
     hasher.update(&canonical);
     if let Some(code) = code {
@@ -282,8 +286,8 @@ pub fn hook_combined_hash(json_bytes: &[u8], code: &Option<String>) -> String {
 /// The separator includes the field name (not just `"code"`) so a
 /// future rule field that also carries Python wouldn't silently
 /// collide.
-pub fn rule_combined_hash(json_bytes: &[u8], code: &Option<String>) -> String {
-    let canonical = crate::snapshot::noise::canonicalize_for_hash(json_bytes);
+pub fn rule_combined_hash(json_bytes: &[u8], code: &Option<String>, lockfile: &Lockfile) -> String {
+    let canonical = crate::snapshot::noise::canonicalize_for_hash(json_bytes, lockfile);
     let mut hasher = Sha256::new();
     hasher.update(&canonical);
     if let Some(code) = code {
@@ -370,8 +374,8 @@ mod tests {
 
     #[test]
     fn content_hash_is_deterministic() {
-        let h1 = content_hash(b"hello");
-        let h2 = content_hash(b"hello");
+        let h1 = content_hash(b"hello", &Lockfile::default());
+        let h2 = content_hash(b"hello", &Lockfile::default());
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 64);
         assert!(h1.chars().all(|c| c.is_ascii_hexdigit()));
@@ -379,15 +383,18 @@ mod tests {
 
     #[test]
     fn content_hash_distinguishes_inputs() {
-        assert_ne!(content_hash(b"foo"), content_hash(b"bar"));
+        assert_ne!(
+            content_hash(b"foo", &Lockfile::default()),
+            content_hash(b"bar", &Lockfile::default())
+        );
     }
 
     #[test]
     fn schema_combined_hash_no_formulas() {
-        let h1 = schema_combined_hash(b"{}", &[]);
-        let h2 = schema_combined_hash(b"{}", &[]);
+        let h1 = schema_combined_hash(b"{}", &[], &Lockfile::default());
+        let h2 = schema_combined_hash(b"{}", &[], &Lockfile::default());
         assert_eq!(h1, h2);
-        assert_eq!(h1, content_hash(b"{}"));
+        assert_eq!(h1, content_hash(b"{}", &Lockfile::default()));
     }
 
     #[test]
@@ -396,8 +403,8 @@ mod tests {
             ("amount_total".to_string(), b"a + b".to_vec()),
             ("invoice_id".to_string(), b"x".to_vec()),
         ];
-        let h1 = schema_combined_hash(b"{}", &formulas);
-        let h2 = schema_combined_hash(b"{}", &formulas);
+        let h1 = schema_combined_hash(b"{}", &formulas, &Lockfile::default());
+        let h2 = schema_combined_hash(b"{}", &formulas, &Lockfile::default());
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 64);
     }
@@ -408,8 +415,8 @@ mod tests {
         let f1 = vec![("amount_total".to_string(), b"a + b".to_vec())];
         let f2 = vec![("amount_total".to_string(), b"a + b + c".to_vec())];
         assert_ne!(
-            schema_combined_hash(json, &f1),
-            schema_combined_hash(json, &f2)
+            schema_combined_hash(json, &f1, &Lockfile::default()),
+            schema_combined_hash(json, &f2, &Lockfile::default())
         );
     }
 
@@ -419,31 +426,35 @@ mod tests {
         let f1 = vec![("amount_total".to_string(), b"x".to_vec())];
         let f2 = vec![("amount_due".to_string(), b"x".to_vec())];
         assert_ne!(
-            schema_combined_hash(json, &f1),
-            schema_combined_hash(json, &f2)
+            schema_combined_hash(json, &f1, &Lockfile::default()),
+            schema_combined_hash(json, &f2, &Lockfile::default())
         );
     }
 
     #[test]
     fn hook_combined_hash_no_code() {
-        let h1 = hook_combined_hash(b"{}", &None);
-        let h2 = hook_combined_hash(b"{}", &None);
+        let h1 = hook_combined_hash(b"{}", &None, &Lockfile::default());
+        let h2 = hook_combined_hash(b"{}", &None, &Lockfile::default());
         assert_eq!(h1, h2);
-        assert_eq!(h1, content_hash(b"{}"));
+        assert_eq!(h1, content_hash(b"{}", &Lockfile::default()));
     }
 
     #[test]
     fn hook_combined_hash_with_code_differs_from_no_code() {
-        let h_no = hook_combined_hash(b"{}", &None);
-        let h_with = hook_combined_hash(b"{}", &Some("def x(): pass".to_string()));
+        let h_no = hook_combined_hash(b"{}", &None, &Lockfile::default());
+        let h_with = hook_combined_hash(
+            b"{}",
+            &Some("def x(): pass".to_string()),
+            &Lockfile::default(),
+        );
         assert_ne!(h_no, h_with);
     }
 
     #[test]
     fn hook_combined_hash_changes_when_code_changes() {
         let json = b"{}";
-        let h1 = hook_combined_hash(json, &Some("v1".to_string()));
-        let h2 = hook_combined_hash(json, &Some("v2".to_string()));
+        let h1 = hook_combined_hash(json, &Some("v1".to_string()), &Lockfile::default());
+        let h2 = hook_combined_hash(json, &Some("v2".to_string()), &Lockfile::default());
         assert_ne!(h1, h2);
     }
 
@@ -451,22 +462,31 @@ mod tests {
     fn content_hash_equal_when_only_modified_at_differs() {
         let a = b"{\"name\":\"x\",\"modified_at\":\"2026-01-01\"}";
         let b = b"{\"name\":\"x\",\"modified_at\":\"2026-12-31\"}";
-        assert_eq!(content_hash(a), content_hash(b));
+        assert_eq!(
+            content_hash(a, &Lockfile::default()),
+            content_hash(b, &Lockfile::default())
+        );
     }
 
     #[test]
     fn content_hash_differs_on_real_change() {
         let a = b"{\"name\":\"x\",\"modified_at\":\"t\"}";
         let b = b"{\"name\":\"y\",\"modified_at\":\"t\"}";
-        assert_ne!(content_hash(a), content_hash(b));
+        assert_ne!(
+            content_hash(a, &Lockfile::default()),
+            content_hash(b, &Lockfile::default())
+        );
     }
 
     #[test]
     fn content_hash_falls_back_for_non_json_bytes() {
-        let h1 = content_hash(b"hello world");
-        let h2 = content_hash(b"hello world");
+        let h1 = content_hash(b"hello world", &Lockfile::default());
+        let h2 = content_hash(b"hello world", &Lockfile::default());
         assert_eq!(h1, h2);
-        assert_ne!(content_hash(b"hello world"), content_hash(b"goodbye"));
+        assert_ne!(
+            content_hash(b"hello world", &Lockfile::default()),
+            content_hash(b"goodbye", &Lockfile::default())
+        );
     }
 
     #[test]
@@ -474,29 +494,32 @@ mod tests {
         let a = b"{\"name\":\"h\",\"modified_at\":\"t1\"}";
         let b = b"{\"name\":\"h\",\"modified_at\":\"t2\"}";
         let code = Some("def x(): pass".to_string());
-        assert_eq!(hook_combined_hash(a, &code), hook_combined_hash(b, &code));
+        assert_eq!(
+            hook_combined_hash(a, &code, &Lockfile::default()),
+            hook_combined_hash(b, &code, &Lockfile::default())
+        );
     }
 
     #[test]
     fn rule_combined_hash_no_code() {
-        let h1 = rule_combined_hash(b"{}", &None);
-        let h2 = rule_combined_hash(b"{}", &None);
+        let h1 = rule_combined_hash(b"{}", &None, &Lockfile::default());
+        let h2 = rule_combined_hash(b"{}", &None, &Lockfile::default());
         assert_eq!(h1, h2);
-        assert_eq!(h1, content_hash(b"{}"));
+        assert_eq!(h1, content_hash(b"{}", &Lockfile::default()));
     }
 
     #[test]
     fn rule_combined_hash_with_code_differs_from_no_code() {
-        let h_no = rule_combined_hash(b"{}", &None);
-        let h_with = rule_combined_hash(b"{}", &Some("x > 0".to_string()));
+        let h_no = rule_combined_hash(b"{}", &None, &Lockfile::default());
+        let h_with = rule_combined_hash(b"{}", &Some("x > 0".to_string()), &Lockfile::default());
         assert_ne!(h_no, h_with);
     }
 
     #[test]
     fn rule_combined_hash_changes_when_code_changes() {
         let json = b"{}";
-        let h1 = rule_combined_hash(json, &Some("x > 0".to_string()));
-        let h2 = rule_combined_hash(json, &Some("y < 10".to_string()));
+        let h1 = rule_combined_hash(json, &Some("x > 0".to_string()), &Lockfile::default());
+        let h2 = rule_combined_hash(json, &Some("y < 10".to_string()), &Lockfile::default());
         assert_ne!(h1, h2);
     }
 
@@ -505,7 +528,10 @@ mod tests {
         let a = b"{\"name\":\"r\",\"modified_at\":\"t1\"}";
         let b = b"{\"name\":\"r\",\"modified_at\":\"t2\"}";
         let code = Some("x > 0".to_string());
-        assert_eq!(rule_combined_hash(a, &code), rule_combined_hash(b, &code));
+        assert_eq!(
+            rule_combined_hash(a, &code, &Lockfile::default()),
+            rule_combined_hash(b, &code, &Lockfile::default())
+        );
     }
 
     /// rule_combined_hash and hook_combined_hash must NOT collide when
@@ -516,8 +542,8 @@ mod tests {
         let json = b"{}";
         let code = Some("x > 0".to_string());
         assert_ne!(
-            rule_combined_hash(json, &code),
-            hook_combined_hash(json, &code)
+            rule_combined_hash(json, &code, &Lockfile::default()),
+            hook_combined_hash(json, &code, &Lockfile::default())
         );
     }
 
@@ -527,8 +553,8 @@ mod tests {
         let b = b"{\"name\":\"s\",\"modified_at\":\"t2\"}";
         let formulas = vec![("42".to_string(), b"return 1\n".to_vec())];
         assert_eq!(
-            schema_combined_hash(a, &formulas),
-            schema_combined_hash(b, &formulas)
+            schema_combined_hash(a, &formulas, &Lockfile::default()),
+            schema_combined_hash(b, &formulas, &Lockfile::default())
         );
     }
 
@@ -591,9 +617,9 @@ mod tests {
         let json = b"{\"name\":\"validator\",\"status\":\"<refreshed live in Rossum; not synced by rdc>\"}";
         let code = Some("def process(payload, settings):\n    pass\n".to_string());
 
-        let legacy = hook_combined_hash(json, &code);
+        let legacy = hook_combined_hash(json, &code, &Lockfile::default());
         let sidecars = vec![("code".to_string(), code.clone().unwrap().into_bytes())];
-        let codec = codec_combined_hash(json, &sidecars);
+        let codec = codec_combined_hash(json, &sidecars, &Lockfile::default());
         assert_eq!(
             legacy, codec,
             "hook_combined_hash must equal codec::combined_hash (with code)"
@@ -602,8 +628,8 @@ mod tests {
         // --- without code ---
         let json_no_code =
             b"{\"name\":\"webhook\",\"status\":\"<refreshed live in Rossum; not synced by rdc>\"}";
-        let legacy_no_code = hook_combined_hash(json_no_code, &None);
-        let codec_no_code = codec_combined_hash(json_no_code, &[]);
+        let legacy_no_code = hook_combined_hash(json_no_code, &None, &Lockfile::default());
+        let codec_no_code = codec_combined_hash(json_no_code, &[], &Lockfile::default());
         assert_eq!(
             legacy_no_code, codec_no_code,
             "hook_combined_hash must equal codec::combined_hash (no code)"

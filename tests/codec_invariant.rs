@@ -325,7 +325,7 @@ fn hash_consistent_with_disk_bytes() {
         let c = codec(kind).unwrap_or_else(|| panic!("{kind} codec must be registered"));
 
         let hash1 = c
-            .base_hash(&v)
+            .base_hash(&v, &rdc::state::Lockfile::default())
             .unwrap_or_else(|e| panic!("{kind}: base_hash on original: {e}"));
 
         let art = c
@@ -343,7 +343,7 @@ fn hash_consistent_with_disk_bytes() {
         splice_sidecars_for_rehash(&mut reparsed, &art.sidecars);
 
         let hash2 = c
-            .base_hash(&reparsed)
+            .base_hash(&reparsed, &rdc::state::Lockfile::default())
             .unwrap_or_else(|e| panic!("{kind}: base_hash on reparsed: {e}"));
 
         assert_eq!(
@@ -472,7 +472,7 @@ fn queues_redaction_correct() {
 /// including any kind added in the future.
 #[test]
 fn every_codec_redacts_its_redact_on_pull_fields() {
-    use rdc::snapshot::create::{redact_on_pull, REDACTED_VALUE_SENTINEL};
+    use rdc::snapshot::create::{REDACTED_VALUE_SENTINEL, redact_on_pull};
     for (kind, value) in codec_cases() {
         let fields = redact_on_pull(kind);
         if fields.is_empty() {

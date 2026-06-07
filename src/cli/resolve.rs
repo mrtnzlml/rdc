@@ -44,7 +44,9 @@ use std::process::Command;
 /// helper so the resolver UI, hunk walker, and conflict-buffer builder all agree
 /// on the same op sequence.
 pub fn line_diff<'old, 'new>(old: &'old str, new: &'new str) -> TextDiff<'old, 'new, str> {
-    TextDiff::configure().algorithm(Algorithm::Histogram).diff_lines(old, new)
+    TextDiff::configure()
+        .algorithm(Algorithm::Histogram)
+        .diff_lines(old, new)
 }
 
 /// Outcome of presenting a single conflict to the user.
@@ -138,7 +140,16 @@ pub fn prompt_resolve<R: BufRead, W: Write>(
     env: &str,
 ) -> Result<Resolution> {
     let mode = detect_color_mode(false);
-    prompt_resolve_with_color(input, output, index, total, local_path, remote_bytes, env, mode)
+    prompt_resolve_with_color(
+        input,
+        output,
+        index,
+        total,
+        local_path,
+        remote_bytes,
+        env,
+        mode,
+    )
 }
 
 /// Color-aware core. Tests pin the mode here; production goes through
@@ -155,7 +166,15 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
 ) -> Result<Resolution> {
     let local_bytes = read_local(local_path)?;
     prompt_resolve_with_bytes_and_color(
-        input, output, index, total, local_path, &local_bytes, remote_bytes, env, mode,
+        input,
+        output,
+        index,
+        total,
+        local_path,
+        &local_bytes,
+        remote_bytes,
+        env,
+        mode,
     )
 }
 
@@ -181,7 +200,15 @@ pub fn prompt_resolve_with_bytes<R: BufRead, W: Write>(
 ) -> Result<Resolution> {
     let mode = detect_color_mode(false);
     prompt_resolve_with_bytes_and_color(
-        input, output, index, total, local_path, local_bytes, remote_bytes, env, mode,
+        input,
+        output,
+        index,
+        total,
+        local_path,
+        local_bytes,
+        remote_bytes,
+        env,
+        mode,
     )
 }
 
@@ -203,8 +230,14 @@ pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
 ) -> Result<Resolution> {
     // Strip noise fields before diff display so the user only sees real
     // changes. modified_at server-churn must not appear in the resolver.
-    let local_canonical = crate::snapshot::noise::canonicalize_for_hash(local_bytes);
-    let remote_canonical = crate::snapshot::noise::canonicalize_for_hash(remote_bytes);
+    let local_canonical = crate::snapshot::noise::canonicalize_for_hash(
+        local_bytes,
+        &crate::state::Lockfile::default(),
+    );
+    let remote_canonical = crate::snapshot::noise::canonicalize_for_hash(
+        remote_bytes,
+        &crate::state::Lockfile::default(),
+    );
 
     if local_canonical == remote_canonical {
         return Ok(Resolution::KeepLocal);
@@ -257,9 +290,7 @@ pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
                 "[k] keep local  [r] use {env}  [e] edit  [h] hunk-by-hunk  [s] skip (shadow file)  [a] abort > "
             )
         } else {
-            format!(
-                "[k] keep local  [r] use {env}  [e] edit  [s] skip (shadow file)  [a] abort > "
-            )
+            format!("[k] keep local  [r] use {env}  [e] edit  [s] skip (shadow file)  [a] abort > ")
         };
         write!(output, "{}", colorize_prompt(&prompt_text, mode))?;
         output.flush().ok();
@@ -446,12 +477,7 @@ fn build_conflict_buffer(local: &[u8], remote: &[u8], env: &str) -> Vec<u8> {
     let mut local_chunk: Vec<&str> = Vec::new();
     let mut remote_chunk: Vec<&str> = Vec::new();
 
-    fn flush<'a>(
-        out: &mut String,
-        local: &mut Vec<&'a str>,
-        remote: &mut Vec<&'a str>,
-        env: &str,
-    ) {
+    fn flush<'a>(out: &mut String, local: &mut Vec<&'a str>, remote: &mut Vec<&'a str>, env: &str) {
         if local.is_empty() && remote.is_empty() {
             return;
         }
@@ -579,8 +605,7 @@ fn run_editor_loop<R: BufRead, W: Write>(
 /// markers, valid UTF-8, and valid JSON if the target path is a `.json`
 /// file. Returns the failure reason as a user-facing string.
 fn validate_edited(bytes: &[u8], local_path: &Path) -> std::result::Result<(), String> {
-    let s = std::str::from_utf8(bytes)
-        .map_err(|_| "edited file is not valid UTF-8".to_string())?;
+    let s = std::str::from_utf8(bytes).map_err(|_| "edited file is not valid UTF-8".to_string())?;
     // Markers are caught even when indented — leading whitespace on a
     // marker line is almost never legitimate content in `.py` or `.json`
     // files, and a sneakily-indented `    <<<<<<<` would otherwise slip
@@ -780,7 +805,10 @@ fn prompt_single_hunk<R: BufRead, W: Write>(
     let prefix_start = local_range.start.saturating_sub(CONTEXT);
     let prefix = &local_lines[prefix_start..local_range.start];
 
-    let suffix_end = local_range.end.saturating_add(CONTEXT).min(local_lines.len());
+    let suffix_end = local_range
+        .end
+        .saturating_add(CONTEXT)
+        .min(local_lines.len());
     let suffix = &local_lines[local_range.end..suffix_end];
 
     writeln!(output)?;
@@ -844,9 +872,8 @@ fn prompt_single_hunk<R: BufRead, W: Write>(
     writeln!(output)?;
 
     loop {
-        let prompt_text = format!(
-            "[k] keep local  [r] use {env}  [e] edit  [b] both  [s] skip  [a] abort > "
-        );
+        let prompt_text =
+            format!("[k] keep local  [r] use {env}  [e] edit  [b] both  [s] skip  [a] abort > ");
         write!(output, "{}", colorize_prompt(&prompt_text, mode))?;
         output.flush().ok();
         let mut line = String::new();
@@ -968,8 +995,7 @@ fn run_single_hunk_editor<R: BufRead, W: Write>(
 /// JSON-syntax check is intentionally skipped because per-hunk edits
 /// don't carry a full JSON document context.
 fn validate_edited_markers_only(bytes: &[u8]) -> std::result::Result<(), String> {
-    let s = std::str::from_utf8(bytes)
-        .map_err(|_| "edited hunk is not valid UTF-8".to_string())?;
+    let s = std::str::from_utf8(bytes).map_err(|_| "edited hunk is not valid UTF-8".to_string())?;
     // Match `validate_edited`: catch indented markers too. A user could
     // otherwise leave `    <<<<<<<` inside a per-hunk edit and quietly
     // commit it.
@@ -1205,9 +1231,13 @@ pub fn resolve_push_drift(
         env,
     )?;
     match resolution {
-        Resolution::KeepLocal => Ok(PushDriftOutcome::Patch { payload_override: None }),
+        Resolution::KeepLocal => Ok(PushDriftOutcome::Patch {
+            payload_override: None,
+        }),
         Resolution::KeepRemote => Ok(PushDriftOutcome::Adopt),
-        Resolution::Edit(edited) => Ok(PushDriftOutcome::Patch { payload_override: Some(edited) }),
+        Resolution::Edit(edited) => Ok(PushDriftOutcome::Patch {
+            payload_override: Some(edited),
+        }),
         // Hunk-walk-with-skipped-markers is meaningful on a pull (local
         // file ends up with markers, lockfile records the hash of those
         // bytes), but on push the override would be PATCHed straight to
@@ -1223,9 +1253,13 @@ pub fn resolve_push_drift(
 fn sort_users_for_picker(users: &[crate::model::User]) -> Vec<&crate::model::User> {
     let mut v: Vec<&crate::model::User> = users.iter().collect();
     v.sort_by_key(|u| {
-        if u.is_system_user() { 0u8 }
-        else if u.is_admin() { 1 }
-        else { 2 }
+        if u.is_system_user() {
+            0u8
+        } else if u.is_admin() {
+            1
+        } else {
+            2
+        }
     });
     v
 }
@@ -1234,10 +1268,7 @@ fn sort_users_for_picker(users: &[crate::model::User]) -> Vec<&crate::model::Use
 /// in priority order (system → admin → other) so the recommended pick is
 /// at the top. Each label is a single-line summary that fits in an
 /// inquire `Select`.
-pub fn format_user_choices(
-    users: &[crate::model::User],
-    self_user_id: Option<u64>,
-) -> Vec<String> {
+pub fn format_user_choices(users: &[crate::model::User], self_user_id: Option<u64>) -> Vec<String> {
     let sorted = sort_users_for_picker(users);
     sorted
         .iter()
@@ -1256,7 +1287,9 @@ pub fn format_user_choices(
             let display = if u.first_name.is_empty() && u.last_name.is_empty() {
                 u.username.clone()
             } else {
-                format!("{} {}", u.first_name, u.last_name).trim().to_string()
+                format!("{} {}", u.first_name, u.last_name)
+                    .trim()
+                    .to_string()
             };
             // Two real users can share first+last name; the email is
             // the only field guaranteed unique per Rossum user. Render
@@ -1293,8 +1326,7 @@ pub fn prompt_token_owner(
     options.push(abort_label.clone());
 
     let prompt = format!("Pick the token_owner for store extension '{slug}' on {tgt_env}");
-    let help =
-        "used as the API service account for the extension's calls (usually a system user)";
+    let help = "used as the API service account for the extension's calls (usually a system user)";
 
     let answer = match Select::new(&prompt, options.clone())
         .with_help_message(help)
@@ -1314,10 +1346,11 @@ pub fn prompt_token_owner(
         .get(answer.index)
         .ok_or_else(|| anyhow::anyhow!("internal: picker index {} out of range", answer.index))?;
 
-    let apply_all = Confirm::new("Apply this choice to all remaining store extensions in this deploy?")
-        .with_default(false)
-        .prompt()
-        .unwrap_or(false);
+    let apply_all =
+        Confirm::new("Apply this choice to all remaining store extensions in this deploy?")
+            .with_default(false)
+            .prompt()
+            .unwrap_or(false);
     Ok(Some((chosen.url.clone(), apply_all)))
 }
 
@@ -1351,7 +1384,11 @@ pub fn prompt_anomaly_cure(
     // TTY mode: use the project's existing prompt library (`inquire`,
     // matching `prompt_token_owner` above). Show config.private and
     // has-code signals so the operator can decide.
-    let private = hook.config.get("private").and_then(|v| v.as_bool()).unwrap_or(false);
+    let private = hook
+        .config
+        .get("private")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let has_code = hook
         .config
         .get("code")
@@ -1612,12 +1649,30 @@ pub fn render_styled_diff(
                 }
                 let _ = match change.tag() {
                     ChangeTag::Delete => {
-                        let body = render_content(&content, is_json, Some(SGR_BG_REMOVE), SGR_BG_REMOVE_HI, &emph);
-                        writeln!(out, "{SGR_BG_REMOVE}  {SGR_GUTTER_REMOVE}{n:>w$} {marker}{SGR_FG_DEFAULT} {body}{SGR_EOL}{SGR_RESET}")
+                        let body = render_content(
+                            &content,
+                            is_json,
+                            Some(SGR_BG_REMOVE),
+                            SGR_BG_REMOVE_HI,
+                            &emph,
+                        );
+                        writeln!(
+                            out,
+                            "{SGR_BG_REMOVE}  {SGR_GUTTER_REMOVE}{n:>w$} {marker}{SGR_FG_DEFAULT} {body}{SGR_EOL}{SGR_RESET}"
+                        )
                     }
                     ChangeTag::Insert => {
-                        let body = render_content(&content, is_json, Some(SGR_BG_ADD), SGR_BG_ADD_HI, &emph);
-                        writeln!(out, "{SGR_BG_ADD}  {SGR_GUTTER_ADD}{n:>w$} {marker}{SGR_FG_DEFAULT} {body}{SGR_EOL}{SGR_RESET}")
+                        let body = render_content(
+                            &content,
+                            is_json,
+                            Some(SGR_BG_ADD),
+                            SGR_BG_ADD_HI,
+                            &emph,
+                        );
+                        writeln!(
+                            out,
+                            "{SGR_BG_ADD}  {SGR_GUTTER_ADD}{n:>w$} {marker}{SGR_FG_DEFAULT} {body}{SGR_EOL}{SGR_RESET}"
+                        )
                     }
                     ChangeTag::Equal => {
                         let body = render_content(&content, is_json, None, "", &[]);
@@ -1636,7 +1691,10 @@ pub fn render_styled_diff(
 /// non-`/dev/null` side and strips a trailing ` (…)` annotation.
 pub fn diff_display_path(a: &str, b: &str) -> String {
     let pick = if a == "/dev/null" { b } else { a };
-    pick.rsplit_once(" (").map(|(p, _)| p).unwrap_or(pick).to_string()
+    pick.rsplit_once(" (")
+        .map(|(p, _)| p)
+        .unwrap_or(pick)
+        .to_string()
 }
 
 /// Extract the ` (…)` annotation a caller appends to a diff side label
@@ -1675,12 +1733,19 @@ fn json_fg_spans(line: &str) -> Vec<(usize, usize, &'static str)> {
             while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
                 j += 1;
             }
-            let color = if j < b.len() && b[j] == b':' { SGR_J_KEY } else { SGR_J_STR };
+            let color = if j < b.len() && b[j] == b':' {
+                SGR_J_KEY
+            } else {
+                SGR_J_STR
+            };
             spans.push((start, i, color));
-        } else if c.is_ascii_digit() || (c == b'-' && i + 1 < b.len() && b[i + 1].is_ascii_digit()) {
+        } else if c.is_ascii_digit() || (c == b'-' && i + 1 < b.len() && b[i + 1].is_ascii_digit())
+        {
             let start = i;
             i += 1;
-            while i < b.len() && (b[i].is_ascii_digit() || matches!(b[i], b'.' | b'e' | b'E' | b'+' | b'-')) {
+            while i < b.len()
+                && (b[i].is_ascii_digit() || matches!(b[i], b'.' | b'e' | b'E' | b'+' | b'-'))
+            {
                 i += 1;
             }
             spans.push((start, i, SGR_J_NUM));
@@ -1718,7 +1783,11 @@ fn render_content(
     hi_bg: &str,
     emph: &[(usize, usize)],
 ) -> String {
-    let fg = if is_json { json_fg_spans(content) } else { Vec::new() };
+    let fg = if is_json {
+        json_fg_spans(content)
+    } else {
+        Vec::new()
+    };
     let mut bounds: Vec<usize> = vec![0, content.len()];
     for (s, e, _) in &fg {
         bounds.push(*s);
@@ -1739,13 +1808,17 @@ fn render_content(
         if a >= z {
             continue;
         }
-        let seg_fg = fg.iter().find(|(s, e, _)| *s <= a && a < *e).map(|(_, _, c)| *c);
+        let seg_fg = fg
+            .iter()
+            .find(|(s, e, _)| *s <= a && a < *e)
+            .map(|(_, _, c)| *c);
         let seg_emph = emph.iter().any(|(s, e)| *s <= a && a < *e);
         if let Some(bg) = base_bg
-            && seg_emph != cur_emph {
-                out.push_str(if seg_emph { hi_bg } else { bg });
-                cur_emph = seg_emph;
-            }
+            && seg_emph != cur_emph
+        {
+            out.push_str(if seg_emph { hi_bg } else { bg });
+            cur_emph = seg_emph;
+        }
         if seg_fg != cur_fg {
             out.push_str(seg_fg.unwrap_or(SGR_FG_DEFAULT));
             cur_fg = seg_fg;
@@ -1756,9 +1829,10 @@ fn render_content(
         out.push_str(SGR_FG_DEFAULT);
     }
     if let Some(bg) = base_bg
-        && cur_emph {
-            out.push_str(bg);
-        }
+        && cur_emph
+    {
+        out.push_str(bg);
+    }
     out
 }
 
@@ -1817,23 +1891,24 @@ pub fn colorize_prompt(text: &str, mode: ColorMode) -> String {
     while let Some(c) = chars.next() {
         if c == '[' {
             if let Some(&letter) = chars.peek()
-                && letter.is_ascii_alphabetic() {
-                    chars.next(); // consume letter
-                    if matches!(chars.peek(), Some(']')) {
-                        chars.next(); // consume ]
-                        out.push('[');
-                        out.push_str(SGR_AMBER_BOLD);
-                        out.push(letter);
-                        out.push_str(SGR_RESET);
-                        out.push(']');
-                        continue;
-                    } else {
-                        // Not a single-letter bracketed token — emit as-is.
-                        out.push('[');
-                        out.push(letter);
-                        continue;
-                    }
+                && letter.is_ascii_alphabetic()
+            {
+                chars.next(); // consume letter
+                if matches!(chars.peek(), Some(']')) {
+                    chars.next(); // consume ]
+                    out.push('[');
+                    out.push_str(SGR_AMBER_BOLD);
+                    out.push(letter);
+                    out.push_str(SGR_RESET);
+                    out.push(']');
+                    continue;
+                } else {
+                    // Not a single-letter bracketed token — emit as-is.
+                    out.push('[');
+                    out.push(letter);
+                    continue;
                 }
+            }
             out.push(c);
         } else {
             out.push(c);
@@ -1940,7 +2015,10 @@ mod tests {
         // unchanged `name` line must not be a `-`/`+` line.
         assert!(d.contains("-  \"status\": \"ready\""), "got: {d}");
         assert!(d.contains("+  \"status\": \"pending\""), "got: {d}");
-        assert!(!d.contains("-  \"name\""), "name should be in context only, got: {d}");
+        assert!(
+            !d.contains("-  \"name\""),
+            "name should be in context only, got: {d}"
+        );
     }
 
     #[test]
@@ -2024,7 +2102,10 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         // Two separate marker blocks.
         let marker_count = s.matches("<<<<<<< local").count();
-        assert_eq!(marker_count, 2, "expected 2 conflict blocks, got {marker_count}: {s}");
+        assert_eq!(
+            marker_count, 2,
+            "expected 2 conflict blocks, got {marker_count}: {s}"
+        );
     }
 
     #[test]
@@ -2145,7 +2226,10 @@ mod tests {
         let out = resolve_combined_file(1, 2, &path, b"same\n", b"same\n", true, "test").unwrap();
         assert_eq!(out.bytes(), b"same\n");
         // Bytes-equal sides are a "Resolved" outcome — caller may advance.
-        assert!(!out.is_preserve_base(), "equal bytes must not preserve base");
+        assert!(
+            !out.is_preserve_base(),
+            "equal bytes must not preserve base"
+        );
         // No shadow file written.
         assert!(!dir.path().join("a.py.test").exists());
     }
@@ -2155,7 +2239,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("a.py");
         std::fs::write(&path, b"local\n").unwrap();
-        let out = resolve_combined_file(1, 1, &path, b"local\n", b"remote\n", false, "test").unwrap();
+        let out =
+            resolve_combined_file(1, 1, &path, b"local\n", b"remote\n", false, "test").unwrap();
         assert_eq!(out.bytes(), b"local\n");
         // Non-interactive shadow-skip MUST signal preserve-base so the
         // caller does not advance the entity's combined hash.
@@ -2163,7 +2248,10 @@ mod tests {
             out.is_preserve_base(),
             "non-interactive shadow-fallback must signal preserve-base"
         );
-        assert_eq!(std::fs::read(dir.path().join("a.py.test")).unwrap(), b"remote\n");
+        assert_eq!(
+            std::fs::read(dir.path().join("a.py.test")).unwrap(),
+            b"remote\n"
+        );
         // Local file untouched.
         assert_eq!(std::fs::read(&path).unwrap(), b"local\n");
     }
@@ -2204,24 +2292,42 @@ mod tests {
 
     #[test]
     fn decide_color_mode_no_color_env_returns_plain() {
-        assert!(matches!(decide_color_mode(false, true, true), ColorMode::Plain));
-        assert!(matches!(decide_color_mode(false, true, false), ColorMode::Plain));
+        assert!(matches!(
+            decide_color_mode(false, true, true),
+            ColorMode::Plain
+        ));
+        assert!(matches!(
+            decide_color_mode(false, true, false),
+            ColorMode::Plain
+        ));
     }
 
     #[test]
     fn decide_color_mode_no_color_flag_returns_plain() {
-        assert!(matches!(decide_color_mode(true, false, true), ColorMode::Plain));
-        assert!(matches!(decide_color_mode(true, false, false), ColorMode::Plain));
+        assert!(matches!(
+            decide_color_mode(true, false, true),
+            ColorMode::Plain
+        ));
+        assert!(matches!(
+            decide_color_mode(true, false, false),
+            ColorMode::Plain
+        ));
     }
 
     #[test]
     fn decide_color_mode_tty_with_no_overrides_returns_color() {
-        assert!(matches!(decide_color_mode(false, false, true), ColorMode::Color));
+        assert!(matches!(
+            decide_color_mode(false, false, true),
+            ColorMode::Color
+        ));
     }
 
     #[test]
     fn decide_color_mode_no_tty_returns_plain() {
-        assert!(matches!(decide_color_mode(false, false, false), ColorMode::Plain));
+        assert!(matches!(
+            decide_color_mode(false, false, false),
+            ColorMode::Plain
+        ));
     }
 
     #[test]
@@ -2302,10 +2408,21 @@ mod tests {
         ])).unwrap();
         let choices = format_user_choices(&users, Some(938493));
         // System user first.
-        assert!(choices[0].contains("u938493"), "system_user should be ranked first, got {:?}", choices);
-        assert!(choices.iter().any(|c| c.contains("u100")), "alice should be present");
+        assert!(
+            choices[0].contains("u938493"),
+            "system_user should be ranked first, got {:?}",
+            choices
+        );
+        assert!(
+            choices.iter().any(|c| c.contains("u100")),
+            "alice should be present"
+        );
         // Active session's own user tagged.
-        assert!(choices[0].contains("you"), "self user should be tagged, got {:?}", choices[0]);
+        assert!(
+            choices[0].contains("you"),
+            "self user should be tagged, got {:?}",
+            choices[0]
+        );
     }
 
     #[test]
@@ -2322,16 +2439,21 @@ mod tests {
              "email": "alice@b.com",
              "first_name": "Alice", "last_name": "Smith",
              "is_active": true, "groups": ["https://x/groups/3"]}
-        ])).unwrap();
+        ]))
+        .unwrap();
         let choices = format_user_choices(&users, None);
         // Each line carries its own email so the operator can pick.
         assert!(
-            choices.iter().any(|c| c.contains("Alice Smith <alice@a.com>")),
+            choices
+                .iter()
+                .any(|c| c.contains("Alice Smith <alice@a.com>")),
             "expected '<alice@a.com>' in some line, got {:?}",
             choices,
         );
         assert!(
-            choices.iter().any(|c| c.contains("Alice Smith <alice@b.com>")),
+            choices
+                .iter()
+                .any(|c| c.contains("Alice Smith <alice@b.com>")),
             "expected '<alice@b.com>' in some line, got {:?}",
             choices,
         );
@@ -2351,14 +2473,18 @@ mod tests {
              "email": "name-as-username",
              "first_name": "", "last_name": "",
              "is_active": true, "groups": ["https://x/groups/3"]}
-        ])).unwrap();
+        ]))
+        .unwrap();
         let choices = format_user_choices(&users, None);
         for c in &choices {
             assert!(!c.contains("<>"), "no empty email markers: {:?}", c);
         }
         // For the username-only user, display == email; suppress the
         // duplicate.
-        let same = choices.iter().find(|c| c.contains("name-as-username")).unwrap();
+        let same = choices
+            .iter()
+            .find(|c| c.contains("name-as-username"))
+            .unwrap();
         assert!(
             !same.contains("<name-as-username>"),
             "should suppress redundant `<email>` when it equals display, got {:?}",
@@ -2374,7 +2500,11 @@ mod tests {
              "is_active": true, "groups": ["https://x/groups/3"]}
         ])).unwrap();
         let choices = format_user_choices(&users, None);
-        assert!(!choices[0].contains("you"), "no self_id → no 'you' tag, got {:?}", choices[0]);
+        assert!(
+            !choices[0].contains("you"),
+            "no self_id → no 'you' tag, got {:?}",
+            choices[0]
+        );
     }
 
     #[test]
@@ -2388,16 +2518,30 @@ mod tests {
         let input = Cursor::new(b"s\n");
 
         let _ = prompt_resolve_with_color(
-            input, &mut out, 1, 1, &local, remote, "production", ColorMode::Plain,
-        ).unwrap();
+            input,
+            &mut out,
+            1,
+            1,
+            &local,
+            remote,
+            "production",
+            ColorMode::Plain,
+        )
+        .unwrap();
 
         let s = String::from_utf8_lossy(&out);
-        assert!(s.contains("[r] use production"), "prompt missing env-named [r] label: {s}");
+        assert!(
+            s.contains("[r] use production"),
+            "prompt missing env-named [r] label: {s}"
+        );
         // The env name now lives only in the prompt's `[r]` label, not the
         // diff body (the styled renderer headers with the file path). Confirm
         // the styled diff rendered and shows the changed value.
         assert!(s.contains("Update("), "styled diff header missing: {s}");
-        assert!(s.contains("\"a\": 2"), "diff should show the remote value: {s}");
+        assert!(
+            s.contains("\"a\": 2"),
+            "diff should show the remote value: {s}"
+        );
         assert!(!s.contains("[r]emote"), "old literal label leaked: {s}");
     }
 
@@ -2405,49 +2549,124 @@ mod tests {
     fn render_styled_diff_plain_layout() {
         let l = "{\n  \"hidden\": true\n}\n";
         let r = "{\n  \"hidden\": false\n}\n";
-        let out = render_styled_diff("q/schema.json (local)", "q/schema.json (remote)", l, r, ColorMode::Plain);
+        let out = render_styled_diff(
+            "q/schema.json (local)",
+            "q/schema.json (remote)",
+            l,
+            r,
+            ColorMode::Plain,
+        );
         assert!(out.starts_with("Update(q/schema.json)\n"), "header: {out}");
-        assert!(out.contains("Added 1 line, removed 1 line"), "summary: {out}");
+        assert!(
+            out.contains("Added 1 line, removed 1 line"),
+            "summary: {out}"
+        );
         assert!(out.contains("- local   + remote"), "side legend: {out}");
         assert!(out.contains(" - "), "removed marker: {out}");
         assert!(out.contains(" + "), "added marker: {out}");
-        assert!(out.contains("true") && out.contains("false"), "both values: {out}");
-        assert!(!out.contains('\u{1b}'), "plain mode must carry no SGR: {out}");
+        assert!(
+            out.contains("true") && out.contains("false"),
+            "both values: {out}"
+        );
+        assert!(
+            !out.contains('\u{1b}'),
+            "plain mode must carry no SGR: {out}"
+        );
         // identical sides → empty
-        assert!(render_styled_diff("q/x.json (local)", "q/x.json (remote)", l, l, ColorMode::Plain).is_empty());
+        assert!(
+            render_styled_diff(
+                "q/x.json (local)",
+                "q/x.json (remote)",
+                l,
+                l,
+                ColorMode::Plain
+            )
+            .is_empty()
+        );
         // verb reflects one-sided diffs
-        assert!(render_styled_diff("/dev/null", "q/x.json", "", r, ColorMode::Plain).starts_with("Create("));
-        assert!(render_styled_diff("q/x.json", "/dev/null", l, "", ColorMode::Plain).starts_with("Delete("));
+        assert!(
+            render_styled_diff("/dev/null", "q/x.json", "", r, ColorMode::Plain)
+                .starts_with("Create(")
+        );
+        assert!(
+            render_styled_diff("q/x.json", "/dev/null", l, "", ColorMode::Plain)
+                .starts_with("Delete(")
+        );
     }
 
     #[test]
     fn render_styled_diff_color_backgrounds_and_highlight() {
         let l = "{\n  \"hidden\": true\n}\n";
         let r = "{\n  \"hidden\": false\n}\n";
-        let out = render_styled_diff("q/schema.json (local)", "q/schema.json (remote)", l, r, ColorMode::Color);
-        assert!(!out.contains('\u{25cf}'), "decorative header bullet should be removed: {out:?}");
-        assert!(out.contains(SGR_BG_REMOVE), "removed row needs a red background");
-        assert!(out.contains(SGR_BG_ADD), "added row needs a green background");
-        assert!(out.contains(SGR_EOL), "rows must fill the background to the line end");
+        let out = render_styled_diff(
+            "q/schema.json (local)",
+            "q/schema.json (remote)",
+            l,
+            r,
+            ColorMode::Color,
+        );
+        assert!(
+            !out.contains('\u{25cf}'),
+            "decorative header bullet should be removed: {out:?}"
+        );
+        assert!(
+            out.contains(SGR_BG_REMOVE),
+            "removed row needs a red background"
+        );
+        assert!(
+            out.contains(SGR_BG_ADD),
+            "added row needs a green background"
+        );
+        assert!(
+            out.contains(SGR_EOL),
+            "rows must fill the background to the line end"
+        );
         assert!(out.contains(SGR_J_KEY), "JSON keys should be highlighted");
         assert!(out.contains(SGR_J_KW), "true/false should be highlighted");
         // Colored gutters on changed rows.
-        assert!(out.contains(SGR_GUTTER_REMOVE), "removed line number should be red");
-        assert!(out.contains(SGR_GUTTER_ADD), "added line number should be green");
+        assert!(
+            out.contains(SGR_GUTTER_REMOVE),
+            "removed line number should be red"
+        );
+        assert!(
+            out.contains(SGR_GUTTER_ADD),
+            "added line number should be green"
+        );
         // Intra-line emphasis: the changed value carries the brighter bg.
-        assert!(out.contains(SGR_BG_REMOVE_HI), "changed span on removed row needs brighter red");
-        assert!(out.contains(SGR_BG_ADD_HI), "changed span on added row needs brighter green");
+        assert!(
+            out.contains(SGR_BG_REMOVE_HI),
+            "changed span on removed row needs brighter red"
+        );
+        assert!(
+            out.contains(SGR_BG_ADD_HI),
+            "changed span on added row needs brighter green"
+        );
         // Side legend tokens are color-coded (bold red/green) to mirror the
         // -/+ rows, not dimmed.
-        assert!(out.contains(&format!("{SGR_REMOVE_BOLD}- local")), "legend '- local' should be bold red: {out:?}");
-        assert!(out.contains(&format!("{SGR_ADD_BOLD}+ remote")), "legend '+ remote' should be bold green: {out:?}");
+        assert!(
+            out.contains(&format!("{SGR_REMOVE_BOLD}- local")),
+            "legend '- local' should be bold red: {out:?}"
+        );
+        assert!(
+            out.contains(&format!("{SGR_ADD_BOLD}+ remote")),
+            "legend '+ remote' should be bold green: {out:?}"
+        );
         // Non-.json content is not JSON-highlighted (but still gets row bg).
-        let py = render_styled_diff("hooks/h.py (local)", "hooks/h.py (remote)", "a = 1\n", "a = 2\n", ColorMode::Color);
+        let py = render_styled_diff(
+            "hooks/h.py (local)",
+            "hooks/h.py (remote)",
+            "a = 1\n",
+            "a = 2\n",
+            ColorMode::Color,
+        );
         assert!(
             !py.contains(SGR_J_KEY) && !py.contains(SGR_J_NUM),
             "non-json must skip syntax highlighting: {py:?}"
         );
-        assert!(py.contains(SGR_BG_ADD), "non-json still gets row backgrounds");
+        assert!(
+            py.contains(SGR_BG_ADD),
+            "non-json still gets row backgrounds"
+        );
     }
 
     #[test]
@@ -2461,14 +2680,25 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let input = Cursor::new(b"s\n");
         let res = prompt_remote_delete_with_color(
-            input, &mut out, &local, "production", ColorMode::Plain,
-        ).unwrap();
+            input,
+            &mut out,
+            &local,
+            "production",
+            ColorMode::Plain,
+        )
+        .unwrap();
         assert!(matches!(res, Resolution::Skip));
 
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("deleted on production"), "header: {s}");
-        assert!(s.contains("[k] keep local (restore on production)"), "k label: {s}");
-        assert!(s.contains("[r] use production (delete local)"), "r label: {s}");
+        assert!(
+            s.contains("[k] keep local (restore on production)"),
+            "k label: {s}"
+        );
+        assert!(
+            s.contains("[r] use production (delete local)"),
+            "r label: {s}"
+        );
         assert!(!s.contains("[e]"), "no edit option in delete prompt: {s}");
     }
 
@@ -2480,9 +2710,9 @@ mod tests {
         std::fs::write(&local, b"{}").unwrap();
         let mut out: Vec<u8> = Vec::new();
         let input = Cursor::new(b"k\n");
-        let res = prompt_remote_delete_with_color(
-            input, &mut out, &local, "test", ColorMode::Plain,
-        ).unwrap();
+        let res =
+            prompt_remote_delete_with_color(input, &mut out, &local, "test", ColorMode::Plain)
+                .unwrap();
         assert!(matches!(res, Resolution::KeepLocal));
     }
 
@@ -2494,9 +2724,9 @@ mod tests {
         std::fs::write(&local, b"{}").unwrap();
         let mut out: Vec<u8> = Vec::new();
         let input = Cursor::new(b"r\n");
-        let res = prompt_remote_delete_with_color(
-            input, &mut out, &local, "test", ColorMode::Plain,
-        ).unwrap();
+        let res =
+            prompt_remote_delete_with_color(input, &mut out, &local, "test", ColorMode::Plain)
+                .unwrap();
         assert!(matches!(res, Resolution::KeepRemote));
     }
 
@@ -2508,9 +2738,9 @@ mod tests {
         std::fs::write(&local, b"{}").unwrap();
         let mut out: Vec<u8> = Vec::new();
         let input = Cursor::new(b"a\n");
-        let res = prompt_remote_delete_with_color(
-            input, &mut out, &local, "test", ColorMode::Plain,
-        ).unwrap();
+        let res =
+            prompt_remote_delete_with_color(input, &mut out, &local, "test", ColorMode::Plain)
+                .unwrap();
         assert!(matches!(res, Resolution::Abort));
     }
 
@@ -2529,8 +2759,15 @@ mod tests {
         let mut input = Cursor::new(b"k\nk\nk\n".to_vec());
         let path = std::path::Path::new("x.py");
         let outcome = prompt_hunk_by_hunk(
-            &mut input, &mut output, &local, &remote, path, "production", ColorMode::Plain,
-        ).unwrap();
+            &mut input,
+            &mut output,
+            &local,
+            &remote,
+            path,
+            "production",
+            ColorMode::Plain,
+        )
+        .unwrap();
         match outcome {
             EditOutcome::Edited(bytes) => assert_eq!(bytes, local),
             other => panic!("expected Edited(local), got {other:?}"),
@@ -2544,8 +2781,15 @@ mod tests {
         let mut input = Cursor::new(b"r\nr\nr\n".to_vec());
         let path = std::path::Path::new("x.py");
         let outcome = prompt_hunk_by_hunk(
-            &mut input, &mut output, &local, &remote, path, "production", ColorMode::Plain,
-        ).unwrap();
+            &mut input,
+            &mut output,
+            &local,
+            &remote,
+            path,
+            "production",
+            ColorMode::Plain,
+        )
+        .unwrap();
         match outcome {
             EditOutcome::Edited(bytes) => assert_eq!(bytes, remote),
             other => panic!("expected Edited(remote), got {other:?}"),
@@ -2560,8 +2804,15 @@ mod tests {
         let mut input = Cursor::new(b"k\nr\nk\n".to_vec());
         let path = std::path::Path::new("x.py");
         let outcome = prompt_hunk_by_hunk(
-            &mut input, &mut output, &local, &remote, path, "production", ColorMode::Plain,
-        ).unwrap();
+            &mut input,
+            &mut output,
+            &local,
+            &remote,
+            path,
+            "production",
+            ColorMode::Plain,
+        )
+        .unwrap();
         let bytes = match outcome {
             EditOutcome::Edited(b) => b,
             other => panic!("expected Edited, got {other:?}"),
@@ -2569,12 +2820,7 @@ mod tests {
         // Hunk 1 = local (FOO), hunk 2 = remote (bar), hunk 3 = local (BAZ).
         // Equal lines (a, b, c, d) preserved.
         let expected = b"a\nFOO\nb\nbar\nc\nBAZ\nd\n".to_vec();
-        assert_eq!(
-            bytes,
-            expected,
-            "got {:?}",
-            String::from_utf8_lossy(&bytes)
-        );
+        assert_eq!(bytes, expected, "got {:?}", String::from_utf8_lossy(&bytes));
     }
 
     #[test]
@@ -2586,20 +2832,22 @@ mod tests {
         let mut input = Cursor::new(b"b\n".to_vec());
         let path = std::path::Path::new("x.py");
         let outcome = prompt_hunk_by_hunk(
-            &mut input, &mut output, &local, &remote, path, "production", ColorMode::Plain,
-        ).unwrap();
+            &mut input,
+            &mut output,
+            &local,
+            &remote,
+            path,
+            "production",
+            ColorMode::Plain,
+        )
+        .unwrap();
         let bytes = match outcome {
             EditOutcome::Edited(b) => b,
             other => panic!("expected Edited, got {other:?}"),
         };
         // Local lines first, then remote lines, no markers.
         let expected = b"a\nLOCAL\nREMOTE\nb\n".to_vec();
-        assert_eq!(
-            bytes,
-            expected,
-            "got {:?}",
-            String::from_utf8_lossy(&bytes)
-        );
+        assert_eq!(bytes, expected, "got {:?}", String::from_utf8_lossy(&bytes));
         let s = String::from_utf8_lossy(&bytes);
         assert!(!s.contains("<<<<<<<"), "no markers on `[b]oth`: {s}");
     }
@@ -2612,8 +2860,15 @@ mod tests {
         let mut input = Cursor::new(b"s\n".to_vec());
         let path = std::path::Path::new("x.py");
         let outcome = prompt_hunk_by_hunk(
-            &mut input, &mut output, &local, &remote, path, "production", ColorMode::Plain,
-        ).unwrap();
+            &mut input,
+            &mut output,
+            &local,
+            &remote,
+            path,
+            "production",
+            ColorMode::Plain,
+        )
+        .unwrap();
         let bytes = match outcome {
             EditOutcome::EditedWithMarkers(b) => b,
             other => panic!("expected EditedWithMarkers, got {other:?}"),
@@ -2632,8 +2887,15 @@ mod tests {
         let mut input = Cursor::new(b"a\n".to_vec());
         let path = std::path::Path::new("x.py");
         let outcome = prompt_hunk_by_hunk(
-            &mut input, &mut output, &local, &remote, path, "production", ColorMode::Plain,
-        ).unwrap();
+            &mut input,
+            &mut output,
+            &local,
+            &remote,
+            path,
+            "production",
+            ColorMode::Plain,
+        )
+        .unwrap();
         assert!(matches!(outcome, EditOutcome::Aborted), "got {outcome:?}");
     }
 
@@ -2646,7 +2908,8 @@ mod tests {
         // and `- LOCAL_LINE` / `+ REMOTE_LINE` rows for the conflicting
         // lines with surrounding equal-context rows.
         let local = b"line1\nline2\nline3\nLOCAL_LINE\nline5\nline6\nline7\nline8\nline9\nline10\n";
-        let remote = b"line1\nline2\nline3\nREMOTE_LINE\nline5\nline6\nline7\nline8\nline9\nline10\n";
+        let remote =
+            b"line1\nline2\nline3\nREMOTE_LINE\nline5\nline6\nline7\nline8\nline9\nline10\n";
 
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.py");
@@ -2708,10 +2971,17 @@ mod tests {
             b"a\nREMOTE\nb\n",
             "production",
             ColorMode::Plain,
-        ).unwrap();
+        )
+        .unwrap();
         let s = String::from_utf8(output).unwrap();
-        assert!(!s.contains("[h]"), "single-hunk prompt must not offer [h]: {s}");
-        assert!(!s.contains("hunks)"), "single-hunk header must not advertise count: {s}");
+        assert!(
+            !s.contains("[h]"),
+            "single-hunk prompt must not offer [h]: {s}"
+        );
+        assert!(
+            !s.contains("hunks)"),
+            "single-hunk header must not advertise count: {s}"
+        );
 
         // Three-hunk case — `[h] hunk-by-hunk` must appear, header must say "(3 hunks)".
         let path3 = dir.path().join("y.py");
@@ -2727,7 +2997,8 @@ mod tests {
             b"a\nfoo\nb\nbar\nc\nbaz\nd\n",
             "production",
             ColorMode::Plain,
-        ).unwrap();
+        )
+        .unwrap();
         let s3 = String::from_utf8(output3).unwrap();
         assert!(
             s3.contains("[h] hunk-by-hunk"),
@@ -3054,7 +3325,10 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         let marker_count = s.matches("<<<<<<< local").count();
         assert_eq!(marker_count, 1, "expected 1 block, got {marker_count}: {s}");
-        assert!(s.contains("<<<<<<< local\na\nb\nc\n=======\nx\ny\nz\n>>>>>>> test\n"), "{s}");
+        assert!(
+            s.contains("<<<<<<< local\na\nb\nc\n=======\nx\ny\nz\n>>>>>>> test\n"),
+            "{s}"
+        );
     }
 
     #[test]
@@ -3064,7 +3338,10 @@ mod tests {
         let buf = build_conflict_buffer(local, remote, "test");
         let s = String::from_utf8(buf).unwrap();
         let marker_count = s.matches("<<<<<<< local").count();
-        assert_eq!(marker_count, 3, "expected 3 blocks, got {marker_count}: {s}");
+        assert_eq!(
+            marker_count, 3,
+            "expected 3 blocks, got {marker_count}: {s}"
+        );
     }
 
     #[test]
@@ -3102,8 +3379,15 @@ mod tests {
         let mut input = Cursor::new(b"k\n".to_vec());
         let path = std::path::Path::new("x.py");
         let outcome = prompt_hunk_by_hunk(
-            &mut input, &mut output, &local, &remote, path, "production", ColorMode::Plain,
-        ).unwrap();
+            &mut input,
+            &mut output,
+            &local,
+            &remote,
+            path,
+            "production",
+            ColorMode::Plain,
+        )
+        .unwrap();
         let bytes = match outcome {
             EditOutcome::EditedWithMarkers(b) => b,
             other => panic!("expected EditedWithMarkers, got {other:?}"),
@@ -3127,8 +3411,15 @@ mod tests {
         let mut input = Cursor::new(b"x\nk\n".to_vec());
         let path = std::path::Path::new("x.py");
         let outcome = prompt_hunk_by_hunk(
-            &mut input, &mut output, &local, &remote, path, "test", ColorMode::Plain,
-        ).unwrap();
+            &mut input,
+            &mut output,
+            &local,
+            &remote,
+            path,
+            "test",
+            ColorMode::Plain,
+        )
+        .unwrap();
         match outcome {
             EditOutcome::Edited(bytes) => assert_eq!(bytes, local),
             other => panic!("expected Edited, got {other:?}"),
@@ -3144,8 +3435,15 @@ mod tests {
         let mut input = Cursor::new(b"a\n".to_vec());
         let path = std::path::Path::new("x.py");
         let outcome = prompt_hunk_by_hunk(
-            &mut input, &mut output, &local, &remote, path, "test", ColorMode::Plain,
-        ).unwrap();
+            &mut input,
+            &mut output,
+            &local,
+            &remote,
+            path,
+            "test",
+            ColorMode::Plain,
+        )
+        .unwrap();
         assert!(matches!(outcome, EditOutcome::Aborted), "got {outcome:?}");
     }
 
@@ -3158,8 +3456,15 @@ mod tests {
         let mut input = Cursor::new(b"k\nr\nb\ns\n".to_vec());
         let path = std::path::Path::new("x.py");
         let outcome = prompt_hunk_by_hunk(
-            &mut input, &mut output, &local, &remote, path, "production", ColorMode::Plain,
-        ).unwrap();
+            &mut input,
+            &mut output,
+            &local,
+            &remote,
+            path,
+            "production",
+            ColorMode::Plain,
+        )
+        .unwrap();
         let bytes = match outcome {
             EditOutcome::EditedWithMarkers(b) => b,
             other => panic!("expected EditedWithMarkers (one [s] used), got {other:?}"),
@@ -3170,12 +3475,7 @@ mod tests {
         let expected =
             b"a\nFOO\nb\nbar\nc\nBAZ\nbaz\nd\n<<<<<<< local\nQUX\n=======\nqux\n>>>>>>> production\ne\n"
                 .to_vec();
-        assert_eq!(
-            bytes,
-            expected,
-            "got {:?}",
-            String::from_utf8_lossy(&bytes)
-        );
+        assert_eq!(bytes, expected, "got {:?}", String::from_utf8_lossy(&bytes));
     }
 
     #[test]
@@ -3188,8 +3488,15 @@ mod tests {
         let mut input = Cursor::new(b"".to_vec());
         let path = std::path::Path::new("x.py");
         let outcome = prompt_hunk_by_hunk(
-            &mut input, &mut output, &local, &remote, path, "test", ColorMode::Plain,
-        ).unwrap();
+            &mut input,
+            &mut output,
+            &local,
+            &remote,
+            path,
+            "test",
+            ColorMode::Plain,
+        )
+        .unwrap();
         match outcome {
             EditOutcome::Edited(bytes) => assert_eq!(bytes, local),
             other => panic!("expected Edited(local), got {other:?}"),
@@ -3275,7 +3582,10 @@ mod tests {
         )
         .unwrap();
         let s = String::from_utf8(output).unwrap();
-        assert!(s.contains("(3 hunks)"), "header should advertise hunk count: {s}");
+        assert!(
+            s.contains("(3 hunks)"),
+            "header should advertise hunk count: {s}"
+        );
     }
 
     #[test]
@@ -3297,7 +3607,10 @@ mod tests {
         )
         .unwrap();
         let s = String::from_utf8(output).unwrap();
-        assert!(!s.contains("hunks)"), "single-hunk header must omit count: {s}");
+        assert!(
+            !s.contains("hunks)"),
+            "single-hunk header must omit count: {s}"
+        );
     }
 
     #[test]
@@ -3323,7 +3636,13 @@ mod tests {
         let s = String::from_utf8(output).unwrap();
         assert!(s.contains("unrecognized"), "should print unrecognized: {s}");
         let prompts = s.matches("[k] keep local").count();
-        assert!(prompts >= 2, "should have re-prompted at least twice: count={prompts}, output={s}");
-        assert!(s.contains("[h] hunk-by-hunk"), "multi-hunk re-prompt should include [h]: {s}");
+        assert!(
+            prompts >= 2,
+            "should have re-prompted at least twice: count={prompts}, output={s}"
+        );
+        assert!(
+            s.contains("[h] hunk-by-hunk"),
+            "multi-hunk re-prompt should include [h]: {s}"
+        );
     }
 }
