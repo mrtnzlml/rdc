@@ -3320,8 +3320,8 @@ mod tests {
     }
 
     fn classified_for(fixture: &ConflictFixture) -> Vec<ClassifiedItem> {
-        let local_hash = content_hash(&label_bytes(&fixture.local_edit), &Lockfile::default());
-        let remote_hash = content_hash(&label_bytes(&fixture.remote_label), &Lockfile::default());
+        let local_hash = content_hash(&label_bytes(&fixture.local_edit), &fixture.lockfile);
+        let remote_hash = content_hash(&label_bytes(&fixture.remote_label), &fixture.lockfile);
         let base_hash = fixture
             .lockfile
             .objects
@@ -3389,7 +3389,7 @@ mod tests {
         // Lockfile aligned to remote hash so the push driver's drift
         // check accepts the force-push.
         let remote_bytes = label_bytes(&fixture.remote_label);
-        let remote_hash = content_hash(&remote_bytes, &Lockfile::default());
+        let remote_hash = content_hash(&remote_bytes, &fixture.lockfile);
         let recorded = fixture
             .lockfile
             .objects
@@ -3456,7 +3456,7 @@ mod tests {
             .and_then(|m| m.get("audit-hold"))
             .and_then(|e| e.content_hash.clone())
             .unwrap();
-        assert_eq!(recorded, content_hash(&remote_bytes, &Lockfile::default()));
+        assert_eq!(recorded, content_hash(&remote_bytes, &fixture.lockfile));
     }
 
     /// Scripted `s\n` ([s]kip): the resolver writes a shadow file next
@@ -4383,8 +4383,7 @@ mod tests {
         let remote_hook = &catalog.hooks[0];
         let (remote_json_full, remote_code) =
             crate::snapshot::hook::serialize_hook(remote_hook).unwrap();
-        let expected =
-            crate::state::hook_combined_hash(&remote_json_full, &remote_code, &Lockfile::default());
+        let expected = crate::state::hook_combined_hash(&remote_json_full, &remote_code, &lockfile);
         assert_eq!(
             recorded, expected,
             "lockfile base should equal remote combined hash after [k]"
@@ -5102,6 +5101,53 @@ mod tests {
         );
         let overlay: crate::overlay::Overlay = toml::from_str(&overlay_toml).unwrap();
 
+        // Seed the lockfile with a base hash that differs from both local and
+        // remote (simulates a prior state before both sides diverged).
+        // Build lockfile first so all hash computations can use it for URL
+        // normalization (rdc:// form), matching what the resolver records.
+        let mut lockfile = Lockfile::default();
+        lockfile.upsert(
+            "hooks",
+            slug,
+            ObjectEntry {
+                id: 555,
+                url: Some("https://x.invalid/api/v1/hooks/555".to_string()),
+                modified_at: None,
+                content_hash: Some(String::new()), // placeholder, replaced below
+                secrets_hash: None,
+            },
+        );
+
+        let base_json = serde_json::json!({
+            "id": 555,
+            "url": "https://x.invalid/api/v1/hooks/555",
+            "name": "Validator hook",
+            "type": "function",
+            "queues": [],
+            "events": ["annotation_content"],
+            "config": { "runtime": "python3.12" }
+        });
+        let mut base_bytes = serde_json::to_vec_pretty(&base_json).unwrap();
+        base_bytes.push(b'\n');
+        let base_code = "def validate(payload):\n    pass\n".to_string();
+        let base_hash = combined_hash(
+            &base_bytes,
+            &[("code".to_string(), base_code.into_bytes())],
+            &lockfile,
+        );
+        // Update the lockfile entry with the real base hash.
+        lockfile.upsert(
+            "hooks",
+            slug,
+            ObjectEntry {
+                id: 555,
+                url: Some("https://x.invalid/api/v1/hooks/555".to_string()),
+                modified_at: None,
+                content_hash: Some(base_hash.clone()),
+                secrets_hash: None,
+            },
+        );
+
         // Compute the expected "correct" remote hash: post-overlay (no description)
         // + code sidecar. This is what the pull driver records and what the next
         // classifier would compute on the on-disk bytes.
@@ -5120,39 +5166,7 @@ mod tests {
         let expected_hash = combined_hash(
             &remote_json_stripped,
             &[("code".to_string(), remote_code_bytes)],
-            &Lockfile::default(),
-        );
-
-        // Seed the lockfile with a base hash that differs from both local and
-        // remote (simulates a prior state before both sides diverged).
-        let base_json = serde_json::json!({
-            "id": 555,
-            "url": "https://x.invalid/api/v1/hooks/555",
-            "name": "Validator hook",
-            "type": "function",
-            "queues": [],
-            "events": ["annotation_content"],
-            "config": { "runtime": "python3.12" }
-        });
-        let mut base_bytes = serde_json::to_vec_pretty(&base_json).unwrap();
-        base_bytes.push(b'\n');
-        let base_code = "def validate(payload):\n    pass\n".to_string();
-        let base_hash = combined_hash(
-            &base_bytes,
-            &[("code".to_string(), base_code.into_bytes())],
-            &Lockfile::default(),
-        );
-        let mut lockfile = Lockfile::default();
-        lockfile.upsert(
-            "hooks",
-            slug,
-            ObjectEntry {
-                id: 555,
-                url: Some("https://x.invalid/api/v1/hooks/555".to_string()),
-                modified_at: None,
-                content_hash: Some(base_hash.clone()),
-                secrets_hash: None,
-            },
+            &lockfile,
         );
 
         // Simulate the local hash: post-overlay (no description) + local code.
@@ -5160,7 +5174,7 @@ mod tests {
         let local_hash = combined_hash(
             &local_json_bytes,
             &[("code".to_string(), local_code_str.into_bytes())],
-            &Lockfile::default(),
+            &lockfile,
         );
 
         // Remote hash via the codec (what the classifier would compute).
