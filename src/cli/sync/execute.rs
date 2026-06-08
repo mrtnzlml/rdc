@@ -1228,14 +1228,6 @@ fn resolve_one_conflict<R: BufRead>(
         &remote_code,
         &remote_formulas,
     )? {
-        crate::cli::pull::common::record_object(
-            ctx.lockfile,
-            &it.kind,
-            &it.slug,
-            id,
-            modified_at,
-            Some(merged_combined_hash),
-        );
         let render = |xs: &[String]| -> String {
             if xs.is_empty() {
                 "<none>".to_string()
@@ -1255,6 +1247,43 @@ fn resolve_one_conflict<R: BufRead>(
                 render(&rp),
             ),
         );
+        // The merged bytes (already on disk + base cache) incorporate
+        // both sides. If the merge kept ANY local-side change (`lp`
+        // non-empty), the remote does NOT yet have it — recording
+        // base=merged and returning here would leave local==base but
+        // remote≠base, so the NEXT sync classifies the slug as
+        // `RemoteEdit` and PULLS the remote, silently reverting the
+        // local change (data-loss bug). Instead, promote the merged
+        // file to the push pipeline exactly like the keep-local `[k]`
+        // outcome: pin the lockfile base to the CURRENT remote hash so
+        // the push driver's drift check passes (remote_hash == base),
+        // then let the PATCH re-record the post-push base. After that
+        // remote == merged == local == base → converged, nothing lost.
+        if lp.is_empty() {
+            // Purely adopting remote (only remote-side fields moved):
+            // no local change to propagate. Record base=merged and
+            // return — no push needed.
+            crate::cli::pull::common::record_object(
+                ctx.lockfile,
+                &it.kind,
+                &it.slug,
+                id,
+                modified_at,
+                Some(merged_combined_hash),
+            );
+        } else {
+            crate::cli::pull::common::record_object(
+                ctx.lockfile,
+                &it.kind,
+                &it.slug,
+                id,
+                modified_at,
+                Some(canonical_remote_hash.clone()),
+            );
+            outcome
+                .promoted_to_push
+                .push((it.kind.clone(), it.slug.clone(), local_path));
+        }
         return Ok(());
     }
 
