@@ -7079,3 +7079,897 @@ async fn sync_delete_skips_failed_and_continues_batch() {
         "failed-delete label must be retained in lockfile for retry: {lf_raw}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Push-side CREATE (POST) positive coverage.
+//
+// The classifier marks a file present on disk with NO lockfile entry and NO
+// matching remote object as `LocalCreate` (see `classify.rs`:
+// `(local_changed, _, remote_present, locked_present) == (true, false, false,
+// false)`). The push driver then POSTs it, records the returned id in the
+// lockfile, and writes back the canonical (codec) form so a re-sync is a
+// no-op. These tests lock in that behavior — previously only a NEGATIVE
+// `.expect(0)` guard existed (asserting NO create in conflict scenarios) and
+// `hooks` was the only kind with a positive create test (in `tests/api.rs`).
+//
+// Each test was confirmed to genuinely exercise the POST: pointing the mocked
+// POST `path()` at a wrong endpoint makes the create fail (sync errors with a
+// decode/404), so a passing run proves the POST landed on the asserted path.
+// ---------------------------------------------------------------------------
+
+/// Count mutating (POST/PATCH/DELETE) requests against a given path, ignoring
+/// the data-storage paths (which use POST for *reads*).
+fn count_mutations(reqs: &[wiremock::Request], exact_path: &str) -> usize {
+    reqs.iter()
+        .filter(|r| {
+            r.url.path() == exact_path
+                && matches!(
+                    r.method,
+                    http::Method::POST | http::Method::PATCH | http::Method::DELETE
+                )
+        })
+        .count()
+}
+
+/// Push-side LocalCreate for a label: a label JSON exists on disk with no
+/// lockfile entry and the remote listing omits it. `sync` must classify it
+/// `LocalCreate`, POST `/labels`, record the returned id in the lockfile, and
+/// write back the canonical form. A second sync must then be a no-op (no
+/// further POST/PATCH).
+#[tokio::test]
+async fn push_create_label() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // Stateful label listing: empty on the FIRST list (before the create),
+    // then serves the created label on every subsequent list. This mirrors a
+    // real Rossum — once POSTed, the object appears in future listings — so
+    // the second sync classifies it `Clean` (not `RemoteDelete`) and is a
+    // genuine idempotency check, not a deferred-delete artifact.
+    let created_label = serde_json::json!({
+        "id": 7777,
+        "url": format!("{}/api/v1/labels/7777", server.uri()),
+        "name": "Priority High",
+        "organization": format!("{}/api/v1/organizations/1", server.uri()),
+        "color": "#ff0000",
+        "modified_at": "2026-05-01T08:00:00Z"
+    });
+    let label_list_calls = Arc::new(AtomicUsize::new(0));
+    let counter = label_list_calls.clone();
+    let created_for_list = created_label.clone();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(move |_req: &Request| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let body = if n == 0 {
+                serde_json::json!({ "pagination": { "next": null }, "results": [] })
+            } else {
+                serde_json::json!({
+                    "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+                    "results": [created_for_list.clone()]
+                })
+            };
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &["/api/v1/labels"]).await;
+
+    // POST /labels → server assigns id 7777 and a url. `.expect(1)` enforces
+    // exactly one create call across the whole test (one sync only).
+    Mock::given(method("POST"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(&created_label))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // Seed a NEW local label with no lockfile entry. `organization` is a
+    // verbatim env URL (not a portable `rdc://` ref); the push driver passes
+    // it through unchanged.
+    let labels_dir = project.path().join("envs/dev/labels");
+    std::fs::create_dir_all(&labels_dir).unwrap();
+    let local_label = serde_json::json!({
+        "id": 0,
+        "url": "",
+        "name": "Priority High",
+        "organization": format!("{}/api/v1/organizations/1", server.uri()),
+        "color": "#ff0000"
+    });
+    let mut bytes = serde_json::to_vec_pretty(&local_label).unwrap();
+    bytes.push(b'\n');
+    std::fs::write(labels_dir.join("priority-high.json"), &bytes).unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let r1 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+
+    // Snapshot mutations after the first sync, then run a second sync to
+    // assert idempotency, before restoring CWD.
+    let reqs_after_first = server.received_requests().await.unwrap_or_default();
+    let r2 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    r1.expect("first sync (label create) should succeed");
+    r2.expect("second sync should succeed and be a no-op");
+
+    // The POST landed exactly once on /labels.
+    assert_eq!(
+        count_mutations(&reqs_after_first, "/api/v1/labels"),
+        1,
+        "exactly one POST /labels should have happened on the create sync"
+    );
+
+    // The POST body carried the user-authored name and stripped the
+    // placeholder id/url (per strip_for_create).
+    let post = reqs_after_first
+        .iter()
+        .find(|r| r.method == http::Method::POST && r.url.path() == "/api/v1/labels")
+        .expect("a POST /labels request must exist");
+    let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+    assert_eq!(body["name"], "Priority High", "POST body name: {body}");
+    assert!(
+        body.get("id").is_none(),
+        "placeholder id must be stripped from POST body: {body}"
+    );
+    assert!(
+        body.get("url").is_none(),
+        "placeholder url must be stripped from POST body: {body}"
+    );
+
+    // Lockfile records the returned id.
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    let lf: serde_json::Value = serde_json::from_str(&lf_raw).unwrap();
+    assert_eq!(
+        lf.pointer("/objects/labels/priority-high/id"),
+        Some(&serde_json::json!(7777)),
+        "lockfile must record the created label id: {lf_raw}"
+    );
+
+    // Idempotency: the second sync issued no further mutation on /labels
+    // (the only mutating request total is the single create POST).
+    let reqs_after_second = server.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        count_mutations(&reqs_after_second, "/api/v1/labels"),
+        1,
+        "second sync must not POST/PATCH /labels again (idempotent)"
+    );
+}
+
+/// Push-side LocalCreate for a rule: a rule JSON (+ `.py` sidecar carrying
+/// `trigger_condition`) exists on disk with no lockfile entry and the remote
+/// omits it. `sync` must POST `/rules` with the reconstituted
+/// `trigger_condition`, record the id, and be idempotent on re-sync.
+#[tokio::test]
+async fn push_create_rule() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let trigger = "annotation_content.total > 1000\n";
+    let created_rule = serde_json::json!({
+        "id": 8888,
+        "url": format!("{}/api/v1/rules/8888", server.uri()),
+        "name": "E-invoice Validation",
+        "queues": [],
+        "trigger_condition": trigger,
+        "modified_at": "2026-05-01T08:00:00Z"
+    });
+    // Stateful listing: empty before the create, then the created rule — so
+    // the second sync sees it as Clean (a true idempotency check).
+    let rule_list_calls = Arc::new(AtomicUsize::new(0));
+    let counter = rule_list_calls.clone();
+    let created_for_list = created_rule.clone();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/rules"))
+        .respond_with(move |_req: &Request| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let body = if n == 0 {
+                serde_json::json!({ "pagination": { "next": null }, "results": [] })
+            } else {
+                serde_json::json!({
+                    "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+                    "results": [created_for_list.clone()]
+                })
+            };
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &["/api/v1/rules"]).await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/rules"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(&created_rule))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // Seed a NEW local rule: JSON without `trigger_condition` (it lives in
+    // the `.py` sidecar, exactly as pull writes it).
+    let rules_dir = project.path().join("envs/dev/rules");
+    std::fs::create_dir_all(&rules_dir).unwrap();
+    let local_rule = serde_json::json!({
+        "id": 0,
+        "url": "",
+        "name": "E-invoice Validation",
+        "queues": []
+    });
+    let mut bytes = serde_json::to_vec_pretty(&local_rule).unwrap();
+    bytes.push(b'\n');
+    std::fs::write(rules_dir.join("e-invoice-validation.json"), &bytes).unwrap();
+    std::fs::write(
+        rules_dir.join("e-invoice-validation.py"),
+        trigger.as_bytes(),
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let r1 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let reqs_after_first = server.received_requests().await.unwrap_or_default();
+    let r2 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    r1.expect("first sync (rule create) should succeed");
+    r2.expect("second sync should succeed and be a no-op");
+
+    assert_eq!(
+        count_mutations(&reqs_after_first, "/api/v1/rules"),
+        1,
+        "exactly one POST /rules should have happened on the create sync"
+    );
+
+    let post = reqs_after_first
+        .iter()
+        .find(|r| r.method == http::Method::POST && r.url.path() == "/api/v1/rules")
+        .expect("a POST /rules request must exist");
+    let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+    assert_eq!(body["name"], "E-invoice Validation", "POST body: {body}");
+    assert_eq!(
+        body["trigger_condition"], trigger,
+        "trigger_condition from the .py sidecar must be folded into the POST body: {body}"
+    );
+
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    let lf: serde_json::Value = serde_json::from_str(&lf_raw).unwrap();
+    assert_eq!(
+        lf.pointer("/objects/rules/e-invoice-validation/id"),
+        Some(&serde_json::json!(8888)),
+        "lockfile must record the created rule id: {lf_raw}"
+    );
+
+    let reqs_after_second = server.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        count_mutations(&reqs_after_second, "/api/v1/rules"),
+        1,
+        "second sync must not POST/PATCH /rules again (idempotent)"
+    );
+}
+
+/// Keystone test: dependency-ordered CREATE of a brand-new workspace + its
+/// queue + the queue's schema, all seeded locally with no lockfile entries
+/// and `rdc://` portable refs. `sync` must POST them in dependency order
+/// (workspace → schema → queue), and the queue POST body must have its
+/// `workspace`/`schema` `rdc://` refs RESOLVED to the freshly-created env
+/// URLs (derived from the ids returned by the workspace/schema POSTs, which
+/// run first and feed the lockfile). A second sync must be idempotent.
+#[tokio::test]
+async fn push_create_dependency_ordered_workspace_schema_queue() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // Fresh ids assigned by the server on create. The env's api_base is
+    // `{server.uri()}/api/v1`, so the lockfile DERIVES each created object's
+    // URL as `{api_base}/<kind>/<id>` (see Lockfile::url_for_slug). The queue
+    // POST body's resolved refs must therefore be exactly these URLs.
+    let ws_id = 5100u64;
+    let schema_id = 5200u64;
+    let queue_id = 5300u64;
+    let ws_url = format!("{}/api/v1/workspaces/{ws_id}", server.uri());
+    let schema_url = format!("{}/api/v1/schemas/{schema_id}", server.uri());
+    let queue_url = format!("{}/api/v1/queues/{queue_id}", server.uri());
+
+    let created_ws = serde_json::json!({
+        "id": ws_id,
+        "url": ws_url,
+        "name": "Invoices AP",
+        "organization": format!("{}/api/v1/organizations/1", server.uri()),
+        "queues": [queue_url.clone()],
+        "modified_at": "2026-05-01T08:00:00Z"
+    });
+    let created_schema = serde_json::json!({
+        "id": schema_id,
+        "url": schema_url,
+        "name": "Cost Invoices Schema",
+        "queues": [queue_url.clone()],
+        "content": [
+            { "category": "section", "id": "header", "label": "Header", "children": [
+                { "category": "datapoint", "id": "invoice_id", "type": "string" }
+            ]}
+        ],
+        "modified_at": "2026-05-01T08:00:00Z"
+    });
+    let created_queue = serde_json::json!({
+        "id": queue_id,
+        "url": queue_url,
+        "name": "Cost Invoices",
+        "workspace": ws_url.clone(),
+        "schema": schema_url.clone(),
+        "modified_at": "2026-05-01T08:00:00Z"
+    });
+
+    // Stateful workspace/queue listings: empty before the create, then the
+    // created objects afterward — so the second sync sees Clean (genuine
+    // idempotency) instead of treating them as remote-deleted.
+    let ws_list_calls = Arc::new(AtomicUsize::new(0));
+    let counter = ws_list_calls.clone();
+    let created_ws_for_list = created_ws.clone();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(move |_req: &Request| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let body = if n == 0 {
+                serde_json::json!({ "pagination": { "next": null }, "results": [] })
+            } else {
+                serde_json::json!({
+                    "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+                    "results": [created_ws_for_list.clone()]
+                })
+            };
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server)
+        .await;
+
+    let queue_list_calls = Arc::new(AtomicUsize::new(0));
+    let counter = queue_list_calls.clone();
+    let created_queue_for_list = created_queue.clone();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .respond_with(move |_req: &Request| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let body = if n == 0 {
+                serde_json::json!({ "pagination": { "next": null }, "results": [] })
+            } else {
+                serde_json::json!({
+                    "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+                    "results": [created_queue_for_list.clone()]
+                })
+            };
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server)
+        .await;
+
+    // The created schema is fetched by id on the second sync's pull (the
+    // queue's `schema` URL points here).
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/schemas/{schema_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&created_schema))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/workspaces", "/api/v1/queues"]).await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(&created_ws))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/schemas"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(&created_schema))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/queues"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(&created_queue))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // Seed the local snapshot: workspace/<ws>/workspace.json and the nested
+    // queue.json + schema.json. The queue references the workspace and schema
+    // via portable `rdc://` refs (env-agnostic), exactly as pull writes them.
+    let ws_dir = project.path().join("envs/dev/workspaces/invoices-ap");
+    let q_dir = ws_dir.join("queues/cost-invoices");
+    std::fs::create_dir_all(&q_dir).unwrap();
+
+    let ws_json = serde_json::json!({
+        "id": 0,
+        "url": "",
+        "name": "Invoices AP",
+        "organization": format!("{}/api/v1/organizations/1", server.uri()),
+        "queues": []
+    });
+    let mut b = serde_json::to_vec_pretty(&ws_json).unwrap();
+    b.push(b'\n');
+    std::fs::write(ws_dir.join("workspace.json"), &b).unwrap();
+
+    let schema_json = serde_json::json!({
+        "id": 0,
+        "url": "",
+        "name": "Cost Invoices Schema",
+        "queues": [],
+        "content": [
+            { "category": "section", "id": "header", "label": "Header", "children": [
+                { "category": "datapoint", "id": "invoice_id", "type": "string" }
+            ]}
+        ]
+    });
+    let mut b = serde_json::to_vec_pretty(&schema_json).unwrap();
+    b.push(b'\n');
+    std::fs::write(q_dir.join("schema.json"), &b).unwrap();
+
+    let queue_json = serde_json::json!({
+        "id": 0,
+        "url": "",
+        "name": "Cost Invoices",
+        "workspace": "rdc://workspaces/invoices-ap",
+        "schema": "rdc://schemas/cost-invoices"
+    });
+    let mut b = serde_json::to_vec_pretty(&queue_json).unwrap();
+    b.push(b'\n');
+    std::fs::write(q_dir.join("queue.json"), &b).unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let r1 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let reqs_after_first = server.received_requests().await.unwrap_or_default();
+    let r2 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    r1.expect("first sync (dependency-ordered create) should succeed");
+    r2.expect("second sync should succeed and be a no-op");
+
+    // All three POSTs landed exactly once.
+    assert_eq!(
+        count_mutations(&reqs_after_first, "/api/v1/workspaces"),
+        1,
+        "exactly one POST /workspaces"
+    );
+    assert_eq!(
+        count_mutations(&reqs_after_first, "/api/v1/schemas"),
+        1,
+        "exactly one POST /schemas"
+    );
+    assert_eq!(
+        count_mutations(&reqs_after_first, "/api/v1/queues"),
+        1,
+        "exactly one POST /queues"
+    );
+
+    // Dependency ordering: the workspace and schema POSTs both precede the
+    // queue POST (the queue's resolved refs depend on their fresh ids).
+    let post_index = |p: &str| -> usize {
+        reqs_after_first
+            .iter()
+            .position(|r| r.method == http::Method::POST && r.url.path() == p)
+            .unwrap_or_else(|| panic!("expected a POST to {p}"))
+    };
+    let ws_idx = post_index("/api/v1/workspaces");
+    let schema_idx = post_index("/api/v1/schemas");
+    let queue_idx = post_index("/api/v1/queues");
+    assert!(
+        ws_idx < queue_idx,
+        "workspace POST (#{ws_idx}) must precede queue POST (#{queue_idx})"
+    );
+    assert!(
+        schema_idx < queue_idx,
+        "schema POST (#{schema_idx}) must precede queue POST (#{queue_idx})"
+    );
+
+    // The queue POST body's refs are RESOLVED to the freshly-created env URLs
+    // (NOT `rdc://`), proving the workspace/schema ids flowed into the queue.
+    let queue_post = reqs_after_first
+        .iter()
+        .find(|r| r.method == http::Method::POST && r.url.path() == "/api/v1/queues")
+        .expect("a POST /queues request must exist");
+    let qbody: serde_json::Value = serde_json::from_slice(&queue_post.body).unwrap();
+    assert_eq!(
+        qbody["workspace"],
+        serde_json::json!(format!("{}/api/v1/workspaces/{ws_id}", server.uri())),
+        "queue.workspace must resolve to the freshly-created workspace URL: {qbody}"
+    );
+    assert_eq!(
+        qbody["schema"],
+        serde_json::json!(format!("{}/api/v1/schemas/{schema_id}", server.uri())),
+        "queue.schema must resolve to the freshly-created schema URL: {qbody}"
+    );
+    assert!(
+        !qbody.to_string().contains("rdc://"),
+        "no unresolved rdc:// refs may remain in the queue POST body: {qbody}"
+    );
+
+    // Lockfile records all three ids under the right kinds.
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    let lf: serde_json::Value = serde_json::from_str(&lf_raw).unwrap();
+    assert_eq!(
+        lf.pointer("/objects/workspaces/invoices-ap/id"),
+        Some(&serde_json::json!(ws_id)),
+        "lockfile workspace id: {lf_raw}"
+    );
+    assert_eq!(
+        lf.pointer("/objects/schemas/cost-invoices/id"),
+        Some(&serde_json::json!(schema_id)),
+        "lockfile schema id: {lf_raw}"
+    );
+    assert_eq!(
+        lf.pointer("/objects/queues/cost-invoices/id"),
+        Some(&serde_json::json!(queue_id)),
+        "lockfile queue id: {lf_raw}"
+    );
+
+    // Idempotency: the second sync issued no further create on any of the
+    // three endpoints.
+    let reqs_after_second = server.received_requests().await.unwrap_or_default();
+    for ep in ["/api/v1/workspaces", "/api/v1/schemas", "/api/v1/queues"] {
+        assert_eq!(
+            count_mutations(&reqs_after_second, ep),
+            1,
+            "second sync must not mutate {ep} again (idempotent)"
+        );
+    }
+}
+
+/// Push-side LocalCreate for an inbox + email template, both queue-nested.
+/// The owning workspace/queue/schema already exist (seeded in the lockfile +
+/// remote listing as Clean), so only the new inbox and email template are
+/// `LocalCreate`. `sync` must POST `/inboxes` and `/email_templates`, each
+/// with its `queue` ref resolved to the existing queue URL, and be
+/// idempotent on re-sync.
+#[tokio::test]
+async fn push_create_inbox_and_email_template() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // The workspace + queue + schema already exist remotely and locally
+    // (Clean). The inbox and email_template are NOT in the listings → the
+    // local files for them are LocalCreate.
+    let ws_url = format!("{}/api/v1/workspaces/800", server.uri());
+    let queue_url = format!("{}/api/v1/queues/100", server.uri());
+    let schema_url = format!("{}/api/v1/schemas/200", server.uri());
+
+    let workspaces_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [{
+            "id": 800, "url": ws_url, "name": "Invoices AP",
+            "organization": format!("{}/api/v1/organizations/1", server.uri()),
+            "queues": [queue_url.clone()], "modified_at": "2026-04-20T08:00:00Z"
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(workspaces_body))
+        .mount(&server)
+        .await;
+
+    let queues_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [{
+            "id": 100, "url": queue_url.clone(), "name": "Cost Invoices",
+            "workspace": ws_url.clone(), "schema": schema_url.clone(),
+            "modified_at": "2026-04-20T08:00:00Z"
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(queues_body))
+        .mount(&server)
+        .await;
+
+    let schema_body = serde_json::json!({
+        "id": 200, "url": schema_url.clone(), "name": "Cost Invoices Schema",
+        "queues": [queue_url.clone()],
+        "content": [
+            { "category": "section", "id": "header", "label": "Header", "children": [
+                { "category": "datapoint", "id": "invoice_id", "type": "string" }
+            ]}
+        ],
+        "modified_at": "2026-04-10T09:00:00Z"
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schemas/200"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(schema_body))
+        .mount(&server)
+        .await;
+
+    // POST endpoints for the two new nested objects. The server assigns ids
+    // and (for the inbox) the email address.
+    let created_inbox = serde_json::json!({
+        "id": 300,
+        "url": format!("{}/api/v1/inboxes/300", server.uri()),
+        "name": "Cost Invoices Inbox",
+        "email": "cost-invoices@mock.rossum.app",
+        "queues": [queue_url.clone()],
+        "filters": [],
+        "modified_at": "2026-05-01T08:00:00Z"
+    });
+    let created_template = serde_json::json!({
+        "id": 9001,
+        "url": format!("{}/api/v1/email_templates/9001", server.uri()),
+        "name": "Rejection Notice",
+        "subject": "Your invoice was rejected",
+        "queue": queue_url.clone(),
+        "modified_at": "2026-05-01T08:00:00Z"
+    });
+
+    // Stateful inbox/email_template listings: empty until the create, then
+    // the created object — so the final sync classifies them Clean (genuine
+    // idempotency). The first sync (initial pull) and the second sync's pull
+    // both see empty; only the third sync's pull sees the created objects.
+    let inbox_list_calls = Arc::new(AtomicUsize::new(0));
+    let counter = inbox_list_calls.clone();
+    let created_inbox_for_list = created_inbox.clone();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/inboxes"))
+        .respond_with(move |_req: &Request| {
+            // Two list calls happen before the create lands (initial pull +
+            // the create sync's own pull pass), so serve the created body
+            // only from the third list onward.
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let body = if n < 2 {
+                serde_json::json!({ "pagination": { "next": null }, "results": [] })
+            } else {
+                serde_json::json!({
+                    "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+                    "results": [created_inbox_for_list.clone()]
+                })
+            };
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server)
+        .await;
+
+    let tpl_list_calls = Arc::new(AtomicUsize::new(0));
+    let counter = tpl_list_calls.clone();
+    let created_tpl_for_list = created_template.clone();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/email_templates"))
+        .respond_with(move |_req: &Request| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let body = if n < 2 {
+                serde_json::json!({ "pagination": { "next": null }, "results": [] })
+            } else {
+                serde_json::json!({
+                    "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+                    "results": [created_tpl_for_list.clone()]
+                })
+            };
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(
+        &server,
+        &[
+            "/api/v1/workspaces",
+            "/api/v1/queues",
+            "/api/v1/inboxes",
+            "/api/v1/email_templates",
+        ],
+    )
+    .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/inboxes"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(&created_inbox))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/email_templates"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(&created_template))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // First sync: pull the existing workspace/queue/schema so they land in
+    // the lockfile as Clean. The inbox + template files don't exist yet, so
+    // nothing is created. The seed-then-create-then-resync steps below all
+    // run inside the same CWD window; results are asserted after CWD is
+    // restored (mirroring the other push_create tests) so a mid-test panic
+    // can't poison the process-global CWD.
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let pull = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+
+    // Now seed the NEW inbox + email template under the existing queue, both
+    // with `rdc://queues/cost-invoices` refs.
+    let q_dir = project
+        .path()
+        .join("envs/dev/workspaces/invoices-ap/queues/cost-invoices");
+    let inbox_json = serde_json::json!({
+        "id": 0, "url": "",
+        "name": "Cost Invoices Inbox",
+        "queues": ["rdc://queues/cost-invoices"],
+        "filters": []
+    });
+    let mut b = serde_json::to_vec_pretty(&inbox_json).unwrap();
+    b.push(b'\n');
+    std::fs::write(q_dir.join("inbox.json"), &b).unwrap();
+
+    let tpl_dir = q_dir.join("email-templates");
+    std::fs::create_dir_all(&tpl_dir).unwrap();
+    let tpl_json = serde_json::json!({
+        "id": 0, "url": "",
+        "name": "Rejection Notice",
+        "subject": "Your invoice was rejected",
+        "queue": "rdc://queues/cost-invoices"
+    });
+    let mut b = serde_json::to_vec_pretty(&tpl_json).unwrap();
+    b.push(b'\n');
+    std::fs::write(tpl_dir.join("rejection-notice.json"), &b).unwrap();
+
+    let r2 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let reqs_after_create = server.received_requests().await.unwrap_or_default();
+    let r3 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    pull.expect("initial pull sync should succeed");
+    r2.expect("second sync (inbox + template create) should succeed");
+    r3.expect("third sync should succeed and be a no-op");
+
+    assert_eq!(
+        count_mutations(&reqs_after_create, "/api/v1/inboxes"),
+        1,
+        "exactly one POST /inboxes"
+    );
+    assert_eq!(
+        count_mutations(&reqs_after_create, "/api/v1/email_templates"),
+        1,
+        "exactly one POST /email_templates"
+    );
+
+    // Inbox POST body: `email` is stripped (server-assigned) and the queue
+    // ref resolved to the existing queue URL.
+    let inbox_post = reqs_after_create
+        .iter()
+        .find(|r| r.method == http::Method::POST && r.url.path() == "/api/v1/inboxes")
+        .expect("a POST /inboxes request must exist");
+    let ibody: serde_json::Value = serde_json::from_slice(&inbox_post.body).unwrap();
+    assert_eq!(
+        ibody["name"], "Cost Invoices Inbox",
+        "inbox POST body: {ibody}"
+    );
+    assert_eq!(
+        ibody["queues"],
+        serde_json::json!([queue_url.clone()]),
+        "inbox.queues must resolve to the existing queue URL: {ibody}"
+    );
+    assert!(
+        ibody.get("email").is_none(),
+        "server-assigned email must be stripped from the inbox POST body: {ibody}"
+    );
+
+    // Email template POST body: queue ref resolved.
+    let tpl_post = reqs_after_create
+        .iter()
+        .find(|r| r.method == http::Method::POST && r.url.path() == "/api/v1/email_templates")
+        .expect("a POST /email_templates request must exist");
+    let tbody: serde_json::Value = serde_json::from_slice(&tpl_post.body).unwrap();
+    assert_eq!(
+        tbody["name"], "Rejection Notice",
+        "template POST body: {tbody}"
+    );
+    assert_eq!(
+        tbody["queue"],
+        serde_json::json!(queue_url.clone()),
+        "template.queue must resolve to the existing queue URL: {tbody}"
+    );
+
+    // Lockfile records both created ids (email_templates use a compound key).
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    let lf: serde_json::Value = serde_json::from_str(&lf_raw).unwrap();
+    assert_eq!(
+        lf.pointer("/objects/inboxes/cost-invoices/id"),
+        Some(&serde_json::json!(300)),
+        "lockfile inbox id: {lf_raw}"
+    );
+    assert_eq!(
+        lf.pointer("/objects/email_templates/invoices-ap~1cost-invoices~1rejection-notice/id"),
+        Some(&serde_json::json!(9001)),
+        "lockfile email_template id (compound key): {lf_raw}"
+    );
+
+    // Idempotency: the third sync issued no further create.
+    let reqs_after_second = server.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        count_mutations(&reqs_after_second, "/api/v1/inboxes"),
+        1,
+        "third sync must not POST /inboxes again (idempotent)"
+    );
+    assert_eq!(
+        count_mutations(&reqs_after_second, "/api/v1/email_templates"),
+        1,
+        "third sync must not POST /email_templates again (idempotent)"
+    );
+}
