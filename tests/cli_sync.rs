@@ -2975,6 +2975,201 @@ async fn sync_clean_queue_tree_no_writes() {
     );
 }
 
+/// Regression for the deletion_requested-queue hook churn (Bug #1):
+/// a hook references a queue that rdc does NOT track (a
+/// `deletion_requested` queue, still returned by `GET /queues` but with
+/// `workspace: null`). The hook stores that ref as a RAW URL on disk
+/// because the queue can't be portabilized. The classifier's
+/// catalog-augment used to seed the untracked queue into its working
+/// lockfile, so it portabilized that ref to `rdc://` and the recomputed
+/// remote hash diverged from the stable pull-recorded base on EVERY sync
+/// → the hook re-pulled forever. After the fix the augment skips
+/// workspace-less queues, so the second sync is Clean (`0 changed`) and
+/// the raw ref survives on disk.
+#[tokio::test]
+async fn sync_hook_referencing_deletion_requested_queue_is_clean_on_resync() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // Workspace + schema + inbox + email template (queue 100 tree). Queues
+    // are mounted SEPARATELY below so the deletion_requested queue 999 is in
+    // the same listing.
+    let ws_url = format!("{}/api/v1/workspaces/800", server.uri());
+    let queue_url = format!("{}/api/v1/queues/100", server.uri());
+    let schema_url = format!("{}/api/v1/schemas/200", server.uri());
+    let inbox_url = format!("{}/api/v1/inboxes/300", server.uri());
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+            "results": [{
+                "id": 800, "url": ws_url, "name": "Invoices AP",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "queues": [queue_url.clone()], "modified_at": "2026-04-20T08:00:00Z"
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    // /queues returns BOTH the tracked queue 100 and the untracked
+    // deletion_requested queue 999 (workspace=null → rdc never tracks it).
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "total": 2, "total_pages": 1, "next": null, "previous": null },
+            "results": [
+                {
+                    "id": 100, "url": queue_url.clone(), "name": "Cost Invoices",
+                    "workspace": format!("{}/api/v1/workspaces/800", server.uri()),
+                    "schema": schema_url.clone(), "inbox": inbox_url.clone(),
+                    "modified_at": "2026-04-20T08:00:00Z"
+                },
+                {
+                    "id": 999, "url": format!("{}/api/v1/queues/999", server.uri()),
+                    "name": "Deletion Requested Queue",
+                    "workspace": serde_json::Value::Null,
+                    "schema": serde_json::Value::Null,
+                    "status": "deletion_requested",
+                    "modified_at": "2026-04-20T08:00:00Z"
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schemas/200"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 200, "url": schema_url, "name": "Cost Invoices Schema",
+            "queues": [queue_url.clone()],
+            "content": [
+                { "category": "section", "id": "header", "label": "Header", "children": [
+                    { "category": "datapoint", "id": "invoice_id", "type": "string" }
+                ]}
+            ],
+            "modified_at": "2026-04-10T09:00:00Z"
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/inboxes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "total_pages": 1, "next": null },
+            "results": [{
+                "id": 300, "url": inbox_url,
+                "name": "Cost Invoices Inbox",
+                "email": "cost-invoices@mock.rossum.app",
+                "queues": [queue_url.clone()],
+                "modified_at": "2026-04-10T09:00:00Z", "filters": []
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    // A hook that references BOTH the tracked queue 100 AND the untracked
+    // deletion_requested queue 999. The 999 ref stays a raw URL forever.
+    let hooks_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [{
+            "id": 501,
+            "url": format!("{}/api/v1/hooks/501", server.uri()),
+            "name": "Churning Logger",
+            "type": "function",
+            "queues": [
+                format!("{}/api/v1/queues/999", server.uri()),
+                queue_url.clone()
+            ],
+            "events": ["annotation_content"],
+            "config": { "runtime": "python3.12", "code": "def x(p):\n    return {}\n" },
+            "modified_at": "2026-04-20T08:00:00Z"
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(hooks_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(
+        &server,
+        &[
+            "/api/v1/workspaces",
+            "/api/v1/queues",
+            "/api/v1/inboxes",
+            "/api/v1/hooks",
+        ],
+    )
+    .await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // First sync: pulls the hook + queue tree.
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev"])
+        .assert()
+        .success();
+
+    // The hook's untracked-queue ref must be a RAW URL on disk (can't
+    // portabilize — queue 999 isn't tracked).
+    let hook_path = project.path().join("envs/dev/hooks/churning-logger.json");
+    let hook_json = std::fs::read_to_string(&hook_path).unwrap();
+    assert!(
+        hook_json.contains("/api/v1/queues/999"),
+        "untracked-queue ref must remain a raw URL on disk:\n{hook_json}"
+    );
+
+    // Second sync: must be Clean — `0 changed`, no hook re-pull.
+    let out = assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "second sync must succeed:\n{stderr}");
+    assert!(
+        stderr.contains("(0 changed"),
+        "second sync must report 0 changed (no churn); got:\n{stderr}"
+    );
+
+    // No mutating API calls on the clean re-sync.
+    for req in server.received_requests().await.unwrap_or_default() {
+        let p = req.url.path();
+        if p.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "unexpected mutating request on clean re-sync: {} {}",
+            req.method,
+            p
+        );
+    }
+}
+
 /// Watch-mode initial reconcile: on `run_watch` startup, before the
 /// ctrl-c block, one full `run_cycle` runs. This brings the env to a
 /// known state before watching kicks in. Mirrors the setup of
@@ -5354,7 +5549,7 @@ async fn sync_pushes_local_edits_before_pulling_remote_changes() {
     let out = assert_cmd::Command::cargo_bin("rdc")
         .unwrap()
         .current_dir(project.path())
-        .args(["sync", "dev", "--yes"])
+        .args(["sync", "dev"])
         .assert()
         .success();
     let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
@@ -5910,7 +6105,7 @@ async fn sync_emits_progress_milestone_for_large_list() {
     let mut cmd = assert_cmd::Command::cargo_bin("rdc").unwrap();
     let assert = cmd
         .current_dir(project.path())
-        .args(["sync", "dev", "--yes"])
+        .args(["sync", "dev"])
         .assert()
         .success();
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
@@ -8208,5 +8403,206 @@ async fn push_create_inbox_and_email_template() {
         count_mutations(&reqs_after_second, "/api/v1/email_templates"),
         1,
         "third sync must not POST /email_templates again (idempotent)"
+    );
+}
+
+/// Regression for the inbox-push → parent-queue re-pull churn (Bug #2):
+/// after `rdc sync` PATCHes an inbox edit, the NEXT sync must be Clean.
+/// The inbox push driver used to write the inbox to disk + cache in its
+/// RAW (URL) form while recording the lockfile base over the PORTABILIZED
+/// (`rdc://`) form. The next sync's scanner (which canonicalizes with an
+/// empty lockfile → no portabilization) then hashed the raw on-disk bytes
+/// and got a value that differed from the recorded base, flagging the
+/// inbox as changed and re-pulling it (surfaced as "queues (1 pulled …
+/// inboxes 1)" because inboxes are bundled under the queue driver). After
+/// the fix the push driver portabilizes before writing+hashing, exactly
+/// like the pull driver, so disk == base form and the re-sync is Clean.
+#[tokio::test]
+async fn sync_inbox_push_then_resync_is_clean() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let ws_url = format!("{}/api/v1/workspaces/800", server.uri());
+    let queue_url = format!("{}/api/v1/queues/100", server.uri());
+    let schema_url = format!("{}/api/v1/schemas/200", server.uri());
+    let inbox_url = format!("{}/api/v1/inboxes/300", server.uri());
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+            "results": [{
+                "id": 800, "url": ws_url.clone(), "name": "Invoices AP",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "queues": [queue_url.clone()], "modified_at": "2026-04-20T08:00:00Z"
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+            "results": [{
+                "id": 100, "url": queue_url.clone(), "name": "Cost Invoices",
+                "workspace": ws_url.clone(), "schema": schema_url.clone(),
+                "inbox": inbox_url.clone(), "modified_at": "2026-04-20T08:00:00Z"
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    // The parent queue object is byte-identical before and after the inbox
+    // PATCH (no cascade) — its GET body never changes. The inbox GET-by-id is
+    // used by the push driver's drift check.
+    let schema_body = serde_json::json!({
+        "id": 200, "url": schema_url.clone(), "name": "Cost Invoices Schema",
+        "queues": [queue_url.clone()],
+        "content": [
+            { "category": "section", "id": "header", "label": "Header", "children": [
+                { "category": "datapoint", "id": "invoice_id", "type": "string" }
+            ]}
+        ],
+        "modified_at": "2026-04-10T09:00:00Z"
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schemas/200"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(schema_body))
+        .mount(&server)
+        .await;
+
+    // Stateful inbox state: starts as the original; once the PATCH lands the
+    // GET-by-id and the list reflect the edited bounce email. The list is what
+    // the classifier reads; the GET-by-id is the push driver's drift check.
+    let inbox_state = Arc::new(Mutex::new(serde_json::json!({
+        "id": 300, "url": inbox_url.clone(),
+        "name": "Cost Invoices Inbox",
+        "email": "cost-invoices@mock.rossum.app",
+        "bounce_email_to": "original@example.com",
+        "queues": [queue_url.clone()],
+        "modified_at": "2026-04-10T09:00:00Z", "filters": []
+    })));
+
+    let st = inbox_state.clone();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/inboxes"))
+        .respond_with(move |_req: &Request| {
+            let body = st.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pagination": { "total_pages": 1, "next": null },
+                "results": [body]
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let st = inbox_state.clone();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/inboxes/300"))
+        .respond_with(move |_req: &Request| {
+            let body = st.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server)
+        .await;
+
+    let st = inbox_state.clone();
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/inboxes/300"))
+        .respond_with(move |req: &Request| {
+            // Apply the PATCH body onto the stored state so subsequent GETs
+            // reflect the edit (the server echoes the updated object).
+            let patch: serde_json::Value = req.body_json().unwrap();
+            let mut guard = st.lock().unwrap_or_else(|p| p.into_inner());
+            if let (Some(obj), Some(p)) = (guard.as_object_mut(), patch.as_object()) {
+                for (k, v) in p {
+                    obj.insert(k.clone(), v.clone());
+                }
+                obj.insert(
+                    "modified_at".to_string(),
+                    serde_json::json!("2026-05-01T10:00:00Z"),
+                );
+            }
+            ResponseTemplate::new(200).set_body_json(guard.clone())
+        })
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(
+        &server,
+        &["/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes"],
+    )
+    .await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // Sync 1: pull the queue tree (inbox lands on disk in rdc form).
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev"])
+        .assert()
+        .success();
+
+    // Edit the inbox locally (change bounce_email_to) → LocalEdit → PATCH.
+    let inbox_path = project
+        .path()
+        .join("envs/dev/workspaces/invoices-ap/queues/cost-invoices/inbox.json");
+    let mut inbox: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&inbox_path).unwrap()).unwrap();
+    inbox["bounce_email_to"] = serde_json::json!("edited@example.com");
+    std::fs::write(
+        &inbox_path,
+        format!("{}\n", serde_json::to_string_pretty(&inbox).unwrap()),
+    )
+    .unwrap();
+
+    // Sync 2: pushes the inbox PATCH.
+    let out2 = assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev"])
+        .output()
+        .unwrap();
+    assert!(
+        out2.status.success(),
+        "second sync (push) must succeed:\n{}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out2.stderr).contains("patch  inbox/cost-invoices"),
+        "second sync must PATCH the edited inbox:\n{}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+
+    // Sync 3: must be Clean — 0 changed, no inbox/queue re-pull.
+    let out3 = assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev"])
+        .output()
+        .unwrap();
+    let stderr3 = String::from_utf8_lossy(&out3.stderr);
+    assert!(out3.status.success(), "third sync must succeed:\n{stderr3}");
+    assert!(
+        stderr3.contains("(0 changed"),
+        "third sync after an inbox push must be Clean (0 changed); got:\n{stderr3}"
     );
 }

@@ -535,7 +535,21 @@ pub fn from_catalog_scan_lockfile(
             add("workspaces", x.id, &x.name);
         }
         for x in &catalog.queues {
-            add("queues", x.id, &x.name);
+            // Only seed queues rdc actually TRACKS — those that belong to a
+            // workspace. A workspace-less queue (orphan / `deletion_requested`,
+            // still returned by GET /queues) is excluded by the pull driver and
+            // the classify queue-loop alike, so it never enters the lockfile.
+            // Seeding it here would let `portabilize_proposed` rewrite a hook's
+            // (or another object's) raw URL ref to that queue into `rdc://`
+            // form during classify, while the pull-recorded base — computed
+            // against the real lockfile that never tracked the queue — left the
+            // ref a raw URL. The two hashes then diverge on EVERY sync, so the
+            // referencing object re-pulls forever (RemoteEdit). Mirroring the
+            // pull driver's `workspace.is_some()` gate keeps both paths leaving
+            // an unresolvable ref raw, so they hash identically.
+            if x.workspace.is_some() {
+                add("queues", x.id, &x.name);
+            }
         }
         for x in catalog.schemas_by_queue_id.values() {
             add("schemas", x.id, &x.name);
@@ -1429,6 +1443,125 @@ mod tests {
             },
         );
         hook_combined_hash(&stripped, &code, &lf)
+    }
+
+    /// Regression for the deletion_requested-queue hook churn (Bug #1).
+    ///
+    /// A hook references a queue that rdc does NOT track (e.g. a
+    /// `deletion_requested` queue with `workspace: null`). The pull driver
+    /// excludes such queues, so it records the hook base with the queue ref
+    /// left as a RAW URL (un-portabilized). The classifier's catalog-augment,
+    /// however, used to seed EVERY catalog queue — including the untracked one
+    /// — into the working lockfile, so `portabilize_proposed` rewrote the raw
+    /// ref to `rdc://queues/<slug>`. The recomputed remote hash then diverged
+    /// from the stable pull-recorded base on EVERY sync → perpetual RemoteEdit
+    /// re-pull. The fix excludes untracked (workspace-less) queues from the
+    /// augment so both paths leave the unresolvable ref raw and hash equally.
+    #[test]
+    fn from_catalog_scan_lockfile_hook_with_untracked_queue_ref_is_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+
+        let api_base = "https://x.invalid/api/v1";
+
+        // Untracked queue 999 (workspace=null → deletion_requested; rdc never
+        // tracks it, yet GET /queues still returns it).
+        let deletion_queue: crate::model::Queue = serde_json::from_value(json!({
+            "id": 999,
+            "url": format!("{api_base}/queues/999"),
+            "name": "Deletion Requested Queue",
+            "workspace": serde_json::Value::Null,
+            "schema": serde_json::Value::Null,
+            "status": "deletion_requested",
+        }))
+        .unwrap();
+
+        // Hook references ONLY the untracked queue 999. As pulled, this ref
+        // stays a raw URL (it can't portabilize — 999 isn't tracked).
+        let hook: Hook = serde_json::from_value(json!({
+            "id": 501,
+            "url": format!("{api_base}/hooks/501"),
+            "name": "Churning Logger",
+            "type": "function",
+            "queues": [format!("{api_base}/queues/999")],
+            "events": ["annotation_content"],
+            "config": { "runtime": "python3.12", "code": "def x(p):\n    return {}\n" },
+            "modified_at": "2026-04-20T08:00:00Z",
+        }))
+        .unwrap();
+        let slug = "churning-logger";
+
+        // The real (production) lockfile: tracks the hook (so its self-url
+        // normalizes to rdc:// during pull/post-pass), but NOT queue 999.
+        let mut lockfile = Lockfile {
+            api_base: api_base.to_string(),
+            ..Lockfile::default()
+        };
+        lockfile.upsert(
+            "hooks",
+            slug,
+            ObjectEntry {
+                id: 501,
+                modified_at: Some("2026-04-20T08:00:00Z".to_string()),
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+
+        // Pull-recorded hook base: portabilize against the REAL lockfile (the
+        // hook is tracked → self-url becomes rdc://; queue 999 is absent →
+        // stays raw), then hash. Mirrors the pull driver + post-pass exactly.
+        let (hook_json, hook_code) = serialize_hook(&hook).unwrap();
+        let portabilized = crate::cli::pull::common::portabilize_proposed(&hook_json, &lockfile);
+        let base_hash = hook_combined_hash(&portabilized, &hook_code, &lockfile);
+
+        // Write the on-disk hook (portabilized form) + .py sidecar so the
+        // scanner sees an unchanged local.
+        let local_json_path = paths.hooks_dir().join(format!("{slug}.json"));
+        std::fs::write(&local_json_path, &portabilized).unwrap();
+        std::fs::write(
+            paths.hooks_dir().join(format!("{slug}.py")),
+            hook_code.as_ref().unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        // Record the base hash now that we've computed it.
+        lockfile
+            .objects
+            .get_mut("hooks")
+            .unwrap()
+            .get_mut(slug)
+            .unwrap()
+            .content_hash = Some(base_hash.clone());
+
+        let (_scanned, changes, tombstones) =
+            crate::cli::push::scan::scan(&paths, &lockfile).unwrap();
+        assert!(
+            !changes.hooks.contains_key(slug),
+            "scanner must not flag an unchanged hook"
+        );
+
+        // Catalog includes the untracked queue 999 + the hook (this is what
+        // drives the augment to seed queue 999 before the fix).
+        let mut catalog = catalog_with_hooks(vec![hook]);
+        catalog.queues = vec![deletion_queue];
+
+        let classified =
+            from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile, None).unwrap();
+        let item = classified
+            .iter()
+            .find(|c| c.kind == "hooks" && c.slug == slug)
+            .expect("hook must appear in classification");
+        assert_eq!(
+            item.class,
+            SyncClass::Clean,
+            "hook referencing an untracked queue must classify Clean; got {:?} \
+             (remote_hash={:?}, base_hash={:?})",
+            item.class,
+            item.remote_hash,
+            item.base_hash,
+        );
     }
 
     /// Regression for the conflict-resolution bypass: when both local
