@@ -164,15 +164,31 @@ pub async fn push(
             .update_inbox(id, &payload_to_send, Some(progress.clone()))
             .await
             .with_context(|| format!("PATCH /inboxes/{id}"));
-        let updated = patch_result?;
+        // Propagate any PATCH error; the response body itself is discarded in
+        // favor of a fresh GET (see below) for re-baselining.
+        let _patched = patch_result?;
+
+        // Re-baseline from a fresh GET, not the PATCH response. The Rossum
+        // inbox PATCH response OMITS fields the GET response includes (e.g.
+        // `bounce_email_to: null`), and those land in the untyped `extra`
+        // passthrough. Recording the base from the PATCH-derived bytes would
+        // make the recorded shape (key absent) differ from what the next
+        // sync's classifier reads off the GET/list (key present, null) →
+        // a spurious RemoteEdit → a one-cycle re-pull of the queue bundle.
+        // GET-derived bytes match the classifier's input shape exactly, so
+        // the next sync settles to Clean. See BUG2 / push/inboxes.rs.
+        let refetched = client
+            .get_inbox(id, Some(progress.clone()))
+            .await
+            .with_context(|| format!("GET /inboxes/{id} to re-baseline after push"))?;
 
         let codec = crate::snapshot::codec::codec("inboxes").unwrap();
         let updated_art = codec
             .disk_bytes(
-                &serde_json::to_value(&updated)
-                    .context("serializing updated inbox for disk write")?,
+                &serde_json::to_value(&refetched)
+                    .context("serializing re-fetched inbox for disk write")?,
             )
-            .context("codec disk_bytes for updated inbox")?;
+            .context("codec disk_bytes for re-fetched inbox")?;
         let updated_bytes = maybe_strip_overlay(updated_art.json, overlay_paths)?;
         let updated_hash = combined_hash(&updated_bytes, &updated_art.sidecars, lockfile);
         crate::state::base_cache::write_disk_and_cache(paths, inbox_path, &updated_bytes)
@@ -182,8 +198,8 @@ pub async fn push(
             "inboxes",
             q_slug,
             ObjectEntry {
-                id: updated.id,
-                modified_at: updated.modified_at().map(|s| s.to_string()),
+                id: refetched.id,
+                modified_at: refetched.modified_at().map(|s| s.to_string()),
                 content_hash: Some(updated_hash),
                 secrets_hash: None,
             },

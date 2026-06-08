@@ -8408,15 +8408,26 @@ async fn push_create_inbox_and_email_template() {
 
 /// Regression for the inbox-push → parent-queue re-pull churn (Bug #2):
 /// after `rdc sync` PATCHes an inbox edit, the NEXT sync must be Clean.
-/// The inbox push driver used to write the inbox to disk + cache in its
-/// RAW (URL) form while recording the lockfile base over the PORTABILIZED
-/// (`rdc://`) form. The next sync's scanner (which canonicalizes with an
-/// empty lockfile → no portabilization) then hashed the raw on-disk bytes
-/// and got a value that differed from the recorded base, flagging the
-/// inbox as changed and re-pulling it (surfaced as "queues (1 pulled …
-/// inboxes 1)" because inboxes are bundled under the queue driver). After
-/// the fix the push driver portabilizes before writing+hashing, exactly
-/// like the pull driver, so disk == base form and the re-sync is Clean.
+///
+/// Root cause (empirically confirmed against the live Rossum API): the
+/// inbox **PATCH** response OMITS the `bounce_email_to` field, while the
+/// **GET** response INCLUDES it (as `null`). `bounce_email_to` rides in
+/// the `Inbox` model's untyped `extra` passthrough, so a PATCH-derived
+/// base lacks the key while the next sync's classifier — which reads the
+/// inbox off the bulk `GET /inboxes` list — sees the key present (null).
+/// base(no key) ≠ remote(key=null) → spurious RemoteEdit → the queue
+/// driver re-pulls the bundle once ("queues (1 pulled … inboxes 1)").
+///
+/// This mock REPLICATES THE QUIRK: the PATCH handler returns a body
+/// WITHOUT `bounce_email_to`, while every GET (list + by-id) returns it as
+/// `null`. The fix re-baselines the inbox push from a fresh GET (not the
+/// PATCH response), so the recorded base shape matches the classifier's
+/// input on the next sync and the third sync settles to Clean.
+///
+/// NOTE: a prior version of this test echoed `bounce_email_to` back in the
+/// PATCH response (identical PATCH/GET shapes) and was therefore a
+/// false-negative — it passed even on the unfixed code. The PATCH-response
+/// omission below is load-bearing.
 #[tokio::test]
 async fn sync_inbox_push_then_resync_is_clean() {
     let server = MockServer::start().await;
@@ -8477,14 +8488,14 @@ async fn sync_inbox_push_then_resync_is_clean() {
         .mount(&server)
         .await;
 
-    // Stateful inbox state: starts as the original; once the PATCH lands the
-    // GET-by-id and the list reflect the edited bounce email. The list is what
-    // the classifier reads; the GET-by-id is the push driver's drift check.
+    // Stateful inbox state. CRUCIAL: GET responses (list + by-id) ALWAYS
+    // carry `bounce_email_to: null`; the PATCH response (below) strips it.
+    // This is the exact live-API quirk that drives Bug #2.
     let inbox_state = Arc::new(Mutex::new(serde_json::json!({
         "id": 300, "url": inbox_url.clone(),
         "name": "Cost Invoices Inbox",
         "email": "cost-invoices@mock.rossum.app",
-        "bounce_email_to": "original@example.com",
+        "bounce_email_to": serde_json::Value::Null,
         "queues": [queue_url.clone()],
         "modified_at": "2026-04-10T09:00:00Z", "filters": []
     })));
@@ -8493,6 +8504,8 @@ async fn sync_inbox_push_then_resync_is_clean() {
     Mock::given(method("GET"))
         .and(path("/api/v1/inboxes"))
         .respond_with(move |_req: &Request| {
+            // GET includes `bounce_email_to: null` — this is what the
+            // classifier reads to compute the inbox's remote hash.
             let body = st.lock().unwrap_or_else(|p| p.into_inner()).clone();
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "pagination": { "total_pages": 1, "next": null },
@@ -8506,6 +8519,8 @@ async fn sync_inbox_push_then_resync_is_clean() {
     Mock::given(method("GET"))
         .and(path("/api/v1/inboxes/300"))
         .respond_with(move |_req: &Request| {
+            // GET-by-id also includes `bounce_email_to: null` — used by the
+            // push driver's drift check and (post-fix) the re-baseline.
             let body = st.lock().unwrap_or_else(|p| p.into_inner()).clone();
             ResponseTemplate::new(200).set_body_json(body)
         })
@@ -8517,19 +8532,29 @@ async fn sync_inbox_push_then_resync_is_clean() {
         .and(path("/api/v1/inboxes/300"))
         .respond_with(move |req: &Request| {
             // Apply the PATCH body onto the stored state so subsequent GETs
-            // reflect the edit (the server echoes the updated object).
+            // reflect the edit, then return a response body that OMITS
+            // `bounce_email_to` — replicating the live Rossum quirk where
+            // the inbox PATCH response drops that field while GET keeps it
+            // (null). The stored state (served by GET) KEEPS the key.
             let patch: serde_json::Value = req.body_json().unwrap();
             let mut guard = st.lock().unwrap_or_else(|p| p.into_inner());
             if let (Some(obj), Some(p)) = (guard.as_object_mut(), patch.as_object()) {
                 for (k, v) in p {
                     obj.insert(k.clone(), v.clone());
                 }
+                // The server keeps bounce_email_to null regardless of input.
+                obj.insert("bounce_email_to".to_string(), serde_json::Value::Null);
                 obj.insert(
                     "modified_at".to_string(),
                     serde_json::json!("2026-05-01T10:00:00Z"),
                 );
             }
-            ResponseTemplate::new(200).set_body_json(guard.clone())
+            let mut patch_response = guard.clone();
+            // PATCH RESPONSE omits bounce_email_to (the quirk under test).
+            if let Some(obj) = patch_response.as_object_mut() {
+                obj.remove("bounce_email_to");
+            }
+            ResponseTemplate::new(200).set_body_json(patch_response)
         })
         .mount(&server)
         .await;
@@ -8561,13 +8586,15 @@ async fn sync_inbox_push_then_resync_is_clean() {
         .assert()
         .success();
 
-    // Edit the inbox locally (change bounce_email_to) → LocalEdit → PATCH.
+    // Edit the inbox name locally → LocalEdit → PATCH. (We edit `name`, not
+    // `bounce_email_to`, because the server keeps the latter null; the point
+    // is that the PATCH *response* shape differs from GET regardless.)
     let inbox_path = project
         .path()
         .join("envs/dev/workspaces/invoices-ap/queues/cost-invoices/inbox.json");
     let mut inbox: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&inbox_path).unwrap()).unwrap();
-    inbox["bounce_email_to"] = serde_json::json!("edited@example.com");
+    inbox["name"] = serde_json::json!("Cost Invoices Inbox (edited)");
     std::fs::write(
         &inbox_path,
         format!("{}\n", serde_json::to_string_pretty(&inbox).unwrap()),
