@@ -512,13 +512,22 @@ pub fn apply(
 /// urls embed their parent slug the same way; those kinds aren't exercised here
 /// so are left for a follow-up.
 fn compound_prefix_pairs(p: &PendingRename) -> Vec<(String, String)> {
-    let et = crate::snapshot::refs::RDC_SCHEME.to_string() + "email_templates/";
+    let scheme = crate::snapshot::refs::RDC_SCHEME;
+    let et = format!("{scheme}email_templates/");
     match p {
         PendingRename::Queue { ws, old, new } => {
             vec![(format!("{et}{ws}/{old}/"), format!("{et}{ws}/{new}/"))]
         }
         PendingRename::Workspace { old, new } => {
             vec![(format!("{et}{old}/"), format!("{et}{new}/"))]
+        }
+        PendingRename::Engine { old, new } => {
+            let ef = format!("{scheme}engine_fields/");
+            vec![(format!("{ef}{old}/"), format!("{ef}{new}/"))]
+        }
+        PendingRename::Workflow { old, new } => {
+            let ws = format!("{scheme}workflow_steps/");
+            vec![(format!("{ws}{old}/"), format!("{ws}{new}/"))]
         }
         _ => Vec::new(),
     }
@@ -601,13 +610,14 @@ fn base_sidecars(kind: &str, base_json_path: &std::path::Path) -> Vec<(String, V
 }
 
 /// The `rdc://<kind>/<old>` → `rdc://<kind>/<new>` reference substitutions a
-/// single applied rename implies. Only kinds that are actual reference targets
-/// are emitted (mirroring `migrate`'s `SUBST_KINDS`): workspaces, queues
+/// single applied rename implies. Emitted for every kind that other objects
+/// reference by a whole-token `rdc://<kind>/<slug>` value: workspaces, queues
 /// (which also drag their schema/inbox — those share the queue slug), hooks,
-/// rules, labels, engines. Compound-keyed kinds that nothing references
-/// (engine_fields / email_templates / workflows / workflow_steps) get no
-/// substitution — their files still move, and their merge base still follows
-/// via the base-cache mirror.
+/// rules, labels, engines, and workflows (queues' `workflows[]` and steps'
+/// `workflow` field point at them). This also rewrites the renamed object's
+/// own `url`. The compound-keyed leaf kinds nothing references by a whole
+/// token (engine_fields / email_templates / workflow_steps) instead get a
+/// prefix rewrite of their own compound url via `compound_prefix_pairs`.
 fn ref_subst_pairs(p: &PendingRename) -> Vec<(String, String)> {
     let pair = |kind: &str, old: &str, new: &str| {
         (
@@ -626,8 +636,8 @@ fn ref_subst_pairs(p: &PendingRename) -> Vec<(String, String)> {
         PendingRename::Rule { old, new } => vec![pair("rules", old, new)],
         PendingRename::Label { old, new } => vec![pair("labels", old, new)],
         PendingRename::Engine { old, new } => vec![pair("engines", old, new)],
+        PendingRename::Workflow { old, new } => vec![pair("workflows", old, new)],
         PendingRename::EngineField { .. }
-        | PendingRename::Workflow { .. }
         | PendingRename::WorkflowStep { .. }
         | PendingRename::EmailTemplate { .. } => Vec::new(),
     }
@@ -815,9 +825,12 @@ fn apply_one(paths: &Paths, lockfile: &mut Lockfile, p: &PendingRename) -> Resul
         }
         PendingRename::Engine { old, new } => {
             // Engines own a dir (engine.json + fields/); a rename moves
-            // the whole subtree. Engine-field slugs are unchanged.
+            // the whole subtree. The field slugs are unchanged, but their
+            // compound lockfile keys `<engine>/<field>` embed the engine
+            // slug, so the engine segment must cascade.
             move_dir(paths, &paths.engine_dir(old), &paths.engine_dir(new))?;
             rename_lockfile_key(lockfile, "engines", old, new);
+            rewrite_compound_prefix(lockfile, "engine_fields", 0, old, new);
             collect_orphans(paths, "engines", old, &mut orphans);
         }
         PendingRename::EngineField { old, new } => {
@@ -834,9 +847,11 @@ fn apply_one(paths: &Paths, lockfile: &mut Lockfile, p: &PendingRename) -> Resul
         }
         PendingRename::Workflow { old, new } => {
             // Workflows own a dir (workflow.json + steps/); same shape
-            // as engines.
+            // as engines — the step keys `<workflow>/<step>` embed the
+            // workflow slug, so its segment must cascade.
             move_dir(paths, &paths.workflow_dir(old), &paths.workflow_dir(new))?;
             rename_lockfile_key(lockfile, "workflows", old, new);
+            rewrite_compound_prefix(lockfile, "workflow_steps", 0, old, new);
             collect_orphans(paths, "workflows", old, &mut orphans);
         }
         PendingRename::WorkflowStep { old, new } => {
@@ -955,7 +970,23 @@ fn rewrite_email_template_compound_prefix(
     old: &str,
     new: &str,
 ) {
-    let Some(by_key) = lockfile.objects.get_mut("email_templates") else {
+    rewrite_compound_prefix(lockfile, "email_templates", segment, old, new);
+}
+
+/// Rewrite the Nth `/`-segment of every compound lockfile key of `kind` from
+/// `old` to `new`. Used when a container renames and its children's keys embed
+/// the container slug: `email_templates` (`<ws>/<q>/<t>`, segments 0/1),
+/// `engine_fields` (`<engine>/<field>`, segment 0), `workflow_steps`
+/// (`<workflow>/<step>`, segment 0). `splitn(3)` keeps the trailing segment
+/// intact, so it handles both 2- and 3-segment keys.
+fn rewrite_compound_prefix(
+    lockfile: &mut Lockfile,
+    kind: &str,
+    segment: usize,
+    old: &str,
+    new: &str,
+) {
+    let Some(by_key) = lockfile.objects.get_mut(kind) else {
         return;
     };
     let to_rewrite: Vec<String> = by_key
@@ -1905,5 +1936,142 @@ mod tests {
         );
         // The plain queue ref is also rewritten (whole-token path).
         assert!(et.contains(r#""rdc://queues/cost-invoices""#), "queue ref: {et}");
+    }
+
+    /// Portable-refs gap #6a: an engine rename must cascade to its fields'
+    /// compound lockfile keys (`<engine>/<field>`) AND rewrite each field's
+    /// compound own-`url` (`rdc://engine_fields/<engine>/<field>`). Symmetric
+    /// with the queue→email-template cascade.
+    #[test]
+    fn apply_engine_rename_cascades_field_keys_and_own_urls() {
+        use crate::state::ObjectEntry;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        std::fs::create_dir_all(paths.engine_fields_dir("old-eng")).unwrap();
+        std::fs::write(
+            paths.engine_dir("old-eng").join("engine.json"),
+            r#"{"id":1,"name":"New Engine","url":"rdc://engines/old-eng"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            paths.engine_fields_dir("old-eng").join("amount.json"),
+            r#"{"id":2,"name":"amount","url":"rdc://engine_fields/old-eng/amount","engine":"rdc://engines/old-eng"}"#,
+        )
+        .unwrap();
+
+        let mut lockfile = Lockfile::default();
+        lockfile.upsert(
+            "engines",
+            "old-eng",
+            ObjectEntry { id: 1, modified_at: None, content_hash: None, secrets_hash: None },
+        );
+        lockfile.upsert(
+            "engine_fields",
+            "old-eng/amount",
+            ObjectEntry { id: 2, modified_at: None, content_hash: None, secrets_hash: None },
+        );
+
+        let pending = detect(&paths, &lockfile);
+        assert_eq!(
+            pending,
+            vec![PendingRename::Engine { old: "old-eng".into(), new: "new-engine".into() }]
+        );
+        apply(&paths, &mut lockfile, pending, false).unwrap();
+
+        // Compound key cascaded.
+        let ef = lockfile.objects.get("engine_fields").unwrap();
+        assert!(ef.contains_key("new-engine/amount"), "field key cascaded: {:?}", ef.keys().collect::<Vec<_>>());
+        assert!(!ef.contains_key("old-eng/amount"), "old field key gone");
+        // Field's compound own-url rewritten + its engine ref (whole-token).
+        let field = std::fs::read_to_string(
+            paths.engine_fields_dir("new-engine").join("amount.json"),
+        )
+        .unwrap();
+        assert!(
+            field.contains(r#""rdc://engine_fields/new-engine/amount""#),
+            "field compound own-url must follow engine rename, got: {field}"
+        );
+        assert!(field.contains(r#""rdc://engines/new-engine""#), "engine ref rewritten: {field}");
+        assert!(!field.contains("old-eng"), "no stale engine slug: {field}");
+    }
+
+    /// Portable-refs gap #6b: same cascade for workflow → workflow steps
+    /// (`rdc://workflow_steps/<workflow>/<step>`).
+    #[test]
+    fn apply_workflow_rename_cascades_step_keys_and_own_urls() {
+        use crate::state::ObjectEntry;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        std::fs::create_dir_all(paths.workflow_dir("old-wf").join("steps")).unwrap();
+        std::fs::write(
+            paths.workflow_dir("old-wf").join("workflow.json"),
+            r#"{"id":1,"name":"New Flow","url":"rdc://workflows/old-wf"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            paths.workflow_dir("old-wf").join("steps").join("review.json"),
+            r#"{"id":2,"name":"review","url":"rdc://workflow_steps/old-wf/review","workflow":"rdc://workflows/old-wf"}"#,
+        )
+        .unwrap();
+        // A queue references the workflow (workflows ARE ref targets).
+        let qdir = paths.queue_dir("ws1", "q1");
+        std::fs::create_dir_all(&qdir).unwrap();
+        std::fs::write(
+            qdir.join("queue.json"),
+            r#"{"id":5,"name":"Q1","url":"rdc://queues/q1","workflows":[{"url":"rdc://workflows/old-wf","priority":1}]}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(paths.workspace_dir("ws1")).unwrap();
+
+        let mut lockfile = Lockfile::default();
+        lockfile.upsert(
+            "workspaces",
+            "ws1",
+            ObjectEntry { id: 9, modified_at: None, content_hash: None, secrets_hash: None },
+        );
+        lockfile.upsert(
+            "queues",
+            "q1",
+            ObjectEntry { id: 5, modified_at: None, content_hash: None, secrets_hash: None },
+        );
+        lockfile.upsert(
+            "workflows",
+            "old-wf",
+            ObjectEntry { id: 1, modified_at: None, content_hash: None, secrets_hash: None },
+        );
+        lockfile.upsert(
+            "workflow_steps",
+            "old-wf/review",
+            ObjectEntry { id: 2, modified_at: None, content_hash: None, secrets_hash: None },
+        );
+
+        let pending = detect(&paths, &lockfile);
+        assert_eq!(
+            pending,
+            vec![PendingRename::Workflow { old: "old-wf".into(), new: "new-flow".into() }]
+        );
+        apply(&paths, &mut lockfile, pending, false).unwrap();
+
+        let ws = lockfile.objects.get("workflow_steps").unwrap();
+        assert!(ws.contains_key("new-flow/review"), "step key cascaded: {:?}", ws.keys().collect::<Vec<_>>());
+        assert!(!ws.contains_key("old-wf/review"), "old step key gone");
+        // Workflow's own url (whole-token) rewritten.
+        let wf = std::fs::read_to_string(paths.workflow_dir("new-flow").join("workflow.json")).unwrap();
+        assert!(wf.contains(r#""rdc://workflows/new-flow""#), "workflow own url: {wf}");
+        // Step: compound own-url AND its `workflow` ref rewritten.
+        let step = std::fs::read_to_string(
+            paths.workflow_dir("new-flow").join("steps").join("review.json"),
+        )
+        .unwrap();
+        assert!(
+            step.contains(r#""rdc://workflow_steps/new-flow/review""#),
+            "step compound own-url must follow workflow rename, got: {step}"
+        );
+        assert!(step.contains(r#""rdc://workflows/new-flow""#), "step workflow ref: {step}");
+        assert!(!step.contains("old-wf"), "no stale workflow slug in step: {step}");
+        // Referencing queue's workflows[] ref rewritten.
+        let q = std::fs::read_to_string(qdir.join("queue.json")).unwrap();
+        assert!(q.contains(r#""rdc://workflows/new-flow""#), "queue workflow ref: {q}");
+        assert!(!q.contains("old-wf"), "no stale workflow slug in queue: {q}");
     }
 }
