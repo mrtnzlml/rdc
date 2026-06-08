@@ -1,3 +1,16 @@
+# FINAL fix status — all bugs fixed + live-verified (2026-06-08)
+
+Every bug found across the CRUD/edge-case live testing is now FIXED, committed to `main` (local, unpushed), suite-green, and LIVE-verified against TEST org 214757:
+- **fix#1 DELETE batch error-isolation** — `e8ad2f9`. Skip-and-continue past a failed DELETE (400/409) instead of aborting. Live-verified (queue-subtree delete skips unique-type 400s + schema 409, still deletes queue/workspace).
+- **fix#2 auto-merge data-loss** — `c863229`. A successful disjoint auto-merge now PUSHES the merged result (was: silently reverted next sync). Live-verified (audit-hold: local color + remote name → merged color reaches remote, no revert).
+- **fix#3 push-CREATE positive test coverage** — `924a197`. 4 new tests (dependency-ordered create + flat kinds).
+- **bug#1 deletion_requested-queue hook churn** — `8fabb94`. The collision-fix catalog-augment over-seeded workspace-less (`deletion_requested`) queues that the pull driver excludes, so classify portabilized a hook's queue ref to rdc:// while the pull-base kept it raw → perpetual RemoteEdit. Fix: augment seeds a queue only when `workspace.is_some()` (mirrors pull driver). Live-verified: the 5 hooks referencing deletion_requested queue 3760895 stop churning; org fully idempotent (0 changed).
+- **BUG2 inbox push one-cycle re-pull** — `c695404`. Root cause (live-confirmed): the inbox PATCH response OMITS `bounce_email_to` but GET includes it (`null`); push re-baselined from the PATCH response → base shape ≠ classify's GET shape → one-cycle bundle re-pull. Fix: push driver re-fetches the inbox via GET after PATCH and re-baselines from THAT. Live-verified: inbox edit → push → 2nd sync `0 changed`. (The prior subagent's wiremock test was a false-negative — it echoed `bounce_email_to`; rewritten to faithfully omit-on-PATCH/null-on-GET, RED pre-fix → GREEN.)
+
+Method lesson reinforced: wiremock can false-negative when it doesn't replicate a real API response-shape quirk (PATCH-vs-GET field omission). LIVE verification caught both BUG2's reality and the false test. Token lifetime ~1h; re-auth as needed.
+
+---
+
 # Live CRUD + edge-case test pass — lockfile v3 (2026-06-08, fresh token)
 
 Binary: `target/release/rdc` at HEAD `5c23363` (portable refs + migrate + deploy removed + lockfile v3). Project `/tmp/rdc-coll2` (lockfile was v2). All restored to baseline after testing (sync `0 changed`); intentional collision fixtures kept; one `deletion_requested` queue+schema auto-purge ~2026-06-09.
