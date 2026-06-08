@@ -27,12 +27,12 @@
 //!    `[a]bort`; `[r]estore` is documented as a future enhancement — for
 //!    now it skips with an instruction to re-pull).
 
-use crate::api::{anyhow_has_status, RossumClient};
+use crate::api::{RossumClient, anyhow_has_status};
 use crate::cli::push::scan::Tombstones;
 use crate::log::{Action, Log};
 
 use crate::state::Lockfile;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 use std::sync::Arc;
@@ -56,6 +56,10 @@ pub struct DeleteCounts {
     pub engines: usize,
     pub engine_fields: usize,
     pub skipped: usize,
+    /// Per-object DELETEs the remote rejected (e.g. a `400` on a
+    /// unique-type `email_template`, a `409`, etc.). These are skipped
+    /// and tallied rather than aborting the batch — see `run_deletes`.
+    pub failed: usize,
 }
 
 impl DeleteCounts {
@@ -169,6 +173,18 @@ pub async fn preview_tombstone_bodies(
 /// Run the deletes phase. Drift-checks each tombstone, prompts the
 /// per-object resolver on drift, then issues `DELETE /<kind>/<id>` and
 /// cleans the lockfile entry.
+///
+/// **Skip-and-continue.** A per-object DELETE failure (any non-2xx the
+/// remote returns — e.g. a `400 Cannot delete template with unique type:
+/// rejection_default` on a server-auto-created `email_template`, or a
+/// `409`) is *not* propagated. If we `?`-bailed on the first error the
+/// whole reverse-dependency batch would abort, orphaning every sibling
+/// and parent that was perfectly deletable. Instead we emit a warning,
+/// tally it in `DeleteCounts::failed`, leave the lockfile entry intact
+/// (so a later sync retries it), and CONTINUE the loop. `run_deletes`
+/// still returns `Ok` so the surrounding sync completes and every
+/// deletable object actually gets deleted; the failures surface as
+/// warnings in the run summary, never as a hard abort.
 pub async fn run_deletes(
     client: &RossumClient,
     lockfile: &mut Lockfile,
@@ -183,9 +199,31 @@ pub async fn run_deletes(
         // (we'd hold a borrow of the map otherwise).
         let entries: Vec<(String, u64)> = map.iter().map(|(s, i)| (s.clone(), *i)).collect();
         for (slug, id) in entries {
-            let outcome = delete_one(client, kind, &slug, id, lockfile, interactive, progress).await?;
-            apply_outcome(&mut counts, kind, outcome);
+            match delete_one(client, kind, &slug, id, lockfile, interactive, progress).await {
+                Ok(outcome) => apply_outcome(&mut counts, kind, outcome),
+                Err(e) => {
+                    // Skip-and-continue: the remote refused this DELETE.
+                    // Warn, tally, leave the lockfile entry for retry, and
+                    // keep going so siblings + parents still get deleted.
+                    counts.failed += 1;
+                    progress.event(
+                        Action::Warn,
+                        &format!("{kind}/{slug} delete failed (skipped): {e:#}"),
+                    );
+                }
+            }
         }
+    }
+
+    if counts.failed > 0 {
+        progress.event(
+            Action::Warn,
+            &format!(
+                "{} object(s) could not be deleted and were skipped; they remain on the \
+                 remote and in the lockfile. Re-run `rdc sync <env> --allow-deletes` to retry.",
+                counts.failed
+            ),
+        );
     }
 
     Ok(counts)
@@ -220,7 +258,10 @@ async fn delete_one(
         if let Some(m) = lockfile.objects.get_mut(kind) {
             m.remove(slug);
         }
-        progress.event(Action::Skip, &format!("{kind}/{slug} (remote id {id} missing)"));
+        progress.event(
+            Action::Skip,
+            &format!("{kind}/{slug} (remote id {id} missing)"),
+        );
         return Ok(DeleteOutcome::AlreadyGone);
     }
     let remote_modified = remote.expect("checked Some");
@@ -251,7 +292,10 @@ async fn delete_one(
                 return Ok(DeleteOutcome::Skipped);
             }
             DeleteDriftChoice::Restore => {
-                progress.event(Action::Skip, &format!("{kind}/{slug} (drift; run `rdc sync` to restore)"));
+                progress.event(
+                    Action::Skip,
+                    &format!("{kind}/{slug} (drift; run `rdc sync` to restore)"),
+                );
                 return Ok(DeleteOutcome::Skipped);
             }
             DeleteDriftChoice::Abort => {
@@ -367,14 +411,34 @@ async fn fetch_remote_modified_at(
         },
         // No direct get_* for these kinds → use list + filter (one
         // list call per kind, irrespective of tombstone count).
-        "labels" => client.list_labels(None).await?.into_iter().find(|x| x.id == id).map(|x| x.modified_at().map(|s| s.to_string())),
-        "rules" => client.list_rules(None).await?.into_iter().find(|x| x.id == id).map(|x| x.modified_at().map(|s| s.to_string())),
-        "queues" => client.list_queues(None).await?.into_iter().find(|x| x.id == id).map(|x| x.modified_at().map(|s| s.to_string())),
+        "labels" => client
+            .list_labels(None)
+            .await?
+            .into_iter()
+            .find(|x| x.id == id)
+            .map(|x| x.modified_at().map(|s| s.to_string())),
+        "rules" => client
+            .list_rules(None)
+            .await?
+            .into_iter()
+            .find(|x| x.id == id)
+            .map(|x| x.modified_at().map(|s| s.to_string())),
+        "queues" => client
+            .list_queues(None)
+            .await?
+            .into_iter()
+            .find(|x| x.id == id)
+            .map(|x| x.modified_at().map(|s| s.to_string())),
         // Engines / engine_fields don't expose modified_at on their
         // model today; existence is the best signal we have. Treat
         // "exists" as "not drifted" so the user isn't prompted for
         // every one of them.
-        "engines" => client.list_engines(None).await?.into_iter().find(|x| x.id == id).map(|_| None),
+        "engines" => client
+            .list_engines(None)
+            .await?
+            .into_iter()
+            .find(|x| x.id == id)
+            .map(|_| None),
         "engine_fields" => client
             .list_engine_fields(None)
             .await?
@@ -385,7 +449,8 @@ async fn fetch_remote_modified_at(
             .list_email_templates(None)
             .await?
             .into_iter()
-            .find(|x| x.id == id).map(|x| x.modified_at().map(|s| s.to_string())),
+            .find(|x| x.id == id)
+            .map(|x| x.modified_at().map(|s| s.to_string())),
         _ => None,
     })
 }
