@@ -6893,3 +6893,189 @@ async fn sync_keeps_same_named_queues_distinct_across_workspaces() {
         );
     }
 }
+
+/// Regression: a single un-deletable object must NOT abort the whole
+/// delete batch.
+///
+/// The delete phase walks tombstones in reverse-dependency order and used
+/// to `?`-propagate the first per-object DELETE error, which aborted the
+/// entire batch and orphaned every sibling + parent. Live repro: deleting
+/// a queue subtree fails because Rossum auto-creates a `rejection_default`
+/// email_template whose DELETE returns `400 {"detail":"Cannot delete
+/// template with unique type: ..."}`. That single 400 stranded the queue,
+/// schema, and workspace.
+///
+/// This test seeds three `LocalDelete` tombstones of the same kind
+/// (labels — no `modified_at`, so the drift check passes cleanly) and
+/// mocks the MIDDLE label's DELETE to return 400 while the other two
+/// return 204. With the bug present, the batch aborts on the 400 and the
+/// label that sorts AFTER it never gets its DELETE; with the fix, all
+/// three DELETEs land, the sync exits success, and the failed one is
+/// surfaced as a warning + left in the lockfile.
+#[tokio::test]
+async fn sync_delete_skips_failed_and_continues_batch() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // Three labels. Names chosen so their slugs sort with the failing
+    // one (id 52) in the MIDDLE of the BTreeMap iteration order:
+    //   "aaa-label" (51) < "mmm-label" (52, fails) < "zzz-label" (53).
+    // That guarantees a third label is queued AFTER the failure, so the
+    // bug (abort-on-first-error) is observable: id 53's DELETE never
+    // lands under the old code.
+    let labels_body = serde_json::json!({
+        "pagination": { "total": 3, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 51,
+                "url": format!("{}/api/v1/labels/51", server.uri()),
+                "name": "Aaa Label",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "color": "#111111"
+            },
+            {
+                "id": 52,
+                "url": format!("{}/api/v1/labels/52", server.uri()),
+                "name": "Mmm Label",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "color": "#222222"
+            },
+            {
+                "id": 53,
+                "url": format!("{}/api/v1/labels/53", server.uri()),
+                "name": "Zzz Label",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "color": "#333333"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&labels_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/labels"]).await;
+
+    // DELETE mocks: the two outer labels succeed (204), the middle one
+    // rejects with a 400 carrying a Rossum-style detail body — exactly
+    // the shape of the unique-type-template rejection from the live repro.
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/labels/51"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/labels/52"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "detail": "Cannot delete object with unique constraint"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/labels/53"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // First sync: pull the three labels so local files + lockfile entries
+    // exist. This is the standard seed pattern used across this file.
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("seed sync should succeed");
+
+    let aaa = project.path().join("envs/dev/labels/aaa-label.json");
+    let mmm = project.path().join("envs/dev/labels/mmm-label.json");
+    let zzz = project.path().join("envs/dev/labels/zzz-label.json");
+    assert!(
+        aaa.exists() && mmm.exists() && zzz.exists(),
+        "seed sync must write all three label files"
+    );
+
+    // Delete all three local files → three LocalDelete tombstones. The
+    // lockfile entries stay, so the classifier sees clean deletes.
+    std::fs::remove_file(&aaa).unwrap();
+    std::fs::remove_file(&mmm).unwrap();
+    std::fs::remove_file(&zzz).unwrap();
+
+    // Second sync with --allow-deletes (non-interactive). Must NOT abort
+    // on the middle label's 400.
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* allow_deletes = */ true, /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    result.expect("sync must succeed despite a per-object delete failure");
+
+    // The batch ran to completion: every label's DELETE was attempted,
+    // including id 53 which sorts AFTER the failed id 52. Under the bug,
+    // the 400 on /labels/52 aborts the loop and /labels/53 is never
+    // called — this is the assertion that goes RED on old code.
+    let reqs = server.received_requests().await.unwrap_or_default();
+    let delete_hit = |id: u64| -> usize {
+        let p = format!("/api/v1/labels/{id}");
+        reqs.iter()
+            .filter(|r| r.method == http::Method::DELETE && r.url.path() == p)
+            .count()
+    };
+    assert_eq!(delete_hit(51), 1, "DELETE /labels/51 should have run");
+    assert_eq!(
+        delete_hit(52),
+        1,
+        "DELETE /labels/52 should have been attempted (and failed)"
+    );
+    assert_eq!(
+        delete_hit(53),
+        1,
+        "DELETE /labels/53 must run even though /labels/52 failed before it"
+    );
+
+    // The lockfile reflects reality: the two deleted labels are gone, the
+    // failed one is retained so a future sync retries it.
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    let lf: serde_json::Value = serde_json::from_str(&lf_raw).unwrap();
+    let labels_obj = lf
+        .get("objects")
+        .and_then(|o| o.get("labels"))
+        .and_then(|l| l.as_object())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !labels_obj.contains_key("aaa-label"),
+        "successfully-deleted label must be removed from lockfile: {lf_raw}"
+    );
+    assert!(
+        !labels_obj.contains_key("zzz-label"),
+        "successfully-deleted label must be removed from lockfile: {lf_raw}"
+    );
+    assert!(
+        labels_obj.contains_key("mmm-label"),
+        "failed-delete label must be retained in lockfile for retry: {lf_raw}"
+    );
+}
