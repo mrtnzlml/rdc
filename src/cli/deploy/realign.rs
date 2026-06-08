@@ -449,6 +449,14 @@ pub fn apply(
     let mut stats = ApplyStats::default();
     let mut idx = 0usize;
     let total = pending.len();
+    // `rdc://<kind>/<old>` → `rdc://<kind>/<new>` for every applied rename.
+    // Swept across the whole snapshot after all moves complete so the renamed
+    // object's own `url` and every sibling's reference follow the new slug.
+    let mut ref_subst: Vec<(String, String)> = Vec::new();
+    // Compound own-url prefixes (`rdc://email_templates/<ws>/<q>/…`) whose
+    // ws/q segment embeds a renamed slug. These are mid-string, not whole
+    // tokens, so they need a separate prefix rewrite.
+    let mut prefix_subst: Vec<(String, String)> = Vec::new();
 
     // Process in priority order: workspaces, queues, leaves. The list
     // is already sorted by `detect`.
@@ -471,6 +479,8 @@ pub fn apply(
             Ok(orphan_msgs) => {
                 stats.applied += 1;
                 stats.orphan_warnings.extend(orphan_msgs);
+                ref_subst.extend(ref_subst_pairs(&p));
+                prefix_subst.extend(compound_prefix_pairs(&p));
                 // Cascade in-memory pending updates: if we just renamed
                 // a workspace, later Queue / EmailTemplate entries
                 // referencing the old ws_slug need their ws_slug
@@ -485,7 +495,216 @@ pub fn apply(
         idx += 1;
     }
 
+    if !ref_subst.is_empty() || !prefix_subst.is_empty() {
+        rewrite_refs_in_tree(paths, &ref_subst, &prefix_subst)?;
+        refresh_lockfile_hashes(paths, lockfile)?;
+    }
+
     Ok(stats)
+}
+
+/// Compound own-url prefix substitutions a rename implies. An email template's
+/// own url is `rdc://email_templates/<ws>/<q>/<t>`, embedding both the
+/// workspace and queue slug. When either renames, that mid-string segment must
+/// follow — the whole-token sweep can't (the slug isn't the whole token). The
+/// trailing `/` bounds the match so a slug never matches a longer sibling
+/// (`…/cost/` never matches `…/cost-2/`). Engine-field / workflow-step compound
+/// urls embed their parent slug the same way; those kinds aren't exercised here
+/// so are left for a follow-up.
+fn compound_prefix_pairs(p: &PendingRename) -> Vec<(String, String)> {
+    let et = crate::snapshot::refs::RDC_SCHEME.to_string() + "email_templates/";
+    match p {
+        PendingRename::Queue { ws, old, new } => {
+            vec![(format!("{et}{ws}/{old}/"), format!("{et}{ws}/{new}/"))]
+        }
+        PendingRename::Workspace { old, new } => {
+            vec![(format!("{et}{old}/"), format!("{et}{new}/"))]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Recompute every object's lockfile `content_hash` from its base-cache bytes.
+///
+/// The stored hash is slug-encoded: `canonicalize_for_hash` portabilizes a
+/// body's references (URL → `rdc://<kind>/<slug>`) via the lockfile *before*
+/// hashing. A slug rename changes that id→slug mapping, so the stored hash of
+/// every object that references a renamed object silently goes stale — even
+/// though the base-cache bytes never changed. Leaving it stale makes the next
+/// sync see local≠base for each such object: the "both diverged" prompt storm.
+///
+/// The base cache holds the pulled body in canonical disk form (code/formulas
+/// split into sidecars, server-noise stripped) with references still in URL
+/// form. `combined_hash` runs `canonicalize_for_hash`, which portabilizes those
+/// URLs via the *current* lockfile — so recomputing it after the rename
+/// reproduces exactly the hash the next sync derives for the (unchanged) remote
+/// under the new slug mapping. Objects referencing no renamed object hash
+/// identically (idempotent no-op); the rest are corrected. Base bytes are the
+/// right source — they are the last-synced remote, so an object whose `name`
+/// the user *also* edited locally keeps its pending push (local≠base) rather
+/// than being silently reverted. The renamed object's own base file was moved
+/// to the new-slug path by `move_base_mirror`, so it classifies under the new
+/// slug here. Best-effort per object: an unclassifiable path, unreadable file,
+/// or unregistered kind is skipped rather than aborting the realign.
+fn refresh_lockfile_hashes(paths: &Paths, lockfile: &mut Lockfile) -> Result<()> {
+    let base_root = paths.base_cache_root();
+    for base_path in json_files_under(&base_root) {
+        let Ok(rel) = base_path.strip_prefix(&base_root) else {
+            continue;
+        };
+        let Some((kind, slug)) = crate::cli::migrate::classify(rel) else {
+            continue;
+        };
+        let Ok(json) = std::fs::read(&base_path) else {
+            continue;
+        };
+        let sidecars = base_sidecars(kind, &base_path);
+        let hash = crate::snapshot::codec::combined_hash(&json, &sidecars, lockfile);
+        if let Some(entry) = lockfile
+            .objects
+            .get_mut(kind)
+            .and_then(|m| m.get_mut(&slug))
+        {
+            entry.content_hash = Some(hash);
+        }
+    }
+    Ok(())
+}
+
+/// Read a base-cache object's sidecar `(label, bytes)` pairs, matching the
+/// labels each `KindCodec::disk_bytes` emits so the recomputed `combined_hash`
+/// is byte-identical to the one pull recorded. The base cache mirrors the env
+/// tree, so sidecars sit beside the JSON exactly as on disk. Code/formulas
+/// carry no refs, so the slug rename leaves them untouched — but they must
+/// still fold into the combined hash.
+fn base_sidecars(kind: &str, base_json_path: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let stem = base_json_path.file_stem().and_then(|s| s.to_str());
+    let dir = base_json_path.parent();
+    match (kind, stem, dir) {
+        ("hooks", Some(stem), Some(dir)) => {
+            for ext in ["py", "js"] {
+                if let Ok(bytes) = std::fs::read(dir.join(format!("{stem}.{ext}"))) {
+                    return vec![("code".to_string(), bytes)];
+                }
+            }
+            Vec::new()
+        }
+        ("rules", Some(stem), Some(dir)) => match std::fs::read(dir.join(format!("{stem}.py"))) {
+            Ok(bytes) => vec![("trigger_condition".to_string(), bytes)],
+            Err(_) => Vec::new(),
+        },
+        ("schemas", _, Some(queue_dir)) => {
+            crate::snapshot::schema::read_local_formulas(queue_dir).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The `rdc://<kind>/<old>` → `rdc://<kind>/<new>` reference substitutions a
+/// single applied rename implies. Only kinds that are actual reference targets
+/// are emitted (mirroring `migrate`'s `SUBST_KINDS`): workspaces, queues
+/// (which also drag their schema/inbox — those share the queue slug), hooks,
+/// rules, labels, engines. Compound-keyed kinds that nothing references
+/// (engine_fields / email_templates / workflows / workflow_steps) get no
+/// substitution — their files still move, and their merge base still follows
+/// via the base-cache mirror.
+fn ref_subst_pairs(p: &PendingRename) -> Vec<(String, String)> {
+    let pair = |kind: &str, old: &str, new: &str| {
+        (
+            format!("{}{kind}/{old}", crate::snapshot::refs::RDC_SCHEME),
+            format!("{}{kind}/{new}", crate::snapshot::refs::RDC_SCHEME),
+        )
+    };
+    match p {
+        PendingRename::Workspace { old, new } => vec![pair("workspaces", old, new)],
+        PendingRename::Queue { old, new, .. } => vec![
+            pair("queues", old, new),
+            pair("schemas", old, new),
+            pair("inboxes", old, new),
+        ],
+        PendingRename::Hook { old, new } => vec![pair("hooks", old, new)],
+        PendingRename::Rule { old, new } => vec![pair("rules", old, new)],
+        PendingRename::Label { old, new } => vec![pair("labels", old, new)],
+        PendingRename::Engine { old, new } => vec![pair("engines", old, new)],
+        PendingRename::EngineField { .. }
+        | PendingRename::Workflow { .. }
+        | PendingRename::WorkflowStep { .. }
+        | PendingRename::EmailTemplate { .. } => Vec::new(),
+    }
+}
+
+/// Surgically rewrite portable refs across every `.json` file under both the
+/// env tree AND the base-cache tree. A ref is always a complete,
+/// quote-delimited JSON string value (`"rdc://<kind>/<slug>"`), never a
+/// substring of a template or formula, so a byte-level replacement of the
+/// quoted token is exact and — unlike a parse/re-serialize round-trip —
+/// introduces zero key-order or formatting churn. The trailing quote also
+/// prevents a slug from matching a longer slug that shares its prefix
+/// (`…/cost"` never matches `…/cost-invoices"`).
+///
+/// The base-cache sweep is essential: the base mirrors the *portabilized*
+/// remote, whose slugs follow the lockfile. After a slug rename, every
+/// referencing object's base still carries the old ref; leaving it stale makes
+/// the next sync see local≠base even when local==remote, raising a spurious
+/// "both diverged" conflict for every referencing object.
+/// Sweeps both the env tree (always `rdc://`-form) and the base-cache tree
+/// (raw remote, usually URL-form but `rdc://` for some pull paths). The base
+/// sweep is a no-op on URL-form bodies; the lockfile-hash refresh handles the
+/// URL→slug portabilization shift for those. Both passes together leave the
+/// snapshot's reference graph consistent regardless of stored form.
+fn rewrite_refs_in_tree(
+    paths: &Paths,
+    subst: &[(String, String)],
+    prefix_subst: &[(String, String)],
+) -> Result<()> {
+    // Whole-token refs are quote-delimited (`"rdc://kind/slug"`); prefix refs
+    // are mid-string segments of a compound url, bounded by a trailing `/`.
+    let needles: Vec<(String, String)> = subst
+        .iter()
+        .map(|(old, new)| (format!("\"{old}\""), format!("\"{new}\"")))
+        .collect();
+    for root in [paths.env_root(), paths.base_cache_root()] {
+        for path in json_files_under(&root) {
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut updated = raw.clone();
+            for (old, new) in &needles {
+                if updated.contains(old.as_str()) {
+                    updated = updated.replace(old.as_str(), new.as_str());
+                }
+            }
+            for (old, new) in prefix_subst {
+                if updated.contains(old.as_str()) {
+                    updated = updated.replace(old.as_str(), new.as_str());
+                }
+            }
+            if updated != raw {
+                crate::snapshot::writer::write_atomic(&path, updated.as_bytes())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recursively collect every `*.json` file under `root` (skips missing roots).
+fn json_files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                out.push(path);
+            }
+        }
+    }
+    out
 }
 
 fn cascade_pending(rest: &mut [PendingRename], applied: &PendingRename) {
@@ -549,6 +768,7 @@ fn apply_one(paths: &Paths, lockfile: &mut Lockfile, p: &PendingRename) -> Resul
     match p {
         PendingRename::Hook { old, new } => {
             move_file(
+                paths,
                 &paths.hooks_dir().join(format!("{old}.json")),
                 &paths.hooks_dir().join(format!("{new}.json")),
             )?;
@@ -556,10 +776,12 @@ fn apply_one(paths: &Paths, lockfile: &mut Lockfile, p: &PendingRename) -> Resul
             // whichever happens to exist. Both extensions are a no-op
             // when absent thanks to `move_optional`.
             move_optional(
+                paths,
                 &paths.hooks_dir().join(format!("{old}.py")),
                 &paths.hooks_dir().join(format!("{new}.py")),
             )?;
             move_optional(
+                paths,
                 &paths.hooks_dir().join(format!("{old}.js")),
                 &paths.hooks_dir().join(format!("{new}.js")),
             )?;
@@ -570,10 +792,12 @@ fn apply_one(paths: &Paths, lockfile: &mut Lockfile, p: &PendingRename) -> Resul
             // Rules are a combined-form kind (json + optional
             // trigger_condition .py). Move both files when present.
             move_file(
+                paths,
                 &paths.rules_dir().join(format!("{old}.json")),
                 &paths.rules_dir().join(format!("{new}.json")),
             )?;
             move_optional(
+                paths,
                 &paths.rules_dir().join(format!("{old}.py")),
                 &paths.rules_dir().join(format!("{new}.py")),
             )?;
@@ -582,6 +806,7 @@ fn apply_one(paths: &Paths, lockfile: &mut Lockfile, p: &PendingRename) -> Resul
         }
         PendingRename::Label { old, new } => {
             move_file(
+                paths,
                 &paths.labels_dir().join(format!("{old}.json")),
                 &paths.labels_dir().join(format!("{new}.json")),
             )?;
@@ -591,7 +816,7 @@ fn apply_one(paths: &Paths, lockfile: &mut Lockfile, p: &PendingRename) -> Resul
         PendingRename::Engine { old, new } => {
             // Engines own a dir (engine.json + fields/); a rename moves
             // the whole subtree. Engine-field slugs are unchanged.
-            move_dir(&paths.engine_dir(old), &paths.engine_dir(new))?;
+            move_dir(paths, &paths.engine_dir(old), &paths.engine_dir(new))?;
             rename_lockfile_key(lockfile, "engines", old, new);
             collect_orphans(paths, "engines", old, &mut orphans);
         }
@@ -602,7 +827,7 @@ fn apply_one(paths: &Paths, lockfile: &mut Lockfile, p: &PendingRename) -> Resul
                 && let Some(parent) = old_path.parent()
             {
                 let new_field = new.split_once('/').map(|(_, f)| f).unwrap_or(new);
-                move_file(&old_path, &parent.join(format!("{new_field}.json")))?;
+                move_file(paths, &old_path, &parent.join(format!("{new_field}.json")))?;
             }
             rename_lockfile_key(lockfile, "engine_fields", old, new);
             collect_orphans(paths, "engine_fields", old, &mut orphans);
@@ -610,7 +835,7 @@ fn apply_one(paths: &Paths, lockfile: &mut Lockfile, p: &PendingRename) -> Resul
         PendingRename::Workflow { old, new } => {
             // Workflows own a dir (workflow.json + steps/); same shape
             // as engines.
-            move_dir(&paths.workflow_dir(old), &paths.workflow_dir(new))?;
+            move_dir(paths, &paths.workflow_dir(old), &paths.workflow_dir(new))?;
             rename_lockfile_key(lockfile, "workflows", old, new);
             collect_orphans(paths, "workflows", old, &mut orphans);
         }
@@ -619,13 +844,14 @@ fn apply_one(paths: &Paths, lockfile: &mut Lockfile, p: &PendingRename) -> Resul
                 && let Some(parent) = old_path.parent()
             {
                 let new_step = new.split_once('/').map(|(_, s)| s).unwrap_or(new);
-                move_file(&old_path, &parent.join(format!("{new_step}.json")))?;
+                move_file(paths, &old_path, &parent.join(format!("{new_step}.json")))?;
             }
             rename_lockfile_key(lockfile, "workflow_steps", old, new);
         }
         PendingRename::EmailTemplate { ws, q, old, new } => {
             let dir = paths.queue_email_templates_dir(ws, q);
             move_file(
+                paths,
                 &dir.join(format!("{old}.json")),
                 &dir.join(format!("{new}.json")),
             )?;
@@ -635,13 +861,13 @@ fn apply_one(paths: &Paths, lockfile: &mut Lockfile, p: &PendingRename) -> Resul
             collect_orphans(paths, "email_templates", &old_compound, &mut orphans);
         }
         PendingRename::Workspace { old, new } => {
-            move_dir(&paths.workspace_dir(old), &paths.workspace_dir(new))?;
+            move_dir(paths, &paths.workspace_dir(old), &paths.workspace_dir(new))?;
             rename_lockfile_key(lockfile, "workspaces", old, new);
             rewrite_email_template_compound_prefix(lockfile, 0, old, new);
             collect_orphans(paths, "workspaces", old, &mut orphans);
         }
         PendingRename::Queue { ws, old, new } => {
-            move_dir(&paths.queue_dir(ws, old), &paths.queue_dir(ws, new))?;
+            move_dir(paths, &paths.queue_dir(ws, old), &paths.queue_dir(ws, new))?;
             rename_lockfile_key(lockfile, "queues", old, new);
             rename_lockfile_key(lockfile, "schemas", old, new);
             rename_lockfile_key(lockfile, "inboxes", old, new);
@@ -652,7 +878,7 @@ fn apply_one(paths: &Paths, lockfile: &mut Lockfile, p: &PendingRename) -> Resul
     Ok(orphans)
 }
 
-fn move_file(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+fn move_file(paths: &Paths, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
     if to.exists() {
         anyhow::bail!("destination {} already exists", to.display());
     }
@@ -661,22 +887,54 @@ fn move_file(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     std::fs::rename(from, to)
-        .with_context(|| format!("moving {} -> {}", from.display(), to.display()))
+        .with_context(|| format!("moving {} -> {}", from.display(), to.display()))?;
+    move_base_mirror(paths, from, to)
 }
 
-fn move_optional(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+fn move_optional(paths: &Paths, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
     if !from.exists() {
         return Ok(());
     }
-    move_file(from, to)
+    move_file(paths, from, to)
 }
 
-fn move_dir(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+fn move_dir(paths: &Paths, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
     if to.exists() {
         anyhow::bail!("destination {} already exists", to.display());
     }
     std::fs::rename(from, to)
-        .with_context(|| format!("moving {} -> {}", from.display(), to.display()))
+        .with_context(|| format!("moving {} -> {}", from.display(), to.display()))?;
+    move_base_mirror(paths, from, to)
+}
+
+/// Mirror an env-tree move onto the base-cache tree. The base cache mirrors
+/// the env tree 1:1 (`state::base_cache`), so when a rename relocates an
+/// object's files we must move the matching base sidecar(s) to the new slug —
+/// otherwise the renamed object loses its 3-way-merge base and the next sync
+/// reports a spurious "both diverged" conflict instead of a clean push.
+/// Best-effort: a missing base mirror (never synced) or a path outside the env
+/// tree is a no-op, not an error.
+fn move_base_mirror(paths: &Paths, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    let (Some(base_from), Some(base_to)) = (
+        crate::state::base_cache::cache_mirror(paths, from),
+        crate::state::base_cache::cache_mirror(paths, to),
+    ) else {
+        return Ok(());
+    };
+    if !base_from.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = base_to.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::rename(&base_from, &base_to).with_context(|| {
+        format!(
+            "moving base cache {} -> {}",
+            base_from.display(),
+            base_to.display()
+        )
+    })
 }
 
 /// Move a slug-keyed entry within a lockfile kind.
@@ -1350,5 +1608,302 @@ mod tests {
             pending.is_empty(),
             "expected no rename (would collide), got {pending:?}"
         );
+    }
+
+    /// Portable-refs gap #1: a rename must rewrite the renamed object's own
+    /// `url` field AND every `rdc://<kind>/<old>` reference in sibling files,
+    /// or the snapshot's reference graph dangles at the old slug.
+    #[test]
+    fn apply_hook_rename_rewrites_own_url_and_referencing_queue() {
+        use crate::state::ObjectEntry;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+        std::fs::write(
+            paths.hooks_dir().join("val.json"),
+            r#"{"id":1,"name":"Validator V2","url":"rdc://hooks/val","queues":["rdc://queues/q1"]}"#,
+        )
+        .unwrap();
+        let qdir = paths.queue_dir("ws1", "q1");
+        std::fs::create_dir_all(&qdir).unwrap();
+        std::fs::write(
+            qdir.join("queue.json"),
+            r#"{"id":2,"name":"Q1","url":"rdc://queues/q1","hooks":["rdc://hooks/val"]}"#,
+        )
+        .unwrap();
+
+        let mut lockfile = Lockfile::default();
+        lockfile.upsert(
+            "hooks",
+            "val",
+            ObjectEntry { id: 1, modified_at: None, content_hash: Some("h".into()), secrets_hash: None },
+        );
+        lockfile.upsert(
+            "queues",
+            "q1",
+            ObjectEntry { id: 2, modified_at: None, content_hash: None, secrets_hash: None },
+        );
+
+        let pending = detect(&paths, &lockfile);
+        assert_eq!(
+            pending,
+            vec![PendingRename::Hook { old: "val".into(), new: "validator-v2".into() }]
+        );
+        let stats = apply(&paths, &mut lockfile, pending, false).unwrap();
+        assert_eq!(stats.applied, 1);
+
+        let hook = std::fs::read_to_string(paths.hooks_dir().join("validator-v2.json")).unwrap();
+        assert!(
+            hook.contains(r#""rdc://hooks/validator-v2""#),
+            "renamed hook's own url must be rewritten, got: {hook}"
+        );
+        let q = std::fs::read_to_string(qdir.join("queue.json")).unwrap();
+        assert!(
+            q.contains(r#""rdc://hooks/validator-v2""#),
+            "referencing queue's hooks[] must be rewritten, got: {q}"
+        );
+        assert!(
+            !q.contains(r#""rdc://hooks/val""#),
+            "old slug ref must be gone, got: {q}"
+        );
+    }
+
+    /// Portable-refs gap #2: a queue rename must rewrite `rdc://queues/<old>`
+    /// AND `rdc://schemas/<old>` refs everywhere (queue/schema share the slug),
+    /// across workspace.json, the schema, and every referencing hook.
+    #[test]
+    fn apply_queue_rename_rewrites_refs_across_workspace_schema_and_hooks() {
+        use crate::state::ObjectEntry;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        let qdir = paths.queue_dir("ws1", "cost");
+        std::fs::create_dir_all(&qdir).unwrap();
+        std::fs::write(
+            qdir.join("queue.json"),
+            r#"{"id":2,"name":"Cost Invoices","url":"rdc://queues/cost","schema":"rdc://schemas/cost"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            qdir.join("schema.json"),
+            r#"{"id":3,"name":"S","url":"rdc://schemas/cost","queues":["rdc://queues/cost"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            paths.workspace_dir("ws1").join("workspace.json"),
+            r#"{"id":1,"name":"Ws1","url":"rdc://workspaces/ws1","queues":["rdc://queues/cost"]}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+        std::fs::write(
+            paths.hooks_dir().join("h1.json"),
+            r#"{"id":9,"name":"h1","url":"rdc://hooks/h1","queues":["rdc://queues/cost"]}"#,
+        )
+        .unwrap();
+
+        let mut lockfile = Lockfile::default();
+        for (kind, slug, id) in [
+            ("workspaces", "ws1", 1u64),
+            ("queues", "cost", 2),
+            ("schemas", "cost", 3),
+            ("hooks", "h1", 9),
+        ] {
+            lockfile.upsert(
+                kind,
+                slug,
+                ObjectEntry { id, modified_at: None, content_hash: None, secrets_hash: None },
+            );
+        }
+
+        let pending = detect(&paths, &lockfile);
+        assert_eq!(
+            pending,
+            vec![PendingRename::Queue {
+                ws: "ws1".into(),
+                old: "cost".into(),
+                new: "cost-invoices".into(),
+            }]
+        );
+        apply(&paths, &mut lockfile, pending, false).unwrap();
+
+        let qdir_new = paths.queue_dir("ws1", "cost-invoices");
+        let q = std::fs::read_to_string(qdir_new.join("queue.json")).unwrap();
+        assert!(q.contains(r#""rdc://queues/cost-invoices""#) && q.contains(r#""rdc://schemas/cost-invoices""#), "queue.json refs: {q}");
+        let s = std::fs::read_to_string(qdir_new.join("schema.json")).unwrap();
+        assert!(s.contains(r#""rdc://schemas/cost-invoices""#) && s.contains(r#""rdc://queues/cost-invoices""#), "schema.json refs: {s}");
+        let ws = std::fs::read_to_string(paths.workspace_dir("ws1").join("workspace.json")).unwrap();
+        assert!(ws.contains(r#""rdc://queues/cost-invoices""#), "workspace refs: {ws}");
+        let h = std::fs::read_to_string(paths.hooks_dir().join("h1.json")).unwrap();
+        assert!(h.contains(r#""rdc://queues/cost-invoices""#), "hook refs: {h}");
+        // No stale old-slug refs anywhere.
+        for body in [&q, &s, &ws, &h] {
+            assert!(!body.contains(r#"/cost""#), "stale old slug remains: {body}");
+        }
+    }
+
+    /// Portable-refs gap #3: a rename must move the base-cache sidecar to the
+    /// new slug so the next sync keeps a 3-way merge base (otherwise a pure
+    /// local rename degrades to a spurious "both diverged" conflict).
+    #[test]
+    fn apply_label_rename_moves_base_cache_sidecar() {
+        use crate::state::ObjectEntry;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        std::fs::create_dir_all(paths.labels_dir()).unwrap();
+        std::fs::write(
+            paths.labels_dir().join("hold.json"),
+            r#"{"id":1,"name":"Audit Hold","url":"rdc://labels/hold"}"#,
+        )
+        .unwrap();
+        let base_old = paths.base_cache_root().join("labels").join("hold.json");
+        std::fs::create_dir_all(base_old.parent().unwrap()).unwrap();
+        std::fs::write(&base_old, r#"{"id":1,"name":"Audit Hold","url":"rdc://labels/hold"}"#).unwrap();
+
+        let mut lockfile = Lockfile::default();
+        lockfile.upsert(
+            "labels",
+            "hold",
+            ObjectEntry { id: 1, modified_at: None, content_hash: None, secrets_hash: None },
+        );
+
+        let pending = detect(&paths, &lockfile);
+        assert_eq!(
+            pending,
+            vec![PendingRename::Label { old: "hold".into(), new: "audit-hold".into() }]
+        );
+        apply(&paths, &mut lockfile, pending, false).unwrap();
+
+        let base_new = paths.base_cache_root().join("labels").join("audit-hold.json");
+        assert!(base_new.exists(), "base-cache sidecar must move to the new slug");
+        assert!(!base_old.exists(), "old-slug base-cache sidecar must be gone");
+    }
+
+    /// Portable-refs gap #3b: a referencing object's *base-cache* copy must also
+    /// have its `rdc://<kind>/<old>` ref rewritten. The base mirrors the
+    /// portabilized remote, whose slug follows the lockfile; if the base keeps
+    /// the old ref while the env file gets the new one, the next sync sees
+    /// local≠base even though local==remote and raises a spurious conflict.
+    #[test]
+    fn apply_rename_rewrites_refs_in_base_cache_of_referencing_objects() {
+        use crate::state::ObjectEntry;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+        // Env file references the hook being renamed.
+        std::fs::write(
+            paths.hooks_dir().join("val.json"),
+            r#"{"id":1,"name":"Validator V2","url":"rdc://hooks/val","queues":[]}"#,
+        )
+        .unwrap();
+        let qdir = paths.queue_dir("ws1", "q1");
+        std::fs::create_dir_all(&qdir).unwrap();
+        std::fs::write(
+            qdir.join("queue.json"),
+            r#"{"id":2,"name":"Q1","url":"rdc://queues/q1","hooks":["rdc://hooks/val"]}"#,
+        )
+        .unwrap();
+        // Base-cache copy of the referencing queue still holds the OLD ref.
+        let base_q = paths
+            .base_cache_root()
+            .join("workspaces/ws1/queues/q1/queue.json");
+        std::fs::create_dir_all(base_q.parent().unwrap()).unwrap();
+        std::fs::write(
+            &base_q,
+            r#"{"id":2,"name":"Q1","url":"rdc://queues/q1","hooks":["rdc://hooks/val"]}"#,
+        )
+        .unwrap();
+
+        let mut lockfile = Lockfile::default();
+        lockfile.upsert(
+            "hooks",
+            "val",
+            ObjectEntry { id: 1, modified_at: None, content_hash: Some("h".into()), secrets_hash: None },
+        );
+        lockfile.upsert(
+            "queues",
+            "q1",
+            ObjectEntry { id: 2, modified_at: None, content_hash: None, secrets_hash: None },
+        );
+
+        let pending = detect(&paths, &lockfile);
+        apply(&paths, &mut lockfile, pending, false).unwrap();
+
+        let base = std::fs::read_to_string(&base_q).unwrap();
+        assert!(
+            base.contains(r#""rdc://hooks/validator-v2""#),
+            "base-cache ref must be rewritten too, got: {base}"
+        );
+        assert!(
+            !base.contains(r#""rdc://hooks/val""#),
+            "old base-cache ref must be gone, got: {base}"
+        );
+    }
+
+    /// Portable-refs gap #5: a queue rename must rewrite the COMPOUND own-`url`
+    /// of every email template under it (`rdc://email_templates/<ws>/<q>/<t>`),
+    /// whose middle segment embeds the queue slug. A whole-token sweep misses
+    /// these (the queue slug is mid-string, not the whole token), leaving the
+    /// template's own url stale and forcing a spurious PATCH on the next sync.
+    #[test]
+    fn apply_queue_rename_rewrites_email_template_compound_own_urls() {
+        use crate::state::ObjectEntry;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        let qdir = paths.queue_dir("ws1", "cost");
+        std::fs::create_dir_all(&qdir).unwrap();
+        std::fs::write(
+            qdir.join("queue.json"),
+            r#"{"id":2,"name":"Cost Invoices","url":"rdc://queues/cost","schema":"rdc://schemas/cost"}"#,
+        )
+        .unwrap();
+        let et_dir = paths.queue_email_templates_dir("ws1", "cost");
+        std::fs::create_dir_all(&et_dir).unwrap();
+        std::fs::write(
+            et_dir.join("welcome.json"),
+            r#"{"id":7,"name":"Welcome","url":"rdc://email_templates/ws1/cost/welcome","queue":"rdc://queues/cost"}"#,
+        )
+        .unwrap();
+        // detect()'s queue locator needs the parent workspace in the lockfile.
+        std::fs::create_dir_all(paths.workspace_dir("ws1")).unwrap();
+
+        let mut lockfile = Lockfile::default();
+        lockfile.upsert(
+            "workspaces",
+            "ws1",
+            ObjectEntry { id: 9, modified_at: None, content_hash: None, secrets_hash: None },
+        );
+        for (kind, slug, id) in [("queues", "cost", 2u64), ("schemas", "cost", 3)] {
+            lockfile.upsert(
+                kind,
+                slug,
+                ObjectEntry { id, modified_at: None, content_hash: None, secrets_hash: None },
+            );
+        }
+        lockfile.upsert(
+            "email_templates",
+            "ws1/cost/welcome",
+            ObjectEntry { id: 7, modified_at: None, content_hash: None, secrets_hash: None },
+        );
+
+        let pending = detect(&paths, &lockfile);
+        assert_eq!(
+            pending,
+            vec![PendingRename::Queue { ws: "ws1".into(), old: "cost".into(), new: "cost-invoices".into() }]
+        );
+        apply(&paths, &mut lockfile, pending, false).unwrap();
+
+        let et = std::fs::read_to_string(
+            paths.queue_email_templates_dir("ws1", "cost-invoices").join("welcome.json"),
+        )
+        .unwrap();
+        assert!(
+            et.contains(r#""rdc://email_templates/ws1/cost-invoices/welcome""#),
+            "email template compound own-url must follow the queue rename, got: {et}"
+        );
+        assert!(
+            !et.contains(r#""rdc://email_templates/ws1/cost/welcome""#),
+            "stale compound own-url must be gone, got: {et}"
+        );
+        // The plain queue ref is also rewritten (whole-token path).
+        assert!(et.contains(r#""rdc://queues/cost-invoices""#), "queue ref: {et}");
     }
 }

@@ -77,7 +77,7 @@ fn build_subst(mapping: &Mapping) -> BTreeMap<String, String> {
 /// `src_slug` is the source-env lockfile/overlay coordinate: flat for
 /// hooks/labels/rules/workspaces/queues, and the compound `<engine>/<field>`
 /// (engine_fields) / `<ws>/<q>/<template>` (email_templates).
-fn classify(rel: &Path) -> Option<(&'static str, String)> {
+pub(crate) fn classify(rel: &Path) -> Option<(&'static str, String)> {
     let comps: Vec<String> = rel
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
