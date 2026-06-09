@@ -145,6 +145,39 @@ fn sort_queues(value: &mut Value) {
     });
 }
 
+/// Sort a hook's top-level `run_after` array in place, lexicographically.
+///
+/// `run_after` is the hook's dependency SET — "this hook runs after ALL of
+/// these have completed" — so the relative order of its entries carries no
+/// meaning to the API. The server returns it in internal numeric-id order,
+/// which differs across environments (ids are not portable). Left untouched,
+/// the on-disk `rdc://` refs would land in an env-specific order, so a
+/// cross-env `migrate` would emit a spurious reorder and a re-pull could churn.
+///
+/// Unlike [`sort_queues`] (which sorts the live `queues` URLs at serialize
+/// time, before portabilization — fine for *within-env* stability), this MUST
+/// run on the **portable `rdc://<slug>` form**: slugs are stable across envs,
+/// URLs/ids are not. Callers therefore invoke it after portabilization (the
+/// pull post-pass) or on already-portable snapshots (`migrate`).
+///
+/// Defensive: only sorts when every element is a string; a mixed/hand-edited
+/// array passes through untouched rather than panicking.
+pub fn sort_run_after(value: &mut Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let Some(Value::Array(refs)) = obj.get_mut("run_after") else {
+        return;
+    };
+    if !refs.iter().all(|v| matches!(v, Value::String(_))) {
+        return;
+    }
+    refs.sort_by(|a, b| match (a, b) {
+        (Value::String(s1), Value::String(s2)) => s1.cmp(s2),
+        _ => std::cmp::Ordering::Equal,
+    });
+}
+
 /// Write only the hook's sidecar code file (extracted from `config.code`).
 /// The `ext` argument is the file extension (`"py"` or `"js"`) and must be
 /// derived from the hook's runtime by the caller via
