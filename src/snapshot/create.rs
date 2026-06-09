@@ -196,6 +196,20 @@ pub fn strip_for_cross_env_patch(body: &mut Value, kind: &str) {
     // via the overlay's `store_extension_token_owner`, independent of this strip.
     if kind == "hooks" {
         obj.remove("token_owner");
+        // `hook_template` is a per-env store-template URL: the host is the
+        // env's org subdomain (the template id itself is cluster-stable) and
+        // the field is read-only — the API assigns it at `POST /hooks/create`
+        // and ignores it on PATCH. Like `token_owner`, it never carries
+        // cross-env drift, so strip it so a cross-env migrate restores the
+        // TARGET's value instead of importing the source env's host. (The
+        // store-extension install path reads `hook_template` straight off the
+        // on-disk file via `build_install_body`, independent of this strip.)
+        obj.remove("hook_template");
+        // `guide` is read-only store-template HTML that embeds the env's
+        // configurator URL (`https://<org>-<env>.rossum.app/svc/...`). Same
+        // reasoning as `hook_template`: per-env and never writable, so it must
+        // not cross envs.
+        obj.remove("guide");
     }
     // The Rossum API treats an engine field's `name` as immutable after
     // create — `PATCH /engine_fields/<id>` with a changed `name` returns
@@ -411,6 +425,51 @@ mod tests {
         assert!(
             q.as_object().unwrap().contains_key("token_owner"),
             "token_owner strip must be hooks-scoped",
+        );
+    }
+
+    #[test]
+    fn cross_env_strip_removes_hook_template_and_guide_but_create_keeps_them() {
+        // A store-extension hook carries two per-env, read-only store-template
+        // fields: `hook_template` (a URL whose host is the env's org subdomain;
+        // the template id is cluster-stable) and `guide` (HTML embedding the
+        // env's configurator URL). Both are assigned/refreshed server-side and
+        // ignored on write — they never cross envs, exactly like `token_owner`.
+        let body = json!({
+            "id": 1, "url": "u", "name": "h", "type": "webhook",
+            "extension_source": "rossum_store",
+            "hook_template": "https://acme-dev.rossum.app/api/v1/hook_templates/39",
+            "guide": "<div><form action=\"https://acme-dev.rossum.app/svc/x/\"></form></div>",
+        });
+        // Within-env create/push must PRESERVE both (same env → values valid).
+        let mut create = body.clone();
+        strip_for_create(&mut create, "hooks");
+        let c = create.as_object().unwrap();
+        assert!(
+            c.contains_key("hook_template"),
+            "within-env create must keep hook_template",
+        );
+        assert!(c.contains_key("guide"), "within-env create must keep guide");
+        // Cross-env strip REMOVES both — a cross-env migrate must restore the
+        // TARGET's values rather than import the source env's.
+        let mut cross = body.clone();
+        strip_for_cross_env_patch(&mut cross, "hooks");
+        let x = cross.as_object().unwrap();
+        assert!(
+            !x.contains_key("hook_template"),
+            "cross-env strip must remove hook_template",
+        );
+        assert!(
+            !x.contains_key("guide"),
+            "cross-env strip must remove guide",
+        );
+        // The strip is hooks-scoped — other kinds keep these keys untouched.
+        let mut q = json!({ "id": 1, "url": "u", "name": "q", "hook_template": "x", "guide": "y" });
+        strip_for_cross_env_patch(&mut q, "queues");
+        let qo = q.as_object().unwrap();
+        assert!(
+            qo.contains_key("hook_template") && qo.contains_key("guide"),
+            "hook_template/guide strip must be hooks-scoped",
         );
     }
 
