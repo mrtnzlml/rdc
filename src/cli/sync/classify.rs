@@ -71,6 +71,22 @@ pub fn classify(
             (false, true,  true, true)  if remote_hash == base_hash => SyncClass::LocalDelete,
             (false, false, true, true)  if remote_hash != base_hash => SyncClass::RemoteEdit,
             (false, false, true, false) => SyncClass::RemoteCreate,
+            // Local AND remote both differ from base, but they agree with
+            // EACH OTHER (`local_hash == remote_hash`). This is convergence,
+            // not a conflict — there is no second value to reconcile, so a
+            // prompt would be pure noise. Adopt the agreed value as
+            // `RemoteEdit`: the pull driver writes the canonical bytes and
+            // advances the base, pull-only (never a push). The dominant case
+            // is the portable-refs migration — a legacy URL-form local body
+            // and the portabilized remote canonicalize identically while the
+            // lockfile base was recorded by an older rdc in the pre-portable
+            // form. (Genuine divergence, `local_hash != remote_hash`, still
+            // falls through to `BothDiverged` below.)
+            (true, false, true, true)
+                if remote_hash != base_hash && local_hash == remote_hash =>
+            {
+                SyncClass::RemoteEdit
+            }
             (true,  false, true,  true)  if remote_hash != base_hash => SyncClass::BothDiverged,
             (false, true,  false, true)  => SyncClass::BothDeleted,
 
@@ -219,6 +235,25 @@ mod tests {
             &m(&[("hooks", "v1", "h_base")]),
         );
         assert_eq!(class_of(&result, "v1"), &SyncClass::BothDiverged);
+    }
+
+    #[test]
+    fn converged_when_local_equals_remote_both_differ_from_stale_base() {
+        // local and remote hold the SAME value (equal hash) but it differs
+        // from the lockfile base. This is NOT a real conflict — both sides
+        // already agree, so there is nothing to merge. Adopt the agreed
+        // value via RemoteEdit (the pull driver writes the canonical bytes
+        // and advances the base), pull-only, no prompt. This is the
+        // portable-refs migration shape: a legacy URL-form local body and
+        // the portabilized remote canonicalize to the same hash while the
+        // base was recorded by an older rdc in the pre-portable form.
+        let result = classify(
+            &m(&[("hooks", "v1", "h_agreed")]),
+            &m(&[("hooks", "v1", "h_agreed")]),
+            &BTreeSet::new(),
+            &m(&[("hooks", "v1", "h_stale_base")]),
+        );
+        assert_eq!(class_of(&result, "v1"), &SyncClass::RemoteEdit);
     }
 
     #[test]
