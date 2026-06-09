@@ -172,6 +172,7 @@ fn transform_file(
     mapping: &Mapping,
     subst: &BTreeMap<String, String>,
     overlay: Option<&Overlay>,
+    tgt_org_url: &str,
 ) -> Result<()> {
     let src_path = src_root.join(rel);
     let dst_path = tgt_root.join(remap_relative(rel, mapping));
@@ -203,6 +204,20 @@ fn transform_file(
         }
     });
 
+    // Reconcile env-specific identity: the source body carries the SOURCE
+    // env's `id`, `created_by`/`modified_by`, `organization`, etc. — which are
+    // wrong for the target. For an object that already exists in tgt (matched),
+    // restore the TARGET's values for every field `cross_env_body` strips
+    // (id/url/created_*/modified_*/status/organization + per-kind server-managed
+    // / reverse-ref fields); for a new object (no tgt file), strip them to a
+    // clean create payload so `rdc sync` POSTs and the server assigns identity.
+    // Runs BEFORE the overlay so an explicit overlay override still wins.
+    if let Some((kind, _)) = classify(rel)
+        && let Some(codec) = crate::snapshot::codec::codec(kind)
+    {
+        reconcile_target_identity(&mut value, &dst_path, codec, tgt_org_url);
+    }
+
     // Apply the tgt overlay for this object, if any.
     if let Some((kind, src_slug)) = classify(rel)
         && let Some(ov) = overlay
@@ -215,6 +230,92 @@ fn transform_file(
     json.push(b'\n');
     crate::snapshot::writer::write_atomic(&dst_path, &json)?;
     Ok(())
+}
+
+/// Replace the source body's env-specific identity with the target's.
+///
+/// `value` is the source object (post-`rdc://` subst). `tgt_path` is where it
+/// will land in the target env. The "env-specific" field set is defined
+/// authoritatively by the codec's `cross_env_body` (the same fields a cross-env
+/// PATCH strips because they never cross envs: id/url/created_*/modified_*/
+/// status/organization, plus per-kind server-managed and reverse-ref fields).
+///
+/// - **Matched** (a target file already exists): for each env-specific field,
+///   take the TARGET file's value (or drop the field if the target lacks it).
+///   The deployable content — everything `cross_env_body` keeps, including
+///   forward refs like a hook's `queues` — stays the source's.
+/// - **New** (no target file): strip the server-assigned fields to a clean
+///   create payload (`create_body`) so the subsequent `rdc sync` POSTs.
+fn reconcile_target_identity(
+    value: &mut serde_json::Value,
+    tgt_path: &Path,
+    codec: &'static dyn crate::snapshot::codec::KindCodec,
+    tgt_org_url: &str,
+) {
+    if !value.is_object() {
+        return;
+    }
+
+    // The env-specific field set = top-level keys `cross_env_body` removes
+    // (id/url/created_*/modified_*/status/organization + per-kind server-managed
+    // and reverse-ref fields). Probe on a clone so `value`'s content is intact.
+    let mut probe = value.clone();
+    codec.cross_env_body(&mut probe);
+    let kept: std::collections::BTreeSet<String> = probe
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    let env_fields: Vec<String> = value
+        .as_object()
+        .map(|m| m.keys().filter(|k| !kept.contains(*k)).cloned().collect())
+        .unwrap_or_default();
+
+    let tgt: Option<serde_json::Value> = std::fs::read(tgt_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok());
+
+    // Does the source object carry an `organization`? (Used only on the
+    // new-object path to decide whether to set the target org.)
+    let had_org = value.get("organization").is_some();
+
+    let tgt_obj = tgt.as_ref().and_then(|t| t.as_object());
+    let obj = value.as_object_mut().expect("checked is_object above");
+
+    match tgt_obj {
+        Some(tobj) => {
+            // Matched: take the TARGET's value for every env field (or drop it
+            // if the target lacks it). Deployable content stays the source's.
+            for field in env_fields {
+                match tobj.get(&field) {
+                    Some(tgt_field) => {
+                        obj.insert(field, tgt_field.clone());
+                    }
+                    None => {
+                        obj.remove(&field);
+                    }
+                }
+            }
+        }
+        None => {
+            // New in tgt: there's no target identity to inherit. Strip only the
+            // universally server-assigned fields (id/url/created_*/modified_*/
+            // status) so `rdc sync` POSTs a clean create — the server assigns
+            // them. Set `organization` to the TARGET org (the object is created
+            // in tgt; src's org would be wrong/rejected). Leave the rest as the
+            // source's transformed content, including portable `rdc://` ref
+            // lists — the subst already remapped them to tgt slugs, and the
+            // server reconciles reverse-ref lists on create.
+            for field in crate::snapshot::create::UNIVERSAL_SERVER_FIELDS {
+                obj.remove(*field);
+            }
+            if had_org {
+                obj.insert(
+                    "organization".to_string(),
+                    serde_json::Value::String(tgt_org_url.to_string()),
+                );
+            }
+        }
+    }
 }
 
 /// Recursively enumerate every snapshot file under `env_root`, returning paths
@@ -335,6 +436,20 @@ pub fn run(src: &str, tgt: &str, mirror: bool, dry_run: bool, only: Vec<String>)
         )
     })?;
 
+    // The target env's organization URL, used to set `organization` on objects
+    // that are NEW in tgt (a cross-env create would otherwise carry the source
+    // env's org). Matched objects take their org from the existing tgt file.
+    let project_cfg = crate::config::ProjectConfig::load(&cwd.join("rdc.toml"))?;
+    let tgt_env_cfg = project_cfg
+        .envs
+        .get(tgt)
+        .ok_or_else(|| anyhow::anyhow!("env '{tgt}' is not defined in rdc.toml"))?;
+    let tgt_org_url = format!(
+        "{}/organizations/{}",
+        tgt_env_cfg.api_base.trim_end_matches('/'),
+        tgt_env_cfg.org_id
+    );
+
     let files = enumerate_files(&src_root, src)?;
     let mut copied = 0usize;
     let mut renamed = 0usize;
@@ -369,6 +484,7 @@ pub fn run(src: &str, tgt: &str, mirror: bool, dry_run: bool, only: Vec<String>)
                 &mapping,
                 &subst,
                 tgt_overlay.as_ref(),
+                &tgt_org_url,
             )
             .with_context(|| format!("migrating {}", rel.display()))?;
         }
@@ -649,7 +765,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, None).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2").unwrap();
 
         // File landed at the remapped path.
         let dst = tgt
@@ -695,7 +811,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay)).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2").unwrap();
 
         let dst = tgt.path().join("hooks/extractor-prod.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -719,7 +835,7 @@ mod tests {
         fs::write(&src_file, code).unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, None).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2").unwrap();
 
         let dst = tgt.path().join("hooks/extractor-prod.py");
         assert_eq!(

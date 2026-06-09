@@ -12,7 +12,7 @@ use serde_json::Value;
 
 /// Field names that the server assigns / computes on every kind. Always
 /// stripped before POST regardless of kind.
-const UNIVERSAL_SERVER_FIELDS: &[&str] = &[
+pub(crate) const UNIVERSAL_SERVER_FIELDS: &[&str] = &[
     "id",
     "url",
     "created_at",
