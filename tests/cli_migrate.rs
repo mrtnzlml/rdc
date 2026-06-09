@@ -339,3 +339,124 @@ fn migrate_binary_dry_run_writes_nothing() {
         "binary --dry-run must not write target files"
     );
 }
+
+/// Migrate MUST preserve the TARGET object's env-specific identity (id, url-host
+/// fields, created_by/modified_by, organization) and only carry over the
+/// source's deployable CONTENT. Regression for the bug where migrate copied the
+/// source env's `id` and `created_by`/`modified_by`/`organization` into the
+/// target, making every object claim the wrong (source) identity.
+#[test]
+fn migrate_preserves_target_identity_for_matched_object() {
+    let project = init_two_env_project(); // envs: test (host test.example), prod (prod.example)
+    let root = project.path();
+
+    // SOURCE (test) hook: src identity + src content.
+    write(
+        &root.join("envs/test/hooks/extractor.json"),
+        &serde_json::json!({
+            "id": 100,
+            "url": "rdc://hooks/extractor",
+            "name": "Extractor NEW NAME",
+            "type": "function",
+            "events": ["annotation_content.started"],
+            "created_by": "https://test.example/api/v1/users/11",
+            "modified_by": "https://test.example/api/v1/users/11",
+            "organization": "https://test.example/api/v1/organizations/1",
+            "queues": [],
+        }),
+    );
+    // TARGET (prod) hook ALREADY EXISTS with its own identity + old content.
+    write(
+        &root.join("envs/prod/hooks/extractor.json"),
+        &serde_json::json!({
+            "id": 999,
+            "url": "rdc://hooks/extractor",
+            "name": "Extractor OLD NAME",
+            "type": "function",
+            "events": ["annotation_content.initialize"],
+            "created_by": "https://prod.example/api/v1/users/77",
+            "modified_by": "https://prod.example/api/v1/users/77",
+            "organization": "https://prod.example/api/v1/organizations/2",
+            "queues": [],
+        }),
+    );
+    // identity mapping
+    let map_dir = root.join(".rdc/map");
+    std::fs::create_dir_all(&map_dir).unwrap();
+    std::fs::write(
+        map_dir.join("test-to-prod.toml"),
+        "version = 1\n\n[hooks]\n\"extractor\" = \"extractor\"\n",
+    )
+    .unwrap();
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![]);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("migrate should succeed");
+
+    let h = read_json(&root.join("envs/prod/hooks/extractor.json"));
+    // Identity preserved from TARGET:
+    assert_eq!(h["id"], 999, "target id must be preserved, not src's 100");
+    assert_eq!(
+        h["created_by"], "https://prod.example/api/v1/users/77",
+        "target created_by must be preserved (prod host), not src's"
+    );
+    assert_eq!(
+        h["modified_by"], "https://prod.example/api/v1/users/77",
+        "target modified_by must be preserved"
+    );
+    assert_eq!(
+        h["organization"], "https://prod.example/api/v1/organizations/2",
+        "target organization must be preserved"
+    );
+    // Content migrated from SOURCE:
+    assert_eq!(h["name"], "Extractor NEW NAME", "src content (name) migrated");
+    assert_eq!(h["events"][0], "annotation_content.started", "src content (events) migrated");
+}
+
+/// For an object that does NOT exist in the target (new), migrate must strip the
+/// source's server-assigned identity (so `rdc sync` POSTs a clean create), not
+/// carry the source env's id/created_by across.
+#[test]
+fn migrate_strips_identity_for_new_object() {
+    let project = init_two_env_project();
+    let root = project.path();
+    write(
+        &root.join("envs/test/hooks/brand-new.json"),
+        &serde_json::json!({
+            "id": 100,
+            "url": "rdc://hooks/brand-new",
+            "name": "Brand New",
+            "type": "function",
+            "created_by": "https://test.example/api/v1/users/11",
+            "organization": "https://test.example/api/v1/organizations/1",
+            "queues": [],
+        }),
+    );
+    let map_dir = root.join(".rdc/map");
+    std::fs::create_dir_all(&map_dir).unwrap();
+    std::fs::write(
+        map_dir.join("test-to-prod.toml"),
+        "version = 1\n\n[hooks]\n\"brand-new\" = \"brand-new\"\n",
+    )
+    .unwrap();
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    rdc::cli::migrate::run("test", "prod", false, false, vec![]).expect("migrate ok");
+    std::env::set_current_dir(&prev).unwrap();
+
+    let h = read_json(&root.join("envs/prod/hooks/brand-new.json"));
+    assert!(h.get("id").is_none(), "new object must not carry src id; got {:?}", h.get("id"));
+    assert!(h.get("url").is_none(), "new object must not carry src url");
+    assert!(h.get("created_by").is_none(), "new object must not carry src created_by");
+    // organization is set to the TARGET org (prod), never the source's.
+    assert_eq!(
+        h["organization"], "https://prod.example/api/v1/organizations/2",
+        "new object organization must be the target org, not src's"
+    );
+    assert_eq!(h["name"], "Brand New", "content preserved for the create");
+}
