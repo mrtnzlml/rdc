@@ -56,9 +56,15 @@ pub fn portabilize_refs(paths: &Paths, lockfile: &mut Lockfile) -> Result<()> {
             Err(_) => continue, // defensive: skip unparseable files
         };
 
-        // Portabilize. Skip if nothing changed.
+        // Portabilize, then canonicalize a hook's `run_after` order. Both run
+        // before the change check so a sort-only delta (refs already portable
+        // but in the source env's arbitrary id order) still rewrites + rehashes
+        // — keeping run_after slug-sorted and stable across re-pulls and envs.
         let before = value.clone();
         portabilize_value(&mut value, lockfile);
+        if kind == "hooks" {
+            crate::snapshot::hook::sort_run_after(&mut value);
+        }
         if value == before {
             continue;
         }
@@ -408,6 +414,76 @@ mod tests {
         // The file content must be identical (no rdc:// double-conversion).
         let on_disk = fs::read(&label_path).unwrap();
         assert_eq!(on_disk, bytes, "file bytes must be unchanged");
+    }
+
+    #[test]
+    fn portabilize_refs_sorts_run_after_even_when_already_portable() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+
+        const SLUG: &str = "exporter";
+        let mut lockfile = Lockfile::default();
+        seed_entry(&mut lockfile, "hooks", SLUG, 500);
+
+        // A hook whose refs are ALREADY portable rdc:// — so `portabilize_value`
+        // is a pure no-op — but whose `run_after` is in the source env's
+        // arbitrary (non-sorted) id order. The post-pass must still canonicalize
+        // it, otherwise a re-pull would keep churning and migrate would reorder.
+        let hook = json!({
+            "id": 500,
+            "url": format!("rdc://hooks/{SLUG}"),
+            "name": "Exporter",
+            "type": "webhook",
+            "run_after": ["rdc://hooks/valve-template", "rdc://hooks/fitting-template"],
+        });
+        let mut bytes = serde_json::to_vec_pretty(&hook).unwrap();
+        bytes.push(b'\n');
+        let path = paths.hooks_dir().join(format!("{SLUG}.json"));
+        write_file(&path, &bytes);
+
+        let code: Option<String> = None;
+        let pre = crate::state::hook_combined_hash(&bytes, &code, &Lockfile::default());
+        lockfile
+            .objects
+            .get_mut("hooks")
+            .unwrap()
+            .get_mut(SLUG)
+            .unwrap()
+            .content_hash = Some(pre.clone());
+
+        portabilize_refs(&paths, &mut lockfile).expect("portabilize_refs must succeed");
+
+        // The on-disk BYTES must change: the file is rewritten with run_after
+        // in canonical sorted order (this is the symptom the user hit — a
+        // spurious reorder in `git diff`/`migrate`).
+        let after_bytes = fs::read(&path).unwrap();
+        assert_ne!(after_bytes, bytes, "the file must be rewritten with sorted run_after");
+        let v: serde_json::Value = serde_json::from_slice(&after_bytes).unwrap();
+        assert_eq!(
+            v["run_after"],
+            json!([
+                "rdc://hooks/fitting-template",
+                "rdc://hooks/valve-template"
+            ]),
+            "post-pass must sort run_after into a canonical, env-stable order"
+        );
+
+        // The lockfile hash stays consistent with the on-disk bytes. (It does
+        // not change: `canonicalize_for_hash` already sorts `rdc://` ref arrays,
+        // so run_after order never affected the hash — the instability was
+        // purely in the written bytes, which this fix canonicalizes.)
+        let new = lockfile
+            .objects
+            .get("hooks")
+            .unwrap()
+            .get(SLUG)
+            .unwrap()
+            .content_hash
+            .clone()
+            .unwrap();
+        let expected = crate::state::hook_combined_hash(&after_bytes, &code, &Lockfile::default());
+        assert_eq!(new, expected, "lockfile hash must match the on-disk bytes");
+        assert_eq!(new, pre, "hash is order-invariant for rdc:// ref arrays by design");
     }
 
     #[test]
