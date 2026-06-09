@@ -226,6 +226,13 @@ fn transform_file(
         apply_overrides(&mut value, overrides);
     }
 
+    // Canonicalize a hook's `run_after` to a stable, env-independent order. The
+    // refs are now in portable `rdc://<slug>` form (post-subst), and `run_after`
+    // is an unordered dependency set, so sorting the slugs makes migrate emit no
+    // spurious reorder regardless of the source env's API ordering. No-op for
+    // non-hook files (they carry no `run_after`).
+    crate::snapshot::hook::sort_run_after(&mut value);
+
     let mut json = serde_json::to_vec_pretty(&value)?;
     json.push(b'\n');
     crate::snapshot::writer::write_atomic(&dst_path, &json)?;
@@ -817,6 +824,101 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
         assert_eq!(v["name"], "Extractor (PROD)", "tgt overlay must be applied");
         assert_eq!(v["type"], "function");
+    }
+
+    #[test]
+    fn transform_matched_hook_preserves_target_env_metadata_and_sorts_run_after() {
+        use std::fs;
+        let src = tempfile::TempDir::new().unwrap();
+        let tgt = tempfile::TempDir::new().unwrap();
+
+        // Identity mapping (auto-matched same-slug hook).
+        let m = Mapping::default();
+
+        let rel = Path::new("hooks/mdh-vendors.json");
+
+        // SOURCE (dev): per-env store-template metadata points at the source
+        // env, and run_after is in the source env's arbitrary API order.
+        let src_file = src.path().join(rel);
+        fs::create_dir_all(src_file.parent().unwrap()).unwrap();
+        fs::write(
+            &src_file,
+            serde_json::to_vec(&serde_json::json!({
+                "id": 111,
+                "url": "https://acme-dev.rossum.app/api/v1/hooks/111",
+                "name": "MDH: Vendors",
+                "type": "webhook",
+                "extension_source": "rossum_store",
+                "run_after": ["rdc://hooks/valve-template", "rdc://hooks/fitting-template"],
+                "token_owner": "https://acme-dev.rossum.app/api/v1/users/1",
+                "hook_template": "https://acme-dev.rossum.app/api/v1/hook_templates/39",
+                "guide": "<form action=\"https://acme-dev.rossum.app/svc/x/\"></form>",
+                "organization": "https://acme-dev.rossum.app/api/v1/organizations/1",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // TARGET (test): an already-matched hook with the test env's metadata.
+        let tgt_file = tgt.path().join(rel);
+        fs::create_dir_all(tgt_file.parent().unwrap()).unwrap();
+        fs::write(
+            &tgt_file,
+            serde_json::to_vec(&serde_json::json!({
+                "id": 222,
+                "url": "https://acme-test.rossum.app/api/v1/hooks/222",
+                "name": "MDH: Vendors",
+                "type": "webhook",
+                "extension_source": "rossum_store",
+                "run_after": [],
+                "token_owner": "https://acme-test.rossum.app/api/v1/users/2",
+                "hook_template": "https://acme-test.rossum.app/api/v1/hook_templates/39",
+                "guide": "<form action=\"https://acme-test.rossum.app/svc/x/\"></form>",
+                "organization": "https://acme-test.rossum.app/api/v1/organizations/2",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let subst = build_subst(&m);
+        transform_file(
+            rel,
+            src.path(),
+            tgt.path(),
+            &m,
+            &subst,
+            None,
+            "https://acme-test.rossum.app/api/v1/organizations/2",
+        )
+        .unwrap();
+
+        let v: serde_json::Value = serde_json::from_slice(&fs::read(&tgt_file).unwrap()).unwrap();
+
+        // Per-env, read-only store-template metadata must stay the TARGET's —
+        // migrate must NOT import the source env's host (the reported bug).
+        assert_eq!(
+            v["hook_template"], "https://acme-test.rossum.app/api/v1/hook_templates/39",
+            "hook_template must be preserved as the target env's value",
+        );
+        assert_eq!(
+            v["guide"], "<form action=\"https://acme-test.rossum.app/svc/x/\"></form>",
+            "guide must be preserved as the target env's value",
+        );
+        assert_eq!(
+            v["token_owner"], "https://acme-test.rossum.app/api/v1/users/2",
+            "token_owner must be preserved as the target env's value",
+        );
+
+        // run_after is a dependency SET — its rdc:// refs must be sorted to a
+        // canonical, env-stable order so migrate produces no spurious reorder.
+        assert_eq!(
+            v["run_after"],
+            serde_json::json!([
+                "rdc://hooks/fitting-template",
+                "rdc://hooks/valve-template"
+            ]),
+            "run_after rdc:// refs must be lexicographically sorted",
+        );
     }
 
     #[test]
