@@ -1743,6 +1743,161 @@ fn drop_lockfile_entry(ctx: &mut PullCtx<'_>, kind: &str, slug: &str) {
     }
 }
 
+/// Remove an orphaned MDH dataset's on-disk dir + base-cache mirror +
+/// lockfile entry. Best-effort on the filesystem (idempotent: missing
+/// paths are a no-op); the lockfile drop is the load-bearing part so the
+/// dataset stops being re-flagged on the next sync.
+fn remove_mdh_dataset(ctx: &mut PullCtx<'_>, slug: &str, indexes_path: &Path) {
+    let dataset_dir = ctx.paths.dataset_dir(slug);
+    if dataset_dir.exists() {
+        std::fs::remove_dir_all(&dataset_dir).ok();
+    }
+    crate::state::base_cache::forget(ctx.paths, indexes_path).ok();
+    // Drop the now-empty base-cache dataset dir too (cosmetic; only
+    // succeeds if empty).
+    if let Some(mirror) = crate::state::base_cache::cache_mirror(ctx.paths, indexes_path)
+        && let Some(mirror_dir) = mirror.parent()
+    {
+        std::fs::remove_dir(mirror_dir).ok();
+    }
+    drop_lockfile_entry(ctx, "mdh_indexes", slug);
+}
+
+/// Reconcile MDH datasets the remote no longer lists.
+///
+/// MDH bypasses the classifier (see `from_catalog_scan_lockfile`), so a
+/// remotely-deleted collection never produces a `RemoteDelete` and was
+/// historically orphaned on disk forever (its `envs/<env>/mdh/<slug>/`
+/// dir, base-cache mirror, and `mdh_indexes` lockfile entry all
+/// persisted). This closes that gap: any `mdh_indexes` lockfile slug
+/// absent from `remote_slugs` is an orphan, reconciled with the same UX
+/// as the classifier's remote-delete family
+/// ([`crate::cli::resolve::prompt_remote_delete`]'s `[k]/[r]/[s]/[a]`):
+///
+/// - `[r]` use env (delete local): remove the dataset dir + base-cache
+///   mirror, drop the lockfile entry. The dominant case.
+/// - `[s]` skip: write a `<indexes.json>.<env>-deleted` marker; the next
+///   sync re-presents the choice.
+/// - `[k]` keep local: MDH has no remote-restore path (`push_dataset`
+///   only edits indexes of an *existing* collection — it can't recreate
+///   a deleted one), so this keeps the on-disk files but drops the
+///   lockfile entry + base cache so the dataset isn't re-flagged every
+///   sync. A warning explains the collection is not recreated on the env.
+/// - `[a]` abort: propagate [`PullAborted`].
+///
+/// `interactive == false` (CI / `--yes`) falls back to `[s]` for every
+/// orphan, mirroring [`resolve_remote_deletes`], so a non-tty run never
+/// silently destroys local files. A lockfile entry whose on-disk
+/// `indexes.json` is already gone is a both-sides-agree deletion: the
+/// entry + base cache are dropped silently, no prompt.
+///
+/// Returns the number of datasets removed from disk.
+async fn prune_mdh_orphans<R: BufRead>(
+    ctx: &mut PullCtx<'_>,
+    remote_slugs: &std::collections::BTreeSet<String>,
+    mut input: R,
+    interactive: bool,
+    progress: &Arc<Log>,
+) -> Result<usize> {
+    let orphan_slugs: Vec<String> = ctx
+        .lockfile
+        .objects
+        .get("mdh_indexes")
+        .map(|m| {
+            m.keys()
+                .filter(|s| !remote_slugs.contains(s.as_str()))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    if orphan_slugs.is_empty() {
+        return Ok(0);
+    }
+
+    let env = ctx.paths.env().to_string();
+    let mut pruned = 0usize;
+
+    for slug in orphan_slugs {
+        let indexes_path = ctx.paths.dataset_dir(&slug).join("indexes.json");
+
+        // Both-sides-agree deletion: lockfile entry but no local file.
+        if !indexes_path.exists() {
+            remove_mdh_dataset(ctx, &slug, &indexes_path);
+            progress.event(
+                Action::Delete,
+                &format!("mdh/{slug} (deleted on {env}; no local file)"),
+            );
+            pruned += 1;
+            continue;
+        }
+
+        // Non-tty: defer with a marker, never silently delete local files.
+        if !interactive {
+            let marker = deleted_marker_path(&indexes_path, &env);
+            write_atomic(&marker, b"")?;
+            progress.event(
+                Action::Warn,
+                &format!(
+                    "mdh/{slug}: env deletion deferred (non-tty); marker at {}",
+                    marker.display(),
+                ),
+            );
+            continue;
+        }
+
+        // Interactive prompt — same shape as the classifier kinds.
+        let prompt_res: std::cell::RefCell<Option<Resolution>> = std::cell::RefCell::new(None);
+        let indexes_for_prompt = indexes_path.clone();
+        progress.with_prompt(|| -> anyhow::Result<()> {
+            let r = prompt_remote_delete(
+                &mut input,
+                std::io::stderr().lock(),
+                &indexes_for_prompt,
+                &env,
+            )?;
+            *prompt_res.borrow_mut() = Some(r);
+            Ok(())
+        })?;
+        let resolution = prompt_res.into_inner().expect("with_prompt must populate");
+
+        match resolution {
+            Resolution::KeepRemote => {
+                remove_mdh_dataset(ctx, &slug, &indexes_path);
+                progress.event(Action::Delete, &format!("mdh/{slug}"));
+                pruned += 1;
+            }
+            Resolution::KeepLocal => {
+                // No remote-restore path for MDH collections. Keep the
+                // local files but stop tracking so the dataset isn't
+                // re-flagged every sync.
+                crate::state::base_cache::forget(ctx.paths, &indexes_path).ok();
+                drop_lockfile_entry(ctx, "mdh_indexes", &slug);
+                progress.event(
+                    Action::Info,
+                    &format!(
+                        "mdh/{slug}: kept local files; the collection is NOT recreated on {env} \
+                         (MDH collections can't be pushed). Recreate it on {env} and re-sync to \
+                         re-establish tracking."
+                    ),
+                );
+            }
+            Resolution::Skip => {
+                let marker = deleted_marker_path(&indexes_path, &env);
+                write_atomic(&marker, b"")?;
+                progress.event(
+                    Action::Warn,
+                    &format!("mdh/{slug}: env deletion deferred; marker at {}", marker.display()),
+                );
+            }
+            Resolution::Edit(_) | Resolution::EditWithMarkers(_) | Resolution::Abort => {
+                return Err(anyhow::Error::new(PullAborted));
+            }
+        }
+    }
+
+    Ok(pruned)
+}
+
 /// Resolve `RemoteDelete`, `LocalEditRemoteDelete`,
 /// `LocalDeleteRemoteEdit`, and `BothDeleted` items in `classified`.
 ///
@@ -3170,6 +3325,23 @@ pub async fn run(
                 collections: catalog.mdh.collections.clone(),
             };
             crate::cli::pull::mdh::process(ctx, listed, &subset, progress).await?;
+
+            // Reconcile datasets the env no longer lists: an `mdh_indexes`
+            // lockfile slug absent from the server's collection set is an
+            // orphan (its collection was deleted on the env). MDH bypasses
+            // the classifier, so without this the dataset would persist on
+            // disk forever. Guarded by the non-empty-collections gate above,
+            // so a transient empty / 404 listing (MDH disabled) can never
+            // mass-delete every local dataset.
+            let remote_slugs: BTreeSet<String> = slug_to_collection.keys().cloned().collect();
+            outcome.remote_deletes_resolved += prune_mdh_orphans(
+                ctx,
+                &remote_slugs,
+                CoordinatorStdin::new(),
+                interactive,
+                progress,
+            )
+            .await?;
         }
 
         // Post-pass: rewrite portable-kind URLs in every snapshotted file to
@@ -3745,6 +3917,297 @@ mod tests {
             remote_hash: None,
             base_hash: Some("dummy".to_string()),
         }]
+    }
+
+    /// Seed `slug` as a clean (local == base) MDH dataset on disk: the
+    /// env-tree `indexes.json`, the base-cache mirror, and a lockfile
+    /// `mdh_indexes` entry whose `content_hash` matches the bytes.
+    /// Returns the base-cache mirror path so callers can assert on it.
+    fn seed_mdh_dataset(paths: &Paths, lockfile: &mut Lockfile, slug: &str) -> PathBuf {
+        let bytes: &[u8] = b"{\n  \"regular\": [],\n  \"search\": []\n}";
+        let dir = paths.dataset_dir(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ix = dir.join("indexes.json");
+        std::fs::write(&ix, bytes).unwrap();
+        let mirror = paths
+            .base_cache_root()
+            .join("mdh")
+            .join(slug)
+            .join("indexes.json");
+        std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+        std::fs::write(&mirror, bytes).unwrap();
+        lockfile.upsert(
+            "mdh_indexes",
+            slug,
+            ObjectEntry {
+                id: 0,
+                modified_at: None,
+                content_hash: Some(content_hash(bytes, &Lockfile::default())),
+                secrets_hash: None,
+            },
+        );
+        mirror
+    }
+
+    /// Scripted `r\n` ([r] use env; delete local) on an MDH dataset the
+    /// remote no longer lists: the orphan's env-tree dir, base-cache
+    /// mirror, and lockfile entry are all removed; a sibling dataset the
+    /// remote still lists is left completely untouched.
+    #[tokio::test]
+    async fn prune_mdh_orphans_use_env_removes_dataset_base_and_lockfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        let mut lockfile = Lockfile::default();
+
+        let live_mirror = seed_mdh_dataset(&paths, &mut lockfile, "vendors");
+        let orphan_mirror = seed_mdh_dataset(&paths, &mut lockfile, "vendors-2");
+
+        let client =
+            RossumClient::new("https://unused.invalid/api/v1".to_string(), "TEST".to_string())
+                .unwrap();
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+
+        // Remote lists only `vendors`; `vendors-2` was deleted on the env.
+        let remote_slugs = std::collections::BTreeSet::from(["vendors".to_string()]);
+
+        let pruned = {
+            let mut ctx = PullCtx {
+                paths: &paths,
+                client: &client,
+                lockfile: &mut lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: true,
+            };
+            prune_mdh_orphans(&mut ctx, &remote_slugs, Cursor::new(b"r\n"), true, &progress)
+                .await
+                .expect("prune should succeed on [r]")
+        };
+
+        assert_eq!(pruned, 1, "exactly one orphan (vendors-2) pruned");
+
+        // Orphan gone everywhere.
+        assert!(
+            !paths.dataset_dir("vendors-2").exists(),
+            "orphan dataset dir must be removed"
+        );
+        assert!(
+            !orphan_mirror.exists(),
+            "orphan base-cache mirror must be removed"
+        );
+        assert!(
+            lockfile
+                .objects
+                .get("mdh_indexes")
+                .and_then(|m| m.get("vendors-2"))
+                .is_none(),
+            "orphan lockfile entry must be dropped"
+        );
+
+        // Live dataset untouched.
+        assert!(
+            paths.dataset_dir("vendors").join("indexes.json").exists(),
+            "live dataset dir must survive"
+        );
+        assert!(live_mirror.exists(), "live base-cache mirror must survive");
+        assert!(
+            lockfile
+                .objects
+                .get("mdh_indexes")
+                .and_then(|m| m.get("vendors"))
+                .is_some(),
+            "live lockfile entry must survive"
+        );
+    }
+
+    /// Non-tty (CI / `--yes`): an MDH orphan must NOT be silently
+    /// deleted. The dataset + lockfile entry survive; a `-deleted`
+    /// marker is written so the next interactive sync re-presents it.
+    #[tokio::test]
+    async fn prune_mdh_orphans_non_interactive_defers_with_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        let mut lockfile = Lockfile::default();
+        seed_mdh_dataset(&paths, &mut lockfile, "vendors-2");
+
+        let client =
+            RossumClient::new("https://unused.invalid/api/v1".to_string(), "TEST".to_string())
+                .unwrap();
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+        let remote_slugs = std::collections::BTreeSet::<String>::new();
+
+        let indexes_path = paths.dataset_dir("vendors-2").join("indexes.json");
+        let pruned = {
+            let mut ctx = PullCtx {
+                paths: &paths,
+                client: &client,
+                lockfile: &mut lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: false,
+            };
+            prune_mdh_orphans(&mut ctx, &remote_slugs, Cursor::new(b""), false, &progress)
+                .await
+                .expect("prune should succeed non-interactively")
+        };
+
+        assert_eq!(pruned, 0, "nothing deleted from disk in non-tty mode");
+        assert!(indexes_path.exists(), "dataset must survive non-tty");
+        assert!(
+            lockfile
+                .objects
+                .get("mdh_indexes")
+                .and_then(|m| m.get("vendors-2"))
+                .is_some(),
+            "lockfile entry must survive non-tty"
+        );
+        assert!(
+            deleted_marker_path(&indexes_path, "test").exists(),
+            "a -deleted marker must be written"
+        );
+    }
+
+    /// Scripted `s\n` ([s]kip): write the marker, keep everything.
+    #[tokio::test]
+    async fn prune_mdh_orphans_skip_writes_marker_keeps_dataset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        let mut lockfile = Lockfile::default();
+        seed_mdh_dataset(&paths, &mut lockfile, "vendors-2");
+
+        let client =
+            RossumClient::new("https://unused.invalid/api/v1".to_string(), "TEST".to_string())
+                .unwrap();
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+        let remote_slugs = std::collections::BTreeSet::<String>::new();
+        let indexes_path = paths.dataset_dir("vendors-2").join("indexes.json");
+
+        let pruned = {
+            let mut ctx = PullCtx {
+                paths: &paths,
+                client: &client,
+                lockfile: &mut lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: true,
+            };
+            prune_mdh_orphans(&mut ctx, &remote_slugs, Cursor::new(b"s\n"), true, &progress)
+                .await
+                .expect("prune should succeed on [s]")
+        };
+
+        assert_eq!(pruned, 0, "[s] deletes nothing");
+        assert!(indexes_path.exists(), "[s] keeps the dataset");
+        assert!(
+            lockfile
+                .objects
+                .get("mdh_indexes")
+                .and_then(|m| m.get("vendors-2"))
+                .is_some(),
+            "[s] keeps the lockfile entry"
+        );
+        assert!(
+            deleted_marker_path(&indexes_path, "test").exists(),
+            "[s] writes a -deleted marker"
+        );
+    }
+
+    /// Scripted `k\n` ([k]eep local): MDH can't be re-created on the env,
+    /// so keep the on-disk files but DROP the lockfile entry so the
+    /// dataset isn't re-flagged every sync.
+    #[tokio::test]
+    async fn prune_mdh_orphans_keep_local_untracks_but_keeps_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        let mut lockfile = Lockfile::default();
+        let mirror = seed_mdh_dataset(&paths, &mut lockfile, "vendors-2");
+
+        let client =
+            RossumClient::new("https://unused.invalid/api/v1".to_string(), "TEST".to_string())
+                .unwrap();
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+        let remote_slugs = std::collections::BTreeSet::<String>::new();
+        let indexes_path = paths.dataset_dir("vendors-2").join("indexes.json");
+
+        let pruned = {
+            let mut ctx = PullCtx {
+                paths: &paths,
+                client: &client,
+                lockfile: &mut lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: true,
+            };
+            prune_mdh_orphans(&mut ctx, &remote_slugs, Cursor::new(b"k\n"), true, &progress)
+                .await
+                .expect("prune should succeed on [k]")
+        };
+
+        assert_eq!(pruned, 0, "[k] deletes nothing from the working tree");
+        assert!(indexes_path.exists(), "[k] keeps the local files");
+        assert!(
+            lockfile
+                .objects
+                .get("mdh_indexes")
+                .and_then(|m| m.get("vendors-2"))
+                .is_none(),
+            "[k] drops the lockfile entry (stop tracking)"
+        );
+        assert!(!mirror.exists(), "[k] drops the base-cache mirror");
+        assert!(
+            !deleted_marker_path(&indexes_path, "test").exists(),
+            "[k] writes no marker"
+        );
+    }
+
+    /// Lockfile entry with no on-disk file: both sides agree on deletion.
+    /// Drop the entry silently (no prompt — works non-interactively too).
+    #[tokio::test]
+    async fn prune_mdh_orphans_missing_local_file_silently_drops_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        let mut lockfile = Lockfile::default();
+        // Lockfile entry only — no dataset dir / indexes.json on disk.
+        lockfile.upsert(
+            "mdh_indexes",
+            "vendors-2",
+            ObjectEntry {
+                id: 0,
+                modified_at: None,
+                content_hash: Some("stale".to_string()),
+                secrets_hash: None,
+            },
+        );
+
+        let client =
+            RossumClient::new("https://unused.invalid/api/v1".to_string(), "TEST".to_string())
+                .unwrap();
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+        let remote_slugs = std::collections::BTreeSet::<String>::new();
+
+        let pruned = {
+            let mut ctx = PullCtx {
+                paths: &paths,
+                client: &client,
+                lockfile: &mut lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: false,
+            };
+            prune_mdh_orphans(&mut ctx, &remote_slugs, Cursor::new(b""), false, &progress)
+                .await
+                .expect("prune should succeed on both-deleted")
+        };
+
+        assert_eq!(pruned, 1, "both-deleted counts as reconciled");
+        assert!(
+            lockfile
+                .objects
+                .get("mdh_indexes")
+                .and_then(|m| m.get("vendors-2"))
+                .is_none(),
+            "stale lockfile entry must be dropped silently"
+        );
     }
 
     /// Scripted `k\n` ([k]eep local; restore on env) on a RemoteDelete
