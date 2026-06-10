@@ -5631,20 +5631,19 @@ mod tests {
         );
     }
 
-    // ----- Bug-d regression: overlay + conflict convergence ---------------
+    // ----- Overlay + conflict convergence (C-1 model) ---------------------
     //
-    // An object with an overlay-managed field that resolves a conflict via
-    // [r] (keep-remote) must record the POST-overlay hash so the next sync
-    // classifies the object as Clean (converges). Before the fix the executor
-    // used the PRE-overlay bytes for `remote_bytes`, which produced a hash
-    // that never matched the pull driver's on-disk hash → perpetual conflict.
+    // Under C-1 overlays are migrate-only: pull/sync never strip them, so an
+    // overlay-managed field rides in the snapshot like any other content. A
+    // hook with such a field that resolves a BothDiverged conflict via [r]
+    // (keep-remote) writes the remote bytes verbatim (field KEPT) and records
+    // the hash of exactly those bytes, so the NEXT sync classifies it Clean.
 
-    /// Bug-d repro: hook with an overlay-managed field, BothDiverged
-    /// conflict, resolved via `[r]` (keep-remote). The lockfile must
-    /// record `combined_hash(post_overlay_json, code_sidecar)`, not the
-    /// pre-overlay bytes, so the NEXT sync classifies the hook as Clean.
+    /// Hook with an overlay-managed `description`, BothDiverged conflict,
+    /// resolved via `[r]` (keep-remote). Under C-1 the field stays on disk and
+    /// the lockfile records the hash of the written bytes (convergence).
     #[tokio::test]
-    async fn resolve_conflicts_hook_overlay_keep_remote_records_post_overlay_hash() {
+    async fn resolve_conflicts_hook_overlay_keep_remote_keeps_field_and_converges() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::for_env(tmp.path(), "test");
         std::fs::create_dir_all(paths.hooks_dir()).unwrap();
@@ -5667,8 +5666,9 @@ mod tests {
         }))
         .unwrap();
 
-        // Local file: same hook but user edited `events` (adds annotation_status).
-        // The overlay is in effect, so on-disk the file has no `description`.
+        // Local file: same hook but user edited `events` (adds annotation_status)
+        // and it happens to omit `description` — the divergence vs remote is
+        // what matters for the BothDiverged setup here.
         let local_json_no_desc = serde_json::json!({
             "id": 555,
             "url": "https://x.invalid/api/v1/hooks/555",
@@ -5685,7 +5685,8 @@ mod tests {
         std::fs::write(&local_json_path, &local_json_bytes).unwrap();
         std::fs::write(&local_py_path, b"def validate(payload):\n    pass\n").unwrap();
 
-        // Build the overlay that strips `description` from hooks/<slug>.
+        // Overlay manages `description` for hooks/<slug>. Under C-1 this no
+        // longer strips on pull/sync; it only matters at migrate time.
         let overlay_toml = format!(
             "version = 1\n\n[hooks.{}]\n\"description\" = \"PROD-specific description managed by overlay\"\n",
             slug
@@ -5737,14 +5738,15 @@ mod tests {
             },
         );
 
-        // Compute the expected "correct" remote hash: post-overlay (no description)
-        // + code sidecar. This is what the pull driver records and what the next
-        // classifier would compute on the on-disk bytes.
+        // Compute the expected remote hash. Under C-1 `maybe_strip_overlay` is
+        // a no-op, so this is the FULL remote (description kept) + code sidecar
+        // — exactly the on-disk bytes keep-remote writes and the next
+        // classifier would hash.
         let codec = crate::snapshot::codec::codec("hooks").unwrap();
         let remote_value = serde_json::to_value(&remote_hook).unwrap();
         let remote_art = codec.disk_bytes(&remote_value).unwrap();
         let remote_ovl = overlay.hook(slug);
-        let remote_json_stripped =
+        let remote_json_full =
             crate::cli::pull::common::maybe_strip_overlay(remote_art.json, remote_ovl).unwrap();
         let remote_code_bytes = remote_art
             .sidecars
@@ -5753,7 +5755,7 @@ mod tests {
             .map(|(_, b)| b.clone())
             .unwrap_or_default();
         let expected_hash = combined_hash(
-            &remote_json_stripped,
+            &remote_json_full,
             &[("code".to_string(), remote_code_bytes)],
             &lockfile,
         );
@@ -5813,9 +5815,9 @@ mod tests {
             "keep-remote must not promote to push"
         );
 
-        // The recorded lockfile hash MUST be the post-overlay combined hash.
-        // Before the fix, this would be the pre-overlay hash (containing
-        // `description`), which would cause the next sync to re-conflict forever.
+        // The recorded lockfile hash MUST match the hash of the bytes actually
+        // written to disk (the full remote, description kept), so the next sync
+        // classifies the hook as Clean instead of re-conflicting forever.
         let recorded = lockfile
             .objects
             .get("hooks")
@@ -5824,16 +5826,17 @@ mod tests {
             .expect("lockfile must have entry after resolution");
         assert_eq!(
             recorded, expected_hash,
-            "bug-d: keep-remote must record the POST-overlay combined hash; \
-             before the fix the executor wrote the pre-overlay hash causing perpetual conflict. \
-             got {recorded}, expected {expected_hash}"
+            "keep-remote must record the hash of the written (unstripped) bytes \
+             so the next sync converges; got {recorded}, expected {expected_hash}"
         );
 
-        // The on-disk file must be the post-overlay bytes (no `description`).
+        // C-1: overlays are migrate-only and never stripped, so keep-remote
+        // writes the remote bytes verbatim — the overlay-managed `description`
+        // STAYS on disk (visible to the user), matching the recorded hash.
         let disk_json = std::fs::read_to_string(&local_json_path).unwrap();
         assert!(
-            !disk_json.contains("description"),
-            "on-disk hook must not contain the overlay-managed field after keep-remote; got: {disk_json}"
+            disk_json.contains("description"),
+            "under C-1 the overlay-managed field must remain on disk after keep-remote; got: {disk_json}"
         );
     }
 

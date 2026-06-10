@@ -1,7 +1,7 @@
 use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::log::{Action, Log};
-use crate::overlay::{Overlay, apply_overrides};
+use crate::overlay::Overlay;
 use crate::paths::Paths;
 
 use crate::secrets::{HookSecrets, load_hook_secrets};
@@ -58,10 +58,11 @@ pub async fn push(
     progress: &Arc<Log>,
     env: &str,
 ) -> Result<(usize, usize)> {
-    // Load overlay if present. Overlay drives both the outbound payload
-    // (apply_overrides) AND the strip applied to remote bytes for hashing
-    // — so disk-bytes (already stripped) and post-strip remote bytes can
-    // both be compared against `lockfile.content_hash`.
+    // C-1 overlay model: overlays are MIGRATE-ONLY. Push no longer applies or
+    // strips them — the snapshot already carries each env's real values. The
+    // overlay is still loaded here only to feed the now-no-op
+    // `maybe_strip_overlay` drift comparison; this vestigial plumbing is slated
+    // for a follow-up cleanup.
     let overlay = Overlay::load(&paths.overlay_file())
         .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
@@ -119,9 +120,6 @@ pub async fn push(
             // Read + overlay-apply once; reused by both paths.
             let mut payload = read_hook_value(&hooks_dir, slug)
                 .with_context(|| format!("reading local hook '{slug}' for create"))?;
-            if let Some(p) = overlay_paths {
-                apply_overrides(&mut payload, p);
-            }
             crate::snapshot::refs::resolve_value(&mut payload, lockfile);
 
             // Anomaly guard, then dispatch on extension type.
@@ -264,9 +262,6 @@ pub async fn push(
         // since overlay may mutate `config.runtime`. The on-disk sidecar
         // is whatever the local JSON declared.
         let local_ext = hook_code_extension_from_value(&payload);
-        if let Some(p) = overlay_paths {
-            apply_overrides(&mut payload, p);
-        }
         crate::snapshot::refs::resolve_value(&mut payload, lockfile);
         let payload_hook: crate::model::Hook = serde_json::from_value(payload)
             .with_context(|| format!("deserializing overlay-applied hook '{slug}'"))?;

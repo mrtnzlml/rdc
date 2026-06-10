@@ -1,7 +1,7 @@
 use crate::api::{RossumClient, anyhow_has_status};
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::log::{Action, Log};
-use crate::overlay::{Overlay, apply_overrides};
+use crate::overlay::Overlay;
 use crate::paths::Paths;
 
 use crate::snapshot::codec::combined_hash;
@@ -42,9 +42,6 @@ pub async fn push(
                 std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
             let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
                 .with_context(|| format!("parsing {}", path.display()))?;
-            if let Some(p) = overlay_paths {
-                apply_overrides(&mut payload, p);
-            }
             crate::snapshot::refs::resolve_value(&mut payload, lockfile);
             strip_for_create(&mut payload, "engines");
             let create_result = client
@@ -93,9 +90,6 @@ pub async fn push(
 
         let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
             .with_context(|| format!("parsing {}", path.display()))?;
-        if let Some(p) = overlay_paths {
-            apply_overrides(&mut payload, p);
-        }
         crate::snapshot::refs::resolve_value(&mut payload, lockfile);
         let payload_engine: crate::model::Engine = serde_json::from_value(payload)
             .with_context(|| format!("deserializing overlay-applied engine '{slug}'"))?;
