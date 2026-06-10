@@ -571,6 +571,18 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
             continue;
         };
 
+        // The remote object was just serialized from the live API, so its
+        // cross-references are absolute URLs; the on-disk local snapshot stores
+        // them as portable `rdc://` refs. Normalize the remote to the same form
+        // — exactly as the pull driver and the classifier's remote hashing do —
+        // so the conflict diff and the keep-remote write surface only genuine
+        // divergence instead of a wall of URL-vs-`rdc://` noise that compares
+        // equal anyway. Hashing is unaffected (`canonicalize_for_hash`
+        // portabilizes regardless, and is idempotent on already-portable bytes).
+        let mut refs = refs;
+        refs.remote_bytes =
+            crate::cli::pull::common::portabilize_proposed(&refs.remote_bytes, ctx.lockfile);
+
         resolve_one_conflict(
             ctx,
             it,
@@ -1131,11 +1143,12 @@ fn resolve_one_conflict<R: BufRead>(
     // canonicalize-equal JSON pair which short-circuits to
     // `KeepLocal` — silently routing the item to push.
     let local_json_bytes = std::fs::read(&local_path).unwrap_or_default();
-    // Use the env lockfile (not an empty one) so reference normalization is
-    // applied symmetrically: the on-disk local is in rdc:// form while the
-    // remote is in URL form, and only `ctx.lockfile` lets them canonicalize
-    // equal. Without it a code-only divergence is mis-read as a JSON divergence
-    // and the shadow lands next to the .json instead of the .py.
+    // Use the env lockfile (not an empty one) so reference normalization stays
+    // symmetric and robust. `remote_bytes` was already portabilized to rdc://
+    // form above, but canonicalizing both sides through `ctx.lockfile` still
+    // resolves any ref portabilization couldn't (e.g. a forward ref not yet in
+    // the lockfile), so a code-only divergence isn't mis-read as a JSON
+    // divergence (which would land the shadow next to the .json, not the .py).
     let local_json_canon =
         crate::snapshot::noise::canonicalize_for_hash(&local_json_bytes, ctx.lockfile);
     let remote_json_canon =
@@ -3607,12 +3620,17 @@ mod tests {
             "no push items expected on [r]"
         );
 
-        // Local file overwritten with remote bytes.
-        let remote_bytes = label_bytes(&fixture.remote_label);
+        // Local file overwritten with the remote bytes, normalized to the
+        // snapshot's portable `rdc://` ref form (matching the on-disk canonical
+        // form rather than the raw API URLs the API returned).
+        let remote_bytes = crate::cli::pull::common::portabilize_proposed(
+            &label_bytes(&fixture.remote_label),
+            &fixture.lockfile,
+        );
         let local_after = std::fs::read(&fixture.local_path).unwrap();
         assert_eq!(
             local_after, remote_bytes,
-            "local file should be replaced by remote bytes"
+            "local file should be replaced by the portabilized remote bytes"
         );
 
         // Lockfile records the remote hash.
@@ -3680,7 +3698,12 @@ mod tests {
             "shadow file should be written at {}",
             shadow.display()
         );
-        let remote_bytes = label_bytes(&fixture.remote_label);
+        // The shadow carries the remote bytes in portable `rdc://` form, so a
+        // diff against the local (also rdc://) surfaces only real divergence.
+        let remote_bytes = crate::cli::pull::common::portabilize_proposed(
+            &label_bytes(&fixture.remote_label),
+            &fixture.lockfile,
+        );
         assert_eq!(std::fs::read(&shadow).unwrap(), remote_bytes);
 
         // Local file untouched.
@@ -4895,13 +4918,131 @@ mod tests {
         // bytes match either before or post-write (both acceptable
         // shapes).
         let json_after = std::fs::read(&json_path).unwrap();
+        // The written JSON is now normalized to portable `rdc://` form, whereas
+        // the local-before JSON held raw API URLs. Canonicalizing both through
+        // the env lockfile resolves refs by id on each side, confirming the
+        // JSON portion is unchanged apart from ref *form*.
         let json_canon_before =
-            crate::snapshot::noise::canonicalize_for_hash(&json_before, &Lockfile::default());
+            crate::snapshot::noise::canonicalize_for_hash(&json_before, &lockfile);
         let json_canon_after =
-            crate::snapshot::noise::canonicalize_for_hash(&json_after, &Lockfile::default());
+            crate::snapshot::noise::canonicalize_for_hash(&json_after, &lockfile);
         assert_eq!(
             json_canon_before, json_canon_after,
             "JSON canonical form must remain stable on [r] (was identical before)"
+        );
+    }
+
+    /// A `BothDiverged` hook where the local snapshot stores cross-refs as
+    /// portable `rdc://` and the remote (live API) returns the same refs as
+    /// absolute URLs, plus a genuine difference (the name). The resolver must
+    /// normalize the remote to `rdc://` form before it is shown / written, so
+    /// the prompt surfaces only the real difference and `[r]` writes portable
+    /// bytes — not raw API URLs that would de-portabilize the snapshot.
+    #[tokio::test]
+    async fn resolve_conflicts_hook_keep_remote_writes_portable_refs_not_urls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+
+        let slug = "wh";
+        // Local on-disk snapshot: cross-refs already in portable rdc:// form.
+        let mut local_json = serde_json::to_vec_pretty(&serde_json::json!({
+            "id": 42,
+            "url": "rdc://hooks/wh",
+            "name": "Webhook (local)",
+            "type": "webhook",
+            "queues": ["rdc://queues/inv"],
+            "events": [],
+            "config": {}
+        }))
+        .unwrap();
+        local_json.push(b'\n');
+        let local_path = paths.hooks_dir().join(format!("{slug}.json"));
+        std::fs::write(&local_path, &local_json).unwrap();
+
+        // Remote (from the API): URL-form refs + a genuine diff (the name) so
+        // the JSON does NOT canonicalize-equal and the resolver reaches the
+        // keep-remote write rather than the Clean short-circuit.
+        let remote_hook: crate::model::Hook = serde_json::from_value(serde_json::json!({
+            "id": 42,
+            "url": "https://x.invalid/api/v1/hooks/42",
+            "name": "Webhook (remote)",
+            "type": "webhook",
+            "queues": ["https://x.invalid/api/v1/queues/100"],
+            "events": [],
+            "config": {}
+        }))
+        .unwrap();
+
+        // Lockfile maps the URL refs to slugs so portabilization can run.
+        let mut lockfile = Lockfile {
+            api_base: "https://x.invalid/api/v1".to_string(),
+            ..Lockfile::default()
+        };
+        lockfile.upsert(
+            "hooks",
+            slug,
+            ObjectEntry {
+                id: 42,
+                modified_at: None,
+                content_hash: Some("base".to_string()),
+                secrets_hash: None,
+            },
+        );
+        lockfile.upsert(
+            "queues",
+            "inv",
+            ObjectEntry {
+                id: 100,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+
+        let catalog = catalog_with_hooks(vec![remote_hook]);
+        let classified = vec![ClassifiedItem {
+            kind: "hooks".to_string(),
+            slug: slug.to_string(),
+            class: SyncClass::BothDiverged,
+            local_hash: Some("L".to_string()),
+            remote_hash: Some("R".to_string()),
+            base_hash: Some("B".to_string()),
+        }];
+
+        let client =
+            RossumClient::new("https://unused.invalid/api/v1".to_string(), "TEST".to_string())
+                .unwrap();
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+        {
+            let mut ctx = PullCtx {
+                paths: &paths,
+                client: &client,
+                lockfile: &mut lockfile,
+                queue_locations: BTreeMap::new(),
+                overlay: None,
+                interactive: true,
+            };
+            resolve_conflicts(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b"r\n"),
+                true,
+                &progress,
+            )
+            .await
+            .expect("resolver should succeed on [r]");
+        }
+
+        let after = String::from_utf8(std::fs::read(&local_path).unwrap()).unwrap();
+        assert!(
+            after.contains("rdc://queues/inv"),
+            "keep-remote must write portable refs; got:\n{after}"
+        );
+        assert!(
+            !after.contains("queues/100") && !after.contains("x.invalid"),
+            "keep-remote must NOT write raw API URLs; got:\n{after}"
         );
     }
 
