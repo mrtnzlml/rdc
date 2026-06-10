@@ -160,9 +160,6 @@ pub fn redact_for_disk(body: &mut Value, kind: &str) {
 /// (as the sync adapter previously did for queues) makes a server-set runtime
 /// field like `counts` churn read as remote drift, surfacing a spurious
 /// conflict against a lockfile base that *was* recorded from redacted bytes.
-///
-/// Note: any per-object overlay strip is layered on top by the caller
-/// (`maybe_strip_overlay`); it's kind-agnostic and orthogonal to redaction.
 pub fn redacted_disk_bytes<T: Serialize>(
     value: &T,
     kind: &str,

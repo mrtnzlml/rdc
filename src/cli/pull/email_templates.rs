@@ -1,5 +1,5 @@
 use super::common::{
-    PullAction, PullCtx, apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
+    PullAction, PullCtx, apply_pull_action, decide_pull_action, record_object,
     skip_on_permission_denied,
 };
 use crate::log::{Action, Log};
@@ -86,19 +86,12 @@ pub async fn process(
             std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
             // Canonical on-disk bytes via KindCodec: strips `modified_at`.
-            // Overlay is keyed by the full composite lockfile_key.
             let value = serde_json::to_value(t)?;
             let art = crate::snapshot::codec::codec(KIND)
                 .unwrap()
                 .disk_bytes(&value)
                 .context("serializing email template")?;
-            let codec = crate::snapshot::codec::codec(KIND).unwrap();
-            let proposed = maybe_strip_overlay(
-                art.json,
-                ctx.overlay
-                    .as_ref()
-                    .and_then(|o| codec.overlay(o, &lockfile_key)),
-            )?;
+            let proposed = art.json;
 
             let local_path = dir.join(format!("{template_slug}.json"));
             let base_hash = ctx

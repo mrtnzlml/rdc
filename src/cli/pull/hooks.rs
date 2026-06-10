@@ -1,5 +1,5 @@
 use super::common::{
-    PullAction, PullCtx, apply_pull_action, maybe_strip_overlay, record_object,
+    PullAction, PullCtx, apply_pull_action, record_object,
     skip_on_permission_denied,
 };
 use crate::log::{Action, Log};
@@ -80,13 +80,6 @@ pub async fn process(
             }
 
             let (proposed_json, proposed_code) = serialize_hook(hook)?;
-            // Strip overlay-managed paths from the JSON (spec §9.3). Code in
-            // <slug>.py is the canonical form for hook code, so strip
-            // doesn't touch the .py side; users rarely overlay `config.code`.
-            let proposed_json = maybe_strip_overlay(
-                proposed_json,
-                ctx.overlay.as_ref().and_then(|o| o.hook(&slug)),
-            )?;
             let proposed_json =
                 crate::cli::pull::common::portabilize_proposed(&proposed_json, &*ctx.lockfile);
 

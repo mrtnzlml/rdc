@@ -1,7 +1,5 @@
 use crate::api::RossumClient;
-use crate::cli::pull::common::maybe_strip_overlay;
 use crate::log::{Action, Log};
-use crate::overlay::Overlay;
 use crate::paths::Paths;
 
 use crate::snapshot::create::{strip_for_create, strip_patch_extra};
@@ -17,7 +15,7 @@ use std::sync::Arc;
 /// Post-PATCH disk write is also stripped so the snapshot matches
 /// lockfile.content_hash.
 pub async fn push(
-    paths: &Paths,
+    _paths: &Paths,
     client: &RossumClient,
     lockfile: &mut Lockfile,
     interactive: bool,
@@ -25,8 +23,6 @@ pub async fn push(
     progress: &Arc<Log>,
     env: &str,
 ) -> Result<(usize, usize)> {
-    let overlay = Overlay::load(&paths.overlay_file())
-        .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
     let mut pushed = 0usize;
     let mut skipped = 0usize;
@@ -38,7 +34,6 @@ pub async fn push(
         let queue_dir = schema_path
             .parent()
             .with_context(|| format!("schema path has no parent: {}", schema_path.display()))?;
-        let overlay_paths = overlay.as_ref().and_then(|ov| ov.schema(q_slug));
 
         // Missing lockfile entry → new schema, POST.
         if lockfile
@@ -57,7 +52,6 @@ pub async fn push(
                 .with_context(|| format!("POST /schemas (creating for queue '{q_slug}')"));
             let created = create_result?;
             let (created_json, created_formulas) = serialize_schema(&created)?;
-            let created_json = maybe_strip_overlay(created_json, overlay_paths)?;
             let created_hash = schema_combined_hash(&created_json, &created_formulas, lockfile);
             write_schema_bytes(queue_dir, &created_json, &created_formulas).with_context(|| {
                 format!("writing post-create canonical form for schema '{q_slug}'")
@@ -89,13 +83,13 @@ pub async fn push(
         };
         let base = base.clone();
 
-        // Read raw Value (formulas spliced inline), apply overlay,
-        // deserialize for the PATCH body.
+        // Read raw Value (formulas spliced inline), deserialize for the
+        // PATCH body.
         let mut payload = read_schema_value(queue_dir)
             .with_context(|| format!("reading local schema for queue '{q_slug}'"))?;
         crate::snapshot::refs::resolve_value(&mut payload, lockfile);
         let payload_schema: crate::model::Schema = serde_json::from_value(payload)
-            .with_context(|| format!("deserializing overlay-applied schema '{q_slug}'"))?;
+            .with_context(|| format!("deserializing schema '{q_slug}'"))?;
 
         let id = entry.id;
         let remote_schema = if let Some(s) = remote_cache.get(&id) {
@@ -109,7 +103,6 @@ pub async fn push(
             s
         };
         let (remote_json, remote_formulas) = serialize_schema(&remote_schema)?;
-        let remote_json = maybe_strip_overlay(remote_json, overlay_paths)?;
         let remote_combined = schema_combined_hash(&remote_json, &remote_formulas, lockfile);
         let mut payload_to_send = payload_schema;
         if remote_combined != base {
@@ -170,7 +163,6 @@ pub async fn push(
         let updated = patch_result?;
 
         let (updated_json, updated_formulas) = serialize_schema(&updated)?;
-        let updated_json = maybe_strip_overlay(updated_json, overlay_paths)?;
         let updated_hash = schema_combined_hash(&updated_json, &updated_formulas, lockfile);
         write_schema_bytes(queue_dir, &updated_json, &updated_formulas)
             .with_context(|| format!("writing post-push canonical form for schema '{q_slug}'"))?;

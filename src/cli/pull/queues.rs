@@ -9,7 +9,7 @@
 //! (lockfile, queue_locations, conflict counts).
 
 use super::common::{
-    PullAction, PullCtx, apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
+    PullAction, PullCtx, apply_pull_action, decide_pull_action, record_object,
     skip_on_permission_denied,
 };
 use crate::log::{Action, Log};
@@ -141,13 +141,7 @@ pub async fn process(
                 .unwrap()
                 .disk_bytes(&value)
                 .context("serializing queue")?;
-            let codec_q = crate::snapshot::codec::codec(KIND_QUEUES).unwrap();
-            let queue_proposed = maybe_strip_overlay(
-                art.json,
-                ctx.overlay
-                    .as_ref()
-                    .and_then(|o| codec_q.overlay(o, &q_slug)),
-            )?;
+            let queue_proposed = art.json;
             let queue_base = ctx
                 .lockfile
                 .objects
@@ -257,17 +251,11 @@ fn write_schema_for_queue(
     let pre_local_formulas = crate::snapshot::schema::read_local_formulas(queue_dir)?;
 
     let (remote_json_bytes, remote_formulas) = crate::snapshot::schema::serialize_schema(schema)?;
-    let remote_json_bytes = maybe_strip_overlay(
-        remote_json_bytes,
-        ctx.overlay.as_ref().and_then(|o| o.schema(&w.q_slug)),
-    )?;
     let remote_json_bytes =
         crate::cli::pull::common::portabilize_proposed(&remote_json_bytes, &*ctx.lockfile);
 
-    // Remote hash is computed over the POST-overlay bytes so it matches what
-    // is actually written to disk. Using codec.base_hash(&value) (PRE-overlay)
-    // would diverge whenever a schema overlay is configured, causing phantom
-    // drift on every subsequent pull.
+    // Remote hash is computed over the canonical bytes that are actually
+    // written to disk, so re-pulls don't show phantom drift.
     let remote_combined_hash =
         crate::state::schema_combined_hash(&remote_json_bytes, &remote_formulas, ctx.lockfile);
 
@@ -443,13 +431,7 @@ fn write_inbox_for_queue(
         .unwrap()
         .disk_bytes(&value)
         .context("serializing inbox")?;
-    let codec_i = crate::snapshot::codec::codec(KIND_INBOXES).unwrap();
-    let inbox_proposed = maybe_strip_overlay(
-        art.json,
-        ctx.overlay
-            .as_ref()
-            .and_then(|o| codec_i.overlay(o, &w.q_slug)),
-    )?;
+    let inbox_proposed = art.json;
 
     let inbox_base = ctx
         .lockfile

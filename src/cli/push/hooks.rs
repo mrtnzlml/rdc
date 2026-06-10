@@ -1,7 +1,5 @@
 use crate::api::RossumClient;
-use crate::cli::pull::common::maybe_strip_overlay;
 use crate::log::{Action, Log};
-use crate::overlay::Overlay;
 use crate::paths::Paths;
 
 use crate::secrets::{HookSecrets, load_hook_secrets};
@@ -58,14 +56,6 @@ pub async fn push(
     progress: &Arc<Log>,
     env: &str,
 ) -> Result<(usize, usize)> {
-    // C-1 overlay model: overlays are MIGRATE-ONLY. Push no longer applies or
-    // strips them — the snapshot already carries each env's real values. The
-    // overlay is still loaded here only to feed the now-no-op
-    // `maybe_strip_overlay` drift comparison; this vestigial plumbing is slated
-    // for a follow-up cleanup.
-    let overlay = Overlay::load(&paths.overlay_file())
-        .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
-
     // Load hook secrets for this env (the gitignored `secrets/<env>.hook-secrets.json`).
     // Missing file → empty map, all injection sites become no-ops.
     let hook_secrets = load_hook_secrets(paths.root(), env)
@@ -106,7 +96,6 @@ pub async fn push(
     let mut drift_hooks: Option<Vec<crate::model::Hook>> = None;
 
     for (slug, local_json_path) in changes {
-        let overlay_paths = overlay.as_ref().and_then(|ov| ov.hook(slug));
 
         // Missing lockfile entry = new hook → POST. Local file becomes the
         // create payload; server response (with id/url assigned) overwrites
@@ -207,7 +196,7 @@ pub async fn push(
             // it stays canonical even if the local JSON declared a
             // different runtime.
             let (created_json_full, created_code) = serialize_hook(&created)?;
-            let created_json_stripped = maybe_strip_overlay(created_json_full, overlay_paths)?;
+            let created_json_stripped = created_json_full;
             let created_hash = hook_combined_hash(&created_json_stripped, &created_code, lockfile);
             let created_ext = hook_code_extension(&created);
             write_atomic(local_json_path, &created_json_stripped)
@@ -253,21 +242,17 @@ pub async fn push(
 
         let id = entry.id;
 
-        // Read raw Value (with the sidecar code spliced in) so overlay
-        // can re-add fields stripped by pull (spec §9.3) BEFORE typed
+        // Read raw Value (with the sidecar code spliced in) BEFORE typed
         // deserialize.
         let mut payload = read_hook_value(&hooks_dir, slug)
             .with_context(|| format!("reading local hook '{slug}'"))?;
-        // Derive the local sidecar extension *before* applying overlay,
-        // since overlay may mutate `config.runtime`. The on-disk sidecar
-        // is whatever the local JSON declared.
+        // The on-disk sidecar is whatever the local JSON declared.
         let local_ext = hook_code_extension_from_value(&payload);
         crate::snapshot::refs::resolve_value(&mut payload, lockfile);
         let payload_hook: crate::model::Hook = serde_json::from_value(payload)
-            .with_context(|| format!("deserializing overlay-applied hook '{slug}'"))?;
+            .with_context(|| format!("deserializing hook '{slug}'"))?;
 
-        // Drift check: fetch remote, serialize, strip same overlay paths,
-        // hash. Compare to base (which was recorded post-strip on pull).
+        // Drift check: fetch remote, serialize, hash. Compare to base.
         // The list is cached across iterations within this loop so a batch
         // of N updates only pays one list call here.
         if drift_hooks.is_none() {
@@ -290,7 +275,7 @@ pub async fn push(
             continue;
         };
         let (remote_json_full, remote_code) = serialize_hook(remote_hook)?;
-        let remote_json_stripped = maybe_strip_overlay(remote_json_full, overlay_paths)?;
+        let remote_json_stripped = remote_json_full;
         let remote_combined = hook_combined_hash(&remote_json_stripped, &remote_code, lockfile);
         let mut payload_to_send = payload_hook;
         if remote_combined != base {
@@ -388,7 +373,7 @@ pub async fn push(
         // Refresh local file with the post-strip canonical form (matches
         // what next pull would write) and update lockfile to match.
         let (updated_json_full, updated_code) = serialize_hook(&updated)?;
-        let updated_json_stripped = maybe_strip_overlay(updated_json_full, overlay_paths)?;
+        let updated_json_stripped = updated_json_full;
         let updated_hash = hook_combined_hash(&updated_json_stripped, &updated_code, lockfile);
         let updated_ext = hook_code_extension(&updated);
         crate::state::base_cache::write_disk_and_cache(
