@@ -470,20 +470,16 @@ async fn prefetch_queue_schemas(
 /// keep the snapshot in its canonical pre-overlay form (spec §9.3).
 pub fn maybe_strip_overlay(
     bytes: Vec<u8>,
-    paths: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
+    _paths: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
 ) -> Result<Vec<u8>> {
-    let Some(paths) = paths else {
-        return Ok(bytes);
-    };
-    if paths.is_empty() {
-        return Ok(bytes);
-    }
-    let mut value: serde_json::Value =
-        serde_json::from_slice(&bytes).context("parsing JSON for overlay strip")?;
-    crate::overlay::strip_paths(&mut value, paths);
-    let mut out = serde_json::to_vec_pretty(&value).context("re-serializing post overlay strip")?;
-    out.push(b'\n');
-    Ok(out)
+    // C-1 overlay model: overlays are a MIGRATE-ONLY substitution. The
+    // canonical snapshot carries each env's real values (visible on disk and
+    // round-tripping like any other field), so pull/sync/push no longer strip
+    // overlay-managed paths. Retained as a no-op (rather than removed at ~100
+    // call sites) so the pull/classify/push-drift hashing stays symmetric
+    // without a sweeping signature change; `apply_overrides` likewise survives
+    // only in `migrate`. The `_paths` argument is intentionally ignored.
+    Ok(bytes)
 }
 
 /// Record an object in the lockfile under the given kind/slug.
@@ -854,6 +850,28 @@ fn resolve_conflict_interactive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maybe_strip_overlay_is_a_noop_under_migrate_only_overlays() {
+        // C-1: overlays act only at migrate time. Pull/sync no longer strip
+        // overlay-managed paths, so the env-specific value stays visible on
+        // disk and round-trips like any other field.
+        use std::collections::BTreeMap;
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "h",
+            "config": { "url": "https://test/svc/validate", "timeout_s": 30 }
+        }))
+        .unwrap();
+        let mut paths: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        paths.insert("config.url".to_string(), serde_json::Value::Null);
+
+        let out = maybe_strip_overlay(bytes.clone(), Some(&paths)).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            v["config"]["url"], "https://test/svc/validate",
+            "overlay-managed path must NOT be stripped under C-1"
+        );
+    }
 
     #[test]
     fn inboxes_by_queue_maps_by_attached_queue_id() {
