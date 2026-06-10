@@ -668,6 +668,112 @@ mod tests {
     }
 
     #[test]
+    fn schema_local_adds_top_level_table_while_remote_edits_sibling() {
+        // Repro of the reported scenario: the user adds a top-level table
+        // (multivalue → tuple → column datapoints) into a section's children
+        // locally, while the remote edits a SIBLING datapoint's label. The
+        // merge must keep BOTH the remote edit AND the local table.
+        let base = json!({"content": [
+            {"category": "section", "id": "basic", "children": [
+                {"category": "datapoint", "id": "invoice_id", "label": "Invoice"}
+            ]}
+        ]});
+        let local = json!({"content": [
+            {"category": "section", "id": "basic", "children": [
+                {"category": "datapoint", "id": "invoice_id", "label": "Invoice"},
+                {"category": "multivalue", "id": "line_items", "label": "Line items",
+                 "children": {"category": "tuple", "id": "line_items_tuple", "children": [
+                    {"category": "datapoint", "id": "item_desc", "label": "Desc"}
+                 ]}}
+            ]}
+        ]});
+        let remote = json!({"content": [
+            {"category": "section", "id": "basic", "children": [
+                {"category": "datapoint", "id": "invoice_id", "label": "Invoice No."}
+            ]}
+        ]});
+        let out = merge3_json(&base, &local, &remote);
+        assert_eq!(
+            merged_value(out),
+            json!({"content": [
+                {"category": "section", "id": "basic", "children": [
+                    {"category": "datapoint", "id": "invoice_id", "label": "Invoice No."},
+                    {"category": "multivalue", "id": "line_items", "label": "Line items",
+                     "children": {"category": "tuple", "id": "line_items_tuple", "children": [
+                        {"category": "datapoint", "id": "item_desc", "label": "Desc"}
+                     ]}}
+                ]}
+            ]}),
+            "local table must survive a simultaneous remote edit to a sibling"
+        );
+    }
+
+    #[test]
+    fn schema_local_adds_new_top_level_section_while_remote_edits_other_section() {
+        // EXACT reported shape: local adds a brand-new top-level SECTION
+        // (containing a table) at the end of `content`, while the remote edits
+        // a field in a DIFFERENT existing section. The new section must survive.
+        let base = json!({"content": [
+            {"category": "section", "id": "sec_a", "children": [
+                {"category": "datapoint", "id": "a1", "label": "A1"}
+            ]},
+            {"category": "section", "id": "sec_b", "children": [
+                {"category": "datapoint", "id": "b1", "label": "B1"}
+            ]}
+        ]});
+        let local = json!({"content": [
+            {"category": "section", "id": "sec_a", "children": [
+                {"category": "datapoint", "id": "a1", "label": "A1"}
+            ]},
+            {"category": "section", "id": "sec_b", "children": [
+                {"category": "datapoint", "id": "b1", "label": "B1"}
+            ]},
+            {"category": "section", "id": "sec_new", "children": [
+                {"category": "multivalue", "id": "my_table", "label": "My table",
+                 "children": {"category": "tuple", "id": "my_table_tuple", "children": [
+                    {"category": "datapoint", "id": "col1", "label": "Col"}
+                 ]}}
+            ]}
+        ]});
+        let remote = json!({"content": [
+            {"category": "section", "id": "sec_a", "children": [
+                {"category": "datapoint", "id": "a1", "label": "A1 EDITED"}
+            ]},
+            {"category": "section", "id": "sec_b", "children": [
+                {"category": "datapoint", "id": "b1", "label": "B1"}
+            ]}
+        ]});
+        let (merged, local_paths) = match merge3_json(&base, &local, &remote) {
+            MergeOutcome::Merged { merged, local_paths, .. } => (merged, local_paths),
+            MergeOutcome::Conflict { reasons } => panic!("unexpected conflict: {reasons:?}"),
+        };
+        let ids: Vec<String> = merged["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            ids.contains(&"sec_new".to_string()),
+            "the locally-added top-level section must survive; got section ids {ids:?}"
+        );
+        assert_eq!(
+            merged["content"][0]["children"][0]["label"], "A1 EDITED",
+            "remote's sibling-section edit must also be kept"
+        );
+        // The added section MUST be reported as a local-side change. This is
+        // the trigger the auto-merge caller relies on (commit c863229): a
+        // non-empty `local_paths` promotes the merged result to the push
+        // pipeline, so the new section reaches the remote instead of being
+        // reverted on the next sync. Without this flag the table silently
+        // dropped (the reported bug).
+        assert!(
+            local_paths.iter().any(|p| p.contains("sec_new")),
+            "the local section-add must be recorded in local_paths so it gets pushed; got {local_paths:?}"
+        );
+    }
+
+    #[test]
     fn opaque_array_without_ids_is_conflict_on_divergence() {
         let base = json!([1, 2, 3]);
         let local = json!([1, 2, 3, 4]);
