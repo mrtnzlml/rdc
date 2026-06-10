@@ -1,7 +1,5 @@
 use crate::api::RossumClient;
-use crate::cli::pull::common::maybe_strip_overlay;
 use crate::log::{Action, Log};
-use crate::overlay::Overlay;
 use crate::paths::Paths;
 
 use crate::snapshot::codec::combined_hash;
@@ -21,8 +19,6 @@ pub async fn push(
     progress: &Arc<Log>,
     env: &str,
 ) -> Result<(usize, usize)> {
-    let overlay = Overlay::load(&paths.overlay_file())
-        .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
     let mut pushed = 0usize;
     let mut skipped = 0usize;
@@ -30,7 +26,6 @@ pub async fn push(
     let mut remote_labels: Option<Vec<crate::model::Label>> = None;
 
     for (slug, path) in changes {
-        let overlay_paths = overlay.as_ref().and_then(|ov| ov.label(slug));
 
         // Missing lockfile entry → new label, POST.
         if lockfile
@@ -54,7 +49,7 @@ pub async fn push(
             let created_art = codec
                 .disk_bytes(&serde_json::to_value(&created).context("serializing created label")?)
                 .context("codec disk_bytes for created label")?;
-            let created_bytes = maybe_strip_overlay(created_art.json, overlay_paths)?;
+            let created_bytes = created_art.json;
             let created_hash = combined_hash(&created_bytes, &created_art.sidecars, lockfile);
             write_atomic(path, &created_bytes)
                 .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
@@ -119,7 +114,7 @@ pub async fn push(
                     .context("serializing remote label for drift check")?,
             )
             .context("codec disk_bytes for remote label")?;
-        let remote_bytes = maybe_strip_overlay(remote_art.json, overlay_paths)?;
+        let remote_bytes = remote_art.json;
         let remote_combined = combined_hash(&remote_bytes, &remote_art.sidecars, lockfile);
         let mut payload_to_send = payload_label;
         if remote_combined != base {
@@ -184,7 +179,7 @@ pub async fn push(
                     .context("serializing updated label for disk write")?,
             )
             .context("codec disk_bytes for updated label")?;
-        let updated_bytes = maybe_strip_overlay(updated_art.json, overlay_paths)?;
+        let updated_bytes = updated_art.json;
         let updated_hash = combined_hash(&updated_bytes, &updated_art.sidecars, lockfile);
         crate::state::base_cache::write_disk_and_cache(paths, path, &updated_bytes)
             .with_context(|| format!("writing post-push canonical form for '{slug}'"))?;

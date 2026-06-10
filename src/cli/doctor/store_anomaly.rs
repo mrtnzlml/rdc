@@ -162,11 +162,7 @@ async fn convert_to_custom(
     // Reuse the pull side's canonical serialization so disk + hash stay
     // aligned with what a future pull would write.
     let (json_bytes, code) = crate::snapshot::hook::serialize_hook(&updated)?;
-    let overlay = crate::overlay::Overlay::load(&paths.overlay_file())?;
-    let stripped = crate::cli::pull::common::maybe_strip_overlay(
-        json_bytes,
-        overlay.as_ref().and_then(|o| o.hook(slug)),
-    )?;
+    let stripped = json_bytes;
     let hash = crate::state::hook_combined_hash(&stripped, &code, lockfile);
     let local_path = paths.hooks_dir().join(format!("{slug}.json"));
     crate::snapshot::writer::write_atomic(&local_path, &stripped)
@@ -406,11 +402,7 @@ async fn reinstall_as_store_extension(
 
     // 6. Reconcile local snapshot for the slug.
     let (json_bytes, code) = crate::snapshot::hook::serialize_hook(&updated)?;
-    let overlay = crate::overlay::Overlay::load(&paths.overlay_file())?;
-    let stripped = crate::cli::pull::common::maybe_strip_overlay(
-        json_bytes,
-        overlay.as_ref().and_then(|o| o.hook(slug)),
-    )?;
+    let stripped = json_bytes;
     let hash = crate::state::hook_combined_hash(&stripped, &code, lockfile);
     let local_path = paths.hooks_dir().join(format!("{slug}.json"));
     crate::snapshot::writer::write_atomic(&local_path, &stripped).with_context(|| {
@@ -462,10 +454,7 @@ async fn reinstall_as_store_extension(
             .await
             .with_context(|| format!("GET /hooks/{} (post-rewire refresh)", h.id))?;
         let (j, c) = crate::snapshot::hook::serialize_hook(&fresh)?;
-        let s = crate::cli::pull::common::maybe_strip_overlay(
-            j,
-            overlay.as_ref().and_then(|o| o.hook(&dep_slug)),
-        )?;
+        let s = j;
         let hh = crate::state::hook_combined_hash(&s, &c, lockfile);
         let dep_path = paths.hooks_dir().join(format!("{dep_slug}.json"));
         crate::snapshot::writer::write_atomic(&dep_path, &s)?;

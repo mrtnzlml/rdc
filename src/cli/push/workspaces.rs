@@ -4,9 +4,7 @@
 //! driver runs first in the phase-2 dispatch.
 
 use crate::api::RossumClient;
-use crate::cli::pull::common::maybe_strip_overlay;
 use crate::log::{Action, Log};
-use crate::overlay::Overlay;
 use crate::paths::Paths;
 
 use crate::snapshot::codec::combined_hash;
@@ -26,20 +24,10 @@ pub async fn push(
     progress: &Arc<Log>,
     env: &str,
 ) -> Result<(usize, usize)> {
-    let overlay = Overlay::load(&paths.overlay_file())
-        .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
-
     let mut pushed = 0usize;
     let mut skipped = 0usize;
 
     for (ws_slug, ws_path) in changes {
-        // Workspaces don't have a typed overlay accessor in `Overlay`
-        // today (no `[workspaces.<slug>]` section). If users start
-        // needing one — e.g. per-env `autopilot` differences — that's a
-        // future Overlay extension; for now the payload is sent as-is.
-        let overlay_paths: Option<&BTreeMap<String, serde_json::Value>> = None;
-        let _ = overlay;
-
         // CREATE — no lockfile entry yet.
         if lockfile
             .objects
@@ -64,7 +52,7 @@ pub async fn push(
                     &serde_json::to_value(&created).context("serializing created workspace")?,
                 )
                 .context("codec disk_bytes for created workspace")?;
-            let created_bytes = maybe_strip_overlay(created_art.json, overlay_paths)?;
+            let created_bytes = created_art.json;
             let created_hash = combined_hash(&created_bytes, &created_art.sidecars, lockfile);
             write_atomic(ws_path, &created_bytes)
                 .with_context(|| format!("writing post-create canonical form for '{ws_slug}'"))?;
@@ -123,7 +111,7 @@ pub async fn push(
                     .context("serializing remote workspace for drift check")?,
             )
             .context("codec disk_bytes for remote workspace")?;
-        let remote_bytes = maybe_strip_overlay(remote_art.json, overlay_paths)?;
+        let remote_bytes = remote_art.json;
         let remote_combined = combined_hash(&remote_bytes, &remote_art.sidecars, lockfile);
         let mut payload_to_send = payload_workspace;
         if remote_combined != base {
@@ -187,7 +175,7 @@ pub async fn push(
                     .context("serializing updated workspace for disk write")?,
             )
             .context("codec disk_bytes for updated workspace")?;
-        let updated_bytes = maybe_strip_overlay(updated_art.json, overlay_paths)?;
+        let updated_bytes = updated_art.json;
         let updated_hash = combined_hash(&updated_bytes, &updated_art.sidecars, lockfile);
         crate::state::base_cache::write_disk_and_cache(paths, ws_path, &updated_bytes)
             .with_context(|| format!("writing post-push canonical form for '{ws_slug}'"))?;

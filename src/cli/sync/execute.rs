@@ -29,7 +29,7 @@
 //!
 //! Spec: docs/superpowers/specs/2026-05-14-unified-sync-design.md.
 
-use crate::cli::pull::common::{PullCtx, RemoteCatalog, maybe_strip_overlay};
+use crate::cli::pull::common::{PullCtx, RemoteCatalog};
 use crate::cli::resolve::{PullAborted, Resolution, prompt_remote_delete, prompt_resolve};
 use crate::cli::stdin_coord::CoordinatorStdin;
 use crate::cli::sync::classify::{ClassifiedItem, SyncClass};
@@ -279,11 +279,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 let codec = crate::snapshot::codec::codec("labels")?;
                 let value = serde_json::to_value(l).ok()?;
                 let art = codec.disk_bytes(&value).ok()?;
-                let ovl_paths = ctx
-                    .overlay
-                    .as_ref()
-                    .and_then(|o| codec.overlay(o, &it.slug));
-                let json_bytes = maybe_strip_overlay(art.json, ovl_paths).ok()?;
+                let json_bytes = art.json;
                 let local_path = ctx.paths.labels_dir().join(format!("{}.json", it.slug));
                 Some(ConflictRefs {
                     remote_bytes: json_bytes,
@@ -302,11 +298,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                     let codec = crate::snapshot::codec::codec("workspaces")?;
                     let value = serde_json::to_value(w).ok()?;
                     let art = codec.disk_bytes(&value).ok()?;
-                    let ovl_paths = ctx
-                        .overlay
-                        .as_ref()
-                        .and_then(|o| codec.overlay(o, &it.slug));
-                    let json_bytes = maybe_strip_overlay(art.json, ovl_paths).ok()?;
+                    let json_bytes = art.json;
                     let local_path = ctx.paths.workspace_dir(&it.slug).join("workspace.json");
                     Some(ConflictRefs {
                         remote_bytes: json_bytes,
@@ -322,11 +314,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 let codec = crate::snapshot::codec::codec("engines")?;
                 let value = serde_json::to_value(e).ok()?;
                 let art = codec.disk_bytes(&value).ok()?;
-                let ovl_paths = ctx
-                    .overlay
-                    .as_ref()
-                    .and_then(|o| codec.overlay(o, &it.slug));
-                let json_bytes = maybe_strip_overlay(art.json, ovl_paths).ok()?;
+                let json_bytes = art.json;
                 let local_path = ctx.paths.engine_dir(&it.slug).join("engine.json");
                 Some(ConflictRefs {
                     remote_bytes: json_bytes,
@@ -352,11 +340,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                         let codec = crate::snapshot::codec::codec("engine_fields")?;
                         let value = serde_json::to_value(f).ok()?;
                         let art = codec.disk_bytes(&value).ok()?;
-                        let ovl_paths = ctx
-                            .overlay
-                            .as_ref()
-                            .and_then(|o| codec.overlay(o, &it.slug));
-                        let json_bytes = maybe_strip_overlay(art.json, ovl_paths).ok()?;
+                        let json_bytes = art.json;
                         let local_path = ctx
                             .paths
                             .engine_fields_dir(&engine_slug)
@@ -379,11 +363,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 let codec = crate::snapshot::codec::codec("hooks")?;
                 let value = serde_json::to_value(h).ok()?;
                 let art = codec.disk_bytes(&value).ok()?;
-                let ovl_paths = ctx
-                    .overlay
-                    .as_ref()
-                    .and_then(|o| codec.overlay(o, &it.slug));
-                let json_bytes = maybe_strip_overlay(art.json, ovl_paths).ok()?;
+                let json_bytes = art.json;
                 let code = art
                     .sidecars
                     .into_iter()
@@ -404,11 +384,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 let codec = crate::snapshot::codec::codec("rules")?;
                 let value = serde_json::to_value(r).ok()?;
                 let art = codec.disk_bytes(&value).ok()?;
-                let ovl_paths = ctx
-                    .overlay
-                    .as_ref()
-                    .and_then(|o| codec.overlay(o, &it.slug));
-                let json_bytes = maybe_strip_overlay(art.json, ovl_paths).ok()?;
+                let json_bytes = art.json;
                 let code = art
                     .sidecars
                     .into_iter()
@@ -434,11 +410,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                     let codec = crate::snapshot::codec::codec("queues")?;
                     let value = serde_json::to_value(*q).ok()?;
                     let art = codec.disk_bytes(&value).ok()?;
-                    let ovl_paths = ctx
-                        .overlay
-                        .as_ref()
-                        .and_then(|o| codec.overlay(o, &it.slug));
-                    let json_bytes = maybe_strip_overlay(art.json, ovl_paths).ok()?;
+                    let json_bytes = art.json;
                     let local_path = ctx.paths.queue_dir(ws_slug, &it.slug).join("queue.json");
                     Some(ConflictRefs {
                         remote_bytes: json_bytes,
@@ -461,14 +433,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                         let codec = crate::snapshot::codec::codec("schemas")?;
                         let value = serde_json::to_value(schema).ok()?;
                         let art = codec.disk_bytes(&value).ok()?;
-                        // Schema slug for the codec overlay lookup is the
-                        // composite `<ws_slug>/<q_slug>` key.
-                        let composite = format!("{ws_slug}/{}", it.slug);
-                        let ovl_paths = ctx
-                            .overlay
-                            .as_ref()
-                            .and_then(|o| codec.overlay(o, &composite));
-                        let json_bytes = maybe_strip_overlay(art.json, ovl_paths).ok()?;
+                        let json_bytes = art.json;
                         // Sidecars are `"formulas/<field_id>.py"` → extract
                         // the `(field_id, bytes)` pairs for the resolver.
                         let formulas: Vec<(String, Vec<u8>)> = art
@@ -500,11 +465,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                     let codec = crate::snapshot::codec::codec("inboxes")?;
                     let value = serde_json::to_value(inbox).ok()?;
                     let art = codec.disk_bytes(&value).ok()?;
-                    let ovl_paths = ctx
-                        .overlay
-                        .as_ref()
-                        .and_then(|o| codec.overlay(o, &it.slug));
-                    let json_bytes = maybe_strip_overlay(art.json, ovl_paths).ok()?;
+                    let json_bytes = art.json;
                     let local_path = ctx.paths.queue_dir(ws_slug, &it.slug).join("inbox.json");
                     Some(ConflictRefs {
                         remote_bytes: json_bytes,
@@ -529,11 +490,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                         let codec = crate::snapshot::codec::codec("email_templates")?;
                         let value = serde_json::to_value(t).ok()?;
                         let art = codec.disk_bytes(&value).ok()?;
-                        let ovl_paths = ctx
-                            .overlay
-                            .as_ref()
-                            .and_then(|o| codec.overlay(o, &it.slug));
-                        let json_bytes = maybe_strip_overlay(art.json, ovl_paths).ok()?;
+                        let json_bytes = art.json;
                         let local_path = ctx
                             .paths
                             .queue_email_templates_dir(parts[0], parts[1])
@@ -755,7 +712,6 @@ type AutoMergeResult = (String, Vec<String>, Vec<String>);
 fn try_auto_merge(
     ctx: &mut PullCtx<'_>,
     kind: &str,
-    slug: &str,
     hash_strategy: HashStrategy,
     lockfile_base_hash: &Option<String>,
     local_path: &Path,
@@ -805,8 +761,7 @@ fn try_auto_merge(
         |v: serde_json::Value| -> Option<(Vec<u8>, Vec<(String, Vec<u8>)>)> {
             let codec = crate::snapshot::codec::codec(kind)?;
             let art = codec.disk_bytes(&v).ok()?;
-            let ovl_paths = ctx.overlay.as_ref().and_then(|o| codec.overlay(o, slug));
-            let json_out = maybe_strip_overlay(art.json, ovl_paths).ok()?;
+            let json_out = art.json;
             Some((json_out, art.sidecars))
         };
 
@@ -1229,7 +1184,6 @@ fn resolve_one_conflict<R: BufRead>(
     if let Some((merged_combined_hash, lp, rp)) = try_auto_merge(
         ctx,
         &it.kind,
-        &it.slug,
         hash_strategy,
         &it.base_hash,
         &local_path,
@@ -2160,11 +2114,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             let codec = crate::snapshot::codec::codec("labels")?;
                             let value = serde_json::to_value(l).ok()?;
                             let art = codec.disk_bytes(&value).ok()?;
-                            let ovl = ctx
-                                .overlay
-                                .as_ref()
-                                .and_then(|o| codec.overlay(o, &it.slug));
-                            let bytes = maybe_strip_overlay(art.json, ovl).ok()?;
+                            let bytes = art.json;
                             Some(bytes)
                         });
                         Some(RemoteDeleteRefs {
@@ -2184,11 +2134,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             let codec = crate::snapshot::codec::codec("workspaces")?;
                             let value = serde_json::to_value(w).ok()?;
                             let art = codec.disk_bytes(&value).ok()?;
-                            let ovl = ctx
-                                .overlay
-                                .as_ref()
-                                .and_then(|o| codec.overlay(o, &it.slug));
-                            let bytes = maybe_strip_overlay(art.json, ovl).ok()?;
+                            let bytes = art.json;
                             Some(bytes)
                         });
                         Some(RemoteDeleteRefs {
@@ -2208,11 +2154,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             let codec = crate::snapshot::codec::codec("engines")?;
                             let value = serde_json::to_value(e).ok()?;
                             let art = codec.disk_bytes(&value).ok()?;
-                            let ovl = ctx
-                                .overlay
-                                .as_ref()
-                                .and_then(|o| codec.overlay(o, &it.slug));
-                            let bytes = maybe_strip_overlay(art.json, ovl).ok()?;
+                            let bytes = art.json;
                             Some(bytes)
                         });
                         Some(RemoteDeleteRefs {
@@ -2253,11 +2195,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             let codec = crate::snapshot::codec::codec("engine_fields")?;
                             let value = serde_json::to_value(f).ok()?;
                             let art = codec.disk_bytes(&value).ok()?;
-                            let ovl = ctx
-                                .overlay
-                                .as_ref()
-                                .and_then(|o| codec.overlay(o, &it.slug));
-                            let bytes = maybe_strip_overlay(art.json, ovl).ok()?;
+                            let bytes = art.json;
                             Some(bytes)
                         });
                         Some(RemoteDeleteRefs {
@@ -2280,11 +2218,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             let codec = crate::snapshot::codec::codec("hooks")?;
                             let value = serde_json::to_value(h).ok()?;
                             let art = codec.disk_bytes(&value).ok()?;
-                            let ovl = ctx
-                                .overlay
-                                .as_ref()
-                                .and_then(|o| codec.overlay(o, &it.slug));
-                            let json = maybe_strip_overlay(art.json, ovl).ok()?;
+                            let json = art.json;
                             let code = art
                                 .sidecars
                                 .into_iter()
@@ -2312,11 +2246,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             let codec = crate::snapshot::codec::codec("rules")?;
                             let value = serde_json::to_value(r).ok()?;
                             let art = codec.disk_bytes(&value).ok()?;
-                            let ovl = ctx
-                                .overlay
-                                .as_ref()
-                                .and_then(|o| codec.overlay(o, &it.slug));
-                            let json = maybe_strip_overlay(art.json, ovl).ok()?;
+                            let json = art.json;
                             let code = art
                                 .sidecars
                                 .into_iter()
@@ -2363,11 +2293,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             let codec = crate::snapshot::codec::codec("queues")?;
                             let value = serde_json::to_value(*q).ok()?;
                             let art = codec.disk_bytes(&value).ok()?;
-                            let ovl = ctx
-                                .overlay
-                                .as_ref()
-                                .and_then(|o| codec.overlay(o, &it.slug));
-                            let bytes = maybe_strip_overlay(art.json, ovl).ok()?;
+                            let bytes = art.json;
                             Some(bytes)
                         });
                         Some(RemoteDeleteRefs {
@@ -2412,20 +2338,13 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                                     .join("schema.json")
                             }),
                         };
-                        // Derive codec artifacts (json + formula sidecars) and
-                        // apply overlay strip. The composite slug for overlay
-                        // lookup is `<ws_slug>/<q_slug>`.
+                        // Derive codec artifacts (json + formula sidecars).
                         let (restore_bytes, restore_formulas) =
-                            match body_pair.as_ref().and_then(|(s, ws_slug)| {
-                                let composite = format!("{ws_slug}/{}", it.slug);
+                            match body_pair.as_ref().and_then(|(s, _ws_slug)| {
                                 let codec = crate::snapshot::codec::codec("schemas")?;
                                 let value = serde_json::to_value(*s).ok()?;
                                 let art = codec.disk_bytes(&value).ok()?;
-                                let ovl = ctx
-                                    .overlay
-                                    .as_ref()
-                                    .and_then(|o| codec.overlay(o, &composite));
-                                let json = maybe_strip_overlay(art.json, ovl).ok()?;
+                                let json = art.json;
                                 let formulas: Vec<(String, Vec<u8>)> = art
                                     .sidecars
                                     .into_iter()
@@ -2484,11 +2403,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             let codec = crate::snapshot::codec::codec("inboxes")?;
                             let value = serde_json::to_value(*i).ok()?;
                             let art = codec.disk_bytes(&value).ok()?;
-                            let ovl = ctx
-                                .overlay
-                                .as_ref()
-                                .and_then(|o| codec.overlay(o, &it.slug));
-                            let bytes = maybe_strip_overlay(art.json, ovl).ok()?;
+                            let bytes = art.json;
                             Some(bytes)
                         });
                         Some(RemoteDeleteRefs {
@@ -2522,11 +2437,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             let codec = crate::snapshot::codec::codec("email_templates")?;
                             let value = serde_json::to_value(t).ok()?;
                             let art = codec.disk_bytes(&value).ok()?;
-                            let ovl = ctx
-                                .overlay
-                                .as_ref()
-                                .and_then(|o| codec.overlay(o, &it.slug));
-                            let bytes = maybe_strip_overlay(art.json, ovl).ok()?;
+                            let bytes = art.json;
                             Some(bytes)
                         });
                         Some(RemoteDeleteRefs {
@@ -3539,7 +3450,6 @@ mod tests {
                 client: &fixture.client,
                 lockfile: &mut fixture.lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: true,
             };
             resolve_conflicts(
@@ -3599,7 +3509,6 @@ mod tests {
                 client: &fixture.client,
                 lockfile: &mut fixture.lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: true,
             };
             resolve_conflicts(
@@ -3671,7 +3580,6 @@ mod tests {
                 client: &fixture.client,
                 lockfile: &mut fixture.lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: true,
             };
             resolve_conflicts(
@@ -3754,7 +3662,6 @@ mod tests {
                 client: &fixture.client,
                 lockfile: &mut fixture.lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: false,
             };
             // Empty stdin — non-interactive path must not block on read.
@@ -3806,7 +3713,6 @@ mod tests {
                 client: &fixture.client,
                 lockfile: &mut fixture.lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: true,
             };
             resolve_conflicts(
@@ -3856,7 +3762,6 @@ mod tests {
                 client: &fixture.client,
                 lockfile: &mut fixture.lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: true,
             };
             // Empty stdin — if the resolver tried to read here, the
@@ -3999,7 +3904,6 @@ mod tests {
                 client: &client,
                 lockfile: &mut lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: true,
             };
             prune_mdh_orphans(&mut ctx, &remote_slugs, Cursor::new(b"r\n"), true, &progress)
@@ -4066,7 +3970,6 @@ mod tests {
                 client: &client,
                 lockfile: &mut lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: false,
             };
             prune_mdh_orphans(&mut ctx, &remote_slugs, Cursor::new(b""), false, &progress)
@@ -4111,7 +4014,6 @@ mod tests {
                 client: &client,
                 lockfile: &mut lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: true,
             };
             prune_mdh_orphans(&mut ctx, &remote_slugs, Cursor::new(b"s\n"), true, &progress)
@@ -4158,7 +4060,6 @@ mod tests {
                 client: &client,
                 lockfile: &mut lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: true,
             };
             prune_mdh_orphans(&mut ctx, &remote_slugs, Cursor::new(b"k\n"), true, &progress)
@@ -4214,7 +4115,6 @@ mod tests {
                 client: &client,
                 lockfile: &mut lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: false,
             };
             prune_mdh_orphans(&mut ctx, &remote_slugs, Cursor::new(b""), false, &progress)
@@ -4252,7 +4152,6 @@ mod tests {
                 client: &fixture.client,
                 lockfile: &mut fixture.lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: true,
             };
             resolve_remote_deletes(
@@ -4311,7 +4210,6 @@ mod tests {
                 client: &fixture.client,
                 lockfile: &mut fixture.lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: true,
             };
             resolve_remote_deletes(
@@ -4364,7 +4262,6 @@ mod tests {
                 client: &fixture.client,
                 lockfile: &mut fixture.lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: true,
             };
             resolve_remote_deletes(
@@ -4419,7 +4316,6 @@ mod tests {
                 client: &fixture.client,
                 lockfile: &mut fixture.lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: false,
             };
             // Empty stdin — if the helper tried to read here, the read
@@ -4504,7 +4400,6 @@ mod tests {
                 client: &client,
                 lockfile: &mut lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: true,
             };
             resolve_remote_deletes(
@@ -4564,7 +4459,6 @@ mod tests {
                 client: &fixture.client,
                 lockfile: &mut fixture.lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: true,
             };
             // Empty stdin — BothDeleted must not prompt.
@@ -4745,7 +4639,6 @@ mod tests {
                 client: &client,
                 lockfile: &mut lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: true,
             };
             resolve_conflicts(
@@ -4820,7 +4713,6 @@ mod tests {
                 client: &client,
                 lockfile: &mut lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: true,
             };
             resolve_conflicts(
@@ -4890,7 +4782,6 @@ mod tests {
                 client: &client,
                 lockfile: &mut lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: true,
             };
             resolve_conflicts(
@@ -5020,7 +4911,6 @@ mod tests {
                 client: &client,
                 lockfile: &mut lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: true,
             };
             resolve_conflicts(
@@ -5182,7 +5072,6 @@ mod tests {
                 client: &client,
                 lockfile: &mut lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: true,
             };
             // Empty stdin → resolver hits the legacy `read_line == 0`
@@ -5340,7 +5229,6 @@ mod tests {
                 client: &client,
                 lockfile: &mut lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: true,
             };
             resolve_conflicts(
@@ -5590,7 +5478,6 @@ mod tests {
                 client: &client,
                 lockfile: &mut lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: true,
             };
             resolve_conflicts(
@@ -5685,14 +5572,6 @@ mod tests {
         std::fs::write(&local_json_path, &local_json_bytes).unwrap();
         std::fs::write(&local_py_path, b"def validate(payload):\n    pass\n").unwrap();
 
-        // Overlay manages `description` for hooks/<slug>. Under C-1 this no
-        // longer strips on pull/sync; it only matters at migrate time.
-        let overlay_toml = format!(
-            "version = 1\n\n[hooks.{}]\n\"description\" = \"PROD-specific description managed by overlay\"\n",
-            slug
-        );
-        let overlay: crate::overlay::Overlay = toml::from_str(&overlay_toml).unwrap();
-
         // Seed the lockfile with a base hash that differs from both local and
         // remote (simulates a prior state before both sides diverged).
         // Build lockfile first so all hash computations can use it for URL
@@ -5738,16 +5617,13 @@ mod tests {
             },
         );
 
-        // Compute the expected remote hash. Under C-1 `maybe_strip_overlay` is
-        // a no-op, so this is the FULL remote (description kept) + code sidecar
-        // — exactly the on-disk bytes keep-remote writes and the next
-        // classifier would hash.
+        // Compute the expected remote hash. Under C-1 overlays are migrate-only,
+        // so this is the FULL remote (description kept) + code sidecar — exactly
+        // the on-disk bytes keep-remote writes and the next classifier would hash.
         let codec = crate::snapshot::codec::codec("hooks").unwrap();
         let remote_value = serde_json::to_value(&remote_hook).unwrap();
         let remote_art = codec.disk_bytes(&remote_value).unwrap();
-        let remote_ovl = overlay.hook(slug);
-        let remote_json_full =
-            crate::cli::pull::common::maybe_strip_overlay(remote_art.json, remote_ovl).unwrap();
+        let remote_json_full = remote_art.json;
         let remote_code_bytes = remote_art
             .sidecars
             .iter()
@@ -5794,7 +5670,6 @@ mod tests {
                 client: &client,
                 lockfile: &mut lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: Some(overlay),
                 interactive: true,
             };
             resolve_conflicts(
@@ -5987,7 +5862,6 @@ mod tests {
                 client: &client,
                 lockfile: &mut lockfile,
                 queue_locations: BTreeMap::new(),
-                overlay: None,
                 interactive: true,
             };
             resolve_remote_deletes(

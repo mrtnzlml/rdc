@@ -233,8 +233,6 @@ pub(crate) async fn run_cycle(
     // ids (push ref resolution, deploy cross-ref rewriting). Without this an
     // empty api_base makes `url_for_slug` return None and push refs fail loud.
     lockfile.api_base = env_cfg.api_base.clone();
-    let overlay = crate::overlay::Overlay::load(&paths.overlay_file())
-        .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
     let _title = if dry_run {
         format!("rdc sync {env} (dry run)")
@@ -262,7 +260,6 @@ pub(crate) async fn run_cycle(
             client: &client,
             lockfile: &mut lockfile,
             queue_locations: std::collections::BTreeMap::new(),
-            overlay: overlay.clone(),
             interactive,
         };
         crate::cli::pull::common::list_remote(&mut ctx, env_cfg, env, &token, &progress).await?
@@ -273,10 +270,10 @@ pub(crate) async fn run_cycle(
     let (_scanned, changes, tombstones) = crate::cli::push::scan::scan(&paths, &lockfile)?;
 
     // Phase 3: classify. The adapter re-runs each pull driver's
-    // canonical hashing (including overlay strip) so the recomputed
-    // remote hashes match what the lockfile recorded on last pull.
+    // canonical hashing so the recomputed remote hashes match what the
+    // lockfile recorded on last pull.
     let classified =
-        from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile, overlay.as_ref())?;
+        from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile)?;
 
     // Classification computed; grid renderer rebuild handled elsewhere.
 
@@ -389,7 +386,6 @@ pub(crate) async fn run_cycle(
             client: &client,
             lockfile: &mut lockfile,
             queue_locations: std::collections::BTreeMap::new(),
-            overlay,
             interactive,
         };
         execute::run(
@@ -410,20 +406,13 @@ pub(crate) async fn run_cycle(
     // No-op for the log renderer.
     let (_scanned_after, changes_after, tombstones_after) =
         crate::cli::push::scan::scan(&paths, &lockfile)?;
-    let overlay_after = crate::overlay::Overlay::load(&paths.overlay_file())
-        .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
     // Post-execute repaint re-classify. Collisions were already caught
     // pre-execute (above), so any error here would be spurious — discard it
     // and fall back to an empty repaint set rather than abort after a
     // successful sync.
-    let _classified_after = from_catalog_scan_lockfile(
-        &catalog,
-        &changes_after,
-        &tombstones_after,
-        &lockfile,
-        overlay_after.as_ref(),
-    )
-    .unwrap_or_default();
+    let _classified_after =
+        from_catalog_scan_lockfile(&catalog, &changes_after, &tombstones_after, &lockfile)
+            .unwrap_or_default();
     lockfile.save(&paths.lockfile())?;
     crate::cli::index::generate(&paths, &lockfile)
         .with_context(|| format!("generating _index.md for env '{env}'"))?;
@@ -453,14 +442,9 @@ pub(crate) async fn run_cycle(
 /// The hashing on each side must match so the classifier produces `Clean`
 /// when nothing has changed:
 /// * **`remote_hashes`** — re-runs the canonical serialization the per-kind
-///   pull driver performs before `record_object` (serialize → optional
-///   overlay strip → `content_hash`). This mirrors how the lockfile's
-///   `content_hash` was written on the last pull. The `overlay` arg lets
-///   the adapter apply the same `maybe_strip_overlay` the pull driver
-///   ran; without it, an env with any writable-kind overlay would emit
-///   spurious `RemoteEdit` for objects that haven't actually changed
-///   (since the lockfile recorded the post-strip hash, but the adapter
-///   would hash the pre-strip bytes).
+///   pull driver performs before `record_object` (serialize →
+///   `content_hash`). This mirrors how the lockfile's `content_hash` was
+///   written on the last pull.
 /// * **`scan_changes`** — already computed by [`crate::cli::push::scan::scan`]
 ///   over local file bytes with the same `content_hash` function. We
 ///   re-derive from the on-disk path here rather than smuggling the hash
@@ -475,7 +459,6 @@ pub fn from_catalog_scan_lockfile(
     changes: &crate::cli::push::scan::ChangeList,
     tombstones: &crate::cli::push::scan::Tombstones,
     lockfile: &crate::state::Lockfile,
-    overlay: Option<&crate::overlay::Overlay>,
 ) -> anyhow::Result<Vec<crate::cli::sync::classify::ClassifiedItem>> {
     use std::collections::{BTreeMap, BTreeSet};
     let mut remote_hashes: BTreeMap<(String, String), String> = BTreeMap::new();
@@ -586,13 +569,7 @@ pub fn from_catalog_scan_lockfile(
             Ok(a) => a,
             Err(_) => continue,
         };
-        let json = match crate::cli::pull::common::maybe_strip_overlay(
-            art.json,
-            overlay.and_then(|o| labels_codec.overlay(o, &slug)),
-        ) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
+        let json = art.json;
         let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
         let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
         remote_hashes.insert(("labels".to_string(), slug), hash);
@@ -635,12 +612,7 @@ pub fn from_catalog_scan_lockfile(
         if let Ok(value) = serde_json::to_value(org)
             && let Ok(art) = org_codec.disk_bytes(&value)
         {
-            // Organization has no overlay (codec.overlay returns None).
-            let json = crate::cli::pull::common::maybe_strip_overlay(
-                art.json,
-                overlay.and_then(|o| org_codec.overlay(o, "self")),
-            )
-            .unwrap_or_else(|_| vec![]);
+            let json = art.json;
             if !json.is_empty() {
                 let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
                 remote_hashes.insert(("organization".to_string(), "self".to_string()), hash);
@@ -685,13 +657,7 @@ pub fn from_catalog_scan_lockfile(
             Ok(a) => a,
             Err(_) => continue,
         };
-        let json = match crate::cli::pull::common::maybe_strip_overlay(
-            art.json,
-            overlay.and_then(|o| workflows_codec.overlay(o, &slug)),
-        ) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
+        let json = art.json;
         let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
         let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
         remote_hashes.insert(("workflows".to_string(), slug), hash);
@@ -743,13 +709,7 @@ pub fn from_catalog_scan_lockfile(
             Ok(a) => a,
             Err(_) => continue,
         };
-        let json = match crate::cli::pull::common::maybe_strip_overlay(
-            art.json,
-            overlay.and_then(|o| workflow_steps_codec.overlay(o, &composite_key)),
-        ) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
+        let json = art.json;
         let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
         let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
         remote_hashes.insert(("workflow_steps".to_string(), composite_key), hash);
@@ -773,9 +733,6 @@ pub fn from_catalog_scan_lockfile(
     // recursively. This caused a workspace whose remote `modified_at`
     // changed to phantom-drift (RemoteEdit / BothDiverged) even when no
     // meaningful content changed. Routing through the codec fixes this.
-    //
-    // Workspaces have no overlay (the codec's `overlay()` returns None),
-    // so `maybe_strip_overlay` is a no-op here.
     //
     // Build a freshly-computed workspace URL → slug map alongside the
     // hash insertion. Queue derivation below uses this map so a
@@ -805,13 +762,7 @@ pub fn from_catalog_scan_lockfile(
             Ok(a) => a,
             Err(_) => continue,
         };
-        let json = match crate::cli::pull::common::maybe_strip_overlay(
-            art.json,
-            overlay.and_then(|o| workspaces_codec.overlay(o, &slug)),
-        ) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
+        let json = art.json;
         let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
         let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
         remote_hashes.insert(("workspaces".to_string(), slug), hash);
@@ -865,13 +816,7 @@ pub fn from_catalog_scan_lockfile(
             Ok(a) => a,
             Err(_) => continue,
         };
-        let json = match crate::cli::pull::common::maybe_strip_overlay(
-            art.json,
-            overlay.and_then(|o| engines_codec.overlay(o, &slug)),
-        ) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
+        let json = art.json;
         let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
         let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
         remote_hashes.insert(("engines".to_string(), slug), hash);
@@ -932,13 +877,7 @@ pub fn from_catalog_scan_lockfile(
             Ok(a) => a,
             Err(_) => continue,
         };
-        let json = match crate::cli::pull::common::maybe_strip_overlay(
-            art.json,
-            overlay.and_then(|o| engine_fields_codec.overlay(o, &composite_key)),
-        ) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
+        let json = art.json;
         let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
         let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
         remote_hashes.insert(("engine_fields".to_string(), composite_key), hash);
@@ -995,13 +934,7 @@ pub fn from_catalog_scan_lockfile(
             Ok(a) => a,
             Err(_) => continue,
         };
-        let json = match crate::cli::pull::common::maybe_strip_overlay(
-            art.json,
-            overlay.and_then(|o| hooks_codec.overlay(o, &slug)),
-        ) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
+        let json = art.json;
         let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
         let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
         remote_hashes.insert(("hooks".to_string(), slug), hash);
@@ -1065,13 +998,7 @@ pub fn from_catalog_scan_lockfile(
             Ok(a) => a,
             Err(_) => continue,
         };
-        let json = match crate::cli::pull::common::maybe_strip_overlay(
-            art.json,
-            overlay.and_then(|o| rules_codec.overlay(o, &slug)),
-        ) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
+        let json = art.json;
         let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
         let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
         remote_hashes.insert(("rules".to_string(), slug), hash);
@@ -1165,28 +1092,18 @@ pub fn from_catalog_scan_lockfile(
         // strips `modified_at`) for hash parity with the pull baseline.
         if let Ok(q_value) = serde_json::to_value(q)
             && let Ok(q_art) = queues_codec.disk_bytes(&q_value)
-            && let Ok(q_json) = crate::cli::pull::common::maybe_strip_overlay(
-                q_art.json,
-                overlay.and_then(|o| queues_codec.overlay(o, &q_slug)),
-            )
         {
-            let q_json = crate::cli::pull::common::portabilize_proposed(&q_json, lockfile);
+            let q_json = crate::cli::pull::common::portabilize_proposed(&q_art.json, lockfile);
             let q_hash = crate::snapshot::codec::combined_hash(&q_json, &q_art.sidecars, lockfile);
             remote_hashes.insert(("queues".to_string(), q_slug.clone()), q_hash);
         }
 
-        // schemas — combined (json + formulas). The composite slug for
-        // schemas is `<ws_slug>/<q_slug>` (matching the lockfile key).
-        let schema_composite = format!("{ws_slug}/{q_slug}");
+        // schemas — combined (json + formulas).
         if let Some(schema) = catalog.schemas_by_queue_id.get(&q.id)
             && let Ok(s_value) = serde_json::to_value(schema)
             && let Ok(s_art) = schemas_codec.disk_bytes(&s_value)
-            && let Ok(s_json) = crate::cli::pull::common::maybe_strip_overlay(
-                s_art.json,
-                overlay.and_then(|o| schemas_codec.overlay(o, &schema_composite)),
-            )
         {
-            let s_json = crate::cli::pull::common::portabilize_proposed(&s_json, lockfile);
+            let s_json = crate::cli::pull::common::portabilize_proposed(&s_art.json, lockfile);
             let s_hash = crate::snapshot::codec::combined_hash(&s_json, &s_art.sidecars, lockfile);
             remote_hashes.insert(("schemas".to_string(), q_slug.clone()), s_hash);
         }
@@ -1195,12 +1112,8 @@ pub fn from_catalog_scan_lockfile(
         if let Some(inbox) = catalog.inboxes_by_queue_id.get(&q.id)
             && let Ok(i_value) = serde_json::to_value(inbox)
             && let Ok(i_art) = inboxes_codec.disk_bytes(&i_value)
-            && let Ok(i_json) = crate::cli::pull::common::maybe_strip_overlay(
-                i_art.json,
-                overlay.and_then(|o| inboxes_codec.overlay(o, &q_slug)),
-            )
         {
-            let i_json = crate::cli::pull::common::portabilize_proposed(&i_json, lockfile);
+            let i_json = crate::cli::pull::common::portabilize_proposed(&i_art.json, lockfile);
             let i_hash = crate::snapshot::codec::combined_hash(&i_json, &i_art.sidecars, lockfile);
             remote_hashes.insert(("inboxes".to_string(), q_slug.clone()), i_hash);
         }
@@ -1317,13 +1230,7 @@ pub fn from_catalog_scan_lockfile(
             Ok(a) => a,
             Err(_) => continue,
         };
-        let json = match crate::cli::pull::common::maybe_strip_overlay(
-            art.json,
-            overlay.and_then(|o| email_templates_codec.overlay(o, &compound)),
-        ) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
+        let json = art.json;
         let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
         let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
         remote_hashes.insert(("email_templates".to_string(), compound), hash);
@@ -1420,13 +1327,9 @@ mod tests {
     /// Hash a hook the way the pull driver does (serialize + optional
     /// overlay strip + `hook_combined_hash`) so the test seeds the
     /// lockfile with the same base hash production would have written.
-    fn pull_driver_hash(
-        h: &Hook,
-        overlay_paths: Option<&BTreeMap<String, serde_json::Value>>,
-    ) -> String {
+    fn pull_driver_hash(h: &Hook) -> String {
         let (json_bytes, code) = serialize_hook(h).unwrap();
-        let stripped =
-            crate::cli::pull::common::maybe_strip_overlay(json_bytes, overlay_paths).unwrap();
+        let stripped = json_bytes;
         // Simulate the pull driver's FINAL recorded base (after the portabilize
         // post-pass): the hook is in the lockfile, so its self-url normalizes to
         // `rdc://`. Hash with a minimal lockfile holding this hook so the base
@@ -1548,7 +1451,7 @@ mod tests {
         catalog.queues = vec![deletion_queue];
 
         let classified =
-            from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile, None).unwrap();
+            from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile).unwrap();
         let item = classified
             .iter()
             .find(|c| c.kind == "hooks" && c.slug == slug)
@@ -1584,7 +1487,7 @@ mod tests {
             "def base():\n    return 1\n",
             "2026-05-14T08:00:00Z",
         );
-        let base_hash = pull_driver_hash(&base_hook, None);
+        let base_hash = pull_driver_hash(&base_hook);
 
         // Local state on disk: the user edited the .py sidecar AND tweaked
         // the .json (e.g., events list). The scan must therefore observe a
@@ -1644,7 +1547,7 @@ mod tests {
 
         // --- act ----------------------------------------------------------
         let classified =
-            from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile, None).unwrap();
+            from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile).unwrap();
 
         // --- assert -------------------------------------------------------
         let item = classified
@@ -1704,7 +1607,7 @@ mod tests {
 
         let catalog = catalog_with_hooks(vec![hook_a, hook_b]);
         let classified =
-            from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile, None).unwrap();
+            from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile).unwrap();
 
         // Both siblings must surface as DISTINCT RemoteCreate items. Before the
         // fix the augment used `slugify(name)` + clobbering `upsert`, collapsing
@@ -1768,19 +1671,6 @@ mod tests {
         std::fs::create_dir_all(paths.hooks_dir()).unwrap();
         std::fs::create_dir_all(paths.env_root()).unwrap();
 
-        // Overlay drops `config.runtime` from canonical form on pull and
-        // re-applies it on push. The lockfile thus records hash WITHOUT
-        // `config.runtime`.
-        std::fs::write(
-            paths.overlay_file(),
-            r#"version = 1
-
-[hooks.ap-reject-if-no-doc-id]
-"config.runtime" = "python3.12-secure"
-"#,
-        )
-        .unwrap();
-
         let slug = "ap-reject-if-no-doc-id";
         let base_hook = mk_hook(
             42,
@@ -1789,19 +1679,16 @@ mod tests {
             "2026-05-14T08:00:00Z",
         );
 
-        // Compute the pull-driver base hash (post-strip) so the lockfile
-        // matches what production would have written.
-        let overlay = crate::overlay::Overlay::load(&paths.overlay_file()).unwrap();
-        let overlay_paths = overlay.as_ref().and_then(|o| o.hook(slug));
-        let base_hash = pull_driver_hash(&base_hook, overlay_paths);
+        // Compute the pull-driver base hash so the lockfile matches what
+        // production would have written.
+        let base_hash = pull_driver_hash(&base_hook);
 
         // Local file: the disk form is the post-strip canonical AND
         // portabilized to `rdc://` form — matching what the pull post-pass
         // writes to disk in production. A minimal lockfile holding this hook
         // lets the self-url normalize identically to base/remote.
         let (base_json_full, base_code) = serialize_hook(&base_hook).unwrap();
-        let base_json_stripped =
-            crate::cli::pull::common::maybe_strip_overlay(base_json_full, overlay_paths).unwrap();
+        let base_json_stripped = base_json_full;
         let mut local_lf = Lockfile::default();
         local_lf.upsert(
             "hooks",
@@ -1844,14 +1731,8 @@ mod tests {
         );
 
         let catalog = catalog_with_hooks(vec![base_hook.clone()]);
-        let classified = from_catalog_scan_lockfile(
-            &catalog,
-            &changes,
-            &tombstones,
-            &lockfile,
-            overlay.as_ref(),
-        )
-        .unwrap();
+        let classified =
+            from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile).unwrap();
         let item = classified
             .iter()
             .find(|c| c.kind == "hooks" && c.slug == slug)
@@ -1899,16 +1780,6 @@ mod tests {
         std::fs::create_dir_all(paths.hooks_dir()).unwrap();
         std::fs::create_dir_all(paths.env_root()).unwrap();
 
-        std::fs::write(
-            paths.overlay_file(),
-            r#"version = 1
-
-[hooks.ap-reject-if-no-doc-id]
-"config.runtime" = "python3.12-secure"
-"#,
-        )
-        .unwrap();
-
         let slug = "ap-reject-if-no-doc-id";
         let base_hook = mk_hook(
             42,
@@ -1916,16 +1787,12 @@ mod tests {
             "def base():\n    return 1\n",
             "2026-05-14T08:00:00Z",
         );
-        let overlay = crate::overlay::Overlay::load(&paths.overlay_file()).unwrap();
-        let overlay_paths = overlay.as_ref().and_then(|o| o.hook(slug));
-        let base_hash = pull_driver_hash(&base_hook, overlay_paths);
+        let base_hash = pull_driver_hash(&base_hook);
 
         // Local edited the .py sidecar — different code from base. Disk
-        // bytes for JSON are the post-strip form (unchanged); .py was
-        // touched.
+        // bytes for JSON are unchanged; .py was touched.
         let (base_json_full, _base_code) = serialize_hook(&base_hook).unwrap();
-        let base_json_stripped =
-            crate::cli::pull::common::maybe_strip_overlay(base_json_full, overlay_paths).unwrap();
+        let base_json_stripped = base_json_full;
         let local_json_path = paths.hooks_dir().join(format!("{slug}.json"));
         let local_py_path = paths.hooks_dir().join(format!("{slug}.py"));
         std::fs::write(&local_json_path, &base_json_stripped).unwrap();
@@ -1961,14 +1828,8 @@ mod tests {
         );
 
         let catalog = catalog_with_hooks(vec![remote_hook]);
-        let classified = from_catalog_scan_lockfile(
-            &catalog,
-            &changes,
-            &tombstones,
-            &lockfile,
-            overlay.as_ref(),
-        )
-        .unwrap();
+        let classified =
+            from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile).unwrap();
         let item = classified
             .iter()
             .find(|c| c.kind == "hooks" && c.slug == slug)
