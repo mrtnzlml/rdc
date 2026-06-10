@@ -1,11 +1,21 @@
-//! Per-env overlays — declarative env-specific values that override the
-//! canonical snapshot when pushing to that env. Per spec §9.
+//! Per-env overlays — declarative env-specific values applied when MIGRATING
+//! a snapshot from one environment to another. Per spec §9.
 //!
-//! Bidirectional: applied on push (merged into the outbound PATCH body)
-//! and stripped on pull (the snapshot stays in canonical pre-overlay
-//! form so cross-env diffs and deploys are quiet). The override format
-//! is simple dotted-path keys; JMESPath wildcards / array filters are
-//! out of scope for v1.
+//! C-1 model (migrate-only): an overlay maps dotted-path keys to the value the
+//! TARGET env should use. `migrate` applies them (via [`apply_overrides`]) so
+//! the promoted snapshot carries that env's real values. Pull, push, and sync
+//! treat overlay-managed fields as ordinary content — they are NOT stripped on
+//! pull nor re-applied on push — so each env's snapshot shows its real values
+//! on disk and the snapshot itself is the source of truth for what is pushed.
+//!
+//! (Previously the overlay was bidirectional — applied on push, stripped on
+//! pull — which kept the snapshot env-agnostic but hid the value from disk.
+//! C-1 trades that for visibility: snapshots are env-specific and self-evident.
+//! [`strip_paths`] and the now-no-op `maybe_strip_overlay` are vestigial under
+//! C-1, retained pending a cleanup pass.)
+//!
+//! The override format is simple dotted-path keys; JMESPath wildcards / array
+//! filters are out of scope for v1.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

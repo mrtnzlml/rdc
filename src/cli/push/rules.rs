@@ -1,7 +1,7 @@
 use crate::api::RossumClient;
 use crate::cli::pull::common::maybe_strip_overlay;
 use crate::log::{Action, Log};
-use crate::overlay::{Overlay, apply_overrides};
+use crate::overlay::Overlay;
 use crate::paths::Paths;
 
 use crate::snapshot::create::{strip_for_create, strip_patch_extra};
@@ -43,9 +43,6 @@ pub async fn push(
         {
             let mut payload = read_rule_value(&rules_dir, slug)
                 .with_context(|| format!("reading local rule '{slug}' for create"))?;
-            if let Some(p) = overlay_paths {
-                apply_overrides(&mut payload, p);
-            }
             crate::snapshot::refs::resolve_value(&mut payload, lockfile);
             strip_for_create(&mut payload, "rules");
             let create_result = client
@@ -93,9 +90,6 @@ pub async fn push(
 
         let mut payload = read_rule_value(&rules_dir, slug)
             .with_context(|| format!("reading local rule '{slug}'"))?;
-        if let Some(p) = overlay_paths {
-            apply_overrides(&mut payload, p);
-        }
         crate::snapshot::refs::resolve_value(&mut payload, lockfile);
         let payload_rule: crate::model::Rule = serde_json::from_value(payload)
             .with_context(|| format!("deserializing overlay-applied rule '{slug}'"))?;
