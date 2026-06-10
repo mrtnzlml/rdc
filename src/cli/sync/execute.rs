@@ -358,8 +358,8 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
             }
             "hooks" => hook_by_slug.get(it.slug.as_str()).copied().and_then(|h| {
                 // Route through the codec to get the canonical on-disk bytes
-                // (status-redacted, code extracted) and apply the overlay strip
-                // so the remote bytes match what the pull driver writes to disk.
+                // (status-redacted, code extracted) so the remote bytes match
+                // what the pull driver writes to disk.
                 let codec = crate::snapshot::codec::codec("hooks")?;
                 let value = serde_json::to_value(h).ok()?;
                 let art = codec.disk_bytes(&value).ok()?;
@@ -405,8 +405,8 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 .get(it.slug.as_str())
                 .and_then(|(q, ws_slug)| {
                     // Route through codec to get canonical on-disk bytes
-                    // (counts-redacted) and apply overlay strip so the remote
-                    // bytes match what the pull driver writes to disk.
+                    // (counts-redacted) so the remote bytes match what the
+                    // pull driver writes to disk.
                     let codec = crate::snapshot::codec::codec("queues")?;
                     let value = serde_json::to_value(*q).ok()?;
                     let art = codec.disk_bytes(&value).ok()?;
@@ -424,8 +424,8 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                 }),
             "schemas" => {
                 // Route through codec so we get the canonical json + formula
-                // sidecars and apply the overlay strip. The combined_hash over
-                // (stripped_json, sidecars) matches what pull::queues records.
+                // sidecars. The combined_hash over (canonical_json, sidecars)
+                // matches what pull::queues records.
                 queue_by_slug
                     .get(it.slug.as_str())
                     .and_then(|(q, ws_slug)| {
@@ -753,9 +753,8 @@ fn try_auto_merge(
 
     // Helper: canonicalize merged JSON through the codec for this kind
     // (re-applies redact/hidden-strip so a merge can't bake in a live
-    // `counts`/`agenda_id`/`status` field) and apply the overlay strip
-    // so overlay-managed fields don't get baked into the merged bytes.
-    // Returns `(canonical_json, sidecars)`.
+    // `counts`/`agenda_id`/`status` field). Returns
+    // `(canonical_json, sidecars)`.
     #[allow(clippy::type_complexity)]
     let canonicalize_merged_json =
         |v: serde_json::Value| -> Option<(Vec<u8>, Vec<(String, Vec<u8>)>)> {
@@ -856,7 +855,7 @@ fn try_auto_merge(
             local_paths.extend(code_lp);
             remote_paths.extend(code_rp);
 
-            // Canonicalize merged JSON through the codec + overlay strip.
+            // Canonicalize merged JSON through the codec.
             let merged_json_bytes = match canonicalize_merged_json(json_merged) {
                 Some((bytes, _)) => bytes,
                 None => {
@@ -985,9 +984,8 @@ fn try_auto_merge(
                 }
             }
 
-            // Canonicalize the merged schema JSON through the codec +
-            // overlay strip before writing, so overlay-managed fields
-            // don't get baked into the merged output.
+            // Canonicalize the merged schema JSON through the codec before
+            // writing, so the merged output matches the codec's on-disk form.
             let merged_json_bytes = match canonicalize_merged_json(json_merged) {
                 Some((bytes, _)) => bytes,
                 None => {
@@ -2212,8 +2210,8 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                         let local_path = ctx.paths.hooks_dir().join(format!("{}.json", it.slug));
                         let body = hook_by_slug.get(it.slug.as_str()).copied();
                         // Route through the codec to get the canonical on-disk
-                        // bytes (status-redacted, code extracted) and apply the
-                        // overlay strip so the restore matches the pull driver.
+                        // bytes (status-redacted, code extracted) so the
+                        // restore matches the pull driver.
                         let (restore_bytes, restore_code) = match body.and_then(|h| {
                             let codec = crate::snapshot::codec::codec("hooks")?;
                             let value = serde_json::to_value(h).ok()?;
@@ -2311,7 +2309,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                         // schemas live alongside the queue at schema.json.
                         // Bug e fix: route through the codec so formula sidecars
                         // are preserved and restored on [r]/[k]. The hash must
-                        // be combined_hash(post-overlay json, framed sidecars).
+                        // be combined_hash(canonical json, framed sidecars).
                         let body_pair =
                             queue_by_slug
                                 .get(it.slug.as_str())
@@ -5636,7 +5634,7 @@ mod tests {
             &lockfile,
         );
 
-        // Simulate the local hash: post-overlay (no description) + local code.
+        // Simulate the local hash: on-disk JSON (no description) + local code.
         let local_code_str = "def validate(payload):\n    pass\n".to_string();
         let local_hash = combined_hash(
             &local_json_bytes,
@@ -5894,7 +5892,7 @@ mod tests {
             "restored formula must match the remote schema's formula"
         );
 
-        // The lockfile hash must be combined_hash(post-overlay json, framed sidecars)
+        // The lockfile hash must be combined_hash(canonical json, framed sidecars)
         // so the next sync sees Clean.
         let expected_hash = codec
             .base_hash(&schema_value, &Lockfile::default())

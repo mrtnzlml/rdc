@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 /// Push locally-edited schemas. Iterates the pre-computed change list (from
 /// phase 1 scan). Each entry's path is the schema.json file; the queue dir
-/// is derived as path.parent(). Drift-checks remote post-strip, and PATCHes.
-/// Post-PATCH disk write is also stripped so the snapshot matches
-/// lockfile.content_hash.
+/// is derived as path.parent(). Drift-checks the remote's canonical
+/// on-disk form, and PATCHes. The post-PATCH disk write is the same
+/// canonical form so the snapshot matches lockfile.content_hash.
 pub async fn push(
     _paths: &Paths,
     client: &RossumClient,
