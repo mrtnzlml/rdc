@@ -1,5 +1,5 @@
 use super::common::{
-    PullAction, PullCtx, apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
+    PullAction, PullCtx, apply_pull_action, decide_pull_action, record_object,
     skip_on_permission_denied,
 };
 use crate::log::{Action, Log};
@@ -58,10 +58,7 @@ pub async fn process(
             let value = serde_json::to_value(e)?;
             let codec = crate::snapshot::codec::codec(KIND).unwrap();
             let art = codec.disk_bytes(&value).context("serializing engine")?;
-            let proposed = maybe_strip_overlay(
-                art.json,
-                ctx.overlay.as_ref().and_then(|o| codec.overlay(o, &slug)),
-            )?;
+            let proposed = art.json;
 
             let local_path = engine_dir.join("engine.json");
             let base_hash = ctx

@@ -1,5 +1,5 @@
 use super::common::{
-    PullAction, PullCtx, apply_pull_action, decide_pull_action, maybe_strip_overlay, record_object,
+    PullAction, PullCtx, apply_pull_action, decide_pull_action, record_object,
     skip_on_permission_denied,
 };
 use crate::log::{Action, Log};
@@ -90,19 +90,12 @@ pub async fn process(
                 .with_context(|| format!("creating {}", fields_dir.display()))?;
 
             // Canonical on-disk bytes via KindCodec: strips `modified_at`.
-            // Overlay is keyed by the composite key.
             let value = serde_json::to_value(f)?;
             let art = crate::snapshot::codec::codec(KIND)
                 .unwrap()
                 .disk_bytes(&value)
                 .context("serializing engine field")?;
-            let codec = crate::snapshot::codec::codec(KIND).unwrap();
-            let proposed = maybe_strip_overlay(
-                art.json,
-                ctx.overlay
-                    .as_ref()
-                    .and_then(|o| codec.overlay(o, &composite_key)),
-            )?;
+            let proposed = art.json;
 
             let local_path = fields_dir.join(format!("{field_slug}.json"));
             let base_hash = ctx

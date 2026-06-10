@@ -1,7 +1,5 @@
 use crate::api::RossumClient;
-use crate::cli::pull::common::maybe_strip_overlay;
 use crate::log::{Action, Log};
-use crate::overlay::Overlay;
 use crate::paths::Paths;
 
 use crate::snapshot::create::{strip_for_create, strip_patch_extra};
@@ -21,8 +19,6 @@ pub async fn push(
     progress: &Arc<Log>,
     env: &str,
 ) -> Result<(usize, usize)> {
-    let overlay = Overlay::load(&paths.overlay_file())
-        .with_context(|| format!("loading overlay from {}", paths.overlay_file().display()))?;
 
     let rules_dir = paths.rules_dir();
     let mut pushed = 0usize;
@@ -32,7 +28,6 @@ pub async fn push(
 
     for (slug, local_json_path) in changes {
         let local_py_path = rules_dir.join(format!("{slug}.py"));
-        let overlay_paths = overlay.as_ref().and_then(|ov| ov.rule(slug));
 
         // CREATE — no lockfile entry yet.
         if lockfile
@@ -51,7 +46,7 @@ pub async fn push(
                 .with_context(|| format!("POST /rules (creating '{slug}')"));
             let created = create_result?;
             let (created_json_full, created_code) = serialize_rule(&created)?;
-            let created_json_stripped = maybe_strip_overlay(created_json_full, overlay_paths)?;
+            let created_json_stripped = created_json_full;
             let created_hash = rule_combined_hash(&created_json_stripped, &created_code, lockfile);
             write_atomic(local_json_path, &created_json_stripped)
                 .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
@@ -113,7 +108,7 @@ pub async fn push(
             continue;
         };
         let (remote_json_full, remote_code) = serialize_rule(remote_rule)?;
-        let remote_json_stripped = maybe_strip_overlay(remote_json_full, overlay_paths)?;
+        let remote_json_stripped = remote_json_full;
         let remote_combined = rule_combined_hash(&remote_json_stripped, &remote_code, lockfile);
         let mut payload_to_send = payload_rule;
         if remote_combined != base {
@@ -176,7 +171,7 @@ pub async fn push(
 
         // Refresh local file with the post-strip canonical form.
         let (updated_json_full, updated_code) = serialize_rule(&updated)?;
-        let updated_json_stripped = maybe_strip_overlay(updated_json_full, overlay_paths)?;
+        let updated_json_stripped = updated_json_full;
         let updated_hash = rule_combined_hash(&updated_json_stripped, &updated_code, lockfile);
         crate::state::base_cache::write_disk_and_cache(
             paths,
