@@ -140,6 +140,14 @@ jobs:
 
             def install
               bin.install "rdc"
+              # rdc uses clap_complete's dynamic completions: COMPLETE=<shell> rdc
+              # emits the registration script. :clap is Homebrew's predefined
+              # format for exactly that protocol (bash/zsh/fish by default).
+              generate_completions_from_executable(bin/"rdc", shell_parameter_format: :clap)
+              # clap's zsh script only registers the completer (it is written for
+              # \`source <(COMPLETE=zsh rdc)\`); autoloaded from fpath as _rdc, the
+              # first TAB of a session would no-op. Invoke the completer too.
+              (zsh_completion/"_rdc").append_lines "_clap_dynamic_completer_rdc"
             end
 
             test do
