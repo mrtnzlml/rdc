@@ -45,10 +45,9 @@ pub async fn push(
                 .await
                 .with_context(|| format!("POST /rules (creating '{slug}')"));
             let created = create_result?;
-            let (created_json_full, created_code) = serialize_rule(&created)?;
-            let created_json_stripped = created_json_full;
-            let created_hash = rule_combined_hash(&created_json_stripped, &created_code, lockfile);
-            write_atomic(local_json_path, &created_json_stripped)
+            let (created_json, created_code) = serialize_rule(&created)?;
+            let created_hash = rule_combined_hash(&created_json, &created_code, lockfile);
+            write_atomic(local_json_path, &created_json)
                 .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
             if let Some(code) = &created_code {
                 write_rule_code(&rules_dir, slug, code)
@@ -107,13 +106,12 @@ pub async fn push(
             skipped += 1;
             continue;
         };
-        let (remote_json_full, remote_code) = serialize_rule(remote_rule)?;
-        let remote_json_stripped = remote_json_full;
-        let remote_combined = rule_combined_hash(&remote_json_stripped, &remote_code, lockfile);
+        let (remote_json, remote_code) = serialize_rule(remote_rule)?;
+        let remote_combined = rule_combined_hash(&remote_json, &remote_code, lockfile);
         let mut payload_to_send = payload_rule;
         if remote_combined != base {
             use crate::cli::resolve::{PushDriftOutcome, resolve_push_drift};
-            match resolve_push_drift(interactive, local_json_path, &remote_json_stripped, env)? {
+            match resolve_push_drift(interactive, local_json_path, &remote_json, env)? {
                 PushDriftOutcome::Patch { payload_override } => {
                     if let Some(bytes) = payload_override {
                         let mut ov: serde_json::Value = serde_json::from_slice(&bytes)
@@ -124,7 +122,7 @@ pub async fn push(
                     }
                 }
                 PushDriftOutcome::Adopt => {
-                    write_atomic(local_json_path, &remote_json_stripped).with_context(|| {
+                    write_atomic(local_json_path, &remote_json).with_context(|| {
                         format!("adopting remote into {}", local_json_path.display())
                     })?;
                     if let Some(code) = &remote_code {
@@ -169,14 +167,13 @@ pub async fn push(
             .with_context(|| format!("PATCH /rules/{id}"));
         let updated = patch_result?;
 
-        // Refresh local file with the post-strip canonical form.
-        let (updated_json_full, updated_code) = serialize_rule(&updated)?;
-        let updated_json_stripped = updated_json_full;
-        let updated_hash = rule_combined_hash(&updated_json_stripped, &updated_code, lockfile);
+        // Refresh local file with the codec's canonical form.
+        let (updated_json, updated_code) = serialize_rule(&updated)?;
+        let updated_hash = rule_combined_hash(&updated_json, &updated_code, lockfile);
         crate::state::base_cache::write_disk_and_cache(
             paths,
             local_json_path,
-            &updated_json_stripped,
+            &updated_json,
         )
         .with_context(|| format!("writing post-push canonical form for '{slug}'"))?;
         if let Some(code) = &updated_code {

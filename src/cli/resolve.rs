@@ -1196,7 +1196,7 @@ pub enum PushDriftOutcome {
 
 /// Resolve a push-side drift conflict (spec §7.3 step 5). Caller passes
 /// the on-disk local path, the bytes the user wants to push, and the
-/// (overlay-stripped) bytes currently on the server.
+/// remote's canonical on-disk bytes (noise redacted, refs portabilized).
 ///
 /// When `interactive == false` (CI / non-TTY / `--yes`), returns
 /// `PushDriftOutcome::Skip` to preserve legacy behavior.
