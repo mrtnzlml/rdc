@@ -18,8 +18,9 @@ pub fn write_schema(queue_dir: &Path, schema: &Schema) -> Result<Vec<u8>> {
 }
 
 /// Write pre-serialized schema bytes + formulas. Bypasses the typed
-/// re-serialize done by `write_schema` — used by the pull driver after
-/// applying overlay strip to the schema's JSON Value.
+/// re-serialize done by `write_schema` — used by the pull driver, which
+/// hands in the codec's canonical JSON Value (noise redacted, formulas
+/// extracted, refs portabilized).
 pub fn write_schema_bytes(
     queue_dir: &Path,
     json_bytes: &[u8],

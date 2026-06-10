@@ -236,9 +236,9 @@ pub fn read_hook_value(dir: &Path, slug: &str) -> Result<Value> {
 /// Read a hook back from disk into a typed `Hook`. Splices the sidecar
 /// code file (`.py` or `.js`) back into `config.code` first, so the
 /// in-memory `Hook` is byte-for-byte equivalent to what was originally
-/// serialized. Fails if required typed fields are missing —
-/// overlay-stripping callers should use `read_hook_value` + apply
-/// overlay + `from_value` instead.
+/// serialized. Fails if required typed fields are missing — callers that
+/// need to mutate the untyped JSON before typing should use
+/// `read_hook_value` + `from_value` instead.
 pub fn read_hook(dir: &Path, slug: &str) -> Result<Hook> {
     let value = read_hook_value(dir, slug)?;
     let json_path = dir.join(format!("{slug}.json"));

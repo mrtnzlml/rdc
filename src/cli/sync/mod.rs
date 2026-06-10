@@ -1324,12 +1324,11 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
 
-    /// Hash a hook the way the pull driver does (serialize + optional
-    /// overlay strip + `hook_combined_hash`) so the test seeds the
-    /// lockfile with the same base hash production would have written.
+    /// Hash a hook the way the pull driver does (serialize +
+    /// `hook_combined_hash`) so the test seeds the lockfile with the same
+    /// base hash production would have written.
     fn pull_driver_hash(h: &Hook) -> String {
         let (json_bytes, code) = serialize_hook(h).unwrap();
-        let stripped = json_bytes;
         // Simulate the pull driver's FINAL recorded base (after the portabilize
         // post-pass): the hook is in the lockfile, so its self-url normalizes to
         // `rdc://`. Hash with a minimal lockfile holding this hook so the base
@@ -1345,7 +1344,7 @@ mod tests {
                 secrets_hash: None,
             },
         );
-        hook_combined_hash(&stripped, &code, &lf)
+        hook_combined_hash(&json_bytes, &code, &lf)
     }
 
     /// Regression for the deletion_requested-queue hook churn (Bug #1).
@@ -1636,34 +1635,25 @@ mod tests {
         assert_eq!(second.class, SyncClass::RemoteCreate);
     }
 
-    /// Regression for hypothesis A (overlay-strip parity): when the env has
-    /// an overlay configured for the hook, the pull driver hashes the
-    /// post-strip bytes and the lockfile records that hash. The adapter
-    /// recomputes the remote hash WITHOUT applying the same strip, so for
-    /// an UNCHANGED remote the two hashes don't match → the classifier
-    /// emits a false-positive RemoteEdit (or, with a local edit on top, a
-    /// silent BothDiverged that should have been LocalEdit — or vice
-    /// versa: a real BothDiverged silently downgraded because the adapter's
-    /// "is the remote at the lockfile?" answer is wrong).
+    /// Regression for classifier hash-parity: the pull driver records the
+    /// base hash over the canonical on-disk bytes, and the adapter
+    /// recomputes the remote hash over the same canonical bytes. For an
+    /// UNCHANGED remote the two hashes must match → `Clean`. If they ever
+    /// diverged the classifier would emit a false-positive RemoteEdit (or,
+    /// with a local edit on top, a silent BothDiverged that should have
+    /// been LocalEdit — or vice versa: a real BothDiverged silently
+    /// downgraded because the adapter's "is the remote at the lockfile?"
+    /// answer is wrong).
     ///
-    /// Concretely: with an overlay-stripped field whose value DIFFERS
-    /// between the lockfile base and the recomputed remote, an UNCHANGED
-    /// remote already mis-classifies. With a local edit on top the same
-    /// false-positive arises. This test pins the parity at the adapter.
+    /// This test pins the no-divergence case; a sibling test below covers
+    /// the divergent (`BothDiverged`) case.
     ///
     /// Setup:
-    /// - Overlay: `[hooks.<slug>] "config.runtime" = "python3.12-secure"`
     /// - Base hook (pull-time): `runtime: "python3.12"`, code A. Lockfile
-    ///   recorded `hash(strip(serialize(base)) + A)`.
+    ///   recorded `hash(serialize(base) + A)`.
     /// - Remote (now): IDENTICAL to base — nobody changed remote.
     /// - Local: IDENTICAL to base — nobody changed local.
     /// - Expected: `Clean` (everything matches the lockfile).
-    /// - Bug at HEAD: adapter recomputes `hash(serialize(remote) + A)`
-    ///   without stripping `config.runtime`. The serialize output still
-    ///   contains `"runtime": "python3.12"` (matching the pull-time bytes
-    ///   pre-strip), so the hashes happen to match here. This test
-    ///   confirms parity in the no-divergence case; a sibling test
-    ///   below covers the divergent case where the bug bites.
     #[test]
     fn from_catalog_scan_lockfile_overlay_parity_clean_when_unchanged() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1683,12 +1673,11 @@ mod tests {
         // production would have written.
         let base_hash = pull_driver_hash(&base_hook);
 
-        // Local file: the disk form is the post-strip canonical AND
+        // Local file: the disk form is the codec's canonical form AND
         // portabilized to `rdc://` form — matching what the pull post-pass
         // writes to disk in production. A minimal lockfile holding this hook
         // lets the self-url normalize identically to base/remote.
-        let (base_json_full, base_code) = serialize_hook(&base_hook).unwrap();
-        let base_json_stripped = base_json_full;
+        let (base_json, base_code) = serialize_hook(&base_hook).unwrap();
         let mut local_lf = Lockfile::default();
         local_lf.upsert(
             "hooks",
@@ -1700,14 +1689,14 @@ mod tests {
                 secrets_hash: None,
             },
         );
-        let base_json_stripped =
-            crate::cli::pull::common::portabilize_proposed(&base_json_stripped, &local_lf);
+        let base_json =
+            crate::cli::pull::common::portabilize_proposed(&base_json, &local_lf);
         let local_json_path = paths.hooks_dir().join(format!("{slug}.json"));
         let local_py_path = paths.hooks_dir().join(format!("{slug}.py"));
-        std::fs::write(&local_json_path, &base_json_stripped).unwrap();
+        std::fs::write(&local_json_path, &base_json).unwrap();
         std::fs::write(&local_py_path, base_code.as_ref().unwrap().as_bytes()).unwrap();
 
-        // Lockfile: records post-strip base hash.
+        // Lockfile: records the canonical base hash.
         let mut lockfile = Lockfile::default();
         lockfile.upsert(
             "hooks",
@@ -1724,7 +1713,7 @@ mod tests {
         let (_scanned, changes, tombstones) =
             crate::cli::push::scan::scan(&paths, &lockfile).unwrap();
         // Scan must NOT flag this hook — local matches lockfile-recorded
-        // post-strip hash, since `read(local) == base_json_stripped`.
+        // canonical hash, since `read(local) == base_json`.
         assert!(
             !changes.hooks.contains_key(slug),
             "scanner shouldn't flag an unchanged local hook"
@@ -1748,31 +1737,18 @@ mod tests {
         );
     }
 
-    /// The pointed regression: env has an overlay configured for the
-    /// hook AND both local and remote have diverged. Without overlay
-    /// parity, the adapter mis-classifies and the conflict prompt is
-    /// silently bypassed.
+    /// The pointed regression: both local and remote have diverged from
+    /// the recorded base. The adapter must classify this as
+    /// `BothDiverged` so the conflict prompt fires.
     ///
     /// Concretely:
-    /// - Overlay strips `config.runtime` from canonical form.
     /// - Base hook: `runtime: "python3.12"`, code = "base".
-    ///   Lockfile records `hash(strip(serialize(base)) + "base")`.
+    ///   Lockfile records `hash(serialize(base) + "base")`.
     /// - Remote NOW: `runtime: "python3.12"`, code = "REMOTE_EDIT" (user
     ///   modified via UI).
     /// - Local NOW: `runtime: "python3.12"`, code = "LOCAL_EDIT" (user
     ///   modified the .py sidecar).
     /// - Expected: `BothDiverged` → conflict prompt.
-    /// - HEAD bug: adapter hashes remote via `hash(serialize(remote) +
-    ///   "REMOTE_EDIT")` without stripping; the lockfile's recorded base
-    ///   hash was computed AFTER strip. So the comparison shape is fine
-    ///   for runtime (it just gets dropped or kept consistently) — BUT
-    ///   the comparison's correctness depends on `strip(serialize(h))`
-    ///   producing identical bytes to `serialize(h)`. Without the strip,
-    ///   the field is included; with it, it's removed. If the overlay
-    ///   strip removes a field that's present in serialize, the two
-    ///   diverge. This test makes that divergence concrete by using a
-    ///   field whose absence (post-strip) the lockfile recorded, but
-    ///   whose presence the adapter measures.
     #[test]
     fn from_catalog_scan_lockfile_overlay_both_diverged_with_overlay() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1791,16 +1767,13 @@ mod tests {
 
         // Local edited the .py sidecar — different code from base. Disk
         // bytes for JSON are unchanged; .py was touched.
-        let (base_json_full, _base_code) = serialize_hook(&base_hook).unwrap();
-        let base_json_stripped = base_json_full;
+        let (base_json, _base_code) = serialize_hook(&base_hook).unwrap();
         let local_json_path = paths.hooks_dir().join(format!("{slug}.json"));
         let local_py_path = paths.hooks_dir().join(format!("{slug}.py"));
-        std::fs::write(&local_json_path, &base_json_stripped).unwrap();
+        std::fs::write(&local_json_path, &base_json).unwrap();
         std::fs::write(&local_py_path, b"def local_edit():\n    return 2\n").unwrap();
 
-        // Remote: also edited (via Rossum UI). The remote payload still
-        // carries `config.runtime` (Rossum always returns it); the
-        // overlay's job is to strip it post-pull.
+        // Remote: also edited (via Rossum UI).
         let remote_hook = mk_hook(
             42,
             slug,

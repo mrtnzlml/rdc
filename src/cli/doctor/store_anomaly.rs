@@ -161,11 +161,10 @@ async fn convert_to_custom(
 
     // Reuse the pull side's canonical serialization so disk + hash stay
     // aligned with what a future pull would write.
-    let (json_bytes, code) = crate::snapshot::hook::serialize_hook(&updated)?;
-    let stripped = json_bytes;
-    let hash = crate::state::hook_combined_hash(&stripped, &code, lockfile);
+    let (canonical, code) = crate::snapshot::hook::serialize_hook(&updated)?;
+    let hash = crate::state::hook_combined_hash(&canonical, &code, lockfile);
     let local_path = paths.hooks_dir().join(format!("{slug}.json"));
-    crate::snapshot::writer::write_atomic(&local_path, &stripped)
+    crate::snapshot::writer::write_atomic(&local_path, &canonical)
         .with_context(|| format!("writing post-cure snapshot to {}", local_path.display()))?;
 
     // The hook's `extension_source` lives in `extra` (flattened in the
@@ -401,11 +400,10 @@ async fn reinstall_as_store_extension(
     }
 
     // 6. Reconcile local snapshot for the slug.
-    let (json_bytes, code) = crate::snapshot::hook::serialize_hook(&updated)?;
-    let stripped = json_bytes;
-    let hash = crate::state::hook_combined_hash(&stripped, &code, lockfile);
+    let (canonical, code) = crate::snapshot::hook::serialize_hook(&updated)?;
+    let hash = crate::state::hook_combined_hash(&canonical, &code, lockfile);
     let local_path = paths.hooks_dir().join(format!("{slug}.json"));
-    crate::snapshot::writer::write_atomic(&local_path, &stripped).with_context(|| {
+    crate::snapshot::writer::write_atomic(&local_path, &canonical).with_context(|| {
         format!(
             "writing post-reinstall snapshot to {}",
             local_path.display()

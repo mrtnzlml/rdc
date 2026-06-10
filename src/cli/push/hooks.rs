@@ -106,7 +106,7 @@ pub async fn push(
             .and_then(|m| m.get(slug.as_str()))
             .is_none()
         {
-            // Read + overlay-apply once; reused by both paths.
+            // Read + portabilize refs once; reused by both paths.
             let mut payload = read_hook_value(&hooks_dir, slug)
                 .with_context(|| format!("reading local hook '{slug}' for create"))?;
             crate::snapshot::refs::resolve_value(&mut payload, lockfile);
@@ -195,11 +195,10 @@ pub async fn push(
             // extension is derived from the server's response runtime so
             // it stays canonical even if the local JSON declared a
             // different runtime.
-            let (created_json_full, created_code) = serialize_hook(&created)?;
-            let created_json_stripped = created_json_full;
-            let created_hash = hook_combined_hash(&created_json_stripped, &created_code, lockfile);
+            let (created_json, created_code) = serialize_hook(&created)?;
+            let created_hash = hook_combined_hash(&created_json, &created_code, lockfile);
             let created_ext = hook_code_extension(&created);
-            write_atomic(local_json_path, &created_json_stripped)
+            write_atomic(local_json_path, &created_json)
                 .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
             if let Some(code) = &created_code {
                 write_hook_code(&hooks_dir, slug, code, created_ext)
@@ -274,9 +273,8 @@ pub async fn push(
             skipped += 1;
             continue;
         };
-        let (remote_json_full, remote_code) = serialize_hook(remote_hook)?;
-        let remote_json_stripped = remote_json_full;
-        let remote_combined = hook_combined_hash(&remote_json_stripped, &remote_code, lockfile);
+        let (remote_json, remote_code) = serialize_hook(remote_hook)?;
+        let remote_combined = hook_combined_hash(&remote_json, &remote_code, lockfile);
         let mut payload_to_send = payload_hook;
         if remote_combined != base {
             // Drift detected. The hook is a combined-hash kind (json + py);
@@ -284,7 +282,7 @@ pub async fn push(
             // common case). On Adopt, we write both .json and .py from
             // the remote so disk + lockfile stay aligned.
             use crate::cli::resolve::{PushDriftOutcome, resolve_push_drift};
-            match resolve_push_drift(interactive, local_json_path, &remote_json_stripped, env)? {
+            match resolve_push_drift(interactive, local_json_path, &remote_json, env)? {
                 PushDriftOutcome::Patch { payload_override } => {
                     if let Some(bytes) = payload_override {
                         let mut ov: serde_json::Value = serde_json::from_slice(&bytes)
@@ -295,7 +293,7 @@ pub async fn push(
                     }
                 }
                 PushDriftOutcome::Adopt => {
-                    write_atomic(local_json_path, &remote_json_stripped).with_context(|| {
+                    write_atomic(local_json_path, &remote_json).with_context(|| {
                         format!("adopting remote into {}", local_json_path.display())
                     })?;
                     // Adopt uses the remote runtime to decide the
@@ -370,16 +368,15 @@ pub async fn push(
             .with_context(|| format!("PATCH /hooks/{id}"));
         let updated = patch_result?;
 
-        // Refresh local file with the post-strip canonical form (matches
+        // Refresh local file with the codec's canonical form (matches
         // what next pull would write) and update lockfile to match.
-        let (updated_json_full, updated_code) = serialize_hook(&updated)?;
-        let updated_json_stripped = updated_json_full;
-        let updated_hash = hook_combined_hash(&updated_json_stripped, &updated_code, lockfile);
+        let (updated_json, updated_code) = serialize_hook(&updated)?;
+        let updated_hash = hook_combined_hash(&updated_json, &updated_code, lockfile);
         let updated_ext = hook_code_extension(&updated);
         crate::state::base_cache::write_disk_and_cache(
             paths,
             local_json_path,
-            &updated_json_stripped,
+            &updated_json,
         )
         .with_context(|| format!("writing post-push canonical form for '{slug}'"))?;
         if let Some(code) = &updated_code {
