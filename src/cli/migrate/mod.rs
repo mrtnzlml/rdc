@@ -325,18 +325,50 @@ fn reconcile_target_identity(
     }
 }
 
-/// Recursively enumerate every snapshot file under `env_root`, returning paths
-/// relative to `env_root`. Skips per-env / generated artifacts that must not be
-/// migrated: `_index.md` (rebuilt by sync), `overlay.toml` (per-env config),
-/// `organization.json` (per-env external singleton), and any sync shadow
-/// artifact (`<file>.<env>` / `<file>.<env>-deleted`).
+/// rdc-managed top-level directories under an env root — the same per-kind
+/// dirs `paths.rs` exposes and `push::scan` reads. Migrate copies only files
+/// WITHIN these. Everything else under `envs/<env>/` — user pytest `tests/`,
+/// helper `scripts/`, `README`s, `__pycache__`, and the per-env singletons
+/// (`_index.md`, `overlay.toml`, `organization.json`) — is NOT rdc-managed and
+/// must be left untouched: a snapshot→snapshot transform has no business
+/// copying files rdc neither pulls nor pushes.
+const MANAGED_DIRS: &[&str] = &[
+    "hooks",
+    "workspaces",
+    "rules",
+    "labels",
+    "engines",
+    "workflows",
+    "mdh",
+];
+
+/// Enumerate every rdc-managed snapshot file under `env_root`, returning paths
+/// relative to `env_root`. Only descends into [`MANAGED_DIRS`]; any other
+/// top-level entry is ignored entirely. Within a managed dir, sync shadow
+/// artifacts (`<file>.<env>` / `<file>.<env>-deleted`) are skipped via
+/// [`should_skip`].
 fn enumerate_files(env_root: &Path, env: &str) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
-    if env_root.exists() {
-        walk_dir(env_root, env_root, env, &mut out)?;
+    for dir in MANAGED_DIRS {
+        let managed = env_root.join(dir);
+        if managed.exists() {
+            walk_dir(env_root, &managed, env, &mut out)?;
+        }
     }
     out.sort();
     Ok(out)
+}
+
+/// File extensions rdc actually writes inside a managed dir: `.json` (objects),
+/// `.py` (hook / rule / schema-formula code), `.js` (Node.js hook code).
+/// Anything else sitting next to them — `.pyc` bytecode, `.DS_Store`, editor
+/// temp files, sync shadow artifacts (`<file>.<env>`) — is foreign to rdc and
+/// must not be migrated.
+fn is_managed_leaf(name: &str) -> bool {
+    matches!(
+        name.rsplit_once('.').map(|(_, ext)| ext),
+        Some("json") | Some("py") | Some("js")
+    )
 }
 
 fn walk_dir(base: &Path, dir: &Path, env: &str, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -346,8 +378,13 @@ fn walk_dir(base: &Path, dir: &Path, env: &str, out: &mut Vec<PathBuf>) -> Resul
         let file_type = entry.file_type()?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if file_type.is_dir() {
+            // Never descend Python bytecode caches — they sit beside the `.py`
+            // sidecars but are tooling output, not rdc's.
+            if name == "__pycache__" {
+                continue;
+            }
             walk_dir(base, &path, env, out)?;
-        } else if !should_skip(&name, env) {
+        } else if !should_skip(&name, env) && is_managed_leaf(&name) {
             let rel = path
                 .strip_prefix(base)
                 .expect("walked path is under base")
@@ -717,6 +754,70 @@ mod tests {
             remap_relative(Path::new("workspaces/main/queues/invoices/inbox.json"), &m),
             PathBuf::from("workspaces/main-prod/queues/invoices-prod/inbox.json")
         );
+    }
+
+    #[test]
+    fn enumerate_files_includes_only_rdc_managed_dirs() {
+        use std::collections::BTreeSet;
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // rdc-managed files — including non-JSON sidecars that don't classify
+        // to a kind but ARE rdc's (hook code, schema formulas).
+        let managed = [
+            "hooks/extractor.json",
+            "hooks/extractor.py",
+            "rules/r.json",
+            "labels/l.json",
+            "engines/e/engine.json",
+            "engines/e/fields/f.json",
+            "workspaces/main/queues/inv/queue.json",
+            "workspaces/main/queues/inv/schema.json",
+            "workspaces/main/queues/inv/formulas/123.py",
+            "workflows/wf/steps/s.json",
+            "mdh/datasets/d.json",
+        ];
+        // NOT rdc-managed — user content / per-env singletons / generated /
+        // tooling detritus. Migrate must leave these entirely alone, including
+        // when they appear INSIDE a managed dir (Python bytecode caches next to
+        // hook/formula sidecars, editor noise, sync shadow artifacts).
+        let non_managed = [
+            "tests/test_header_product_match_config.py",
+            "tests/__pycache__/test_x.cpython-312.pyc",
+            "scripts/deploy.sh",
+            "README.md",
+            "_index.md",
+            "overlay.toml",
+            "organization.json",
+            // Inside managed dirs but not rdc's:
+            "hooks/__pycache__/extractor.cpython-312.pyc",
+            "workspaces/main/queues/inv/formulas/__pycache__/f.cpython-312.pyc",
+            "hooks/.DS_Store",
+            // Sync shadow artifact (must stay skipped):
+            "hooks/extractor.json.test-mtr",
+        ];
+        for rel in managed.iter().chain(non_managed.iter()) {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, b"x").unwrap();
+        }
+
+        let got: BTreeSet<String> = enumerate_files(root, "test-mtr")
+            .unwrap()
+            .into_iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+
+        for rel in managed {
+            assert!(got.contains(rel), "managed file {rel} must be enumerated; got {got:?}");
+        }
+        for rel in non_managed {
+            assert!(
+                !got.contains(rel),
+                "non-rdc-managed entry {rel} must NOT be enumerated; got {got:?}"
+            );
+        }
     }
 
     // ---- A2: ref substitution + overlay + write ----
