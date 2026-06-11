@@ -275,6 +275,12 @@ pub(crate) async fn run_cycle(
     let classified =
         from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile)?;
 
+    // Changed local files that don't parse as JSON. Surfaced as a
+    // dedicated dry-run section, and a hard refusal before any push —
+    // otherwise the file rides classification on its raw-byte hash and
+    // only explodes mid-push, after earlier kinds already landed.
+    let parse_errors = changes.json_parse_errors();
+
     // Classification computed; grid renderer rebuild handled elsewhere.
 
     // Phase 4: plan + confirm. `--dry-run` exits here without writing.
@@ -361,18 +367,53 @@ pub(crate) async fn run_cycle(
             progress.block(&body);
         }
 
+        if !parse_errors.is_empty() {
+            progress.event(Action::Plan, "parse errors");
+            let mut body = String::new();
+            use std::fmt::Write as _;
+            for e in &parse_errors {
+                let _ = writeln!(body, "- {}/{} -- {}: {}", e.kind, e.slug, e.path.display(), e.error);
+            }
+            progress.block(&body);
+        }
+
         if !renderer_was_supplied {
+            let parse_suffix = if parse_errors.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", {} parse error{}",
+                    parse_errors.len(),
+                    if parse_errors.len() == 1 { "" } else { "s" }
+                )
+            };
             progress.event(
                 Action::Done,
                 &format!(
-                    "Dry run: {} would push, {} would pull, {} would prompt (no writes)",
+                    "Dry run: {} would push, {} would pull, {} would prompt{} (no writes)",
                     push_items.len(),
                     pull_items.len(),
                     prompt_items.len(),
+                    parse_suffix,
                 ),
             );
         }
         return Ok(CycleOutcome::default());
+    }
+
+    // Refuse to push with unparseable local files — fail BEFORE the first
+    // remote write so a malformed file can never cause a partial push.
+    // `--no-push` (audit) proceeds: there is nothing to half-apply.
+    if !no_push && !parse_errors.is_empty() {
+        let mut msg = format!(
+            "{} changed local file(s) are not valid JSON; refusing to push before any remote write:",
+            parse_errors.len()
+        );
+        for e in &parse_errors {
+            use std::fmt::Write as _;
+            let _ = write!(msg, "\n  - {}/{} -- {}: {}", e.kind, e.slug, e.path.display(), e.error);
+        }
+        anyhow::bail!("{msg}");
     }
 
     // Phase 5: execute. The destructive-delete gate (`--allow-deletes`)
