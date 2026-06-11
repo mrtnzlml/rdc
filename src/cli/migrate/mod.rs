@@ -109,6 +109,41 @@ pub(crate) fn classify(rel: &Path) -> Option<(&'static str, String)> {
     }
 }
 
+/// Selection-aware variant of [`classify`]: additionally maps code sidecars
+/// to the primary object they belong to, so `--only hooks/<slug>` carries
+/// `hooks/<slug>.py`/`.js` (and rules `.py`, schema `formulas/*.py`) along
+/// with the JSON. Only the `--only` filter uses this — remapping and overlay
+/// lookups keep operating on primary JSON files via [`classify`].
+fn classify_for_selection(rel: &Path) -> Option<(&'static str, String)> {
+    if let Some(hit) = classify(rel) {
+        return Some(hit);
+    }
+    let comps: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let leaf = comps.last()?;
+    let strip_code = |l: &str| {
+        l.strip_suffix(".py")
+            .or_else(|| l.strip_suffix(".js"))
+            .map(str::to_string)
+    };
+    match comps.first().map(String::as_str) {
+        Some("hooks") if comps.len() == 2 => strip_code(leaf).map(|s| ("hooks", s)),
+        Some("rules") if comps.len() == 2 => leaf
+            .strip_suffix(".py")
+            .map(|s| ("rules", s.to_string())),
+        // workspaces/<ws>/queues/<q>/formulas/<field>.py → the queue's schema.
+        Some("workspaces")
+            if comps.len() == 6 && comps[2] == "queues" && comps[4] == "formulas" =>
+        {
+            leaf.strip_suffix(".py")
+                .map(|_| ("schemas", comps[3].clone()))
+        }
+        _ => None,
+    }
+}
+
 fn classify_workspace(comps: &[String]) -> Option<(&'static str, String)> {
     let ws = comps.get(1)?;
     let leaf = comps.last()?;
@@ -511,7 +546,7 @@ pub fn run(src: &str, tgt: &str, mirror: bool, dry_run: bool, only: Vec<String>)
         // selection. Files with no classifiable object (workflows, mdh) are
         // skipped under an active selection — the user narrowed scope.
         if let Some(sel) = &selection {
-            match classify(rel) {
+            match classify_for_selection(rel) {
                 Some((kind, slug)) if sel.contains(kind, &slug) => {}
                 _ => continue,
             }
