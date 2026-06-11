@@ -1714,6 +1714,40 @@ fn deleted_marker_path(local_path: &Path, env: &str) -> PathBuf {
 /// either way; leaving it on disk misleads (it no longer reflects any
 /// pending decision). Idempotent — missing files are no-ops. Skip-style
 /// outcomes must NOT call this: their artifacts are the deferral.
+/// Recompute the canonical combined hash of an object's CURRENT on-disk
+/// state (JSON + sidecars), using exactly the same per-kind helpers the
+/// scanner uses, so the result is comparable to lockfile base hashes.
+/// `None` when the JSON file is unreadable.
+fn local_disk_hash(refs: &RemoteDeleteRefs) -> Option<String> {
+    let bytes = std::fs::read(&refs.local_path).ok()?;
+    let lf = crate::state::Lockfile::default();
+    Some(match refs.hash_strategy {
+        HashStrategy::Hook => {
+            let code = std::fs::read_to_string(sidecar_path_for_conflict(
+                &refs.local_path,
+                refs.hash_strategy,
+            ))
+            .ok();
+            crate::state::hook_combined_hash(&bytes, &code, &lf)
+        }
+        HashStrategy::Rule => {
+            let code = std::fs::read_to_string(sidecar_path_for_conflict(
+                &refs.local_path,
+                refs.hash_strategy,
+            ))
+            .ok();
+            crate::state::rule_combined_hash(&bytes, &code, &lf)
+        }
+        HashStrategy::Schema => {
+            let queue_dir = refs.local_path.parent().unwrap_or(&refs.local_path);
+            let formulas =
+                crate::snapshot::schema::read_local_formulas(queue_dir).unwrap_or_default();
+            crate::state::schema_combined_hash(&bytes, &formulas, &lf)
+        }
+        HashStrategy::Flat => crate::state::content_hash(&bytes, &lf),
+    })
+}
+
 /// Mirror an env-side deletion locally: remove the JSON file, any code
 /// sidecar (both runtime extensions for hooks), a schema's `formulas/`
 /// directory, and a stale `<file>.<env>-deleted` marker; drop the
@@ -2625,12 +2659,29 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                         drop_lockfile_entry(ctx, &it.kind, &it.slug);
                         continue;
                     }
-                    delete_local_object(ctx, it, &refs, &env)?;
-                    progress.event(
-                        Action::Delete,
-                        &format!("{}/{} (deleted on {env})", it.kind, it.slug),
-                    );
-                    continue;
+                    // Resolve-time drift re-check (defense in depth,
+                    // symmetric with the pre-PATCH re-fetch on the push
+                    // side): the classification is scan-time state. If
+                    // the file changed since — a mid-run edit is easy to
+                    // produce under `--watch` — it is no longer the
+                    // clean class, and auto-deleting it would destroy
+                    // the edit. Fall through to the prompt flow instead.
+                    let recorded_base = ctx
+                        .lockfile
+                        .objects
+                        .get(it.kind.as_str())
+                        .and_then(|m| m.get(it.slug.as_str()))
+                        .and_then(|e| e.content_hash.clone());
+                    let still_clean =
+                        recorded_base.is_some() && local_disk_hash(&refs) == recorded_base;
+                    if still_clean {
+                        delete_local_object(ctx, it, &refs, &env)?;
+                        progress.event(
+                            Action::Delete,
+                            &format!("{}/{} (deleted on {env})", it.kind, it.slug),
+                        );
+                        continue;
+                    }
                 }
 
                 if !interactive {
@@ -4125,6 +4176,64 @@ mod tests {
                 .and_then(|m| m.get("audit-hold"))
                 .is_none(),
             "lockfile entry must be dropped"
+        );
+    }
+
+    /// A `RemoteDelete` whose local file was EDITED mid-run (after the
+    /// scan classified it clean, before resolution) must NOT be
+    /// auto-deleted — the edit makes it a genuine conflict, so it falls
+    /// back to the prompt flow (scripted `s` defers with a marker and
+    /// the edited file survives).
+    #[tokio::test]
+    async fn resolve_remote_deletes_mid_run_edit_falls_back_to_prompt() {
+        let mut fixture = setup_remote_delete_fixture();
+        let classified = classified_remote_delete();
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+
+        // Mid-run edit: disk no longer matches the lockfile base the
+        // classifier saw at scan time.
+        std::fs::write(
+            &fixture.local_path,
+            label_bytes(&mk_label(42, "Audit Hold", "#ffffff")),
+        )
+        .unwrap();
+
+        {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                interactive: true,
+            };
+            resolve_remote_deletes(
+                &mut ctx,
+                &catalog_with_labels(vec![]),
+                &classified,
+                Cursor::new(b"s\n"),
+                true,
+                &progress,
+            )
+            .await
+            .expect("mid-run-edited RemoteDelete must fall back to the prompt")
+        };
+
+        assert!(
+            fixture.local_path.exists(),
+            "the mid-run edit must survive — auto-delete on stale classification is data loss"
+        );
+        assert!(
+            deleted_marker_path(&fixture.local_path, "test").exists(),
+            "[s] defers with a marker like any genuine conflict"
+        );
+        assert!(
+            fixture
+                .lockfile
+                .objects
+                .get("labels")
+                .and_then(|m| m.get("audit-hold"))
+                .is_some(),
+            "lockfile entry must survive the deferral"
         );
     }
 

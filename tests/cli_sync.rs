@@ -4834,9 +4834,16 @@ async fn run_rule_conflict_scenario(variant: RuleConflictVariant) {
     let name_local = "E-invoice Validation (local)".to_string();
     let name_remote = "E-invoice Validation (remote)".to_string();
 
+    // Flipped by the LocalJsonRemoteCode PATCH responder so the listing
+    // advances to phase 3 (merged body) and the idempotency re-sync
+    // classifies Clean.
+    let patch_landed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     let list_call_count = Arc::new(AtomicUsize::new(0));
     let counter = list_call_count.clone();
     let uri_clone = server.uri();
+    let patch_landed_list = patch_landed.clone();
+    let name_local_list = name_local.clone();
     Mock::given(method("GET"))
         .and(path("/api/v1/rules"))
         .respond_with(move |_req: &Request| {
@@ -4849,6 +4856,17 @@ async fn run_rule_conflict_scenario(variant: RuleConflictVariant) {
                 )
             } else {
                 match variant {
+                    RuleConflictVariant::LocalJsonRemoteCode
+                        if patch_landed_list.load(Ordering::SeqCst) =>
+                    {
+                        // Phase 3: local name + remote condition both on
+                        // the remote → idempotency sync sees Clean.
+                        (
+                            name_local_list.clone(),
+                            Some(remote_cond_edit.to_string()),
+                            "2026-05-14T11:00:00Z".to_string(),
+                        )
+                    }
                     RuleConflictVariant::JsonBothEdited => (
                         name_remote.clone(),
                         Some(base_cond.to_string()),
@@ -4906,9 +4924,11 @@ async fn run_rule_conflict_scenario(variant: RuleConflictVariant) {
         // remote — exactly one PATCH, echoing the merged rule.
         let uri_patch = server.uri();
         let name_local_patch = name_local.clone();
+        let patch_landed_resp = patch_landed.clone();
         Mock::given(method("PATCH"))
             .and(path(format!("/api/v1/rules/{rule_id}")))
             .respond_with(move |_req: &Request| {
+                patch_landed_resp.store(true, Ordering::SeqCst);
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "id": rule_id,
                     "url": format!("{uri_patch}/api/v1/rules/{rule_id}"),
@@ -5039,6 +5059,39 @@ async fn run_rule_conflict_scenario(variant: RuleConflictVariant) {
             py_after,
             remote_cond_edit.as_bytes(),
             "variant {variant:?}: local .py must adopt the remote condition edit"
+        );
+
+        // Idempotency: the listing now serves the merged body (phase 3),
+        // so a re-sync must classify Clean — no further mutations, the
+        // local name edit not reverted.
+        std::env::set_current_dir(project.path()).unwrap();
+        rdc::cli::sync::run("dev", false, false, false, false, false)
+            .await
+            .expect("idempotency sync should succeed");
+        std::env::set_current_dir(&prev_cwd).unwrap();
+        let muts_after = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| {
+                (r.method == http::Method::PATCH
+                    || r.method == http::Method::POST
+                    || r.method == http::Method::DELETE)
+                    && (r.url.path() == format!("/api/v1/rules/{rule_id}")
+                        || r.url.path() == "/api/v1/rules")
+            })
+            .count();
+        assert_eq!(
+            muts_after, 1,
+            "variant {variant:?}: idempotency sync must not re-PATCH the rule"
+        );
+        let local_after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&json_path).unwrap()).unwrap();
+        assert_eq!(
+            local_after["name"].as_str(),
+            Some(name_local.as_str()),
+            "variant {variant:?}: local name edit must survive the idempotency sync"
         );
     } else {
         assert_eq!(
