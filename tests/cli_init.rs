@@ -202,10 +202,12 @@ fn init_creates_readme_with_sync_commands_and_skips_deploy_for_single_env() {
     assert!(body.contains("_index.md"), "missing _index.md link: {body}");
 }
 
-/// Two-env project includes a Deploy section with a concrete example
-/// using the alphabetically-first pair (BTreeMap order, deterministic).
+/// Two-env project includes a Promote section with a concrete
+/// migrate+sync example using the alphabetically-first pair (BTreeMap
+/// order, deterministic). `rdc deploy` no longer exists; the scaffold
+/// must not advertise it.
 #[test]
-fn init_readme_includes_deploy_for_multiple_envs() {
+fn init_readme_includes_promote_for_multiple_envs() {
     let dir = TempDir::new().unwrap();
     Command::cargo_bin("rdc")
         .unwrap()
@@ -222,14 +224,55 @@ fn init_readme_includes_deploy_for_multiple_envs() {
     // Both envs listed in the sync block.
     assert!(body.contains("rdc sync dev"));
     assert!(body.contains("rdc sync prod"));
-    // Deploy section appears for multi-env projects.
-    assert!(body.contains("## Deploy"), "deploy section missing: {body}");
+    // Promote section appears for multi-env projects.
+    assert!(body.contains("## Promote"), "promote section missing: {body}");
     // The first two alphabetically: dev → prod.
     assert!(
-        body.contains("rdc deploy dev prod"),
-        "expected deploy example with dev→prod: {body}"
+        body.contains("rdc migrate dev prod"),
+        "expected migrate example with dev→prod: {body}"
     );
-    assert!(body.contains("--dry-run"), "deploy --dry-run guidance missing: {body}");
+    assert!(body.contains("--dry-run"), "migrate --dry-run guidance missing: {body}");
+    // The removed command must not be advertised anywhere in the scaffold.
+    assert!(
+        !body.contains("rdc deploy"),
+        "scaffolded README must not document the removed `rdc deploy`: {body}"
+    );
+}
+
+/// The scaffolded agent guide must describe only commands and flags that
+/// exist: no removed `rdc deploy`, no nonexistent `sync --diff`, and the
+/// conflict-resolver letters spelled the way `src/cli/resolve.rs` prints
+/// them.
+#[test]
+fn init_claude_md_documents_only_real_commands() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--env", "dev=https://example.rossum.app/api/v1:285704",
+        ])
+        .assert()
+        .success();
+
+    let body = std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
+    assert!(
+        !body.contains("rdc deploy"),
+        "CLAUDE.md must not document the removed `rdc deploy`"
+    );
+    assert!(
+        !body.contains("--diff"),
+        "CLAUDE.md must not document the nonexistent `sync --diff` flag"
+    );
+    assert!(
+        body.contains("rdc migrate"),
+        "CLAUDE.md must document the migrate+sync promote workflow"
+    );
+    assert!(
+        body.contains("[s] skip (shadow file)"),
+        "CLAUDE.md must quote the resolver options as resolve.rs prints them"
+    );
 }
 
 /// User has authored their own README before running init — we must

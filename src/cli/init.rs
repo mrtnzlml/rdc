@@ -544,8 +544,8 @@ fn write_claude_md(root: &Path) -> Result<()> {
 
 /// Write a human-facing `README.md` at the project root listing the
 /// run-the-project commands: one `rdc sync <env>` per env defined in
-/// `cfg`, and — when there are at least two envs — a `rdc deploy
-/// <src> <tgt>` example using the first two envs alphabetically. Same
+/// `cfg`, and — when there are at least two envs — a promote example
+/// (`rdc migrate` + `rdc sync`) using the first two envs alphabetically. Same
 /// once-only contract as [`write_claude_md`]: skipped when README.md
 /// already exists, so the user's content is never clobbered.
 ///
@@ -588,25 +588,28 @@ fn write_readme(root: &Path, cfg: &ProjectConfig) -> Result<()> {
         md.push_str("```\n\n");
     }
 
-    // Deploy section only when there's something to deploy between.
+    // Promote section only when there are two envs to promote between.
     // BTreeMap iteration is already sorted, so the first two keys give
     // a deterministic example without an extra sort step.
     if cfg.envs.len() >= 2 {
         let mut iter = cfg.envs.keys();
         let src = iter.next().expect("len >= 2");
         let tgt = iter.next().expect("len >= 2");
-        md.push_str("## Deploy\n\n");
+        md.push_str("## Promote changes between environments\n\n");
         md.push_str(
-            "`rdc deploy <src> <tgt>` promotes one env to another. The full \
-             per-object diff prints before the confirmation prompt so you \
-             commit with the actual delta in hand.\n\n",
+            "`rdc migrate <src> <tgt>` copies one env's snapshot into \
+             another's, locally — slug remap, portable-ref rewrite, target \
+             overlay; zero remote calls. Review the transform with `git \
+             diff`, then push it with `rdc sync <tgt>`.\n\n",
         );
         md.push_str("```sh\n");
         md.push_str(&format!(
-            "rdc deploy {src} {tgt} --dry-run   # preview only, no remote writes\n"
+            "rdc migrate {src} {tgt} --dry-run   # preview the local transform\n"
         ));
+        md.push_str(&format!("rdc migrate {src} {tgt}\n"));
+        md.push_str("git diff                          # review what would be pushed\n");
         md.push_str(&format!(
-            "rdc deploy {src} {tgt}              # execute after reviewing\n"
+            "rdc sync {tgt}                      # push to the remote\n"
         ));
         md.push_str("```\n\n");
     }
@@ -614,7 +617,7 @@ fn write_readme(root: &Path, cfg: &ProjectConfig) -> Result<()> {
     md.push_str("## See also\n\n");
     md.push_str(
         "- `CLAUDE.md` — editing recipes, repo layout, common commands, \
-         conflict + deploy workflows.\n\
+         conflict + promote workflows.\n\
          - `envs/<env>/_index.md` — auto-generated map of every object in \
          `<env>` with paths and cross-references.\n",
     );
@@ -741,8 +744,7 @@ In non-TTY (CI) mode, `--allow-deletes` is mandatory; without it the
 sync refuses with a clear list of pending tombstones.
 
 `rdc sync <env> --dry-run` lists pending tombstones in a `deletes:`
-section without sending anything; `--diff` adds the full remote body
-for each as a deleted-file diff.
+section without sending anything.
 
 Deletes run after creates / updates in reverse dependency order
 (`engine_fields → engines → labels → rules → hooks →
@@ -777,9 +779,10 @@ so the sentinel never reaches the server.
   also remove remote objects whose local files you've deleted;
   `--no-push` for read-only audit; `--no-pull` to deploy local edits
   without overwriting local files
-- `rdc deploy <src> <tgt>` — promote one env to another in one shot
-  (POST missing + PATCH deltas, URL rewrites included); `--dry-run`
-  previews without writing
+- `rdc migrate <src> <tgt>` — copy one env's snapshot into another's,
+  locally (slug remap + `rdc://` ref rewrite + target overlay; zero
+  remote calls); review with `git diff`, then `rdc sync <tgt>` to push;
+  `--dry-run` previews, `--only <kind>/<slug>` narrows scope
 - `rdc doctor <env>` — realign stale local slugs after
   a remote rename (offline)
 - `rdc doctor <env> --rebuild-lock` — recover from a corrupted
@@ -789,7 +792,8 @@ so the sentinel never reaches the server.
 
 A three-way merge (local · base · remote) runs on every sync. When
 both sides have diverged, `rdc sync` prompts an inline resolver:
-`[k]eep local · [r]emote · [e]dit · [s]kip · [a]bort`. In non-TTY
+`[k] keep local · [r] use <env> · [e] edit · [s] skip (shadow file) ·
+[a] abort` (plus `[h] hunk-by-hunk` for multi-hunk bodies). In non-TTY
 (CI / `--yes`) mode, conflicts produce a `<file>.<env-name>` shadow and
 keep the local on disk.
 
@@ -797,13 +801,16 @@ The same drift check runs before each PATCH on the push side. The
 prompt is `[k]` (force-push), `[r]` (adopt remote), `[s]` (skip),
 `[a]` (abort).
 
-## Cross-env deploys (e.g. dev → prod)
+## Promoting changes between environments (e.g. dev → prod)
 
 1. `rdc sync dev` and `rdc sync prod` so both lockfiles are populated.
-2. `rdc deploy dev prod --dry-run` — preview the plan.
-3. `rdc deploy dev prod` — execute. Per-env values stay in each env's
-   `overlay.toml`; the slug-to-slug mapping is built automatically and
-   stored at `.rdc/map/dev-to-prod.toml` (hand-edit for renames if needed).
+2. `rdc migrate dev prod --dry-run` — preview the local file transform.
+3. `rdc migrate dev prod` — copy dev's snapshot into `envs/prod/`,
+   renaming slugs per the auto-matched mapping (stored at
+   `.rdc/map/dev-to-prod.toml`; hand-edit for renames), rewriting
+   portable `rdc://` refs, and applying prod's `overlay.toml`.
+4. Review the result with `git diff`, then `rdc sync prod` to push —
+   sync creates missing objects in dependency order.
 
 ## What NOT to edit
 
@@ -824,5 +831,5 @@ prompt is `[k]` (force-push), `[r]` (adopt remote), `[s]` (skip),
   duplicate copies (one per consuming queue) and the lockfile will
   carry an entry per queue slug pointing at the same remote id. Push
   to that shared resource works (id is the truth), but cross-env
-  deploys via `rdc deploy` may surface confusing diffs.
+  promotion via `rdc migrate` may surface confusing diffs.
 "#;

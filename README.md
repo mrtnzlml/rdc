@@ -142,7 +142,7 @@ Lists every change that would be sent — POSTs, PATCHes, DELETEs — without wr
 When both local and the env have changed since the last sync, an inline resolver opens for each conflicting file:
 
 ```
-[k] keep local  [r] use test  [e] edit  [s] skip  [a] abort >
+[k] keep local  [r] use test  [e] edit  [s] skip (shadow file)  [a] abort >
 ```
 
 - `k` — push local bytes to the env.
@@ -150,6 +150,8 @@ When both local and the env have changed since the last sync, an inline resolver
 - `e` — open `$EDITOR` on git-style conflict markers.
 - `s` — skip; the env's bytes land at `<file>.<env-name>` for review.
 - `a` — abort.
+
+Multi-hunk bodies additionally offer `[h] hunk-by-hunk` to walk the differences one at a time.
 
 ### Create or delete
 
@@ -164,46 +166,30 @@ $ rdc sync test
 Proceed with deletion? [y/N] y
 ```
 
-## `rdc deploy`
+## `rdc migrate`
 
-Promotes one env's snapshot to another. Plans every create/update, prints the per-object diff, waits for confirmation, then applies.
-
-```sh
-rdc deploy test prod
-```
-
-Example session:
-
-```
---- hooks/validator-invoices.json (tgt before)
-+++ hooks/validator-invoices.json (tgt after)
-@@ ...
--  "name": "Validator: invoices",
-+  "name": "Validator (PROD)",
-
-Would apply 1 hooks (1 PATCHes) from test to prod
-Proceed? [y/N] y
-Applied 1 hooks (1 PATCHes) from test to prod
-Deployed test -> prod: 0 created, 0 deleted, 2 API calls, 1.4s
-```
-
-Re-running on a synced env is a no-op.
-
-### Preview a deploy
+Promotes one env's snapshot to another, in two reviewable steps. `rdc migrate <src> <tgt>` is pure-local — zero remote calls: it copies `envs/<src>/` into `envs/<tgt>/`, renaming slugs per the auto-matched mapping (stored at `.rdc/map/<src>-to-<tgt>.toml`, hand-editable for renames), rewriting portable `rdc://<kind>/<slug>` references, and applying the target env's `overlay.toml`. Pushing is a separate, explicit step.
 
 ```sh
-rdc deploy test prod --dry-run
+rdc migrate test prod --dry-run   # preview the per-file plan
+rdc migrate test prod             # transform envs/prod/ locally
+git diff                          # review the actual delta
+rdc sync prod                     # push — creates objects in dependency order
 ```
 
-Same plan output, no API writes.
+Re-running on an already-migrated snapshot is a no-op (matched objects keep the target's identity).
 
-### Selective deploy
+### Mirror semantics
 
-Deploy only part of the snapshot by passing one or more `--only <selector>` flags:
+By default migrate is additive — objects that exist only in the target are left intact. `--mirror` also deletes target snapshot files with no source counterpart (local file removals; review with `git diff` before syncing).
+
+### Selective migrate
+
+Limit the transform with one or more `--only <selector>` flags:
 
 ```sh
-rdc deploy test prod --only hooks/validator-invoices
-rdc deploy test prod --only 'schemas/cost-*'
+rdc migrate test prod --only hooks/validator-invoices
+rdc migrate test prod --only 'schemas/cost-*'
 ```
 
 Selector forms:
@@ -214,9 +200,11 @@ Selector forms:
 | `<kind>/<glob>` | `schemas/cost-*` | `*` glob in the slug segment |
 | `*/<glob>` | `*/cost-invoices` | any kind whose slug matches |
 
+Code sidecars travel with their object: selecting `hooks/<slug>` carries `hooks/<slug>.py`, selecting `schemas/<q>` carries the queue's `formulas/*.py`.
+
 ### Hook secrets
 
-Hook secret values aren't copied between envs. If the target's `secrets/<tgt>.hook-secrets.json` is missing keys, `rdc deploy` lists them, pre-populates the file with empty placeholders, and aborts — fill in the values and re-run.
+Hook secret values are never copied between envs — they live in each env's gitignored `secrets/<env>.hook-secrets.json`. On push, `rdc sync` injects only filled values; keys still holding the placeholder sentinel are skipped, so a half-edited template never leaks a literal to the API.
 
 ## Commands
 
@@ -225,7 +213,7 @@ Hook secret values aren't copied between envs. If the target's `secrets/<tgt>.ho
 | `rdc init` | Create a new project, or add an env to an existing one. Prompts interactively. |
 | `rdc auth <env>` | Set or refresh the API token for `<env>`. |
 | `rdc sync <env>` | Reconcile snapshot ↔ remote in one pass. |
-| `rdc deploy <src> <tgt>` | Promote one env's snapshot to another. |
+| `rdc migrate <src> <tgt>` | Copy one env's snapshot into another's, locally (slug remap, ref rewrite, overlay) — then push with `rdc sync <tgt>`. |
 | `rdc doctor <env>` | Diagnose and fix the local snapshot — realign stale slugs, repair store-extension hooks, optionally rebuild the lockfile (`--rebuild-lock`). |
 | `rdc upgrade` | Self-update the binary. |
 
