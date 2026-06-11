@@ -46,6 +46,51 @@ impl ChangeList {
     pub fn is_empty(&self) -> bool {
         self.total() == 0
     }
+
+    /// Validate that every changed local JSON file actually parses.
+    /// The scanner itself hashes raw bytes (hashing must never fail), so
+    /// a malformed file otherwise rides through classification as a
+    /// normal local edit and only explodes mid-push — after earlier
+    /// kinds were already written. Callers surface these in the dry-run
+    /// plan and refuse a real push before the first remote write.
+    pub fn json_parse_errors(&self) -> Vec<JsonParseError> {
+        let mut out = Vec::new();
+        let mut check = |kind: &'static str, map: &BTreeMap<String, std::path::PathBuf>| {
+            for (slug, path) in map {
+                let Ok(bytes) = std::fs::read(path) else {
+                    continue; // unreadable ≠ unparseable; push surfaces I/O errors
+                };
+                if let Err(e) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    out.push(JsonParseError {
+                        kind,
+                        slug: slug.clone(),
+                        path: path.clone(),
+                        error: e.to_string(),
+                    });
+                }
+            }
+        };
+        check("workspaces", &self.workspaces);
+        check("hooks", &self.hooks);
+        check("rules", &self.rules);
+        check("labels", &self.labels);
+        check("queues", &self.queues);
+        check("schemas", &self.schemas);
+        check("inboxes", &self.inboxes);
+        check("email_templates", &self.email_templates);
+        check("engines", &self.engines);
+        check("engine_fields", &self.engine_fields);
+        out
+    }
+}
+
+/// One unparseable changed local file, as reported by
+/// [`ChangeList::json_parse_errors`].
+pub struct JsonParseError {
+    pub kind: &'static str,
+    pub slug: String,
+    pub path: std::path::PathBuf,
+    pub error: String,
 }
 
 /// Lockfile entries whose on-disk file is missing — the user's explicit

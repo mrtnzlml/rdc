@@ -817,6 +817,130 @@ async fn sync_no_pull_skips_remote_change() {
 /// / `would pull` event-log lines plus a `Dry run: …` summary to stderr.
 /// We invoke the binary directly here so we can capture stderr — calling
 /// `sync::run` directly would print to the test runner's own stderr.
+/// A locally-MALFORMED JSON file must surface in `--dry-run` as a
+/// dedicated "parse errors" section (not a phantom "would push PATCH"),
+/// and a real sync must refuse BEFORE the first remote write — even when
+/// another, valid local edit is pending (no partial pushes).
+#[tokio::test]
+async fn sync_surfaces_parse_errors_and_refuses_partial_push() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // Two labels on the env: one will be corrupted locally, one validly
+    // edited — the valid PATCH must NOT land when the corrupt one refuses.
+    let labels_body = serde_json::json!({
+        "pagination": { "total": 2, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 41,
+                "url": format!("{}/api/v1/labels/41", server.uri()),
+                "name": "Corrupt Me",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "color": "#111111",
+                "modified_at": "2026-04-15T08:00:00Z"
+            },
+            {
+                "id": 42,
+                "url": format!("{}/api/v1/labels/42", server.uri()),
+                "name": "Valid Edit",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "color": "#222222",
+                "modified_at": "2026-04-15T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&labels_body))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &["/api/v1/labels"]).await;
+
+    // Any mutating request is a fail-fast violation.
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/labels/41"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/labels/42"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("seed sync should succeed");
+
+    // Corrupt one label, validly edit the other.
+    let corrupt_path = project.path().join("envs/dev/labels/corrupt-me.json");
+    std::fs::write(&corrupt_path, b"{\"broken\": ").unwrap();
+    let valid_path = project.path().join("envs/dev/labels/valid-edit.json");
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&valid_path).unwrap()).unwrap();
+    v["color"] = serde_json::json!("#333333");
+    std::fs::write(&valid_path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    // Dry-run (binary, so the rendered plan is observable): succeeds as a
+    // preview but must name the parse error rather than a phantom PATCH.
+    let dry = assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev", "--dry-run"])
+        .output()
+        .unwrap();
+    let dry_all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&dry.stdout),
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    assert!(dry.status.success(), "dry-run is a preview and must succeed: {dry_all}");
+    assert!(
+        dry_all.contains("parse error"),
+        "dry-run must surface a parse-errors section: {dry_all}"
+    );
+    assert!(
+        dry_all.contains("labels/corrupt-me"),
+        "dry-run must name the unparseable object: {dry_all}"
+    );
+
+    // Real sync: refuses before ANY remote write (wiremock .expect(0)
+    // guards both PATCH endpoints on Drop).
+    std::env::set_current_dir(project.path()).unwrap();
+    let err = rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect_err("sync must refuse to push with an unparseable local file");
+    std::env::set_current_dir(&prev_cwd).unwrap();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("corrupt-me"),
+        "refusal must name the unparseable file: {msg}"
+    );
+}
+
 #[tokio::test]
 async fn sync_dry_run_makes_zero_writes() {
     let server = MockServer::start().await;
