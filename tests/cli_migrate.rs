@@ -260,6 +260,87 @@ fn migrate_only_restricts_to_selected_object() {
     );
 }
 
+#[test]
+fn migrate_only_includes_sidecars_of_selected_objects() {
+    let project = init_two_env_project();
+    let root = project.path();
+    let test_root = root.join("envs/test");
+
+    // Hook with a code sidecar — selecting the hook must carry the .py along.
+    write(
+        &test_root.join("hooks/keeper.json"),
+        &serde_json::json!({ "name": "Keeper", "type": "function" }),
+    );
+    std::fs::write(test_root.join("hooks/keeper.py"), b"def k(): pass\n").unwrap();
+    // Unselected hook + sidecar must both stay behind.
+    write(
+        &test_root.join("hooks/skipped.json"),
+        &serde_json::json!({ "name": "Skipped", "type": "function" }),
+    );
+    std::fs::write(test_root.join("hooks/skipped.py"), b"def s(): pass\n").unwrap();
+
+    // Rule with a trigger-condition sidecar.
+    write(
+        &test_root.join("rules/validation.json"),
+        &serde_json::json!({ "name": "Validation" }),
+    );
+    std::fs::write(test_root.join("rules/validation.py"), b"x > 0\n").unwrap();
+
+    // Schema with a formula sidecar nested under its queue.
+    let qdir = test_root.join("workspaces/main/queues/cost-invoices");
+    write(
+        &qdir.join("schema.json"),
+        &serde_json::json!({ "name": "Cost invoices schema", "content": [] }),
+    );
+    std::fs::create_dir_all(qdir.join("formulas")).unwrap();
+    std::fs::write(
+        qdir.join("formulas/total_amount.py"),
+        b"field.total_amount\n",
+    )
+    .unwrap();
+    write(
+        &test_root.join("workspaces/main/workspace.json"),
+        &serde_json::json!({ "name": "Main" }),
+    );
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run(
+        "test",
+        "prod",
+        false,
+        false,
+        vec![
+            "hooks/keeper".into(),
+            "rules/validation".into(),
+            "schemas/cost-invoices".into(),
+        ],
+    );
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("migrate --only should succeed");
+
+    let prod_root = root.join("envs/prod");
+    assert!(
+        prod_root.join("hooks/keeper.py").exists(),
+        "selected hook's .py sidecar must be migrated"
+    );
+    assert!(
+        !prod_root.join("hooks/skipped.py").exists(),
+        "unselected hook's sidecar must NOT be migrated"
+    );
+    assert!(
+        prod_root.join("rules/validation.py").exists(),
+        "selected rule's .py sidecar must be migrated"
+    );
+    assert!(
+        prod_root
+            .join("workspaces/main/queues/cost-invoices/formulas/total_amount.py")
+            .exists(),
+        "selected schema's formula sidecars must be migrated"
+    );
+}
+
 /// An `--only` selector that matches nothing aborts loudly rather than
 /// silently producing an empty migration (preserves the coverage of the
 /// former `deploy_only_with_unknown_selector_errors`).
