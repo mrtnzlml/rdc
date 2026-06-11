@@ -817,6 +817,98 @@ async fn sync_no_pull_skips_remote_change() {
 /// / `would pull` event-log lines plus a `Dry run: …` summary to stderr.
 /// We invoke the binary directly here so we can capture stderr — calling
 /// `sync::run` directly would print to the test runner's own stderr.
+/// A clean `RemoteDelete` is not a conflict any more: `--dry-run` must
+/// list it on the pull side as `(delete local; deleted on env)` and NOT
+/// under "would prompt".
+#[tokio::test]
+async fn sync_dry_run_lists_clean_remote_delete_under_pull() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // Phase 1: one label exists; phase 2 (after seed): the env deleted it.
+    let n = Arc::new(AtomicUsize::new(0));
+    let counter = n.clone();
+    let uri = server.uri();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(move |_req: &Request| {
+            let first = counter.fetch_add(1, Ordering::SeqCst) == 0;
+            let results = if first {
+                serde_json::json!([{
+                    "id": 51,
+                    "url": format!("{uri}/api/v1/labels/51"),
+                    "name": "Doomed Label",
+                    "organization": format!("{uri}/api/v1/organizations/1"),
+                    "color": "#101010",
+                    "modified_at": "2026-04-15T08:00:00Z"
+                }])
+            } else {
+                serde_json::json!([])
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+                "results": results
+            }))
+        })
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &["/api/v1/labels"]).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("seed sync should succeed");
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    let dry = assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev", "--dry-run"])
+        .output()
+        .unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&dry.stdout),
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    assert!(dry.status.success(), "dry-run must succeed: {all}");
+    assert!(
+        all.contains("labels/doomed-label (delete local; deleted on env)"),
+        "clean RemoteDelete must be listed on the pull side: {all}"
+    );
+    assert!(
+        !all.contains("doomed-label -- deleted on env"),
+        "clean RemoteDelete must not appear as a prompt item: {all}"
+    );
+    assert!(
+        all.contains("0 would prompt"),
+        "nothing should be classified as a prompt: {all}"
+    );
+    assert!(
+        all.contains("1 would pull"),
+        "the deletion must count under would-pull: {all}"
+    );
+}
+
 /// A locally-MALFORMED JSON file must surface in `--dry-run` as a
 /// dedicated "parse errors" section (not a phantom "would push PATCH"),
 /// and a real sync must refuse BEFORE the first remote write — even when

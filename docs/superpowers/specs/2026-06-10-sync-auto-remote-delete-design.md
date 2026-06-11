@@ -1,7 +1,7 @@
 # Sync: auto-resolve clean remote deletions locally
 
 **Date:** 2026-06-10
-**Status:** Approved
+**Status:** Implemented (2026-06-11)
 
 ## Problem
 
