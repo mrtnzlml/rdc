@@ -1470,6 +1470,8 @@ fn resolve_one_conflict<R: BufRead>(
                 modified_at,
                 Some(canonical_remote_hash.clone()),
             );
+            sweep_conflict_artifacts(&local_path, env);
+            sweep_conflict_artifacts(&code_path, env);
             outcome
                 .promoted_to_push
                 .push((it.kind.clone(), it.slug.clone(), local_path));
@@ -1535,6 +1537,8 @@ fn resolve_one_conflict<R: BufRead>(
                 modified_at,
                 Some(canonical_remote_hash.clone()),
             );
+            sweep_conflict_artifacts(&local_path, env);
+            sweep_conflict_artifacts(&code_path, env);
         }
         Resolution::Edit(edited) => {
             // Fully-resolved edit — write bytes to disk and align base to
@@ -1560,6 +1564,8 @@ fn resolve_one_conflict<R: BufRead>(
                 modified_at,
                 Some(canonical_remote_hash.clone()),
             );
+            sweep_conflict_artifacts(&local_path, env);
+            sweep_conflict_artifacts(&code_path, env);
             outcome
                 .promoted_to_push
                 .push((it.kind.clone(), it.slug.clone(), local_path));
@@ -1695,6 +1701,18 @@ fn deleted_marker_path(local_path: &Path, env: &str) -> PathBuf {
     let mut s = shadow.into_os_string();
     s.push("-deleted");
     PathBuf::from(s)
+}
+
+/// Sweep stale conflict artifacts for a file whose conflict has just been
+/// RESOLVED: the `<file>.<env>` shadow (left by an earlier non-TTY run or
+/// an explicit `[s]kip`) and the `<file>.<env>-deleted` marker. Once the
+/// user picks `[k]`/`[r]`/`[e]` the shadow's content is consumed or stale
+/// either way; leaving it on disk misleads (it no longer reflects any
+/// pending decision). Idempotent — missing files are no-ops. Skip-style
+/// outcomes must NOT call this: their artifacts are the deferral.
+fn sweep_conflict_artifacts(local_path: &Path, env: &str) {
+    let _ = std::fs::remove_file(crate::paths::shadow_path_for(local_path, env));
+    let _ = std::fs::remove_file(deleted_marker_path(local_path, env));
 }
 
 /// Drop a `(kind, slug)` entry from the lockfile. Used by the
@@ -3549,6 +3567,89 @@ mod tests {
             .and_then(|e| e.content_hash.clone())
             .unwrap();
         assert_eq!(recorded, content_hash(&remote_bytes, &fixture.lockfile));
+    }
+
+    /// A stale shadow (and `-deleted` marker) left by an earlier
+    /// non-TTY skip must be swept when the conflict is finally resolved
+    /// with [r] — the shadow's content is now consumed/stale either way.
+    #[tokio::test]
+    async fn resolve_conflicts_use_remote_sweeps_stale_shadow() {
+        let mut fixture = setup_conflict_fixture();
+        let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
+        let classified = classified_for(&fixture);
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+
+        let shadow = crate::paths::shadow_path_for(&fixture.local_path, "test");
+        let marker = deleted_marker_path(&fixture.local_path, "test");
+        std::fs::write(&shadow, b"{}").unwrap();
+        std::fs::write(&marker, b"").unwrap();
+
+        {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                interactive: true,
+            };
+            resolve_conflicts(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b"r\n"),
+                true,
+                &progress,
+            )
+            .await
+            .expect("resolver should succeed on [r]");
+        }
+
+        assert!(
+            !shadow.exists(),
+            "stale shadow must be swept after [r] resolution"
+        );
+        assert!(
+            !marker.exists(),
+            "stale -deleted marker must be swept after [r] resolution"
+        );
+    }
+
+    /// Same sweep on [k]eep local: the conflict is resolved (local wins,
+    /// push promoted), so a shadow from an earlier skip is stale.
+    #[tokio::test]
+    async fn resolve_conflicts_keep_local_sweeps_stale_shadow() {
+        let mut fixture = setup_conflict_fixture();
+        let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
+        let classified = classified_for(&fixture);
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+
+        let shadow = crate::paths::shadow_path_for(&fixture.local_path, "test");
+        std::fs::write(&shadow, b"{}").unwrap();
+
+        {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                interactive: true,
+            };
+            resolve_conflicts(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b"k\n"),
+                true,
+                &progress,
+            )
+            .await
+            .expect("resolver should succeed on [k]");
+        }
+
+        assert!(
+            !shadow.exists(),
+            "stale shadow must be swept after [k] resolution"
+        );
     }
 
     /// Scripted `s\n` ([s]kip): the resolver writes a shadow file next
