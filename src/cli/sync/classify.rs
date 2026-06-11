@@ -357,6 +357,10 @@ mod tests {
                 | SyncClass::LocalDelete
                 | SyncClass::RemoteEdit
                 | SyncClass::RemoteCreate
+                // Clean RemoteDelete auto-resolves (deletes the local
+                // file) without a prompt — it must therefore never be
+                // produced for a state where local diverged from base.
+                | SyncClass::RemoteDelete
         )
     }
 

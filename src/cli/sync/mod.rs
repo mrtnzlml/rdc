@@ -291,20 +291,27 @@ pub(crate) async fn run_cycle(
     if dry_run {
         use crate::cli::sync::classify::SyncClass;
 
-        // Pull-side items (would write local).
+        // Pull-side items (would write local). A clean `RemoteDelete`
+        // auto-resolves by mirroring the env's deletion locally, so it
+        // belongs here — not under "would prompt".
         let pull_items: Vec<&crate::cli::sync::classify::ClassifiedItem> = classified
             .iter()
-            .filter(|c| matches!(c.class, SyncClass::RemoteEdit | SyncClass::RemoteCreate))
+            .filter(|c| {
+                matches!(
+                    c.class,
+                    SyncClass::RemoteEdit | SyncClass::RemoteCreate | SyncClass::RemoteDelete
+                )
+            })
             .collect();
         if !pull_items.is_empty() {
             progress.event(Action::Plan, "would pull");
             let mut body = String::new();
             use std::fmt::Write as _;
             for it in &pull_items {
-                let note = if matches!(it.class, SyncClass::RemoteCreate) {
-                    " (new)"
-                } else {
-                    ""
+                let note = match it.class {
+                    SyncClass::RemoteCreate => " (new)",
+                    SyncClass::RemoteDelete => " (delete local; deleted on env)",
+                    _ => "",
                 };
                 let _ = writeln!(body, "- {}/{}{}", it.kind, it.slug, note);
             }
@@ -346,7 +353,6 @@ pub(crate) async fn run_cycle(
                     SyncClass::BothDiverged
                         | SyncClass::LocalEditRemoteDelete
                         | SyncClass::LocalDeleteRemoteEdit
-                        | SyncClass::RemoteDelete
                 )
             })
             .collect();
@@ -359,7 +365,6 @@ pub(crate) async fn run_cycle(
                     SyncClass::BothDiverged => "both diverged",
                     SyncClass::LocalEditRemoteDelete => "local edit, deleted on env",
                     SyncClass::LocalDeleteRemoteEdit => "local delete, edited on env",
-                    SyncClass::RemoteDelete => "deleted on env",
                     _ => "",
                 };
                 let _ = writeln!(body, "- {}/{} -- {}", it.kind, it.slug, tag);

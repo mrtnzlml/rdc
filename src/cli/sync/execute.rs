@@ -7,9 +7,13 @@
 //!   skip writes a shadow file and records the local hash; abort bubbles
 //!   [`crate::cli::resolve::PullAborted`].
 //! - **Remote-delete + double-conflict + both-deleted** — handled by
-//!   [`resolve_remote_deletes`]. `RemoteDelete`, `LocalEditRemoteDelete`,
-//!   and `LocalDeleteRemoteEdit` share the same `[k]/[r]/[s]/[a]` prompt
-//!   shape ([`crate::cli::resolve::prompt_remote_delete`]); `BothDeleted`
+//!   [`resolve_remote_deletes`]. A clean `RemoteDelete` (local unchanged
+//!   vs base — the class's definition) AUTO-RESOLVES by mirroring the
+//!   env's deletion locally, with a visible per-item Delete event — no
+//!   prompt, interactive and non-TTY alike. The genuine conflicts
+//!   `LocalEditRemoteDelete` and `LocalDeleteRemoteEdit` share the
+//!   `[k]/[r]/[s]/[a]` prompt shape
+//!   ([`crate::cli::resolve::prompt_remote_delete`]); `BothDeleted`
 //!   converges silently by dropping the lockfile entry. `[k]` (restore on
 //!   env) drops the lockfile entry and promotes the item to the push
 //!   pipeline so it's POSTed; `[r]` mirrors the deletion locally; `[s]`
@@ -1710,6 +1714,51 @@ fn deleted_marker_path(local_path: &Path, env: &str) -> PathBuf {
 /// either way; leaving it on disk misleads (it no longer reflects any
 /// pending decision). Idempotent — missing files are no-ops. Skip-style
 /// outcomes must NOT call this: their artifacts are the deferral.
+/// Mirror an env-side deletion locally: remove the JSON file, any code
+/// sidecar (both runtime extensions for hooks), a schema's `formulas/`
+/// directory, and a stale `<file>.<env>-deleted` marker; drop the
+/// lockfile entry. Shared by the `[r]` prompt arm and the clean
+/// `RemoteDelete` auto-resolve path.
+fn delete_local_object(
+    ctx: &mut crate::cli::pull::common::PullCtx<'_>,
+    it: &ClassifiedItem,
+    refs: &RemoteDeleteRefs,
+    env: &str,
+) -> Result<()> {
+    let local_path = &refs.local_path;
+    // For split-file kinds, pick the sidecar extension from the local
+    // JSON's runtime BEFORE deleting the JSON itself. Also sweep a
+    // stale-other-extension sidecar.
+    let sidecar = sidecar_path_for_conflict(local_path, refs.hash_strategy);
+    let other_sidecar = if sidecar.extension().and_then(|s| s.to_str()) == Some("js") {
+        local_path.with_extension("py")
+    } else {
+        local_path.with_extension("js")
+    };
+    std::fs::remove_file(local_path)
+        .with_context(|| format!("removing {}", local_path.display()))?;
+    if matches!(refs.hash_strategy, HashStrategy::Hook | HashStrategy::Rule) && sidecar.exists() {
+        std::fs::remove_file(&sidecar)
+            .with_context(|| format!("removing {}", sidecar.display()))?;
+    }
+    if matches!(refs.hash_strategy, HashStrategy::Hook) && other_sidecar.exists() {
+        std::fs::remove_file(&other_sidecar)
+            .with_context(|| format!("removing {}", other_sidecar.display()))?;
+    }
+    // For schemas, also sweep the formulas/ directory so deleted schemas
+    // don't leave orphan formula files behind.
+    if matches!(refs.hash_strategy, HashStrategy::Schema) {
+        let queue_dir = local_path.parent().unwrap_or(local_path);
+        let formulas_dir = queue_dir.join("formulas");
+        if formulas_dir.exists() {
+            std::fs::remove_dir_all(&formulas_dir).ok();
+        }
+    }
+    let _ = std::fs::remove_file(deleted_marker_path(local_path, env));
+    drop_lockfile_entry(ctx, &it.kind, &it.slug);
+    Ok(())
+}
+
 fn sweep_conflict_artifacts(local_path: &Path, env: &str) {
     let _ = std::fs::remove_file(crate::paths::shadow_path_for(local_path, env));
     let _ = std::fs::remove_file(deleted_marker_path(local_path, env));
@@ -1814,6 +1863,30 @@ async fn prune_mdh_orphans<R: BufRead>(
             continue;
         }
 
+        // Unchanged orphan (indexes.json bytes hash to exactly the
+        // lockfile entry — the same comparison `decide_pull_action`
+        // makes) auto-prunes: same rule as clean `RemoteDelete`, in
+        // interactive and non-TTY runs alike. Locally modified orphans
+        // fall through to the prompt / marker flow below.
+        let unchanged = std::fs::read(&indexes_path)
+            .ok()
+            .map(|bytes| crate::state::content_hash(&bytes, &crate::state::Lockfile::default()))
+            .is_some_and(|h| {
+                ctx.lockfile
+                    .objects
+                    .get("mdh_indexes")
+                    .and_then(|m| m.get(&slug))
+                    .and_then(|e| e.content_hash.as_deref())
+                    == Some(h.as_str())
+            });
+        if unchanged {
+            let _ = std::fs::remove_file(deleted_marker_path(&indexes_path, &env));
+            remove_mdh_dataset(ctx, &slug, &indexes_path);
+            progress.event(Action::Delete, &format!("mdh/{slug} (deleted on {env})"));
+            pruned += 1;
+            continue;
+        }
+
         // Non-tty: defer with a marker, never silently delete local files.
         if !interactive {
             let marker = deleted_marker_path(&indexes_path, &env);
@@ -1884,8 +1957,16 @@ async fn prune_mdh_orphans<R: BufRead>(
 /// Resolve `RemoteDelete`, `LocalEditRemoteDelete`,
 /// `LocalDeleteRemoteEdit`, and `BothDeleted` items in `classified`.
 ///
-/// All three "destructive direction" classes share the same prompt
-/// shape ([`crate::cli::resolve::prompt_remote_delete`]) and resolve
+/// A clean `RemoteDelete` (local canonically unchanged vs the lockfile
+/// base — that is what the class means) auto-resolves without a prompt:
+/// the local file, sidecars, and a stale `-deleted` marker are removed
+/// and the lockfile entry is dropped, in interactive and non-TTY runs
+/// alike. Recovery is `git restore <file>` + sync (re-POSTs as
+/// `LocalCreate`). See
+/// docs/superpowers/specs/2026-06-10-sync-auto-remote-delete-design.md.
+///
+/// The two genuine-conflict classes share the same prompt shape
+/// ([`crate::cli::resolve::prompt_remote_delete`]) and resolve
 /// to one of:
 /// - `[k]` **keep local** — restore on env. The lockfile entry is
 ///   dropped and the item is promoted to the push pipeline, which sees
@@ -2526,6 +2607,32 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     }
                 }
 
+                // Clean `RemoteDelete` auto-resolves — in interactive and
+                // non-TTY runs alike. The class itself means the local file
+                // is canonically unchanged vs the lockfile base, so the
+                // three-way merge has an unambiguous answer: mirror the
+                // env's deletion locally. No prompt, no marker — but a
+                // visible per-item Delete event, and git makes the local
+                // removal trivially recoverable (`git restore` + sync
+                // re-POSTs it, same outcome as `[k]` used to produce).
+                // Genuine conflicts (LocalEditRemoteDelete /
+                // LocalDeleteRemoteEdit) keep prompting below. See
+                // docs/superpowers/specs/2026-06-10-sync-auto-remote-delete-design.md.
+                if matches!(it.class, SyncClass::RemoteDelete) {
+                    if !local_path.exists() {
+                        // Vanished mid-run — both sides agree; converge by
+                        // dropping the entry (same semantics as BothDeleted).
+                        drop_lockfile_entry(ctx, &it.kind, &it.slug);
+                        continue;
+                    }
+                    delete_local_object(ctx, it, &refs, &env)?;
+                    progress.event(
+                        Action::Delete,
+                        &format!("{}/{} (deleted on {env})", it.kind, it.slug),
+                    );
+                    continue;
+                }
+
                 if !interactive {
                     // CI / --yes fallback: write the deleted marker so
                     // the next interactive sync re-presents the choice.
@@ -2660,46 +2767,9 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             }
                         } else {
                             // Mirror the env's deletion: remove local +
-                            // drop lockfile entry. No push action — env
-                            // already doesn't have it. For split-file
-                            // kinds, drop the sidecar too — pick the
-                            // extension from the local JSON's runtime
-                            // before deleting the JSON itself. Also
-                            // sweep a stale-other-extension sidecar.
-                            let sidecar =
-                                sidecar_path_for_conflict(&local_path, refs.hash_strategy);
-                            let other_sidecar =
-                                if sidecar.extension().and_then(|s| s.to_str()) == Some("js") {
-                                    local_path.with_extension("py")
-                                } else {
-                                    local_path.with_extension("js")
-                                };
-                            std::fs::remove_file(&local_path)
-                                .with_context(|| format!("removing {}", local_path.display()))?;
-                            if matches!(refs.hash_strategy, HashStrategy::Hook | HashStrategy::Rule)
-                                && sidecar.exists()
-                            {
-                                std::fs::remove_file(&sidecar)
-                                    .with_context(|| format!("removing {}", sidecar.display()))?;
-                            }
-                            if matches!(refs.hash_strategy, HashStrategy::Hook)
-                                && other_sidecar.exists()
-                            {
-                                std::fs::remove_file(&other_sidecar).with_context(|| {
-                                    format!("removing {}", other_sidecar.display())
-                                })?;
-                            }
-                            // For schemas, also sweep the formulas/ directory
-                            // so locally-deleted schemas don't leave orphan
-                            // formula files behind.
-                            if matches!(refs.hash_strategy, HashStrategy::Schema) {
-                                let queue_dir = local_path.parent().unwrap_or(&local_path);
-                                let formulas_dir = queue_dir.join("formulas");
-                                if formulas_dir.exists() {
-                                    std::fs::remove_dir_all(&formulas_dir).ok();
-                                }
-                            }
-                            drop_lockfile_entry(ctx, &it.kind, &it.slug);
+                            // sidecars + marker, drop the lockfile entry.
+                            // No push action — env already doesn't have it.
+                            delete_local_object(ctx, it, &refs, &env)?;
                         }
                     }
                     Resolution::Skip => {
@@ -3946,6 +4016,159 @@ mod tests {
         }]
     }
 
+    fn classified_local_edit_remote_delete() -> Vec<ClassifiedItem> {
+        vec![ClassifiedItem {
+            kind: "labels".to_string(),
+            slug: "audit-hold".to_string(),
+            class: SyncClass::LocalEditRemoteDelete,
+            local_hash: None,
+            remote_hash: None,
+            base_hash: Some("dummy".to_string()),
+        }]
+    }
+
+    /// Clean `RemoteDelete` (local canonically unchanged vs base — that is
+    /// the class's definition) auto-resolves: local file removed, lockfile
+    /// entry dropped, a stale `-deleted` marker swept — WITHOUT consuming
+    /// any scripted stdin (an empty reader would EOF→Skip if a prompt ran,
+    /// which would write a marker and keep the file).
+    #[tokio::test]
+    async fn resolve_remote_deletes_clean_auto_resolves_without_prompt() {
+        let mut fixture = setup_remote_delete_fixture();
+        let classified = classified_remote_delete();
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+
+        // Stale marker from an earlier deferral must be swept by the auto path.
+        let marker = deleted_marker_path(&fixture.local_path, "test");
+        std::fs::write(&marker, b"").unwrap();
+
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                interactive: true,
+            };
+            resolve_remote_deletes(
+                &mut ctx,
+                &catalog_with_labels(vec![]),
+                &classified,
+                Cursor::new(b""),
+                true,
+                &progress,
+            )
+            .await
+            .expect("clean RemoteDelete must auto-resolve")
+        };
+
+        assert!(
+            !fixture.local_path.exists(),
+            "local file must be removed by the auto-resolve"
+        );
+        assert!(!marker.exists(), "stale -deleted marker must be swept");
+        assert!(
+            fixture
+                .lockfile
+                .objects
+                .get("labels")
+                .and_then(|m| m.get("audit-hold"))
+                .is_none(),
+            "lockfile entry must be dropped"
+        );
+        assert!(
+            outcome.promoted_to_push.is_empty(),
+            "auto-resolve must not promote anything to push"
+        );
+    }
+
+    /// The same auto-resolution applies in non-interactive (`--yes` /
+    /// non-TTY / CI) runs — symmetric with `RemoteEdit`, which already
+    /// overwrites local files without prompting in both modes.
+    #[tokio::test]
+    async fn resolve_remote_deletes_clean_auto_resolves_non_interactive() {
+        let mut fixture = setup_remote_delete_fixture();
+        let classified = classified_remote_delete();
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+
+        {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                interactive: false,
+            };
+            resolve_remote_deletes(
+                &mut ctx,
+                &catalog_with_labels(vec![]),
+                &classified,
+                Cursor::new(b""),
+                false,
+                &progress,
+            )
+            .await
+            .expect("clean RemoteDelete must auto-resolve non-interactively")
+        };
+
+        assert!(
+            !fixture.local_path.exists(),
+            "local file must be removed without a marker in non-TTY too"
+        );
+        let marker = deleted_marker_path(&fixture.local_path, "test");
+        assert!(!marker.exists(), "no deferral marker for the clean class");
+        assert!(
+            fixture
+                .lockfile
+                .objects
+                .get("labels")
+                .and_then(|m| m.get("audit-hold"))
+                .is_none(),
+            "lockfile entry must be dropped"
+        );
+    }
+
+    /// A `RemoteDelete` whose local file vanished mid-run (after the scan,
+    /// before resolution) converges by dropping the lockfile entry — same
+    /// semantics as `BothDeleted` — instead of warn-and-skip.
+    #[tokio::test]
+    async fn resolve_remote_deletes_missing_local_converges_silently() {
+        let mut fixture = setup_remote_delete_fixture();
+        let classified = classified_remote_delete();
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+        std::fs::remove_file(&fixture.local_path).unwrap();
+
+        {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                interactive: true,
+            };
+            resolve_remote_deletes(
+                &mut ctx,
+                &catalog_with_labels(vec![]),
+                &classified,
+                Cursor::new(b""),
+                true,
+                &progress,
+            )
+            .await
+            .expect("mid-run-missing local must converge")
+        };
+
+        assert!(
+            fixture
+                .lockfile
+                .objects
+                .get("labels")
+                .and_then(|m| m.get("audit-hold"))
+                .is_none(),
+            "lockfile entry must be dropped when both sides agree"
+        );
+    }
+
     /// Seed `slug` as a clean (local == base) MDH dataset on disk: the
     /// env-tree `indexes.json`, the base-cache mirror, and a lockfile
     /// `mdh_indexes` entry whose `content_hash` matches the bytes.
@@ -3976,6 +4199,116 @@ mod tests {
         mirror
     }
 
+    /// An MDH orphan whose `indexes.json` is byte-unchanged vs the
+    /// lockfile hash auto-prunes — no prompt (empty stdin would EOF), no
+    /// marker, interactive and non-TTY alike. Same rule as clean
+    /// `RemoteDelete`.
+    #[tokio::test]
+    async fn prune_mdh_orphans_unchanged_auto_prunes_without_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        let mut lockfile = Lockfile::default();
+        let mirror = seed_mdh_dataset(&paths, &mut lockfile, "vendors-2");
+        let ix = paths.dataset_dir("vendors-2").join("indexes.json");
+        // Stale marker from an earlier deferral must be swept too.
+        let marker = deleted_marker_path(&ix, "test");
+        std::fs::write(&marker, b"").unwrap();
+
+        let client = RossumClient::new(
+            "https://unused.invalid/api/v1".to_string(),
+            "TEST".to_string(),
+        )
+        .unwrap();
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+        let pruned = {
+            let mut ctx = PullCtx {
+                paths: &paths,
+                client: &client,
+                lockfile: &mut lockfile,
+                queue_locations: BTreeMap::new(),
+                interactive: true,
+            };
+            prune_mdh_orphans(
+                &mut ctx,
+                &BTreeSet::new(),
+                Cursor::new(b""),
+                true,
+                &progress,
+            )
+            .await
+            .expect("unchanged orphan must auto-prune")
+        };
+
+        assert_eq!(pruned, 1, "unchanged orphan counts as pruned");
+        assert!(!ix.exists(), "env-tree dataset dir must be removed");
+        assert!(!mirror.exists(), "base-cache mirror must be removed");
+        assert!(!marker.exists(), "stale marker must be swept");
+        assert!(
+            lockfile
+                .objects
+                .get("mdh_indexes")
+                .and_then(|m| m.get("vendors-2"))
+                .is_none(),
+            "lockfile entry must be dropped"
+        );
+    }
+
+    /// A locally-MODIFIED orphan keeps prompting (scripted `s` defers
+    /// with a marker and keeps the dataset).
+    #[tokio::test]
+    async fn prune_mdh_orphans_modified_local_still_prompts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        let mut lockfile = Lockfile::default();
+        seed_mdh_dataset(&paths, &mut lockfile, "vendors-2");
+        let ix = paths.dataset_dir("vendors-2").join("indexes.json");
+        std::fs::write(
+            &ix,
+            b"{\n  \"regular\": [\"locally-edited\"],\n  \"search\": []\n}",
+        )
+        .unwrap();
+
+        let client = RossumClient::new(
+            "https://unused.invalid/api/v1".to_string(),
+            "TEST".to_string(),
+        )
+        .unwrap();
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+        let pruned = {
+            let mut ctx = PullCtx {
+                paths: &paths,
+                client: &client,
+                lockfile: &mut lockfile,
+                queue_locations: BTreeMap::new(),
+                interactive: true,
+            };
+            prune_mdh_orphans(
+                &mut ctx,
+                &BTreeSet::new(),
+                Cursor::new(b"s\n"),
+                true,
+                &progress,
+            )
+            .await
+            .expect("modified orphan prompt must succeed")
+        };
+
+        assert_eq!(pruned, 0, "skip defers — nothing pruned");
+        assert!(ix.exists(), "modified dataset must survive [s]");
+        assert!(
+            deleted_marker_path(&ix, "test").exists(),
+            "deferral marker must be written"
+        );
+        assert!(
+            lockfile
+                .objects
+                .get("mdh_indexes")
+                .and_then(|m| m.get("vendors-2"))
+                .is_some(),
+            "lockfile entry must survive the deferral"
+        );
+    }
+
     /// Scripted `r\n` ([r] use env; delete local) on an MDH dataset the
     /// remote no longer lists: the orphan's env-tree dir, base-cache
     /// mirror, and lockfile entry are all removed; a sibling dataset the
@@ -3988,6 +4321,13 @@ mod tests {
 
         let live_mirror = seed_mdh_dataset(&paths, &mut lockfile, "vendors");
         let orphan_mirror = seed_mdh_dataset(&paths, &mut lockfile, "vendors-2");
+        // Modify the orphan's local indexes.json so it is a genuine
+        // conflict — unchanged orphans auto-prune without prompting.
+        std::fs::write(
+            paths.dataset_dir("vendors-2").join("indexes.json"),
+            b"{\n  \"regular\": [\"locally-edited\"],\n  \"search\": []\n}",
+        )
+        .unwrap();
 
         let client =
             RossumClient::new("https://unused.invalid/api/v1".to_string(), "TEST".to_string())
@@ -4055,6 +4395,13 @@ mod tests {
         let paths = Paths::for_env(tmp.path(), "test");
         let mut lockfile = Lockfile::default();
         seed_mdh_dataset(&paths, &mut lockfile, "vendors-2");
+        // Modify the orphan's local indexes.json so it is a genuine
+        // conflict — unchanged orphans auto-prune without prompting.
+        std::fs::write(
+            paths.dataset_dir("vendors-2").join("indexes.json"),
+            b"{\n  \"regular\": [\"locally-edited\"],\n  \"search\": []\n}",
+        )
+        .unwrap();
 
         let client =
             RossumClient::new("https://unused.invalid/api/v1".to_string(), "TEST".to_string())
@@ -4099,6 +4446,13 @@ mod tests {
         let paths = Paths::for_env(tmp.path(), "test");
         let mut lockfile = Lockfile::default();
         seed_mdh_dataset(&paths, &mut lockfile, "vendors-2");
+        // Modify the orphan's local indexes.json so it is a genuine
+        // conflict — unchanged orphans auto-prune without prompting.
+        std::fs::write(
+            paths.dataset_dir("vendors-2").join("indexes.json"),
+            b"{\n  \"regular\": [\"locally-edited\"],\n  \"search\": []\n}",
+        )
+        .unwrap();
 
         let client =
             RossumClient::new("https://unused.invalid/api/v1".to_string(), "TEST".to_string())
@@ -4145,6 +4499,13 @@ mod tests {
         let paths = Paths::for_env(tmp.path(), "test");
         let mut lockfile = Lockfile::default();
         let mirror = seed_mdh_dataset(&paths, &mut lockfile, "vendors-2");
+        // Modify the orphan's local indexes.json so it is a genuine
+        // conflict — unchanged orphans auto-prune without prompting.
+        std::fs::write(
+            paths.dataset_dir("vendors-2").join("indexes.json"),
+            b"{\n  \"regular\": [\"locally-edited\"],\n  \"search\": []\n}",
+        )
+        .unwrap();
 
         let client =
             RossumClient::new("https://unused.invalid/api/v1".to_string(), "TEST".to_string())
@@ -4240,7 +4601,15 @@ mod tests {
     async fn resolve_remote_deletes_keep_local_promotes_to_restore() {
         let mut fixture = setup_remote_delete_fixture();
         let catalog = catalog_with_labels(vec![]);
-        let classified = classified_remote_delete();
+        // The local file carries an edit vs base — a genuine conflict
+        // (LocalEditRemoteDelete), which must keep prompting; the clean
+        // class auto-resolves and is covered separately above.
+        std::fs::write(
+            &fixture.local_path,
+            label_bytes(&mk_label(42, "Audit Hold", "#ffffff")),
+        )
+        .unwrap();
+        let classified = classified_local_edit_remote_delete();
         let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let local_before = std::fs::read(&fixture.local_path).unwrap();
@@ -4300,7 +4669,15 @@ mod tests {
     async fn resolve_remote_deletes_use_env_removes_local_and_drops_lockfile() {
         let mut fixture = setup_remote_delete_fixture();
         let catalog = catalog_with_labels(vec![]);
-        let classified = classified_remote_delete();
+        // The local file carries an edit vs base — a genuine conflict
+        // (LocalEditRemoteDelete), which must keep prompting; the clean
+        // class auto-resolves and is covered separately above.
+        std::fs::write(
+            &fixture.local_path,
+            label_bytes(&mk_label(42, "Audit Hold", "#ffffff")),
+        )
+        .unwrap();
+        let classified = classified_local_edit_remote_delete();
         let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let outcome = {
@@ -4349,7 +4726,15 @@ mod tests {
     async fn resolve_remote_deletes_skip_writes_env_deleted_marker() {
         let mut fixture = setup_remote_delete_fixture();
         let catalog = catalog_with_labels(vec![]);
-        let classified = classified_remote_delete();
+        // The local file carries an edit vs base — a genuine conflict
+        // (LocalEditRemoteDelete), which must keep prompting; the clean
+        // class auto-resolves and is covered separately above.
+        std::fs::write(
+            &fixture.local_path,
+            label_bytes(&mk_label(42, "Audit Hold", "#ffffff")),
+        )
+        .unwrap();
+        let classified = classified_local_edit_remote_delete();
         let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let local_before = std::fs::read(&fixture.local_path).unwrap();
@@ -4404,7 +4789,15 @@ mod tests {
     async fn resolve_remote_deletes_non_tty_falls_back_to_skip() {
         let mut fixture = setup_remote_delete_fixture();
         let catalog = catalog_with_labels(vec![]);
-        let classified = classified_remote_delete();
+        // The local file carries an edit vs base — a genuine conflict
+        // (LocalEditRemoteDelete), which must keep prompting; the clean
+        // class auto-resolves and is covered separately above.
+        std::fs::write(
+            &fixture.local_path,
+            label_bytes(&mk_label(42, "Audit Hold", "#ffffff")),
+        )
+        .unwrap();
+        let classified = classified_local_edit_remote_delete();
         let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let local_before = std::fs::read(&fixture.local_path).unwrap();
