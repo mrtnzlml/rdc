@@ -1,5 +1,6 @@
 // Slug derivation. Stable, deterministic, ASCII-safe.
 // Conversion rules:
+//   - Transliterate non-ASCII to ASCII (deunicode): "žluťoučký" → "zlutoucky".
 //   - Lowercase the input.
 //   - Replace any sequence of non-alphanumeric ASCII characters with a single hyphen.
 //   - Strip leading/trailing hyphens.
@@ -8,6 +9,7 @@
 // Collision handling is the caller's responsibility (see `slugify_unique`).
 
 pub fn slugify(input: &str) -> String {
+    let input = deunicode::deunicode(input);
     let mut out = String::with_capacity(input.len());
     let mut prev_hyphen = true; // skip leading hyphens
     for ch in input.chars() {
@@ -78,9 +80,27 @@ mod tests {
     }
 
     #[test]
-    fn unicode_stripped() {
-        // Non-ASCII characters are dropped (treated as non-alphanumeric).
-        assert_eq!(slugify("Faktura č. 1"), "faktura-1");
+    fn unicode_transliterated() {
+        // Non-ASCII letters transliterate to their ASCII equivalents
+        // instead of vanishing.
+        assert_eq!(slugify("Faktura č. 1"), "faktura-c-1");
+    }
+
+    #[test]
+    fn czech_diacritics_transliterate() {
+        assert_eq!(slugify("Smlouvy — žluťoučký kůň"), "smlouvy-zlutoucky-kun");
+    }
+
+    #[test]
+    fn german_and_french_transliterate() {
+        assert_eq!(slugify("Über straße"), "uber-strasse");
+        assert_eq!(slugify("Reçu déjà"), "recu-deja");
+    }
+
+    #[test]
+    fn emoji_transliterate_to_names() {
+        // deunicode renders emoji as words rather than dropping them.
+        assert_eq!(slugify("Queue 🐎"), "queue-racehorse");
     }
 
     #[test]
