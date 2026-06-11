@@ -12,11 +12,35 @@
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::TempDir;
 
-fn cwd_lock() -> MutexGuard<'static, ()> {
+/// Guard returned by [`cwd_lock`]: holds the global mutex AND restores
+/// the working directory captured at lock time when dropped — including
+/// on panic. Without the restore, a test that panics inside its
+/// `set_current_dir` window leaves the process cwd pointing into its
+/// (now deleted) tempdir and every later in-process test fails with
+/// `NotFound` — one red test used to cascade into dozens.
+struct CwdLock {
+    _lock: MutexGuard<'static, ()>,
+    prev: Option<std::path::PathBuf>,
+}
+
+impl Drop for CwdLock {
+    fn drop(&mut self) {
+        if let Some(prev) = self.prev.take() {
+            let _ = std::env::set_current_dir(prev);
+        }
+    }
+}
+
+fn cwd_lock() -> CwdLock {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    let lock = LOCK
+        .get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    CwdLock {
+        _lock: lock,
+        prev: std::env::current_dir().ok(),
+    }
 }
 
 /// Bootstrap a two-env project (`test` + `prod`) via the `init` subcommand,

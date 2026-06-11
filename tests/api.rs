@@ -21,12 +21,33 @@ fn fixture(name: &str) -> serde_json::Value {
 /// (specifically `std::env::set_current_dir`). Cargo runs tests within a
 /// binary in parallel; without serialization here, two tests can change
 /// CWD concurrently and one will read the wrong path.
-fn cwd_lock() -> std::sync::MutexGuard<'static, ()> {
+struct CwdLock {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prev: Option<std::path::PathBuf>,
+}
+
+impl Drop for CwdLock {
+    fn drop(&mut self) {
+        if let Some(prev) = self.prev.take() {
+            let _ = std::env::set_current_dir(prev);
+        }
+    }
+}
+
+/// The returned guard also restores the lock-time working directory on
+/// drop (panic-safe), so one failing test can't strand the process cwd
+/// in a deleted tempdir for every test after it.
+fn cwd_lock() -> CwdLock {
     use std::sync::{Mutex, OnceLock};
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    let lock = LOCK
+        .get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    CwdLock {
+        _lock: lock,
+        prev: std::env::current_dir().ok(),
+    }
 }
 
 /// RAII guard that unsets the listed env vars on drop, so a panicking

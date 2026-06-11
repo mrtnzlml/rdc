@@ -29,11 +29,35 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 /// `std::sync::Mutex` (not async) is fine — the critical section is
 /// short and the tests don't await anything across it that would benefit
 /// from yielding.
-fn cwd_lock() -> MutexGuard<'static, ()> {
+/// Guard returned by [`cwd_lock`]: holds the global mutex AND restores
+/// the working directory captured at lock time when dropped — including
+/// on panic. Without the restore, a test that panics inside its
+/// `set_current_dir` window leaves the process cwd pointing into its
+/// (now deleted) tempdir and every later in-process test fails with
+/// `NotFound` — one red test used to cascade into dozens.
+struct CwdLock {
+    _lock: MutexGuard<'static, ()>,
+    prev: Option<std::path::PathBuf>,
+}
+
+impl Drop for CwdLock {
+    fn drop(&mut self) {
+        if let Some(prev) = self.prev.take() {
+            let _ = std::env::set_current_dir(prev);
+        }
+    }
+}
+
+fn cwd_lock() -> CwdLock {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    let lock = LOCK
+        .get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    CwdLock {
+        _lock: lock,
+        prev: std::env::current_dir().ok(),
+    }
 }
 
 fn fixture(name: &str) -> serde_json::Value {
@@ -4025,7 +4049,9 @@ enum HookConflictVariant {
     JsonBothEdited,
     /// Both sides edited the .py portion (different code on each side).
     CodeBothEdited,
-    /// Local edited JSON; remote edited .py.
+    /// Local edited JSON; remote edited .py. Disjoint axes → clean
+    /// 3-way merge: local keeps its JSON edit, adopts the remote code,
+    /// and pushes the JSON edit upstream (exactly one PATCH).
     LocalJsonRemoteCode,
     /// Local has .py (edited), remote removed the code field entirely.
     LocalHasCodeRemoteRemoved,
@@ -4081,6 +4107,7 @@ async fn run_hook_conflict_scenario(variant: HookConflictVariant) {
     let uri_clone = server_uri.clone();
     let patch_landed_list = patch_landed.clone();
     let events_union_list = events_union.clone();
+    let events_local_list = events_local.clone();
     Mock::given(method("GET"))
         .and(path("/api/v1/hooks"))
         .respond_with(move |_req: &Request| {
@@ -4111,6 +4138,17 @@ async fn run_hook_conflict_scenario(variant: HookConflictVariant) {
                         Some(base_code.to_string()),
                         "2026-05-14T10:00:00Z".to_string(),
                     ),
+                    HookConflictVariant::LocalJsonRemoteCode
+                        if patch_landed_list.load(Ordering::SeqCst) =>
+                    {
+                        // Phase 3: local events + remote code are now both
+                        // on the remote → idempotency sync sees Clean.
+                        (
+                            events_local_list.clone(),
+                            Some(remote_code_edit.to_string()),
+                            "2026-05-14T11:00:00Z".to_string(),
+                        )
+                    }
                     HookConflictVariant::CodeBothEdited => (
                         events_base.clone(),
                         Some(remote_code_edit.to_string()),
@@ -4170,16 +4208,25 @@ async fn run_hook_conflict_scenario(variant: HookConflictVariant) {
     // Drop if one lands. `BothEditedToSameCode` is Clean → also zero
     // PATCH.
     //
-    // `JsonBothEdited` is the lone exception: it is a clean 3-way
-    // AUTO-MERGE (the event arrays union), and the auto-merge-push fix
-    // correctly PATCHes the unioned events back to the remote. So for
-    // that variant we mount a real PATCH responder (`.expect(1)`) that
-    // echoes the merged hook and flips `patch_landed` to advance the
-    // listing to phase 3.
-    if matches!(variant, HookConflictVariant::JsonBothEdited) {
+    // Two variants are clean 3-way AUTO-MERGES, not conflicts:
+    // `JsonBothEdited` (the event arrays union) and `LocalJsonRemoteCode`
+    // (disjoint axes — local JSON edit, remote sidecar edit). Both keep a
+    // local-side change that must reach the remote, so for these we mount
+    // a real PATCH responder (`.expect(1)`) that echoes the merged hook
+    // and flips `patch_landed` to advance the listing to phase 3.
+    if matches!(
+        variant,
+        HookConflictVariant::JsonBothEdited | HookConflictVariant::LocalJsonRemoteCode
+    ) {
         let patch_landed_resp = patch_landed.clone();
         let uri_patch = server_uri.clone();
-        let events_union_patch = events_union.clone();
+        // What the merged hook looks like on the remote after the PATCH:
+        // JsonBothEdited unions the events (code untouched);
+        // LocalJsonRemoteCode keeps the local events and the remote code.
+        let (patched_events, patched_code) = match variant {
+            HookConflictVariant::JsonBothEdited => (events_union.clone(), base_code),
+            _ => (events_local.clone(), remote_code_edit),
+        };
         Mock::given(method("PATCH"))
             .and(path(format!("/api/v1/hooks/{hook_id}")))
             .respond_with(move |_req: &Request| {
@@ -4190,8 +4237,8 @@ async fn run_hook_conflict_scenario(variant: HookConflictVariant) {
                     "name": "ap-validator",
                     "type": "function",
                     "queues": [],
-                    "events": events_union_patch,
-                    "config": { "runtime": "python3.12", "code": base_code },
+                    "events": patched_events,
+                    "config": { "runtime": "python3.12", "code": patched_code },
                     "modified_at": "2026-05-14T11:00:00Z"
                 }))
             })
@@ -4282,8 +4329,8 @@ async fn run_hook_conflict_scenario(variant: HookConflictVariant) {
 
     // Run second sync non-interactively. For CONFLICT variants the
     // resolver falls back to shadow-file behavior and NO PATCH/POST/
-    // DELETE may land. For `JsonBothEdited` (an auto-merge) exactly one
-    // PATCH of the unioned events lands.
+    // DELETE may land. For the auto-merge variants (`JsonBothEdited`,
+    // `LocalJsonRemoteCode`) exactly one PATCH of the merged hook lands.
     rdc::cli::sync::run("dev", false, false, false, false, false)
         .await
         .expect("second sync should succeed");
@@ -4302,9 +4349,12 @@ async fn run_hook_conflict_scenario(variant: HookConflictVariant) {
         })
         .map(|r| r.body)
         .collect();
-    if matches!(variant, HookConflictVariant::JsonBothEdited) {
+    if matches!(
+        variant,
+        HookConflictVariant::JsonBothEdited | HookConflictVariant::LocalJsonRemoteCode
+    ) {
         // Auto-merge that kept a local-side change (the local-only event)
-        // must push exactly one PATCH carrying the unioned events.
+        // must push exactly one PATCH carrying the merged hook.
         assert_eq!(
             hook_mutation_bodies.len(),
             1,
@@ -4318,10 +4368,31 @@ async fn run_hook_conflict_scenario(variant: HookConflictVariant) {
             .iter()
             .map(|x| x.as_str().unwrap())
             .collect();
-        for ev in ["annotation_content", "annotation_status", "user_invited"] {
+        let expected_events: &[&str] = match variant {
+            // Union of base/local/remote event edits.
+            HookConflictVariant::JsonBothEdited => {
+                &["annotation_content", "annotation_status", "user_invited"]
+            }
+            // Remote didn't touch events — only the local edit lands.
+            _ => &["annotation_content", "annotation_status"],
+        };
+        for ev in expected_events {
             assert!(
-                evs.contains(&ev),
-                "variant {variant:?}: PATCH body events must contain the union member {ev}; got {evs:?}"
+                evs.contains(ev),
+                "variant {variant:?}: PATCH body events must contain {ev}; got {evs:?}"
+            );
+        }
+        if matches!(variant, HookConflictVariant::LocalJsonRemoteCode) {
+            assert!(
+                !evs.contains(&"user_invited"),
+                "variant {variant:?}: PATCH must not invent events the local edit never made; got {evs:?}"
+            );
+            // The disjoint merge adopts the remote code on disk.
+            let py_after = std::fs::read(&py_path).unwrap();
+            assert_eq!(
+                py_after,
+                remote_code_edit.as_bytes(),
+                "variant {variant:?}: local .py must adopt the remote code edit"
             );
         }
 
@@ -4407,9 +4478,9 @@ async fn run_hook_conflict_scenario(variant: HookConflictVariant) {
             //   it PATCHes the union upstream (asserted above) and the
             //   lockfile advances to the post-push base.
             // LocalJsonRemoteCode: local edits JSON `events`, remote
-            //   edits sidecar `.py`. Strict sidecar + JSON merge both
-            //   succeed; here the local side adopts the remote `.py` so
-            //   no local change survives → no push (PATCH=0 above).
+            //   edits sidecar `.py` — disjoint axes. The merge keeps the
+            //   local events, adopts the remote code, and PATCHes the
+            //   local edit upstream (asserted above).
             // Contract: lockfile MAY advance to the merged/post-push hash
             // (no longer pinned to the prior base).
             let _ = (base_before, base_after);
@@ -4478,8 +4549,14 @@ async fn sync_hook_conflict_code_both_edited_never_silently_pushes() {
     run_hook_conflict_scenario(HookConflictVariant::CodeBothEdited).await;
 }
 
+/// Local JSON edit + remote code edit touch disjoint axes of the same
+/// hook: a clean 3-way merge, not a conflict. The merge keeps the local
+/// `events` edit, adopts the remote `.py`, and pushes the JSON edit
+/// upstream — exactly one PATCH, idempotent on re-sync, nothing lost on
+/// either axis. (Pre-portabilization this case rendered as a conflict
+/// only because the remote's raw URLs produced phantom JSON hunks.)
 #[tokio::test]
-async fn sync_hook_conflict_local_json_remote_code_never_silently_pushes() {
+async fn sync_hook_auto_merges_local_json_remote_code() {
     run_hook_conflict_scenario(HookConflictVariant::LocalJsonRemoteCode).await;
 }
 
@@ -4512,7 +4589,8 @@ enum RuleConflictVariant {
     JsonBothEdited,
     /// Both sides edited trigger_condition (the .py sidecar).
     CodeBothEdited,
-    /// Local JSON, remote code.
+    /// Local JSON, remote code. Disjoint axes → clean 3-way merge that
+    /// adopts the remote condition and PATCHes the local name upstream.
     LocalJsonRemoteCode,
     /// Local has .py (edited), remote dropped trigger_condition.
     LocalHasCodeRemoteRemoved,
@@ -4607,12 +4685,34 @@ async fn run_rule_conflict_scenario(variant: RuleConflictVariant) {
 
     mock_empty_lists_except(&server, &["/api/v1/rules"]).await;
 
-    Mock::given(method("PATCH"))
-        .and(path(format!("/api/v1/rules/{rule_id}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-        .expect(0)
-        .mount(&server)
-        .await;
+    if matches!(variant, RuleConflictVariant::LocalJsonRemoteCode) {
+        // Disjoint auto-merge: the local `name` edit must reach the
+        // remote — exactly one PATCH, echoing the merged rule.
+        let uri_patch = server.uri();
+        let name_local_patch = name_local.clone();
+        Mock::given(method("PATCH"))
+            .and(path(format!("/api/v1/rules/{rule_id}")))
+            .respond_with(move |_req: &Request| {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": rule_id,
+                    "url": format!("{uri_patch}/api/v1/rules/{rule_id}"),
+                    "name": name_local_patch,
+                    "queues": [],
+                    "trigger_condition": remote_cond_edit,
+                    "modified_at": "2026-05-14T11:00:00Z"
+                }))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+    } else {
+        Mock::given(method("PATCH"))
+            .and(path(format!("/api/v1/rules/{rule_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+    }
     Mock::given(method("POST"))
         .and(path("/api/v1/rules"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
@@ -4689,11 +4789,11 @@ async fn run_rule_conflict_scenario(variant: RuleConflictVariant) {
 
     std::env::set_current_dir(&prev_cwd).unwrap();
 
-    let mutation_count = server
+    let mutation_bodies: Vec<Vec<u8>> = server
         .received_requests()
         .await
         .unwrap_or_default()
-        .iter()
+        .into_iter()
         .filter(|r| {
             (r.method == http::Method::PATCH
                 || r.method == http::Method::POST
@@ -4701,11 +4801,37 @@ async fn run_rule_conflict_scenario(variant: RuleConflictVariant) {
                 && (r.url.path() == format!("/api/v1/rules/{rule_id}")
                     || r.url.path() == "/api/v1/rules")
         })
-        .count();
-    assert_eq!(
-        mutation_count, 0,
-        "variant {variant:?}: rules endpoint must not receive mutating requests; saw {mutation_count}",
-    );
+        .map(|r| r.body)
+        .collect();
+    if matches!(variant, RuleConflictVariant::LocalJsonRemoteCode) {
+        // Disjoint auto-merge: the local name edit lands in exactly one
+        // PATCH, and the local sidecar adopts the remote condition.
+        assert_eq!(
+            mutation_bodies.len(),
+            1,
+            "variant {variant:?}: auto-merge must PATCH exactly once; saw {}",
+            mutation_bodies.len()
+        );
+        let patched: serde_json::Value = serde_json::from_slice(&mutation_bodies[0]).unwrap();
+        assert_eq!(
+            patched["name"].as_str(),
+            Some(name_local.as_str()),
+            "variant {variant:?}: PATCH must carry the local name edit"
+        );
+        let py_after = std::fs::read(&py_path).unwrap();
+        assert_eq!(
+            py_after,
+            remote_cond_edit.as_bytes(),
+            "variant {variant:?}: local .py must adopt the remote condition edit"
+        );
+    } else {
+        assert_eq!(
+            mutation_bodies.len(),
+            0,
+            "variant {variant:?}: rules endpoint must not receive mutating requests; saw {}",
+            mutation_bodies.len()
+        );
+    }
 
     let lf_after =
         std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
@@ -4758,7 +4884,7 @@ async fn sync_rule_conflict_code_both_edited_never_silently_pushes() {
 }
 
 #[tokio::test]
-async fn sync_rule_conflict_local_json_remote_code_never_silently_pushes() {
+async fn sync_rule_auto_merges_local_json_remote_code() {
     run_rule_conflict_scenario(RuleConflictVariant::LocalJsonRemoteCode).await;
 }
 
@@ -6118,16 +6244,13 @@ async fn sync_emits_progress_milestone_for_large_list() {
 /// Regression: hook with an overlay must NOT oscillate between Write and
 /// KeepLocal across successive pulls.
 ///
-/// Before the fix, `pull::hooks::process` recorded `codec.base_hash(&value)`
-/// (PRE-overlay JSON) in the lockfile, but the file written to disk was the
-/// POST-overlay-stripped JSON. The on-disk hash (computed at sync classification
-/// time via `local_hook_combined_hash`) uses the POST-overlay bytes, so the
-/// stored baseline never matched the on-disk hash → the hook was always
-/// classified as a change ("phantom drift") on every subsequent pull.
-///
-/// After the fix, the baseline is `local_hook_combined_hash(post_overlay_json,
-/// code)` — identical to what the classifier computes → the second sync sees
-/// Clean (no rewrites, no API mutations).
+/// Under C-1, overlays are migrate-only: pull/sync never strip
+/// overlay-managed fields, so the field rides in the snapshot like any
+/// other content and the lockfile baseline is computed over exactly the
+/// bytes on disk. The invariant this test pins is the absence of phantom
+/// drift: with an overlay configured, the second sync over an unchanged
+/// remote must classify Clean — no file rewrites, no lockfile churn, no
+/// API mutations.
 #[tokio::test]
 async fn sync_hook_with_overlay_no_phantom_drift() {
     let server = MockServer::start().await;
@@ -6180,9 +6303,8 @@ async fn sync_hook_with_overlay_no_phantom_drift() {
     .unwrap();
 
     // Install an overlay that manages the `description` field on this hook.
-    // The overlay causes `maybe_strip_overlay` to remove `description` from
-    // the on-disk JSON — the on-disk bytes are therefore DIFFERENT from the
-    // raw serialize_hook bytes (pre-overlay), and the hash must reflect that.
+    // Under C-1 the overlay is migrate-only — pull keeps the field on disk —
+    // but its mere presence must not perturb hashing into phantom drift.
     let overlay_dir = project.path().join("envs/dev");
     std::fs::create_dir_all(&overlay_dir).unwrap();
     std::fs::write(
@@ -6205,13 +6327,14 @@ async fn sync_hook_with_overlay_no_phantom_drift() {
         .await
         .expect("first sync should succeed");
 
-    // Verify the on-disk hook does NOT contain the overlay-managed field.
+    // Under C-1 overlays are migrate-only: the overlay-managed field must
+    // ride in the snapshot like any other content (pull does not strip it).
     let hook_path = project.path().join("envs/dev/hooks/validator-hook.json");
     assert!(hook_path.exists(), "hook file must exist after first sync");
     let disk_json = std::fs::read_to_string(&hook_path).unwrap();
     assert!(
-        !disk_json.contains("PROD-specific description"),
-        "overlay-managed field must be stripped from on-disk hook: {disk_json}",
+        disk_json.contains("PROD-specific description"),
+        "C-1: overlay-managed field must remain in the on-disk hook: {disk_json}",
     );
 
     // Snapshot the lockfile hash and the on-disk file so we can assert they
