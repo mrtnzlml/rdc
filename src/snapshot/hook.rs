@@ -129,7 +129,7 @@ pub fn serialize_hook(hook: &Hook) -> Result<(Vec<u8>, Option<String>)> {
 /// Defensive: only sorts when every element is a string. Mixed arrays
 /// (which shouldn't happen for `queues` but might if someone hand-edits
 /// the file) pass through untouched rather than panicking.
-fn sort_queues(value: &mut Value) {
+pub(crate) fn sort_queues(value: &mut Value) {
     let Some(obj) = value.as_object_mut() else {
         return;
     };

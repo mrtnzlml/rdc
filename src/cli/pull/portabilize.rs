@@ -64,6 +64,11 @@ pub fn portabilize_refs(paths: &Paths, lockfile: &mut Lockfile) -> Result<()> {
         portabilize_value(&mut value, lockfile);
         if kind == "hooks" {
             crate::snapshot::hook::sort_run_after(&mut value);
+            // `queues` was sorted at serialize time, before portabilization —
+            // i.e. in URL/id order. Re-sort the now-portable slugs so the
+            // on-disk order is env-stable and `doctor` never re-canonicalizes
+            // freshly pulled hooks. Same rationale as `run_after` above.
+            crate::snapshot::hook::sort_queues(&mut value);
         }
         if value == before {
             continue;
@@ -414,6 +419,65 @@ mod tests {
         // The file content must be identical (no rdc:// double-conversion).
         let on_disk = fs::read(&label_path).unwrap();
         assert_eq!(on_disk, bytes, "file bytes must be unchanged");
+    }
+
+    #[test]
+    fn portabilize_refs_sorts_hook_queues_into_slug_order() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+
+        const SLUG: &str = "exporter";
+        let mut lockfile = Lockfile::default();
+        seed_entry(&mut lockfile, "hooks", SLUG, 500);
+
+        // Pull serializes hooks with `queues` sorted BEFORE portabilization —
+        // i.e. in URL/id order. After the rdc:// rewrite the slugs land in
+        // that id order, not slug order, so `doctor` would "canonicalize"
+        // every freshly pulled hook. The post-pass must leave the array in
+        // slug-sorted order, exactly like `run_after`.
+        let hook = json!({
+            "id": 500,
+            "url": format!("rdc://hooks/{SLUG}"),
+            "name": "Exporter",
+            "type": "webhook",
+            "queues": ["rdc://queues/zeta-line", "rdc://queues/alpha-line"],
+            "run_after": [],
+        });
+        let mut bytes = serde_json::to_vec_pretty(&hook).unwrap();
+        bytes.push(b'\n');
+        let path = paths.hooks_dir().join(format!("{SLUG}.json"));
+        write_file(&path, &bytes);
+
+        let code: Option<String> = None;
+        let pre = crate::state::hook_combined_hash(&bytes, &code, &Lockfile::default());
+        lockfile
+            .objects
+            .get_mut("hooks")
+            .unwrap()
+            .get_mut(SLUG)
+            .unwrap()
+            .content_hash = Some(pre.clone());
+
+        portabilize_refs(&paths, &mut lockfile).expect("portabilize_refs must succeed");
+
+        let after_bytes = fs::read(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&after_bytes).unwrap();
+        assert_eq!(
+            v["queues"],
+            json!(["rdc://queues/alpha-line", "rdc://queues/zeta-line"]),
+            "post-pass must sort hook.queues into slug order so doctor finds no drift"
+        );
+        // Hash is order-invariant for rdc:// ref arrays by design.
+        let new = lockfile
+            .objects
+            .get("hooks")
+            .unwrap()
+            .get(SLUG)
+            .unwrap()
+            .content_hash
+            .clone()
+            .unwrap();
+        assert_eq!(new, pre, "queues order must not affect the combined hash");
     }
 
     #[test]

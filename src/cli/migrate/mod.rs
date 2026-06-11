@@ -232,6 +232,14 @@ fn transform_file(
     // spurious reorder regardless of the source env's API ordering. No-op for
     // non-hook files (they carry no `run_after`).
     crate::snapshot::hook::sort_run_after(&mut value);
+    // Same for a hook's `queues` membership set: keep the portable slugs in
+    // sorted order so source envs pulled before the post-pass sort existed
+    // don't leak their id-ordering into the target snapshot. Unlike
+    // `run_after`, a `queues` array also exists on inboxes/schemas/workspaces
+    // where pull preserves API order — so this must stay hooks-only.
+    if rel.starts_with("hooks") {
+        crate::snapshot::hook::sort_queues(&mut value);
+    }
 
     let mut json = serde_json::to_vec_pretty(&value)?;
     json.push(b'\n');
