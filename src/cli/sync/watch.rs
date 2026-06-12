@@ -70,7 +70,7 @@ pub async fn run_watch(
     let paths = crate::paths::Paths::for_env(&cwd, env);
 
     // Construct the renderer ONCE so freshness clocks persist across cycles.
-    let renderer = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
+    let renderer = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
 
     // Initial reconcile.
     {

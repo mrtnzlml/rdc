@@ -90,9 +90,6 @@ const CLI_STYLES: Styles = Styles::styled()
     disable_help_subcommand = true,
 )]
 pub struct Cli {
-    /// Disable ANSI color in output. Also honored via `NO_COLOR`.
-    #[arg(long = "no-color", global = true)]
-    pub no_color: bool,
     /// Skip interactive prompts (conflict resolver, init wizard).
     /// Conflicts fall back to the shadow-file flow; the wizard exits
     /// with usage hints. Auto-enabled when stdin isn't a TTY.
@@ -270,8 +267,6 @@ pub enum Command {
 }
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
-    crate::cli::resolve::set_no_color_flag(cli.no_color);
-
     // Once-daily passive nudge. Skipped for the upgrade command since
     // it computes the same answer fresh. Refresh runs first (tight 2s
     // timeout, silent on failure) so the cache is up-to-date by the

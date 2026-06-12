@@ -249,7 +249,7 @@ pub(crate) async fn run_cycle(
     // summaries.
     let renderer_was_supplied = renderer.is_some();
     let progress: Arc<Log> =
-        renderer.unwrap_or_else(|| Log::new(crate::cli::resolve::detect_color_mode(false)));
+        renderer.unwrap_or_else(|| Log::new(crate::cli::resolve::detect_color_mode()));
     let started = std::time::Instant::now();
 
     // Phase 1: list remote. Mirrors `pull::run`'s `PullCtx` construction

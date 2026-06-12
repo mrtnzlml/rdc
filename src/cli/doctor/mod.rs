@@ -45,7 +45,7 @@ pub async fn run(env: &str, rebuild_lock: bool, check: bool, yes: bool) -> Resul
         .api_base
         .clone();
     let paths = Paths::for_env(&cwd, env);
-    let log = Log::new(crate::cli::resolve::detect_color_mode(false));
+    let log = Log::new(crate::cli::resolve::detect_color_mode());
 
     // 1. Pre-flight: local changes not yet pushed to the remote (offline).
     let unpushed = count_unpushed(&paths, &api_base)?;
