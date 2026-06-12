@@ -345,7 +345,7 @@ pub async fn refresh_cache_if_stale() {
 /// Called once per command, just before the dispatch.
 pub fn emit_nudge_if_available() {
     if let Some(latest) = cached_upgrade_available() {
-        let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
+        let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
         log.event(crate::log::Action::Info, &format!("rdc v{latest} is available; run `rdc upgrade` to install"));
     }
 }
@@ -382,7 +382,7 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
     }
 
     let install = classify_install()?;
-    let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
+    let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
     let target_path = match &install {
         InstallLocation::Cargo(path) => {
             log.event(
@@ -437,7 +437,7 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
     // Wrap the download in a spinner so the user sees activity while
     // multi-megabyte tarball bytes are streaming. Spinner only — no
     // per-byte progress bar (per the progress UX spec).
-    let progress = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
+    let progress = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
     progress.event(crate::log::Action::Upgr, &format!("downloading {asset_name}"));
     let bytes_result = async {
         http_client(UPGRADE_TIMEOUT)?

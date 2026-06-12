@@ -139,7 +139,7 @@ pub fn prompt_resolve<R: BufRead, W: Write>(
     remote_bytes: &[u8],
     env: &str,
 ) -> Result<Resolution> {
-    let mode = detect_color_mode(false);
+    let mode = detect_color_mode();
     prompt_resolve_with_color(
         input,
         output,
@@ -198,7 +198,7 @@ pub fn prompt_resolve_with_bytes<R: BufRead, W: Write>(
     remote_bytes: &[u8],
     env: &str,
 ) -> Result<Resolution> {
-    let mode = detect_color_mode(false);
+    let mode = detect_color_mode();
     prompt_resolve_with_bytes_and_color(
         input,
         output,
@@ -380,7 +380,7 @@ pub fn prompt_remote_delete<R: BufRead, W: Write>(
     local_path: &Path,
     env: &str,
 ) -> Result<Resolution> {
-    let mode = detect_color_mode(false);
+    let mode = detect_color_mode();
     prompt_remote_delete_with_color(input, output, local_path, env, mode)
 }
 
@@ -1086,7 +1086,7 @@ pub fn resolve_combined_file(
     if !interactive {
         let conflict_path = crate::paths::shadow_path_for(local_path, env);
         write_atomic(&conflict_path, remote_bytes)?;
-        let log = crate::log::Log::new(detect_color_mode(false));
+        let log = crate::log::Log::new(detect_color_mode());
         log.event(
             crate::log::Action::Warn,
             &format!(
@@ -1151,7 +1151,7 @@ pub fn resolve_combined_file(
         Resolution::Skip => {
             let conflict_path = crate::paths::shadow_path_for(local_path, env);
             write_atomic(&conflict_path, remote_bytes)?;
-            let log = crate::log::Log::new(detect_color_mode(false));
+            let log = crate::log::Log::new(detect_color_mode());
             log.event(
                 crate::log::Action::Warn,
                 &format!(
@@ -1441,33 +1441,20 @@ pub enum ColorMode {
     Color,
 }
 
-/// Process-wide override for the `--no-color` CLI flag. Set once at
-/// `rdc` startup by `cli::run`; read by `detect_color_mode`. Using an
-/// atomic instead of threading the flag through every PullCtx /
-/// PushDriftOutcome / Apply call site — the flag is set exactly once
-/// and never changes during a run.
-static NO_COLOR_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Record the `--no-color` flag value from the CLI parser.
-pub fn set_no_color_flag(no_color: bool) {
-    NO_COLOR_FLAG.store(no_color, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Decide the color mode at runtime. `--no-color` flag has highest priority,
-/// then NO_COLOR env var, then stderr TTY detection.
-pub fn detect_color_mode(no_color_flag: bool) -> ColorMode {
+/// Decide the color mode at runtime. NO_COLOR env var has highest
+/// priority, then stderr TTY detection.
+pub fn detect_color_mode() -> ColorMode {
     decide_color_mode(
-        no_color_flag || NO_COLOR_FLAG.load(std::sync::atomic::Ordering::Relaxed),
         std::env::var_os("NO_COLOR").is_some(),
         std::io::stderr().is_terminal(),
     )
 }
 
-/// Pure form for testing: returns the color mode given the three inputs
+/// Pure form for testing: returns the color mode given the two inputs
 /// directly. The wrapping `detect_color_mode` plumbs in the live env +
 /// TTY readings.
-fn decide_color_mode(no_color: bool, no_color_env: bool, is_tty: bool) -> ColorMode {
-    if no_color || no_color_env {
+fn decide_color_mode(no_color_env: bool, is_tty: bool) -> ColorMode {
+    if no_color_env {
         return ColorMode::Plain;
     }
     if is_tty {
@@ -1935,7 +1922,7 @@ pub fn colorize_dim(text: &str, mode: ColorMode) -> String {
 /// so every diff looks the same: a `Verb(path)` header, an `Added N /
 /// removed M` summary, and line-numbered hunks with red/green row
 /// backgrounds + JSON syntax highlighting on a TTY (plain otherwise;
-/// respects `NO_COLOR` and `--no-color`).
+/// respects `NO_COLOR`).
 pub fn print_unified(
     left_label: &str,
     right_label: &str,
@@ -1946,7 +1933,7 @@ pub fn print_unified(
     if left == right {
         return;
     }
-    let mode = detect_color_mode(false);
+    let mode = detect_color_mode();
     let rendered = render_styled_diff(left_label, right_label, left, right, mode);
     if rendered.is_empty() {
         return;
@@ -2292,42 +2279,18 @@ mod tests {
 
     #[test]
     fn decide_color_mode_no_color_env_returns_plain() {
-        assert!(matches!(
-            decide_color_mode(false, true, true),
-            ColorMode::Plain
-        ));
-        assert!(matches!(
-            decide_color_mode(false, true, false),
-            ColorMode::Plain
-        ));
-    }
-
-    #[test]
-    fn decide_color_mode_no_color_flag_returns_plain() {
-        assert!(matches!(
-            decide_color_mode(true, false, true),
-            ColorMode::Plain
-        ));
-        assert!(matches!(
-            decide_color_mode(true, false, false),
-            ColorMode::Plain
-        ));
+        assert!(matches!(decide_color_mode(true, true), ColorMode::Plain));
+        assert!(matches!(decide_color_mode(true, false), ColorMode::Plain));
     }
 
     #[test]
     fn decide_color_mode_tty_with_no_overrides_returns_color() {
-        assert!(matches!(
-            decide_color_mode(false, false, true),
-            ColorMode::Color
-        ));
+        assert!(matches!(decide_color_mode(false, true), ColorMode::Color));
     }
 
     #[test]
     fn decide_color_mode_no_tty_returns_plain() {
-        assert!(matches!(
-            decide_color_mode(false, false, false),
-            ColorMode::Plain
-        ));
+        assert!(matches!(decide_color_mode(false, false), ColorMode::Plain));
     }
 
     #[test]

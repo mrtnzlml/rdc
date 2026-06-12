@@ -499,7 +499,7 @@ pub fn run(src: &str, tgt: &str, mirror: bool, dry_run: bool, only: Vec<String>)
         );
     }
 
-    let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
+    let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
 
     // Mapping: load, auto-match same-slug pairs, validate sources, persist.
     let mapping_file = src_paths.mapping_file(src, tgt);

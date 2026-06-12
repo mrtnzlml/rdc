@@ -18,7 +18,7 @@ pub async fn run(env: &str) -> Result<()> {
     let paths = Paths::for_env(&cwd, env);
     let lockfile_path = paths.lockfile();
 
-    let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
+    let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
     if lockfile_path.exists() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

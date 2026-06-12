@@ -61,7 +61,7 @@ pub async fn run(env: &str, check: bool, yes: bool) -> Result<()> {
         .get(env)
         .ok_or_else(|| anyhow!("env '{env}' is not defined in rdc.toml"))?;
     let paths = Paths::for_env(&cwd, env);
-    let log = Log::new(crate::cli::resolve::detect_color_mode(false));
+    let log = Log::new(crate::cli::resolve::detect_color_mode());
 
     let anomalies = find_anomalies(&paths)?;
     if anomalies.is_empty() {

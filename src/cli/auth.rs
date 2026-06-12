@@ -35,7 +35,7 @@ pub async fn run(
         .ok_or_else(|| anyhow!("env '{env}' is not defined in rdc.toml"))?;
     let paths = Paths::for_env(&cwd, env);
 
-    let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
+    let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
 
     if let Some(username) = username_arg {
         // --username flow: read password, exchange for a token via
@@ -134,7 +134,7 @@ fn read_password_for_login() -> Result<String> {
 async fn validate_token(env_cfg: &EnvConfig, token: &str) -> Result<String> {
     let client = RossumClient::new(env_cfg.api_base.clone(), token.to_string())
         .context("constructing Rossum API client")?;
-    let progress = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
+    let progress = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
     progress.event(
         Action::Auth,
         &format!("validating token (GET /organizations/{})", env_cfg.org_id),
@@ -209,7 +209,7 @@ pub async fn refresh_token_for_401(env: &str) -> Result<()> {
                 .envs
                 .get(env)
                 .ok_or_else(|| anyhow!("env '{env}' is not defined in rdc.toml"))?;
-            let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
+            let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
             log.event(
                 Action::Auth,
                 &format!("token for env '{env}' rejected (401); silent re-login from ${user_var}"),
@@ -239,7 +239,7 @@ pub async fn refresh_token_for_401(env: &str) -> Result<()> {
     let paths = Paths::for_env(&cwd, env);
     let secrets_path = paths.secrets_file();
 
-    let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode(false));
+    let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
     log.event(
         Action::Auth,
         &format!("token for env '{env}' rejected (401); refreshing"),
