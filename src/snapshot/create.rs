@@ -189,8 +189,12 @@ pub fn strip_for_cross_env_patch(body: &mut Value, kind: &str) {
     // that env's users, which aren't a deployable kind in rdc (no cross-env
     // mapping). It always differs across envs and is never meaningful cross-env
     // drift, so strip it from cross-env comparisons — exactly like
-    // `organization`. The sync push sets the correct target owner explicitly
-    // via the overlay's `store_extension_token_owner`, independent of this strip.
+    // `organization`. The value a hook actually keeps is controlled by `rdc
+    // migrate`: when the target overlay configures one — a per-hook
+    // `token_owner`, or the kind-wide `[hooks."*"] token_owner` default — that
+    // owner is written into the snapshot; with no overlay entry the hook keeps
+    // its as-migrated value. Either way this strip affects only the cross-env
+    // *comparison*, not the value pushed.
     if kind == "hooks" {
         obj.remove("token_owner");
         // `hook_template` is a per-env store-template URL: the host is the
@@ -248,8 +252,9 @@ pub fn strip_patch_extra(extra: &mut IndexMap<String, Value>, kind: &str, cross_
     if cross_env {
         extra.shift_remove("organization");
         // Mirror `strip_for_cross_env_patch`: a hook's `token_owner` is a
-        // per-env user URL with no cross-env mapping; deploy sets the correct
-        // target owner explicitly before PATCH.
+        // per-env user URL with no cross-env mapping; `rdc migrate` writes the
+        // target owner into the snapshot when the overlay configures one
+        // (per-hook or `[hooks."*"]`).
         if kind == "hooks" {
             extra.shift_remove("token_owner");
         }

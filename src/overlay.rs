@@ -23,20 +23,17 @@ use std::path::Path;
 
 pub const OVERLAY_VERSION: u32 = 1;
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Default)]
-pub struct Defaults {
-    /// Fallback `token_owner` URL applied to every store extension that
-    /// has no per-hook `token_owner` override. Set automatically by
-    /// `rdc deploy`'s interactive picker on first deploy; hand-editable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub store_extension_token_owner: Option<String>,
-}
-
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Overlay {
     pub version: u32,
-    #[serde(default)]
-    pub defaults: Defaults,
+    /// Hook overrides keyed by hook slug. The reserved slug `"*"` is a
+    /// kind-wide default applied to EVERY hook (e.g. `[hooks."*"] token_owner`),
+    /// with a real per-slug entry winning over it. `"*"` is not a valid Rossum
+    /// slug, so it never collides with a real hook. The same `"*"` convention
+    /// applies to every other kind below; for the compound-key kinds
+    /// (`engine_fields` = `<engine>/<field>`, `email_templates` =
+    /// `<ws>/<q>/<template>`) `"*"` matches the WHOLE key — all objects of that
+    /// kind — not a single path segment.
     #[serde(default)]
     pub hooks: BTreeMap<String, BTreeMap<String, Value>>,
     #[serde(default)]
@@ -120,7 +117,6 @@ impl Default for Overlay {
     fn default() -> Self {
         Self {
             version: OVERLAY_VERSION,
-            defaults: Defaults::default(),
             hooks: BTreeMap::new(),
             rules: BTreeMap::new(),
             labels: BTreeMap::new(),
@@ -132,30 +128,6 @@ impl Default for Overlay {
             engine_fields: BTreeMap::new(),
         }
     }
-}
-
-/// Idempotent write: load the overlay file (or create an empty one),
-/// patch in the `token_owner` (per-hook if `slug` is `Some`, otherwise
-/// into `[defaults] store_extension_token_owner`), atomically rewrite
-/// the TOML. Preserves every other key.
-pub fn write_store_extension_token_owner(
-    path: &Path,
-    slug: Option<&str>,
-    user_url: &str,
-) -> Result<()> {
-    let mut overlay = Overlay::load(path)?.unwrap_or_default();
-    match slug {
-        Some(s) => {
-            let entry = overlay.hooks.entry(s.to_string()).or_insert_with(BTreeMap::new);
-            entry.insert("token_owner".into(), Value::String(user_url.into()));
-        }
-        None => {
-            overlay.defaults.store_extension_token_owner = Some(user_url.into());
-        }
-    }
-    let s = toml::to_string_pretty(&overlay).context("serializing overlay")?;
-    crate::snapshot::writer::write_atomic(path, s.as_bytes())?;
-    Ok(())
 }
 
 /// Apply a flat dotted-path → value map onto a `serde_json::Value`. Creates
@@ -279,73 +251,27 @@ version = 1
     }
 
     #[test]
-    fn defaults_section_parses_store_extension_token_owner() {
+    fn wildcard_slug_is_parsed_as_an_ordinary_kind_key() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("overlay.toml");
         std::fs::write(&path, r#"
 version = 1
 
-[defaults]
-store_extension_token_owner = "https://prod/api/v1/users/938493"
+[hooks."*"]
+token_owner = "https://prod/api/v1/users/938493"
 
 [hooks.master-data-hub]
 "name" = "MDH (PROD)"
 "#).unwrap();
         let overlay = Overlay::load(&path).unwrap().unwrap();
+        // The reserved "*" wildcard is just another key in the hooks map; the
+        // migrate driver gives it kind-wide-default semantics (applied to every
+        // hook, with a real per-slug entry winning over it).
+        let star = overlay.hook("*").unwrap();
         assert_eq!(
-            overlay.defaults.store_extension_token_owner.as_deref(),
-            Some("https://prod/api/v1/users/938493")
+            star.get("token_owner").unwrap(),
+            &Value::String("https://prod/api/v1/users/938493".into())
         );
         assert!(overlay.hook("master-data-hub").is_some());
-    }
-
-    #[test]
-    fn defaults_section_is_optional() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("overlay.toml");
-        std::fs::write(&path, "version = 1\n").unwrap();
-        let overlay = Overlay::load(&path).unwrap().unwrap();
-        assert!(overlay.defaults.store_extension_token_owner.is_none());
-    }
-
-    #[test]
-    fn write_token_owner_creates_per_hook_entry() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("overlay.toml");
-        std::fs::write(&path, "version = 1\n\n[hooks.other-hook]\n\"name\" = \"Other\"\n").unwrap();
-
-        write_store_extension_token_owner(&path, Some("master-data-hub"), "https://prod/api/v1/users/938493").unwrap();
-
-        let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("[hooks.master-data-hub]"));
-        assert!(raw.contains("token_owner = \"https://prod/api/v1/users/938493\""));
-        assert!(raw.contains("[hooks.other-hook]"), "existing entries must be preserved");
-        assert!(raw.contains("Other"));
-    }
-
-    #[test]
-    fn write_token_owner_creates_defaults_entry_when_slug_none() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("overlay.toml");
-        std::fs::write(&path, "version = 1\n").unwrap();
-
-        write_store_extension_token_owner(&path, None, "https://prod/api/v1/users/938493").unwrap();
-
-        let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("[defaults]"));
-        assert!(raw.contains("store_extension_token_owner = \"https://prod/api/v1/users/938493\""));
-    }
-
-    #[test]
-    fn write_token_owner_creates_file_if_missing() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("overlay.toml");
-
-        write_store_extension_token_owner(&path, None, "https://prod/api/v1/users/938493").unwrap();
-
-        let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("version = 1"));
-        assert!(raw.contains("[defaults]"));
-        assert!(raw.contains("store_extension_token_owner"));
     }
 }
