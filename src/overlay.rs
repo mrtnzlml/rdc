@@ -1,8 +1,8 @@
 //! Per-env overlays — declarative env-specific values applied when MIGRATING
 //! a snapshot from one environment to another. Per spec §9.
 //!
-//! C-1 model (migrate-only): an overlay maps dotted-path keys to the value the
-//! TARGET env should use. `migrate` applies them (via [`apply_overrides`]) so
+//! C-1 model (migrate-only): an overlay maps each object's fields to the value
+//! the TARGET env should use. `migrate` applies them (via [`apply_overrides`]) so
 //! the promoted snapshot carries that env's real values. Pull, push, and sync
 //! treat overlay-managed fields as ordinary content — they are NOT stripped on
 //! pull nor re-applied on push — so each env's snapshot shows its real values
@@ -12,8 +12,10 @@
 //! pull — which kept the snapshot env-agnostic but hid the value from disk.
 //! C-1 trades that for visibility: snapshots are env-specific and self-evident.)
 //!
-//! The override format is simple dotted-path keys; JMESPath wildcards / array
-//! filters are out of scope for v1.
+//! Overrides are native TOML: each value is deep-merged onto the object, so a
+//! nested table (or unquoted dotted key) sets a nested field while preserving
+//! its siblings, and a key is taken literally (a dot in a key is part of the
+//! name, not a path). JMESPath wildcards / array filters are out of scope for v1.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -130,37 +132,40 @@ impl Default for Overlay {
     }
 }
 
-/// Apply a flat dotted-path → value map onto a `serde_json::Value`. Creates
-/// intermediate objects if missing. Existing values at the path are
-/// overwritten unconditionally.
+/// Deep-merge an override map onto a `serde_json::Value`, following native TOML
+/// semantics. Each entry is a field of the target object: a nested object value
+/// (from a TOML sub-table or an unquoted dotted key) is merged recursively so
+/// the target's sibling keys are preserved; any other value (scalar/array, or
+/// an object replacing a non-object) overwrites the field. Keys are taken
+/// literally — a key containing a dot is a single literal field name (TOML's
+/// `"a.b"`), NOT a path. To target a nested field, use native TOML nesting
+/// (`[table.sub]` or `a.b = …`), which the parser turns into nested objects.
 pub fn apply_overrides(value: &mut Value, overrides: &BTreeMap<String, Value>) {
-    for (path, new_value) in overrides {
-        set_at_path(value, path, new_value.clone());
+    if !value.is_object() {
+        *value = Value::Object(serde_json::Map::new());
+    }
+    let target = value
+        .as_object_mut()
+        .expect("just ensured value is a JSON object");
+    for (key, new_value) in overrides {
+        merge_field(target, key, new_value);
     }
 }
 
-fn set_at_path(value: &mut Value, path: &str, new_value: Value) {
-    let segments: Vec<&str> = path.split('.').collect();
-    if segments.is_empty() {
-        return;
-    }
-    let mut current = value;
-    for segment in &segments[..segments.len() - 1] {
-        if !current.is_object() {
-            *current = Value::Object(Default::default());
+/// Set `key` on `target`, recursively merging when BOTH the existing value and
+/// `new_value` are objects (so the target's other keys survive); otherwise
+/// replace the field wholesale.
+fn merge_field(target: &mut serde_json::Map<String, Value>, key: &str, new_value: &Value) {
+    match (target.get_mut(key), new_value) {
+        (Some(Value::Object(existing)), Value::Object(incoming)) => {
+            for (k, v) in incoming {
+                merge_field(existing, k, v);
+            }
         }
-        let obj = current.as_object_mut().expect("set_at_path just initialized current as Value::Object");
-        let entry = obj.entry((*segment).to_string()).or_insert(Value::Object(Default::default()));
-        if !entry.is_object() {
-            *entry = Value::Object(Default::default());
+        _ => {
+            target.insert(key.to_string(), new_value.clone());
         }
-        current = entry;
     }
-    if !current.is_object() {
-        *current = Value::Object(Default::default());
-    }
-    let obj = current.as_object_mut().expect("set_at_path just initialized current as Value::Object");
-    obj.insert(segments.last().unwrap().to_string(), new_value);
 }
 
 #[cfg(test)]
@@ -199,16 +204,17 @@ version = 1
     fn load_parses_schema_overrides() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("overlay.toml");
+        // Native TOML nesting: an unquoted dotted key builds a sub-table.
         std::fs::write(&path, r#"
 version = 1
 
 [schemas.cost-invoices]
-"settings.default_score_threshold" = 0.95
+settings.default_score_threshold = 0.95
 "#).unwrap();
         let overlay = Overlay::load(&path).unwrap().unwrap();
         let s = overlay.schema("cost-invoices").unwrap();
-        let v = s.get("settings.default_score_threshold").unwrap();
-        assert_eq!(v.as_f64().unwrap(), 0.95);
+        let settings = s.get("settings").unwrap();
+        assert_eq!(settings["default_score_threshold"].as_f64().unwrap(), 0.95);
     }
 
     #[test]
@@ -222,32 +228,47 @@ version = 1
     }
 
     #[test]
-    fn apply_nested_dotted_override() {
+    fn apply_merges_nested_object_preserving_siblings() {
+        // Native TOML: a nested table deep-merges into the target object, leaving
+        // the target's other keys intact (the corrected, non-destructive behavior).
         let mut v = json!({ "config": { "runtime": "old", "other": "kept" } });
         let mut overrides = BTreeMap::new();
-        overrides.insert("config.runtime".to_string(), Value::String("new".into()));
+        overrides.insert("config".to_string(), json!({ "runtime": "new" }));
         apply_overrides(&mut v, &overrides);
         assert_eq!(v["config"]["runtime"], Value::String("new".into()));
-        assert_eq!(v["config"]["other"], Value::String("kept".into()));
+        assert_eq!(v["config"]["other"], Value::String("kept".into()), "siblings preserved");
     }
 
     #[test]
-    fn apply_creates_intermediate_objects_when_missing() {
+    fn apply_creates_missing_nested_objects() {
         let mut v = json!({ "name": "x" });
         let mut overrides = BTreeMap::new();
-        overrides.insert("settings.deep.value".to_string(), Value::String("created".into()));
+        overrides.insert("settings".to_string(), json!({ "deep": { "value": "created" } }));
         apply_overrides(&mut v, &overrides);
         assert_eq!(v["settings"]["deep"]["value"], Value::String("created".into()));
         assert_eq!(v["name"], Value::String("x".into()));
     }
 
     #[test]
-    fn apply_replaces_non_object_at_intermediate_path() {
+    fn apply_replaces_non_object_target_with_object() {
+        // Object-over-scalar at a leaf: the scalar is replaced wholesale.
         let mut v = json!({ "config": "scalar" });
         let mut overrides = BTreeMap::new();
-        overrides.insert("config.runtime".to_string(), Value::String("py".into()));
+        overrides.insert("config".to_string(), json!({ "runtime": "py" }));
         apply_overrides(&mut v, &overrides);
         assert_eq!(v["config"]["runtime"], Value::String("py".into()));
+    }
+
+    #[test]
+    fn apply_treats_dotted_key_as_literal_field_not_a_path() {
+        // Native TOML: a key literally containing a dot (TOML's `"a.b"`) is a
+        // single literal field name, NOT a path. rdc no longer splits on '.'.
+        let mut v = json!({ "config": { "url": "keep" } });
+        let mut overrides = BTreeMap::new();
+        overrides.insert("config.url".to_string(), Value::String("literal".into()));
+        apply_overrides(&mut v, &overrides);
+        assert_eq!(v["config.url"], Value::String("literal".into()), "set as a literal field");
+        assert_eq!(v["config"]["url"], Value::String("keep".into()), "nested config.url untouched");
     }
 
     #[test]
