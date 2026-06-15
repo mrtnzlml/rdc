@@ -167,6 +167,29 @@ fn classify_workspace(comps: &[String]) -> Option<(&'static str, String)> {
     }
 }
 
+/// Dispatch an overlay lookup for a `(kind, slug)` pair to the matching
+/// accessor. `slug` is the literal overlay key — either a remapped target slug
+/// (a per-object override) or the reserved `"*"` wildcard (a kind-wide default).
+/// `"*"` is not a valid Rossum slug, so it never collides with a real object.
+fn overlay_slug<'a>(
+    overlay: &'a Overlay,
+    kind: &str,
+    slug: &str,
+) -> Option<&'a BTreeMap<String, serde_json::Value>> {
+    match kind {
+        "hooks" => overlay.hook(slug),
+        "rules" => overlay.rule(slug),
+        "labels" => overlay.label(slug),
+        "schemas" => overlay.schema(slug),
+        "queues" => overlay.queue(slug),
+        "inboxes" => overlay.inbox(slug),
+        "email_templates" => overlay.email_template(slug),
+        "engines" => overlay.engine(slug),
+        "engine_fields" => overlay.engine_field(slug),
+        _ => None,
+    }
+}
+
 /// Look up the tgt overlay overrides for a classified `(kind, src_slug)` pair.
 /// The src slug is first remapped to its tgt slug (overlays are keyed by the
 /// target-env slug, since the file lands under that slug), then dispatched to
@@ -177,19 +200,7 @@ fn overlay_for<'a>(
     kind: &str,
     src_slug: &str,
 ) -> Option<&'a BTreeMap<String, serde_json::Value>> {
-    let tgt = tgt_slug(mapping, kind, src_slug);
-    match kind {
-        "hooks" => overlay.hook(&tgt),
-        "rules" => overlay.rule(&tgt),
-        "labels" => overlay.label(&tgt),
-        "schemas" => overlay.schema(&tgt),
-        "queues" => overlay.queue(&tgt),
-        "inboxes" => overlay.inbox(&tgt),
-        "email_templates" => overlay.email_template(&tgt),
-        "engines" => overlay.engine(&tgt),
-        "engine_fields" => overlay.engine_field(&tgt),
-        _ => None,
-    }
+    overlay_slug(overlay, kind, &tgt_slug(mapping, kind, src_slug))
 }
 
 /// Transform one source file into its target location.
@@ -253,12 +264,21 @@ fn transform_file(
         reconcile_target_identity(&mut value, &dst_path, codec, tgt_org_url);
     }
 
-    // Apply the tgt overlay for this object, if any.
+    // Apply the tgt overlay for this object. A kind-wide default lives under the
+    // reserved `"*"` slug (e.g. `[hooks."*"]`) and is applied FIRST; the
+    // per-object entry (`[hooks.<slug>]`) is applied SECOND so it wins on any
+    // shared key. Both run AFTER `reconcile_target_identity`, so an overlay value
+    // overrides the object's reconciled/source content. Precedence:
+    // per-object override > kind-wide `"*"` default > reconciled value.
     if let Some((kind, src_slug)) = classify(rel)
         && let Some(ov) = overlay
-        && let Some(overrides) = overlay_for(ov, mapping, kind, &src_slug)
     {
-        apply_overrides(&mut value, overrides);
+        if let Some(defaults) = overlay_slug(ov, kind, "*") {
+            apply_overrides(&mut value, defaults);
+        }
+        if let Some(overrides) = overlay_for(ov, mapping, kind, &src_slug) {
+            apply_overrides(&mut value, overrides);
+        }
     }
 
     // Canonicalize a hook's `run_after` to a stable, env-independent order. The
@@ -968,6 +988,139 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
         assert_eq!(v["name"], "Extractor (PROD)", "tgt overlay must be applied");
         assert_eq!(v["type"], "function");
+    }
+
+    #[test]
+    fn transform_applies_wildcard_default_to_objects_without_per_object_override() {
+        use std::fs;
+        let src = tempfile::TempDir::new().unwrap();
+        let tgt = tempfile::TempDir::new().unwrap();
+
+        // Identity mapping; NO per-hook overlay entry for this slug — only the
+        // reserved `"*"` kind-wide default.
+        let m = Mapping::default();
+        let mut overlay = Overlay::default();
+        let mut star = BTreeMap::new();
+        star.insert(
+            "token_owner".to_string(),
+            serde_json::Value::String("https://tgt.example/api/v1/users/2".into()),
+        );
+        overlay.hooks.insert("*".to_string(), star);
+
+        let rel = Path::new("hooks/any-hook.json");
+        let src_file = src.path().join(rel);
+        fs::create_dir_all(src_file.parent().unwrap()).unwrap();
+        // New hook (no tgt file): reconcile keeps the SOURCE-env token_owner, so
+        // the wildcard default must override it to the target user.
+        fs::write(
+            &src_file,
+            serde_json::to_vec(&serde_json::json!({
+                "name": "Any Hook",
+                "type": "function",
+                "token_owner": "https://src.example/api/v1/users/1",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let subst = build_subst(&m);
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2").unwrap();
+
+        let dst = tgt.path().join("hooks/any-hook.json");
+        let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
+        assert_eq!(
+            v["token_owner"], "https://tgt.example/api/v1/users/2",
+            "[hooks.\"*\"] wildcard default must apply to a hook with no per-hook override",
+        );
+    }
+
+    #[test]
+    fn transform_per_object_override_wins_over_wildcard_default() {
+        use std::fs;
+        let src = tempfile::TempDir::new().unwrap();
+        let tgt = tempfile::TempDir::new().unwrap();
+
+        let m = Mapping::default();
+        let mut overlay = Overlay::default();
+        // Wildcard sets BOTH a key the per-hook entry overrides (token_owner)
+        // and a key only it sets (name).
+        let mut star = BTreeMap::new();
+        star.insert(
+            "token_owner".to_string(),
+            serde_json::Value::String("https://tgt.example/api/v1/users/2".into()),
+        );
+        star.insert(
+            "name".to_string(),
+            serde_json::Value::String("Wildcard Name".into()),
+        );
+        overlay.hooks.insert("*".to_string(), star);
+        let mut per_hook = BTreeMap::new();
+        per_hook.insert(
+            "token_owner".to_string(),
+            serde_json::Value::String("https://tgt.example/api/v1/users/99".into()),
+        );
+        overlay.hooks.insert("special-hook".to_string(), per_hook);
+
+        let rel = Path::new("hooks/special-hook.json");
+        let src_file = src.path().join(rel);
+        fs::create_dir_all(src_file.parent().unwrap()).unwrap();
+        fs::write(
+            &src_file,
+            serde_json::to_vec(&serde_json::json!({ "name": "Special", "type": "function" }))
+                .unwrap(),
+        )
+        .unwrap();
+
+        let subst = build_subst(&m);
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2").unwrap();
+
+        let dst = tgt.path().join("hooks/special-hook.json");
+        let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
+        assert_eq!(
+            v["token_owner"], "https://tgt.example/api/v1/users/99",
+            "per-hook [hooks.<slug>] override must win over the wildcard on a shared key",
+        );
+        assert_eq!(
+            v["name"], "Wildcard Name",
+            "wildcard-only key must still be applied alongside a per-hook override",
+        );
+        assert_eq!(v["type"], "function", "unrelated field untouched");
+    }
+
+    #[test]
+    fn transform_wildcard_default_applies_to_non_hook_kinds() {
+        use std::fs;
+        let src = tempfile::TempDir::new().unwrap();
+        let tgt = tempfile::TempDir::new().unwrap();
+
+        // The wildcard is generic across kinds — prove it for rules.
+        let m = Mapping::default();
+        let mut overlay = Overlay::default();
+        let mut star = BTreeMap::new();
+        star.insert(
+            "name".to_string(),
+            serde_json::Value::String("Default Rule Name".into()),
+        );
+        overlay.rules.insert("*".to_string(), star);
+
+        let rel = Path::new("rules/some-rule.json");
+        let src_file = src.path().join(rel);
+        fs::create_dir_all(src_file.parent().unwrap()).unwrap();
+        fs::write(
+            &src_file,
+            serde_json::to_vec(&serde_json::json!({ "name": "Original Rule" })).unwrap(),
+        )
+        .unwrap();
+
+        let subst = build_subst(&m);
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2").unwrap();
+
+        let dst = tgt.path().join("rules/some-rule.json");
+        let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
+        assert_eq!(
+            v["name"], "Default Rule Name",
+            "[rules.\"*\"] wildcard default must apply to rules too",
+        );
     }
 
     #[test]
