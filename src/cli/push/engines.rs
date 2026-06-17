@@ -39,14 +39,6 @@ pub async fn push(
             let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
                 .with_context(|| format!("parsing {}", path.display()))?;
             let deferred = crate::snapshot::refs::resolve_value_deferring(&mut payload, lockfile);
-            if !deferred.is_empty() {
-                relink.push(crate::cli::push::relink::DeferredRelink {
-                    kind: "engines".to_string(),
-                    slug: slug.clone(),
-                    path: path.clone(),
-                    fields: deferred,
-                });
-            }
             strip_for_create(&mut payload, "engines");
             let create_result = client
                 .create_engine(&payload, Some(progress.clone()))
@@ -54,8 +46,8 @@ pub async fn push(
                 .with_context(|| format!("POST /engines (creating '{slug}')"));
             let created = match create_result {
                 Ok(c) => c,
-                Err(e) if crate::api::anyhow_has_status(&e, 405) || crate::api::anyhow_has_status(&e, 403) => {
-                    let code = if crate::api::anyhow_has_status(&e, 403) { "403" } else { "405" };
+                Err(e) if anyhow_has_status(&e, 405) || anyhow_has_status(&e, 403) => {
+                    let code = if anyhow_has_status(&e, 403) { "403" } else { "405" };
                     progress.event(Action::Skip, &format!("engine/{slug} (create {code} — engines not writable on this plan)"));
                     skipped += 1;
                     continue;
@@ -82,6 +74,14 @@ pub async fn push(
                     secrets_hash: None,
                 },
             );
+            if !deferred.is_empty() {
+                relink.push(crate::cli::push::relink::DeferredRelink {
+                    kind: "engines".to_string(),
+                    slug: slug.clone(),
+                    path: path.clone(),
+                    fields: deferred,
+                });
+            }
             progress.event(Action::Post, &format!("engine/{slug} id={}", created.id));
             pushed += 1;
             continue;
@@ -103,15 +103,7 @@ pub async fn push(
 
         let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
             .with_context(|| format!("parsing {}", path.display()))?;
-        let deferred = crate::snapshot::refs::resolve_value_deferring(&mut payload, lockfile);
-        if !deferred.is_empty() {
-            relink.push(crate::cli::push::relink::DeferredRelink {
-                kind: "engines".to_string(),
-                slug: slug.clone(),
-                path: path.clone(),
-                fields: deferred,
-            });
-        }
+        let mut deferred = crate::snapshot::refs::resolve_value_deferring(&mut payload, lockfile);
         let payload_engine: crate::model::Engine = serde_json::from_value(payload)
             .with_context(|| format!("deserializing overlay-applied engine '{slug}'"))?;
 
@@ -152,15 +144,7 @@ pub async fn push(
                     if let Some(bytes) = payload_override {
                         let mut ov: serde_json::Value = serde_json::from_slice(&bytes)
                             .with_context(|| format!("re-deserializing edited engine '{slug}'"))?;
-                        let deferred = crate::snapshot::refs::resolve_value_deferring(&mut ov, lockfile);
-                        if !deferred.is_empty() {
-                            relink.push(crate::cli::push::relink::DeferredRelink {
-                                kind: "engines".to_string(),
-                                slug: slug.clone(),
-                                path: path.clone(),
-                                fields: deferred,
-                            });
-                        }
+                        deferred = crate::snapshot::refs::resolve_value_deferring(&mut ov, lockfile);
                         payload_to_send = serde_json::from_value(ov)
                             .with_context(|| format!("re-deserializing edited engine '{slug}'"))?;
                     }
@@ -246,6 +230,14 @@ pub async fn push(
                 secrets_hash: None,
             },
         );
+        if !deferred.is_empty() {
+            relink.push(crate::cli::push::relink::DeferredRelink {
+                kind: "engines".to_string(),
+                slug: slug.clone(),
+                path: path.clone(),
+                fields: deferred,
+            });
+        }
         progress.event(Action::Patch, &format!("engine/{slug}"));
         pushed += 1;
     }
