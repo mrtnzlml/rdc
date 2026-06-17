@@ -1,0 +1,116 @@
+# Promotion + deploy pipeline for Rossum environments managed with rdc.
+#
+# Companion to gitlab-ci-archival.yml. Two actions:
+#   * migrate (manual button): copy one env's config onto another (e.g.
+#     dev -> test) with `rdc migrate`, then open a merge request with the
+#     result for you to review. Pure-local: no Rossum credentials needed.
+#   * deploy (automatic): when that MR is merged to the default branch, push
+#     every env whose config changed to its Rossum remote with
+#     `rdc sync <env> --no-pull` (writes the remote, never overwrites local).
+#
+# Copy this file to .gitlab-ci.yml at the root of your Rossum project repo
+# (the one with rdc.toml + envs/), or `include:` it. Then:
+#   1. Set CI variables (Settings -> CI/CD -> Variables; masked, protected):
+#        RDC_USER_<ENV> / RDC_PASS_<ENV>  (or RDC_TOKEN_<ENV>) for every env
+#        you deploy TO. Suffix = env name uppercased, non-alphanumerics -> '_'
+#        (env 'test' -> RDC_USER_TEST, 'prod-eu' -> RDC_USER_PROD_EU).
+#   2. Let the migrate job push a branch + open an MR: enable "Allow Git push
+#      requests to this repository" for the CI/CD job token (Token Permissions;
+#      GitLab 17.2+), or replace ${CI_JOB_TOKEN} in the push URL with a
+#      project/personal access token (CI variable) with write access.
+#   3. Adjust RDC_VERSION and the migrate defaults (RDC_SRC / RDC_TGT) below.
+#   4. Promote: CI/CD -> Pipelines -> "Run pipeline" (optionally set RDC_SRC /
+#      RDC_TGT in the form), then press play on the `migrate` job. Review and
+#      merge the MR it opens; the merge auto-deploys the target env.
+#
+# CAUTION: the deploy job writes to Rossum. It is additive by default (never
+# prunes remote objects); set a CI variable RDC_ALLOW_DELETES=1 to pass
+# `--allow-deletes`. Do NOT point auto-deploy at the same envs an archival
+# pipeline pulls into this repo, or merging an archival snapshot would push it
+# straight back to the remote.
+
+variables:
+  RDC_VERSION: "v0.3.0"  # latest release; see
+                          # https://github.com/mrtnzlml/rdc/releases
+
+stages:
+  - migrate
+  - deploy
+
+# Shared setup: pinned rdc binary on Alpine.
+.rdc:
+  image: alpine:3.20
+  before_script:
+    - apk add --no-cache curl git
+    - curl -fsSL "https://github.com/mrtnzlml/rdc/releases/download/${RDC_VERSION}/rdc-x86_64-unknown-linux-gnu.tar.gz" | tar xz -C /usr/local/bin
+    - rdc --version
+
+# Manual "button": promote one env's config onto another, locally, and open a
+# merge request with the result. `rdc migrate` makes zero remote calls, so this
+# job needs no Rossum credentials -- only rights to push a branch + open an MR.
+migrate:
+  extends: .rdc
+  stage: migrate
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+  variables:
+    RDC_SRC: "dev"
+    RDC_TGT: "test"
+  script:
+    - git config user.name  "rdc-migrate[bot]"
+    - git config user.email "rdc-migrate@noreply"
+    - rdc migrate "$RDC_SRC" "$RDC_TGT"
+    - |
+      set -eu
+      git add -A "envs/$RDC_TGT"
+      if git diff --staged --quiet; then
+        echo "Migrating $RDC_SRC -> $RDC_TGT produced no changes."
+        exit 0
+      fi
+      # One rolling MR per source->target pair: reset a stable branch onto the
+      # current default branch plus a single migration commit, then force-push.
+      # Re-running migrate updates the same open MR; merging it removes the
+      # branch and triggers the automatic deploy below.
+      BRANCH="migrate/$RDC_SRC-to-$RDC_TGT"
+      git checkout -B "$BRANCH"
+      git commit -m "chore(migrate): $RDC_SRC -> $RDC_TGT"
+      git push --force \
+        -o merge_request.create \
+        -o merge_request.target="$CI_DEFAULT_BRANCH" \
+        -o merge_request.title="chore(migrate): $RDC_SRC -> $RDC_TGT" \
+        -o merge_request.remove_source_branch \
+        "https://oauth2:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" \
+        "HEAD:refs/heads/$BRANCH"
+
+# Automatic: on a push/merge to the default branch, deploy every env whose
+# config changed in that push to its Rossum remote.
+deploy:
+  extends: .rdc
+  stage: deploy
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  variables:
+    GIT_DEPTH: "0"  # full history so we can diff the merge against its parent
+  script:
+    - |
+      set -eu
+      # Which env directories changed in this push? CI_COMMIT_BEFORE_SHA is the
+      # previous default-branch tip; it is all-zeros for the first pipeline, so
+      # fall back to the commit's first parent.
+      BEFORE="$CI_COMMIT_BEFORE_SHA"
+      case "$BEFORE" in
+        0000000000000000000000000000000000000000|"") BEFORE="$CI_COMMIT_SHA~1" ;;
+      esac
+      CHANGED=$(git diff --name-only "$BEFORE" "$CI_COMMIT_SHA" -- 'envs/' \
+        | sed -n 's#^envs/\([^/]*\)/.*#\1#p' | sort -u)
+      if [ -z "$CHANGED" ]; then
+        echo "No env config changed in this push; nothing to deploy."
+        exit 0
+      fi
+      DELETES=""
+      [ "${RDC_ALLOW_DELETES:-0}" = "1" ] && DELETES="--allow-deletes"
+      for env in $CHANGED; do
+        echo ">> Deploying $env to its Rossum remote"
+        rdc sync "$env" --no-pull --yes $DELETES
+      done
