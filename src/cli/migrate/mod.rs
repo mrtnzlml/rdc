@@ -157,6 +157,39 @@ fn is_sidecar(rel: &Path) -> bool {
     !is_json && classify_for_selection(rel).is_some()
 }
 
+/// Recursively list files under `overlay_dir`, returning paths RELATIVE to it,
+/// sorted. Skips `__pycache__` directories (tooling output), mirroring
+/// [`walk_dir`]. Returns an empty vec if `overlay_dir` does not exist.
+fn list_overlay_files(overlay_dir: &Path) -> Result<Vec<PathBuf>> {
+    fn walk(base: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+        for entry in
+            std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?
+        {
+            let entry = entry.with_context(|| format!("listing {}", dir.display()))?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                if entry.file_name() == "__pycache__" {
+                    continue;
+                }
+                walk(base, &path, out)?;
+            } else {
+                out.push(
+                    path.strip_prefix(base)
+                        .expect("walked path is under base")
+                        .to_path_buf(),
+                );
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    if overlay_dir.exists() {
+        walk(overlay_dir, overlay_dir, &mut out)?;
+    }
+    out.sort();
+    Ok(out)
+}
+
 fn classify_workspace(comps: &[String]) -> Option<(&'static str, String)> {
     let ws = comps.get(1)?;
     let leaf = comps.last()?;
@@ -1254,6 +1287,35 @@ mod tests {
             fs::read(&dst).unwrap(),
             code,
             ".py is copied verbatim — no ref substitution inside code"
+        );
+    }
+
+    #[test]
+    fn list_overlay_files_returns_relpaths_skipping_pycache() {
+        use std::fs;
+        let dir = tempfile::TempDir::new().unwrap();
+        let ov = dir.path();
+        fs::create_dir_all(ov.join("hooks")).unwrap();
+        fs::write(ov.join("hooks/extractor.py"), b"x").unwrap();
+        fs::create_dir_all(ov.join("workspaces/main/queues/invoices/formulas")).unwrap();
+        fs::write(
+            ov.join("workspaces/main/queues/invoices/formulas/sftp_path.py"),
+            b"y",
+        )
+        .unwrap();
+        // __pycache__ must be ignored.
+        fs::create_dir_all(ov.join("hooks/__pycache__")).unwrap();
+        fs::write(ov.join("hooks/__pycache__/extractor.cpython-312.pyc"), b"z").unwrap();
+
+        let got: Vec<std::path::PathBuf> = list_overlay_files(ov).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                std::path::PathBuf::from("hooks/extractor.py"),
+                std::path::PathBuf::from(
+                    "workspaces/main/queues/invoices/formulas/sftp_path.py"
+                ),
+            ]
         );
     }
 
