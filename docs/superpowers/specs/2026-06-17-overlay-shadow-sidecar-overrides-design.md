@@ -18,8 +18,8 @@ But **code/formula sidecar files are copied verbatim** (`transform_file`,
 | schema formula | `content[].formula` | `workspaces/<ws>/queues/<q>/formulas/<field>.py` |
 
 There is no way to make a sidecar env-specific. Real case: a `sftp_export_path`
-formula returns a constant path (`"/Test/MTR - Pipe and Fitting"`) that must
-differ in production. Promoting test→prod clobbers prod's value. `overlay.toml`
+formula returns a constant path (e.g. `"/test/exports"`) that must differ in
+production. Promoting test→prod clobbers prod's value. `overlay.toml`
 cannot reach it: formulas are extracted *out* of `schema.json` into sidecars, and
 even in-JSON the field lives in the `content[]` array, which the overlay's
 deep-merge replaces wholesale rather than targeting (`merge_field`,
@@ -46,11 +46,11 @@ A new per-env directory `envs/<env>/overlay/` (sibling of the existing
 using the **target** env's slugs/paths and shadow sidecar files. Example:
 
 ```
-envs/prod-mtr/overlay/workspaces/ferguson-mtr/queues/2-pipe-and-fitting-mtr/formulas/sftp_export_path.py
+envs/prod/overlay/workspaces/main/queues/invoices/formulas/sftp_export_path.py
 ```
 
 overrides the migrated
-`envs/prod-mtr/workspaces/ferguson-mtr/queues/2-pipe-and-fitting-mtr/formulas/sftp_export_path.py`.
+`envs/prod/workspaces/main/queues/invoices/formulas/sftp_export_path.py`.
 
 The directory is committed to git as part of the env's configuration. It is **not**
 a `MANAGED_DIR` (`src/cli/migrate/mod.rs:398` lists only `hooks, workspaces, rules,
