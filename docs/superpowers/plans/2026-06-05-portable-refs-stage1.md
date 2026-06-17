@@ -57,7 +57,7 @@ mod tests {
     fn parse_rdc_ref_splits_kind_and_slug() {
         assert_eq!(parse_rdc_ref("rdc://queues/invoices"), Some(("queues", "invoices")));
         // composite slug (engine_fields, email_templates): kind = first segment, slug = remainder
-        assert_eq!(parse_rdc_ref("rdc://engine_fields/ops/code"), Some(("engine_fields", "ops/code")));
+        assert_eq!(parse_rdc_ref("rdc://engine_fields/default/code"), Some(("engine_fields", "default/code")));
         assert_eq!(parse_rdc_ref("https://x.rossum.app/api/v1/queues/1"), None);
         assert_eq!(parse_rdc_ref("not a ref"), None);
         assert_eq!(parse_rdc_ref("rdc://queues"), None); // no slug
@@ -733,20 +733,20 @@ Run: `cargo build --release`
 # Copy a real project to a scratch dir so the original is untouched.
 cp -R /path/to/acme-rdc /tmp/rdc-portable-verify
 cd /tmp/rdc-portable-verify
-# Pull dev-ops with the freshly built binary (NOT the Homebrew rdc — use the absolute path).
-/Users/martin.zlamal@rossum.ai/Work/github.com/mrtnzlml/rdc/target/release/rdc sync dev-ops   # provide a valid token when prompted
+# Pull dev with the freshly built binary (NOT the Homebrew rdc — use the absolute path).
+/Users/martin.zlamal@rossum.ai/Work/github.com/mrtnzlml/rdc/target/release/rdc sync dev   # provide a valid token when prompted
 ```
 
 - [ ] **Step 3: Confirm the three properties**
 
 ```bash
 # (a) snapshot now stores rdc:// refs, no raw /api/v1/ object URLs in queue/hook bodies
-grep -rl 'rdc://' envs/dev-ops/workspaces | head
-grep -rn '"workspace": "https' envs/dev-ops/workspaces || echo "no raw workspace URLs ✓"
+grep -rl 'rdc://' envs/dev/workspaces | head
+grep -rn '"workspace": "https' envs/dev/workspaces || echo "no raw workspace URLs ✓"
 # (b) a second pull is a no-op (Clean) — run sync again, expect "up to date" / no drift
-/Users/.../target/release/rdc sync dev-ops
+/Users/.../target/release/rdc sync dev
 # (c) (read-only) deploy --dry-run still produces a plan without panicking
-/Users/.../target/release/rdc deploy dev-ops test-ops --dry-run | tail
+/Users/.../target/release/rdc deploy dev test --dry-run | tail
 ```
 
 Expected: (a) refs are `rdc://`; (b) second pull reports no changes (rebaseline holds); (c) deploy dry-run still runs.
@@ -755,7 +755,7 @@ Expected: (a) refs are `rdc://`; (b) second pull reports no changes (rebaseline 
 
 ```bash
 cd /Users/martin.zlamal@rossum.ai/Work/github.com/mrtnzlml/rdc
-git commit --allow-empty -m "verify(portable-refs): live dev-ops pull writes rdc://, idempotent, deploy dry-run OK"
+git commit --allow-empty -m "verify(portable-refs): live dev pull writes rdc://, idempotent, deploy dry-run OK"
 ```
 
 ---

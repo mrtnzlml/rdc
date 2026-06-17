@@ -127,9 +127,9 @@ mod tests {
     #[test]
     fn resolve_relink_body_resolves_when_target_now_exists() {
         let api_base = "https://x.rossum.app/api/v1";
-        let lockfile = lf(api_base, "engines", "1-intake-triage-ops", 392);
+        let lockfile = lf(api_base, "engines", "1-intake-triage", 392);
         let fields = vec![("engine".to_string(),
-            serde_json::json!("rdc://engines/1-intake-triage-ops"))];
+            serde_json::json!("rdc://engines/1-intake-triage"))];
         let body = resolve_relink_body(&fields, &lockfile).expect("should resolve");
         assert_eq!(body["engine"], format!("{api_base}/engines/392"));
     }
