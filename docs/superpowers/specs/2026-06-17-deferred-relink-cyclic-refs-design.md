@@ -10,11 +10,11 @@
 not yet exist in the target environment:
 
 ```
-fail   pushing queues for env 'test-ops': PATCH /queues/5550440:
+fail   pushing queues for env 'test': PATCH /queues/5550440:
        Rossum API returned status 400: {"engine":["Invalid hyperlink - No URL match."]}
 ```
 
-The queue's `engine` is a portable ref `rdc://engines/1-intake-triage-ops`
+The queue's `engine` is a portable ref `rdc://engines/1-intake-triage`
 pointing at an engine that is itself a `LocalCreate` in the same sync.
 
 ## 2. Root cause (verified)
@@ -41,12 +41,12 @@ pointing at an engine that is itself a `LocalCreate` in the same sync.
 
 ### Live verification (2026-06-17)
 
-- `queue.engine = "rdc://engines/1-intake-triage-ops"` → exactly
+- `queue.engine = "rdc://engines/1-intake-triage"` → exactly
   `400 {"engine":["Invalid hyperlink - No URL match."]}`. A well-formed but
   missing URL instead returns `"Object does not exist."` — so **"No URL match"
   proves the unresolved `rdc://` *scheme* reached the API**, not a stale real URL.
 - Engine skeleton `POST` (`training_queues:[]`) → **201**; `DELETE` → **204**
-  (engines creatable on test-ops; 403 on org 1 / sandbox 214757).
+  (engines creatable on test; 403 on org 1 / sandbox 214757).
 - `PATCH engine.training_queues:[<real queue url>]` → **200** (the relink
   primitive works).
 - `PATCH queue.engine = <fresh engine>` → **400** with the `engine_fields`
@@ -68,7 +68,7 @@ pointing at an engine that is itself a `LocalCreate` in the same sync.
   `rdc://queues/…` through the lockfile, so correct ids are a *prerequisite*,
   tracked separately.
 - Deciding whether the snapshot's 6 new per-queue engines *should* exist in
-  test-ops (a project/data question, not a tool bug).
+  test (a project/data question, not a tool bug).
 - Creating `engine_fields` content that satisfies an engine's binding
   restriction — that is user-authored snapshot data; the relink only sequences
   existing snapshot objects.
@@ -165,8 +165,8 @@ phase as a `PATCH engine/<id> { training_queues: […] }`.)
 - **Idempotency:** after a relink sync, a re-run classifies all objects `Clean`.
 
 ## 7. Out of scope / prerequisites
-- **Stale lockfile ids (blocker).** test-ops's lockfile records
-  `2-paper-and-toner-ops=555325` / `3-stapler-ops=555326`, but the live ids are
+- **Stale lockfile ids (blocker).** test's lockfile records
+  `2-paper-and-toner=555325` / `3-stapler=555326`, but the live ids are
   `5550441` / `5550442` (the stale ones 404). The `training_queues` relink
   resolves `rdc://queues/…` through the lockfile, so it would resolve to a dead
   URL until the lockfile is re-pinned (`doctor --rebuild-lock` or equivalent).
