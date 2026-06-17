@@ -91,6 +91,45 @@ pub fn resolve_value(value: &mut Value, lockfile: &Lockfile) {
     });
 }
 
+/// Push side, two-phase. Resolve every `rdc://` ref that CAN be resolved
+/// (rewriting it to an env URL in place), then DEFER every **top-level object
+/// field** whose value still contains a residual `rdc://` ref — remove it from
+/// `value` and return `(field_name, original_value)` so the caller can PATCH it
+/// later, once the referenced object exists. The returned value is the ORIGINAL
+/// (pre-resolution) field so re-resolving it later is straightforward.
+/// Non-object inputs defer nothing.
+pub fn resolve_value_deferring(value: &mut Value, lockfile: &Lockfile) -> Vec<(String, Value)> {
+    let Some(obj) = value.as_object() else {
+        resolve_value(value, lockfile);
+        return Vec::new();
+    };
+    // Snapshot the keys that have any rdc:// refs so we can save the originals.
+    let candidate_keys: Vec<String> = obj
+        .iter()
+        .filter(|(_, v)| !residual_rdc_refs(v).is_empty())
+        .map(|(k, _)| k.clone())
+        .collect();
+    // Save originals BEFORE resolution (caller re-resolves them later).
+    let originals: Vec<(String, Value)> = candidate_keys
+        .iter()
+        .filter_map(|k| obj.get(k).map(|v| (k.clone(), v.clone())))
+        .collect();
+    // Resolve the whole body in place.
+    resolve_value(value, lockfile);
+    // Now check which fields STILL have residual refs after resolution and defer them.
+    let obj = value.as_object_mut().expect("checked above");
+    let mut deferred = Vec::new();
+    for (k, orig) in originals {
+        if let Some(resolved_v) = obj.get(&k)
+            && !residual_rdc_refs(resolved_v).is_empty()
+        {
+            obj.remove(&k);
+            deferred.push((k, orig));
+        }
+    }
+    deferred
+}
+
 /// Recursively apply `f` to every string leaf in a JSON tree, read-only.
 /// The immutable mirror of [`walk_strings_mut`] (object keys are not visited).
 pub fn walk_strings(value: &Value, f: &mut dyn FnMut(&str)) {
@@ -269,5 +308,44 @@ mod tests {
             "settings": { "x": 1 },
         });
         assert!(residual_rdc_refs(&v).is_empty());
+    }
+
+    #[test]
+    fn resolve_value_deferring_defers_unresolved_top_level_fields_only() {
+        let api_base = "https://example.rossum.app/api/v1";
+        let lf = lf_with(api_base, "queues", "invoices", 10);
+        let mut body = serde_json::json!({
+            "name": "Q",
+            "workspace": "rdc://queues/invoices",            // resolvable -> stays, rewritten
+            "engine": "rdc://engines/1-intake-triage-ops",    // dangling -> deferred + removed
+        });
+        let deferred = resolve_value_deferring(&mut body, &lf);
+        assert_eq!(body["workspace"], format!("{api_base}/queues/10"));
+        assert!(body.get("engine").is_none(), "deferred field must be removed: {body}");
+        assert_eq!(deferred, vec![("engine".to_string(),
+            serde_json::json!("rdc://engines/1-intake-triage-ops"))]);
+    }
+
+    #[test]
+    fn resolve_value_deferring_defers_array_field_with_any_unresolved_member() {
+        let api_base = "https://example.rossum.app/api/v1";
+        let lf = lf_with(api_base, "queues", "invoices", 10);
+        let mut body = serde_json::json!({
+            "training_queues": ["rdc://queues/invoices", "rdc://queues/missing"],
+        });
+        let deferred = resolve_value_deferring(&mut body, &lf);
+        assert!(body.get("training_queues").is_none());
+        assert_eq!(deferred, vec![("training_queues".to_string(),
+            serde_json::json!(["rdc://queues/invoices", "rdc://queues/missing"]))]);
+    }
+
+    #[test]
+    fn resolve_value_deferring_defers_nothing_when_fully_resolvable() {
+        let api_base = "https://example.rossum.app/api/v1";
+        let lf = lf_with(api_base, "queues", "invoices", 10);
+        let mut body = serde_json::json!({ "workspace": "rdc://queues/invoices" });
+        let deferred = resolve_value_deferring(&mut body, &lf);
+        assert!(deferred.is_empty());
+        assert_eq!(body["workspace"], format!("{api_base}/queues/10"));
     }
 }
