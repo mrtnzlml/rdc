@@ -623,13 +623,13 @@ mod tests {
     fn ensure_no_residual_refs_errors_naming_every_ref_and_the_path() {
         let body = json!({
             "name": "1. Inbox & Sorting",
-            "engine": "rdc://engines/1-inbox-sorting-mtr",
+            "engine": "rdc://engines/1-inbox-sorting",
             "schema": "https://x.rossum.app/api/v1/schemas/5",
         });
         let err = ensure_no_residual_refs("/queues/2860440", &body).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("rdc://engines/1-inbox-sorting-mtr"),
+            msg.contains("rdc://engines/1-inbox-sorting"),
             "error must name the unresolved ref: {msg}"
         );
         assert!(
@@ -687,13 +687,13 @@ mod tests {
             "name": "1. Inbox & Sorting",
             "workspace": null,
             "schema": null,
-            "engine": "rdc://engines/1-inbox-sorting-mtr"
+            "engine": "rdc://engines/1-inbox-sorting"
         }))
         .unwrap();
         let err = client.update_queue(2860440, &queue, None).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("rdc://engines/1-inbox-sorting-mtr"),
+            msg.contains("rdc://engines/1-inbox-sorting"),
             "PATCH guard must name the ref from extra: {msg}"
         );
     }

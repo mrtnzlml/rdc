@@ -281,21 +281,21 @@ mod tests {
         // A body that has already been through `resolve_value`: resolvable
         // refs are now env URLs, only the dangling ones survive as `rdc://`.
         let v = serde_json::json!({
-            "engine": "rdc://engines/1-inbox-sorting-mtr",          // dangling
+            "engine": "rdc://engines/1-inbox-sorting",          // dangling
             "schema": "https://example.rossum.app/api/v1/schemas/5", // resolved
             "training_queues": [
                 "https://example.rossum.app/api/v1/queues/777325",   // resolved
-                "rdc://queues/2-pipe-and-fitting-mtr-legacy",        // dangling
-                "rdc://queues/2-pipe-and-fitting-mtr-legacy",        // dup of above
+                "rdc://queues/2-pipe-and-fitting-legacy",        // dangling
+                "rdc://queues/2-pipe-and-fitting-legacy",        // dup of above
             ],
             "plain": "not a ref",
-            "nested": { "deep": "rdc://engines/1-inbox-sorting-mtr" } // dup, nested
+            "nested": { "deep": "rdc://engines/1-inbox-sorting" } // dup, nested
         });
         assert_eq!(
             residual_rdc_refs(&v),
             vec![
-                "rdc://engines/1-inbox-sorting-mtr".to_string(),
-                "rdc://queues/2-pipe-and-fitting-mtr-legacy".to_string(),
+                "rdc://engines/1-inbox-sorting".to_string(),
+                "rdc://queues/2-pipe-and-fitting-legacy".to_string(),
             ],
         );
     }
@@ -317,13 +317,13 @@ mod tests {
         let mut body = serde_json::json!({
             "name": "Q",
             "workspace": "rdc://queues/invoices",            // resolvable -> stays, rewritten
-            "engine": "rdc://engines/1-inbox-sorting-mtr",    // dangling -> deferred + removed
+            "engine": "rdc://engines/1-inbox-sorting",    // dangling -> deferred + removed
         });
         let deferred = resolve_value_deferring(&mut body, &lf);
         assert_eq!(body["workspace"], format!("{api_base}/queues/10"));
         assert!(body.get("engine").is_none(), "deferred field must be removed: {body}");
         assert_eq!(deferred, vec![("engine".to_string(),
-            serde_json::json!("rdc://engines/1-inbox-sorting-mtr"))]);
+            serde_json::json!("rdc://engines/1-inbox-sorting"))]);
     }
 
     #[test]

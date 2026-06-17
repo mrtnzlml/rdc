@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-06-17-deferred-relink-cyclic-refs-design.md`
 
-**Prerequisite (NOT in this plan):** test-mtr's stale lockfile ids (§7 of the spec) must be re-pinned before the `training_queues` relink can resolve on that project. This plan assumes correct lockfile ids.
+**Prerequisite (NOT in this plan):** test's stale lockfile ids (§7 of the spec) must be re-pinned before the `training_queues` relink can resolve on that project. This plan assumes correct lockfile ids.
 
 **Already shipped (do not redo):** `refs::residual_rdc_refs` + `refs::walk_strings`, and `api::ensure_no_residual_refs` wired into `post_json`/`patch_json` (the hard backstop). 736 lib tests green at plan time.
 
@@ -40,13 +40,13 @@ Add to the `tests` module in `src/snapshot/refs.rs`:
 ```rust
 #[test]
 fn resolve_value_deferring_defers_unresolved_top_level_fields_only() {
-    // `invoices` is pinned; `1-inbox-sorting-mtr` engine is NOT.
+    // `invoices` is pinned; `1-inbox-sorting` engine is NOT.
     let api_base = "https://example.rossum.app/api/v1";
     let lf = lf_with(api_base, "queues", "invoices", 10);
     let mut body = serde_json::json!({
         "name": "Q",
         "workspace": "rdc://queues/invoices",            // resolvable -> stays, rewritten
-        "engine": "rdc://engines/1-inbox-sorting-mtr",    // dangling -> deferred + removed
+        "engine": "rdc://engines/1-inbox-sorting",    // dangling -> deferred + removed
     });
     let deferred = resolve_value_deferring(&mut body, &lf);
     // resolvable ref was rewritten in place
@@ -55,7 +55,7 @@ fn resolve_value_deferring_defers_unresolved_top_level_fields_only() {
     assert!(body.get("engine").is_none(), "deferred field must be removed: {body}");
     // and returned for later relink, with its original value
     assert_eq!(deferred, vec![("engine".to_string(),
-        serde_json::json!("rdc://engines/1-inbox-sorting-mtr"))]);
+        serde_json::json!("rdc://engines/1-inbox-sorting"))]);
 }
 
 #[test]
@@ -222,9 +222,9 @@ mod tests {
     #[test]
     fn resolve_relink_body_resolves_when_target_now_exists() {
         let api_base = "https://x.rossum.app/api/v1";
-        let lockfile = lf(api_base, "engines", "1-inbox-sorting-mtr", 392);
+        let lockfile = lf(api_base, "engines", "1-inbox-sorting", 392);
         let fields = vec![("engine".to_string(),
-            serde_json::json!("rdc://engines/1-inbox-sorting-mtr"))];
+            serde_json::json!("rdc://engines/1-inbox-sorting"))];
         let body = resolve_relink_body(&fields, &lockfile).expect("should resolve");
         assert_eq!(body["engine"], format!("{api_base}/engines/392"));
     }
@@ -540,18 +540,18 @@ git commit -m "feat(sync): two-phase deferred relink for engine<->queue cycles"
 
 ## Task 8: Live acceptance + idempotency (authorized env)
 
-rdc has no mock-HTTP harness, so the relink orchestration is accepted against a live engine-capable env (test-mtr) with the user's authorization. The relink PATCH primitives are already live-verified (spec §2).
+rdc has no mock-HTTP harness, so the relink orchestration is accepted against a live engine-capable env (test) with the user's authorization. The relink PATCH primitives are already live-verified (spec §2).
 
-- [ ] **Step 1: Resolve the stale-lockfile-id prerequisite** for the target project (spec §7) — e.g. `rdc doctor --rebuild-lock test-mtr` — so `rdc://queues/…` resolve to live ids. Confirm with `rdc sync test-mtr --dry-run`.
+- [ ] **Step 1: Resolve the stale-lockfile-id prerequisite** for the target project (spec §7) — e.g. `rdc doctor --rebuild-lock test` — so `rdc://queues/…` resolve to live ids. Confirm with `rdc sync test --dry-run`.
 
 - [ ] **Step 2: Run the sync**
 
-Run: `rdc sync test-mtr`
+Run: `rdc sync test`
 Expected: engines POST, engine_fields POST, queues PATCH (engine omitted), then `relink queues/1-inbox-sorting [engine]` lines; **no** `Invalid hyperlink` 400. If any relink fails, it is reported in one aggregated fail-loud error (apply-all-then-fail-loud).
 
 - [ ] **Step 3: Idempotency**
 
-Run: `rdc sync test-mtr` (again)
+Run: `rdc sync test` (again)
 Expected: no pushes/relinks — every object `Clean` (the relink + `portabilize_refs` post-pass recorded matching hashes).
 
 - [ ] **Step 4: Clean up any throwaway verification objects** and record results in the `project-engine-queue-cycle` memory.
