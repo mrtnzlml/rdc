@@ -664,6 +664,14 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn patch_value_refuses_unresolved_ref_before_network() {
+        let client = RossumClient::new("https://example.invalid/api/v1".to_string(), "t".to_string()).unwrap();
+        let body = json!({ "engine": "rdc://engines/missing" });
+        let err = client.patch_value("/queues/1", &body, None).await.unwrap_err();
+        assert!(format!("{err:#}").contains("rdc://engines/missing"), "got: {err:#}");
+    }
+
     /// Integration: the PATCH choke point serialises the typed `Queue` (whose
     /// `engine` lives in the flattened `extra`) and must catch the residual
     /// ref there — this is the exact path that shipped the bad value in the
