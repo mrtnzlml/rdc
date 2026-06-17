@@ -12,8 +12,8 @@ three-way merge has an unambiguous answer (mirror the env's deletion locally)
 — so the prompt is pure noise. Real-world trigger: deleting one engine on an
 env produces one prompt per engine field.
 
-Verified instance: `envs/dev-ap/engines/mtr-training/fields/item-code.json`
-in the ferguson project — local canonical hash `e15a7c56…` equals the
+Verified instance: `envs/staging/engines/default-training/fields/item-code.json`
+in the acme project — local canonical hash `e15a7c56…` equals the
 lockfile base hash exactly, so the item classified as pure `RemoteDelete`,
 yet sync prompted.
 
@@ -47,7 +47,7 @@ recoverable.
 | MDH orphan, `indexes.json` modified | bypasses classifier | prompt | prompt (unchanged) |
 
 The auto path always emits a visible per-item `Action::Delete` event,
-e.g. `engines/mtr-training/fields/item-code.json (deleted on dev-ap)` —
+e.g. `engines/default-training/fields/item-code.json (deleted on staging)` —
 no question asked, but never invisible.
 
 ## Implementation (Approach A: auto-resolve in the resolver)

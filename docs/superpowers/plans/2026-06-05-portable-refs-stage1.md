@@ -57,7 +57,7 @@ mod tests {
     fn parse_rdc_ref_splits_kind_and_slug() {
         assert_eq!(parse_rdc_ref("rdc://queues/invoices"), Some(("queues", "invoices")));
         // composite slug (engine_fields, email_templates): kind = first segment, slug = remainder
-        assert_eq!(parse_rdc_ref("rdc://engine_fields/mtr/code"), Some(("engine_fields", "mtr/code")));
+        assert_eq!(parse_rdc_ref("rdc://engine_fields/default/code"), Some(("engine_fields", "default/code")));
         assert_eq!(parse_rdc_ref("https://x.rossum.app/api/v1/queues/1"), None);
         assert_eq!(parse_rdc_ref("not a ref"), None);
         assert_eq!(parse_rdc_ref("rdc://queues"), None); // no slug
@@ -220,7 +220,7 @@ Add to the `tests` module in `src/snapshot/refs.rs`:
 
     #[test]
     fn url_round_trips_through_rdc() {
-        let url = "https://ferguson-dev.rossum.app/api/v1/workspaces/1054061";
+        let url = "https://acme-dev.rossum.app/api/v1/workspaces/1054061";
         let lf = lf_with("workspaces", "demo", 1054061, url);
         let rdc = url_to_rdc(url, &lf).unwrap();
         assert_eq!(rdc, "rdc://workspaces/demo");
@@ -229,10 +229,10 @@ Add to the `tests` module in `src/snapshot/refs.rs`:
 
     #[test]
     fn organization_and_unknown_urls_are_left_as_urls() {
-        let org = "https://ferguson-dev.rossum.app/api/v1/organizations/418975";
+        let org = "https://acme-dev.rossum.app/api/v1/organizations/418975";
         let mut lf = lf_with("organization", "self", 418975, org);
         // a user URL not tracked at all
-        let user = "https://ferguson-dev.rossum.app/api/v1/users/499604";
+        let user = "https://acme-dev.rossum.app/api/v1/users/499604";
         assert_eq!(url_to_rdc(org, &lf), None);   // organization is not portable
         assert_eq!(url_to_rdc(user, &lf), None);  // not in lockfile
         // nested + array conversion only touches portable refs
@@ -731,22 +731,22 @@ Run: `cargo build --release`
 
 ```bash
 # Copy a real project to a scratch dir so the original is untouched.
-cp -R /Users/martin.zlamal@rossum.ai/Work/gitlab.rossum.cloud/ferguson/ferguson-us2-rdc /tmp/rdc-portable-verify
+cp -R /path/to/acme-rdc /tmp/rdc-portable-verify
 cd /tmp/rdc-portable-verify
-# Pull dev-mtr with the freshly built binary (NOT the Homebrew rdc — use the absolute path).
-/Users/martin.zlamal@rossum.ai/Work/github.com/mrtnzlml/rdc/target/release/rdc sync dev-mtr   # provide a valid token when prompted
+# Pull dev with the freshly built binary (NOT the Homebrew rdc — use the absolute path).
+/Users/martin.zlamal@rossum.ai/Work/github.com/mrtnzlml/rdc/target/release/rdc sync dev   # provide a valid token when prompted
 ```
 
 - [ ] **Step 3: Confirm the three properties**
 
 ```bash
 # (a) snapshot now stores rdc:// refs, no raw /api/v1/ object URLs in queue/hook bodies
-grep -rl 'rdc://' envs/dev-mtr/workspaces | head
-grep -rn '"workspace": "https' envs/dev-mtr/workspaces || echo "no raw workspace URLs ✓"
+grep -rl 'rdc://' envs/dev/workspaces | head
+grep -rn '"workspace": "https' envs/dev/workspaces || echo "no raw workspace URLs ✓"
 # (b) a second pull is a no-op (Clean) — run sync again, expect "up to date" / no drift
-/Users/.../target/release/rdc sync dev-mtr
+/Users/.../target/release/rdc sync dev
 # (c) (read-only) deploy --dry-run still produces a plan without panicking
-/Users/.../target/release/rdc deploy dev-mtr test-mtr --dry-run | tail
+/Users/.../target/release/rdc deploy dev test --dry-run | tail
 ```
 
 Expected: (a) refs are `rdc://`; (b) second pull reports no changes (rebaseline holds); (c) deploy dry-run still runs.
@@ -755,7 +755,7 @@ Expected: (a) refs are `rdc://`; (b) second pull reports no changes (rebaseline 
 
 ```bash
 cd /Users/martin.zlamal@rossum.ai/Work/github.com/mrtnzlml/rdc
-git commit --allow-empty -m "verify(portable-refs): live dev-mtr pull writes rdc://, idempotent, deploy dry-run OK"
+git commit --allow-empty -m "verify(portable-refs): live dev pull writes rdc://, idempotent, deploy dry-run OK"
 ```
 
 ---

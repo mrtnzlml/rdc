@@ -959,7 +959,7 @@ mod tests {
             "workspaces/main/queues/inv/formulas/__pycache__/f.cpython-312.pyc",
             "hooks/.DS_Store",
             // Sync shadow artifact (must stay skipped):
-            "hooks/extractor.json.test-mtr",
+            "hooks/extractor.json.test",
         ];
         for rel in managed.iter().chain(non_managed.iter()) {
             let p = root.join(rel);
@@ -967,7 +967,7 @@ mod tests {
             fs::write(&p, b"x").unwrap();
         }
 
-        let got: BTreeSet<String> = enumerate_files(root, "test-mtr")
+        let got: BTreeSet<String> = enumerate_files(root, "test")
             .unwrap()
             .into_iter()
             .map(|p| p.to_string_lossy().replace('\\', "/"))

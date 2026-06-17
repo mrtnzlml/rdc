@@ -49,7 +49,7 @@ An internal cross-reference is serialized on disk as the URI `rdc://<kind>/<slug
   "name": "Invoices",
   "workspace": "rdc://workspaces/demo",
   "schema":    "rdc://schemas/cost-invoices",
-  "engine":    "rdc://engines/mtr-training"
+  "engine":    "rdc://engines/default-training"
 }
 ```
 
@@ -148,7 +148,7 @@ To carry the `rdc://` philosophy through the lockfile (no stored env-specific UR
 - `segment(kind)` is identity for every kind except `organization → organizations`.
 - The env `api_base` is threaded into these methods from the env config (already available at every call site).
 
-**Verified empirically** (dev-mtr lockfile, 100 entries): 99 satisfy `url == api_base + "/" + kind + "/" + id` exactly, with a single host; the only exception is `organization` (lockfile key singular, URL path `organizations/` plural — absorbed by `segment()`); MDH (`mdh_indexes`) entries carry no `/api/v1/` URL and no `rdc://` refs, so they are unaffected. Derivation is therefore reliable.
+**Verified empirically** (dev lockfile, 100 entries): 99 satisfy `url == api_base + "/" + kind + "/" + id` exactly, with a single host; the only exception is `organization` (lockfile key singular, URL path `organizations/` plural — absorbed by `segment()`); MDH (`mdh_indexes`) entries carry no `/api/v1/` URL and no `rdc://` refs, so they are unaffected. Derivation is therefore reliable.
 
 This is a lockfile **format change, v2 → v3**: `load` ignores any legacy `url`; `save` omits it. The existing version gate then makes an old (v2-only) rdc refuse a v3 lockfile with a *"run `rdc upgrade`"* message rather than silently mis-resolving references — the correct behavior, since URL resolution now lives in the binary, not the file.
 
@@ -160,10 +160,10 @@ The env-pair mapping (`.rdc/map/<src>-to-<tgt>.toml`) records the src↔tgt slug
 version = 2
 
 [refs]
-"rdc://engines/mtr-training"            = "rdc://engines/mtr-training"
-"rdc://engine_fields/mtr-training/code" = "rdc://engine_fields/mtr-training/code"
+"rdc://engines/default-training"            = "rdc://engines/default-training"
+"rdc://engine_fields/default-training/code" = "rdc://engine_fields/default-training/code"
 "rdc://queues/exceptions"               = "rdc://queues/exceptions-renamed"
-"rdc://workspaces/ferguson-mtr"         = "rdc://workspaces/ferguson-mtr"
+"rdc://workspaces/acme-sales"         = "rdc://workspaces/acme-sales"
 
 [hook_templates]   # external (hook_template is not a deployable kind → no slug)
 "https://src.rossum.app/api/v1/hook_templates/33" = "https://tgt.rossum.app/api/v1/hook_templates/33"
