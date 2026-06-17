@@ -486,6 +486,12 @@ impl RossumClient {
         TBody: serde::Serialize,
         TResp: serde::de::DeserializeOwned,
     {
+        // Guard before any network call: a typed body's `extra` (e.g. queue
+        // `engine`, engine `training_queues`) can still carry an unresolved
+        // `rdc://` ref. Serialise once and refuse rather than ship it.
+        let body_value =
+            serde_json::to_value(body).context("serializing PATCH body for portable-ref check")?;
+        ensure_no_residual_refs(path, &body_value)?;
         let url = format!("{}{}", self.base_url, path);
         let resp = retry::send_with_retry(
             || self.http
@@ -512,6 +518,9 @@ impl RossumClient {
     where
         TResp: serde::de::DeserializeOwned,
     {
+        // Guard before any network call: never ship an unresolved `rdc://`
+        // portable ref (it 400s opaquely as "Invalid hyperlink - No URL match").
+        ensure_no_residual_refs(path, body)?;
         let url = format!("{}{}", self.base_url, path);
         let resp = retry::send_with_retry(
             || self.http
@@ -577,4 +586,107 @@ pub async fn login(api_base: &str, username: &str, password: &str) -> Result<Str
         .await
         .with_context(|| format!("decoding login response from {url}"))?;
     Ok(parsed.key)
+}
+
+/// Fail-loud guard run on every outbound POST/PATCH body. A body that still
+/// contains an `rdc://<kind>/<slug>` portable reference is one whose push-side
+/// resolution ([`crate::snapshot::refs::resolve_value`]) could not rewrite the
+/// ref to an env URL — the target object's slug isn't in the lockfile yet.
+/// Sent verbatim, the Rossum API parses `rdc://…` as a URL whose path matches
+/// no object and returns the opaque `400 {"engine":["Invalid hyperlink - No URL
+/// match."]}`. Refusing here turns that into a precise, actionable error that
+/// names the request and the offending ref(s) instead of leaking a dangling
+/// reference onto the wire.
+fn ensure_no_residual_refs(path: &str, body: &serde_json::Value) -> Result<()> {
+    let refs = crate::snapshot::refs::residual_rdc_refs(body);
+    if refs.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to send {path}: body still contains unresolved portable reference(s) [{}]. \
+         The referenced object(s) are not present in this environment yet (their slugs are \
+         absent from the lockfile), so the Rossum API would reject the link with \
+         \"Invalid hyperlink - No URL match\". This is the engine\u{2194}queue create-time cycle: \
+         rdc pushes queues before engines, so a queue pointing at a not-yet-created engine \
+         cannot resolve. Create or sync the referenced object first (or remove the reference), \
+         then re-run.",
+        refs.join(", ")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn ensure_no_residual_refs_errors_naming_every_ref_and_the_path() {
+        let body = json!({
+            "name": "1. Inbox & Sorting",
+            "engine": "rdc://engines/1-inbox-sorting-mtr",
+            "schema": "https://x.rossum.app/api/v1/schemas/5",
+        });
+        let err = ensure_no_residual_refs("/queues/2860440", &body).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("rdc://engines/1-inbox-sorting-mtr"),
+            "error must name the unresolved ref: {msg}"
+        );
+        assert!(
+            msg.contains("/queues/2860440"),
+            "error must name the request path: {msg}"
+        );
+    }
+
+    #[test]
+    fn ensure_no_residual_refs_ok_for_fully_resolved_body() {
+        let body = json!({
+            "name": "Q",
+            "engine": "https://x.rossum.app/api/v1/engines/383",
+        });
+        assert!(ensure_no_residual_refs("/queues/1", &body).is_ok());
+    }
+
+    /// Integration: the POST choke point must refuse a body whose `engine`
+    /// is still an unresolved `rdc://` ref — BEFORE any network call (the
+    /// base URL is non-routable; the guard fires first, so this is fast).
+    #[tokio::test]
+    async fn create_queue_refuses_unresolved_engine_ref() {
+        let client =
+            RossumClient::new("https://example.invalid/api/v1".to_string(), "t".to_string())
+                .unwrap();
+        let body = json!({ "name": "Q", "engine": "rdc://engines/missing-engine" });
+        let err = client.create_queue(&body, None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("rdc://engines/missing-engine"),
+            "POST guard must name the ref: {msg}"
+        );
+    }
+
+    /// Integration: the PATCH choke point serialises the typed `Queue` (whose
+    /// `engine` lives in the flattened `extra`) and must catch the residual
+    /// ref there — this is the exact path that shipped the bad value in the
+    /// reported `PATCH /queues/2860440` failure.
+    #[tokio::test]
+    async fn update_queue_refuses_unresolved_engine_ref_in_extra() {
+        let client =
+            RossumClient::new("https://example.invalid/api/v1".to_string(), "t".to_string())
+                .unwrap();
+        let queue: Queue = serde_json::from_value(json!({
+            "id": 2860440,
+            "url": "",
+            "name": "1. Inbox & Sorting",
+            "workspace": null,
+            "schema": null,
+            "engine": "rdc://engines/1-inbox-sorting-mtr"
+        }))
+        .unwrap();
+        let err = client.update_queue(2860440, &queue, None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("rdc://engines/1-inbox-sorting-mtr"),
+            "PATCH guard must name the ref from extra: {msg}"
+        );
+    }
 }
