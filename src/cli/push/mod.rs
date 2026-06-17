@@ -40,6 +40,7 @@ pub(crate) async fn push_classified(
     interactive: bool,
     changes: &scan::ChangeList,
     catalog_hooks: &[crate::model::Hook],
+    relink: &mut Vec<relink::DeferredRelink>,
     progress: &Arc<Log>,
 ) -> Result<()> {
     if !changes.workspaces.is_empty() {
@@ -51,7 +52,7 @@ pub(crate) async fn push_classified(
             .with_context(|| format!("pushing schemas for env '{env}'"))?;
     }
     if !changes.queues.is_empty() {
-        queues::push(paths, client, lockfile, interactive, &changes.queues, progress, env).await
+        queues::push(paths, client, lockfile, interactive, &changes.queues, relink, progress, env).await
             .with_context(|| format!("pushing queues for env '{env}'"))?;
     }
     if !changes.inboxes.is_empty() {
@@ -79,7 +80,7 @@ pub(crate) async fn push_classified(
             .with_context(|| format!("pushing labels for env '{env}'"))?;
     }
     if !changes.engines.is_empty() {
-        engines::push(paths, client, lockfile, interactive, &changes.engines, progress, env).await
+        engines::push(paths, client, lockfile, interactive, &changes.engines, relink, progress, env).await
             .with_context(|| format!("pushing engines for env '{env}'"))?;
     }
     if !changes.engine_fields.is_empty() {
