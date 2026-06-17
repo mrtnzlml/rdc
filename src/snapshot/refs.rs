@@ -91,6 +91,45 @@ pub fn resolve_value(value: &mut Value, lockfile: &Lockfile) {
     });
 }
 
+/// Recursively apply `f` to every string leaf in a JSON tree, read-only.
+/// The immutable mirror of [`walk_strings_mut`] (object keys are not visited).
+pub fn walk_strings(value: &Value, f: &mut dyn FnMut(&str)) {
+    match value {
+        Value::String(s) => f(s),
+        Value::Array(items) => {
+            for item in items {
+                walk_strings(item, f);
+            }
+        }
+        Value::Object(map) => {
+            for (_k, v) in map.iter() {
+                walk_strings(v, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect every `rdc://` portable reference still present in `value`, sorted
+/// and de-duplicated. After [`resolve_value`] has run, the only refs that
+/// remain are *dangling* — their target slug isn't in the lockfile, so they
+/// could not be rewritten to an env URL. A non-empty result means the body is
+/// NOT safe to send: the Rossum API parses an `rdc://…` value as a URL whose
+/// path matches no object and rejects it with `"Invalid hyperlink - No URL
+/// match."`. Callers use this to fail loud (naming the ref) instead of letting
+/// that opaque 400 surface mid-push.
+pub fn residual_rdc_refs(value: &Value) -> Vec<String> {
+    let mut refs = Vec::new();
+    walk_strings(value, &mut |s| {
+        if parse_rdc_ref(s).is_some() {
+            refs.push(s.to_string());
+        }
+    });
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +235,39 @@ mod tests {
         assert_eq!(v["queue"], url);
         assert_eq!(v["other"], "rdc://queues/unknown-slug");
         assert_eq!(v["plain"], "https://example.com/");
+    }
+
+    #[test]
+    fn residual_rdc_refs_finds_every_unresolved_ref_deduped_and_sorted() {
+        // A body that has already been through `resolve_value`: resolvable
+        // refs are now env URLs, only the dangling ones survive as `rdc://`.
+        let v = serde_json::json!({
+            "engine": "rdc://engines/1-intake-triage-ops",          // dangling
+            "schema": "https://example.rossum.app/api/v1/schemas/5", // resolved
+            "training_queues": [
+                "https://example.rossum.app/api/v1/queues/555325",   // resolved
+                "rdc://queues/2-paper-and-toner-ops-legacy",        // dangling
+                "rdc://queues/2-paper-and-toner-ops-legacy",        // dup of above
+            ],
+            "plain": "not a ref",
+            "nested": { "deep": "rdc://engines/1-intake-triage-ops" } // dup, nested
+        });
+        assert_eq!(
+            residual_rdc_refs(&v),
+            vec![
+                "rdc://engines/1-intake-triage-ops".to_string(),
+                "rdc://queues/2-paper-and-toner-ops-legacy".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn residual_rdc_refs_empty_for_fully_resolved_body() {
+        let v = serde_json::json!({
+            "engine": "https://example.rossum.app/api/v1/engines/383",
+            "name": "Intake & Triage",
+            "settings": { "x": 1 },
+        });
+        assert!(residual_rdc_refs(&v).is_empty());
     }
 }
