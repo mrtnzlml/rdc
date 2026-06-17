@@ -609,3 +609,113 @@ fn migrate_overlay_shadow_replaces_formula_sidecar() {
         "shadow content must replace the source formula"
     );
 }
+
+#[test]
+fn migrate_overlay_shadow_replaces_hook_and_rule_code_and_leaves_others() {
+    let project = init_two_env_project();
+    let root = project.path();
+    let test_root = root.join("envs/test");
+
+    // Two hooks (one shadowed, one not) + a rule (shadowed).
+    write(&test_root.join("hooks/extractor.json"), &serde_json::json!({ "name": "Extractor", "type": "function" }));
+    std::fs::write(test_root.join("hooks/extractor.py"), b"def f(p):\n    return 'src'\n").unwrap();
+    write(&test_root.join("hooks/other.json"), &serde_json::json!({ "name": "Other", "type": "function" }));
+    std::fs::write(test_root.join("hooks/other.py"), b"def g(p):\n    return 'keep'\n").unwrap();
+    write(&test_root.join("rules/r1.json"), &serde_json::json!({ "name": "R1" }));
+    std::fs::write(test_root.join("rules/r1.py"), b"src_condition\n").unwrap();
+
+    // Shadows for the hook + the rule only.
+    let ov = root.join("envs/prod/overlay");
+    std::fs::create_dir_all(ov.join("hooks")).unwrap();
+    std::fs::create_dir_all(ov.join("rules")).unwrap();
+    std::fs::write(ov.join("hooks/extractor.py"), b"def f(p):\n    return 'prod'\n").unwrap();
+    std::fs::write(ov.join("rules/r1.py"), b"prod_condition\n").unwrap();
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![]);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("migrate should succeed");
+
+    let prod = root.join("envs/prod");
+    assert_eq!(std::fs::read_to_string(prod.join("hooks/extractor.py")).unwrap(), "def f(p):\n    return 'prod'\n");
+    assert_eq!(std::fs::read_to_string(prod.join("rules/r1.py")).unwrap(), "prod_condition\n");
+    // Un-shadowed sidecar is copied from source verbatim.
+    assert_eq!(std::fs::read_to_string(prod.join("hooks/other.py")).unwrap(), "def g(p):\n    return 'keep'\n");
+}
+
+#[test]
+fn migrate_overlay_dangling_shadow_is_a_hard_error_and_writes_nothing() {
+    let project = init_two_env_project();
+    let root = project.path();
+    let test_root = root.join("envs/test");
+    write(&test_root.join("hooks/extractor.json"), &serde_json::json!({ "name": "Extractor", "type": "function" }));
+    std::fs::write(test_root.join("hooks/extractor.py"), b"x\n").unwrap();
+
+    // Shadow for a hook that does not exist in the source.
+    let ov = root.join("envs/prod/overlay/hooks");
+    std::fs::create_dir_all(&ov).unwrap();
+    std::fs::write(ov.join("ghost.py"), b"x\n").unwrap();
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![]);
+    std::env::set_current_dir(&prev).unwrap();
+
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("hooks/ghost.py"), "error names the offending shadow: {err}");
+    // Fail-fast: no target sidecar was written.
+    assert!(!root.join("envs/prod/hooks/extractor.py").exists(), "must not write before validating");
+}
+
+#[test]
+fn migrate_overlay_json_shadow_is_rejected() {
+    let project = init_two_env_project();
+    let root = project.path();
+    let test_root = root.join("envs/test");
+    write(&test_root.join("hooks/extractor.json"), &serde_json::json!({ "name": "Extractor", "type": "function" }));
+    std::fs::write(test_root.join("hooks/extractor.py"), b"x\n").unwrap();
+
+    // A JSON shadow — out of scope (JSON is overlay.toml's job).
+    let ov = root.join("envs/prod/overlay/hooks");
+    std::fs::create_dir_all(&ov).unwrap();
+    std::fs::write(ov.join("extractor.json"), b"{}\n").unwrap();
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![]);
+    std::env::set_current_dir(&prev).unwrap();
+
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("hooks/extractor.json"), "json shadow is rejected: {err}");
+}
+
+#[test]
+fn migrate_overlay_only_excluded_shadow_does_not_error() {
+    let project = init_two_env_project();
+    let root = project.path();
+    let test_root = root.join("envs/test");
+    write(&test_root.join("hooks/a.json"), &serde_json::json!({ "name": "A", "type": "function" }));
+    std::fs::write(test_root.join("hooks/a.py"), b"a\n").unwrap();
+    write(&test_root.join("hooks/b.json"), &serde_json::json!({ "name": "B", "type": "function" }));
+    std::fs::write(test_root.join("hooks/b.py"), b"b\n").unwrap();
+
+    // Valid shadow for hooks/b, but this run scopes to hooks/a via --only.
+    let ov = root.join("envs/prod/overlay/hooks");
+    std::fs::create_dir_all(&ov).unwrap();
+    std::fs::write(ov.join("b.py"), b"b-prod\n").unwrap();
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec!["hooks/a".to_string()]);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("a valid shadow for an --only-excluded sidecar must not error");
+
+    let prod = root.join("envs/prod");
+    assert!(prod.join("hooks/a.json").exists(), "selected object migrated");
+    assert!(!prod.join("hooks/b.json").exists(), "excluded object not migrated");
+}
