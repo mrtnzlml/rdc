@@ -177,6 +177,11 @@ pub enum Command {
     /// `git diff` and run `rdc sync <tgt>` to push them (sync creates objects
     /// in dependency order). This replaces the remote half of `rdc deploy`
     /// with an offline, reviewable file transform.
+    ///
+    /// Per-env code overrides: a file at `envs/<tgt>/overlay/<relpath>` replaces
+    /// the migrated code/formula sidecar at `<relpath>` (hook/rule `.py`/`.js` or
+    /// a queue's `formulas/<field>.py`). A shadow that overrides no source
+    /// sidecar aborts the migration. Requires rdc >= the release that ships this.
     Migrate {
         /// Source environment (e.g. `test`). Picks interactively when omitted.
         #[arg(add = ArgValueCandidates::new(env_name_candidates))]
