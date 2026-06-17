@@ -190,6 +190,37 @@ fn list_overlay_files(overlay_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+/// Validate the target env's `overlay/` shadow directory. Every file under it
+/// must mirror a code/formula sidecar that migrating the source produces in the
+/// target — i.e. its relpath must be in `produced` (the full source enumeration
+/// remapped to target paths, filtered to sidecars, independent of `--only`). A
+/// shadow that overwrites nothing — a typo, a stale path, a `.json`, or a
+/// sidecar absent from the source — is a hard error naming the offending files.
+/// Run BEFORE any target file is written so the migration aborts cleanly.
+fn validate_overlay_dir(
+    overlay_dir: &Path,
+    produced: &std::collections::BTreeSet<PathBuf>,
+) -> Result<()> {
+    let offenders: Vec<PathBuf> = list_overlay_files(overlay_dir)?
+        .into_iter()
+        .filter(|rel| !produced.contains(rel))
+        .collect();
+    if !offenders.is_empty() {
+        let list = offenders
+            .iter()
+            .map(|p| format!("  - overlay/{}", p.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        anyhow::bail!(
+            "overlay/ contains shadow file(s) that overwrite no source code/formula sidecar:\n\
+             {list}\n\
+             Each file under envs/<env>/overlay/ must mirror a sidecar produced by migrating the \
+             source (a hook/rule .py/.js, or a queue's formulas/<field>.py). Fix the path or remove it."
+        );
+    }
+    Ok(())
+}
+
 fn classify_workspace(comps: &[String]) -> Option<(&'static str, String)> {
     let ws = comps.get(1)?;
     let leaf = comps.last()?;
@@ -1288,6 +1319,55 @@ mod tests {
             code,
             ".py is copied verbatim — no ref substitution inside code"
         );
+    }
+
+    #[test]
+    fn validate_overlay_dir_ok_when_all_files_match_produced() {
+        use std::fs;
+        let dir = tempfile::TempDir::new().unwrap();
+        let ov = dir.path();
+        fs::create_dir_all(ov.join("hooks")).unwrap();
+        fs::write(ov.join("hooks/extractor.py"), b"x").unwrap();
+
+        let produced: std::collections::BTreeSet<PathBuf> =
+            [PathBuf::from("hooks/extractor.py")].into_iter().collect();
+        assert!(validate_overlay_dir(ov, &produced).is_ok());
+    }
+
+    #[test]
+    fn validate_overlay_dir_errors_on_dangling_shadow() {
+        use std::fs;
+        let dir = tempfile::TempDir::new().unwrap();
+        let ov = dir.path();
+        fs::create_dir_all(ov.join("hooks")).unwrap();
+        fs::write(ov.join("hooks/ghost.py"), b"x").unwrap();
+
+        let produced: std::collections::BTreeSet<PathBuf> =
+            [PathBuf::from("hooks/extractor.py")].into_iter().collect();
+        let err = validate_overlay_dir(ov, &produced).unwrap_err().to_string();
+        assert!(err.contains("hooks/ghost.py"), "names the offending file: {err}");
+    }
+
+    #[test]
+    fn validate_overlay_dir_errors_on_json_shadow() {
+        use std::fs;
+        let dir = tempfile::TempDir::new().unwrap();
+        let ov = dir.path();
+        fs::create_dir_all(ov.join("hooks")).unwrap();
+        fs::write(ov.join("hooks/extractor.json"), b"{}").unwrap();
+
+        // `produced` is sidecars only — JSON is never in it.
+        let produced: std::collections::BTreeSet<PathBuf> =
+            [PathBuf::from("hooks/extractor.py")].into_iter().collect();
+        let err = validate_overlay_dir(ov, &produced).unwrap_err().to_string();
+        assert!(err.contains("hooks/extractor.json"), "names the json file: {err}");
+    }
+
+    #[test]
+    fn validate_overlay_dir_ok_when_dir_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let produced = std::collections::BTreeSet::new();
+        assert!(validate_overlay_dir(&dir.path().join("overlay"), &produced).is_ok());
     }
 
     #[test]
