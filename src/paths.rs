@@ -6,6 +6,11 @@
 
 use std::path::{Path, PathBuf};
 
+/// Name of the per-env shadow-override directory (`envs/<env>/overlay/`),
+/// sibling of `overlay.toml`. Files under it shadow code/formula sidecars
+/// during `rdc migrate`.
+pub(crate) const OVERLAY_DIR: &str = "overlay";
+
 /// Bundle of paths derived from a project root and an environment name.
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -80,6 +85,12 @@ impl Paths {
     /// `<root>/envs/<env>/overlay.toml`
     pub fn overlay_file(&self) -> PathBuf {
         self.env_root().join("overlay.toml")
+    }
+
+    /// `<root>/envs/<env>/overlay/` — shadow-override directory. Files mirror
+    /// the snapshot tree and replace code/formula sidecars during `migrate`.
+    pub fn overlay_dir(&self) -> PathBuf {
+        self.env_root().join(OVERLAY_DIR)
     }
 
     /// `<root>/.rdc/map/`
@@ -279,6 +290,11 @@ mod tests {
     #[test]
     fn overlay_file_path() {
         assert_eq!(p().overlay_file(), Path::new("/proj/envs/dev/overlay.toml"));
+    }
+
+    #[test]
+    fn overlay_dir_path() {
+        assert_eq!(p().overlay_dir(), Path::new("/proj/envs/dev/overlay"));
     }
 
     #[test]
