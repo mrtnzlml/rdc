@@ -10,6 +10,9 @@
 //! 3. substitute `rdc://<kind>/<src_slug>` → `rdc://<kind>/<tgt_slug>` in
 //!    file contents (identity for same-slug auto-matched pairs),
 //! 4. apply the target env's overlay to each object.
+//! 5. replace a code/formula sidecar's content when the target env carries a
+//!    shadow file at `envs/<tgt>/overlay/<same-relpath>` (whole-file override;
+//!    a shadow that mirrors no source sidecar is a hard error).
 //!
 //! Afterwards the user reviews `git diff` and runs `rdc sync <tgt>` to push.
 //! `rdc deploy` is untouched; `migrate` is added alongside it.
