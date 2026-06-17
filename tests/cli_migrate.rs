@@ -719,3 +719,92 @@ fn migrate_overlay_only_excluded_shadow_does_not_error() {
     assert!(prod.join("hooks/a.json").exists(), "selected object migrated");
     assert!(!prod.join("hooks/b.json").exists(), "excluded object not migrated");
 }
+
+/// Promotion case: the workspace/queue slugs are renamed, so the shadow lives
+/// at the REMAPPED (target) path. Both `produced_sidecars` and the shadow
+/// lookup key off `remap_relative`, so the override must apply at the renamed
+/// path — the most error-prone real-world scenario.
+#[test]
+fn migrate_overlay_shadow_applies_at_renamed_target_path() {
+    let project = init_two_env_project();
+    let root = project.path();
+    let test_root = root.join("envs/test");
+
+    write(
+        &test_root.join("workspaces/main/workspace.json"),
+        &serde_json::json!({ "name": "Main" }),
+    );
+    write(
+        &test_root.join("workspaces/main/queues/invoices/queue.json"),
+        &serde_json::json!({ "name": "Invoices" }),
+    );
+    write(
+        &test_root.join("workspaces/main/queues/invoices/schema.json"),
+        &serde_json::json!({ "name": "S", "content": [] }),
+    );
+    let src_formula = test_root.join("workspaces/main/queues/invoices/formulas/export_path.py");
+    std::fs::create_dir_all(src_formula.parent().unwrap()).unwrap();
+    std::fs::write(&src_formula, b"\"/test/exports\"\n").unwrap();
+
+    // Rename main -> main-prod, invoices -> invoices-prod.
+    let map_dir = root.join(".rdc/map");
+    std::fs::create_dir_all(&map_dir).unwrap();
+    std::fs::write(
+        map_dir.join("test-to-prod.toml"),
+        "version = 1\n\n[workspaces]\n\"main\" = \"main-prod\"\n\n[queues]\n\"invoices\" = \"invoices-prod\"\n\n[schemas]\n\"invoices\" = \"invoices-prod\"\n",
+    )
+    .unwrap();
+
+    // Shadow placed at the REMAPPED (target) path.
+    let shadow = root
+        .join("envs/prod/overlay/workspaces/main-prod/queues/invoices-prod/formulas/export_path.py");
+    std::fs::create_dir_all(shadow.parent().unwrap()).unwrap();
+    std::fs::write(&shadow, b"\"/prod/exports\"\n").unwrap();
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![]);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("migrate should succeed");
+
+    let prod_formula =
+        root.join("envs/prod/workspaces/main-prod/queues/invoices-prod/formulas/export_path.py");
+    assert_eq!(
+        std::fs::read_to_string(&prod_formula).unwrap(),
+        "\"/prod/exports\"\n",
+        "shadow at the remapped target path must be applied"
+    );
+}
+
+/// The shadow mechanism is extension-agnostic: a Node.js hook's `.js` sidecar
+/// is overridden just like a `.py` one.
+#[test]
+fn migrate_overlay_shadow_replaces_nodejs_hook_js_sidecar() {
+    let project = init_two_env_project();
+    let root = project.path();
+    let test_root = root.join("envs/test");
+
+    write(
+        &test_root.join("hooks/webhook.json"),
+        &serde_json::json!({ "name": "Webhook", "type": "function", "config": { "runtime": "nodejs20.x" } }),
+    );
+    std::fs::write(test_root.join("hooks/webhook.js"), b"// src\n").unwrap();
+
+    let shadow = root.join("envs/prod/overlay/hooks/webhook.js");
+    std::fs::create_dir_all(shadow.parent().unwrap()).unwrap();
+    std::fs::write(&shadow, b"// prod\n").unwrap();
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![]);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("migrate should succeed");
+
+    assert_eq!(
+        std::fs::read_to_string(root.join("envs/prod/hooks/webhook.js")).unwrap(),
+        "// prod\n",
+        "the .js hook sidecar shadow must be applied"
+    );
+}
