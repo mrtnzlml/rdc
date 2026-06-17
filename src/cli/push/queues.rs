@@ -16,6 +16,7 @@ pub async fn push(
     lockfile: &mut Lockfile,
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
+    relink: &mut Vec<crate::cli::push::relink::DeferredRelink>,
     progress: &Arc<Log>,
     env: &str,
 ) -> Result<(usize, usize)> {
@@ -40,7 +41,15 @@ pub async fn push(
                 .with_context(|| format!("reading {}", queue_path.display()))?;
             let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
                 .with_context(|| format!("parsing {}", queue_path.display()))?;
-            crate::snapshot::refs::resolve_value(&mut payload, lockfile);
+            let deferred = crate::snapshot::refs::resolve_value_deferring(&mut payload, lockfile);
+            if !deferred.is_empty() {
+                relink.push(crate::cli::push::relink::DeferredRelink {
+                    kind: "queues".to_string(),
+                    slug: q_slug.clone(),
+                    path: queue_path.clone(),
+                    fields: deferred,
+                });
+            }
             strip_for_create(&mut payload, "queues");
             let create_result = client
                 .create_queue(&payload, Some(progress.clone()))
@@ -88,7 +97,15 @@ pub async fn push(
 
         let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
             .with_context(|| format!("parsing {}", queue_path.display()))?;
-        crate::snapshot::refs::resolve_value(&mut payload, lockfile);
+        let deferred = crate::snapshot::refs::resolve_value_deferring(&mut payload, lockfile);
+        if !deferred.is_empty() {
+            relink.push(crate::cli::push::relink::DeferredRelink {
+                kind: "queues".to_string(),
+                slug: q_slug.clone(),
+                path: queue_path.clone(),
+                fields: deferred,
+            });
+        }
         let payload_queue: crate::model::Queue = serde_json::from_value(payload)
             .with_context(|| format!("deserializing overlay-applied queue '{q_slug}'"))?;
 
@@ -129,7 +146,15 @@ pub async fn push(
                     if let Some(bytes) = payload_override {
                         let mut ov: serde_json::Value = serde_json::from_slice(&bytes)
                             .with_context(|| format!("re-deserializing edited queue '{q_slug}'"))?;
-                        crate::snapshot::refs::resolve_value(&mut ov, lockfile);
+                        let deferred = crate::snapshot::refs::resolve_value_deferring(&mut ov, lockfile);
+                        if !deferred.is_empty() {
+                            relink.push(crate::cli::push::relink::DeferredRelink {
+                                kind: "queues".to_string(),
+                                slug: q_slug.clone(),
+                                path: queue_path.clone(),
+                                fields: deferred,
+                            });
+                        }
                         payload_to_send = serde_json::from_value(ov)
                             .with_context(|| format!("re-deserializing edited queue '{q_slug}'"))?;
                     }

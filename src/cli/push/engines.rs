@@ -16,6 +16,7 @@ pub async fn push(
     lockfile: &mut Lockfile,
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
+    relink: &mut Vec<crate::cli::push::relink::DeferredRelink>,
     progress: &Arc<Log>,
     env: &str,
 ) -> Result<(usize, usize)> {
@@ -37,13 +38,30 @@ pub async fn push(
                 std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
             let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
                 .with_context(|| format!("parsing {}", path.display()))?;
-            crate::snapshot::refs::resolve_value(&mut payload, lockfile);
+            let deferred = crate::snapshot::refs::resolve_value_deferring(&mut payload, lockfile);
+            if !deferred.is_empty() {
+                relink.push(crate::cli::push::relink::DeferredRelink {
+                    kind: "engines".to_string(),
+                    slug: slug.clone(),
+                    path: path.clone(),
+                    fields: deferred,
+                });
+            }
             strip_for_create(&mut payload, "engines");
             let create_result = client
                 .create_engine(&payload, Some(progress.clone()))
                 .await
                 .with_context(|| format!("POST /engines (creating '{slug}')"));
-            let created = create_result?;
+            let created = match create_result {
+                Ok(c) => c,
+                Err(e) if crate::api::anyhow_has_status(&e, 405) || crate::api::anyhow_has_status(&e, 403) => {
+                    let code = if crate::api::anyhow_has_status(&e, 403) { "403" } else { "405" };
+                    progress.event(Action::Skip, &format!("engine/{slug} (create {code} — engines not writable on this plan)"));
+                    skipped += 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             // Canonical on-disk bytes via KindCodec: redacts `agenda_id` and
             // strips hidden fields — matching exactly what pull produces.
             let codec = crate::snapshot::codec::codec("engines").unwrap();
@@ -85,7 +103,15 @@ pub async fn push(
 
         let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
             .with_context(|| format!("parsing {}", path.display()))?;
-        crate::snapshot::refs::resolve_value(&mut payload, lockfile);
+        let deferred = crate::snapshot::refs::resolve_value_deferring(&mut payload, lockfile);
+        if !deferred.is_empty() {
+            relink.push(crate::cli::push::relink::DeferredRelink {
+                kind: "engines".to_string(),
+                slug: slug.clone(),
+                path: path.clone(),
+                fields: deferred,
+            });
+        }
         let payload_engine: crate::model::Engine = serde_json::from_value(payload)
             .with_context(|| format!("deserializing overlay-applied engine '{slug}'"))?;
 
@@ -126,7 +152,15 @@ pub async fn push(
                     if let Some(bytes) = payload_override {
                         let mut ov: serde_json::Value = serde_json::from_slice(&bytes)
                             .with_context(|| format!("re-deserializing edited engine '{slug}'"))?;
-                        crate::snapshot::refs::resolve_value(&mut ov, lockfile);
+                        let deferred = crate::snapshot::refs::resolve_value_deferring(&mut ov, lockfile);
+                        if !deferred.is_empty() {
+                            relink.push(crate::cli::push::relink::DeferredRelink {
+                                kind: "engines".to_string(),
+                                slug: slug.clone(),
+                                path: path.clone(),
+                                fields: deferred,
+                            });
+                        }
                         payload_to_send = serde_json::from_value(ov)
                             .with_context(|| format!("re-deserializing edited engine '{slug}'"))?;
                     }

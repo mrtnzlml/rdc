@@ -3172,6 +3172,7 @@ pub async fn run(
         // empty change list is a no-op for every kind except hooks.
         {
             let env = ctx.paths.env().to_string();
+            let mut relink_items: Vec<crate::cli::push::relink::DeferredRelink> = Vec::new();
             crate::cli::push::push_classified(
                 ctx.paths,
                 ctx.client,
@@ -3180,9 +3181,24 @@ pub async fn run(
                 interactive,
                 &change_list,
                 &catalog.hooks,
+                &mut relink_items,
                 progress,
             )
             .await?;
+
+            if !relink_items.is_empty() {
+                let failures = crate::cli::push::relink::run_relink(
+                    ctx.paths, ctx.client, ctx.lockfile, &relink_items, progress,
+                )
+                .await?;
+                if !failures.is_empty() {
+                    anyhow::bail!(
+                        "deferred relink could not complete {} reference(s):\n  - {}",
+                        failures.len(),
+                        failures.join("\n  - ")
+                    );
+                }
+            }
         }
     }
 

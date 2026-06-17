@@ -12,6 +12,7 @@ use serde_json::{Map, Value};
 pub struct DeferredRelink {
     pub kind: String,
     pub slug: String,
+    pub path: std::path::PathBuf,
     pub fields: Vec<(String, Value)>,
 }
 
@@ -42,6 +43,74 @@ pub fn resolve_relink_body(
         unresolved.dedup();
         Err(unresolved)
     }
+}
+
+use crate::api::RossumClient;
+use crate::log::{Action, Log};
+use crate::paths::Paths;
+use crate::snapshot::codec::{codec, combined_hash};
+use anyhow::Result;
+use std::sync::Arc;
+
+/// PATCH every deferred cross-reference now that all objects exist. Applies all
+/// resolvable relinks; collects failures (unresolved refs OR API rejections)
+/// and returns them so the caller can fail loud after the whole pass.
+pub async fn run_relink(
+    paths: &Paths,
+    client: &RossumClient,
+    lockfile: &mut crate::state::Lockfile,
+    items: &[DeferredRelink],
+    progress: &Arc<Log>,
+) -> Result<Vec<String>> {
+    let mut failures = Vec::new();
+    for it in items {
+        let field_names: Vec<&String> = it.fields.iter().map(|(k, _)| k).collect();
+        let Some(entry) = lockfile.objects.get(&it.kind).and_then(|m| m.get(&it.slug)) else {
+            failures.push(format!(
+                "{}/{}: object missing in lockfile (its create was skipped/failed); cannot relink {:?}",
+                it.kind, it.slug, field_names
+            ));
+            continue;
+        };
+        let id = entry.id;
+        let body = match resolve_relink_body(&it.fields, lockfile) {
+            Ok(b) => b,
+            Err(unresolved) => {
+                failures.push(format!(
+                    "{}/{}: unresolved reference(s) {:?} — target object not present in this environment",
+                    it.kind, it.slug, unresolved
+                ));
+                continue;
+            }
+        };
+        let api_path = format!("/{}/{}", it.kind, id); // endpoint == kind for queues/engines
+        match client
+            .patch_value(&api_path, &Value::Object(body), Some(progress.clone()))
+            .await
+        {
+            Ok(updated) => {
+                // Post-write bookkeeping mirrors a normal push: rewrite the disk
+                // file + re-record the lockfile hash from the relinked object so
+                // the subsequent portabilize_refs post-pass (URL -> rdc://) lands
+                // on Clean.
+                if let Some(c) = codec(&it.kind) {
+                    let art = c.disk_bytes(&updated)?;
+                    let hash = combined_hash(&art.json, &art.sidecars, lockfile);
+                    crate::state::base_cache::write_disk_and_cache(paths, &it.path, &art.json)?;
+                    let modified_at = updated
+                        .get("modified_at")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    crate::cli::pull::common::record_object(
+                        lockfile, &it.kind, &it.slug, id, modified_at, Some(hash),
+                    );
+                }
+                progress.event(Action::Patch, &format!("relink {}/{} {:?}", it.kind, it.slug, field_names));
+            }
+            Err(e) => failures.push(format!("{}/{}: PATCH {} rejected: {e:#}", it.kind, it.slug, api_path)),
+        }
+    }
+    Ok(failures)
 }
 
 #[cfg(test)]
