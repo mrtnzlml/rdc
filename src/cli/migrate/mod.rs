@@ -144,6 +144,19 @@ fn classify_for_selection(rel: &Path) -> Option<(&'static str, String)> {
     }
 }
 
+/// True for a non-JSON code/formula sidecar leaf (`.py`/`.js`) that belongs to
+/// a hook, rule, or schema — the files `migrate` copies verbatim and that an
+/// `overlay/` shadow may replace. JSON objects are excluded (they are
+/// overlay-able through `overlay.toml`); non-sidecar code returns false.
+fn is_sidecar(rel: &Path) -> bool {
+    let is_json = rel
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    !is_json && classify_for_selection(rel).is_some()
+}
+
 fn classify_workspace(comps: &[String]) -> Option<(&'static str, String)> {
     let ws = comps.get(1)?;
     let leaf = comps.last()?;
@@ -1242,5 +1255,23 @@ mod tests {
             code,
             ".py is copied verbatim — no ref substitution inside code"
         );
+    }
+
+    #[test]
+    fn is_sidecar_matches_only_code_files() {
+        // Code/formula sidecars → true.
+        assert!(is_sidecar(Path::new("hooks/extractor.py")));
+        assert!(is_sidecar(Path::new("hooks/extractor.js")));
+        assert!(is_sidecar(Path::new("rules/r1.py")));
+        assert!(is_sidecar(Path::new(
+            "workspaces/main/queues/invoices/formulas/sftp_path.py"
+        )));
+        // JSON objects → false (overlay.toml handles those).
+        assert!(!is_sidecar(Path::new("hooks/extractor.json")));
+        assert!(!is_sidecar(Path::new(
+            "workspaces/main/queues/invoices/schema.json"
+        )));
+        // Non-sidecar code → false.
+        assert!(!is_sidecar(Path::new("workspaces/main/workspace.py")));
     }
 }
