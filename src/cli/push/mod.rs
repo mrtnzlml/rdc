@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use std::sync::Arc;
 
 pub mod deletes;
+pub mod relink;
 mod email_templates;
 mod engine_fields;
 mod engines;
