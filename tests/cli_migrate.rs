@@ -565,3 +565,47 @@ fn migrate_strips_identity_for_new_object() {
     );
     assert_eq!(h["name"], "Brand New", "content preserved for the create");
 }
+
+#[test]
+fn migrate_overlay_shadow_replaces_formula_sidecar() {
+    let project = init_two_env_project();
+    let root = project.path();
+    let test_root = root.join("envs/test");
+
+    write(
+        &test_root.join("workspaces/main/workspace.json"),
+        &serde_json::json!({ "name": "Main" }),
+    );
+    write(
+        &test_root.join("workspaces/main/queues/invoices/queue.json"),
+        &serde_json::json!({ "name": "Invoices" }),
+    );
+    write(
+        &test_root.join("workspaces/main/queues/invoices/schema.json"),
+        &serde_json::json!({ "name": "Invoices schema", "content": [] }),
+    );
+    let src_formula = test_root.join("workspaces/main/queues/invoices/formulas/sftp_path.py");
+    std::fs::create_dir_all(src_formula.parent().unwrap()).unwrap();
+    std::fs::write(&src_formula, b"\"/Test/path\"\n").unwrap();
+
+    // Shadow override for the prod env, mirroring the target tree.
+    let shadow =
+        root.join("envs/prod/overlay/workspaces/main/queues/invoices/formulas/sftp_path.py");
+    std::fs::create_dir_all(shadow.parent().unwrap()).unwrap();
+    std::fs::write(&shadow, b"\"/Prod/path\"\n").unwrap();
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![]);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("migrate should succeed");
+
+    let prod_formula =
+        root.join("envs/prod/workspaces/main/queues/invoices/formulas/sftp_path.py");
+    assert_eq!(
+        std::fs::read_to_string(&prod_formula).unwrap(),
+        "\"/Prod/path\"\n",
+        "shadow content must replace the source formula"
+    );
+}

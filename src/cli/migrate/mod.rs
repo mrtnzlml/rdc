@@ -298,7 +298,8 @@ fn transform_file(
     tgt_org_url: &str,
 ) -> Result<()> {
     let src_path = src_root.join(rel);
-    let dst_path = tgt_root.join(remap_relative(rel, mapping));
+    let dst_rel = remap_relative(rel, mapping);
+    let dst_path = tgt_root.join(&dst_rel);
 
     let is_json = rel
         .extension()
@@ -307,8 +308,16 @@ fn transform_file(
         .unwrap_or(false);
 
     if !is_json {
-        let bytes =
-            std::fs::read(&src_path).with_context(|| format!("reading {}", src_path.display()))?;
+        // Shadow override: a file at <env>/overlay/<dst_rel> replaces the source
+        // sidecar's content for this target env. `run` validates the overlay dir
+        // up-front, so any shadow present here mirrors a real source sidecar.
+        let shadow = tgt_root.join(crate::paths::OVERLAY_DIR).join(&dst_rel);
+        let bytes = if shadow.is_file() {
+            std::fs::read(&shadow)
+                .with_context(|| format!("reading overlay shadow {}", shadow.display()))?
+        } else {
+            std::fs::read(&src_path).with_context(|| format!("reading {}", src_path.display()))?
+        };
         crate::snapshot::writer::write_atomic(&dst_path, &bytes)?;
         return Ok(());
     }
@@ -635,6 +644,18 @@ pub fn run(src: &str, tgt: &str, mirror: bool, dry_run: bool, only: Vec<String>)
     );
 
     let files = enumerate_files(&src_root, src)?;
+
+    // Validate the target env's `overlay/` shadow dir before writing anything:
+    // every shadow must mirror a sidecar this migration produces. Built from the
+    // FULL source enumeration (not the `--only` subset), so scoping with `--only`
+    // never falsely flags a valid shadow it simply did not apply this run.
+    let produced_sidecars: std::collections::BTreeSet<PathBuf> = files
+        .iter()
+        .filter(|rel| is_sidecar(rel))
+        .map(|rel| remap_relative(rel, &mapping))
+        .collect();
+    validate_overlay_dir(&tgt_paths.overlay_dir(), &produced_sidecars)?;
+
     let mut copied = 0usize;
     let mut renamed = 0usize;
 
