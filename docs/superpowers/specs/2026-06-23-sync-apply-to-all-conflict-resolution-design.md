@@ -80,14 +80,20 @@ would be identical to `[k]`/`[r]`).
 Today the parser reads only the first char, **case-insensitively**: `K`→`k`,
 `R`→`r`, `S`→`s`, `A`→`a`, `E`→`e`, `H`→`h` (`src/cli/resolve.rs:301`).
 
-This design removes uppercase aliasing **only for `K` and `R`**, repurposing
-them as the all-variants. `e`/`h`/`s`/`a` retain their current case-insensitive
-behavior. Lowercase `k`/`r` behavior is **unchanged**.
+Uppercase `K`/`R` are repurposed as the all-variants **only when the bulk
+options are actually offered** — i.e. when more than one prompted conflict
+remains in the run. When the options are **not** offered (the last/only
+conflict, or a prompt that opted out such as MDH orphan pruning), `K`/`R`
+retain their existing case-insensitive single-item behavior. This means there
+is **zero behavior change** for any prompt that doesn't show `[K]`/`[R]`, and on
+the last conflict "all" would equal "this one" anyway. `e`/`h`/`s`/`a` always
+retain their current case-insensitive behavior. Lowercase `k`/`r` are
+**unchanged** everywhere.
 
 The bulk confirmation (default No) is the backstop: a habitual capital-letter
-typist who hits `K`/`R` by accident sees the confirmation and can decline,
-landing back on the per-file prompt — no silent behavior change in the
-dangerous direction.
+typist who hits `K`/`R` by accident while the options are shown sees the
+confirmation and can decline, landing back on the per-file prompt — no silent
+behavior change in the dangerous direction.
 
 ### Confirmation
 
@@ -130,11 +136,15 @@ Grounded in the current code:
   `KeepLocalAll` and `KeepRemoteAll`. No existing variant changes — additive at
   the type level.
 - **Prompt functions** (`prompt_resolve_with_bytes_and_color`,
-  `prompt_remote_delete_with_color`): take a flag/count indicating whether the
-  `[K]`/`[R]` options should be offered (i.e. whether >1 prompted conflict
-  remains in the run); parse `K`→`KeepLocalAll`, `R`→`KeepRemoteAll` only when
-  offered; otherwise treat them as unrecognized (reprompt) to avoid surprising
-  uppercase behavior when the options aren't shown.
+  `prompt_remote_delete_with_color`): take `bulk: Option<&BulkPrompt>` where
+  `BulkPrompt` carries the two confirmation summary strings (one per direction).
+  When `Some`, show `[K]`/`[R]`, and on `K`/`R` print the matching summary +
+  `Continue? [y/N]` (default No); a `y` returns `KeepLocalAll`/`KeepRemoteAll`,
+  anything else loops back to the main prompt. When `None`, the options are
+  hidden and `K`/`R` retain their existing single-item behavior (alias `k`/`r`)
+  — zero behavior change for non-opted-in callers (last conflict, MDH orphans).
+  The four existing wrappers forward `None`; the executor calls the core
+  functions directly to pass a real `BulkPrompt`.
 - **Sticky state**: a `BulkChoice` (`AllLocal` / `AllRemote`) carried as
   `Option<BulkChoice>`, owned by `execute::run` and threaded by `&mut` into
   **both** `resolve_conflicts(...)` (`src/cli/sync/execute.rs:81`, called at
@@ -153,7 +163,13 @@ Grounded in the current code:
 
 ## Edge cases
 
-- **Last / only conflict**: `[K]`/`[R]` are hidden; behaves exactly as today.
+- **Last / only conflict**: `[K]`/`[R]` are hidden and `K`/`R` behave exactly as
+  today (single-item `k`/`r`); "all" would equal "this one" anyway.
+- **Drifted `RemoteDelete`**: a `RemoteDelete` that lost its clean status (e.g. a
+  mid-run edit under `--watch`) falls through to the delete prompt. It is **not**
+  swept by the sticky and does **not** offer `[K]`/`[R]` — `RemoteDelete` stays
+  outside the bulk mechanism entirely. Only `LocalEditRemoteDelete` and
+  `LocalDeleteRemoteEdit` participate in the delete phase.
 - **Non-interactive (`--yes` or non-TTY)**: unchanged. `is_interactive` is false
   (`src/cli/resolve.rs:77`), no prompts fire, so the sticky never engages; the
   shadow-file fallback for conflicts and the skip-marker for deletes are
@@ -176,8 +192,8 @@ captured `Vec<u8>` output (`src/cli/resolve.rs` test module ~:2110;
 
 - **Unit (resolve.rs)**:
   - Typing `R` (when offered) → `Resolution::KeepRemoteAll`; `K` → `KeepLocalAll`.
-  - `[K]`/`[R]` suppressed and `R`/`K` treated as unrecognized when only one
-    prompted conflict remains.
+  - `[K]`/`[R]` suppressed when only one prompted conflict remains, and `R`/`K`
+    then behave as single-item `r`/`k` (existing behavior preserved).
   - Color and plain modes still render the prompt (extend existing color tests).
 - **Integration (execute.rs)**:
   - `R\ny\n` at content item 1 of N → every content item resolves `KeepRemote`
@@ -197,3 +213,7 @@ captured `Vec<u8>` output (`src/cli/resolve.rs` test module ~:2110;
 - No new CLI flag (e.g. `--accept remote|local`).
 - No change to non-interactive / CI behavior.
 - No change to clean `--allow-deletes` deletion pushes.
+- **MDH orphan pruning** (`prune_mdh_orphans`, `src/cli/sync/execute.rs:1861`):
+  unchanged. It uses its own `prompt_remote_delete` path with no bulk option, so
+  orphaned MDH datasets still prompt individually (they also have no
+  remote-restore path). The sticky does not reach this function.
