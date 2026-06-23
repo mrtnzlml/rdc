@@ -5,9 +5,9 @@ use indexmap::IndexMap;
 /// Rossum engine. Document-extraction model configuration.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Engine {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::model::null_as_default")]
     pub id: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::model::null_as_default")]
     pub url: String,
     pub name: String,
     #[serde(flatten)]

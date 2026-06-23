@@ -5,9 +5,9 @@ use indexmap::IndexMap;
 /// Rossum rule. Attached to one or more queues; carries business-logic config.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Rule {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::model::null_as_default")]
     pub id: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::model::null_as_default")]
     pub url: String,
     pub name: String,
     #[serde(default)]

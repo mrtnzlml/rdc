@@ -35,7 +35,32 @@ pub use workflow_step::WorkflowStep;
 pub use workspace::Workspace;
 
 use indexmap::IndexMap;
+use serde::Deserialize;
 use serde_json::Value;
+
+/// Deserialize helper shared by every model: treat an explicit JSON `null`
+/// exactly like an absent key by falling back to `T::default()`.
+///
+/// serde's `#[serde(default)]` alone only covers a *missing* key — an explicit
+/// `null` is still handed to the field's deserializer, which fails for
+/// non-`Option` types (`id: u64`, `url: String`) with e.g. "invalid type:
+/// null, expected u64". A new-object file scaffolded by blanking a pulled
+/// object's server-managed fields carries exactly those nulls, and the create
+/// push path strips `id`/`url` before POST anyway, so deserialization must
+/// tolerate them. Always pair with `#[serde(default)]` so a missing key keeps
+/// working too:
+///
+/// ```ignore
+/// #[serde(default, deserialize_with = "crate::model::null_as_default")]
+/// pub id: u64,
+/// ```
+pub(crate) fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
 
 /// Read `modified_at` from a model's `extra` map. Every Rossum object
 /// has the server-set `modified_at` timestamp in the forward-compat
