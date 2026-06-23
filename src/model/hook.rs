@@ -4,9 +4,9 @@ use serde_json::Value;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Hook {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::model::null_as_default")]
     pub id: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::model::null_as_default")]
     pub url: String,
     pub name: String,
     #[serde(rename = "type")]
@@ -90,6 +90,28 @@ mod tests {
         let hook: Hook = serde_json::from_value(payload).unwrap();
         assert!(hook.queues.is_empty());
         assert!(hook.events.is_empty());
+    }
+
+    #[test]
+    fn explicit_null_id_and_url_deserialize_as_default() {
+        // A new-hook file scaffolded by blanking the server-managed fields of a
+        // pulled hook ends up with `"id": null` / `"url": null` (the create push
+        // path strips them before POST anyway). `#[serde(default)]` only covers
+        // an *absent* key, so without null-tolerance these explicit nulls hit
+        // the `u64` / `String` deserializer and blow up with
+        // "invalid type: null, expected u64" — exactly the create-path failure.
+        let payload = json!({
+            "id": Value::Null,
+            "url": Value::Null,
+            "name": "MDH: line items (pilot)",
+            "type": "webhook",
+            "extension_source": "rossum_store",
+            "hook_template": "https://example.rossum.app/api/v1/hook_templates/39"
+        });
+        let hook: Hook = serde_json::from_value(payload).unwrap();
+        assert_eq!(hook.id, 0, "null id must fall back to the default");
+        assert_eq!(hook.url, "", "null url must fall back to the default");
+        assert!(hook.is_store_extension());
     }
 
     #[test]

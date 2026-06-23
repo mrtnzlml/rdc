@@ -8,9 +8,9 @@ use indexmap::IndexMap;
 /// default-rejection-template).
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct EmailTemplate {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::model::null_as_default")]
     pub id: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::model::null_as_default")]
     pub url: String,
     pub name: String,
     pub subject: String,

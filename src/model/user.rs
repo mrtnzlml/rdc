@@ -6,9 +6,9 @@ use indexmap::IndexMap;
 /// token_owner picker on `rdc deploy`; unknown fields survive via `extra`.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct User {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::model::null_as_default")]
     pub id: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::model::null_as_default")]
     pub url: String,
     #[serde(default)]
     pub username: String,

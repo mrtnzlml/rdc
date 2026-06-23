@@ -6,9 +6,9 @@ use indexmap::IndexMap;
 /// email-ingestion endpoint.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Inbox {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::model::null_as_default")]
     pub id: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::model::null_as_default")]
     pub url: String,
     pub name: String,
     #[serde(default)]

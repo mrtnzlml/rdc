@@ -6,9 +6,9 @@ use indexmap::IndexMap;
 /// organization per env (the one whose ID is in `rdc.toml`).
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Organization {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::model::null_as_default")]
     pub id: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::model::null_as_default")]
     pub url: String,
     pub name: String,
     #[serde(flatten)]

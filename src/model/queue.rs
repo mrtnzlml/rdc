@@ -7,9 +7,9 @@ use indexmap::IndexMap;
 /// queues; schema can be null for templates or unconfigured queues.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Queue {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::model::null_as_default")]
     pub id: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::model::null_as_default")]
     pub url: String,
     pub name: String,
     #[serde(default)]
@@ -55,6 +55,23 @@ mod tests {
         assert_eq!(q.inbox.as_deref(), Some("https://x.rossum.app/api/v1/inboxes/813566"));
         let round_trip = serde_json::to_value(&q).unwrap();
         assert_eq!(round_trip, payload);
+    }
+
+    #[test]
+    fn explicit_null_id_and_url_deserialize_as_default() {
+        // Same null-tolerance contract as hooks: a new-object file scaffolded by
+        // blanking a pulled queue's server-managed fields carries `"id": null` /
+        // `"url": null`, which the create push path strips before POST anyway.
+        // Without null-tolerance these explicit nulls fail the `u64` / `String`
+        // deserializer ("invalid type: null, expected u64").
+        let q: Queue = serde_json::from_value(json!({
+            "id": Value::Null,
+            "url": Value::Null,
+            "name": "Invoices",
+        }))
+        .unwrap();
+        assert_eq!(q.id, 0);
+        assert_eq!(q.url, "");
     }
 
     #[test]

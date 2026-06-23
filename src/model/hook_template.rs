@@ -4,7 +4,7 @@ use indexmap::IndexMap;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct HookTemplate {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::model::null_as_default")]
     pub url: String,
     pub name: String,
     #[serde(rename = "type")]
