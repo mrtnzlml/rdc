@@ -65,11 +65,51 @@ pub enum Resolution {
     /// committed bytes are still recorded in the lockfile by hash, so a
     /// follow-up pull sees the partial resolution as the new base.
     EditWithMarkers(Vec<u8>),
+    /// User chose "[K] keep local for ALL remaining conflicts" and confirmed.
+    /// The executor normalizes this to `KeepLocal` for the current item and
+    /// records a sticky `BulkChoice::AllLocal` so the rest of the run skips
+    /// prompting. Never reaches the executor's `match resolution` arms.
+    KeepLocalAll,
+    /// User chose "[R] use {env} for ALL remaining conflicts" and confirmed.
+    /// Normalized to `KeepRemote` + sticky `BulkChoice::AllRemote`.
+    KeepRemoteAll,
     /// Treat this as the legacy shadow-file behavior — write
     /// `<file>.<env>`, keep local. Lockfile records local hash.
     Skip,
     /// Abort the entire pull. Caller stops without saving the lockfile.
     Abort,
+}
+
+/// Which side an in-prompt "apply to all remaining" choice takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BulkChoice {
+    AllLocal,
+    AllRemote,
+}
+
+impl BulkChoice {
+    /// The single-item resolution this bulk choice maps onto for each
+    /// remaining conflict.
+    pub fn resolution(self) -> Resolution {
+        match self {
+            BulkChoice::AllLocal => Resolution::KeepLocal,
+            BulkChoice::AllRemote => Resolution::KeepRemote,
+        }
+    }
+}
+
+/// Supplied by the sync executor to enable the in-prompt "apply to all
+/// remaining" escape hatch. When passed `Some`, the prompt shows
+/// `[K]`/`[R]` and, on selection, prints the matching summary + a
+/// `Continue? [y/N]` confirmation before returning `KeepLocalAll` /
+/// `KeepRemoteAll`. When `None`, the options are hidden and `K`/`R`
+/// keep their existing single-item behavior.
+pub struct BulkPrompt {
+    /// Multi-line impact summary shown before the confirmation when the
+    /// user picks `[K]` (keep local for all). No trailing newline.
+    pub keep_local_summary: String,
+    /// Same, for `[R]` (use env for all).
+    pub use_remote_summary: String,
 }
 
 /// Returns true if interactive resolution is appropriate for this process.
@@ -1163,6 +1203,9 @@ pub fn resolve_combined_file(
             Ok(CombinedFileOutcome::PreserveBase(local_bytes.to_vec()))
         }
         Resolution::Abort => Err(anyhow::Error::new(PullAborted)),
+        Resolution::KeepLocalAll | Resolution::KeepRemoteAll => {
+            unreachable!("bulk *All resolutions are normalized to KeepLocal/KeepRemote before this match")
+        }
     }
 }
 
@@ -1247,6 +1290,9 @@ pub fn resolve_push_drift(
         Resolution::EditWithMarkers(_) => Ok(PushDriftOutcome::Skip),
         Resolution::Skip => Ok(PushDriftOutcome::Skip),
         Resolution::Abort => Err(anyhow::Error::new(PullAborted)),
+        Resolution::KeepLocalAll | Resolution::KeepRemoteAll => {
+            unreachable!("bulk *All resolutions are normalized to KeepLocal/KeepRemote before this match")
+        }
     }
 }
 
@@ -2155,6 +2201,12 @@ mod tests {
         let mut output: Vec<u8> = Vec::new();
         let r = prompt_resolve(input, &mut output, 1, 1, &path, b"remote\n", "test").unwrap();
         assert!(matches!(r, Resolution::Abort));
+    }
+
+    #[test]
+    fn bulk_choice_maps_to_single_item_resolution() {
+        assert!(matches!(BulkChoice::AllLocal.resolution(), Resolution::KeepLocal));
+        assert!(matches!(BulkChoice::AllRemote.resolution(), Resolution::KeepRemote));
     }
 
     #[test]

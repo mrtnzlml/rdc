@@ -820,6 +820,9 @@ fn resolve_conflict_interactive(
             shadow_file_conflict(local_path, remote_bytes, progress, env, base_hash)
         }
         Resolution::Abort => Err(anyhow::Error::new(PullAborted)),
+        Resolution::KeepLocalAll | Resolution::KeepRemoteAll => {
+            unreachable!("bulk *All resolutions are normalized to KeepLocal/KeepRemote before this match")
+        }
     }
 }
 
