@@ -249,7 +249,42 @@ fn prompt_bulk_none_preserves_uppercase_single_behavior() {
 Run: `cargo test prompt_bulk_`
 Expected: FAIL — `prompt_resolve_with_bytes_and_color` takes 9 args, not 10 (does not compile).
 
-- [ ] **Step 3: Add the `bulk` parameter and behavior**
+- [ ] **Step 3: Add a shared `confirm_bulk` helper**
+
+Both prompt functions need the identical "print summary → `Continue? [y/N]` →
+return the bulk resolution / re-prompt" flow. Add one private helper (in
+`src/cli/resolve.rs`, near the prompt functions, e.g. just above
+`prompt_resolve_with_bytes_and_color`) so Task 3 can reuse it instead of
+duplicating the block:
+
+```rust
+/// Render `summary` then a `Continue? [y/N]` confirmation for a bulk
+/// "apply to all" choice. Returns `Some(chosen)` on `y`, `None` to re-prompt
+/// the main menu on any other answer, and `Some(Resolution::Skip)` on EOF
+/// (matching the prompts' top-level EOF handling).
+fn confirm_bulk<R: BufRead, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    summary: &str,
+    chosen: Resolution,
+    mode: ColorMode,
+) -> Result<Option<Resolution>> {
+    writeln!(output, "{summary}")?;
+    write!(output, "{}", colorize_prompt("Continue? [y/N] > ", mode))?;
+    output.flush().ok();
+    let mut c = String::new();
+    if input.read_line(&mut c)? == 0 {
+        return Ok(Some(Resolution::Skip));
+    }
+    if matches!(c.trim().chars().next(), Some('y') | Some('Y')) {
+        Ok(Some(chosen))
+    } else {
+        Ok(None)
+    }
+}
+```
+
+- [ ] **Step 4: Add the `bulk` parameter and behavior to the content prompt**
 
 In `prompt_resolve_with_bytes_and_color`, change the signature to add a trailing parameter:
 
@@ -285,35 +320,21 @@ Then, in the `match line.trim().chars().next() {` block, add these two arms **be
 ```rust
             Some('K') if bulk.is_some() => {
                 let b = bulk.expect("checked is_some");
-                writeln!(output, "{}", b.keep_local_summary)?;
-                write!(output, "{}", colorize_prompt("Continue? [y/N] > ", mode))?;
-                output.flush().ok();
-                let mut c = String::new();
-                if input.read_line(&mut c)? == 0 {
-                    return Ok(Resolution::Skip);
+                match confirm_bulk(&mut input, &mut output, &b.keep_local_summary, Resolution::KeepLocalAll, mode)? {
+                    Some(r) => return Ok(r),
+                    None => continue,
                 }
-                if matches!(c.trim().chars().next(), Some('y') | Some('Y')) {
-                    return Ok(Resolution::KeepLocalAll);
-                }
-                continue;
             }
             Some('R') if bulk.is_some() => {
                 let b = bulk.expect("checked is_some");
-                writeln!(output, "{}", b.use_remote_summary)?;
-                write!(output, "{}", colorize_prompt("Continue? [y/N] > ", mode))?;
-                output.flush().ok();
-                let mut c = String::new();
-                if input.read_line(&mut c)? == 0 {
-                    return Ok(Resolution::Skip);
+                match confirm_bulk(&mut input, &mut output, &b.use_remote_summary, Resolution::KeepRemoteAll, mode)? {
+                    Some(r) => return Ok(r),
+                    None => continue,
                 }
-                if matches!(c.trim().chars().next(), Some('y') | Some('Y')) {
-                    return Ok(Resolution::KeepRemoteAll);
-                }
-                continue;
             }
 ```
 
-- [ ] **Step 4: Forward `None` from the three wrappers**
+- [ ] **Step 5: Forward `None` from the three wrappers**
 
 `prompt_resolve_with_color` (~157) calls `prompt_resolve_with_bytes_and_color(...)` at ~168 — add `None` as the final argument. `prompt_resolve_with_bytes` (~191) calls it at ~202 — add `None`. `prompt_resolve` (~133) calls `prompt_resolve_with_color` (a wrapper, unchanged) — **no change needed**.
 
@@ -326,12 +347,12 @@ Then, in the `match line.trim().chars().next() {` block, add these two arms **be
 ```
 (Append `None` to each existing call — keep all current arguments.)
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [ ] **Step 6: Run tests to verify they pass**
 
 Run: `cargo test prompt_bulk_ && cargo test --lib resolve && cargo build`
 Expected: PASS; existing resolve tests still pass (wrappers unchanged); build succeeds.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/cli/resolve.rs
@@ -415,36 +436,22 @@ Inside its `loop {` (~424), after building `prompt_text` and before `write!(outp
         }
 ```
 
-In its `match line.trim().chars().next() {` block, add the two arms **before** the existing `Some('k') | Some('K') => ...` arm (identical confirm logic as Task 2):
+In its `match line.trim().chars().next() {` block, add the two arms **before** the existing `Some('k') | Some('K') => ...` arm, reusing the `confirm_bulk` helper added in Task 2:
 
 ```rust
             Some('K') if bulk.is_some() => {
                 let b = bulk.expect("checked is_some");
-                writeln!(output, "{}", b.keep_local_summary)?;
-                write!(output, "{}", colorize_prompt("Continue? [y/N] > ", mode))?;
-                output.flush().ok();
-                let mut c = String::new();
-                if input.read_line(&mut c)? == 0 {
-                    return Ok(Resolution::Skip);
+                match confirm_bulk(&mut input, &mut output, &b.keep_local_summary, Resolution::KeepLocalAll, mode)? {
+                    Some(r) => return Ok(r),
+                    None => continue,
                 }
-                if matches!(c.trim().chars().next(), Some('y') | Some('Y')) {
-                    return Ok(Resolution::KeepLocalAll);
-                }
-                continue;
             }
             Some('R') if bulk.is_some() => {
                 let b = bulk.expect("checked is_some");
-                writeln!(output, "{}", b.use_remote_summary)?;
-                write!(output, "{}", colorize_prompt("Continue? [y/N] > ", mode))?;
-                output.flush().ok();
-                let mut c = String::new();
-                if input.read_line(&mut c)? == 0 {
-                    return Ok(Resolution::Skip);
+                match confirm_bulk(&mut input, &mut output, &b.use_remote_summary, Resolution::KeepRemoteAll, mode)? {
+                    Some(r) => return Ok(r),
+                    None => continue,
                 }
-                if matches!(c.trim().chars().next(), Some('y') | Some('Y')) {
-                    return Ok(Resolution::KeepRemoteAll);
-                }
-                continue;
             }
 ```
 
