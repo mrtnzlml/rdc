@@ -471,7 +471,7 @@ pub fn prompt_remote_delete<R: BufRead, W: Write>(
     env: &str,
 ) -> Result<Resolution> {
     let mode = detect_color_mode();
-    prompt_remote_delete_with_color(input, output, local_path, env, mode)
+    prompt_remote_delete_with_color(input, output, local_path, env, mode, None)
 }
 
 /// Color-aware variant. Tests pin the mode; production goes through
@@ -482,6 +482,7 @@ pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
     local_path: &Path,
     env: &str,
     mode: ColorMode,
+    bulk: Option<&BulkPrompt>,
 ) -> Result<Resolution> {
     let local_bytes = read_local(local_path)?;
     let preview = prettify_json_for_diff(&local_bytes);
@@ -519,12 +520,33 @@ pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
              [a] abort > "
         );
         write!(output, "{}", colorize_prompt(&prompt_text, mode))?;
+        if bulk.is_some() {
+            writeln!(
+                output,
+                "{}",
+                colorize_prompt(&format!("[K] keep ALL local  [R] use {env} for ALL"), mode)
+            )?;
+        }
         output.flush().ok();
         let mut line = String::new();
         if input.read_line(&mut line)? == 0 {
             return Ok(Resolution::Skip);
         }
         match line.trim().chars().next() {
+            Some('K') if bulk.is_some() => {
+                let b = bulk.expect("checked is_some");
+                match confirm_bulk(&mut input, &mut output, &b.keep_local_summary, Resolution::KeepLocalAll, mode)? {
+                    Some(r) => return Ok(r),
+                    None => continue,
+                }
+            }
+            Some('R') if bulk.is_some() => {
+                let b = bulk.expect("checked is_some");
+                match confirm_bulk(&mut input, &mut output, &b.use_remote_summary, Resolution::KeepRemoteAll, mode)? {
+                    Some(r) => return Ok(r),
+                    None => continue,
+                }
+            }
             Some('k') | Some('K') => return Ok(Resolution::KeepLocal),
             Some('r') | Some('R') => return Ok(Resolution::KeepRemote),
             Some('s') | Some('S') => return Ok(Resolution::Skip),
@@ -2750,6 +2772,7 @@ mod tests {
             &local,
             "production",
             ColorMode::Plain,
+            None,
         )
         .unwrap();
         assert!(matches!(res, Resolution::Skip));
@@ -2776,7 +2799,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let input = Cursor::new(b"k\n");
         let res =
-            prompt_remote_delete_with_color(input, &mut out, &local, "test", ColorMode::Plain)
+            prompt_remote_delete_with_color(input, &mut out, &local, "test", ColorMode::Plain, None)
                 .unwrap();
         assert!(matches!(res, Resolution::KeepLocal));
     }
@@ -2790,7 +2813,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let input = Cursor::new(b"r\n");
         let res =
-            prompt_remote_delete_with_color(input, &mut out, &local, "test", ColorMode::Plain)
+            prompt_remote_delete_with_color(input, &mut out, &local, "test", ColorMode::Plain, None)
                 .unwrap();
         assert!(matches!(res, Resolution::KeepRemote));
     }
@@ -2804,7 +2827,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let input = Cursor::new(b"a\n");
         let res =
-            prompt_remote_delete_with_color(input, &mut out, &local, "test", ColorMode::Plain)
+            prompt_remote_delete_with_color(input, &mut out, &local, "test", ColorMode::Plain, None)
                 .unwrap();
         assert!(matches!(res, Resolution::Abort));
     }
@@ -3783,5 +3806,34 @@ mod tests {
         assert!(matches!(r, Resolution::KeepRemote), "uppercase R must still mean single KeepRemote when bulk is None");
         let s = String::from_utf8(out).unwrap();
         assert!(!s.contains("for ALL"), "bulk options must be hidden when None: {s}");
+    }
+
+    #[test]
+    fn prompt_remote_delete_bulk_use_remote_all() {
+        use std::io::Cursor;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        std::fs::write(&path, b"{\"a\":1}\n").unwrap();
+        let bulk = BulkPrompt {
+            keep_local_summary: "KEEP-ALL".to_string(),
+            use_remote_summary: "USE-ALL".to_string(),
+        };
+        let input = Cursor::new(b"R\ny\n");
+        let mut out: Vec<u8> = Vec::new();
+        let r = prompt_remote_delete_with_color(input, &mut out, &path, "prod", ColorMode::Plain, Some(&bulk)).unwrap();
+        assert!(matches!(r, Resolution::KeepRemoteAll));
+        assert!(String::from_utf8(out).unwrap().contains("[R] use prod for ALL"));
+    }
+
+    #[test]
+    fn prompt_remote_delete_bulk_none_preserves_single() {
+        use std::io::Cursor;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        std::fs::write(&path, b"{\"a\":1}\n").unwrap();
+        let input = Cursor::new(b"r\n");
+        let mut out: Vec<u8> = Vec::new();
+        let r = prompt_remote_delete_with_color(input, &mut out, &path, "prod", ColorMode::Plain, None).unwrap();
+        assert!(matches!(r, Resolution::KeepRemote));
     }
 }
