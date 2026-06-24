@@ -104,6 +104,7 @@ impl BulkChoice {
 /// `Continue? [y/N]` confirmation before returning `KeepLocalAll` /
 /// `KeepRemoteAll`. When `None`, the options are hidden and `K`/`R`
 /// keep their existing single-item behavior.
+#[derive(Debug, Clone)]
 pub struct BulkPrompt {
     /// Multi-line impact summary shown before the confirmation when the
     /// user picks `[K]` (keep local for all). No trailing newline.
@@ -215,6 +216,7 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
         remote_bytes,
         env,
         mode,
+        None,
     )
 }
 
@@ -249,7 +251,33 @@ pub fn prompt_resolve_with_bytes<R: BufRead, W: Write>(
         remote_bytes,
         env,
         mode,
+        None,
     )
+}
+
+/// Render `summary` then a `Continue? [y/N]` confirmation for a bulk
+/// "apply to all" choice. Returns `Some(chosen)` on `y`, `None` to re-prompt
+/// the main menu on any other answer, and `Some(Resolution::Skip)` on EOF
+/// (matching the prompts' top-level EOF handling).
+fn confirm_bulk<R: BufRead, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    summary: &str,
+    chosen: Resolution,
+    mode: ColorMode,
+) -> Result<Option<Resolution>> {
+    writeln!(output, "{summary}")?;
+    write!(output, "{}", colorize_prompt("Continue? [y/N] > ", mode))?;
+    output.flush().ok();
+    let mut c = String::new();
+    if input.read_line(&mut c)? == 0 {
+        return Ok(Some(Resolution::Skip));
+    }
+    if matches!(c.trim().chars().next(), Some('y') | Some('Y')) {
+        Ok(Some(chosen))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Color-aware bytes-driven core. Shares the prompt + diff +
@@ -267,6 +295,7 @@ pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
     remote_bytes: &[u8],
     env: &str,
     mode: ColorMode,
+    bulk: Option<&BulkPrompt>,
 ) -> Result<Resolution> {
     // Strip noise fields before diff display so the user only sees real
     // changes. modified_at server-churn must not appear in the resolver.
@@ -332,6 +361,13 @@ pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
         } else {
             format!("[k] keep local  [r] use {env}  [e] edit  [s] skip (shadow file)  [a] abort > ")
         };
+        if bulk.is_some() {
+            writeln!(
+                output,
+                "{}",
+                colorize_prompt(&format!("[K] keep ALL local  [R] use {env} for ALL"), mode)
+            )?;
+        }
         write!(output, "{}", colorize_prompt(&prompt_text, mode))?;
         output.flush().ok();
         let mut line = String::new();
@@ -339,6 +375,20 @@ pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
             return Ok(Resolution::Skip);
         }
         match line.trim().chars().next() {
+            Some('K') if bulk.is_some() => {
+                let b = bulk.expect("checked is_some");
+                match confirm_bulk(&mut input, &mut output, &b.keep_local_summary, Resolution::KeepLocalAll, mode)? {
+                    Some(r) => return Ok(r),
+                    None => continue,
+                }
+            }
+            Some('R') if bulk.is_some() => {
+                let b = bulk.expect("checked is_some");
+                match confirm_bulk(&mut input, &mut output, &b.use_remote_summary, Resolution::KeepRemoteAll, mode)? {
+                    Some(r) => return Ok(r),
+                    None => continue,
+                }
+            }
             Some('k') | Some('K') => return Ok(Resolution::KeepLocal),
             Some('r') | Some('R') => return Ok(Resolution::KeepRemote),
             Some('s') | Some('S') => return Ok(Resolution::Skip),
@@ -3659,5 +3709,79 @@ mod tests {
             s.contains("[h] hunk-by-hunk"),
             "multi-hunk re-prompt should include [h]: {s}"
         );
+    }
+
+    #[test]
+    fn prompt_bulk_use_remote_all_after_confirm() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        let bulk = BulkPrompt {
+            keep_local_summary: "KEEP-ALL-SUMMARY".to_string(),
+            use_remote_summary: "USE-ALL-SUMMARY".to_string(),
+        };
+        let input = Cursor::new(b"R\ny\n");
+        let mut out: Vec<u8> = Vec::new();
+        let r = prompt_resolve_with_bytes_and_color(
+            input, &mut out, 1, 3, &path,
+            b"{\"a\":1}", b"{\"a\":2}", "prod", ColorMode::Plain, Some(&bulk),
+        )
+        .unwrap();
+        assert!(matches!(r, Resolution::KeepRemoteAll));
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("[R] use prod for ALL"), "options not shown: {s}");
+        assert!(s.contains("USE-ALL-SUMMARY"), "summary not shown: {s}");
+    }
+
+    #[test]
+    fn prompt_bulk_keep_local_all_after_confirm() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        let bulk = BulkPrompt {
+            keep_local_summary: "KEEP-ALL-SUMMARY".to_string(),
+            use_remote_summary: "USE-ALL-SUMMARY".to_string(),
+        };
+        let input = Cursor::new(b"K\ny\n");
+        let mut out: Vec<u8> = Vec::new();
+        let r = prompt_resolve_with_bytes_and_color(
+            input, &mut out, 1, 3, &path,
+            b"{\"a\":1}", b"{\"a\":2}", "prod", ColorMode::Plain, Some(&bulk),
+        )
+        .unwrap();
+        assert!(matches!(r, Resolution::KeepLocalAll));
+    }
+
+    #[test]
+    fn prompt_bulk_declined_falls_back_to_single() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        let bulk = BulkPrompt {
+            keep_local_summary: "KEEP-ALL-SUMMARY".to_string(),
+            use_remote_summary: "USE-ALL-SUMMARY".to_string(),
+        };
+        // R -> confirm -> n (decline) -> reprompt -> k (single keep local)
+        let input = Cursor::new(b"R\nn\nk\n");
+        let mut out: Vec<u8> = Vec::new();
+        let r = prompt_resolve_with_bytes_and_color(
+            input, &mut out, 1, 3, &path,
+            b"{\"a\":1}", b"{\"a\":2}", "prod", ColorMode::Plain, Some(&bulk),
+        )
+        .unwrap();
+        assert!(matches!(r, Resolution::KeepLocal));
+    }
+
+    #[test]
+    fn prompt_bulk_none_preserves_uppercase_single_behavior() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.json");
+        let input = Cursor::new(b"R\n");
+        let mut out: Vec<u8> = Vec::new();
+        let r = prompt_resolve_with_bytes_and_color(
+            input, &mut out, 1, 1, &path,
+            b"{\"a\":1}", b"{\"a\":2}", "prod", ColorMode::Plain, None,
+        )
+        .unwrap();
+        assert!(matches!(r, Resolution::KeepRemote), "uppercase R must still mean single KeepRemote when bulk is None");
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("for ALL"), "bulk options must be hidden when None: {s}");
     }
 }
