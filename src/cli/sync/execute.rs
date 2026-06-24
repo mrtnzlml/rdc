@@ -34,7 +34,10 @@
 //! Spec: docs/superpowers/specs/2026-05-14-unified-sync-design.md.
 
 use crate::cli::pull::common::{PullCtx, RemoteCatalog};
-use crate::cli::resolve::{PullAborted, Resolution, prompt_remote_delete, prompt_resolve};
+use crate::cli::resolve::{
+    BulkChoice, BulkPrompt, PullAborted, Resolution, detect_color_mode, prompt_remote_delete,
+    prompt_resolve_with_bytes_and_color,
+};
 use crate::cli::stdin_coord::CoordinatorStdin;
 use crate::cli::sync::classify::{ClassifiedItem, SyncClass};
 use crate::log::{Action, Log};
@@ -61,6 +64,44 @@ pub(crate) struct ConflictOutcome {
     pub(crate) promoted_to_push: Vec<(String, String, PathBuf)>,
 }
 
+/// Build the two confirmation summaries for the in-prompt "apply to all
+/// remaining" escape hatch, given the remaining prompted-conflict counts by
+/// class. Returns `None` when one or fewer conflicts remain — offering "all"
+/// would be identical to resolving the single item, so the options stay
+/// hidden and uppercase `K`/`R` keep their single-item meaning.
+fn build_bulk_prompt(
+    env: &str,
+    content: usize,        // BothDiverged remaining, including the current one
+    delete_local: usize,   // LocalEditRemoteDelete remaining
+    recreate_local: usize, // LocalDeleteRemoteEdit remaining
+) -> Option<BulkPrompt> {
+    let total = content + delete_local + recreate_local;
+    if total <= 1 {
+        return None;
+    }
+    let mut keep = format!("Keep local for all {total} remaining conflicts?");
+    let mut remote = format!("Use {env} for all {total} remaining conflicts?");
+    if content > 0 {
+        keep.push_str(&format!("\n  {content} local file(s) kept and pushed to {env}"));
+        remote.push_str(&format!("\n  {content} local file(s) overwritten with {env}"));
+    }
+    if delete_local > 0 {
+        keep.push_str(&format!("\n  {delete_local} file(s) restored on {env}"));
+        remote.push_str(&format!(
+            "\n  {delete_local} local file(s) deleted ({env} deleted them)"
+        ));
+    }
+    if recreate_local > 0 {
+        keep.push_str(&format!(
+            "\n  {recreate_local} local deletion(s) need a follow-up `rdc push --allow-deletes {env}`"
+        ));
+        remote.push_str(&format!(
+            "\n  {recreate_local} local file(s) recreated from {env}"
+        ));
+    }
+    Some(BulkPrompt { keep_local_summary: keep, use_remote_summary: remote })
+}
+
 /// Resolve each `BothDiverged` item in `classified`. The resolver prompt
 /// reads from `input` (production passes a locked stdin; tests pass a
 /// `Cursor`). On `[k]`/`[e]` the item is promoted to the push side (the
@@ -85,6 +126,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
     mut input: R,
     interactive: bool,
     progress: &Arc<Log>,
+    bulk_sticky: &mut Option<BulkChoice>,
 ) -> Result<ConflictOutcome> {
     let mut outcome = ConflictOutcome::default();
 
@@ -268,6 +310,15 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
     if total == 0 {
         return Ok(outcome);
     }
+
+    let lerd_total = classified
+        .iter()
+        .filter(|it| it.class == SyncClass::LocalEditRemoteDelete)
+        .count();
+    let ldre_total = classified
+        .iter()
+        .filter(|it| it.class == SyncClass::LocalDeleteRemoteEdit)
+        .count();
 
     let env = ctx.paths.env().to_string();
     let stderr = std::io::stderr();
@@ -544,6 +595,8 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
         refs.remote_bytes =
             crate::cli::pull::common::portabilize_proposed(&refs.remote_bytes, ctx.lockfile);
 
+        let content_remaining = total - idx;
+        let bulk = build_bulk_prompt(&env, content_remaining, lerd_total, ldre_total);
         resolve_one_conflict(
             ctx,
             it,
@@ -556,6 +609,8 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
             &env,
             progress,
             &mut outcome,
+            bulk_sticky,
+            bulk.as_ref(),
         )?;
     }
 
@@ -1042,6 +1097,8 @@ fn resolve_one_conflict<R: BufRead>(
     env: &str,
     progress: &Arc<Log>,
     outcome: &mut ConflictOutcome,
+    bulk_sticky: &mut Option<BulkChoice>,
+    bulk: Option<&BulkPrompt>,
 ) -> Result<()> {
     let ConflictRefs {
         remote_bytes,
@@ -1345,6 +1402,7 @@ fn resolve_one_conflict<R: BufRead>(
     // Wrap all prompt reads in `with_prompt` so the grid renderer
     // suspends its draw region for the duration of the stdin read.
     // For the log renderer this is a transparent no-op.
+    let sticky_now: Option<BulkChoice> = *bulk_sticky;
     let prompt_out: std::cell::RefCell<Option<PromptOutcome>> = std::cell::RefCell::new(None);
     progress.with_prompt(|| -> anyhow::Result<_> {
         let computed: PromptOutcome = if json_canonicalize_equal && sidecar_diverges {
@@ -1353,16 +1411,21 @@ fn resolve_one_conflict<R: BufRead>(
                     let local_bytes = local_code.clone().unwrap_or_default().into_bytes();
                     let remote_bytes_for_prompt =
                         remote_code.clone().unwrap_or_default().into_bytes();
-                    let r = crate::cli::resolve::prompt_resolve_with_bytes(
-                        &mut *input,
-                        &mut *stderr_lock,
-                        idx_one_based,
-                        total,
-                        &code_path,
-                        &local_bytes,
-                        &remote_bytes_for_prompt,
-                        env,
-                    )?;
+                    let r = match sticky_now {
+                        Some(b) => b.resolution(),
+                        None => prompt_resolve_with_bytes_and_color(
+                            &mut *input,
+                            &mut *stderr_lock,
+                            idx_one_based,
+                            total,
+                            &code_path,
+                            &local_bytes,
+                            &remote_bytes_for_prompt,
+                            env,
+                            detect_color_mode(),
+                            bulk,
+                        )?,
+                    };
                     (
                         r,
                         true,
@@ -1402,16 +1465,21 @@ fn resolve_one_conflict<R: BufRead>(
                         chosen.unwrap_or_else(|| ("unknown".to_string(), Vec::new(), Vec::new()))
                     };
                     let formula_path = formulas_dir.join(format!("{fid}.py"));
-                    let r = crate::cli::resolve::prompt_resolve_with_bytes(
-                        &mut *input,
-                        &mut *stderr_lock,
-                        idx_one_based,
-                        total,
-                        &formula_path,
-                        &local_b,
-                        &remote_b,
-                        env,
-                    )?;
+                    let r = match sticky_now {
+                        Some(b) => b.resolution(),
+                        None => prompt_resolve_with_bytes_and_color(
+                            &mut *input,
+                            &mut *stderr_lock,
+                            idx_one_based,
+                            total,
+                            &formula_path,
+                            &local_b,
+                            &remote_b,
+                            env,
+                            detect_color_mode(),
+                            bulk,
+                        )?,
+                    };
                     // For schemas we don't write the sidecar from the
                     // resolver — the `[r]` path adopts the whole
                     // schema including all formulas (handled below).
@@ -1425,15 +1493,21 @@ fn resolve_one_conflict<R: BufRead>(
         } else {
             // Standard JSON-based prompt (path-driven; reads
             // `local_path` for local bytes).
-            let r = prompt_resolve(
-                &mut *input,
-                &mut *stderr_lock,
-                idx_one_based,
-                total,
-                &local_path,
-                &remote_bytes,
-                env,
-            )?;
+            let r = match sticky_now {
+                Some(b) => b.resolution(),
+                None => prompt_resolve_with_bytes_and_color(
+                    &mut *input,
+                    &mut *stderr_lock,
+                    idx_one_based,
+                    total,
+                    &local_path,
+                    &local_json_bytes,
+                    &remote_bytes,
+                    env,
+                    detect_color_mode(),
+                    bulk,
+                )?,
+            };
             (
                 r,
                 false,
@@ -1449,6 +1523,21 @@ fn resolve_one_conflict<R: BufRead>(
         prompt_out
             .into_inner()
             .expect("with_prompt must populate the resolution");
+
+    // Bulk "[K]/[R] for ALL": record the sticky for the rest of the run and
+    // fold the current item into the equivalent single-item resolution. The
+    // `match resolution` below never sees the `*All` variants.
+    let resolution = match resolution {
+        Resolution::KeepLocalAll => {
+            *bulk_sticky = Some(BulkChoice::AllLocal);
+            Resolution::KeepLocal
+        }
+        Resolution::KeepRemoteAll => {
+            *bulk_sticky = Some(BulkChoice::AllRemote);
+            Resolution::KeepRemote
+        }
+        other => other,
+    };
 
     // Suppress unused-warning for prompt_local_bytes when no Skip arm
     // reads it (the variable carries diagnostic value for future hooks).
@@ -2974,6 +3063,10 @@ pub async fn run(
     // to us through the coordinator; outside watch this reads stdin
     // directly. Either way the read is deferred to the first prompt, so a
     // conflict-free cycle never touches stdin. See `cli::stdin_coord`.
+    // Owned by the run; threaded into both resolution phases so an
+    // "apply to all" choice in the content phase carries into the delete
+    // phase. (Delete phase is wired in the next task.)
+    let mut bulk_sticky: Option<BulkChoice> = None;
     let conflict_outcome = resolve_conflicts(
         ctx,
         catalog,
@@ -2981,6 +3074,7 @@ pub async fn run(
         CoordinatorStdin::new(),
         interactive,
         progress,
+        &mut bulk_sticky,
     )
     .await?;
 
@@ -3454,6 +3548,24 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::Cursor;
 
+    #[test]
+    fn build_bulk_prompt_hides_when_single() {
+        assert!(build_bulk_prompt("prod", 1, 0, 0).is_none());
+        assert!(build_bulk_prompt("prod", 0, 1, 0).is_none());
+        assert!(build_bulk_prompt("prod", 0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn build_bulk_prompt_lists_nonzero_classes() {
+        let b = build_bulk_prompt("prod", 39, 2, 1).expect("should offer when >1");
+        assert!(b.use_remote_summary.contains("all 42 remaining"));
+        assert!(b.use_remote_summary.contains("39 local file(s) overwritten with prod"));
+        assert!(b.use_remote_summary.contains("2 local file(s) deleted"));
+        assert!(b.use_remote_summary.contains("1 local file(s) recreated from prod"));
+        assert!(b.keep_local_summary.contains("39 local file(s) kept and pushed to prod"));
+        assert!(b.keep_local_summary.contains("rdc push --allow-deletes prod"));
+    }
+
     /// Build an empty RemoteCatalog with `labels` populated by the caller.
     /// Other fields default to empty so the helper can construct a minimal
     /// catalog without bringing in every model type.
@@ -3623,6 +3735,7 @@ mod tests {
                 Cursor::new(b"k\n"),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("resolver should succeed on [k]")
@@ -3682,6 +3795,7 @@ mod tests {
                 Cursor::new(b"r\n"),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("resolver should succeed on [r]")
@@ -3747,6 +3861,7 @@ mod tests {
                 Cursor::new(b"r\n"),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("resolver should succeed on [r]");
@@ -3789,6 +3904,7 @@ mod tests {
                 Cursor::new(b"k\n"),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("resolver should succeed on [k]");
@@ -3836,6 +3952,7 @@ mod tests {
                 Cursor::new(b"s\n"),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("resolver should succeed on [s]")
@@ -3919,6 +4036,7 @@ mod tests {
                 Cursor::new(b""),
                 false,
                 &progress,
+                &mut None,
             )
             .await
             .expect("non-interactive resolver must succeed")
@@ -3969,6 +4087,7 @@ mod tests {
                 Cursor::new(b"a\n"),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect_err("abort must surface as an error")
@@ -4021,6 +4140,7 @@ mod tests {
                 Cursor::new(b""),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("no-op resolver must succeed")
@@ -4028,6 +4148,106 @@ mod tests {
 
         assert!(outcome.promoted_to_push.is_empty(), "no items to promote");
         assert_eq!(fixture.lockfile, lf_before, "lockfile must be untouched");
+    }
+
+    // ----- bulk sticky integration tests (Task 4) ------------------------
+
+    /// Picking `R` -> confirm `y` on a content conflict, while another prompted
+    /// conflict remains (a LERD item appended to `classified` makes the bulk
+    /// options appear), resolves the current item as use-remote AND sets the
+    /// run sticky to AllRemote so the rest of the run won't prompt.
+    #[tokio::test]
+    async fn resolve_conflicts_use_remote_all_sets_sticky() {
+        let mut fixture = setup_conflict_fixture();
+        let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
+        // One real BothDiverged + one LERD so total remaining > 1 (options shown).
+        let mut classified = classified_for(&fixture);
+        classified.push(ClassifiedItem {
+            kind: "labels".to_string(),
+            slug: "other-label".to_string(),
+            class: SyncClass::LocalEditRemoteDelete,
+            local_hash: None,
+            remote_hash: None,
+            base_hash: Some("dummy".to_string()),
+        });
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+
+        let mut sticky: Option<BulkChoice> = None;
+        {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                interactive: true,
+            };
+            resolve_conflicts(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b"R\ny\n"),
+                true,
+                &progress,
+                &mut sticky,
+            )
+            .await
+            .expect("resolver should succeed on [R] all");
+        }
+
+        assert_eq!(sticky, Some(BulkChoice::AllRemote), "sticky must be set for the rest of the run");
+        // Current content conflict resolved as use-remote: local overwritten.
+        let remote_bytes = crate::cli::pull::common::portabilize_proposed(
+            &label_bytes(&fixture.remote_label),
+            &fixture.lockfile,
+        );
+        let local_after = std::fs::read(&fixture.local_path).unwrap();
+        assert_eq!(local_after, remote_bytes, "local must be overwritten with remote on [R] all");
+    }
+
+    /// Declining the bulk confirmation (`R` -> `n`) then picking `k` resolves the
+    /// single item as keep-local and leaves the sticky unset.
+    #[tokio::test]
+    async fn resolve_conflicts_bulk_declined_leaves_sticky_unset() {
+        let mut fixture = setup_conflict_fixture();
+        let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
+        let mut classified = classified_for(&fixture);
+        classified.push(ClassifiedItem {
+            kind: "labels".to_string(),
+            slug: "other-label".to_string(),
+            class: SyncClass::LocalEditRemoteDelete,
+            local_hash: None,
+            remote_hash: None,
+            base_hash: Some("dummy".to_string()),
+        });
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+        let local_before = std::fs::read(&fixture.local_path).unwrap();
+
+        let mut sticky: Option<BulkChoice> = None;
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                interactive: true,
+            };
+            resolve_conflicts(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b"R\nn\nk\n"),
+                true,
+                &progress,
+                &mut sticky,
+            )
+            .await
+            .expect("resolver should succeed after decline + [k]")
+        };
+
+        assert_eq!(sticky, None, "declined bulk must not set the sticky");
+        assert_eq!(outcome.promoted_to_push.len(), 1, "[k] promotes to push");
+        let local_after = std::fs::read(&fixture.local_path).unwrap();
+        assert_eq!(local_after, local_before, "local must survive [k]");
     }
 
     // ----- remote-delete + double-conflict tests (Task 17) ---------------
@@ -5276,6 +5496,7 @@ mod tests {
                 Cursor::new(b""),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("resolver should succeed (even with empty stdin → Skip)")
@@ -5350,6 +5571,7 @@ mod tests {
                 Cursor::new(b"k\n"),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("resolver should succeed on [k]")
@@ -5419,6 +5641,7 @@ mod tests {
                 Cursor::new(b"r\n"),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("resolver should succeed on [r]")
@@ -5548,6 +5771,7 @@ mod tests {
                 Cursor::new(b"r\n"),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("resolver should succeed on [r]");
@@ -5713,6 +5937,7 @@ mod tests {
                 Cursor::new(b""),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("resolver should succeed (Skip on empty stdin)")
@@ -5866,6 +6091,7 @@ mod tests {
                 Cursor::new(b""),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("resolver should succeed (Skip on empty stdin)")
@@ -6115,6 +6341,7 @@ mod tests {
                 Cursor::new(b""),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("resolver should succeed (Skip on empty stdin)")
@@ -6307,6 +6534,7 @@ mod tests {
                 Cursor::new(b"r\n"),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("resolver must succeed on [r]")
