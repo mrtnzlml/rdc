@@ -519,7 +519,6 @@ pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
              [s] skip  \
              [a] abort > "
         );
-        write!(output, "{}", colorize_prompt(&prompt_text, mode))?;
         if bulk.is_some() {
             writeln!(
                 output,
@@ -527,6 +526,7 @@ pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
                 colorize_prompt(&format!("[K] keep ALL local  [R] use {env} for ALL"), mode)
             )?;
         }
+        write!(output, "{}", colorize_prompt(&prompt_text, mode))?;
         output.flush().ok();
         let mut line = String::new();
         if input.read_line(&mut line)? == 0 {
@@ -3822,7 +3822,12 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let r = prompt_remote_delete_with_color(input, &mut out, &path, "prod", ColorMode::Plain, Some(&bulk)).unwrap();
         assert!(matches!(r, Resolution::KeepRemoteAll));
-        assert!(String::from_utf8(out).unwrap().contains("[R] use prod for ALL"));
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("[R] use prod for ALL"), "bulk options must be shown: {s}");
+        assert!(
+            s.find("[K] keep ALL local").unwrap() < s.find("[k] keep local").unwrap(),
+            "bulk options line must render before the single-option action line: {s}"
+        );
     }
 
     #[test]
