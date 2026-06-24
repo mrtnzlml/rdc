@@ -36,7 +36,7 @@
 use crate::cli::pull::common::{PullCtx, RemoteCatalog};
 use crate::cli::resolve::{
     BulkChoice, BulkPrompt, PullAborted, Resolution, detect_color_mode, prompt_remote_delete,
-    prompt_resolve_with_bytes_and_color,
+    prompt_remote_delete_with_color, prompt_resolve_with_bytes_and_color,
 };
 use crate::cli::stdin_coord::CoordinatorStdin;
 use crate::cli::sync::classify::{ClassifiedItem, SyncClass};
@@ -2130,8 +2130,20 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
     mut input: R,
     interactive: bool,
     progress: &Arc<Log>,
+    bulk_sticky: &mut Option<BulkChoice>,
 ) -> Result<ConflictOutcome> {
     let mut outcome = ConflictOutcome::default();
+
+    let lerd_total = classified
+        .iter()
+        .filter(|it| it.class == SyncClass::LocalEditRemoteDelete)
+        .count();
+    let ldre_total = classified
+        .iter()
+        .filter(|it| it.class == SyncClass::LocalDeleteRemoteEdit)
+        .count();
+    let mut processed_lerd = 0usize;
+    let mut processed_ldre = 0usize;
 
     // Build slug → object indexes for each kind that may surface here.
     // LocalDeleteRemoteEdit needs the env-side body to restore the file
@@ -2816,19 +2828,61 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     continue;
                 }
 
-                let prompt_res: std::cell::RefCell<Option<Resolution>> =
-                    std::cell::RefCell::new(None);
-                progress.with_prompt(|| -> anyhow::Result<()> {
-                    let r = prompt_remote_delete(
-                        &mut input,
-                        std::io::stderr().lock(),
-                        &local_path,
-                        &env,
-                    )?;
-                    *prompt_res.borrow_mut() = Some(r);
-                    Ok(())
-                })?;
-                let resolution = prompt_res.into_inner().expect("with_prompt must populate");
+                let bulk_eligible = matches!(
+                    it.class,
+                    SyncClass::LocalEditRemoteDelete | SyncClass::LocalDeleteRemoteEdit
+                );
+                let sticky_now = if bulk_eligible { *bulk_sticky } else { None };
+
+                let resolution = if let Some(b) = sticky_now {
+                    b.resolution()
+                } else {
+                    let bulk = if bulk_eligible {
+                        build_bulk_prompt(
+                            &env,
+                            0,
+                            lerd_total - processed_lerd,
+                            ldre_total - processed_ldre,
+                        )
+                    } else {
+                        None
+                    };
+                    let prompt_res: std::cell::RefCell<Option<Resolution>> =
+                        std::cell::RefCell::new(None);
+                    let local_for_prompt = local_path.clone();
+                    progress.with_prompt(|| -> anyhow::Result<()> {
+                        let r = prompt_remote_delete_with_color(
+                            &mut input,
+                            std::io::stderr().lock(),
+                            &local_for_prompt,
+                            &env,
+                            detect_color_mode(),
+                            bulk.as_ref(),
+                        )?;
+                        *prompt_res.borrow_mut() = Some(r);
+                        Ok(())
+                    })?;
+                    let raw = prompt_res.into_inner().expect("with_prompt must populate");
+                    match raw {
+                        Resolution::KeepLocalAll => {
+                            *bulk_sticky = Some(BulkChoice::AllLocal);
+                            Resolution::KeepLocal
+                        }
+                        Resolution::KeepRemoteAll => {
+                            *bulk_sticky = Some(BulkChoice::AllRemote);
+                            Resolution::KeepRemote
+                        }
+                        other => other,
+                    }
+                };
+
+                if bulk_eligible {
+                    match it.class {
+                        SyncClass::LocalEditRemoteDelete => processed_lerd += 1,
+                        SyncClass::LocalDeleteRemoteEdit => processed_ldre += 1,
+                        _ => {}
+                    }
+                }
 
                 // The action a given letter triggers depends on which
                 // class we're resolving (spec §"Double-conflict cases"):
@@ -3089,6 +3143,7 @@ pub async fn run(
         CoordinatorStdin::new(),
         interactive,
         progress,
+        &mut bulk_sticky,
     )
     .await?;
 
@@ -4355,6 +4410,7 @@ mod tests {
                 Cursor::new(b""),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("clean RemoteDelete must auto-resolve")
@@ -4404,6 +4460,7 @@ mod tests {
                 Cursor::new(b""),
                 false,
                 &progress,
+                &mut None,
             )
             .await
             .expect("clean RemoteDelete must auto-resolve non-interactively")
@@ -4460,6 +4517,7 @@ mod tests {
                 Cursor::new(b"s\n"),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("mid-run-edited RemoteDelete must fall back to the prompt")
@@ -4509,6 +4567,7 @@ mod tests {
                 Cursor::new(b""),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("mid-run-missing local must converge")
@@ -4985,6 +5044,7 @@ mod tests {
                 Cursor::new(b"k\n"),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("resolver should succeed on [k]")
@@ -5051,6 +5111,7 @@ mod tests {
                 Cursor::new(b"r\n"),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("resolver should succeed on [r]")
@@ -5111,6 +5172,7 @@ mod tests {
                 Cursor::new(b"s\n"),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("resolver should succeed on [s]")
@@ -5175,6 +5237,7 @@ mod tests {
                 Cursor::new(b""),
                 false,
                 &progress,
+                &mut None,
             )
             .await
             .expect("non-tty resolver must succeed")
@@ -5257,6 +5320,7 @@ mod tests {
                 Cursor::new(b"s\n"),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("LocalDeleteRemoteEdit resolver should succeed on [s]")
@@ -5317,6 +5381,7 @@ mod tests {
                 Cursor::new(b""),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("BothDeleted resolver must succeed without reading stdin")
@@ -5343,6 +5408,47 @@ mod tests {
         assert!(
             !marker.exists(),
             "BothDeleted must not write a deleted-marker"
+        );
+    }
+
+    /// A sticky `AllRemote` set in the content phase must carry into the delete
+    /// phase: a LocalEditRemoteDelete item is resolved as use-remote (local file
+    /// deleted) WITHOUT prompting — proven by feeding empty stdin (a prompt would
+    /// EOF->Skip, write a marker, and keep the file).
+    #[tokio::test]
+    async fn resolve_remote_deletes_honors_sticky_all_remote_without_prompt() {
+        let mut fixture = setup_remote_delete_fixture();
+        let classified = classified_local_edit_remote_delete();
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+
+        let mut sticky: Option<BulkChoice> = Some(BulkChoice::AllRemote);
+        {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                interactive: true,
+            };
+            resolve_remote_deletes(
+                &mut ctx,
+                &catalog_with_labels(vec![]),
+                &classified,
+                Cursor::new(b""),
+                true,
+                &progress,
+                &mut sticky,
+            )
+            .await
+            .expect("sticky AllRemote must resolve the delete conflict without prompting");
+        }
+
+        assert!(!fixture.local_path.exists(), "AllRemote on LERD must delete the local file");
+        let marker = deleted_marker_path(&fixture.local_path, "test");
+        assert!(!marker.exists(), "no skip marker — the sticky resolved it, no prompt ran");
+        assert!(
+            fixture.lockfile.objects.get("labels").and_then(|m| m.get("audit-hold")).is_none(),
+            "lockfile entry must be dropped on use-remote delete"
         );
     }
 
@@ -6727,6 +6833,7 @@ mod tests {
                 Cursor::new(b"r\n"),
                 true,
                 &progress,
+                &mut None,
             )
             .await
             .expect("resolver must succeed on [r]");
