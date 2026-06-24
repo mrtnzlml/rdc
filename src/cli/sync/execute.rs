@@ -1644,6 +1644,9 @@ fn resolve_one_conflict<R: BufRead>(
         Resolution::Abort => {
             return Err(anyhow::Error::new(PullAborted));
         }
+        Resolution::KeepLocalAll | Resolution::KeepRemoteAll => {
+            unreachable!("bulk *All resolutions are normalized to KeepLocal/KeepRemote before this match")
+        }
     }
 
     Ok(())
@@ -1979,7 +1982,11 @@ async fn prune_mdh_orphans<R: BufRead>(
                     &format!("mdh/{slug}: env deletion deferred; marker at {}", marker.display()),
                 );
             }
-            Resolution::Edit(_) | Resolution::EditWithMarkers(_) | Resolution::Abort => {
+            Resolution::Edit(_)
+            | Resolution::EditWithMarkers(_)
+            | Resolution::Abort
+            | Resolution::KeepLocalAll
+            | Resolution::KeepRemoteAll => {
                 return Err(anyhow::Error::new(PullAborted));
             }
         }
@@ -2839,7 +2846,11 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     // `[h]`; the helper's contract documents those
                     // variants as unreachable here. Fall through to
                     // Abort defensively.
-                    Resolution::Edit(_) | Resolution::EditWithMarkers(_) | Resolution::Abort => {
+                    Resolution::Edit(_)
+                    | Resolution::EditWithMarkers(_)
+                    | Resolution::Abort
+                    | Resolution::KeepLocalAll
+                    | Resolution::KeepRemoteAll => {
                         return Err(anyhow::Error::new(PullAborted));
                     }
                 }
