@@ -804,10 +804,12 @@ git commit -m "test(live): LiveClient wrapper over RossumClient (create/delete/l
 **Files:**
 - Create: `tests/live/support/seeder.rs`
 - Create: `tests/live/support/teardown.rs`
+- Modify: `tests/live/support/client.rs` (add `schema_ids_for_queue_prefix` — schemas have no list endpoint)
 - Modify: `tests/live/support/mod.rs` (add `pub mod seeder; pub mod teardown;`)
 
 **Interfaces:**
 - Consumes: `Manifest`/`ObjectSpec` (Task 2), `resolve_placeholders` (Task 2), `RunId` (Task 1), `LiveClient` (Task 4).
+- Adds to `LiveClient`: `pub async fn schema_ids_for_queue_prefix(&self, prefix: &str) -> anyhow::Result<Vec<u64>>`.
 - Produces:
   - `pub struct SeedIndex { by_key: BTreeMap<String, SeedEntry> }` with `pub fn url(&self, kind: &str, key: &str) -> Option<&str>`, `pub fn id(&self, key: &str) -> Option<u64>`, `pub fn entries(&self) -> impl Iterator<Item=&SeedEntry>`.
   - `pub struct SeedEntry { pub key: String, pub kind: String, pub id: u64, pub url: String, pub name: String }`
@@ -917,33 +919,69 @@ pub async fn seed(
 
 - [ ] **Step 2: Implement teardown**
 
+First add this helper to `tests/live/support/client.rs` (`impl LiveClient`) — teardown needs it because schemas have no list endpoint:
+```rust
+/// Schemas have no list endpoint. Collect the schema ids referenced by queues
+/// whose name starts with `prefix`, parsed from each queue's `schema` URL.
+/// Call this BEFORE deleting the queues.
+pub async fn schema_ids_for_queue_prefix(&self, prefix: &str) -> anyhow::Result<Vec<u64>> {
+    let queues = self.inner.list_queues(None).await?;
+    let mut out = Vec::new();
+    for q in queues {
+        if q.name.starts_with(prefix) {
+            if let Some(url) = q.schema.as_deref() {
+                if let Some(id) = url.trim_end_matches('/').rsplit('/').next().and_then(|s| s.parse::<u64>().ok()) {
+                    out.push(id);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+```
+> `Queue.schema` is `Option<String>` holding the remote schema URL; `list_queues` returns remote objects with real URLs (not `rdc://`), so the last-path-segment parse yields the schema id. `self.inner` is already in scope. Drop any now-unneeded `#[allow(dead_code)]` if this method's addition makes the client reachable; keep the build warning-free either way.
+
 `tests/live/support/teardown.rs`:
 ```rust
 use crate::support::client::LiveClient;
 use crate::support::run_id::RunId;
 use anyhow::Result;
 
-/// Dependency-safe deletion order (children before parents).
-const TEARDOWN_ORDER: &[&str] = &[
-    "email_template",
-    "rule",
-    "hook",
-    "inbox",
-    "queue",
-    "schema",
-    "workspace",
-    "label",
-];
-
-/// Delete every object whose name starts with `prefix`, in dependency order.
-/// Tolerant: a not-found / already-deleting object is not an error.
+/// Delete every object whose name starts with `prefix`, in dependency order:
+/// children before parents. Schemas have NO list endpoint and rdc's delete
+/// order is `queues -> schemas`, so schema ids are derived from the `schema`
+/// URL of the prefix-matched queues (captured BEFORE the queues are deleted)
+/// and deleted right after the queues. Tolerant: a not-found / already-deleting
+/// object is logged, not fatal.
 pub async fn teardown_by_prefix(client: &LiveClient, prefix: &str) -> Result<()> {
-    for kind in TEARDOWN_ORDER {
-        // email_template is reachable only via queue listing; skip if list
-        // unsupported for the kind (handled inside list_ids_by_name_prefix).
+    // Capture schema ids BEFORE deleting queues (schemas can't be listed).
+    let schema_ids = client.schema_ids_for_queue_prefix(prefix).await.unwrap_or_default();
+
+    // Listable child kinds, in order, down to queues.
+    for kind in ["email_template", "rule", "hook", "inbox", "queue"] {
         let found = match client.list_ids_by_name_prefix(kind, prefix).await {
             Ok(v) => v,
-            Err(_) => continue, // kind not listable in isolation; covered by parent delete
+            Err(_) => continue, // kind not listable in isolation
+        };
+        for (id, name) in found {
+            if let Err(e) = client.delete(kind, id).await {
+                eprintln!("teardown: delete {kind} {id} ({name}) failed (continuing): {e:#}");
+            }
+        }
+    }
+
+    // Schemas: delete by derived id, now that their queues are gone (avoids 409).
+    for id in schema_ids {
+        if let Err(e) = client.delete("schema", id).await {
+            eprintln!("teardown: delete schema {id} failed (continuing): {e:#}");
+        }
+    }
+
+    // Parents last.
+    for kind in ["workspace", "label"] {
+        let found = match client.list_ids_by_name_prefix(kind, prefix).await {
+            Ok(v) => v,
+            Err(_) => continue,
         };
         for (id, name) in found {
             if let Err(e) = client.delete(kind, id).await {
@@ -1002,7 +1040,8 @@ Expected: compiles.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add tests/live/support/seeder.rs tests/live/support/teardown.rs tests/live/support/mod.rs
+git add tests/live/support/seeder.rs tests/live/support/teardown.rs \
+        tests/live/support/client.rs tests/live/support/mod.rs
 git commit -m "test(live): Seeder (topo create) and RAII Teardown (dependency-order delete)"
 ```
 
