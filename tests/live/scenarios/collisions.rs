@@ -1,4 +1,4 @@
-use crate::support::assert_local::{load_lockfile, lockfile_keys};
+use crate::support::assert_local::{load_lockfile, lockfile_keys, queue_file_path};
 use crate::support::client::LiveClient;
 use crate::support::config::LiveConfig;
 use crate::support::expected::{load_or_compare, CapturedState};
@@ -51,13 +51,12 @@ async fn live_collisions_identity() {
         "two same-named queues must both be tracked, got {:?}",
         captured.lockfile_keys["queues"]
     );
-    // and both on-disk queue files exist (distinct paths)
+    // and both on-disk queue files exist (distinct dirs under their workspaces).
+    // Queue slugs are FLAT (globally -2-deduped); the file lives at
+    // workspaces/<ws>/queues/<flat_slug>/queue.json, found by walking workspaces.
     for slug in lockfile_keys(&lf, "queues").into_iter().filter(|s| s.starts_with(&prefix)) {
-        let (ws, q) = slug
-            .split_once('/')
-            .unwrap_or_else(|| panic!("queue slug '{slug}' expected ws/queue composite form"));
         assert!(
-            project.exists(&format!("envs/test/workspaces/{ws}/queues/{q}/queue.json")),
+            queue_file_path(project.path(), "test", &slug, "queue.json").is_some(),
             "queue file must exist for slug {slug}"
         );
     }

@@ -1,0 +1,24 @@
+[lockfile_keys]
+hooks = [
+    "<id>post-validator",
+    "<id>validator",
+]
+inboxes = ["<id>invoices-2"]
+labels = ["<id>priority"]
+queues = [
+    "<id>invoices",
+    "<id>invoices-2",
+]
+rules = ["<id>totals-positive"]
+schemas = [
+    "<id>invoices",
+    "<id>invoices-2",
+]
+workspaces = [
+    "<id>main",
+    "<id>secondary",
+]
+
+[refs]
+"queue.schema" = "rdc://schemas/<id>invoices"
+"queue.workspace" = "rdc://workspaces/<id>secondary"

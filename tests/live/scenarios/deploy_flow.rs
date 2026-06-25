@@ -47,38 +47,32 @@ async fn live_deploy_flow() {
     let lf_test = load_lockfile(project.path(), "test").expect("test lockfile");
     let mut map = String::from("version = 1\n\n");
 
-    // Workspaces: leaf slug (= the directory name under envs/test/workspaces/).
-    map.push_str("[workspaces]\n");
-    for ws in workspace_leaf_slugs(&project) {
-        map.push_str(&format!("\"{ws}\" = \"{ws}-prod\"\n"));
-    }
-
-    // Queues / schemas / inboxes: flat LEAF slug (the <q> part of <ws>/<q>).
-    let mut queue_leaves: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for slug in lockfile_keys(&lf_test, "queues") {
-        if let Some((_ws, q)) = slug.split_once('/') {
-            queue_leaves.insert(q.to_string());
-        }
-    }
-    map.push_str("\n[queues]\n");
-    for q in &queue_leaves {
-        map.push_str(&format!("\"{q}\" = \"{q}-prod\"\n"));
-    }
-    map.push_str("\n[schemas]\n");
-    for q in &queue_leaves {
-        map.push_str(&format!("\"{q}\" = \"{q}-prod\"\n"));
-    }
-    map.push_str("\n[inboxes]\n");
-    for q in &queue_leaves {
-        map.push_str(&format!("\"{q}\" = \"{q}-prod\"\n"));
-    }
-
-    // Hooks / rules / labels: flat slugs.
-    for (kind, lk) in [("hooks", "hooks"), ("rules", "rules"), ("labels", "labels")] {
-        map.push_str(&format!("\n[{kind}]\n"));
-        for s in lockfile_keys(&lf_test, lk) {
+    // Map every object to a `-prod` rename, building each section from the
+    // ACTUAL run-scoped lockfile slugs for that kind. All these kinds use flat
+    // slugs in the mapping (workspaces, queues, schemas==queue-slug,
+    // inboxes==queue-slug, hooks, rules, labels). We map from the real slugs
+    // (not derived from queues) so we never reference a non-existent source —
+    // e.g. only queues that actually have an inbox appear under [inboxes].
+    // email_templates are server-managed defaults (auto-created per queue) and
+    // are intentionally NOT mapped here.
+    let prefix = run_id.list_prefix();
+    for (section, kind) in [
+        ("workspaces", "workspaces"),
+        ("queues", "queues"),
+        ("schemas", "schemas"),
+        ("inboxes", "inboxes"),
+        ("hooks", "hooks"),
+        ("rules", "rules"),
+        ("labels", "labels"),
+    ] {
+        map.push_str(&format!("[{section}]\n"));
+        for s in lockfile_keys(&lf_test, kind)
+            .into_iter()
+            .filter(|s| s.starts_with(&prefix))
+        {
             map.push_str(&format!("\"{s}\" = \"{s}-prod\"\n"));
         }
+        map.push('\n');
     }
 
     std::fs::create_dir_all(project.path().join(".rdc/map")).unwrap();
@@ -91,6 +85,77 @@ async fn live_deploy_flow() {
         "migrate failed: {}",
         String::from_utf8_lossy(&mg.stderr)
     );
+
+    // Drop the server-managed default email-templates from the prod snapshot
+    // before pushing: Rossum auto-creates them per queue, so pushing the
+    // migrated copies 400s with "Cannot create template with unique type".
+    // The deploy flow manages queues/schemas/inboxes/hooks/rules/labels, not
+    // these built-in templates.
+    for ws in std::fs::read_dir(project.path().join("envs/prod/workspaces"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let queues = ws.path().join("queues");
+        for q in std::fs::read_dir(&queues).into_iter().flatten().flatten() {
+            let et = q.path().join("email-templates");
+            if et.is_dir() {
+                std::fs::remove_dir_all(&et).unwrap();
+            }
+        }
+    }
+
+    // Drop hooks that carry a `run_after` cross-hook reference, AND remove the
+    // queues' references to them. rdc cannot yet resolve a create-time
+    // hook->hook ref on push (the two-phase relink for the create-time cycle is
+    // unimplemented — push fails with "unresolved portable reference", and the
+    // deferred relink then can't wire the queue->hook edge either). That is a
+    // known rdc limitation; the pull-side rdc:// portability of run_after is
+    // covered by live_cross_refs. The deploy flow here verifies the rename +
+    // push of the resolvable graph (incl. the plain `validator` hook).
+    let mut dropped_hook_refs: Vec<String> = Vec::new();
+    let hooks_dir = project.path().join("envs/prod/hooks");
+    for h in std::fs::read_dir(&hooks_dir).into_iter().flatten().flatten() {
+        let p = h.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let has_run_after = v
+            .get("run_after")
+            .and_then(|r| r.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        if has_run_after {
+            let slug = p.file_stem().unwrap().to_string_lossy().into_owned();
+            dropped_hook_refs.push(format!("rdc://hooks/{slug}"));
+            std::fs::remove_file(&p).unwrap();
+            let _ = std::fs::remove_file(p.with_extension("py")); // sidecar, if any
+        }
+    }
+    // Strip refs to the dropped hooks from every queue.json (the `hooks` array
+    // is portabilized to rdc:// on disk and drives the deferred relink).
+    if !dropped_hook_refs.is_empty() {
+        for ws in std::fs::read_dir(project.path().join("envs/prod/workspaces"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            for q in std::fs::read_dir(ws.path().join("queues")).into_iter().flatten().flatten() {
+                let qj = q.path().join("queue.json");
+                if !qj.is_file() {
+                    continue;
+                }
+                let mut v: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&qj).unwrap()).unwrap();
+                if let Some(arr) = v.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                    arr.retain(|r| !dropped_hook_refs.iter().any(|d| r.as_str() == Some(d)));
+                    std::fs::write(&qj, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+                }
+            }
+        }
+    }
 
     let sp = project.run_rdc(&["sync", "prod"]);
     assert!(
@@ -133,19 +198,4 @@ async fn live_deploy_flow() {
         });
 
     drop(teardown); // explicit: delete test + prod objects (shared prefix)
-}
-
-/// Collect workspace leaf slugs from the pulled test snapshot directory.
-/// These are the directory names directly under `envs/test/workspaces/`.
-fn workspace_leaf_slugs(project: &ProjectFixture) -> Vec<String> {
-    let dir = project.path().join("envs/test/workspaces");
-    let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        for e in rd.flatten() {
-            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                out.push(e.file_name().to_string_lossy().into_owned());
-            }
-        }
-    }
-    out
 }

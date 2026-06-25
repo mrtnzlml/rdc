@@ -1,0 +1,12 @@
+[lockfile_keys]
+inboxes = ["<id>invoices-2"]
+queues = [
+    "<id>invoices",
+    "<id>invoices-2",
+]
+schemas = [
+    "<id>invoices",
+    "<id>invoices-2",
+]
+
+[refs]

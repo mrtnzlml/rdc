@@ -78,16 +78,31 @@ impl Teardown {
 impl Drop for Teardown {
     fn drop(&mut self) {
         let prefix = self.run_id.list_prefix();
-        // Build a short-lived runtime to run async deletes from Drop.
-        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-            Ok(rt) => rt,
-            Err(e) => {
-                eprintln!("teardown: could not build runtime: {e}");
-                return;
-            }
-        };
-        if let Err(e) = rt.block_on(teardown_by_prefix(&self.client, &prefix)) {
-            eprintln!("teardown: {e:#}");
-        }
+        let client = &self.client;
+        // `Drop` fires INSIDE the test's tokio runtime (the scenarios are
+        // `#[tokio::test]`). Calling `block_on` on the current thread there
+        // panics ("Cannot start a runtime from within a runtime") — and if
+        // the test is already unwinding from a failed assertion, that second
+        // panic aborts the process (SIGABRT). Run the async teardown on a
+        // dedicated OS thread instead: it has no ambient runtime, so
+        // `block_on` is legal there. `thread::scope` joins before `drop`
+        // returns, so borrowing `client`/`prefix` is sound.
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        eprintln!("teardown: could not build runtime: {e}");
+                        return;
+                    }
+                };
+                if let Err(e) = rt.block_on(teardown_by_prefix(client, &prefix)) {
+                    eprintln!("teardown: {e:#}");
+                }
+            });
+        });
     }
 }

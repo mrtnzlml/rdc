@@ -14,7 +14,8 @@
           "id": "amount_total",
           "label": "Total",
           "type": "number",
-          "formula": "amount_due + amount_tax"
+          "formula": "amount_due + amount_tax",
+          "ui_configuration": { "type": "formula", "edit": "disabled" }
         }
       ]
     }

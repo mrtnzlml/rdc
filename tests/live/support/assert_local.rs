@@ -1,6 +1,31 @@
 use anyhow::{Context, Result};
 use rdc::state::lockfile::Lockfile;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Resolve a queue-scoped file on disk from a queue's FLAT lockfile slug.
+///
+/// Queue / schema / inbox lockfile keys are flat, globally `-2`-deduped slugs
+/// (e.g. `rdc-it-<id>-invoices`, `rdc-it-<id>-invoices-2`) — NOT composite
+/// `<ws>/<q>` — but the files live under
+/// `envs/<env>/workspaces/<ws_slug>/queues/<q_slug>/<file>`. The workspace
+/// segment isn't derivable from the queue slug, so we walk the workspaces tree
+/// to find the matching queue directory. `file` may be a sub-path such as
+/// `"queue.json"`, `"schema.json"`, `"inbox.json"`, or
+/// `"formulas/amount_total.py"`. Returns the absolute path if it exists.
+#[allow(dead_code)]
+pub fn queue_file_path(project: &Path, env: &str, q_slug: &str, file: &str) -> Option<PathBuf> {
+    let ws_root = project.join(format!("envs/{env}/workspaces"));
+    for ws in std::fs::read_dir(&ws_root).ok()?.flatten() {
+        if !ws.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let cand = ws.path().join("queues").join(q_slug).join(file);
+        if cand.exists() {
+            return Some(cand);
+        }
+    }
+    None
+}
 
 #[allow(dead_code)]
 pub fn load_lockfile(project: &Path, env: &str) -> Result<Lockfile> {
