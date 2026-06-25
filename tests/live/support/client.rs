@@ -134,6 +134,63 @@ impl LiveClient {
         };
         Ok(v)
     }
+
+    /// Fetch one object as raw JSON by listing its kind and finding it by id.
+    /// Use for kinds that have a list endpoint but no get-by-id (e.g. labels).
+    pub async fn find_listed_value(
+        &self,
+        kind: &str,
+        id: u64,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        let values: Vec<serde_json::Value> = match kind {
+            "label" => self
+                .inner
+                .list_labels(None)
+                .await?
+                .into_iter()
+                .map(|x| serde_json::to_value(x))
+                .collect::<Result<_, _>>()?,
+            "queue" => self
+                .inner
+                .list_queues(None)
+                .await?
+                .into_iter()
+                .map(|x| serde_json::to_value(x))
+                .collect::<Result<_, _>>()?,
+            "hook" => self
+                .inner
+                .list_hooks(None)
+                .await?
+                .into_iter()
+                .map(|x| serde_json::to_value(x))
+                .collect::<Result<_, _>>()?,
+            "rule" => self
+                .inner
+                .list_rules(None)
+                .await?
+                .into_iter()
+                .map(|x| serde_json::to_value(x))
+                .collect::<Result<_, _>>()?,
+            "inbox" => self
+                .inner
+                .list_inboxes(None)
+                .await?
+                .into_iter()
+                .map(|x| serde_json::to_value(x))
+                .collect::<Result<_, _>>()?,
+            "workspace" => self
+                .inner
+                .list_workspaces(None)
+                .await?
+                .into_iter()
+                .map(|x| serde_json::to_value(x))
+                .collect::<Result<_, _>>()?,
+            other => anyhow::bail!("find_listed_value: unsupported kind '{other}'"),
+        };
+        Ok(values
+            .into_iter()
+            .find(|v| v.get("id").and_then(|i| i.as_u64()) == Some(id)))
+    }
 }
 
 #[allow(dead_code)]
