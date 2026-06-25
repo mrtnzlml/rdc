@@ -262,6 +262,13 @@ leftovers:
 cargo test --test live live_janitor_sweep -- --ignored
 ```
 
+> Queue deletion is asynchronous on Rossum: `DELETE` returns `202`
+> (`deletion_requested`) and the queue lingers ~24h before purge, with its
+> `workspace` nulled. The harness (and `rdc`'s pull) treat such soft-deleted
+> queues as deleted, so they are never re-pulled or counted. A queue's schema
+> stays referenced (and so undeletable) until the queue actually purges — that
+> transient schema orphan is expected, not an `rdc` defect.
+
 Edge cases whose exact on-disk form is intentionally captured rather than
 predicted use golden files in `testdata/live/expected/`. To (re)capture after a
 reviewed change:
