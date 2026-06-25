@@ -11,7 +11,13 @@ use anyhow::Result;
 #[allow(dead_code)]
 pub async fn teardown_by_prefix(client: &LiveClient, prefix: &str) -> Result<()> {
     // Capture schema ids BEFORE deleting queues (schemas can't be listed).
-    let schema_ids = client.schema_ids_for_queue_prefix(prefix).await.unwrap_or_default();
+    let schema_ids = match client.schema_ids_for_queue_prefix(prefix).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            eprintln!("teardown: could not collect schema ids (continuing): {e:#}");
+            Vec::new()
+        }
+    };
 
     // Listable child kinds, in order, down to queues.
     for kind in ["email_template", "rule", "hook", "inbox", "queue"] {
@@ -71,7 +77,7 @@ impl Teardown {
 
 impl Drop for Teardown {
     fn drop(&mut self) {
-        let prefix = format!("{}{}", RunId::marker(), self.run_id.as_str());
+        let prefix = self.run_id.list_prefix();
         // Build a short-lived runtime to run async deletes from Drop.
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(rt) => rt,
