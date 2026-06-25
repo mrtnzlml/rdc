@@ -1,0 +1,74 @@
+# Logical keys are unique; deps drive create order; @kind/key placeholders in
+# bodies resolve to the dependency's server URL after it is created.
+
+[[object]]
+key  = "label-priority"
+kind = "label"
+body = "bodies/labels/priority.json"
+tags = ["core"]
+
+[[object]]
+key  = "ws-main"
+kind = "workspace"
+body = "bodies/workspaces/ws-main.json"
+tags = ["core"]
+
+[[object]]
+key  = "ws-secondary"
+kind = "workspace"
+body = "bodies/workspaces/ws-secondary.json"
+tags = ["collision"]
+
+[[object]]
+key  = "schema-invoices-main"
+kind = "schema"
+body = "bodies/schemas/invoices.json"
+tags = ["core", "sidecars"]
+
+[[object]]
+key  = "schema-invoices-secondary"
+kind = "schema"
+body = "bodies/schemas/invoices-2.json"
+tags = ["collision"]
+
+[[object]]
+key  = "queue-invoices-main"
+kind = "queue"
+body = "bodies/queues/invoices-main.json"
+deps = ["ws-main", "schema-invoices-main"]
+tags = ["core", "collision"]
+
+[[object]]
+key  = "queue-invoices-secondary"
+kind = "queue"
+body = "bodies/queues/invoices-secondary.json"
+deps = ["ws-secondary", "schema-invoices-secondary"]
+tags = ["collision"]
+
+[[object]]
+key  = "inbox-invoices-main"
+kind = "inbox"
+body = "bodies/inboxes/invoices-main.json"
+deps = ["queue-invoices-main"]
+tags = ["core", "redaction"]
+
+[[object]]
+key  = "hook-validator"
+kind = "hook"
+body = "bodies/hooks/validator.json"
+deps = ["queue-invoices-main"]
+tags = ["core", "sidecars", "cross-refs"]
+
+[[object]]
+key  = "hook-post-validator"
+kind = "hook"
+body = "bodies/hooks/post-validator.json"
+deps = ["queue-invoices-main", "hook-validator"]
+tags = ["cross-refs"]
+
+[[object]]
+key  = "rule-totals"
+kind = "rule"
+body = "bodies/rules/totals.json"
+deps = ["queue-invoices-main"]
+tags = ["cross-refs", "sidecars"]

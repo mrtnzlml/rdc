@@ -1,0 +1,8 @@
+{
+  "name": "Post Validator",
+  "type": "function",
+  "events": ["annotation_content"],
+  "queues": ["@queue/queue-invoices-main"],
+  "run_after": ["@hook/hook-validator"],
+  "config": { "runtime": "python3.12", "code": "def rossum_hook_request_handler(p):\n    return {}\n" }
+}

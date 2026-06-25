@@ -1,0 +1,5 @@
+{
+  "name": "Totals positive",
+  "queues": ["@queue/queue-invoices-main"],
+  "trigger_condition": "True\n"
+}

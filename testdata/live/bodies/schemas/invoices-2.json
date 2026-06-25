@@ -1,0 +1,13 @@
+{
+  "name": "Invoices",
+  "content": [
+    {
+      "category": "section",
+      "id": "header",
+      "label": "Header",
+      "children": [
+        { "category": "datapoint", "id": "invoice_id", "label": "Invoice ID", "type": "string" }
+      ]
+    }
+  ]
+}
