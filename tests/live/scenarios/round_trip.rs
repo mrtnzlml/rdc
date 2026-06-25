@@ -59,10 +59,11 @@ async fn live_round_trip_core() {
         captured.lockfile_keys.insert(kind.to_string(), keys);
     }
     // Capture a couple of cross-ref values from the pulled queue-main file.
-    // Path is discovered from the lockfile's queue slug.
-    if let Some(qslug) = lockfile_keys(&lf, "queues").into_iter().next() {
-        // qslug is composite "<ws>/<q>"
-        if let Some((ws, q)) = qslug.split_once('/') {
+    // Path is discovered from the lockfile's queue slug — use the RAW (unstripped)
+    // slug so the on-disk path resolves correctly; strip only when storing values.
+    if let Some(qslug_raw) = lockfile_keys(&lf, "queues").into_iter().next() {
+        // qslug_raw is composite "<ws>/<q>" with the real rdc-it-<id>- prefix
+        if let Some((ws, q)) = qslug_raw.split_once('/') {
             let rel = format!("envs/test/workspaces/{ws}/queues/{q}/queue.json");
             if let Some(raw) = project.read_to_string(&rel) {
                 let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
