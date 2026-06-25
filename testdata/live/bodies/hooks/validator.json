@@ -1,0 +1,7 @@
+{
+  "name": "Validator",
+  "type": "function",
+  "events": ["annotation_content"],
+  "queues": ["@queue/queue-invoices-main"],
+  "config": { "runtime": "python3.12", "code_file": "bodies/hooks/validator.py" }
+}

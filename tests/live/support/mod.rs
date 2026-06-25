@@ -9,3 +9,4 @@ pub mod teardown;
 pub mod assert_local;
 pub mod assert_remote;
 pub mod expected;
+pub mod staticdir;

@@ -1,0 +1,22 @@
+{
+  "name": "Invoices",
+  "content": [
+    {
+      "category": "section",
+      "id": "header",
+      "label": "Header",
+      "children": [
+        { "category": "datapoint", "id": "invoice_id", "label": "Invoice ID", "type": "string" },
+        { "category": "datapoint", "id": "amount_due", "label": "Amount Due", "type": "number" },
+        { "category": "datapoint", "id": "amount_tax", "label": "Tax", "type": "number" },
+        {
+          "category": "datapoint",
+          "id": "amount_total",
+          "label": "Total",
+          "type": "number",
+          "formula": "amount_due + amount_tax"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+{
+  "name": "Invoices",
+  "workspace": "@workspace/ws-main",
+  "schema": "@schema/schema-invoices-main"
+}
