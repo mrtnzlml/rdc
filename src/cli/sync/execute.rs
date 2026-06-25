@@ -1079,7 +1079,7 @@ fn try_auto_merge(
 /// To prevent that, this function:
 /// - Detects sidecar divergence directly (regardless of JSON state).
 /// - When sidecar diverges, redirects the prompt to the sidecar bytes
-///   via `prompt_resolve_with_bytes` (which doesn't require the path
+///   via `prompt_resolve_with_bytes_and_color` (which doesn't require the path
 ///   to exist — important for asymmetric "remote has code, local
 ///   doesn't" cases).
 /// - Records the canonical combined hash on every Resolution arm so
@@ -1733,6 +1733,8 @@ fn resolve_one_conflict<R: BufRead>(
         Resolution::Abort => {
             return Err(anyhow::Error::new(PullAborted));
         }
+        // *All variants are normalized to KeepLocal/KeepRemote at the choke
+        // point just above this match; this arm is defensive only.
         Resolution::KeepLocalAll | Resolution::KeepRemoteAll => {
             unreachable!("bulk *All resolutions are normalized to KeepLocal/KeepRemote before this match")
         }
@@ -2987,8 +2989,10 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     }
                     // The remote-delete prompt never offers `[e]` or
                     // `[h]`; the helper's contract documents those
-                    // variants as unreachable here. Fall through to
-                    // Abort defensively.
+                    // variants as unreachable here. The *All variants are
+                    // normalized to KeepLocal/KeepRemote at the choke point
+                    // above this match, so they are also unreachable here
+                    // (defensive only). Fall through to Abort in all cases.
                     Resolution::Edit(_)
                     | Resolution::EditWithMarkers(_)
                     | Resolution::Abort
@@ -3619,6 +3623,7 @@ mod tests {
         assert!(b.use_remote_summary.contains("1 local file(s) recreated from prod"));
         assert!(b.keep_local_summary.contains("39 local file(s) kept and pushed to prod"));
         assert!(b.keep_local_summary.contains("rdc push --allow-deletes prod"));
+        assert!(!b.use_remote_summary.contains("rdc push --allow-deletes"), "allow-deletes note belongs only to keep-local: {}", b.use_remote_summary);
     }
 
     /// Build an empty RemoteCatalog with `labels` populated by the caller.
@@ -4257,6 +4262,62 @@ mod tests {
         );
         let local_after = std::fs::read(&fixture.local_path).unwrap();
         assert_eq!(local_after, remote_bytes, "local must be overwritten with remote on [R] all");
+    }
+
+    /// Picking `K` -> confirm `y` on a content conflict, while another prompted
+    /// conflict remains (a LERD item appended to `classified` makes the bulk
+    /// options appear), resolves the current item as keep-local AND sets the
+    /// run sticky to AllLocal so the rest of the run won't prompt.
+    #[tokio::test]
+    async fn resolve_conflicts_keep_local_all_sets_sticky() {
+        let mut fixture = setup_conflict_fixture();
+        let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
+        // One real BothDiverged + one LERD so total remaining > 1 (options shown).
+        let mut classified = classified_for(&fixture);
+        classified.push(ClassifiedItem {
+            kind: "labels".to_string(),
+            slug: "other-label".to_string(),
+            class: SyncClass::LocalEditRemoteDelete,
+            local_hash: None,
+            remote_hash: None,
+            base_hash: Some("dummy".to_string()),
+        });
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+
+        // Snapshot local bytes so we can assert they survive.
+        let local_before = std::fs::read(&fixture.local_path).unwrap();
+
+        let mut sticky: Option<BulkChoice> = None;
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                interactive: true,
+            };
+            resolve_conflicts(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b"K\ny\n"),
+                true,
+                &progress,
+                &mut sticky,
+            )
+            .await
+            .expect("resolver should succeed on [K] all")
+        };
+
+        assert_eq!(sticky, Some(BulkChoice::AllLocal), "sticky must be set for the rest of the run");
+        // Local file unchanged — keep-local leaves the user's edit in place.
+        let local_after = std::fs::read(&fixture.local_path).unwrap();
+        assert_eq!(local_after, local_before, "local file must survive [K] all");
+        // BothDiverged item promoted to push so the caller PATCHes the env.
+        assert_eq!(outcome.promoted_to_push.len(), 1, "should promote 1 item");
+        assert_eq!(outcome.promoted_to_push[0].0, "labels");
+        assert_eq!(outcome.promoted_to_push[0].1, "audit-hold");
+        assert_eq!(outcome.promoted_to_push[0].2, fixture.local_path);
     }
 
     /// Declining the bulk confirmation (`R` -> `n`) then picking `k` resolves the
