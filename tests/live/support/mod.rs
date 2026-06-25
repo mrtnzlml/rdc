@@ -1,3 +1,4 @@
+pub mod client;
 pub mod config;
 pub mod run_id;
 pub mod manifest;
