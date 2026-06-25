@@ -1,8 +1,11 @@
-pub mod client;
 pub mod config;
 pub mod run_id;
 pub mod manifest;
 pub mod refs;
 pub mod project;
+pub mod client;
 pub mod seeder;
 pub mod teardown;
+pub mod assert_local;
+pub mod assert_remote;
+pub mod expected;
