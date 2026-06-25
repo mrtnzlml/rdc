@@ -1,4 +1,4 @@
-use crate::support::assert_local::{load_lockfile, lockfile_keys, strip_volatile};
+use crate::support::assert_local::{load_lockfile, lockfile_keys, queue_file_path, strip_volatile};
 use crate::support::client::LiveClient;
 use crate::support::config::LiveConfig;
 use crate::support::project::ProjectFixture;
@@ -53,18 +53,18 @@ async fn live_sidecars_redaction() {
         "config.code must be extracted out of the hook JSON into the .py sidecar"
     );
 
-    // schema: formula extracted to formulas/amount_total.py (under the queue path)
-    let qslug = lockfile_keys(&lf, "queues")
+    // schema: the `amount_total` formula is extracted to a
+    // formulas/amount_total.py sidecar under ITS queue's directory. Queue slugs
+    // are FLAT (globally -2-deduped) and only one of the two seeded schemas
+    // carries the formula, and the slug→queue assignment depends on create
+    // order — so assert that AT LEAST ONE of this run's queues has the sidecar.
+    let has_formula = lockfile_keys(&lf, "queues")
         .into_iter()
-        .find(|s| s.starts_with(&prefix))
-        .expect("no queues for this run found in lockfile");
-    let (ws, q) = qslug
-        .split_once('/')
-        .expect("queue slug must be composite <workspace>/<queue>");
-    let formula = format!("envs/test/workspaces/{ws}/queues/{q}/formulas/amount_total.py");
+        .filter(|s| s.starts_with(&prefix))
+        .any(|q| queue_file_path(project.path(), "test", &q, "formulas/amount_total.py").is_some());
     assert!(
-        project.exists(&formula),
-        "schema formula sidecar must exist at {formula}"
+        has_formula,
+        "a schema formula sidecar formulas/amount_total.py must exist under one of this run's queues"
     );
 
     // rule: trigger_condition extracted to a sidecar
@@ -72,9 +72,11 @@ async fn live_sidecars_redaction() {
         .into_iter()
         .find(|s| s.starts_with(&prefix))
         .expect("no rules for this run found in lockfile");
+    // The rule's trigger_condition (TxScript) is extracted to a `.py` sidecar
+    // (the on-disk extension is .py, not .trigger_condition).
     assert!(
-        project.exists(&format!("envs/test/rules/{rslug}.trigger_condition")),
-        "rule trigger_condition sidecar must exist at envs/test/rules/{rslug}.trigger_condition"
+        project.exists(&format!("envs/test/rules/{rslug}.py")),
+        "rule trigger_condition sidecar must exist at envs/test/rules/{rslug}.py"
     );
 
     // redaction round-trip stability: record the hook's content_hash after the

@@ -64,6 +64,14 @@ pub async fn seed(
             body["name"] = serde_json::Value::String(run_id.prefix(name));
         }
 
+        // Prefix the inbox `email_prefix` too: the live API requires it (or
+        // `email`) on inbox create, and it forms a globally-unique inbox email
+        // address, so it must be unique per run. The run-id prefix keeps the
+        // address slug-safe and teardown-matchable.
+        if let Some(ep) = body.get("email_prefix").and_then(|e| e.as_str()) {
+            body["email_prefix"] = serde_json::Value::String(run_id.prefix(ep));
+        }
+
         // Inline a hook code sidecar if `config.code_file` is present.
         if let Some(code_file) = body
             .get("config")

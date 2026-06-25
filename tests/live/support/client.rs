@@ -143,6 +143,17 @@ impl LiveClient {
 
     /// PATCH only the `name` field of an object via the generic value endpoint.
     pub async fn patch_name(&self, kind: &str, id: u64, name: &str) -> anyhow::Result<()> {
+        self.patch_fields(kind, id, serde_json::json!({ "name": name })).await
+    }
+
+    /// PATCH arbitrary fields of an object via the generic value endpoint.
+    /// `fields` is a partial body, e.g. `json!({ "color": "#00ff00" })`.
+    pub async fn patch_fields(
+        &self,
+        kind: &str,
+        id: u64,
+        fields: serde_json::Value,
+    ) -> anyhow::Result<()> {
         let endpoint = match kind {
             "queue" => "queues",
             "workspace" => "workspaces",
@@ -152,11 +163,10 @@ impl LiveClient {
             "schema" => "schemas",
             "inbox" => "inboxes",
             "email_template" => "email_templates",
-            other => anyhow::bail!("patch_name: unsupported kind '{other}'"),
+            other => anyhow::bail!("patch_fields: unsupported kind '{other}'"),
         };
         let path = format!("/{endpoint}/{id}");
-        let body = serde_json::json!({ "name": name });
-        self.inner.patch_value(&path, &body, None).await?;
+        self.inner.patch_value(&path, &fields, None).await?;
         Ok(())
     }
 

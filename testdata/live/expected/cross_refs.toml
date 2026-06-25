@@ -1,0 +1,5 @@
+[lockfile_keys]
+
+[refs]
+"queue.schema" = "rdc://schemas/<id>invoices"
+"queue.workspace" = "rdc://workspaces/<id>secondary"

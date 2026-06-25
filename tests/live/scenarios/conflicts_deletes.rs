@@ -56,7 +56,10 @@ async fn live_conflicts_deletes() {
 
     let lrel = format!("envs/test/labels/{lslug}.json");
 
-    // Mutate the local label's color field.
+    // Force a genuine both-diverged conflict by changing the SAME field
+    // (`color`) on BOTH sides: local -> #111111, remote -> #00ff00. Changing
+    // DIFFERENT fields (e.g. local color + remote name) auto-merges on this
+    // API and produces no conflict, so the same field is required.
     let mut local: serde_json::Value =
         serde_json::from_str(&project.read_to_string(&lrel).unwrap()).unwrap();
     local["color"] = serde_json::Value::String("#111111".into());
@@ -66,12 +69,11 @@ async fn live_conflicts_deletes() {
     )
     .unwrap();
 
-    // Mutate the remote label's name field (diverges on a different field).
     let lid = index.id("label-priority").expect("label-priority id from seed index");
     client
-        .patch_name("label", lid, &run_id.prefix("Priority Remote"))
+        .patch_fields("label", lid, serde_json::json!({ "color": "#00ff00" }))
         .await
-        .expect("patch remote label name");
+        .expect("patch remote label color");
 
     // Sync non-interactively; piped stdin triggers auto --yes / shadow fallback.
     let confl = project.run_rdc(&["sync", "test"]);

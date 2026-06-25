@@ -1,4 +1,4 @@
-use crate::support::assert_local::{load_lockfile, lockfile_keys};
+use crate::support::assert_local::{load_lockfile, lockfile_keys, queue_file_path};
 use crate::support::client::LiveClient;
 use crate::support::config::LiveConfig;
 use crate::support::expected::{load_or_compare, CapturedState};
@@ -44,19 +44,17 @@ async fn live_cross_refs() {
     // --- assert queue cross-refs are portable rdc:// on disk ---
     // Use the RAW (unstripped) slug so the on-disk path resolves correctly.
     // Unwrap with a panic message so a format regression fails loudly.
+    // Queue slugs are FLAT (globally -2-deduped); the file lives under
+    // workspaces/<ws>/queues/<flat_slug>/queue.json, found by walking workspaces.
     let qslug_raw = lockfile_keys(&lf, "queues")
         .into_iter()
-        .next()
-        .expect("at least one queue slug in lockfile");
-    let (ws, q) = qslug_raw
-        .split_once('/')
-        .unwrap_or_else(|| panic!("queue slug '{qslug_raw}' expected ws/queue composite form"));
-    let queue_rel = format!("envs/test/workspaces/{ws}/queues/{q}/queue.json");
-    let queue_raw = project
-        .read_to_string(&queue_rel)
-        .unwrap_or_else(|| panic!("queue file must exist at {queue_rel}"));
-    let qv: serde_json::Value = serde_json::from_str(&queue_raw)
-        .unwrap_or_else(|e| panic!("parsing {queue_rel}: {e}"));
+        .find(|s| s.starts_with(&prefix))
+        .expect("at least one queue slug for this run in the lockfile");
+    let qpath = queue_file_path(project.path(), "test", &qslug_raw, "queue.json")
+        .unwrap_or_else(|| panic!("queue file not found on disk for slug {qslug_raw}"));
+    let qv: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&qpath).unwrap())
+            .unwrap_or_else(|e| panic!("parsing {}: {e}", qpath.display()));
 
     assert!(
         qv["schema"]

@@ -1,1 +1,1 @@
-{ "name": "Invoices Inbox", "queues": ["@queue/queue-invoices-main"] }
+{ "name": "Invoices Inbox", "email_prefix": "invoices-main", "queues": ["@queue/queue-invoices-main"] }

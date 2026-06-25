@@ -1,4 +1,4 @@
-use crate::support::assert_local::{field, load_lockfile, lockfile_keys};
+use crate::support::assert_local::{field, load_lockfile, lockfile_keys, queue_file_path};
 use crate::support::client::LiveClient;
 use crate::support::config::LiveConfig;
 use crate::support::expected::{load_or_compare, CapturedState};
@@ -63,28 +63,22 @@ async fn live_round_trip_core() {
         );
         captured.lockfile_keys.insert(kind.to_string(), keys);
     }
-    // Capture a couple of cross-ref values from the pulled queue-main file.
-    // Path is discovered from the lockfile's queue slug — use the RAW (unstripped)
-    // slug so the on-disk path resolves correctly; strip only when storing values.
+    // Capture cross-ref values from a pulled queue file. Queue lockfile slugs
+    // are FLAT (globally -2-deduped, e.g. `rdc-it-<id>-invoices`), so the file
+    // lives under workspaces/<ws>/queues/<flat_q_slug>/queue.json — found by
+    // walking workspaces. Use the RAW (unstripped) slug to resolve the path;
+    // strip the run-id only when storing values into the run-agnostic golden.
     if let Some(qslug_raw) = lockfile_keys(&lf, "queues").into_iter().find(|s| s.starts_with(&prefix)) {
-        // qslug_raw is composite "<ws>/<q>" with the real rdc-it-<id>- prefix
-        if let Some((ws, q)) = qslug_raw.split_once('/') {
-            let rel = format!("envs/test/workspaces/{ws}/queues/{q}/queue.json");
-            if let Some(raw) = project.read_to_string(&rel) {
-                let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-                if let Some(s) = v.get("schema").and_then(|x| x.as_str()) {
-                    captured
-                        .refs
-                        .insert("queue.schema".into(), s.replace(&prefix.to_lowercase(), "<id>"));
-                }
-                if let Some(w) = v.get("workspace").and_then(|x| x.as_str()) {
-                    captured.refs.insert(
-                        "queue.workspace".into(),
-                        w.replace(&prefix.to_lowercase(), "<id>"),
-                    );
-                }
-            }
-        }
+        let qpath = queue_file_path(project.path(), "test", &qslug_raw, "queue.json")
+            .unwrap_or_else(|| panic!("queue file not found on disk for slug {qslug_raw}"));
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&qpath).unwrap()).unwrap();
+        let s = v.get("schema").and_then(|x| x.as_str())
+            .unwrap_or_else(|| panic!("queue {qslug_raw} has no schema ref"));
+        captured.refs.insert("queue.schema".into(), s.replace(&prefix.to_lowercase(), "<id>"));
+        let w = v.get("workspace").and_then(|x| x.as_str())
+            .unwrap_or_else(|| panic!("queue {qslug_raw} has no workspace ref"));
+        captured.refs.insert("queue.workspace".into(), w.replace(&prefix.to_lowercase(), "<id>"));
     }
     let golden = static_dir().join("expected/round_trip.toml");
     load_or_compare(&golden, &captured).expect("local state matches golden");
