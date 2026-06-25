@@ -19,17 +19,9 @@ async fn live_janitor_sweep() {
         let left = client.list_ids_by_name_prefix(kind, RunId::marker()).await.unwrap_or_default();
         assert!(left.is_empty(), "janitor left {kind} objects: {left:?}");
     }
-    // Queues delete ASYNCHRONOUSLY on this API (DELETE -> 202
-    // `deletion_requested`, ~24h purge), and a queue's schema stays
-    // 409-referenced until the queue actually purges. So we do NOT require
-    // queues/schemas to be empty — the DELETE was accepted; we only report
-    // what is still settling. (Schemas have no list endpoint, so they can't
-    // be enumerated here anyway.)
+    // Soft-deleted queues (status `deletion_requested` / workspace null) are
+    // treated as deleted and excluded from the listing, so the sweep must leave
+    // no live queues behind either.
     let queues_left = client.list_ids_by_name_prefix("queue", RunId::marker()).await.unwrap_or_default();
-    if !queues_left.is_empty() {
-        eprintln!(
-            "janitor: {} queue(s) still settling (async delete, ~24h purge): {queues_left:?}",
-            queues_left.len()
-        );
-    }
+    assert!(queues_left.is_empty(), "janitor left live queue objects: {queues_left:?}");
 }

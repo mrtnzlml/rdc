@@ -90,6 +90,16 @@ impl LiveClient {
         };
         let mut out = Vec::new();
         for v in values {
+            // Treat soft-deleted queues as deleted: Rossum's async queue DELETE
+            // returns 202 `deletion_requested` and nulls the workspace; such
+            // queues linger ~24h but are gone for our purposes.
+            if kind == "queue" {
+                let soft_deleted = v.get("status").and_then(|s| s.as_str()) == Some("deletion_requested")
+                    || v.get("workspace").map(|w| w.is_null()).unwrap_or(true);
+                if soft_deleted {
+                    continue;
+                }
+            }
             let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
             if name.starts_with(prefix) {
                 if let Some(id) = v.get("id").and_then(|i| i.as_u64()) {
@@ -107,14 +117,14 @@ impl LiveClient {
         let queues = self.inner.list_queues(None).await?;
         let mut out = Vec::new();
         for q in queues {
+            let soft_deleted = q.workspace.is_none()
+                || q.extra.get("status").and_then(|s| s.as_str()) == Some("deletion_requested");
+            if soft_deleted {
+                continue;
+            }
             if q.name.starts_with(prefix) {
                 if let Some(url) = q.schema.as_deref() {
-                    if let Some(id) = url
-                        .trim_end_matches('/')
-                        .rsplit('/')
-                        .next()
-                        .and_then(|s| s.parse::<u64>().ok())
-                    {
+                    if let Some(id) = url.trim_end_matches('/').rsplit('/').next().and_then(|s| s.parse::<u64>().ok()) {
                         out.push(id);
                     }
                 }
