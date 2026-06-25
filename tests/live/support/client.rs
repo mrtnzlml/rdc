@@ -100,6 +100,29 @@ impl LiveClient {
         Ok(out)
     }
 
+    /// Schemas have no list endpoint. Collect the schema ids referenced by queues
+    /// whose name starts with `prefix`, parsed from each queue's `schema` URL.
+    /// Call this BEFORE deleting the queues.
+    pub async fn schema_ids_for_queue_prefix(&self, prefix: &str) -> anyhow::Result<Vec<u64>> {
+        let queues = self.inner.list_queues(None).await?;
+        let mut out = Vec::new();
+        for q in queues {
+            if q.name.starts_with(prefix) {
+                if let Some(url) = q.schema.as_deref() {
+                    if let Some(id) = url
+                        .trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        out.push(id);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Fetch one object as raw JSON (typed getter -> Value).
     pub async fn get_value(&self, kind: &str, id: u64) -> Result<serde_json::Value> {
         let v = match kind {
