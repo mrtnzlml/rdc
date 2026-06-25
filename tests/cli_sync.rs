@@ -9025,3 +9025,238 @@ async fn sync_inbox_push_then_resync_is_clean() {
         "third sync after an inbox push must be Clean (0 changed); got:\n{stderr3}"
     );
 }
+
+/// Push-side LocalCreate for two new hooks where `post-validator` has a
+/// `run_after: ["rdc://hooks/validator"]` cross-ref pointing at `validator`,
+/// which is also being created in the same sync.
+///
+/// Because `validator` doesn't exist in the lockfile yet when `post-validator`
+/// is processed, `resolve_value_deferring` must strip `run_after` from the
+/// create POST body (the ref cannot be resolved yet) and queue a `DeferredRelink`
+/// entry. After both hooks are created the relink pass PATCHes `post-validator`
+/// with `run_after` resolved to the validator hook's env URL.
+///
+/// Before the fix, `resolve_value` left the unresolved `rdc://` ref in the
+/// payload and `ensure_no_residual_refs` inside the push pipeline caused the
+/// create to error — the test's `is_ok()` check and `run_after`-absent assertion
+/// both fail.
+#[tokio::test]
+async fn sync_push_hook_run_after_deferred_relink() {
+    let _cwd_guard = cwd_lock();
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let server_uri = server.uri();
+
+    // Stateful hook listing: empty before the creates, then both hooks visible
+    // on subsequent lists — so a second sync classifies them Clean.
+    let hook_list_calls = Arc::new(AtomicUsize::new(0));
+    let validator_id = 901u64;
+    let post_validator_id = 902u64;
+    let validator_url = format!("{server_uri}/api/v1/hooks/{validator_id}");
+    let post_validator_url = format!("{server_uri}/api/v1/hooks/{post_validator_id}");
+    let validator_hook = serde_json::json!({
+        "id": validator_id,
+        "url": validator_url,
+        "name": "Validator",
+        "type": "function",
+        "events": ["annotation_content"],
+        "queues": [],
+        "config": { "runtime": "python3.12", "code": "def f(p):\n    return {}\n" },
+        "run_after": [],
+        "modified_at": "2026-06-01T10:00:00Z"
+    });
+    let post_validator_hook = serde_json::json!({
+        "id": post_validator_id,
+        "url": post_validator_url,
+        "name": "PostValidator",
+        "type": "function",
+        "events": ["annotation_content"],
+        "queues": [],
+        "config": { "runtime": "python3.12", "code": "def f(p):\n    return {}\n" },
+        "run_after": [validator_url.clone()],
+        "modified_at": "2026-06-01T10:00:01Z"
+    });
+    let counter = hook_list_calls.clone();
+    let vh = validator_hook.clone();
+    let pvh = post_validator_hook.clone();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(move |_req: &Request| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let body = if n == 0 {
+                serde_json::json!({ "pagination": { "next": null }, "results": [] })
+            } else {
+                serde_json::json!({
+                    "pagination": { "total": 2, "total_pages": 1, "next": null, "previous": null },
+                    "results": [vh.clone(), pvh.clone()]
+                })
+            };
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/hooks"]).await;
+
+    // POST /hooks: stateful — first call returns validator (id=901), second
+    // returns post-validator (id=902). Hooks are processed in slug order
+    // (BTreeMap), so `post-validator` < `validator` alphabetically, meaning
+    // post-validator is created first. We track call count and assign ids
+    // in order regardless.
+    let post_calls = Arc::new(AtomicUsize::new(0));
+    let counter = post_calls.clone();
+    let vh2 = validator_hook.clone();
+    let pvh2 = post_validator_hook.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(move |_req: &Request| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            // First POST → post-validator (alphabetically first in BTreeMap)
+            // Second POST → validator
+            let body = if n == 0 { pvh2.clone() } else { vh2.clone() };
+            ResponseTemplate::new(201).set_body_json(body)
+        })
+        .mount(&server)
+        .await;
+
+    // PATCH /hooks/901 (validator relink — should not happen since it has no
+    // unresolvable refs) and /hooks/902 (post-validator relink).
+    // We mount a catch-all PATCH for both ids.
+    let patch_901 = validator_hook.clone();
+    Mock::given(method("PATCH"))
+        .and(path(format!("/api/v1/hooks/{validator_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&patch_901))
+        .mount(&server)
+        .await;
+    let patch_902 = post_validator_hook.clone();
+    Mock::given(method("PATCH"))
+        .and(path(format!("/api/v1/hooks/{post_validator_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&patch_902))
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={server_uri}/api/v1:1")])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // Seed two new local hooks (no lockfile entries).
+    let hooks_dir = project.path().join("envs/dev/hooks");
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+
+    // validator: a plain function hook with no cross-refs.
+    let validator_json = serde_json::json!({
+        "id": 0,
+        "url": "",
+        "name": "Validator",
+        "type": "function",
+        "events": ["annotation_content"],
+        "queues": [],
+        "run_after": [],
+        "config": { "runtime": "python3.12" }
+    });
+    let mut b = serde_json::to_vec_pretty(&validator_json).unwrap();
+    b.push(b'\n');
+    std::fs::write(hooks_dir.join("validator.json"), &b).unwrap();
+    std::fs::write(
+        hooks_dir.join("validator.py"),
+        b"def f(p):\n    return {}\n",
+    )
+    .unwrap();
+
+    // post-validator: run_after references validator via rdc:// (not yet in lockfile).
+    let post_validator_json = serde_json::json!({
+        "id": 0,
+        "url": "",
+        "name": "PostValidator",
+        "type": "function",
+        "events": ["annotation_content"],
+        "queues": [],
+        "run_after": ["rdc://hooks/validator"],
+        "config": { "runtime": "python3.12" }
+    });
+    let mut b = serde_json::to_vec_pretty(&post_validator_json).unwrap();
+    b.push(b'\n');
+    std::fs::write(hooks_dir.join("post-validator.json"), &b).unwrap();
+    std::fs::write(
+        hooks_dir.join("post-validator.py"),
+        b"def f(p):\n    return {}\n",
+    )
+    .unwrap();
+
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    result.expect("sync with hook run_after deferred relink must succeed");
+
+    let all_reqs = server.received_requests().await.unwrap_or_default();
+
+    // Find the POST for post-validator (the hook with run_after). It's the
+    // first POST issued (BTreeMap order: "post-validator" < "validator").
+    let post_bodies: Vec<serde_json::Value> = all_reqs
+        .iter()
+        .filter(|r| r.method == http::Method::POST && r.url.path() == "/api/v1/hooks")
+        .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+        .collect();
+    assert_eq!(post_bodies.len(), 2, "expected exactly 2 hook POSTs; got {}", post_bodies.len());
+
+    // The post-validator create POST body must NOT contain run_after (deferred).
+    // We identify it as the POST whose name is "PostValidator".
+    let post_validator_create = post_bodies
+        .iter()
+        .find(|b| b.get("name").and_then(|v| v.as_str()) == Some("PostValidator"))
+        .expect("a POST body with name='PostValidator' must exist");
+    assert!(
+        post_validator_create.get("run_after").is_none(),
+        "post-validator create POST body must NOT contain run_after (it was deferred);\ngot: {}",
+        serde_json::to_string_pretty(post_validator_create).unwrap()
+    );
+
+    // A PATCH to post-validator (id=902) must have been sent with run_after
+    // resolved to the validator hook's env URL.
+    let patch_bodies: Vec<serde_json::Value> = all_reqs
+        .iter()
+        .filter(|r| {
+            r.method == http::Method::PATCH
+                && r.url.path() == format!("/api/v1/hooks/{post_validator_id}")
+        })
+        .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+        .collect();
+    assert!(
+        !patch_bodies.is_empty(),
+        "a PATCH to post-validator hook (id={post_validator_id}) must have been sent for the deferred run_after relink"
+    );
+    let relink_patch = &patch_bodies[0];
+    let run_after = relink_patch
+        .get("run_after")
+        .and_then(|v| v.as_array())
+        .expect("relink PATCH body must contain run_after array");
+    // The resolved URL must be the validator's env URL (not rdc://).
+    assert!(
+        run_after.iter().any(|v| v.as_str() == Some(&validator_url)),
+        "relink PATCH run_after must contain the validator's env URL '{validator_url}';\ngot: {run_after:?}"
+    );
+    assert!(
+        !relink_patch.to_string().contains("rdc://"),
+        "no unresolved rdc:// refs must remain in the relink PATCH body;\ngot: {}",
+        serde_json::to_string_pretty(relink_patch).unwrap()
+    );
+}
