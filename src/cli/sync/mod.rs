@@ -43,10 +43,10 @@
 //! When the JSON portion canonicalizes-equal but the sidecar
 //! diverges (symmetric or asymmetric), the resolver redirects the
 //! prompt to a bytes-driven variant
-//! ([`crate::cli::resolve::prompt_resolve_with_bytes`]) that shows the
-//! actual divergent bytes. The redirect handles asymmetric cases
+//! ([`crate::cli::resolve::prompt_resolve_with_bytes_and_color`]) that shows
+//! the actual divergent bytes. The redirect handles asymmetric cases
 //! (one side has a sidecar, the other doesn't) by passing empty
-//! bytes for the missing side — `prompt_resolve_with_bytes` does
+//! bytes for the missing side — `prompt_resolve_with_bytes_and_color` does
 //! not require the path to exist on disk.
 //!
 //! Every Resolution branch records the canonical combined hash

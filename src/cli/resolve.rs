@@ -220,41 +220,6 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
     )
 }
 
-/// Bytes-driven variant of [`prompt_resolve_with_color`]. Used by the
-/// sync executor's conflict resolver when the divergence lives in a
-/// sidecar (`.py`, `formulas/<id>.py`) that may not exist on disk
-/// (asymmetric case where one side has the sidecar and the other
-/// doesn't). Reading from disk would fail; callers compose the
-/// `local_bytes` directly and pass them here.
-///
-/// `local_path` is used only for the prompt header (it appears as
-/// "local") and for the `[e]dit` editor's tempfile extension; it does
-/// NOT need to exist on disk.
-pub fn prompt_resolve_with_bytes<R: BufRead, W: Write>(
-    input: R,
-    output: W,
-    index: usize,
-    total: usize,
-    local_path: &Path,
-    local_bytes: &[u8],
-    remote_bytes: &[u8],
-    env: &str,
-) -> Result<Resolution> {
-    let mode = detect_color_mode();
-    prompt_resolve_with_bytes_and_color(
-        input,
-        output,
-        index,
-        total,
-        local_path,
-        local_bytes,
-        remote_bytes,
-        env,
-        mode,
-        None,
-    )
-}
-
 /// Render `summary` then a `Continue? [y/N]` confirmation for a bulk
 /// "apply to all" choice. Returns `Some(chosen)` on `y`, `None` to re-prompt
 /// the main menu on any other answer, and `Some(Resolution::Skip)` on EOF
