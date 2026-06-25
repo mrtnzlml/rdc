@@ -52,12 +52,13 @@ async fn live_collisions_identity() {
     );
     // and both on-disk queue files exist (distinct paths)
     for slug in lockfile_keys(&lf, "queues") {
-        if let Some((ws, q)) = slug.split_once('/') {
-            assert!(
-                project.exists(&format!("envs/test/workspaces/{ws}/queues/{q}/queue.json")),
-                "queue file must exist for slug {slug}"
-            );
-        }
+        let (ws, q) = slug
+            .split_once('/')
+            .unwrap_or_else(|| panic!("queue slug '{slug}' expected ws/queue composite form"));
+        assert!(
+            project.exists(&format!("envs/test/workspaces/{ws}/queues/{q}/queue.json")),
+            "queue file must exist for slug {slug}"
+        );
     }
 
     // rename one queue on the remote, re-pull, assert the on-disk slug is stable
