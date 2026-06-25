@@ -239,3 +239,38 @@ rdc auth test --token <new-token>
 rdc auth test --username alice@example.com
 # password is prompted on TTY (masked)
 ```
+
+## Live integration testing
+
+A high-fidelity, opt-in suite drives the real `rdc` binary against a real
+Rossum test org. It is `#[ignore]`d, so `cargo test` never runs it.
+
+Provide credentials via the environment (nothing is hardcoded in the repo):
+
+```sh
+export RDC_LIVE_API_BASE="https://<host>/v1"
+export RDC_LIVE_ORG_ID="<org id>"
+export RDC_LIVE_TOKEN="<token>"
+cargo test --test live -- --ignored --test-threads=1
+```
+
+Each run namespaces every object it creates with `rdc-it-<run-id>-` and tears
+them all down afterwards (dependency-ordered DELETE). If a run crashes, sweep
+leftovers:
+
+```sh
+cargo test --test live live_janitor_sweep -- --ignored
+```
+
+Edge cases whose exact on-disk form is intentionally captured rather than
+predicted use golden files in `testdata/live/expected/`. To (re)capture after a
+reviewed change:
+
+```sh
+RDC_LIVE_CAPTURE=1 cargo test --test live <scenario> -- --ignored --nocapture
+# review the regenerated testdata/live/expected/<scenario>.toml, then commit
+```
+
+Add a new edge case by dropping JSON bodies + a `manifest.toml` entry into
+`testdata/live/` — no Rust required for the data; add a scenario only for new
+assertions.
