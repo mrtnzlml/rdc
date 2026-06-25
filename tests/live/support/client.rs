@@ -135,6 +135,25 @@ impl LiveClient {
         Ok(v)
     }
 
+    /// PATCH only the `name` field of an object via the generic value endpoint.
+    pub async fn patch_name(&self, kind: &str, id: u64, name: &str) -> anyhow::Result<()> {
+        let endpoint = match kind {
+            "queue" => "queues",
+            "workspace" => "workspaces",
+            "hook" => "hooks",
+            "label" => "labels",
+            "rule" => "rules",
+            "schema" => "schemas",
+            "inbox" => "inboxes",
+            "email_template" => "email_templates",
+            other => anyhow::bail!("patch_name: unsupported kind '{other}'"),
+        };
+        let path = format!("/{endpoint}/{id}");
+        let body = serde_json::json!({ "name": name });
+        self.inner.patch_value(&path, &body, None).await?;
+        Ok(())
+    }
+
     /// Fetch one object as raw JSON by listing its kind and finding it by id.
     /// Use for kinds that have a list endpoint but no get-by-id (e.g. labels).
     pub async fn find_listed_value(
