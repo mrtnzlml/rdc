@@ -55,13 +55,18 @@ async fn live_round_trip_core() {
     };
     let mut captured = CapturedState::default();
     for kind in ["labels", "workspaces", "queues", "schemas", "inboxes", "hooks", "rules"] {
-        let keys = strip(lockfile_keys(&lf, kind));
+        let keys = strip(
+            lockfile_keys(&lf, kind)
+                .into_iter()
+                .filter(|s| s.starts_with(&prefix))
+                .collect(),
+        );
         captured.lockfile_keys.insert(kind.to_string(), keys);
     }
     // Capture a couple of cross-ref values from the pulled queue-main file.
     // Path is discovered from the lockfile's queue slug — use the RAW (unstripped)
     // slug so the on-disk path resolves correctly; strip only when storing values.
-    if let Some(qslug_raw) = lockfile_keys(&lf, "queues").into_iter().next() {
+    if let Some(qslug_raw) = lockfile_keys(&lf, "queues").into_iter().find(|s| s.starts_with(&prefix)) {
         // qslug_raw is composite "<ws>/<q>" with the real rdc-it-<id>- prefix
         if let Some((ws, q)) = qslug_raw.split_once('/') {
             let rel = format!("envs/test/workspaces/{ws}/queues/{q}/queue.json");
@@ -89,8 +94,8 @@ async fn live_round_trip_core() {
     // Find the label file (only one label slug under our prefix).
     let lslug = lockfile_keys(&lf, "labels")
         .into_iter()
-        .next()
-        .expect("a label slug");
+        .find(|s| s.starts_with(&prefix))
+        .expect("a label slug under this run's prefix");
     let lrel = format!("envs/test/labels/{lslug}.json");
     let mut label: serde_json::Value =
         serde_json::from_str(&project.read_to_string(&lrel).unwrap()).unwrap();

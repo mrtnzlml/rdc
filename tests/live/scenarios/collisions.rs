@@ -39,6 +39,7 @@ async fn live_collisions_identity() {
     for kind in ["queues", "schemas", "inboxes"] {
         let keys: Vec<String> = lockfile_keys(&lf, kind)
             .into_iter()
+            .filter(|s| s.starts_with(&prefix))
             .map(|s| s.replace(&prefix, "<id>"))
             .collect();
         captured.lockfile_keys.insert(kind.to_string(), keys);
@@ -51,7 +52,7 @@ async fn live_collisions_identity() {
         captured.lockfile_keys["queues"]
     );
     // and both on-disk queue files exist (distinct paths)
-    for slug in lockfile_keys(&lf, "queues") {
+    for slug in lockfile_keys(&lf, "queues").into_iter().filter(|s| s.starts_with(&prefix)) {
         let (ws, q) = slug
             .split_once('/')
             .unwrap_or_else(|| panic!("queue slug '{slug}' expected ws/queue composite form"));
@@ -71,6 +72,7 @@ async fn live_collisions_identity() {
     let lf2 = load_lockfile(project.path(), "test").expect("lockfile2");
     let slugs_after: Vec<String> = lockfile_keys(&lf2, "queues")
         .into_iter()
+        .filter(|s| s.starts_with(&prefix))
         .map(|s| s.replace(&prefix, "<id>"))
         .collect();
     assert_eq!(
