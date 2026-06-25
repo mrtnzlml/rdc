@@ -124,15 +124,21 @@ impl LiveClient {
     }
 
     /// Fetch one object as raw JSON (typed getter -> Value).
+    /// Kinds with a direct GET endpoint use it; kinds that only have a list
+    /// endpoint ("queue", "label") fall through to `find_listed_value`.
     pub async fn get_value(&self, kind: &str, id: u64) -> Result<serde_json::Value> {
-        let v = match kind {
-            "workspace" => serde_json::to_value(self.inner.get_workspace(id, None).await?)?,
-            "hook" => serde_json::to_value(self.inner.get_hook(id, None).await?)?,
-            "schema" => serde_json::to_value(self.inner.get_schema(id, None).await?)?,
-            "inbox" => serde_json::to_value(self.inner.get_inbox(id, None).await?)?,
-            other => return Err(anyhow!("get_value: unsupported kind '{other}'")),
-        };
-        Ok(v)
+        match kind {
+            "workspace" => Ok(serde_json::to_value(self.inner.get_workspace(id, None).await?)?),
+            "hook" => Ok(serde_json::to_value(self.inner.get_hook(id, None).await?)?),
+            "schema" => Ok(serde_json::to_value(self.inner.get_schema(id, None).await?)?),
+            "inbox" => Ok(serde_json::to_value(self.inner.get_inbox(id, None).await?)?),
+            // "queue" has no GET-by-id endpoint; use the list-based fallback.
+            "queue" => self
+                .find_listed_value("queue", id)
+                .await?
+                .ok_or_else(|| anyhow!("get_value: queue {id} not found")),
+            other => Err(anyhow!("get_value: unsupported kind '{other}'")),
+        }
     }
 
     /// PATCH only the `name` field of an object via the generic value endpoint.
