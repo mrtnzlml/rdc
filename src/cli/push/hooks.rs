@@ -53,6 +53,7 @@ pub async fn push(
     interactive: bool,
     changes: &BTreeMap<String, std::path::PathBuf>,
     catalog_hooks: &[crate::model::Hook],
+    relink: &mut Vec<crate::cli::push::relink::DeferredRelink>,
     progress: &Arc<Log>,
     env: &str,
 ) -> Result<(usize, usize)> {
@@ -109,7 +110,11 @@ pub async fn push(
             // Read + portabilize refs once; reused by both paths.
             let mut payload = read_hook_value(&hooks_dir, slug)
                 .with_context(|| format!("reading local hook '{slug}' for create"))?;
-            crate::snapshot::refs::resolve_value(&mut payload, lockfile);
+            // Two-phase relink: resolve what we can; defer top-level fields whose
+            // rdc:// refs target a hook not yet created (e.g. `run_after` pointing
+            // at another new hook). The relink pass PATCHes them once all hooks
+            // exist. (Patch path intentionally not deferred — see plan ① scope.)
+            let deferred = crate::snapshot::refs::resolve_value_deferring(&mut payload, lockfile);
 
             // Anomaly guard, then dispatch on extension type.
             let typed: crate::model::Hook = serde_json::from_value(payload.clone())
@@ -222,6 +227,14 @@ pub async fn push(
                     secrets_hash: Some(created_secrets_hash),
                 },
             );
+            if !deferred.is_empty() {
+                relink.push(crate::cli::push::relink::DeferredRelink {
+                    kind: "hooks".to_string(),
+                    slug: slug.clone(),
+                    path: local_json_path.clone(),
+                    fields: deferred,
+                });
+            }
             progress.event(Action::Post, &format!("hook/{slug} id={}", created.id));
             pushed += 1;
             continue;

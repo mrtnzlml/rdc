@@ -68,7 +68,7 @@ pub(crate) async fn push_classified(
     // `secrets/<env>.hook-secrets.json` that aren't accompanied by a
     // hook JSON/code edit. The function returns (0, 0) when neither
     // content nor secrets have drifted.
-    hooks::push(paths, client, lockfile, interactive, &changes.hooks, catalog_hooks, progress, env)
+    hooks::push(paths, client, lockfile, interactive, &changes.hooks, catalog_hooks, relink, progress, env)
         .await
         .with_context(|| format!("pushing hooks for env '{env}'"))?;
     if !changes.rules.is_empty() {
