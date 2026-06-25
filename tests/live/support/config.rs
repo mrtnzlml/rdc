@@ -1,7 +1,7 @@
 use std::sync::{Mutex, OnceLock};
 
 /// Serializes tests that mutate process-global env vars.
-fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
