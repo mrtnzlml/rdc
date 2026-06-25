@@ -31,6 +31,13 @@ impl RunId {
     pub fn marker() -> &'static str {
         "rdc-it-"
     }
+
+    /// Exact prefix shared by every object this run creates, including the
+    /// trailing separator: `rdc-it-<id>-`. Use this for list/match/teardown so
+    /// a shorter run-id can never prefix-match a longer run-id's objects.
+    pub fn list_prefix(&self) -> String {
+        format!("{}{}-", Self::marker(), self.0)
+    }
 }
 
 fn to_base36(mut n: u128) -> String {
@@ -60,5 +67,21 @@ mod tests {
         // the id segment is lowercase alnum
         assert!(id.as_str().chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
         assert!(!id.as_str().is_empty());
+    }
+
+    #[test]
+    fn list_prefix_ends_with_dash_and_is_leading_portion_of_prefix() {
+        let id = RunId::new();
+        let lp = id.list_prefix();
+        // must start with the stable marker
+        assert!(lp.starts_with(RunId::marker()), "list_prefix must start with marker()");
+        // must end with a dash separator
+        assert!(lp.ends_with('-'), "list_prefix must end with '-'");
+        // every per-name prefix must start with list_prefix
+        let p = id.prefix("anything");
+        assert!(
+            p.starts_with(&lp),
+            "prefix(\"anything\") = {p:?} should start with list_prefix = {lp:?}"
+        );
     }
 }
