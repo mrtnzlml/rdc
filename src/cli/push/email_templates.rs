@@ -26,7 +26,11 @@ pub async fn push(
 
     // slug (lockfile_key) = "ws_slug/q_slug/template_slug"
     for (lockfile_key, template_path) in changes {
-        // Missing lockfile entry → new email template, POST.
+        // Missing lockfile entry → try to adopt an existing remote template
+        // (Rossum auto-creates typed defaults per queue; blind POST → 400 or
+        // duplicate). Match on type+queue (or name+queue for custom types),
+        // then PATCH local content into the adopted id. Fall through to POST
+        // only when there is genuinely no matching remote template.
         if lockfile
             .objects
             .get("email_templates")
@@ -38,39 +42,135 @@ pub async fn push(
             let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
                 .with_context(|| format!("parsing {}", template_path.display()))?;
             crate::snapshot::refs::resolve_value(&mut payload, lockfile);
+
+            // Identify the local template's queue + match key BEFORE stripping.
+            let local: crate::model::EmailTemplate = serde_json::from_value(payload.clone())
+                .with_context(|| {
+                    format!("deserializing local email template '{lockfile_key}'")
+                })?;
+            let local_type = local.extra.get("type").and_then(|v| v.as_str());
+            let local_queue = local.queue.clone();
+
+            // Populate the remote cache once (shared with the PATCH branch).
+            if remote_cache.is_empty() {
+                for r in client
+                    .list_email_templates(Some(progress.clone()))
+                    .await
+                    .context("listing email templates to adopt server-managed defaults")?
+                {
+                    remote_cache.insert(r.id, r);
+                }
+            }
+
+            // Match an existing remote template on the SAME queue by `type`
+            // (unless "custom") else by `name`. Rossum auto-creates default
+            // templates per queue (some unique-typed → POST 400s; the custom
+            // ones → silent duplicates), so adopt rather than POST.
+            let adopt = remote_cache
+                .values()
+                .find(|r| {
+                    r.queue == local_queue
+                        && match local_type {
+                            Some(t) if t != "custom" => {
+                                r.extra.get("type").and_then(|v| v.as_str()) == Some(t)
+                            }
+                            _ => r.name == local.name,
+                        }
+                })
+                .cloned();
+
+            if let Some(remote) = adopt {
+                // Adopt the remote id into the lockfile, then PATCH local content.
+                let id = remote.id;
+                let mut to_send = local.clone();
+                strip_patch_extra(&mut to_send.extra, "email_templates", false);
+                let updated = client
+                    .update_email_template(id, &to_send, Some(progress.clone()))
+                    .await
+                    .with_context(|| {
+                        format!("PATCH /email_templates/{id} (adopting existing)")
+                    })?;
+                let codec = crate::snapshot::codec::codec("email_templates").unwrap();
+                let updated_art = codec
+                    .disk_bytes(
+                        &serde_json::to_value(&updated)
+                            .context("serializing adopted email template")?,
+                    )
+                    .context("codec disk_bytes for adopted email template")?;
+                let updated_hash =
+                    combined_hash(&updated_art.json, &updated_art.sidecars, lockfile);
+                crate::state::base_cache::write_disk_and_cache(
+                    paths,
+                    template_path,
+                    &updated_art.json,
+                )
+                .with_context(|| format!("writing adopted form for '{lockfile_key}'"))?;
+                lockfile.upsert(
+                    "email_templates",
+                    lockfile_key,
+                    ObjectEntry {
+                        id,
+                        modified_at: updated.modified_at().map(|s| s.to_string()),
+                        content_hash: Some(updated_hash),
+                        secrets_hash: None,
+                    },
+                );
+                progress.event(
+                    Action::Patch,
+                    &format!("email_template/{lockfile_key} adopted existing id={id}"),
+                );
+                pushed += 1;
+                continue;
+            }
+
+            // No existing match → POST as before (skip-and-continue on failure).
             strip_for_create(&mut payload, "email_templates");
-            let create_result = client
+            match client
                 .create_email_template(&payload, Some(progress.clone()))
                 .await
-                .with_context(|| format!("POST /email_templates (creating '{lockfile_key}')"));
-            let created = create_result?;
-            let codec = crate::snapshot::codec::codec("email_templates").unwrap();
-            let created_art = codec
-                .disk_bytes(
-                    &serde_json::to_value(&created)
-                        .context("serializing created email template")?,
-                )
-                .context("codec disk_bytes for created email template")?;
-            let created_bytes = created_art.json;
-            let created_hash = combined_hash(&created_bytes, &created_art.sidecars, lockfile);
-            write_atomic(template_path, &created_bytes).with_context(|| {
-                format!("writing post-create canonical form for '{lockfile_key}'")
-            })?;
-            lockfile.upsert(
-                "email_templates",
-                lockfile_key,
-                ObjectEntry {
-                    id: created.id,
-                    modified_at: created.modified_at().map(|s| s.to_string()),
-                    content_hash: Some(created_hash),
-                    secrets_hash: None,
-                },
-            );
-            progress.event(
-                Action::Post,
-                &format!("email_template/{lockfile_key} id={}", created.id),
-            );
-            pushed += 1;
+            {
+                Ok(created) => {
+                    let codec = crate::snapshot::codec::codec("email_templates").unwrap();
+                    let created_art = codec
+                        .disk_bytes(
+                            &serde_json::to_value(&created)
+                                .context("serializing created email template")?,
+                        )
+                        .context("codec disk_bytes for created email template")?;
+                    let created_bytes = created_art.json;
+                    let created_hash =
+                        combined_hash(&created_bytes, &created_art.sidecars, lockfile);
+                    write_atomic(template_path, &created_bytes).with_context(|| {
+                        format!("writing post-create canonical form for '{lockfile_key}'")
+                    })?;
+                    lockfile.upsert(
+                        "email_templates",
+                        lockfile_key,
+                        ObjectEntry {
+                            id: created.id,
+                            modified_at: created.modified_at().map(|s| s.to_string()),
+                            content_hash: Some(created_hash),
+                            secrets_hash: None,
+                        },
+                    );
+                    progress.event(
+                        Action::Post,
+                        &format!("email_template/{lockfile_key} id={}", created.id),
+                    );
+                    pushed += 1;
+                }
+                Err(e) => {
+                    // Skip-and-continue (mirror the DELETE driver): a stray 400
+                    // (e.g. unique-type conflict) must not abort the whole push.
+                    progress.event(
+                        Action::Warn,
+                        &format!(
+                            "email_template/{lockfile_key} create failed (skipped): {e:#}"
+                        ),
+                    );
+                    skipped += 1;
+                }
+            }
             continue;
         }
 

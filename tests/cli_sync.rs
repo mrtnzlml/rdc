@@ -8622,7 +8622,12 @@ async fn push_create_inbox_and_email_template() {
         .and(path("/api/v1/email_templates"))
         .respond_with(move |_req: &Request| {
             let n = counter.fetch_add(1, Ordering::SeqCst);
-            let body = if n < 2 {
+            // List call sequence (with adopt-or-POST logic):
+            //   n=0: initial pull's list (empty → nothing to pull)
+            //   n=1: second sync's pull list (empty → still LocalCreate)
+            //   n=2: second sync's push adopt-check list (empty → no match → POST)
+            //   n=3+: third sync's pull list (returns created template → Clean)
+            let body = if n < 3 {
                 serde_json::json!({ "pagination": { "next": null }, "results": [] })
             } else {
                 serde_json::json!({
@@ -9258,5 +9263,353 @@ async fn sync_push_hook_run_after_deferred_relink() {
         !relink_patch.to_string().contains("rdc://"),
         "no unresolved rdc:// refs must remain in the relink PATCH body;\ngot: {}",
         serde_json::to_string_pretty(relink_patch).unwrap()
+    );
+}
+
+/// Push-side adopt path: when a local email_template has no lockfile entry
+/// but a remote template with the same `type` (and same `queue`) already
+/// exists, `sync` must adopt it via PATCH instead of POST.
+///
+/// The server auto-creates typed default templates for every queue (e.g.
+/// `rejection_default`). Blindly POSTing them hits a 400 / creates
+/// duplicates. The adopt path: list remote templates, match on type+queue,
+/// adopt the remote id into the lockfile, PATCH local content.
+#[tokio::test]
+async fn sync_push_email_template_adopts_existing_by_type() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let ws_url = format!("{}/api/v1/workspaces/800", server.uri());
+    let queue_url = format!("{}/api/v1/queues/100", server.uri());
+    let schema_url = format!("{}/api/v1/schemas/200", server.uri());
+
+    let workspaces_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [{
+            "id": 800, "url": ws_url, "name": "Invoices AP",
+            "organization": format!("{}/api/v1/organizations/1", server.uri()),
+            "queues": [queue_url.clone()], "modified_at": "2026-04-20T08:00:00Z"
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(workspaces_body))
+        .mount(&server)
+        .await;
+
+    let queues_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [{
+            "id": 100, "url": queue_url.clone(), "name": "Cost Invoices",
+            "workspace": format!("{}/api/v1/workspaces/800", server.uri()),
+            "schema": schema_url.clone(),
+            "modified_at": "2026-04-20T08:00:00Z"
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(queues_body))
+        .mount(&server)
+        .await;
+
+    let schema_body = serde_json::json!({
+        "id": 200, "url": schema_url.clone(), "name": "Cost Invoices Schema",
+        "queues": [queue_url.clone()],
+        "content": [
+            { "category": "section", "id": "header", "label": "Header", "children": [
+                { "category": "datapoint", "id": "invoice_id", "type": "string" }
+            ]}
+        ],
+        "modified_at": "2026-04-10T09:00:00Z"
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schemas/200"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(schema_body))
+        .mount(&server)
+        .await;
+
+    // The remote already has a `rejection_default` template for this queue.
+    let existing_remote_tpl = serde_json::json!({
+        "id": 555,
+        "url": format!("{}/api/v1/email_templates/555", server.uri()),
+        "name": "Default Rejection Template",
+        "subject": "remote subject",
+        "queue": queue_url.clone(),
+        "type": "rejection_default",
+        "modified_at": "2026-04-20T08:00:00Z"
+    });
+
+    // Stateful listing: always returns the existing remote template.
+    let existing_tpl_for_list = existing_remote_tpl.clone();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/email_templates"))
+        .respond_with(move |_req: &Request| {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+                "results": [existing_tpl_for_list.clone()]
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    // PATCH /email_templates/555 → echoes back the template with id 555.
+    let patched_tpl = serde_json::json!({
+        "id": 555,
+        "url": format!("{}/api/v1/email_templates/555", server.uri()),
+        "name": "Default Rejection Template",
+        "subject": "local subject",
+        "queue": queue_url.clone(),
+        "type": "rejection_default",
+        "modified_at": "2026-05-01T08:00:00Z"
+    });
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/email_templates/555"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&patched_tpl))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // POST must NOT be called (adopt path taken).
+    Mock::given(method("POST"))
+        .and(path("/api/v1/email_templates"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({"detail": "should not be called"})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(
+        &server,
+        &[
+            "/api/v1/workspaces",
+            "/api/v1/queues",
+            "/api/v1/email_templates",
+        ],
+    )
+    .await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // Initial pull: lands workspace+queue+schema in the lockfile (Clean).
+    let pull = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+
+    // Seed the new email template file with `rejection_default` type.
+    let q_dir = project
+        .path()
+        .join("envs/dev/workspaces/invoices-ap/queues/cost-invoices");
+    let tpl_dir = q_dir.join("email-templates");
+    std::fs::create_dir_all(&tpl_dir).unwrap();
+    let tpl_json = serde_json::json!({
+        "id": 0, "url": "",
+        "name": "Default Rejection Template",
+        "subject": "local subject",
+        "queue": "rdc://queues/cost-invoices",
+        "type": "rejection_default"
+    });
+    let mut b = serde_json::to_vec_pretty(&tpl_json).unwrap();
+    b.push(b'\n');
+    std::fs::write(tpl_dir.join("rejection-default.json"), &b).unwrap();
+
+    // Sync: the template has no lockfile entry; the remote has a
+    // `rejection_default` for queue/100 → adopt path → PATCH, no POST.
+    let r2 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    pull.expect("initial pull must succeed");
+    r2.expect("adopt sync must succeed");
+
+    // Lockfile now has the adopted remote id (555).
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    let lf: serde_json::Value = serde_json::from_str(&lf_raw).unwrap();
+    assert_eq!(
+        lf.pointer("/objects/email_templates/invoices-ap~1cost-invoices~1rejection-default/id"),
+        Some(&serde_json::json!(555)),
+        "lockfile must record the adopted id 555; lockfile: {lf_raw}"
+    );
+}
+
+/// Push-side no-match path: when the remote listing has no template with
+/// a matching type+queue, `sync` must fall through to POST (create new).
+#[tokio::test]
+async fn sync_push_email_template_posts_when_no_match() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let ws_url = format!("{}/api/v1/workspaces/800", server.uri());
+    let queue_url = format!("{}/api/v1/queues/100", server.uri());
+    let schema_url = format!("{}/api/v1/schemas/200", server.uri());
+
+    let workspaces_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [{
+            "id": 800, "url": ws_url, "name": "Invoices AP",
+            "organization": format!("{}/api/v1/organizations/1", server.uri()),
+            "queues": [queue_url.clone()], "modified_at": "2026-04-20T08:00:00Z"
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(workspaces_body))
+        .mount(&server)
+        .await;
+
+    let queues_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [{
+            "id": 100, "url": queue_url.clone(), "name": "Cost Invoices",
+            "workspace": format!("{}/api/v1/workspaces/800", server.uri()),
+            "schema": schema_url.clone(),
+            "modified_at": "2026-04-20T08:00:00Z"
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(queues_body))
+        .mount(&server)
+        .await;
+
+    let schema_body = serde_json::json!({
+        "id": 200, "url": schema_url.clone(), "name": "Cost Invoices Schema",
+        "queues": [queue_url.clone()],
+        "content": [
+            { "category": "section", "id": "header", "label": "Header", "children": [
+                { "category": "datapoint", "id": "invoice_id", "type": "string" }
+            ]}
+        ],
+        "modified_at": "2026-04-10T09:00:00Z"
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schemas/200"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(schema_body))
+        .mount(&server)
+        .await;
+
+    // The remote has a DIFFERENT type template — no match for `rejection_default`.
+    let remote_other_tpl = serde_json::json!({
+        "id": 600,
+        "url": format!("{}/api/v1/email_templates/600", server.uri()),
+        "name": "Confirmation Email",
+        "subject": "Your invoice was confirmed",
+        "queue": queue_url.clone(),
+        "type": "email_with_no_processable_attachments",
+        "modified_at": "2026-04-20T08:00:00Z"
+    });
+
+    let remote_other_for_list = remote_other_tpl.clone();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/email_templates"))
+        .respond_with(move |_req: &Request| {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+                "results": [remote_other_for_list.clone()]
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    // POST must be called exactly once (no remote match → create new).
+    let created_tpl = serde_json::json!({
+        "id": 9001,
+        "url": format!("{}/api/v1/email_templates/9001", server.uri()),
+        "name": "Default Rejection Template",
+        "subject": "local subject",
+        "queue": queue_url.clone(),
+        "type": "rejection_default",
+        "modified_at": "2026-05-01T08:00:00Z"
+    });
+    Mock::given(method("POST"))
+        .and(path("/api/v1/email_templates"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(&created_tpl))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(
+        &server,
+        &[
+            "/api/v1/workspaces",
+            "/api/v1/queues",
+            "/api/v1/email_templates",
+        ],
+    )
+    .await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    let pull = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+
+    let q_dir = project
+        .path()
+        .join("envs/dev/workspaces/invoices-ap/queues/cost-invoices");
+    let tpl_dir = q_dir.join("email-templates");
+    std::fs::create_dir_all(&tpl_dir).unwrap();
+    let tpl_json = serde_json::json!({
+        "id": 0, "url": "",
+        "name": "Default Rejection Template",
+        "subject": "local subject",
+        "queue": "rdc://queues/cost-invoices",
+        "type": "rejection_default"
+    });
+    let mut b = serde_json::to_vec_pretty(&tpl_json).unwrap();
+    b.push(b'\n');
+    std::fs::write(tpl_dir.join("rejection-default.json"), &b).unwrap();
+
+    // Sync: no matching remote template → must POST.
+    let r2 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    pull.expect("initial pull must succeed");
+    r2.expect("post (no-match) sync must succeed");
+
+    // Lockfile records the newly created id.
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    let lf: serde_json::Value = serde_json::from_str(&lf_raw).unwrap();
+    assert_eq!(
+        lf.pointer("/objects/email_templates/invoices-ap~1cost-invoices~1rejection-default/id"),
+        Some(&serde_json::json!(9001)),
+        "lockfile must record the newly created id 9001; lockfile: {lf_raw}"
     );
 }
