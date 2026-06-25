@@ -36,12 +36,13 @@ async fn live_sidecars_redaction() {
     );
 
     let lf = load_lockfile(project.path(), "test").expect("lockfile");
+    let prefix = run_id.list_prefix();
 
     // hook: a .py sidecar exists and config.code is absent from JSON
     let hslug = lockfile_keys(&lf, "hooks")
         .into_iter()
-        .find(|s| s.contains("validator") && !s.contains("post"))
-        .expect("validator hook not found in lockfile");
+        .find(|s| s.starts_with(&prefix) && s.contains("validator") && !s.contains("post"))
+        .expect("validator hook for this run not found in lockfile");
     assert!(
         project.exists(&format!("envs/test/hooks/{hslug}.py")),
         "hook .py sidecar must exist at envs/test/hooks/{hslug}.py"
@@ -55,8 +56,8 @@ async fn live_sidecars_redaction() {
     // schema: formula extracted to formulas/amount_total.py (under the queue path)
     let qslug = lockfile_keys(&lf, "queues")
         .into_iter()
-        .next()
-        .expect("no queues found in lockfile");
+        .find(|s| s.starts_with(&prefix))
+        .expect("no queues for this run found in lockfile");
     let (ws, q) = qslug
         .split_once('/')
         .expect("queue slug must be composite <workspace>/<queue>");
@@ -69,8 +70,8 @@ async fn live_sidecars_redaction() {
     // rule: trigger_condition extracted to a sidecar
     let rslug = lockfile_keys(&lf, "rules")
         .into_iter()
-        .next()
-        .expect("no rules found in lockfile");
+        .find(|s| s.starts_with(&prefix))
+        .expect("no rules for this run found in lockfile");
     assert!(
         project.exists(&format!("envs/test/rules/{rslug}.trigger_condition")),
         "rule trigger_condition sidecar must exist at envs/test/rules/{rslug}.trigger_condition"
