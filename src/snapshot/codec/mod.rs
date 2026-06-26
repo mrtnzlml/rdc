@@ -19,6 +19,7 @@ mod hooks;
 mod inboxes;
 mod labels;
 mod mdh;
+pub(crate) use mdh::normalize_search_index;
 mod organization;
 mod queues;
 mod rules;
