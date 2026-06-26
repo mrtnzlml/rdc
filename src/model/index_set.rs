@@ -4,7 +4,7 @@ use serde_json::Value;
 /// The set of indexes on an MDH collection. Regular MongoDB indexes and Atlas
 /// Search indexes have different shapes; both are stored as opaque `Value`s
 /// for forward-compat (definitions can change without breaking round-trip).
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Default)]
 pub struct IndexSet {
     /// Regular MongoDB indexes (b-tree, hashed, geo, etc.)
     #[serde(default)]

@@ -308,6 +308,22 @@ fn diff_for_dataset(
     )
 }
 
+/// Build a name→def map, optionally filtering the implicit `_id_` regular
+/// index (server-managed, can't be dropped). Shared by the 2-way mirror diff
+/// and the 3-way base-aware diff.
+fn index_by_name(items: &[Value], filter_id_index: bool) -> BTreeMap<String, &Value> {
+    let mut out: BTreeMap<String, &Value> = BTreeMap::new();
+    for ix in items {
+        if let Some(name) = ix.get("name").and_then(|v| v.as_str()) {
+            if filter_id_index && name == "_id_" {
+                continue;
+            }
+            out.insert(name.to_string(), ix);
+        }
+    }
+    out
+}
+
 /// Pure index-set diff. `mirror` controls only the pruning of entries that
 /// exist remotely but not locally:
 ///   - `mirror == true`  → drop remote-only entries (make remote == local
@@ -325,18 +341,6 @@ pub(crate) fn diff_indexes(
     remote_search: &[Value],
     mirror: bool,
 ) -> DiffPlan {
-    fn index_by_name(items: &[Value], filter_id_index: bool) -> BTreeMap<String, &Value> {
-        let mut out: BTreeMap<String, &Value> = BTreeMap::new();
-        for ix in items {
-            if let Some(name) = ix.get("name").and_then(|v| v.as_str()) {
-                if filter_id_index && name == "_id_" {
-                    continue;
-                }
-                out.insert(name.to_string(), ix);
-            }
-        }
-        out
-    }
     let local_reg = index_by_name(local_regular, true);
     let remote_reg = index_by_name(remote_regular, true);
     let local_search_map = index_by_name(local_search, false);
@@ -399,6 +403,97 @@ pub(crate) fn diff_indexes(
         }
     }
     plan
+}
+
+/// Result of the base-aware (3-way) within-env index diff. `plan` carries
+/// creates and changed-definition drop+recreate pairs (always applied);
+/// `pending_*_deletes` carries genuine user removals (in base, gone from
+/// local, still on remote) which are GATED behind `--allow-deletes`.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Default)]
+pub(crate) struct ThreeWayDiff {
+    pub plan: DiffPlan,
+    pub pending_regular_deletes: Vec<String>,
+    pub pending_search_deletes: Vec<String>,
+}
+
+/// Base-aware diff for the within-env push driver. Unlike `diff_indexes`
+/// (2-way mirror), this distinguishes a *user removal* (index was in the
+/// last-synced base, removed locally, still on remote) from an *admin
+/// addition* (index appeared on remote, never in base or local). The former
+/// is a gated pending delete; the latter is left untouched.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn diff_indexes_3way(
+    base_regular: &[Value],
+    base_search: &[Value],
+    local_regular: &[Value],
+    local_search: &[Value],
+    remote_regular: &[Value],
+    remote_search: &[Value],
+) -> ThreeWayDiff {
+    let mut out = ThreeWayDiff::default();
+    diff_one_kind(
+        base_regular,
+        local_regular,
+        remote_regular,
+        true, // filter the implicit _id_ regular index
+        &mut out.plan.drop_regular,
+        &mut out.plan.create_regular,
+        &mut out.pending_regular_deletes,
+    );
+    diff_one_kind(
+        base_search,
+        local_search,
+        remote_search,
+        false,
+        &mut out.plan.drop_search,
+        &mut out.plan.create_search,
+        &mut out.pending_search_deletes,
+    );
+    out
+}
+
+/// Core 3-way classification for one index kind (regular or search).
+/// `drops`/`creates` receive always-applied changed-def recreate pairs and
+/// local-only creates; `pending_deletes` receives gated user removals.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn diff_one_kind(
+    base: &[Value],
+    local: &[Value],
+    remote: &[Value],
+    filter_id: bool,
+    drops: &mut Vec<String>,
+    creates: &mut Vec<Value>,
+    pending_deletes: &mut Vec<String>,
+) {
+    let base_map = index_by_name(base, filter_id);
+    let local_map = index_by_name(local, filter_id);
+    let remote_map = index_by_name(remote, filter_id);
+
+    // Creates + changed-def recreate, driven by local (BTreeMap → sorted,
+    // deterministic).
+    for (name, local_def) in &local_map {
+        match remote_map.get(name) {
+            None => creates.push((*local_def).clone()), // local-only
+            Some(remote_def) => {
+                if !defs_equivalent(local_def, remote_def) {
+                    drops.push(name.clone());
+                    creates.push((*local_def).clone());
+                }
+            }
+        }
+    }
+    // Removals, driven by remote-only entries.
+    for name in remote_map.keys() {
+        if local_map.contains_key(name) {
+            continue; // present locally → handled above
+        }
+        // Remote-only: a genuine user removal ONLY if it was in the base.
+        // Not in base ⇒ admin-added ⇒ survive (never dropped).
+        if base_map.contains_key(name) {
+            pending_deletes.push(name.clone());
+        }
+    }
 }
 
 /// Two index definitions are equivalent under the server-set `v`
@@ -600,5 +695,110 @@ mod tests {
             plan.drop_search.is_empty(),
             "remote-only search index must survive without mirror: {plan:?}"
         );
+    }
+
+    // --- 3-way (base-aware) diff: the within-env safe-push semantics ---
+
+    #[test]
+    fn three_way_admin_added_remote_only_survives() {
+        // Admin added ix_admin remotely; it's not in base and not in local.
+        // It must NOT be dropped and must NOT become a pending delete.
+        let base = vec![ix("ix_keep", json!({"k": 1}))];
+        let local = vec![ix("ix_keep", json!({"k": 1}))];
+        let remote = vec![ix("ix_keep", json!({"k": 1})), ix("ix_admin", json!({"a": 1}))];
+        let d = diff_indexes_3way(&base, &[], &local, &[], &remote, &[]);
+        assert!(d.plan.drop_regular.is_empty(), "{d:?}");
+        assert!(d.pending_regular_deletes.is_empty(), "{d:?}");
+        assert!(d.plan.create_regular.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn three_way_user_removed_index_is_pending_delete() {
+        // ix_gone was in base, removed from local, still on remote -> pending.
+        let base = vec![ix("ix_keep", json!({"k": 1})), ix("ix_gone", json!({"g": 1}))];
+        let local = vec![ix("ix_keep", json!({"k": 1}))];
+        let remote = vec![ix("ix_keep", json!({"k": 1})), ix("ix_gone", json!({"g": 1}))];
+        let d = diff_indexes_3way(&base, &[], &local, &[], &remote, &[]);
+        assert_eq!(d.pending_regular_deletes, vec!["ix_gone".to_string()]);
+        assert!(d.plan.drop_regular.is_empty(), "pending != plan-drop: {d:?}");
+        assert!(d.plan.create_regular.is_empty());
+    }
+
+    #[test]
+    fn three_way_local_only_index_is_created() {
+        let base = vec![];
+        let local = vec![ix("ix_new", json!({"n": 1}))];
+        let remote = vec![];
+        let d = diff_indexes_3way(&base, &[], &local, &[], &remote, &[]);
+        assert_eq!(d.plan.create_regular.len(), 1);
+        assert!(d.plan.drop_regular.is_empty());
+        assert!(d.pending_regular_deletes.is_empty());
+    }
+
+    #[test]
+    fn three_way_changed_def_is_drop_and_create_not_pending() {
+        // Same name, diverging def -> always drop+recreate, never gated.
+        let base = vec![ix("ix_x", json!({"x": 1}))];
+        let local = vec![ix("ix_x", json!({"x": -1}))];
+        let remote = vec![ix("ix_x", json!({"x": 1}))];
+        let d = diff_indexes_3way(&base, &[], &local, &[], &remote, &[]);
+        assert_eq!(d.plan.drop_regular, vec!["ix_x".to_string()]);
+        assert_eq!(d.plan.create_regular.len(), 1);
+        assert!(d.pending_regular_deletes.is_empty());
+    }
+
+    #[test]
+    fn three_way_no_base_never_pends_deletes() {
+        // No base (empty) + a remote-only index not in local -> can't prove a
+        // user removal, so NO pending delete (strictly-safe fallback). A local
+        // create still happens.
+        let base = vec![];
+        let local = vec![ix("ix_new", json!({"n": 1}))];
+        let remote = vec![ix("ix_admin", json!({"a": 1}))];
+        let d = diff_indexes_3way(&base, &[], &local, &[], &remote, &[]);
+        assert_eq!(d.plan.create_regular.len(), 1, "local-only still created: {d:?}");
+        assert!(d.pending_regular_deletes.is_empty(), "no base => no pending: {d:?}");
+        assert!(d.plan.drop_regular.is_empty());
+    }
+
+    #[test]
+    fn three_way_id_index_filtered_on_all_sides() {
+        let base = vec![ix("_id_", json!({"_id": 1}))];
+        let local = vec![ix("_id_", json!({"_id": 1}))];
+        let remote = vec![ix("_id_", json!({"_id": 1}))];
+        let d = diff_indexes_3way(&base, &[], &local, &[], &remote, &[]);
+        assert!(d.plan.drop_regular.is_empty());
+        assert!(d.plan.create_regular.is_empty());
+        assert!(d.pending_regular_deletes.is_empty());
+    }
+
+    #[test]
+    fn three_way_v_only_diff_is_noop() {
+        let base = vec![json!({"name": "ix_y", "key": {"y": 1}})];
+        let local = vec![json!({"name": "ix_y", "key": {"y": 1}})];
+        let remote = vec![json!({"name": "ix_y", "key": {"y": 1}, "v": 2})];
+        let d = diff_indexes_3way(&base, &[], &local, &[], &remote, &[]);
+        assert!(d.plan.drop_regular.is_empty(), "{d:?}");
+        assert!(d.plan.create_regular.is_empty(), "{d:?}");
+        assert!(d.pending_regular_deletes.is_empty());
+    }
+
+    #[test]
+    fn three_way_search_user_removed_is_pending() {
+        let s = |name: &str, dynamic: bool| json!({"name": name, "mappings": {"dynamic": dynamic}});
+        let base = vec![s("sx_gone", true)];
+        let local: Vec<serde_json::Value> = vec![];
+        let remote = vec![s("sx_gone", true)];
+        let d = diff_indexes_3way(&[], &base, &[], &local, &[], &remote);
+        assert_eq!(d.pending_search_deletes, vec!["sx_gone".to_string()]);
+        assert!(d.plan.drop_search.is_empty());
+    }
+
+    #[test]
+    fn three_way_search_admin_added_survives() {
+        let s = |name: &str, dynamic: bool| json!({"name": name, "mappings": {"dynamic": dynamic}});
+        let d = diff_indexes_3way(&[], &[], &[], &[], &[], &[s("sx_admin", true)]);
+        assert!(d.pending_search_deletes.is_empty(), "{d:?}");
+        assert!(d.plan.drop_search.is_empty());
     }
 }
