@@ -269,6 +269,20 @@ cargo test --test live live_janitor_sweep -- --ignored
 > stays referenced (and so undeletable) until the queue actually purges — that
 > transient schema orphan is expected, not an `rdc` defect.
 
+Master Data Hub (MDH) index coverage runs against a per-run throwaway
+collection (`rdc_it_<run-id>_mdh`), created and dropped out-of-band so the
+suite never touches a real collection; the janitor sweeps any leftover
+`rdc_it_*` collections. The scenario exercises pull round-trip, index
+create/modify, the gated delete, and admin-added survival.
+
+> Within-env MDH push is **base-aware** and treats index drops like every other
+> deletion: an index removed locally is dropped only with `--allow-deletes`
+> (otherwise `rdc sync` refuses, or prompts on a TTY), and an index added on the
+> remote out-of-band (e.g. by an admin) is **never** dropped, because it is
+> absent from the last-synced base. Index *modifications* (and search-index
+> definition changes) are drop-and-recreate regardless, since Data Storage has
+> no in-place update.
+
 Edge cases whose exact on-disk form is intentionally captured rather than
 predicted use golden files in `testdata/live/expected/`. To (re)capture after a
 reviewed change:
