@@ -57,6 +57,9 @@ pub async fn push_dataset(
     collection_name: &str,
     slug: &str,
     indexes_path: &Path,
+    paths: &crate::paths::Paths,
+    allow_deletes: bool,
+    interactive: bool,
     progress: &Arc<Log>,
 ) -> Result<usize> {
     let local_raw = std::fs::read(indexes_path)
@@ -64,9 +67,17 @@ pub async fn push_dataset(
     let local_set: IndexSet = serde_json::from_slice(&local_raw)
         .with_context(|| format!("parsing {}", indexes_path.display()))?;
 
-    // Fetch the live remote state directly — don't trust the lockfile
-    // baseline here, since an admin may have added indexes via the UI
-    // since the last sync and we don't want to silently drop those.
+    // Base leg of the 3-way diff: the last-synced index set, written to the
+    // base cache by the MDH pull driver. Absent (None) on a never-synced
+    // dataset → empty set → no removals can be proven (strictly safe).
+    let base_set: IndexSet = match crate::state::base_cache::read(paths, indexes_path)? {
+        Some(bytes) => serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing base cache for {}", indexes_path.display()))?,
+        None => IndexSet::default(),
+    };
+
+    // Fetch the live remote state directly so an admin's UI-added indexes are
+    // visible to the diff (and, being absent from base, preserved).
     let remote_regular = client
         .list_indexes(collection_name, Some(progress.clone()))
         .await
@@ -76,20 +87,63 @@ pub async fn push_dataset(
         .await
         .with_context(|| format!("listing search indexes for '{collection_name}'"))?;
 
-    let plan = diff_for_dataset(
+    let diff = diff_indexes_3way(
+        &base_set.regular,
+        &base_set.search,
         &local_set.regular,
         &local_set.search,
         &remote_regular,
         &remote_search,
     );
+    let mut plan = diff.plan;
+
+    // Gate genuine user-removal drops behind --allow-deletes (mirrors the
+    // global delete gate). Changed-def recreates in `plan` are NOT gated.
+    let pending = diff.pending_regular_deletes.len() + diff.pending_search_deletes.len();
+    let mut skipped = false;
+    match classify_delete_gate(pending, allow_deletes, interactive) {
+        DeleteGate::Proceed => {
+            plan.drop_regular.extend(diff.pending_regular_deletes.iter().cloned());
+            plan.drop_search.extend(diff.pending_search_deletes.iter().cloned());
+        }
+        DeleteGate::Bail => {
+            anyhow::bail!(
+                "{pending} MDH index(es) on '{collection_name}' marked for deletion but \
+                 --allow-deletes was not passed. Re-run with --allow-deletes to authorise \
+                 the destructive push, or restore {} to cancel.",
+                indexes_path.display()
+            );
+        }
+        DeleteGate::Prompt => {
+            let proceed = prompt_confirm_index_drops(
+                progress,
+                collection_name,
+                &diff.pending_regular_deletes,
+                &diff.pending_search_deletes,
+            )?;
+            if proceed {
+                plan.drop_regular.extend(diff.pending_regular_deletes.iter().cloned());
+                plan.drop_search.extend(diff.pending_search_deletes.iter().cloned());
+            } else {
+                skipped = true;
+                progress.event(
+                    Action::Skip,
+                    &format!("mdh/{slug} {pending} index deletion(s) skipped"),
+                );
+            }
+        }
+    }
 
     let ops = apply_diff(client, collection_name, slug, &plan, progress).await?;
 
-    // Push fully applied — refresh the lockfile content_hash to the
-    // canonical hash of the local bytes. The next pull-driver pass
-    // will see remote (after our writes) canonicalize-equal to local
-    // and run NoChange, so no spurious overwrite.
-    if ops > 0 {
+    // Refresh the lockfile content_hash AND the base cache only when the push
+    // fully reconciled remote to local (no skipped removals). Refreshing on a
+    // skipped removal would make the next sync's `local_hash == base` gate skip
+    // the dataset and silently forget the pending removal. Writing the base
+    // cache here restores the cache↔lockfile hash invariant (the old code
+    // refreshed the lockfile but never the base cache).
+    let fully_applied = ops > 0 && !skipped;
+    if fully_applied {
         let hash = content_hash(&local_raw, &crate::state::Lockfile::default());
         let map = lockfile
             .objects
@@ -104,6 +158,8 @@ pub async fn push_dataset(
                 secrets_hash: None,
             },
         );
+        crate::state::base_cache::write(paths, indexes_path, &local_raw)
+            .with_context(|| format!("writing base cache for mdh/{slug}"))?;
     }
 
     Ok(ops)
@@ -293,6 +349,7 @@ pub(crate) struct DiffPlan {
 
 /// Always-mirror diff for the within-env push driver (make the remote index
 /// set exactly match the local edit). Thin wrapper over [`diff_indexes`].
+#[cfg(test)]
 fn diff_for_dataset(
     local_regular: &[Value],
     local_search: &[Value],
@@ -334,6 +391,7 @@ fn index_by_name(items: &[Value], filter_id_index: bool) -> BTreeMap<String, &Va
 /// A *changed* entry (same name, diverging definition) is ALWAYS a drop +
 /// create regardless of `mirror`, because the Data Storage API has no
 /// in-place update verb.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn diff_indexes(
     local_regular: &[Value],
     local_search: &[Value],
@@ -405,11 +463,71 @@ pub(crate) fn diff_indexes(
     plan
 }
 
+/// Outcome of gating index-deletion (pure; mirrors the global delete gate
+/// `crate::cli::push::deletes::confirm_or_refuse`).
+#[derive(Debug, PartialEq)]
+pub(crate) enum DeleteGate {
+    /// Apply the pending deletes (nothing gated, or `--allow-deletes` set).
+    Proceed,
+    /// Non-interactive without `--allow-deletes`: refuse the destructive push.
+    Bail,
+    /// Interactive without `--allow-deletes`: caller must prompt [y/N].
+    Prompt,
+}
+
+/// Decide how to treat `pending` user-removal index drops, mirroring rdc's
+/// global delete gate: `--allow-deletes` ⇒ proceed; else non-TTY ⇒ bail;
+/// else (TTY) ⇒ prompt. With nothing pending, "proceed" is a no-op.
+pub(crate) fn classify_delete_gate(
+    pending: usize,
+    allow_deletes: bool,
+    interactive: bool,
+) -> DeleteGate {
+    if pending == 0 || allow_deletes {
+        return DeleteGate::Proceed;
+    }
+    if !interactive {
+        return DeleteGate::Bail;
+    }
+    DeleteGate::Prompt
+}
+
+/// Interactive [y/N] confirmation for dropping remote MDH indexes that are no
+/// longer present locally. Returns `true` to proceed with the drops.
+fn prompt_confirm_index_drops(
+    progress: &Arc<Log>,
+    collection_name: &str,
+    pending_regular: &[String],
+    pending_search: &[String],
+) -> Result<bool> {
+    progress.with_prompt(|| -> Result<bool> {
+        use std::io::Write;
+        let n = pending_regular.len() + pending_search.len();
+        eprintln!();
+        eprintln!(
+            "The following {n} MDH index(es) on '{collection_name}' would be DROPPED \
+             (no longer present locally):"
+        );
+        for name in pending_regular {
+            eprintln!("  - regular index '{name}'");
+        }
+        for name in pending_search {
+            eprintln!("  - search index '{name}'");
+        }
+        eprint!("Proceed with the drop(s)? [y/N] ");
+        std::io::stderr().flush().ok();
+        let ans = crate::cli::stdin_coord::read_line_coordinated()?
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        Ok(ans == "y" || ans == "yes")
+    })
+}
+
 /// Result of the base-aware (3-way) within-env index diff. `plan` carries
 /// creates and changed-definition drop+recreate pairs (always applied);
 /// `pending_*_deletes` carries genuine user removals (in base, gone from
 /// local, still on remote) which are GATED behind `--allow-deletes`.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Default)]
 pub(crate) struct ThreeWayDiff {
     pub plan: DiffPlan,
@@ -422,7 +540,6 @@ pub(crate) struct ThreeWayDiff {
 /// last-synced base, removed locally, still on remote) from an *admin
 /// addition* (index appeared on remote, never in base or local). The former
 /// is a gated pending delete; the latter is left untouched.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn diff_indexes_3way(
     base_regular: &[Value],
     base_search: &[Value],
@@ -456,7 +573,6 @@ pub(crate) fn diff_indexes_3way(
 /// Core 3-way classification for one index kind (regular or search).
 /// `drops`/`creates` receive always-applied changed-def recreate pairs and
 /// local-only creates; `pending_deletes` receives gated user removals.
-#[cfg_attr(not(test), allow(dead_code))]
 fn diff_one_kind(
     base: &[Value],
     local: &[Value],
@@ -800,5 +916,27 @@ mod tests {
         let d = diff_indexes_3way(&[], &[], &[], &[], &[], &[s("sx_admin", true)]);
         assert!(d.pending_search_deletes.is_empty(), "{d:?}");
         assert!(d.plan.drop_search.is_empty());
+    }
+
+    #[test]
+    fn gate_no_pending_is_proceed() {
+        assert_eq!(classify_delete_gate(0, false, false), DeleteGate::Proceed);
+        assert_eq!(classify_delete_gate(0, false, true), DeleteGate::Proceed);
+    }
+
+    #[test]
+    fn gate_allow_deletes_proceeds() {
+        assert_eq!(classify_delete_gate(3, true, false), DeleteGate::Proceed);
+        assert_eq!(classify_delete_gate(3, true, true), DeleteGate::Proceed);
+    }
+
+    #[test]
+    fn gate_noninteractive_without_flag_bails() {
+        assert_eq!(classify_delete_gate(1, false, false), DeleteGate::Bail);
+    }
+
+    #[test]
+    fn gate_interactive_without_flag_prompts() {
+        assert_eq!(classify_delete_gate(1, false, true), DeleteGate::Prompt);
     }
 }
