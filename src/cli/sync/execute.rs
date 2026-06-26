@@ -3550,6 +3550,9 @@ pub async fn run(
                         &collection.name,
                         slug,
                         &indexes_path,
+                        ctx.paths,
+                        allow_deletes,
+                        ctx.interactive,
                         progress,
                     )
                     .await
