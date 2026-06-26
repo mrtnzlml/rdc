@@ -347,27 +347,8 @@ pub(crate) struct DiffPlan {
     pub create_search: Vec<Value>,
 }
 
-/// Always-mirror diff for the within-env push driver (make the remote index
-/// set exactly match the local edit). Thin wrapper over [`diff_indexes`].
-#[cfg(test)]
-fn diff_for_dataset(
-    local_regular: &[Value],
-    local_search: &[Value],
-    remote_regular: &[Value],
-    remote_search: &[Value],
-) -> DiffPlan {
-    diff_indexes(
-        local_regular,
-        local_search,
-        remote_regular,
-        remote_search,
-        true,
-    )
-}
-
 /// Build a name→def map, optionally filtering the implicit `_id_` regular
-/// index (server-managed, can't be dropped). Shared by the 2-way mirror diff
-/// and the 3-way base-aware diff.
+/// index (server-managed, can't be dropped). Used by the 3-way base-aware diff.
 fn index_by_name(items: &[Value], filter_id_index: bool) -> BTreeMap<String, &Value> {
     let mut out: BTreeMap<String, &Value> = BTreeMap::new();
     for ix in items {
@@ -379,88 +360,6 @@ fn index_by_name(items: &[Value], filter_id_index: bool) -> BTreeMap<String, &Va
         }
     }
     out
-}
-
-/// Pure index-set diff. `mirror` controls only the pruning of entries that
-/// exist remotely but not locally:
-///   - `mirror == true`  → drop remote-only entries (make remote == local
-///     exactly; within-env `rdc sync` push, and `rdc deploy --mirror`).
-///   - `mirror == false` → leave remote-only entries in place (additive;
-///     `rdc deploy` without `--mirror`).
-///
-/// A *changed* entry (same name, diverging definition) is ALWAYS a drop +
-/// create regardless of `mirror`, because the Data Storage API has no
-/// in-place update verb.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn diff_indexes(
-    local_regular: &[Value],
-    local_search: &[Value],
-    remote_regular: &[Value],
-    remote_search: &[Value],
-    mirror: bool,
-) -> DiffPlan {
-    let local_reg = index_by_name(local_regular, true);
-    let remote_reg = index_by_name(remote_regular, true);
-    let local_search_map = index_by_name(local_search, false);
-    let remote_search_map = index_by_name(remote_search, false);
-
-    let mut plan = DiffPlan::default();
-    // Drop: present remotely but absent locally, OR present on both
-    // sides with diverging definitions (will be re-created in the
-    // creates pass).
-    for (name, remote_def) in &remote_reg {
-        match local_reg.get(name) {
-            // Remote-only: prune only when mirroring.
-            None => {
-                if mirror {
-                    plan.drop_regular.push(name.clone());
-                }
-            }
-            // Same name, changed definition: always drop+recreate.
-            Some(local_def) => {
-                if !defs_equivalent(local_def, remote_def) {
-                    plan.drop_regular.push(name.clone());
-                }
-            }
-        }
-    }
-    for (name, local_def) in &local_reg {
-        match remote_reg.get(name) {
-            None => plan.create_regular.push((*local_def).clone()),
-            Some(remote_def) => {
-                if !defs_equivalent(local_def, remote_def) {
-                    plan.create_regular.push((*local_def).clone());
-                }
-            }
-        }
-    }
-    for (name, remote_def) in &remote_search_map {
-        match local_search_map.get(name) {
-            // Remote-only: prune only when mirroring.
-            None => {
-                if mirror {
-                    plan.drop_search.push(name.clone());
-                }
-            }
-            // Same name, changed definition: always drop+recreate.
-            Some(local_def) => {
-                if !defs_equivalent(local_def, remote_def) {
-                    plan.drop_search.push(name.clone());
-                }
-            }
-        }
-    }
-    for (name, local_def) in &local_search_map {
-        match remote_search_map.get(name) {
-            None => plan.create_search.push((*local_def).clone()),
-            Some(remote_def) => {
-                if !defs_equivalent(local_def, remote_def) {
-                    plan.create_search.push((*local_def).clone());
-                }
-            }
-        }
-    }
-    plan
 }
 
 /// Outcome of gating index-deletion (pure; mirrors the global delete gate
@@ -535,11 +434,11 @@ pub(crate) struct ThreeWayDiff {
     pub pending_search_deletes: Vec<String>,
 }
 
-/// Base-aware diff for the within-env push driver. Unlike `diff_indexes`
-/// (2-way mirror), this distinguishes a *user removal* (index was in the
-/// last-synced base, removed locally, still on remote) from an *admin
-/// addition* (index appeared on remote, never in base or local). The former
-/// is a gated pending delete; the latter is left untouched.
+/// Base-aware diff for the within-env push driver. Distinguishes a *user
+/// removal* (index was in the last-synced base, removed locally, still on
+/// remote) from an *admin addition* (index appeared on remote, never in base
+/// or local). The former is a gated pending delete; the latter is left
+/// untouched.
 pub(crate) fn diff_indexes_3way(
     base_regular: &[Value],
     base_search: &[Value],
@@ -664,83 +563,6 @@ mod tests {
     }
 
     #[test]
-    fn diff_id_index_is_filtered_from_regular_arrays() {
-        let plan = diff_for_dataset(
-            &[ix("_id_", json!({"_id": 1}))],
-            &[],
-            &[ix("_id_", json!({"_id": 1}))],
-            &[],
-        );
-        assert!(plan.drop_regular.is_empty());
-        assert!(plan.create_regular.is_empty());
-    }
-
-    #[test]
-    fn diff_local_only_index_is_created() {
-        let plan = diff_for_dataset(
-            &[ix("ix_vendor_id", json!({"vendor_id": 1}))],
-            &[],
-            &[],
-            &[],
-        );
-        assert!(plan.drop_regular.is_empty());
-        assert_eq!(plan.create_regular.len(), 1);
-        assert_eq!(
-            plan.create_regular[0].get("name").and_then(|v| v.as_str()),
-            Some("ix_vendor_id")
-        );
-    }
-
-    #[test]
-    fn diff_remote_only_index_is_dropped() {
-        let plan = diff_for_dataset(&[], &[], &[ix("ix_orphan", json!({"orphan": 1}))], &[]);
-        assert_eq!(plan.drop_regular, vec!["ix_orphan".to_string()]);
-        assert!(plan.create_regular.is_empty());
-    }
-
-    #[test]
-    fn diff_changed_def_produces_drop_and_create() {
-        // Same name, different key spec → drop the old, create the new.
-        let plan = diff_for_dataset(
-            &[ix("ix_x", json!({"x": -1}))],
-            &[],
-            &[ix("ix_x", json!({"x": 1}))],
-            &[],
-        );
-        assert_eq!(plan.drop_regular, vec!["ix_x".to_string()]);
-        assert_eq!(plan.create_regular.len(), 1);
-    }
-
-    #[test]
-    fn diff_identical_def_is_a_noop_even_if_v_differs() {
-        // `v` is server-set; differing `v` should not trigger churn.
-        let local = json!({"name": "ix_y", "key": {"y": 1}});
-        let remote = json!({"name": "ix_y", "key": {"y": 1}, "v": 2});
-        let plan = diff_for_dataset(&[local], &[], &[remote], &[]);
-        assert!(
-            plan.drop_regular.is_empty(),
-            "should not drop on v-only diff"
-        );
-        assert!(
-            plan.create_regular.is_empty(),
-            "should not create on v-only diff"
-        );
-    }
-
-    #[test]
-    fn diff_search_index_create_drop_pair() {
-        let local = json!({"name": "search1", "mappings": {"dynamic": true}});
-        let remote_other = json!({"name": "search2", "mappings": {"dynamic": false}});
-        let plan = diff_for_dataset(&[], &[local], &[], &[remote_other]);
-        assert_eq!(plan.drop_search, vec!["search2".to_string()]);
-        assert_eq!(plan.create_search.len(), 1);
-        assert_eq!(
-            plan.create_search[0].get("name").and_then(|v| v.as_str()),
-            Some("search1")
-        );
-    }
-
-    #[test]
     fn options_strip_keeps_user_options() {
         let def = json!({
             "name": "ix_z",
@@ -756,61 +578,6 @@ mod tests {
         assert!(!obj.contains_key("v"));
         assert_eq!(obj.get("unique"), Some(&json!(true)));
         assert_eq!(obj.get("sparse"), Some(&json!(false)));
-    }
-
-    #[test]
-    fn diff_remote_only_not_dropped_without_mirror() {
-        // Additive (deploy default): an index that exists only on the
-        // target is left in place — NOT pruned.
-        let plan = diff_indexes(
-            &[],
-            &[],
-            &[ix("ix_orphan", json!({"orphan": 1}))],
-            &[],
-            false,
-        );
-        assert!(
-            plan.drop_regular.is_empty(),
-            "remote-only index must survive without mirror: {plan:?}"
-        );
-        assert!(plan.create_regular.is_empty());
-    }
-
-    #[test]
-    fn diff_remote_only_dropped_with_mirror() {
-        let plan = diff_indexes(
-            &[],
-            &[],
-            &[ix("ix_orphan", json!({"orphan": 1}))],
-            &[],
-            true,
-        );
-        assert_eq!(plan.drop_regular, vec!["ix_orphan".to_string()]);
-    }
-
-    #[test]
-    fn diff_changed_def_drops_even_without_mirror() {
-        // A changed definition is always drop+create (no in-place update),
-        // independent of mirror.
-        let plan = diff_indexes(
-            &[ix("ix_x", json!({"x": -1}))],
-            &[],
-            &[ix("ix_x", json!({"x": 1}))],
-            &[],
-            false,
-        );
-        assert_eq!(plan.drop_regular, vec!["ix_x".to_string()]);
-        assert_eq!(plan.create_regular.len(), 1);
-    }
-
-    #[test]
-    fn diff_remote_only_search_not_dropped_without_mirror() {
-        let remote = json!({"name": "s_orphan", "mappings": {"dynamic": true}});
-        let plan = diff_indexes(&[], &[], &[], &[remote], false);
-        assert!(
-            plan.drop_search.is_empty(),
-            "remote-only search index must survive without mirror: {plan:?}"
-        );
     }
 
     // --- 3-way (base-aware) diff: the within-env safe-push semantics ---
