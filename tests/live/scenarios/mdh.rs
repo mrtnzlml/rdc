@@ -113,6 +113,8 @@ async fn live_mdh_index_lifecycle() {
     // Idempotent: a second sync makes no further changes.
     let out = project.run_rdc(&["sync", "test"]);
     assert!(out.status.success(), "re-sync after create failed: {}", String::from_utf8_lossy(&out.stderr));
+    let (_slug, idx_after) = read_indexes(&project, &run_id);
+    assert!(regular_names(&idx_after).contains(&"ix_b".to_string()), "ix_b must persist after idempotent re-sync");
 
     // --- Phase 3: push modify (change ix_b's key) ---
     let (slug, mut idx3) = read_indexes(&project, &run_id);
@@ -129,6 +131,7 @@ async fn live_mdh_index_lifecycle() {
     let remote = raw.ds_client().list_indexes(&coll, None).await.expect("list");
     let ix_b = remote.iter().find(|ix| ix.get("name").and_then(|n| n.as_str()) == Some("ix_b")).expect("ix_b");
     assert_eq!(ix_b.get("key"), Some(&json!({ "b": 1 })), "ix_b key not updated: {ix_b:?}");
+    assert!(remote_regular_names(&raw, &coll).await.contains(&"ix_a".to_string()), "ix_a must survive modify of ix_b");
 
     // --- Phase 4: gated safe-delete (remove ix_b locally) ---
     let (slug, mut idx4) = read_indexes(&project, &run_id);
@@ -140,8 +143,12 @@ async fn live_mdh_index_lifecycle() {
     // Without --allow-deletes (non-interactive): must REFUSE and leave ix_b.
     let out = project.run_rdc(&["sync", "test"]);
     assert!(!out.status.success(), "sync without --allow-deletes should fail on a removal");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("allow-deletes"), "expected allow-deletes refusal: {stderr}");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(combined.contains("allow-deletes"), "expected allow-deletes refusal: {combined}");
     assert!(
         remote_regular_names(&raw, &coll).await.contains(&"ix_b".to_string()),
         "ix_b must survive the refused delete"
@@ -167,6 +174,7 @@ async fn live_mdh_index_lifecycle() {
     raw.wait_for_regular_index(&coll, "ix_c", true).await.expect("ix_c created");
     let after = remote_regular_names(&raw, &coll).await;
     assert!(after.contains(&"ix_admin".to_string()), "admin-added index must survive: {after:?}");
+    assert!(after.contains(&"ix_a".to_string()), "ix_a must survive all syncs: {after:?}");
 
     // --- Phase 6: idempotency (final re-sync = no error, stable) ---
     let out = project.run_rdc(&["sync", "test"]);
