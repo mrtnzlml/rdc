@@ -196,10 +196,12 @@ intentional keep, not dead-by-accident. (Their tests stay green; only
 
 - `IndexSet` (`src/model/index_set.rs:7`): add `Default` to the derive list
   (additive; needed for the no-base empty set).
-- `derive_data_storage_base` (`src/config/mod.rs:41`): change visibility to
-  `pub` and re-export as `rdc::config::derive_data_storage_base`, so the
-  integration-test crate derives the **same** Data Storage base rdc uses
-  (single source of truth). Pure function; harmless to expose.
+- Data Storage base derivation in the test crate: **no production change
+  needed.** `rdc::config::EnvConfig` is already `pub` with `pub` fields and a
+  `pub data_storage_base()` (`src/config/mod.rs:34`), so the test helper
+  derives the same base via
+  `rdc::config::EnvConfig { api_base, org_id }.data_storage_base()` — single
+  source of truth, zero added surface.
 
 ### 3.5 Backward compatibility
 
@@ -345,5 +347,8 @@ predicting it.
   polls with the same generous timeouts the driver uses
   (`SEARCH_DROP_TIMEOUT = 60s`). If the sandbox is slow, bump the poll bound in
   the test, not the driver.
-- **`derive_data_storage_base` made `pub`.** Minor surface addition, justified
-  by single-sourcing the base derivation with the test crate.
+- **No production visibility changes** beyond `IndexSet: Default`. The test
+  crate reaches the Data Storage base via the already-`pub`
+  `EnvConfig::data_storage_base()` and reuses the already-`pub`
+  `DataStorageClient`; only collection-lifecycle endpoints
+  (`collections/create`, `insert_one`, `collections/drop`) need a raw helper.
