@@ -95,7 +95,10 @@ impl MdhRaw {
             .post("/v1/collections/drop", json!({ "collectionName": name }))
             .await?;
         // 2xx (incl. 202) = accepted; 404 / "not found" = already gone.
-        if status.is_success() || status.as_u16() == 404 || body.contains("not found") {
+        if status.is_success()
+            || status.as_u16() == 404
+            || body.to_lowercase().contains("not found")
+        {
             return Ok(());
         }
         Err(anyhow!("drop_collection {name}: {status} {body}"))
@@ -114,7 +117,7 @@ impl MdhRaw {
     }
 
     /// Same as `wait_for_regular_index` but for Atlas Search indexes, with a
-    /// longer bound (Atlas create/drop runs in the background, up to ~60s).
+    /// longer bound (Atlas create/drop runs in the background; bound is 90s).
     pub async fn wait_for_search_index(&self, coll: &str, name: &str, present: bool) -> Result<()> {
         self.wait_for_index(coll, name, present, true, Duration::from_secs(90)).await
     }
