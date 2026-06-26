@@ -24,4 +24,30 @@ async fn live_janitor_sweep() {
     // no live queues behind either.
     let queues_left = client.list_ids_by_name_prefix("queue", RunId::marker()).await.unwrap_or_default();
     assert!(queues_left.is_empty(), "janitor left live queue objects: {queues_left:?}");
+
+    // MDH: drop every throwaway `rdc_it_*` collection a crashed run left behind.
+    crate::support::teardown::drop_mdh_collections_by_prefix(
+        &cfg,
+        crate::support::mdh::MDH_COLLECTION_MARKER,
+    )
+    .await
+    .expect("janitor mdh sweep");
+    // Collection drop is async (202); poll until none remain (bounded).
+    let raw = crate::support::mdh::MdhRaw::connect(&cfg).expect("connect mdh");
+    let mut remaining = raw.list_collection_names().await.unwrap_or_default();
+    let mut waited = 0;
+    while remaining
+        .iter()
+        .any(|n| n.starts_with(crate::support::mdh::MDH_COLLECTION_MARKER))
+        && waited < 30
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        remaining = raw.list_collection_names().await.unwrap_or_default();
+        waited += 1;
+    }
+    let leftover: Vec<_> = remaining
+        .into_iter()
+        .filter(|n| n.starts_with(crate::support::mdh::MDH_COLLECTION_MARKER))
+        .collect();
+    assert!(leftover.is_empty(), "janitor left MDH collections: {leftover:?}");
 }

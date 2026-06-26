@@ -1,4 +1,5 @@
 use crate::support::client::LiveClient;
+use crate::support::config::LiveConfig;
 use crate::support::run_id::RunId;
 use anyhow::Result;
 
@@ -54,18 +55,43 @@ pub async fn teardown_by_prefix(client: &LiveClient, prefix: &str) -> Result<()>
     Ok(())
 }
 
+/// Drop every MDH collection whose name starts with `marker` (the throwaway
+/// `rdc_it_*` collections this harness creates). Best-effort; async 202 drops.
+#[allow(dead_code)]
+pub async fn drop_mdh_collections_by_prefix(cfg: &LiveConfig, marker: &str) -> anyhow::Result<()> {
+    let raw = crate::support::mdh::MdhRaw::connect(cfg)?;
+    let names = match raw.list_collection_names().await {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("teardown(mdh): list collections failed (continuing): {e:#}");
+            return Ok(());
+        }
+    };
+    for name in names.into_iter().filter(|n| n.starts_with(marker)) {
+        if let Err(e) = raw.drop_collection(&name).await {
+            eprintln!("teardown(mdh): drop collection {name} failed (continuing): {e:#}");
+        }
+    }
+    Ok(())
+}
+
 /// RAII guard: on drop, deletes everything the run created. Holds its own
 /// Tokio runtime handle so it can clean up even from a panicking test.
 #[allow(dead_code)]
 pub struct Teardown {
     client: LiveClient,
     run_id: RunId,
+    cfg: Option<LiveConfig>,
 }
 
 #[allow(dead_code)]
 impl Teardown {
     pub fn new(client: LiveClient, run_id: RunId) -> Teardown {
-        Teardown { client, run_id }
+        Teardown { client, run_id, cfg: None }
+    }
+    /// Like `new`, but also drops this run's throwaway MDH collection(s) on drop.
+    pub fn with_mdh(client: LiveClient, run_id: RunId, cfg: LiveConfig) -> Teardown {
+        Teardown { client, run_id, cfg: Some(cfg) }
     }
     pub fn client(&self) -> &LiveClient {
         &self.client
@@ -79,6 +105,8 @@ impl Drop for Teardown {
     fn drop(&mut self) {
         let prefix = self.run_id.list_prefix();
         let client = &self.client;
+        let run_id = &self.run_id;
+        let cfg = self.cfg.as_ref();
         // `Drop` fires INSIDE the test's tokio runtime (the scenarios are
         // `#[tokio::test]`). Calling `block_on` on the current thread there
         // panics ("Cannot start a runtime from within a runtime") — and if
@@ -101,6 +129,15 @@ impl Drop for Teardown {
                 };
                 if let Err(e) = rt.block_on(teardown_by_prefix(client, &prefix)) {
                     eprintln!("teardown: {e:#}");
+                }
+                if let Some(cfg) = cfg {
+                    // Drop only THIS run's throwaway collection.
+                    let coll = crate::support::mdh::mdh_collection_name(run_id);
+                    if let Ok(raw) = crate::support::mdh::MdhRaw::connect(cfg) {
+                        if let Err(e) = rt.block_on(raw.drop_collection(&coll)) {
+                            eprintln!("teardown(mdh): drop {coll} failed (continuing): {e:#}");
+                        }
+                    }
                 }
             });
         });
