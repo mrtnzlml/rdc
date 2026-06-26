@@ -10,3 +10,4 @@ pub mod assert_local;
 pub mod assert_remote;
 pub mod expected;
 pub mod staticdir;
+pub mod mdh;
