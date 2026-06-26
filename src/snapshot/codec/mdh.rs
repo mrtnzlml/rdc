@@ -110,7 +110,7 @@ fn strip_server_managed(set: &IndexSet) -> IndexSet {
 /// Reshape a search-index list response to the create-body shape. Returns
 /// `None` for entries that can't supply the minimum fields (`name` and
 /// `mappings`) — defensive against future API drift.
-fn normalize_search_index(remote: &Value) -> Option<Value> {
+pub(crate) fn normalize_search_index(remote: &Value) -> Option<Value> {
     let obj = remote.as_object()?;
     let name = obj.get("name")?.clone();
     let definition = obj.get("latest_definition").and_then(|v| v.as_object());
@@ -223,5 +223,29 @@ mod tests {
             Mdh.path(&paths, "vendors"),
             std::path::Path::new("/proj/envs/dev/mdh/vendors/indexes.json")
         );
+    }
+
+    #[test]
+    fn normalize_search_index_reshapes_raw_list_response() {
+        // The exact shape `list_search_indexes` returns for a freshly-created
+        // search index (live-verified): mappings live under `latest_definition`,
+        // plus server-status fields. It must reshape to the canonical
+        // `{name, mappings}` form (empty analyzers omitted) so the push diff
+        // compares like-with-like and does NOT see a spurious change.
+        let raw = json!({
+            "name": "sx_a",
+            "type": "search",
+            "status": "PENDING",
+            "queryable": false,
+            "latest_definition": {
+                "mappings": {"dynamic": true},
+                "analyzer": null,
+                "analyzers": [],
+                "search_analyzer": null,
+                "synonyms": null
+            }
+        });
+        let got = normalize_search_index(&raw).expect("normalizes");
+        assert_eq!(got, json!({"name": "sx_a", "mappings": {"dynamic": true}}));
     }
 }

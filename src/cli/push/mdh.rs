@@ -87,13 +87,32 @@ pub async fn push_dataset(
         .await
         .with_context(|| format!("listing search indexes for '{collection_name}'"))?;
 
+    // Reshape the raw remote search-index list entries to the same canonical
+    // {name, mappings, analyzers?} form the pull writes locally, so the diff
+    // compares like-with-like. Without this, every search index looks "changed"
+    // (local normalized vs remote raw) and is needlessly dropped+recreated on
+    // every sync.
+    let remote_search_norm: Vec<Value> = remote_search
+        .iter()
+        .filter_map(|entry| {
+            let norm = crate::snapshot::codec::normalize_search_index(entry);
+            if norm.is_none() {
+                progress.event(
+                    Action::Warn,
+                    &format!("mdh/{slug} skipping un-normalizable remote search index entry: {entry}"),
+                );
+            }
+            norm
+        })
+        .collect();
+
     let diff = diff_indexes_3way(
         &base_set.regular,
         &base_set.search,
         &local_set.regular,
         &local_set.search,
         &remote_regular,
-        &remote_search,
+        &remote_search_norm,
     );
     let mut plan = diff.plan;
 
