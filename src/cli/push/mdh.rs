@@ -457,7 +457,7 @@ pub(crate) fn diff_indexes_3way(
 /// `drops`/`creates` receive always-applied changed-def recreate pairs and
 /// local-only creates; `pending_deletes` receives gated user removals.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn diff_one_kind(
+fn diff_one_kind(
     base: &[Value],
     local: &[Value],
     remote: &[Value],
