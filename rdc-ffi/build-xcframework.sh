@@ -41,6 +41,12 @@ HDRS="$OUT/include"; mkdir -p "$HDRS"
 find "$OUT" -maxdepth 1 -name "*.h" -exec mv {} "$HDRS/" \;
 find "$OUT" -maxdepth 1 -name "*.modulemap" -exec mv {} "$HDRS/module.modulemap" \;
 
+# Fail loudly if uniffi-bindgen emitted no header/modulemap (e.g. after a
+# toolchain upgrade) rather than letting xcodebuild fail later with an
+# opaque error.
+[ -f "$HDRS/module.modulemap" ] || { echo "ERROR: uniffi-bindgen emitted no .modulemap" >&2; exit 1; }
+ls "$HDRS"/*.h >/dev/null 2>&1 || { echo "ERROR: uniffi-bindgen emitted no .h header" >&2; exit 1; }
+
 echo "==> Creating xcframework"
 rm -rf "$HERE/$MODULE.xcframework"
 xcodebuild -create-xcframework \
