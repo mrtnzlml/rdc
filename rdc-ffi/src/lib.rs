@@ -5,7 +5,6 @@
 
 mod connections;
 mod error;
-#[allow(dead_code)] // discover wired up in Tasks 4-5; remove in Task 5 (find)
 mod discover;
 
 uniffi::setup_scaffolding!();
