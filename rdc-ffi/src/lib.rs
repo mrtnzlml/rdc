@@ -6,6 +6,7 @@
 mod connections;
 mod error;
 mod discover;
+mod sync;
 
 uniffi::setup_scaffolding!();
 
