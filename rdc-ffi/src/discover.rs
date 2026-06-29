@@ -78,7 +78,7 @@ pub(crate) fn inspect(folder: &Path) -> Option<Connection> {
         .ok()
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64);
+        .and_then(|d| i64::try_from(d.as_secs()).ok());
     let file_count = count_files(&folder.join("envs/main"));
     Some(Connection {
         folder: folder.to_path_buf(),
