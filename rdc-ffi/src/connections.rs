@@ -60,6 +60,14 @@ pub struct AddConnectionInput {
     pub password: Option<String>,
 }
 
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct EditCredentialsInput {
+    pub auth_kind: AuthKind,
+    pub token: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
 /// List every Connection under `parent`. Non-project folders are skipped.
 #[uniffi::export]
 pub fn list_connections(parent: String) -> Vec<ConnectionSummary> {
@@ -135,6 +143,24 @@ pub fn add_connection(
         .ok_or_else(|| op("Connection not found after add".into()))
 }
 
+/// Replace a Connection's stored credentials. Existing secrets are wiped
+/// first so a token↔password mode flip leaves no stale fields behind.
+#[uniffi::export]
+pub fn edit_credentials(folder: String, input: EditCredentialsInput) -> Result<(), FfiError> {
+    let folder = std::path::PathBuf::from(folder);
+    if !folder.join("rdc.toml").exists() {
+        return Err(op("Connection not found".into()));
+    }
+    let _ = std::fs::remove_file(folder.join("secrets/main.secrets.json"));
+    write_credentials(
+        &folder,
+        input.auth_kind,
+        input.token.as_deref(),
+        input.username.as_deref(),
+        input.password.as_deref(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +222,38 @@ mod tests {
         };
         let err = add_connection(tmp.path().display().to_string(), input).unwrap_err();
         assert!(format!("{err}").contains("Token is required"));
+    }
+
+    #[test]
+    fn edit_credentials_flips_token_to_password() {
+        let tmp = tempfile::tempdir().unwrap();
+        let added = add_connection(
+            tmp.path().display().to_string(),
+            AddConnectionInput {
+                name: "acme".into(),
+                api_base: "https://example.test/api/v1".into(),
+                org_id: 1,
+                auth_kind: AuthKind::Token,
+                token: Some("tok".into()),
+                username: None,
+                password: None,
+            },
+        )
+        .unwrap();
+
+        edit_credentials(
+            added.folder.clone(),
+            EditCredentialsInput {
+                auth_kind: AuthKind::Password,
+                token: None,
+                username: Some("user".into()),
+                password: Some("pass".into()),
+            },
+        )
+        .unwrap();
+
+        // Discovery now reports password auth.
+        let listed = list_connections(tmp.path().display().to_string());
+        assert_eq!(listed[0].auth_kind, AuthKind::Password);
     }
 }
