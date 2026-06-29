@@ -143,6 +143,33 @@ pub fn add_connection(
         .ok_or_else(|| op("Connection not found after add".into()))
 }
 
+/// Validate that `path` is a single-env (`main`) rdc project and return its
+/// summary. Does not move, copy, or symlink anything.
+#[uniffi::export]
+pub fn validate_existing_project(path: String) -> Result<ConnectionSummary, FfiError> {
+    let source = std::path::PathBuf::from(&path);
+    if !source.is_dir() {
+        return Err(op(format!("Not a folder: {path}")));
+    }
+    let rdc_toml = source.join("rdc.toml");
+    if !rdc_toml.exists() {
+        return Err(op(format!(
+            "{path} doesn't look like an rdc project (no rdc.toml). Run `rdc init` there first."
+        )));
+    }
+    let body = std::fs::read_to_string(&rdc_toml).map_err(|e| op(format!("reading rdc.toml: {e}")))?;
+    if !body.contains("[envs.main]") {
+        return Err(op(format!(
+            "{} has no [envs.main] section; only single-env projects named `main` are supported.",
+            rdc_toml.display()
+        )));
+    }
+    discover::inspect(&source)
+        .as_ref()
+        .map(ConnectionSummary::from)
+        .ok_or_else(|| op("Project not discoverable".into()))
+}
+
 /// Replace a Connection's stored credentials. Existing secrets are wiped
 /// first so a token↔password mode flip leaves no stale fields behind.
 #[uniffi::export]
@@ -255,5 +282,37 @@ mod tests {
         // Discovery now reports password auth.
         let listed = list_connections(tmp.path().display().to_string());
         assert_eq!(listed[0].auth_kind, AuthKind::Password);
+    }
+
+    #[test]
+    fn validate_existing_project_accepts_main_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), "proj");
+        let summary =
+            validate_existing_project(tmp.path().join("proj").display().to_string()).unwrap();
+        assert_eq!(summary.name, "proj");
+        assert_eq!(summary.org_id, 5);
+    }
+
+    #[test]
+    fn validate_existing_project_rejects_missing_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("empty")).unwrap();
+        let err = validate_existing_project(tmp.path().join("empty").display().to_string()).unwrap_err();
+        assert!(format!("{err}").contains("no rdc.toml"));
+    }
+
+    #[test]
+    fn validate_existing_project_rejects_non_main_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("proj");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("rdc.toml"),
+            "[envs.test]\napi_base = \"https://example.test/api/v1\"\norg_id = 1\n",
+        )
+        .unwrap();
+        let err = validate_existing_project(folder.display().to_string()).unwrap_err();
+        assert!(format!("{err}").contains("[envs.main]"));
     }
 }
