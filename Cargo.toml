@@ -56,7 +56,7 @@ panic = "abort"
 opt-level = 3
 
 [workspace]
-members = [".", "desktop"]
+members = [".", "rdc-ffi"]
 
 [workspace.package]
 edition = "2024"

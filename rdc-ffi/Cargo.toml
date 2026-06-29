@@ -1,0 +1,19 @@
+[package]
+name = "rdc-ffi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "FFI bridge exposing rdc's embed surface to the native macOS app"
+
+[lints]
+workspace = true
+
+[lib]
+name = "rdc_ffi"
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[dependencies]
+rdc = { path = ".." }
+
+[dev-dependencies]
+tempfile = "3"
