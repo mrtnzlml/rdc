@@ -3,6 +3,8 @@
 //! the on-disk format.
 
 use crate::discover::{self, AuthKindRaw, Connection};
+use crate::error::{map_err, op, FfiError};
+use std::collections::HashSet;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -47,6 +49,17 @@ impl From<&Connection> for ConnectionSummary {
     }
 }
 
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AddConnectionInput {
+    pub name: String,
+    pub api_base: String,
+    pub org_id: u64,
+    pub auth_kind: AuthKind,
+    pub token: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
 /// List every Connection under `parent`. Non-project folders are skipped.
 #[uniffi::export]
 pub fn list_connections(parent: String) -> Vec<ConnectionSummary> {
@@ -54,6 +67,72 @@ pub fn list_connections(parent: String) -> Vec<ConnectionSummary> {
         .iter()
         .map(ConnectionSummary::from)
         .collect()
+}
+
+/// Write credentials via rdc's own helpers. Empty strings are rejected
+/// the same way the original Tauri command did.
+fn write_credentials(
+    folder: &Path,
+    auth: AuthKind,
+    token: Option<&str>,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<(), FfiError> {
+    match auth {
+        AuthKind::Token => {
+            let t = token
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| op("Token is required.".into()))?;
+            rdc::secrets::write_secrets_file(folder, "main", t, None).map_err(map_err)?;
+        }
+        AuthKind::Password => {
+            let u = username
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| op("Username is required.".into()))?;
+            let p = password
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| op("Password is required.".into()))?;
+            rdc::secrets::save_password_credentials(folder, "main", u, p).map_err(map_err)?;
+        }
+    }
+    Ok(())
+}
+
+/// Create a new Connection: write `rdc.toml` + secrets under a unique slug.
+#[uniffi::export]
+pub fn add_connection(
+    parent: String,
+    input: AddConnectionInput,
+) -> Result<ConnectionSummary, FfiError> {
+    let parent = std::path::PathBuf::from(parent);
+    let used: HashSet<String> = discover::scan(&parent)
+        .iter()
+        .map(|c| c.name().to_string())
+        .collect();
+    let slug = rdc::slug::slugify_unique(&input.name, &used);
+    let folder = parent.join(&slug);
+    std::fs::create_dir_all(&folder).map_err(|e| op(format!("creating folder: {e}")))?;
+
+    let api_base = input.api_base.trim_end_matches('/').to_string();
+    let rdc_toml = format!(
+        "[envs.main]\napi_base = \"{api_base}\"\norg_id = {}\n",
+        input.org_id
+    );
+    std::fs::write(folder.join("rdc.toml"), rdc_toml)
+        .map_err(|e| op(format!("writing rdc.toml: {e}")))?;
+
+    write_credentials(
+        &folder,
+        input.auth_kind,
+        input.token.as_deref(),
+        input.username.as_deref(),
+        input.password.as_deref(),
+    )?;
+
+    discover::find(&parent, &slug)
+        .as_ref()
+        .map(ConnectionSummary::from)
+        .ok_or_else(|| op("Connection not found after add".into()))
 }
 
 #[cfg(test)]
@@ -81,5 +160,41 @@ mod tests {
         assert_eq!(out[0].org_id, 5);
         assert_eq!(out[0].auth_kind, AuthKind::Token);
         assert_eq!(out[0].last_sync_unix, None);
+    }
+
+    #[test]
+    fn add_connection_writes_files_and_summary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = AddConnectionInput {
+            name: "Acme Prod".into(),
+            api_base: "https://example.test/api/v1/".into(),
+            org_id: 42,
+            auth_kind: AuthKind::Token,
+            token: Some("tok-123".into()),
+            username: None,
+            password: None,
+        };
+        let summary = add_connection(tmp.path().display().to_string(), input).unwrap();
+        assert_eq!(summary.org_id, 42);
+        assert_eq!(summary.api_base, "https://example.test/api/v1"); // trailing slash trimmed
+        let folder = tmp.path().join(&summary.id);
+        assert!(folder.join("rdc.toml").exists());
+        assert!(folder.join("secrets/main.secrets.json").exists());
+    }
+
+    #[test]
+    fn add_connection_rejects_empty_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = AddConnectionInput {
+            name: "x".into(),
+            api_base: "https://example.test/api/v1".into(),
+            org_id: 1,
+            auth_kind: AuthKind::Token,
+            token: Some(String::new()),
+            username: None,
+            password: None,
+        };
+        let err = add_connection(tmp.path().display().to_string(), input).unwrap_err();
+        assert!(format!("{err}").contains("Token is required"));
     }
 }
