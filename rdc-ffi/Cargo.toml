@@ -12,8 +12,16 @@ workspace = true
 name = "rdc_ffi"
 crate-type = ["staticlib", "cdylib", "lib"]
 
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["uniffi/cli"]
+
 [dependencies]
 rdc = { path = ".." }
+uniffi = { version = "0.28" }
+anyhow = "1"
+thiserror = "2"
 
 [dev-dependencies]
 tempfile = "3"
