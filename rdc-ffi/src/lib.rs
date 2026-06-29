@@ -3,6 +3,7 @@
 //! Every operation re-uses rdc's own functions; this crate adds no new
 //! credential or sync logic. See `docs/superpowers/specs/2026-06-29-native-macos-app-design.md`.
 
+mod connections;
 mod error;
 #[allow(dead_code)] // discover wired up in Tasks 4-5; remove in Task 5 (find)
 mod discover;
