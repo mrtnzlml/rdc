@@ -339,6 +339,13 @@ pub(crate) async fn event_loop(
                     Err(e) if crate::api::anyhow_has_status(&e, 401) => {
                         // Prompt for a new token inline; retry once. Surface
                         // via the renderer's banner so the grid stays visible.
+                        //
+                        // The attention bell deliberately does NOT ring for this
+                        // prompt: `refresh_token_for_401` uses inquire (raw fd-0
+                        // reads) which races the always-running stdin reader
+                        // under watch, so the token can be mangled and the prompt
+                        // is likely unanswerable here. Pre-existing; tracked in
+                        // issue #2. Re-enable the ring once that is fixed.
                         if let Some(r) = renderer.as_ref() {
                             r.event(crate::log::Action::Auth, "token expired — refreshing");
                         } else {

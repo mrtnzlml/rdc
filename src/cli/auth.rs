@@ -248,12 +248,6 @@ pub async fn refresh_token_for_401(env: &str) -> Result<()> {
     use inquire::error::InquireError;
     use inquire::{Password, PasswordDisplayMode};
 
-    // The token prompt uses inquire (not the coordinated stdin path that
-    // funnels through `read_line_coordinated`), so ring the watch attention
-    // bell explicitly. No-op outside watch (never armed) or off a TTY; pulls
-    // an away-from-keyboard user back to paste a new token.
-    crate::cli::stdin_coord::maybe_ring_bell();
-
     loop {
         let new_token = match Password::new("New API token")
             .with_display_mode(PasswordDisplayMode::Masked)

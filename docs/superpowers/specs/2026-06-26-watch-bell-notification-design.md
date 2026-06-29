@@ -108,12 +108,16 @@ originally used a raw stdin lock and were switched as part of this work:
 
 Both now ring via `read_line_coordinated` and no longer risk deadlocking watch.
 
-### One non-coordinated prompt gets an explicit ring
+### The 401 token prompt is intentionally NOT covered
 
 The **401 token refresh** (`auth::refresh_token_for_401`) prompts via
-`inquire::Password` (crossterm), which cannot use the coordinator, so it calls
-`maybe_ring_bell()` directly before blocking. No-op outside watch (the global
-flag is only armed by the watch loop) and off a TTY.
+`inquire::Password` (crossterm raw fd-0 reads), which cannot use the coordinator.
+A pre-merge code review found this prompt **races the always-running watch stdin
+reader under `--watch`** — the pasted token can be mangled and the prompt is
+likely unanswerable. That is a **pre-existing bug** (tracked in issue #2),
+independent of the bell. Ringing for a prompt the user cannot complete would be
+worse than silence, so the bell deliberately does **not** ring for the 401 under
+watch. Re-enable the ring once issue #2 is fixed.
 
 ### Coverage map (verified)
 
@@ -128,7 +132,7 @@ flag is only armed by the watch loop) and off a TTY.
 | **Pull-driver flat conflict** (`pull::common::resolve_conflict_interactive`) | `read_line_coordinated` (CoordinatorStdin) |
 | **Pull-driver combined-file conflict** (`resolve::resolve_combined_file`) | `read_line_coordinated` (CoordinatorStdin) |
 | Push-drift (`resolve::resolve_push_drift`) | `read_line_coordinated` (CoordinatorStdin) |
-| 401 token (`auth::refresh_token_for_401`) | explicit `maybe_ring_bell()` |
+| 401 token (`auth::refresh_token_for_401`) | **not covered** — prompt is racy under watch (pre-existing, issue #2) |
 
 The bold rows are the prompts the reviews found bypassing the old `with_prompt`
 hook (`resolve_conflict_interactive` and `resolve_delete_drift` in the first
@@ -136,8 +140,9 @@ review; `resolve_combined_file` in the re-review). Under the chokepoint design
 every coordinated prompt rings by construction — no per-site wrapping — and any
 future one does too. Routing `resolve_combined_file` and `resolve_push_drift`
 through the coordinator also fixed a latent watch deadlock (a raw `stdin().lock()`
-competing with the Enter-trigger reader). Only the 401 inquire prompt, which
-cannot use the coordinator, rings explicitly.
+competing with the Enter-trigger reader). The 401 inquire prompt is the one
+in-cycle prompt NOT covered: it has a pre-existing race under watch (issue #2),
+so the bell stays silent for it rather than ring for an unanswerable prompt.
 
 ### Arming
 
@@ -209,4 +214,5 @@ Full `cargo test` green (769 lib + integration, 0 failed). `--no-bell` appears i
 - `src/cli/resolve.rs` — route `resolve_push_drift` and `resolve_combined_file`
   through `CoordinatorStdin` (they ring via `read_line_coordinated` and no longer
   deadlock under watch).
-- `src/cli/auth.rs` — `maybe_ring_bell()` before the 401 token prompt.
+- `src/cli/sync/watch.rs` — also carries a note at the 401 handler explaining why
+  the bell skips that prompt (issue #2).
