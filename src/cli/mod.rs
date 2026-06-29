@@ -142,6 +142,11 @@ pub enum Command {
         /// Print every cycle in watch mode, including no-op cycles.
         #[arg(short = 'v', long = "verbose", requires = "watch")]
         verbose: bool,
+        /// Silence the terminal bell that watch mode rings when a cycle blocks
+        /// for input (conflict / delete / drift / token prompt). On by default
+        /// on a TTY.
+        #[arg(long = "no-bell", requires = "watch")]
+        no_bell: bool,
     },
     /// Removed: replaced by `rdc migrate <src> <tgt>` + `rdc sync <tgt>`.
     ///
@@ -293,6 +298,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             poll_interval,
             no_poll,
             verbose,
+            no_bell,
         }) => {
             let env = crate::cli::env_picker::pick_env("Which env to sync?", env)?;
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
@@ -311,6 +317,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         no_pull,
                         poll,
                         verbose,
+                        no_bell,
                     )
                 })
                 .await

@@ -65,6 +65,7 @@ pub async fn run_watch(
     no_pull: bool,
     poll_interval: Option<Duration>,
     verbose: bool,
+    no_bell: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let paths = crate::paths::Paths::for_env(&cwd, env);
@@ -76,6 +77,9 @@ pub async fn run_watch(
     {
         let _lock =
             crate::cli::sync::lock::EnvLock::acquire(&paths.env_lock(), Duration::from_secs(30))?;
+        if !no_bell {
+            crate::cli::stdin_coord::arm_bell();
+        }
         crate::cli::sync::run_cycle(
             env,
             interactive,
@@ -214,6 +218,7 @@ pub async fn run_watch(
         no_push,
         no_pull,
         verbose,
+        no_bell,
         events_rx,
         shutdown_rx,
         Some(watcher),
@@ -260,6 +265,7 @@ pub(crate) async fn event_loop(
     no_push: bool,
     no_pull: bool,
     verbose: bool,
+    no_bell: bool,
     mut events: tokio::sync::mpsc::Receiver<CycleTrigger>,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
     mut watcher: Option<notify::RecommendedWatcher>,
@@ -320,6 +326,11 @@ pub(crate) async fn event_loop(
                 }
                 sync_running.store(true, Ordering::Relaxed);
                 let _cycle_guard = CycleGuard(&sync_running);
+                // Re-arm the attention bell once per cycle so the first
+                // blocking prompt (conflict / delete / drift / 401) rings.
+                if !no_bell {
+                    crate::cli::stdin_coord::arm_bell();
+                }
                 let _outcome = match crate::cli::sync::run_cycle(
                     env, interactive, false, allow_deletes, no_push, no_pull,
                     renderer.clone(), None, None,
@@ -499,6 +510,7 @@ mod tests {
         sh_tx.send(()).unwrap(); // shutdown before any event
         let result = event_loop(
             "test",
+            false,
             false,
             false,
             false,

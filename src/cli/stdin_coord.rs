@@ -19,6 +19,7 @@
 //! so non-watch `rdc sync` / `deploy` behave exactly as before.
 
 use std::io::{self, BufRead, Read};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 
@@ -72,6 +73,40 @@ impl StdinCoordinator {
     }
 }
 
+/// Watch-mode attention bell state. Armed once per watch cycle by the watch
+/// loop (via [`arm_bell`]); consumed and emitted by [`maybe_ring_bell`] the
+/// moment a prompt blocks for user input, so an away-from-keyboard user is
+/// pulled back. A process-global flag (like [`COORD`]) because watch is a
+/// single foreground process and the bell is a cross-cutting UI nudge.
+static BELL_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Arm the attention bell. The next [`maybe_ring_bell`] on a TTY emits a BEL
+/// (0x07) to stderr, then disarms. Only the watch loop calls this, so the bell
+/// never fires outside `--watch`.
+pub fn arm_bell() {
+    BELL_ARMED.store(true, Ordering::Relaxed);
+}
+
+/// Decide whether the bell should ring now, disarming if so: armed AND
+/// `is_tty`. Split from the I/O so the arm / debounce / re-arm / TTY-gate
+/// logic is unit-testable. The `&&` short-circuit means a non-TTY never
+/// consumes the armed flag.
+fn take_bell(is_tty: bool) -> bool {
+    is_tty && BELL_ARMED.swap(false, Ordering::Relaxed)
+}
+
+/// Emit one terminal BEL (0x07) to stderr if armed and stderr is a TTY, then
+/// disarm. Called the moment a prompt blocks for input. No-op off a TTY (keeps
+/// CI / piped output clean) or when disarmed (so it rings once per arm).
+pub fn maybe_ring_bell() {
+    use std::io::{IsTerminal, Write};
+    if take_bell(std::io::stderr().is_terminal()) {
+        let mut err = std::io::stderr();
+        let _ = err.write_all(b"\x07");
+        let _ = err.flush();
+    }
+}
+
 /// Read one logical line for an interactive prompt. Returns `Ok(None)` at
 /// end of input. The returned string never includes the trailing newline.
 ///
@@ -80,6 +115,12 @@ impl StdinCoordinator {
 /// real stdin, so it cannot deadlock against the owner. Otherwise it reads
 /// the real stdin directly.
 pub fn read_line_coordinated() -> io::Result<Option<String>> {
+    // Ring the watch attention bell the moment a prompt blocks for input.
+    // EVERY coordinated prompt (conflict / remote-delete / destructive-delete
+    // / delete-drift / MDH resolvers) funnels through here — directly or via
+    // `CoordinatorStdin` — so this single call covers them all. No-op outside
+    // watch (never armed) or off a TTY.
+    maybe_ring_bell();
     if let Some(coord) = COORD.get() {
         return Ok(coord.recv_line());
     }
@@ -185,6 +226,24 @@ mod tests {
         // After the prompt consumed its line it unregistered, so a further
         // line falls through to the Enter-trigger path.
         assert_eq!(coord.try_deliver("next".into()), Err("next".into()));
+    }
+
+    #[test]
+    fn bell_arm_take_debounce_rearm_and_tty_gate() {
+        // This is the only test that touches the process-global BELL_ARMED,
+        // so the sequence below is race-free against the rest of the suite.
+        // Off-TTY must never consume the armed flag (so a later TTY read still
+        // rings).
+        arm_bell();
+        assert!(!take_bell(false), "off-TTY must not ring");
+        assert!(take_bell(true), "armed + TTY rings once");
+        assert!(!take_bell(true), "debounced after the first ring");
+        // Re-arming rings again.
+        arm_bell();
+        assert!(take_bell(true), "re-arm rings");
+        assert!(!take_bell(true), "debounced again");
+        // Unarmed is silent.
+        assert!(!take_bell(true), "unarmed is silent");
     }
 
     #[test]
