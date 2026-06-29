@@ -484,9 +484,9 @@ mod tests {
 
 Add `mod discover;` to `rdc-ffi/src/lib.rs` (below `mod error;`).
 
-- [ ] **Step 4: Run to verify it FAILS first (TDD discipline check)**
+- [ ] **Step 4: Run one ported test to confirm the port is intact**
 
-Before declaring the module, the tests don't exist; after adding the file they should pass. To honor TDD on the one new piece of logic — `count_files` over a fresh tree — run only that path:
+This is a near-verbatim port of already-tested logic (the original `desktop/src/discover.rs` was deleted in Task 1), so this is a regression check, not a red-green TDD cycle:
 
 Run: `cargo test -p rdc-ffi discover::tests::scan_finds_rdc_projects_sorts_by_name`
 Expected: PASS (logic ported intact). If it fails, the port introduced a regression — fix before continuing.
