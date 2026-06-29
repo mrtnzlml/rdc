@@ -1175,10 +1175,13 @@ pub fn resolve_combined_file(
         return Ok(CombinedFileOutcome::PreserveBase(local_bytes.to_vec()));
     }
 
-    let stdin = std::io::stdin();
+    // Route through the watch coordinator (like `resolve_conflict_interactive`).
+    // A raw `stdin().lock()` here would deadlock under `--watch`, where the
+    // Enter-trigger reader is the sole stdin owner; going through the
+    // coordinator also rings the watch attention bell via `read_line_coordinated`.
     let stderr = std::io::stderr();
     let resolution = prompt_resolve(
-        stdin.lock(),
+        crate::cli::stdin_coord::CoordinatorStdin::new(),
         stderr.lock(),
         label_index,
         label_total,
@@ -1299,10 +1302,13 @@ pub fn resolve_push_drift(
         return Ok(PushDriftOutcome::Skip);
     }
 
-    let stdin = std::io::stdin();
+    // Route through the watch coordinator (like the conflict resolvers): a raw
+    // `stdin().lock()` here would deadlock under `--watch`, where the
+    // Enter-trigger reader is the sole stdin owner. Reading via the coordinator
+    // also rings the watch attention bell through `read_line_coordinated`.
     let stderr = std::io::stderr();
     let resolution = prompt_resolve(
-        stdin.lock(),
+        crate::cli::stdin_coord::CoordinatorStdin::new(),
         stderr.lock(),
         1,
         1,

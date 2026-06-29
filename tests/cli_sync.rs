@@ -3496,7 +3496,7 @@ async fn sync_watch_initial_reconcile_pulls_remote_creates() {
         res = rdc::cli::sync::watch::run_watch(
             "dev", /* interactive = */ false, /* allow_deletes = */ false,
             /* no_push = */ false, /* no_pull = */ false,
-            /* poll_interval = */ None, /* verbose = */ false,
+            /* poll_interval = */ None, /* verbose = */ false, /* no_bell = */ false,
         ) => {
             std::env::set_current_dir(&prev_cwd).unwrap();
             panic!("watch should be blocked on ctrl_c but exited: {res:?}");
@@ -3603,7 +3603,7 @@ async fn sync_does_not_show_meta_confirmation_prompt() {
         res = rdc::cli::sync::watch::run_watch(
             "dev", /* interactive = */ true, /* allow_deletes = */ false,
             /* no_push = */ false, /* no_pull = */ false,
-            /* poll_interval = */ None, /* verbose = */ false,
+            /* poll_interval = */ None, /* verbose = */ false, /* no_bell = */ false,
         ) => {
             std::env::set_current_dir(&prev_cwd).unwrap();
             panic!(
@@ -3740,7 +3740,7 @@ async fn sync_watch_poll_catches_remote_drift() {
             "dev", /* interactive = */ false, /* allow_deletes = */ false,
             /* no_push = */ false, /* no_pull = */ false,
             /* poll_interval = */ Some(std::time::Duration::from_millis(200)),
-            /* verbose = */ false,
+            /* verbose = */ false, /* no_bell = */ false,
         ) => {
             std::env::set_current_dir(&prev_cwd).unwrap();
             panic!("watch should be blocked on ctrl_c but exited: {res:?}");
@@ -3861,7 +3861,7 @@ async fn sync_watch_does_not_deadlock_with_one_shot_sync() {
         res = rdc::cli::sync::watch::run_watch(
             "dev", /* interactive = */ false, /* allow_deletes = */ false,
             /* no_push = */ false, /* no_pull = */ false,
-            /* poll_interval = */ None, /* verbose = */ false,
+            /* poll_interval = */ None, /* verbose = */ false, /* no_bell = */ false,
         ) => {
             std::env::set_current_dir(&prev_cwd).unwrap();
             let _ = one_shot_thread.join();
