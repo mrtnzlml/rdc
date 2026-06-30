@@ -21,13 +21,18 @@ struct DetailView: View {
             Spacer()
             HStack {
                 Button { sync.sync(connection) } label: { Label("Sync", systemImage: "arrow.triangle.2.circlepath") }
+                    .buttonStyle(.glassProminent)
                     .disabled(isSyncing)
                 Button("Edit Credentials…") { editTarget = connection }
+                    .buttonStyle(.glass)
                 Button("Reveal in Finder") { store.reveal(connection) }
+                    .buttonStyle(.glass)
                 Spacer()
                 Button(store.isExternal(connection) ? "Detach" : "Remove…", role: .destructive) {
                     pendingRemoval = connection
                 }
+                .buttonStyle(.glass)
+                .tint(.red)
             }
         }
         .padding(24)

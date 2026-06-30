@@ -20,6 +20,8 @@ struct EmptyStateView: View {
                         store.setParentFolder(url)
                     }
                 }
+                .buttonStyle(.glassProminent)
+                .controlSize(.large)
                 .keyboardShortcut(.defaultAction)
             }
         }
