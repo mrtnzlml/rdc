@@ -1,0 +1,59 @@
+name: RossumLocal
+options:
+  bundleIdPrefix: ai.rossum
+  createIntermediateGroups: true
+  deploymentTarget:
+    macOS: "15.0"
+settings:
+  base:
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"   # Swift 5 language mode (strict-concurrency = warnings); tighten to 6.0 later
+targets:
+  RossumLocal:
+    type: application
+    platform: macOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: RossumLocal
+      - path: ../rdc-ffi/generated/rdc_ffi.swift
+        group: Generated
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.rossum.local
+        PRODUCT_NAME: "Rossum Local"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: "Rossum Local"
+        INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.developer-tools"
+        INFOPLIST_KEY_NSHumanReadableCopyright: ""
+        CODE_SIGN_ENTITLEMENTS: RossumLocal/RossumLocal.entitlements
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_HARDENED_RUNTIME: YES
+        SWIFT_EMIT_LOC_STRINGS: NO
+        PRODUCT_MODULE_NAME: RossumLocal
+    dependencies:
+      - framework: ../rdc-ffi/rdc_ffi.xcframework
+        embed: false
+  RossumLocalTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: RossumLocalTests
+    dependencies:
+      - target: RossumLocal
+    settings:
+      base:
+        # Unit tests are not sandboxed: free temp-dir + FFI access.
+        ENABLE_APP_SANDBOX: NO
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Rossum Local.app/Contents/MacOS/Rossum Local"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+schemes:
+  RossumLocal:
+    build:
+      targets:
+        RossumLocal: all
+        RossumLocalTests: [test]
+    test:
+      targets:
+        - RossumLocalTests
