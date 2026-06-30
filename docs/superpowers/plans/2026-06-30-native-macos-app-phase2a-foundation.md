@@ -104,7 +104,7 @@ settings:
   base:
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
-    SWIFT_VERSION: "6.0"
+    SWIFT_VERSION: "5.0"   # Swift 5 language mode (strict-concurrency = warnings); tighten to 6.0 later
 targets:
   RossumLocal:
     type: application
