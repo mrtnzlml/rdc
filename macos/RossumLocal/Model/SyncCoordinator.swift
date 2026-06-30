@@ -18,6 +18,9 @@ final class SyncCoordinator {
     private(set) var phases: [String: SyncPhase] = [:]
     private(set) var activeCount: Int = 0
 
+    /// Called on the main actor when a sync reaches a terminal phase (.done/.error).
+    var onTerminal: ((String, SyncPhase) -> Void)?
+
     private let runner: SyncRunner
     init(runner: SyncRunner = BridgeSyncRunner()) { self.runner = runner }
 
@@ -50,7 +53,10 @@ final class SyncCoordinator {
     private func apply(id: String, phase: SyncPhase) {
         let wasActive = isActive(phases[id])
         phases[id] = phase
-        if wasActive, !isActive(phase) { activeCount = max(0, activeCount - 1) }
+        if wasActive, !isActive(phase) {
+            activeCount = max(0, activeCount - 1)
+            onTerminal?(id, phase)
+        }
     }
 }
 
