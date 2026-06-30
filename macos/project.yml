@@ -3,7 +3,7 @@ options:
   bundleIdPrefix: ai.rossum
   createIntermediateGroups: true
   deploymentTarget:
-    macOS: "15.0"
+    macOS: "26.0"
 settings:
   base:
     MARKETING_VERSION: "0.1.0"
@@ -13,7 +13,7 @@ targets:
   RossumLocal:
     type: application
     platform: macOS
-    deploymentTarget: "15.0"
+    deploymentTarget: "26.0"
     sources:
       - path: RossumLocal
       - path: ../rdc-ffi/generated/rdc_ffi.swift
@@ -37,7 +37,7 @@ targets:
   RossumLocalTests:
     type: bundle.unit-test
     platform: macOS
-    deploymentTarget: "15.0"
+    deploymentTarget: "26.0"
     sources:
       - path: RossumLocalTests
     dependencies:
