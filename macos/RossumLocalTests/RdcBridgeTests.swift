@@ -22,4 +22,24 @@ final class RdcBridgeTests: XCTestCase {
         XCTAssertEqual(conns.first?.orgId, 5)
         XCTAssertEqual(conns.first?.authKind, .token)
     }
+
+    func testAddThenListReflectsConnectionAndEditFlipsAuth() throws {
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rdc-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+
+        let bridge = RdcBridge()
+        let added = try bridge.add(parent: parent, input: AddConnectionInput(
+            name: "Acme Prod", apiBase: "https://example.test/api/v1", orgId: 7,
+            authKind: .token, token: "tok-123", username: nil, password: nil))
+        XCTAssertEqual(added.orgId, 7)
+        XCTAssertEqual(added.authKind, .token)
+        XCTAssertEqual(bridge.list(parent: parent).count, 1)
+
+        let folder = parent.appendingPathComponent(added.id)
+        try bridge.edit(folder: folder, input: EditCredentialsInput(
+            authKind: .password, token: nil, username: "user", password: "pass"))
+        XCTAssertEqual(bridge.list(parent: parent).first?.authKind, .password)
+    }
 }

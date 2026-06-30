@@ -15,6 +15,12 @@ struct FakeBridge: RdcBridging {
         guard let s = validateMap[path.path] else { throw FfiError.Operation(message: "not a project") }
         return s
     }
+    func add(parent: URL, input: AddConnectionInput) throws -> ConnectionSummary {
+        throw FfiError.Operation(message: "not implemented in FakeBridge")
+    }
+    func edit(folder: URL, input: EditCredentialsInput) throws {
+        throw FfiError.Operation(message: "not implemented in FakeBridge")
+    }
 }
 
 @MainActor
