@@ -8,6 +8,7 @@ protocol RdcBridging {
     func validate(path: URL) throws -> ConnectionSummary
     func add(parent: URL, input: AddConnectionInput) throws -> ConnectionSummary
     func edit(folder: URL, input: EditCredentialsInput) throws
+    func sync(folder: URL, apiBase: String, orgId: UInt64, progress: SyncProgress) throws -> SyncResult
 }
 
 struct RdcBridge: RdcBridging {
@@ -25,6 +26,12 @@ struct RdcBridge: RdcBridging {
 
     func edit(folder: URL, input: EditCredentialsInput) throws {
         try withScope(folder) { try editCredentials(folder: folder.path, input: input) }
+    }
+
+    func sync(folder: URL, apiBase: String, orgId: UInt64, progress: SyncProgress) throws -> SyncResult {
+        try withScope(folder) {
+            try syncConnection(folder: folder.path, apiBase: apiBase, orgId: orgId, progress: progress)
+        }
     }
 }
 
