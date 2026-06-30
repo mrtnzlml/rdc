@@ -2,17 +2,23 @@ import SwiftUI
 
 @main
 struct RossumLocalApp: App {
+    @State private var store = ConnectionStore(bridge: RdcBridge(), bookmarks: BookmarkStore())
+    @State private var sync = SyncCoordinator()
+
     var body: some Scene {
         WindowGroup {
-            VStack(spacing: 8) {
-                Text("Rossum Local").font(.title2)
-                // Calling ffiVersion() proves the xcframework links and the
-                // generated bindings are callable. Real UI arrives in Phase 2b.
-                Text("rdc core \(ffiVersion() ?? "unavailable")")
-                    .foregroundStyle(.secondary)
+            ContentView()
+                .environment(store)
+                .environment(sync)
+                .frame(minWidth: 720, minHeight: 460)
+        }
+        .commands {
+            CommandGroup(replacing: .newItem) {
+                Button("New Connection…") { NotificationCenter.default.post(name: .newConnection, object: nil) }
+                    .keyboardShortcut("n", modifiers: .command)
+                Button("Open Existing rdc Project…") { NotificationCenter.default.post(name: .openExisting, object: nil) }
+                    .keyboardShortcut("o", modifiers: .command)
             }
-            .frame(minWidth: 640, minHeight: 420)
-            .padding()
         }
     }
 }
