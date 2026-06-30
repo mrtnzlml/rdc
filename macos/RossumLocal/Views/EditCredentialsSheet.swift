@@ -30,7 +30,9 @@ struct EditCredentialsSheet: View {
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                    .buttonStyle(.glass)
                 Button("Save") { save() }.keyboardShortcut(.defaultAction).disabled(!isValid)
+                    .buttonStyle(.glassProminent)
             }.padding()
         }
         .frame(width: 420)
