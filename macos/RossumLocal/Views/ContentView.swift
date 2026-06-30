@@ -3,16 +3,21 @@ import SwiftUI
 struct ContentView: View {
     @Environment(ConnectionStore.self) private var store
     @State private var selectedID: ConnectionSummary.ID?
+    @State private var pendingRemoval: ConnectionSummary?
+
+    private var selected: ConnectionSummary? {
+        store.connections.first { $0.id == selectedID }
+    }
 
     var body: some View {
         NavigationSplitView {
             if store.parentFolder == nil {
                 EmptyStateView(needsFolder: true)
             } else {
-                Text("Sidebar")   // replaced by SidebarView in Task 3
+                SidebarView(selectedID: $selectedID, pendingRemoval: $pendingRemoval)
             }
         } detail: {
-            Text("Detail")        // replaced by DetailView in Task 4
+            Text("Detail")   // replaced in Task 4
         }
         .onAppear { store.reload() }
     }
