@@ -32,3 +32,23 @@ xcodebuild -project RossumLocal.xcodeproj -scheme RossumLocal \
 Model-layer logic (bridge, bookmark store, connection-list merge, sync state,
 formatting) is covered by `RossumLocalTests`. The sandbox runtime (folder
 grant, bookmarks) and a live sync are verified by running the signed app.
+
+## Running the app (maintainer)
+
+The model layer + UI compile under `xcodebuild`, but the GUI, the sandbox folder
+grant, security-scoped bookmarks, and a live sync can only be exercised by running
+the signed app:
+
+1. `../rdc-ffi/build-xcframework.sh` (if not already built)
+2. `xcodegen generate`
+3. `open RossumLocal.xcodeproj`, select your team (free Personal Team is fine), ⌘R.
+
+### Manual verification checklist
+- [ ] First launch shows the "Choose a folder" empty state; picking a folder (e.g. `~/Documents/Rossum`) persists and the sidebar appears.
+- [ ] **New Connection ⌘N** → fill the form (token or username/password) → the connection appears in the sidebar.
+- [ ] Selecting a connection shows its details; **Sync** shows a progress glyph, then a completion notification + the Dock badge clears.
+- [ ] **Open Existing rdc Project ⌘O** → pick an existing `rdc` project folder → it appears (attached, not copied).
+- [ ] **Edit Credentials…** flips token↔password and persists.
+- [ ] **Remove** a managed connection → moves its folder to Trash; **Detach** an external one → leaves the folder in place.
+- [ ] **Reveal in Finder** opens the connection's folder.
+- [ ] Interop: run `rdc sync main` in a connection's folder from Terminal — the CLI and app agree on the same files.
