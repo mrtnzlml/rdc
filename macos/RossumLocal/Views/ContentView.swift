@@ -5,6 +5,7 @@ struct ContentView: View {
     @State private var selectedID: ConnectionSummary.ID?
     @State private var pendingRemoval: ConnectionSummary?
     @State private var editTarget: ConnectionSummary?
+    @State private var showAdd = false
 
     private var selected: ConnectionSummary? {
         store.connections.first { $0.id == selectedID }
@@ -25,5 +26,7 @@ struct ContentView: View {
             }
         }
         .onAppear { store.reload() }
+        .sheet(isPresented: $showAdd) { AddConnectionSheet() }
+        .onReceive(NotificationCenter.default.publisher(for: .newConnection)) { _ in showAdd = true }
     }
 }
