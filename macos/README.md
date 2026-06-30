@@ -52,3 +52,11 @@ the signed app:
 - [ ] **Remove** a managed connection → moves its folder to Trash; **Detach** an external one → leaves the folder in place.
 - [ ] **Reveal in Finder** opens the connection's folder.
 - [ ] Interop: run `rdc sync main` in a connection's folder from Terminal — the CLI and app agree on the same files.
+
+## Design
+
+The UI targets **macOS 26 (Tahoe)** and adopts Liquid Glass: standard controls are
+restyled automatically by the macOS 26 SDK, and primary actions use `.buttonStyle(.glass)` /
+`.glassProminent`, the sidebar uses `.scrollEdgeEffectStyle(.soft)`, and the sync status uses
+an animated SF Symbol. The app icon is a programmatic placeholder
+(`tools/build-app-icon.sh`) pending a real Liquid Glass icon authored in Icon Composer.
