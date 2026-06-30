@@ -15,6 +15,21 @@ final class ConnectionStore {
         self.bookmarks = bookmarks
     }
 
+    /// Returns true on success; on failure sets `lastError` and returns false.
+    func addConnection(_ input: AddConnectionInput) -> Bool {
+        guard let parent = bookmarks.parent else {
+            lastError = "Choose a folder for your connections first."
+            return false
+        }
+        do { _ = try bridge.add(parent: parent, input: input); reload(); return true }
+        catch { lastError = message(from: error); return false }
+    }
+
+    func editCredentials(folder: URL, _ input: EditCredentialsInput) -> Bool {
+        do { try bridge.edit(folder: folder, input: input); reload(); return true }
+        catch { lastError = message(from: error); return false }
+    }
+
     /// Rebuild the list: managed connections under the granted parent, plus each
     /// externally-attached project (skipping any that no longer validate),
     /// de-duped by folder path.

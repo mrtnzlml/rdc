@@ -6,6 +6,8 @@ import Foundation
 protocol RdcBridging {
     func list(parent: URL) -> [ConnectionSummary]
     func validate(path: URL) throws -> ConnectionSummary
+    func add(parent: URL, input: AddConnectionInput) throws -> ConnectionSummary
+    func edit(folder: URL, input: EditCredentialsInput) throws
 }
 
 struct RdcBridge: RdcBridging {
@@ -15,6 +17,14 @@ struct RdcBridge: RdcBridging {
 
     func validate(path: URL) throws -> ConnectionSummary {
         try withScope(path) { try validateExistingProject(path: path.path) }
+    }
+
+    func add(parent: URL, input: AddConnectionInput) throws -> ConnectionSummary {
+        try withScope(parent) { try addConnection(parent: parent.path, input: input) }
+    }
+
+    func edit(folder: URL, input: EditCredentialsInput) throws {
+        try withScope(folder) { try editCredentials(folder: folder.path, input: input) }
     }
 }
 
