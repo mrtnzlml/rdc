@@ -30,6 +30,43 @@ final class ConnectionStore {
         catch { lastError = message(from: error); return false }
     }
 
+    func attachExisting(_ path: URL) -> Bool {
+        do {
+            _ = try bridge.validate(path: path)
+            guard bookmarks.addExternal(path) else {
+                lastError = "Couldn't save access to that folder."
+                return false
+            }
+            reload()
+            return true
+        } catch {
+            lastError = message(from: error)
+            return false
+        }
+    }
+
+    /// External = the connection's folder is not inside the granted parent folder.
+    func isExternal(_ summary: ConnectionSummary) -> Bool {
+        guard let parent = bookmarks.parent?.standardizedFileURL.path else { return true }
+        let folderParent = URL(fileURLWithPath: summary.folder).deletingLastPathComponent()
+            .standardizedFileURL.path
+        return folderParent != parent
+    }
+
+    func remove(_ summary: ConnectionSummary) -> Bool {
+        let folder = URL(fileURLWithPath: summary.folder)
+        if isExternal(summary) {
+            bookmarks.removeExternal(folder)   // never trash the user's external folder
+            reload(); return true
+        }
+        do { try FileActions.trash(folder); reload(); return true }
+        catch { lastError = message(from: error); return false }
+    }
+
+    func reveal(_ summary: ConnectionSummary) {
+        FileActions.reveal(URL(fileURLWithPath: summary.folder))
+    }
+
     /// Rebuild the list: managed connections under the granted parent, plus each
     /// externally-attached project (skipping any that no longer validate),
     /// de-duped by folder path.
