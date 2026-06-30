@@ -34,12 +34,36 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .openExisting)) { _ in
             if let url = FolderPicker.chooseFolder(prompt: "Open") {
-                if !store.attachExisting(url) { /* lastError shown via the alert in Task 8 */ }
+                if !store.attachExisting(url) { /* lastError shown via the alert below */ }
             }
         }
         .onAppear { store.reload() }
         .sheet(isPresented: $showAdd) { AddConnectionSheet() }
         .sheet(item: $editTarget) { conn in EditCredentialsSheet(connection: conn) }
         .onReceive(NotificationCenter.default.publisher(for: .newConnection)) { _ in showAdd = true }
+        .confirmationDialog(
+            "Remove this connection?",
+            isPresented: Binding(get: { pendingRemoval != nil }, set: { if !$0 { pendingRemoval = nil } }),
+            presenting: pendingRemoval
+        ) { conn in
+            Button(store.isExternal(conn) ? "Detach" : "Move to Trash", role: .destructive) {
+                _ = store.remove(conn)
+                if selectedID == conn.id { selectedID = nil }
+                pendingRemoval = nil
+            }
+            Button("Cancel", role: .cancel) { pendingRemoval = nil }
+        } message: { conn in
+            Text(store.isExternal(conn)
+                 ? "\u{201C}\(conn.name)\u{201D} will be detached. Its folder stays where it is."
+                 : "\u{201C}\(conn.name)\u{201D} will be moved to the Trash.")
+        }
+        .alert("Error", isPresented: Binding(
+            get: { store.lastError != nil },
+            set: { if !$0 { store.lastError = nil } })
+        ) {
+            Button("OK") { store.lastError = nil }
+        } message: {
+            Text(store.lastError ?? "")
+        }
     }
 }

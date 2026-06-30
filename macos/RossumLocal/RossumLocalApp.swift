@@ -11,6 +11,17 @@ struct RossumLocalApp: App {
                 .environment(store)
                 .environment(sync)
                 .frame(minWidth: 720, minHeight: 460)
+                .onAppear {
+                    SyncNotifications.requestAuthorization()
+                    sync.onTerminal = { _, phase in
+                        switch phase {
+                        case .done(let n): SyncNotifications.post(title: "Sync complete", body: "\(n) files")
+                        case .error(let m): SyncNotifications.post(title: "Sync failed", body: m)
+                        case .started: break
+                        }
+                    }
+                }
+                .onChange(of: sync.activeCount) { _, newValue in DockBadge.set(newValue) }
         }
         .commands {
             CommandGroup(replacing: .newItem) {
