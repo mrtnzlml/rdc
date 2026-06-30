@@ -36,12 +36,10 @@ final class SyncCoordinator {
             self?.apply(id: id, phase: phase)
         }
 
-        Task.detached {
+        Task.detached { [bridge] in
             // Blocking FFI call off the main thread. Errors surface as a final phase.
             do { _ = try runner.run(folder: folder, apiBase: apiBase, orgId: orgId, progress: bridge) }
-            catch {
-                await MainActor.run { self.apply(id: id, phase: .error(message: message(from: error))) }
-            }
+            catch { bridge.onPhase(phase: .error(message: message(from: error))) }
         }
     }
 
@@ -57,7 +55,7 @@ final class SyncCoordinator {
 }
 
 /// Adapts the FFI callback (fired on a background thread) onto the main actor.
-final class SyncProgressBridge: SyncProgress {
+private final class SyncProgressBridge: SyncProgress {
     private let onMain: @MainActor (SyncPhase) -> Void
     init(onMain: @escaping @MainActor (SyncPhase) -> Void) { self.onMain = onMain }
     func onPhase(phase: SyncPhase) {
