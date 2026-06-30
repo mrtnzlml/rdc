@@ -15,6 +15,12 @@ struct EmptyStateView: View {
                 Text("Pick a folder (e.g. ~/Documents/Rossum) where Rossum Local keeps each connection.")
                     .font(.callout).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
+                Button("Choose Folder…") {
+                    if let url = FolderPicker.chooseFolder(prompt: "Choose", directoryHint: FolderPicker.documentsRossum) {
+                        store.setParentFolder(url)
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
             }
         }
         .padding(40)
