@@ -9,14 +9,15 @@ struct SidebarView: View {
 
     var body: some View {
         List(store.connections, selection: $selectedID) { conn in
-            HStack {
+            HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(conn.name)
+                    Text(conn.name).font(.body)
                     Text(conn.apiBase).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
-                Spacer()
+                Spacer(minLength: 8)
                 statusGlyph(for: conn)
             }
+            .padding(.vertical, 2)
             .tag(conn.id)
             .contextMenu {
                 Button("Sync") { sync.sync(conn) }
@@ -27,6 +28,7 @@ struct SidebarView: View {
                 }
             }
         }
+        .scrollEdgeEffectStyle(.soft, for: .all)
         .navigationTitle("Connections")
     }
 
