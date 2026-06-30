@@ -5,11 +5,16 @@ import Foundation
 /// security scope (a no-op outside the sandbox, e.g. in unit tests).
 protocol RdcBridging {
     func list(parent: URL) -> [ConnectionSummary]
+    func validate(path: URL) throws -> ConnectionSummary
 }
 
 struct RdcBridge: RdcBridging {
     func list(parent: URL) -> [ConnectionSummary] {
         withScope(parent) { listConnections(parent: parent.path) }
+    }
+
+    func validate(path: URL) throws -> ConnectionSummary {
+        try withScope(path) { try validateExistingProject(path: path.path) }
     }
 }
 
@@ -17,8 +22,8 @@ struct RdcBridge: RdcBridging {
 /// `false`-start gracefully: if access can't be started (e.g. non-sandboxed
 /// tests, where it's unnecessary), the body still runs.
 @discardableResult
-func withScope<T>(_ url: URL, _ body: () -> T) -> T {
+func withScope<T>(_ url: URL, _ body: () throws -> T) rethrows -> T {
     let started = url.startAccessingSecurityScopedResource()
     defer { if started { url.stopAccessingSecurityScopedResource() } }
-    return body()
+    return try body()
 }
