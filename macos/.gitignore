@@ -1,0 +1,4 @@
+RossumLocal.xcodeproj/
+build/
+*.xcuserdatad
+.DS_Store
