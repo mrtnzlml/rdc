@@ -38,10 +38,14 @@ final class BookmarkStore {
             return resolved.url
         }
         set {
-            guard let url = newValue, let data = try? codec.encode(url) else {
-                defaults.removeObject(forKey: parentKey); return
+            guard let url = newValue else {
+                defaults.removeObject(forKey: parentKey)
+                return
             }
-            defaults.set(data, forKey: parentKey)
+            // Encode failure must NOT clear an existing grant — leave it intact.
+            if let data = try? codec.encode(url) {
+                defaults.set(data, forKey: parentKey)
+            }
         }
     }
 
@@ -50,13 +54,15 @@ final class BookmarkStore {
         return blobs.compactMap { try? codec.decode($0).url }
     }
 
-    func addExternal(_ url: URL) {
-        guard let data = try? codec.encode(url) else { return }
+    @discardableResult
+    func addExternal(_ url: URL) -> Bool {
+        guard let data = try? codec.encode(url) else { return false }
         var blobs = defaults.array(forKey: externalsKey) as? [Data] ?? []
         // De-dupe by resolved path.
         blobs.removeAll { (try? codec.decode($0).url.path) == url.path }
         blobs.append(data)
         defaults.set(blobs, forKey: externalsKey)
+        return true
     }
 
     func removeExternal(_ url: URL) {
