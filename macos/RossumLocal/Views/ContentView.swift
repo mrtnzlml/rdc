@@ -27,6 +27,7 @@ struct ContentView: View {
         }
         .onAppear { store.reload() }
         .sheet(isPresented: $showAdd) { AddConnectionSheet() }
+        .sheet(item: $editTarget) { conn in EditCredentialsSheet(connection: conn) }
         .onReceive(NotificationCenter.default.publisher(for: .newConnection)) { _ in showAdd = true }
     }
 }
