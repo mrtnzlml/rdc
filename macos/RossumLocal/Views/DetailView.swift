@@ -8,9 +8,9 @@ struct DetailView: View {
     @Binding var pendingRemoval: ConnectionSummary?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 20) {
             Text(connection.name).font(.largeTitle)
-            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 6) {
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
                 row("API base", connection.apiBase)
                 row("Org ID", String(connection.orgId))
                 row("Auth", connection.authKind == .token ? "Token" : "Username / password")
@@ -45,7 +45,13 @@ struct DetailView: View {
 
     @ViewBuilder private var syncStatus: some View {
         switch sync.phases[connection.id] {
-        case .started: HStack { ProgressView().controlSize(.small); Text("Syncing…") }
+        case .started:
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .symbolEffect(.rotate, isActive: true)
+                Text("Syncing…")
+            }
+            .foregroundStyle(.secondary)
         case .done(let n): Label("Synced · \(n) files", systemImage: "checkmark.circle").foregroundStyle(.green)
         case .error(let m): Label(m, systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
         case .none: EmptyView()
