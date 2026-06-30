@@ -25,6 +25,18 @@ struct ContentView: View {
                 EmptyStateView(needsFolder: false)
             }
         }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button { showAdd = true } label: { Image(systemName: "plus") }
+                    .help("New Connection")
+                    .disabled(store.parentFolder == nil)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openExisting)) { _ in
+            if let url = FolderPicker.chooseFolder(prompt: "Open") {
+                if !store.attachExisting(url) { /* lastError shown via the alert in Task 8 */ }
+            }
+        }
         .onAppear { store.reload() }
         .sheet(isPresented: $showAdd) { AddConnectionSheet() }
         .sheet(item: $editTarget) { conn in EditCredentialsSheet(connection: conn) }
