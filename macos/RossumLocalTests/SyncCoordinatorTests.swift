@@ -2,7 +2,7 @@ import XCTest
 @testable import RossumLocal
 
 /// Fake runner: emits started then done synchronously through the progress callback.
-private struct FakeRunner: SyncRunner {
+struct FakeRunner: SyncRunner {
     let fileCount: UInt64
     func run(folder: URL, apiBase: String, orgId: UInt64, progress: SyncProgress) throws -> SyncResult {
         progress.onPhase(phase: .started)

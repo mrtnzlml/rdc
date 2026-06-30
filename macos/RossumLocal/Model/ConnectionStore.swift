@@ -67,6 +67,15 @@ final class ConnectionStore {
         FileActions.reveal(URL(fileURLWithPath: summary.folder))
     }
 
+    /// The granted parent folder for managed connections, if one has been chosen.
+    var parentFolder: URL? { bookmarks.parent }
+
+    /// Grant (or change) the parent folder, then refresh the list.
+    func setParentFolder(_ url: URL) {
+        bookmarks.parent = url
+        reload()
+    }
+
     /// Rebuild the list: managed connections under the granted parent, plus each
     /// externally-attached project (skipping any that no longer validate),
     /// de-duped by folder path.
