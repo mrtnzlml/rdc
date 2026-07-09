@@ -82,11 +82,20 @@ fn endpoint_for(kind: &str) -> &str {
 
 /// Inverse of [`endpoint_for`]: map a URL endpoint segment back to its
 /// lockfile `kind`.
+///
+/// `organizations` → `organization` mirrors [`endpoint_for`]. `webhooks` →
+/// `hooks` is a many-to-one alias with no [`endpoint_for`] counterpart: a
+/// queue's `webhooks` back-reference array carries hook URLs under the legacy
+/// `/webhooks/<id>` endpoint, but those hooks are tracked under the `hooks`
+/// kind. Without this mapping the ref stays raw `https://` on disk while the
+/// parallel `queue.hooks` entry (same hook, `/hooks/<id>` form) portabilizes,
+/// producing mixed https/rdc noise. rdc never *emits* a `/webhooks/` URL
+/// (`endpoint_for("hooks")` is `hooks`), so the alias is inbound-only.
 fn kind_for_endpoint(ep: &str) -> &str {
-    if ep == "organizations" {
-        "organization"
-    } else {
-        ep
+    match ep {
+        "organizations" => "organization",
+        "webhooks" => "hooks",
+        _ => ep,
     }
 }
 
@@ -833,6 +842,46 @@ mod tests {
         assert_eq!(
             lf.slug_for_url("hooks", "https://x/api/v1/workspaces/1"),
             None
+        );
+    }
+
+    /// A queue's `webhooks` back-reference array carries hook URLs under the
+    /// legacy `/webhooks/<id>` endpoint (not `/hooks/<id>`). The endpoint
+    /// segment must still map back to the `hooks` kind so the ref resolves to
+    /// its tracked slug — otherwise the URL stays raw `https://` on disk while
+    /// the parallel `queue.hooks` entry (same hook, `/hooks/<id>` form) is
+    /// portabilized, producing mixed https/rdc noise in the snapshot.
+    #[test]
+    fn lookup_url_maps_webhooks_endpoint_to_hooks_kind() {
+        let mut lf = Lockfile {
+            api_base: "https://x.rossum.app/api/v1".to_string(),
+            ..Lockfile::default()
+        };
+        lf.upsert(
+            "hooks",
+            "validator",
+            ObjectEntry {
+                id: 55,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        // The `/hooks/55` form already resolves.
+        assert_eq!(
+            lf.lookup_url("https://x.rossum.app/api/v1/hooks/55"),
+            Some(("hooks", "validator"))
+        );
+        // The `/webhooks/55` form (from `queue.webhooks`) must resolve to the
+        // SAME hook, not fall through to a nonexistent `webhooks` kind.
+        assert_eq!(
+            lf.lookup_url("https://x.rossum.app/api/v1/webhooks/55"),
+            Some(("hooks", "validator"))
+        );
+        // And via the kind-scoped lookup too.
+        assert_eq!(
+            lf.slug_for_url("hooks", "https://x.rossum.app/api/v1/webhooks/55"),
+            Some("validator")
         );
     }
 

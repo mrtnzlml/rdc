@@ -261,6 +261,37 @@ mod tests {
     }
 
     #[test]
+    fn portabilize_converts_webhooks_endpoint_urls_to_hook_refs() {
+        // A queue snapshot carries the same hook in two arrays: `hooks` (the
+        // `/hooks/<id>` form) and `webhooks` (the legacy `/webhooks/<id>`
+        // form). Both must portabilize to the SAME `rdc://hooks/<slug>` ref;
+        // otherwise `webhooks` stays raw `https://` on disk.
+        let api_base = "https://example.rossum.app/api/v1";
+        let mut lf = lf_with(api_base, "hooks", "validator", 55);
+        lf.upsert(
+            "queues",
+            "invoices",
+            ObjectEntry {
+                id: 10,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        let mut v = serde_json::json!({
+            "url": "https://example.rossum.app/api/v1/queues/10",
+            "hooks": ["https://example.rossum.app/api/v1/hooks/55"],
+            "webhooks": ["https://example.rossum.app/api/v1/webhooks/55"],
+        });
+        portabilize_value(&mut v, &lf);
+        assert_eq!(v["hooks"][0], "rdc://hooks/validator");
+        assert_eq!(
+            v["webhooks"][0], "rdc://hooks/validator",
+            "webhooks (/webhooks/<id> form) must portabilize like hooks"
+        );
+    }
+
+    #[test]
     fn resolve_value_rewrites_rdc_refs_and_leaves_dangling_intact() {
         let api_base = "https://example.rossum.app/api/v1";
         let url = "https://example.rossum.app/api/v1/queues/10";

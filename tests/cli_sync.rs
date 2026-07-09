@@ -3054,6 +3054,207 @@ async fn sync_remote_create_writes_local_queue_tree() {
     );
 }
 
+/// End-to-end guard for the two portable-ref snapshot bugs on a queue's
+/// server-computed hook back-references:
+///
+/// 1. A queue carries the SAME hooks in two arrays — `hooks` (URLs under the
+///    `/hooks/<id>` endpoint) and `webhooks` (the legacy `/webhooks/<id>`
+///    endpoint). Both must portabilize to `rdc://hooks/<slug>`; before the fix
+///    the `webhooks` entries stayed raw `https://` (the `/webhooks/` endpoint
+///    didn't map to the `hooks` kind), producing mixed https/rdc noise.
+/// 2. Both arrays are unordered sets returned in arbitrary id order. The
+///    on-disk order must be stable (slug-sorted), so a later pull that also
+///    carries a real change never reshuffles them in the diff. Here the remote
+///    lists them in reverse-slug order and the snapshot must come out sorted.
+#[tokio::test]
+async fn sync_portabilizes_and_sorts_queue_hook_and_webhook_arrays() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // Two hooks so the ordering assertion is meaningful.
+    let hooks_body = serde_json::json!({
+        "pagination": { "total": 2, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 501,
+                "url": format!("{}/api/v1/hooks/501", server.uri()),
+                "name": "Validator: invoices",
+                "type": "webhook",
+                "queues": [],
+                "events": ["annotation_content"],
+                "config": { "url": "https://example.test/validator" },
+                "modified_at": "2026-04-20T08:00:00Z"
+            },
+            {
+                "id": 502,
+                "url": format!("{}/api/v1/hooks/502", server.uri()),
+                "name": "Exporter: netsuite",
+                "type": "webhook",
+                "queues": [],
+                "events": ["annotation_content"],
+                "config": { "url": "https://example.test/exporter" },
+                "modified_at": "2026-04-20T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(hooks_body))
+        .mount(&server)
+        .await;
+
+    let ws_url = format!("{}/api/v1/workspaces/800", server.uri());
+    let queue_url = format!("{}/api/v1/queues/100", server.uri());
+    let schema_url = format!("{}/api/v1/schemas/200", server.uri());
+    let inbox_url = format!("{}/api/v1/inboxes/300", server.uri());
+
+    let workspaces_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [{
+            "id": 800,
+            "url": ws_url,
+            "name": "Invoices AP",
+            "organization": format!("{}/api/v1/organizations/1", server.uri()),
+            "queues": [queue_url.clone()],
+            "modified_at": "2026-04-20T08:00:00Z"
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(workspaces_body))
+        .mount(&server)
+        .await;
+
+    // The queue lists both hooks in REVERSE slug order, and via BOTH the
+    // `/hooks/<id>` (hooks) and `/webhooks/<id>` (webhooks) endpoints.
+    let queues_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [{
+            "id": 100,
+            "url": queue_url.clone(),
+            "name": "Cost Invoices",
+            "workspace": format!("{}/api/v1/workspaces/800", server.uri()),
+            "schema": schema_url.clone(),
+            "inbox": inbox_url.clone(),
+            "hooks": [
+                format!("{}/api/v1/hooks/501", server.uri()),
+                format!("{}/api/v1/hooks/502", server.uri()),
+            ],
+            "webhooks": [
+                format!("{}/api/v1/webhooks/501", server.uri()),
+                format!("{}/api/v1/webhooks/502", server.uri()),
+            ],
+            "modified_at": "2026-04-20T08:00:00Z"
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(queues_body))
+        .mount(&server)
+        .await;
+
+    let schema_body = serde_json::json!({
+        "id": 200,
+        "url": schema_url,
+        "name": "Cost Invoices Schema",
+        "queues": [queue_url.clone()],
+        "content": [],
+        "modified_at": "2026-04-10T09:00:00Z"
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schemas/200"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(schema_body))
+        .mount(&server)
+        .await;
+
+    let inboxes_body = serde_json::json!({
+        "pagination": { "total_pages": 1, "next": null },
+        "results": [{
+            "id": 300,
+            "url": inbox_url,
+            "name": "Cost Invoices Inbox",
+            "email": "cost-invoices@mock.rossum.app",
+            "queues": [queue_url],
+            "modified_at": "2026-04-10T09:00:00Z",
+            "filters": []
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/inboxes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(inboxes_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(
+        &server,
+        &[
+            "/api/v1/hooks",
+            "/api/v1/workspaces",
+            "/api/v1/queues",
+            "/api/v1/inboxes",
+        ],
+    )
+    .await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+    result.expect("sync should succeed pulling a queue with hook back-references");
+
+    let queue_json = std::fs::read_to_string(
+        project
+            .path()
+            .join("envs/dev/workspaces/invoices-ap/queues/cost-invoices/queue.json"),
+    )
+    .unwrap();
+    let queue: serde_json::Value = serde_json::from_str(&queue_json).unwrap();
+
+    // (1) Both arrays portabilized to rdc://hooks refs — NO raw URLs survive.
+    assert!(
+        !queue_json.contains("/api/v1/webhooks/"),
+        "webhooks endpoint URLs must be portabilized, not left raw: {queue_json}"
+    );
+    assert!(
+        !queue_json.contains("/api/v1/hooks/"),
+        "hooks endpoint URLs must be portabilized, not left raw: {queue_json}"
+    );
+    // (2) Both arrays are slug-sorted (exporter- before validator-), regardless
+    // of the reverse order the remote returned them in.
+    let expected = serde_json::json!([
+        "rdc://hooks/exporter-netsuite",
+        "rdc://hooks/validator-invoices"
+    ]);
+    assert_eq!(queue["hooks"], expected, "queue.hooks must be portable + sorted");
+    assert_eq!(
+        queue["webhooks"], expected,
+        "queue.webhooks must be portable + sorted, same as hooks"
+    );
+}
+
 /// Idempotency for the queue tree: after an initial sync, a second
 /// sync run with no remote or local changes should be a no-op
 /// (no API mutations, no file rewrites). Pins the Clean classification
