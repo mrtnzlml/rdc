@@ -385,6 +385,26 @@ fn transform_file(
         reconcile_score_thresholds(&mut value, kind, &dst_path);
     }
 
+    // Reconcile the per-queue `training_enabled` flag. Engine auto-training is a
+    // per-env policy (train in dev, not in a test clone) and Rossum resets the
+    // flag to `false` on queue creation, so carrying the source's value would
+    // make every migrate+sync conflict (source `true` vs deployed `false`). Like
+    // the score thresholds, a matched target keeps its own value and a brand-new
+    // queue drops the field. Unconditional (no flag): there is no case for
+    // blindly propagating a training toggle across orgs.
+    if let Some((kind, _)) = classify(rel) {
+        reconcile_training_enabled(&mut value, kind, &dst_path);
+    }
+
+    // Trailing-whitespace normalization: Rossum strips trailing whitespace from
+    // stored text (an email_template `message` posted as `…</p>\n` is returned
+    // `…</p>`), so a freshly pulled snapshot never carries it. Trim here too, so
+    // a migrated snapshot is byte-identical to a pulled one (`git diff` stays
+    // clean) rather than reintroducing the source's trailing newline every run.
+    // Mirrors `canonicalize_for_hash`, keeping the on-disk form and the hash in
+    // agreement.
+    crate::snapshot::noise::trim_trailing_whitespace(&mut value);
+
     // Canonicalize the order of every set-like reference array to stable,
     // env-independent order. The refs are now in portable `rdc://<slug>` form
     // (post-subst), and these arrays (`hook.run_after`/`queues`,
@@ -468,6 +488,45 @@ fn reconcile_score_thresholds(value: &mut serde_json::Value, kind: &str, tgt_pat
             }
         }
         _ => {}
+    }
+}
+
+/// Reconcile the per-queue `training_enabled` flag so migrate+sync is stable.
+///
+/// Engine auto-training is a per-env policy (you train the model in dev, not in
+/// a throwaway test clone), and Rossum resets `training_enabled` to `false` when
+/// a queue is created. Carrying the source's value therefore makes every
+/// migrate+sync conflict — the migrated queue says `true`, the deployed queue is
+/// `false`, and neither side ever converges. Following the same rule as
+/// [`reconcile_score_thresholds`]:
+///
+/// - **Matched target** (`tgt_path` exists + carries the flag): adopt the
+///   TARGET's value, so each env keeps its own training policy.
+/// - **New target** (or the target lacks the flag): drop it, so Rossum's
+///   create-time default (`false`) applies and the round-trip is stable.
+///
+/// A no-op for any kind other than `queues`.
+fn reconcile_training_enabled(value: &mut serde_json::Value, kind: &str, tgt_path: &Path) {
+    const KEY: &str = "training_enabled";
+    if kind != "queues" {
+        return;
+    }
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    if !obj.contains_key(KEY) {
+        return;
+    }
+    let target: Option<serde_json::Value> = std::fs::read(tgt_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok());
+    match target.as_ref().and_then(|t| t.get(KEY)).cloned() {
+        Some(v) => {
+            obj.insert(KEY.to_string(), v);
+        }
+        None => {
+            obj.remove(KEY);
+        }
     }
 }
 
@@ -1740,6 +1799,36 @@ mod tests {
         let missing = std::path::Path::new("/nonexistent/does-not-exist/queue.json");
         reconcile_score_thresholds(&mut source, "queues", missing);
         assert!(source.get("default_score_threshold").is_none());
+    }
+
+    #[test]
+    fn reconcile_training_matched_adopts_target_value() {
+        // Engine auto-training is a per-env policy; a matched target keeps its
+        // own `training_enabled` (source `true` must not overwrite target
+        // `false`, or migrate+sync perpetually conflicts).
+        let mut source = serde_json::json!({ "name": "Q", "training_enabled": true });
+        let (_d, tgt) = tgt_file(&serde_json::json!({ "name": "Q", "training_enabled": false }));
+        reconcile_training_enabled(&mut source, "queues", &tgt);
+        assert_eq!(source["training_enabled"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn reconcile_training_new_target_drops_flag() {
+        // No target => brand-new queue => drop the flag; Rossum's create default
+        // (false) applies and the round-trip is stable.
+        let mut source = serde_json::json!({ "name": "Q", "training_enabled": true });
+        let missing = std::path::Path::new("/nonexistent/does-not-exist/queue.json");
+        reconcile_training_enabled(&mut source, "queues", missing);
+        assert!(source.get("training_enabled").is_none());
+    }
+
+    #[test]
+    fn reconcile_training_no_op_for_non_queue() {
+        // Only queues carry `training_enabled`; other kinds are untouched.
+        let mut source = serde_json::json!({ "name": "S", "training_enabled": true });
+        let (_d, tgt) = tgt_file(&serde_json::json!({ "name": "S" }));
+        reconcile_training_enabled(&mut source, "schemas", &tgt);
+        assert_eq!(source["training_enabled"], serde_json::json!(true));
     }
 
     #[test]

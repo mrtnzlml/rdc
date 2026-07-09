@@ -58,9 +58,41 @@ pub fn canonicalize_for_hash(bytes: &[u8], lockfile: &crate::state::Lockfile) ->
     // no-op, preserving prior behavior.
     crate::snapshot::refs::portabilize_value(&mut value, lockfile);
     strip_noise_fields(&mut value);
+    trim_trailing_whitespace(&mut value);
     sort_url_arrays(&mut value);
     sort_keys_recursive(&mut value);
     serde_json::to_vec(&value).unwrap_or_else(|_| bytes.to_vec())
+}
+
+/// Recursively trim trailing whitespace from every string leaf.
+///
+/// Rossum normalizes stored text by stripping trailing whitespace: an
+/// email_template `message` posted as `…</p>\n` is returned as `…</p>`. Because
+/// the server always strips it, a difference that is ONLY trailing whitespace
+/// can never be pushed — so it must not register as drift, or a `migrate` output
+/// (which keeps the source's trailing `\n`) and a fresh `pull` (server stripped
+/// it) would conflict on every run. Leading and internal whitespace are left
+/// intact: they are semantic in multiline text and code.
+pub(crate) fn trim_trailing_whitespace(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim_end();
+            if trimmed.len() != s.len() {
+                *s = trimmed.to_string();
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                trim_trailing_whitespace(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() {
+                trim_trailing_whitespace(v);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Recursively sort the keys of every JSON object alphabetically. Used
@@ -337,6 +369,35 @@ mod tests {
             canonicalize_for_hash(a, &crate::state::Lockfile::default()),
             canonicalize_for_hash(b, &crate::state::Lockfile::default()),
             "non-URL array order is semantic and must remain significant in the hash"
+        );
+    }
+
+    #[test]
+    fn canonicalize_ignores_trailing_whitespace_in_strings() {
+        // Rossum trims trailing whitespace when storing text (an email_template
+        // `message` posted as `…</p>\n` comes back `…</p>`), so a
+        // trailing-whitespace-only difference can never be pushed and must NOT
+        // register as drift — otherwise migrate (source keeps the `\n`) and pull
+        // (server stripped it) perpetually conflict.
+        let a = br#"{"message":"<p>Dear sender</p>\n"}"#;
+        let b = br#"{"message":"<p>Dear sender</p>"}"#;
+        assert_eq!(
+            canonicalize_for_hash(a, &crate::state::Lockfile::default()),
+            canonicalize_for_hash(b, &crate::state::Lockfile::default()),
+            "a trailing-whitespace-only difference must not affect the content hash"
+        );
+    }
+
+    #[test]
+    fn canonicalize_preserves_internal_and_meaningful_content() {
+        // Only TRAILING whitespace is normalized. Internal newlines (multiline
+        // text / code) and real content changes must stay significant.
+        let a = br#"{"message":"line1\nline2"}"#;
+        let b = br#"{"message":"line1line2"}"#;
+        assert_ne!(
+            canonicalize_for_hash(a, &crate::state::Lockfile::default()),
+            canonicalize_for_hash(b, &crate::state::Lockfile::default()),
+            "internal whitespace is semantic and must remain significant"
         );
     }
 }
