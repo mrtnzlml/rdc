@@ -426,7 +426,7 @@ pub(crate) async fn run_cycle(
     // `cli::push::deletes::confirm_or_refuse`, which prints the full
     // tombstone list and either prompts (TTY) or refuses (non-TTY without
     // the flag).
-    let outcome = {
+    let exec_result = {
         let mut ctx = crate::cli::pull::common::PullCtx {
             paths: &paths,
             client: &client,
@@ -444,7 +444,29 @@ pub(crate) async fn run_cycle(
             interactive,
             &progress,
         )
-        .await?
+        .await
+        // `ctx`'s `&mut lockfile` borrow ends here, freeing `lockfile` for the
+        // save-on-abort below.
+    };
+    let outcome = match exec_result {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            // `execute::run` records each object in `lockfile` AS it commits
+            // the write to the remote, but a mid-run error would otherwise skip
+            // the `lockfile.save` at the end of this function — discarding every
+            // record of what was already created/updated. A re-run would then
+            // re-create those objects (duplicating them, since name isn't
+            // unique) instead of resuming. Persist the partial progress
+            // (best-effort) before propagating so the next sync sees the
+            // committed objects and continues from there.
+            if let Err(save_err) = lockfile.save(&paths.lockfile()) {
+                progress.event(
+                    Action::Warn,
+                    &format!("could not persist partial progress to the lockfile: {save_err:#}"),
+                );
+            }
+            return Err(e);
+        }
     };
 
     // Re-classify post-execute and re-ingest so squares whose state flipped
