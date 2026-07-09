@@ -56,20 +56,22 @@ pub fn portabilize_refs(paths: &Paths, lockfile: &mut Lockfile) -> Result<()> {
             Err(_) => continue, // defensive: skip unparseable files
         };
 
-        // Portabilize, then canonicalize a hook's `run_after` order. Both run
-        // before the change check so a sort-only delta (refs already portable
-        // but in the source env's arbitrary id order) still rewrites + rehashes
-        // — keeping run_after slug-sorted and stable across re-pulls and envs.
+        // Portabilize, then canonicalize the order of every set-like reference
+        // array (all elements are URLs or `rdc://` refs) to stable, sorted
+        // order — the SAME normalization `canonicalize_for_hash` applies. The
+        // API returns these back-reference sets (`hook.run_after`/`queues`,
+        // `workspace.queues`, `schema.queues`, `rule.queues`,
+        // `engine.training_queues`, `queue.hooks`/`webhooks`, …) in arbitrary
+        // per-env id order; without canonicalizing the WRITTEN bytes, any
+        // re-pull that also carries a real change rewrites the file with a
+        // reshuffled array (spurious git-diff churn), and `migrate` emits a
+        // reorder. The hash is already order-insensitive, so this never
+        // changes the recorded baseline. Both run before the change check so a
+        // sort-only delta (refs already portable but in the source env's
+        // arbitrary order) still rewrites + rehashes.
         let before = value.clone();
         portabilize_value(&mut value, lockfile);
-        if kind == "hooks" {
-            crate::snapshot::hook::sort_run_after(&mut value);
-            // `queues` was sorted at serialize time, before portabilization —
-            // i.e. in URL/id order. Re-sort the now-portable slugs so the
-            // on-disk order is env-stable and `doctor` never re-canonicalizes
-            // freshly pulled hooks. Same rationale as `run_after` above.
-            crate::snapshot::hook::sort_queues(&mut value);
-        }
+        crate::snapshot::noise::sort_url_arrays(&mut value);
         if value == before {
             continue;
         }
@@ -548,6 +550,57 @@ mod tests {
         let expected = crate::state::hook_combined_hash(&after_bytes, &code, &Lockfile::default());
         assert_eq!(new, expected, "lockfile hash must match the on-disk bytes");
         assert_eq!(new, pre, "hash is order-invariant for rdc:// ref arrays by design");
+    }
+
+    #[test]
+    fn portabilize_refs_sorts_non_hook_ref_arrays_into_stable_order() {
+        // The reorder symptom is NOT hook-specific: a workspace's server-computed
+        // `queues` back-reference comes back in the API's arbitrary id order.
+        // Left unsorted on disk, a re-pull that also carries a real change
+        // rewrites the file with a reshuffled array — spurious git-diff churn.
+        // The post-pass must canonicalize EVERY portable-kind ref array, not
+        // just hooks' `run_after`/`queues`.
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+
+        const WS_SLUG: &str = "acme-ws";
+        let mut lockfile = Lockfile::default();
+        seed_entry(&mut lockfile, "workspaces", WS_SLUG, 3003);
+        seed_entry(&mut lockfile, "queues", "zeta-line", 200);
+        seed_entry(&mut lockfile, "queues", "alpha-line", 100);
+
+        // A workspace whose refs are ALREADY portable rdc:// (so
+        // `portabilize_value` is a no-op) but whose `queues` array is in the
+        // source env's arbitrary id order, not slug order.
+        let ws = json!({
+            "id": 3003,
+            "url": format!("rdc://workspaces/{WS_SLUG}"),
+            "name": "Acme",
+            "queues": ["rdc://queues/zeta-line", "rdc://queues/alpha-line"],
+        });
+        let mut bytes = serde_json::to_vec_pretty(&ws).unwrap();
+        bytes.push(b'\n');
+        let path = paths.workspace_dir(WS_SLUG).join("workspace.json");
+        write_file(&path, &bytes);
+
+        let pre = content_hash(&bytes, &Lockfile::default());
+        lockfile
+            .objects
+            .get_mut("workspaces")
+            .unwrap()
+            .get_mut(WS_SLUG)
+            .unwrap()
+            .content_hash = Some(pre.clone());
+
+        portabilize_refs(&paths, &mut lockfile).expect("portabilize_refs must succeed");
+
+        let after_bytes = fs::read(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&after_bytes).unwrap();
+        assert_eq!(
+            v["queues"],
+            json!(["rdc://queues/alpha-line", "rdc://queues/zeta-line"]),
+            "post-pass must sort a non-hook ref array into stable slug order"
+        );
     }
 
     #[test]
