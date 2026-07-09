@@ -2,13 +2,13 @@ import Foundation
 import Observation
 
 protocol SyncRunner: Sendable {
-    func run(folder: URL, apiBase: String, orgId: UInt64, progress: SyncProgress) throws -> SyncResult
+    func run(folder: URL, scope: URL, apiBase: String, orgId: UInt64, progress: SyncProgress) throws -> SyncResult
 }
 
 /// Real runner: delegates to RdcBridge. Sendable because RdcBridge is stateless.
 struct BridgeSyncRunner: SyncRunner {
-    func run(folder: URL, apiBase: String, orgId: UInt64, progress: SyncProgress) throws -> SyncResult {
-        try RdcBridge().sync(folder: folder, apiBase: apiBase, orgId: orgId, progress: progress)
+    func run(folder: URL, scope: URL, apiBase: String, orgId: UInt64, progress: SyncProgress) throws -> SyncResult {
+        try RdcBridge().sync(folder: folder, scope: scope, apiBase: apiBase, orgId: orgId, progress: progress)
     }
 }
 
@@ -22,7 +22,11 @@ final class SyncCoordinator {
     var onTerminal: ((String, SyncPhase) -> Void)?
 
     private let runner: SyncRunner
-    init(runner: SyncRunner = BridgeSyncRunner()) { self.runner = runner }
+    private let bookmarks: BookmarkStore?
+    init(runner: SyncRunner = BridgeSyncRunner(), bookmarks: BookmarkStore? = nil) {
+        self.runner = runner
+        self.bookmarks = bookmarks
+    }
 
     func sync(_ summary: ConnectionSummary) {
         let id = summary.id
@@ -31,6 +35,11 @@ final class SyncCoordinator {
         activeCount += 1
 
         let folder = URL(fileURLWithPath: summary.folder)
+        // The security-scoped URL that actually authorizes writing under `folder`:
+        // the granted parent for an in-parent connection, or the connection's own
+        // external bookmark. Falls back to `folder` (a no-op scope) only when no
+        // grant is known — outside the sandbox that still works.
+        let scope = bookmarks?.scope(forConnectionAt: folder) ?? folder
         let apiBase = summary.apiBase
         let orgId = summary.orgId
         let runner = self.runner
@@ -41,7 +50,7 @@ final class SyncCoordinator {
 
         Task.detached { [bridge] in
             // Blocking FFI call off the main thread. Errors surface as a final phase.
-            do { _ = try runner.run(folder: folder, apiBase: apiBase, orgId: orgId, progress: bridge) }
+            do { _ = try runner.run(folder: folder, scope: scope, apiBase: apiBase, orgId: orgId, progress: bridge) }
             catch { bridge.onPhase(phase: .error(message: message(from: error))) }
         }
     }

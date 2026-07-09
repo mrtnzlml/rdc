@@ -53,7 +53,11 @@ struct DetailView: View {
             }
             .foregroundStyle(.secondary)
         case .done(let n): Label("Synced · \(n) files", systemImage: "checkmark.circle").foregroundStyle(.green)
-        case .error(let m): Label(m, systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
+        case .error(let m):
+            Label(m, systemImage: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
+                .textSelection(.enabled)
+                .contextMenu { Button("Copy") { Pasteboard.copy(m) } }
         case .none: EmptyView()
         }
     }

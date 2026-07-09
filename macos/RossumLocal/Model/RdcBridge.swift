@@ -8,7 +8,7 @@ protocol RdcBridging {
     func validate(path: URL) throws -> ConnectionSummary
     func add(parent: URL, input: AddConnectionInput) throws -> ConnectionSummary
     func edit(folder: URL, input: EditCredentialsInput) throws
-    func sync(folder: URL, apiBase: String, orgId: UInt64, progress: SyncProgress) throws -> SyncResult
+    func sync(folder: URL, scope: URL, apiBase: String, orgId: UInt64, progress: SyncProgress) throws -> SyncResult
 }
 
 struct RdcBridge: RdcBridging {
@@ -28,8 +28,13 @@ struct RdcBridge: RdcBridging {
         try withScope(folder) { try editCredentials(folder: folder.path, input: input) }
     }
 
-    func sync(folder: URL, apiBase: String, orgId: UInt64, progress: SyncProgress) throws -> SyncResult {
-        try withScope(folder) {
+    // `scope` is the security-scoped URL that authorizes access (the granted
+    // parent, or the connection's own external bookmark). `folder` is the plain
+    // path handed to the FFI. They differ for a connection inside the parent
+    // grant: the child folder isn't itself a security-scoped URL, so bracketing
+    // it would be a no-op and the sandbox would deny the write.
+    func sync(folder: URL, scope: URL, apiBase: String, orgId: UInt64, progress: SyncProgress) throws -> SyncResult {
+        try withScope(scope) {
             try syncConnection(folder: folder.path, apiBase: apiBase, orgId: orgId, progress: progress)
         }
     }

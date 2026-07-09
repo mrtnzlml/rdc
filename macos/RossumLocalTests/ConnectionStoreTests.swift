@@ -21,7 +21,7 @@ struct FakeBridge: RdcBridging {
     func edit(folder: URL, input: EditCredentialsInput) throws {
         throw FfiError.Operation(message: "not implemented in FakeBridge")
     }
-    func sync(folder: URL, apiBase: String, orgId: UInt64, progress: SyncProgress) throws -> SyncResult {
+    func sync(folder: URL, scope: URL, apiBase: String, orgId: UInt64, progress: SyncProgress) throws -> SyncResult {
         throw FfiError.Operation(message: "not implemented in FakeBridge")
     }
 }

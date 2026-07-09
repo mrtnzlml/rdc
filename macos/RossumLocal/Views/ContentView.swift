@@ -34,7 +34,7 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .openExisting)) { _ in
             if let url = FolderPicker.chooseFolder(prompt: "Open") {
-                if !store.attachExisting(url) { /* lastError shown via the alert below */ }
+                if !store.attachExisting(url) { /* lastError shown via the banner */ }
             }
         }
         .onAppear { store.reload() }
@@ -57,13 +57,10 @@ struct ContentView: View {
                  ? "\u{201C}\(conn.name)\u{201D} will be detached. Its folder stays where it is."
                  : "\u{201C}\(conn.name)\u{201D} will be moved to the Trash.")
         }
-        .alert("Error", isPresented: Binding(
-            get: { store.lastError != nil },
-            set: { if !$0 { store.lastError = nil } })
-        ) {
-            Button("OK") { store.lastError = nil }
-        } message: {
-            Text(store.lastError ?? "")
+        .safeAreaInset(edge: .top) {
+            if let err = store.lastError {
+                ErrorBanner(message: err) { store.lastError = nil }
+            }
         }
     }
 }

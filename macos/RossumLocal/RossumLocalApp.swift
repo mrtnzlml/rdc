@@ -2,8 +2,20 @@ import SwiftUI
 
 @main
 struct RossumLocalApp: App {
-    @State private var store = ConnectionStore(bridge: RdcBridge(), bookmarks: BookmarkStore())
-    @State private var sync = SyncCoordinator()
+    @State private var store: ConnectionStore
+    @State private var sync: SyncCoordinator
+
+    init() {
+        // One grant store shared by both: ConnectionStore records/reads folder
+        // access; SyncCoordinator resolves the security scope to bracket a sync
+        // with (see SyncCoordinator.sync / BookmarkStore.scope). Without the
+        // shared parent grant, a sandboxed sync of an in-parent connection would
+        // bracket the plain child folder — a no-op scope — and the OS would deny
+        // the scaffold write (EPERM).
+        let bookmarks = BookmarkStore()
+        _store = State(initialValue: ConnectionStore(bridge: RdcBridge(), bookmarks: bookmarks))
+        _sync = State(initialValue: SyncCoordinator(bookmarks: bookmarks))
+    }
 
     var body: some Scene {
         WindowGroup {
