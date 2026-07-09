@@ -206,6 +206,15 @@ Selector forms:
 
 Code sidecars travel with their object: selecting `hooks/<slug>` carries `hooks/<slug>.py`, selecting `schemas/<q>` carries the queue's `formulas/*.py`.
 
+### Score thresholds
+
+Confidence thresholds are tuned per queue/organization and expected to differ across envs, so migrate **ignores them by default**: a datapoint's `score_threshold` (in a schema) and a queue's `default_score_threshold` are taken from the *target* when the object already exists there, and dropped (falling back to the queue/server default) for brand-new objects. Pass `--migrate-score-thresholds` to carry the source env's values instead.
+
+```sh
+rdc migrate test prod                            # thresholds stay the target's
+rdc migrate test prod --migrate-score-thresholds # promote thresholds too
+```
+
 ### Hook secrets
 
 Hook secret values are never copied between envs — they live in each env's gitignored `secrets/<env>.hook-secrets.json`. On push, `rdc sync` injects only filled values; keys still holding the placeholder sentinel are skipped, so a half-edited template never leaks a literal to the API.

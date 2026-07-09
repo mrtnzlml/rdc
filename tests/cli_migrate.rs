@@ -146,7 +146,7 @@ version = 1
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![]);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed offline");
 
@@ -198,7 +198,7 @@ fn migrate_dry_run_writes_nothing() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, true, vec![]);
+    let result = rdc::cli::migrate::run("test", "prod", false, true, vec![], true);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("dry-run migrate should succeed");
 
@@ -230,7 +230,7 @@ fn migrate_errors_on_stale_mapping_source() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![]);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true);
     std::env::set_current_dir(&prev).unwrap();
 
     let err = result.expect_err("stale mapping source must abort migrate");
@@ -269,7 +269,7 @@ fn migrate_only_restricts_to_selected_object() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec!["hooks/keeper".into()]);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec!["hooks/keeper".into()], true);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate --only should succeed");
 
@@ -340,6 +340,7 @@ fn migrate_only_includes_sidecars_of_selected_objects() {
             "rules/validation".into(),
             "schemas/cost-invoices".into(),
         ],
+        true,
     );
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate --only should succeed");
@@ -386,6 +387,7 @@ fn migrate_only_unknown_selector_errors() {
         false,
         false,
         vec!["hooks/does-not-exist".into()],
+        true,
     );
     std::env::set_current_dir(&prev).unwrap();
 
@@ -497,7 +499,7 @@ fn migrate_preserves_target_identity_for_matched_object() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![]);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -519,6 +521,115 @@ fn migrate_preserves_target_identity_for_matched_object() {
     // Content migrated from SOURCE:
     assert_eq!(h["name"], "Extractor NEW NAME", "src content (name) migrated");
     assert_eq!(h["events"][0], "annotation_content.started", "src content (events) migrated");
+}
+
+/// Helper: write a minimal src+tgt queue tree (queue.json + schema.json) with an
+/// identity mapping, where the schema has one datapoint and the queue has a
+/// `default_score_threshold`. `src_th`/`tgt_th` set the per-datapoint threshold;
+/// `src_def`/`tgt_def` set the queue default. Returns the project root.
+fn setup_threshold_project(
+    src_th: f64,
+    tgt_th: f64,
+    src_def: f64,
+    tgt_def: f64,
+) -> TempDir {
+    let project = init_two_env_project();
+    let root = project.path().to_path_buf();
+    let schema = |th: f64| {
+        serde_json::json!({
+            "name": "Invoices schema",
+            "content": [{
+                "category": "section", "id": "header",
+                "children": [
+                    { "category": "datapoint", "id": "amount", "type": "number", "score_threshold": th }
+                ]
+            }]
+        })
+    };
+    let queue = |def: f64| {
+        serde_json::json!({
+            "name": "Invoices",
+            "workspace": "rdc://workspaces/main",
+            "schema": "rdc://schemas/invoices",
+            "settings": { "default_score_threshold": def }
+        })
+    };
+    for (env, th, def) in [("test", src_th, src_def), ("prod", tgt_th, tgt_def)] {
+        let base = root.join(format!("envs/{env}/workspaces/main/queues/invoices"));
+        write(&base.join("schema.json"), &schema(th));
+        write(&base.join("queue.json"), &queue(def));
+        write(
+            &root.join(format!("envs/{env}/workspaces/main/workspace.json")),
+            &serde_json::json!({ "name": "Main" }),
+        );
+    }
+    let map_dir = root.join(".rdc/map");
+    std::fs::create_dir_all(&map_dir).unwrap();
+    std::fs::write(
+        map_dir.join("test-to-prod.toml"),
+        "version = 1\n\n[workspaces]\n\"main\" = \"main\"\n\n[queues]\n\"invoices\" = \"invoices\"\n\n[schemas]\n\"invoices\" = \"invoices\"\n",
+    )
+    .unwrap();
+    project
+}
+
+/// By default (no `--migrate-score-thresholds`), migrate ignores the source's
+/// thresholds: a matched target keeps its OWN per-datapoint `score_threshold`
+/// and queue `default_score_threshold`.
+#[test]
+fn migrate_ignores_score_thresholds_by_default() {
+    let project = setup_threshold_project(0.5, 0.9, 0.5, 0.85);
+    let root = project.path();
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], false);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("migrate should succeed");
+
+    let base = root.join("envs/prod/workspaces/main/queues/invoices");
+    let schema = read_json(&base.join("schema.json"));
+    assert_eq!(
+        schema["content"][0]["children"][0]["score_threshold"],
+        serde_json::json!(0.9),
+        "matched target must keep its own per-datapoint threshold"
+    );
+    let queue = read_json(&base.join("queue.json"));
+    assert_eq!(
+        queue["settings"]["default_score_threshold"],
+        serde_json::json!(0.85),
+        "matched target must keep its own queue default_score_threshold"
+    );
+}
+
+/// With `--migrate-score-thresholds`, migrate carries the SOURCE's thresholds
+/// verbatim (the pre-existing behavior).
+#[test]
+fn migrate_carries_score_thresholds_with_flag() {
+    let project = setup_threshold_project(0.5, 0.9, 0.5, 0.85);
+    let root = project.path();
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("migrate should succeed");
+
+    let base = root.join("envs/prod/workspaces/main/queues/invoices");
+    let schema = read_json(&base.join("schema.json"));
+    assert_eq!(
+        schema["content"][0]["children"][0]["score_threshold"],
+        serde_json::json!(0.5),
+        "opting in must carry the source per-datapoint threshold"
+    );
+    let queue = read_json(&base.join("queue.json"));
+    assert_eq!(
+        queue["settings"]["default_score_threshold"],
+        serde_json::json!(0.5),
+        "opting in must carry the source queue default_score_threshold"
+    );
 }
 
 /// For an object that does NOT exist in the target (new), migrate must strip the
@@ -551,7 +662,7 @@ fn migrate_strips_identity_for_new_object() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    rdc::cli::migrate::run("test", "prod", false, false, vec![]).expect("migrate ok");
+    rdc::cli::migrate::run("test", "prod", false, false, vec![], true).expect("migrate ok");
     std::env::set_current_dir(&prev).unwrap();
 
     let h = read_json(&root.join("envs/prod/hooks/brand-new.json"));
@@ -597,7 +708,7 @@ fn migrate_overlay_shadow_replaces_formula_sidecar() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![]);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -634,7 +745,7 @@ fn migrate_overlay_shadow_replaces_hook_and_rule_code_and_leaves_others() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![]);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -661,7 +772,7 @@ fn migrate_overlay_dangling_shadow_is_a_hard_error_and_writes_nothing() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![]);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true);
     std::env::set_current_dir(&prev).unwrap();
 
     let err = result.unwrap_err().to_string();
@@ -686,7 +797,7 @@ fn migrate_overlay_json_shadow_is_rejected() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![]);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true);
     std::env::set_current_dir(&prev).unwrap();
 
     let err = result.unwrap_err().to_string();
@@ -711,7 +822,7 @@ fn migrate_overlay_only_excluded_shadow_does_not_error() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec!["hooks/a".to_string()]);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec!["hooks/a".to_string()], true);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("a valid shadow for an --only-excluded sidecar must not error");
 
@@ -764,7 +875,7 @@ fn migrate_overlay_shadow_applies_at_renamed_target_path() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![]);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -798,7 +909,7 @@ fn migrate_overlay_shadow_replaces_nodejs_hook_js_sidecar() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![]);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
