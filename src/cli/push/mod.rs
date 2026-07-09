@@ -71,13 +71,19 @@ pub(crate) async fn push_classified(
     hooks::push(paths, client, lockfile, interactive, &changes.hooks, catalog_hooks, relink, progress, env)
         .await
         .with_context(|| format!("pushing hooks for env '{env}'"))?;
-    if !changes.rules.is_empty() {
-        rules::push(paths, client, lockfile, interactive, &changes.rules, progress, env).await
-            .with_context(|| format!("pushing rules for env '{env}'"))?;
-    }
+    // Labels before rules: a rule's `actions` can reference a label
+    // (`rdc://labels/<slug>`), and `rules::push` resolves those refs at
+    // create time. Labels are leaf objects (they reference only the
+    // organization), so creating them first lets the rule's label refs
+    // resolve against the lockfile instead of failing with "Invalid
+    // hyperlink - No URL match".
     if !changes.labels.is_empty() {
         labels::push(paths, client, lockfile, interactive, &changes.labels, progress, env).await
             .with_context(|| format!("pushing labels for env '{env}'"))?;
+    }
+    if !changes.rules.is_empty() {
+        rules::push(paths, client, lockfile, interactive, &changes.rules, progress, env).await
+            .with_context(|| format!("pushing rules for env '{env}'"))?;
     }
     if !changes.engines.is_empty() {
         engines::push(paths, client, lockfile, interactive, &changes.engines, relink, progress, env).await
