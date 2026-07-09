@@ -50,6 +50,28 @@ final class BookmarkStoreTests: XCTestCase {
         XCTAssertFalse(throwing.addExternal(URL(fileURLWithPath: "/tmp/C")))
     }
 
+    func testScopeReturnsParentForConnectionInsideParent() {
+        let store = makeStore()
+        store.parent = URL(fileURLWithPath: "/tmp/Rossum")
+        let scope = store.scope(forConnectionAt: URL(fileURLWithPath: "/tmp/Rossum/test"))
+        XCTAssertEqual(scope?.path, "/tmp/Rossum")
+    }
+
+    func testScopeReturnsExternalBookmarkForAttachedConnection() {
+        let store = makeStore()
+        store.parent = URL(fileURLWithPath: "/tmp/Rossum")
+        store.addExternal(URL(fileURLWithPath: "/other/proj"))
+        let scope = store.scope(forConnectionAt: URL(fileURLWithPath: "/other/proj"))
+        XCTAssertEqual(scope?.path, "/other/proj")
+    }
+
+    func testScopeIsNilWhenNoGrantCoversFolder() {
+        let store = makeStore()
+        store.parent = URL(fileURLWithPath: "/tmp/Rossum")
+        store.addExternal(URL(fileURLWithPath: "/other/proj"))
+        XCTAssertNil(store.scope(forConnectionAt: URL(fileURLWithPath: "/somewhere/else")))
+    }
+
     func testExternalsAddDedupeRemove() {
         let store = makeStore()
         let a = URL(fileURLWithPath: "/ext/a")

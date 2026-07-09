@@ -70,4 +70,25 @@ final class BookmarkStore {
             .filter { (try? codec.decode($0).url.path) != url.path }
         defaults.set(blobs, forKey: externalsKey)
     }
+
+    /// The security-scoped URL that authorizes file access to a connection at
+    /// `folder`: the granted parent (when `folder` is inside it), otherwise the
+    /// external bookmark whose resolved URL is `folder` or an ancestor of it.
+    /// Returns nil when no stored grant covers `folder`.
+    ///
+    /// The returned URL is a freshly bookmark-resolved URL — bracket it directly
+    /// with `startAccessingSecurityScopedResource`; do not transform it (via
+    /// `standardizedFileURL`, `appendingPathComponent`, …) or the scope is lost.
+    func scope(forConnectionAt folder: URL) -> URL? {
+        let target = folder.standardizedFileURL.path
+        if let parent, Self.grant(parent, covers: target) { return parent }
+        return externalProjects().first { Self.grant($0, covers: target) }
+    }
+
+    /// True when `grant` is `targetPath` itself or a directory ancestor of it.
+    /// Compares standardized copies but never mutates the caller's bookmark URL.
+    private static func grant(_ grant: URL, covers targetPath: String) -> Bool {
+        let g = grant.standardizedFileURL.path
+        return targetPath == g || targetPath.hasPrefix(g + "/")
+    }
 }
