@@ -1327,9 +1327,11 @@ fn resolve_one_conflict<R: BufRead>(
         //
         // For combined-hash kinds where the JSON portions are byte-
         // identical (post-canonicalize) but the sidecar diverges,
-        // land the shadow next to the sidecar so the user sees the
-        // actual divergence — a `.json.<env>` shadow with byte-
-        // identical-to-local content would be misleading.
+        // anchor the shadow on the sidecar so the user sees the actual
+        // divergence — a `schema.json`/`hook.json` shadow with byte-
+        // identical-to-local content would be misleading. (The shadow
+        // lands under `.rdc/conflicts/<env>/`, mirroring the anchor's
+        // env-tree relpath.)
         let (shadow_anchor, shadow_bytes): (PathBuf, Vec<u8>) = if json_canonicalize_equal
             && sidecar_diverges
         {
@@ -1372,7 +1374,7 @@ fn resolve_one_conflict<R: BufRead>(
         } else {
             (local_path.clone(), remote_bytes.clone())
         };
-        let conflict_path = crate::paths::shadow_path_for(&shadow_anchor, env);
+        let conflict_path = ctx.paths.conflict_shadow_path(&shadow_anchor);
         write_atomic(&conflict_path, &shadow_bytes)?;
         progress.event(Action::Warn, &format!(
             "{} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
@@ -1563,8 +1565,8 @@ fn resolve_one_conflict<R: BufRead>(
                 modified_at,
                 Some(canonical_remote_hash.clone()),
             );
-            sweep_conflict_artifacts(&local_path, env);
-            sweep_conflict_artifacts(&code_path, env);
+            sweep_conflict_artifacts(ctx.paths, &local_path);
+            sweep_conflict_artifacts(ctx.paths, &code_path);
             outcome
                 .promoted_to_push
                 .push((it.kind.clone(), it.slug.clone(), local_path));
@@ -1630,8 +1632,8 @@ fn resolve_one_conflict<R: BufRead>(
                 modified_at,
                 Some(canonical_remote_hash.clone()),
             );
-            sweep_conflict_artifacts(&local_path, env);
-            sweep_conflict_artifacts(&code_path, env);
+            sweep_conflict_artifacts(ctx.paths, &local_path);
+            sweep_conflict_artifacts(ctx.paths, &code_path);
         }
         Resolution::Edit(edited) => {
             // Fully-resolved edit — write bytes to disk and align base to
@@ -1657,8 +1659,8 @@ fn resolve_one_conflict<R: BufRead>(
                 modified_at,
                 Some(canonical_remote_hash.clone()),
             );
-            sweep_conflict_artifacts(&local_path, env);
-            sweep_conflict_artifacts(&code_path, env);
+            sweep_conflict_artifacts(ctx.paths, &local_path);
+            sweep_conflict_artifacts(ctx.paths, &code_path);
             outcome
                 .promoted_to_push
                 .push((it.kind.clone(), it.slug.clone(), local_path));
@@ -1700,15 +1702,15 @@ fn resolve_one_conflict<R: BufRead>(
             );
         }
         Resolution::Skip => {
-            // Shadow-file fallback. Write `<prompt>.<env>` with the
-            // remote bytes (the same content the prompt would have
-            // shown), keep local on disk, pin the lockfile to the prior
-            // base so subsequent runs re-prompt. When the prompt was
-            // redirected to the sidecar, the shadow file lands next to
-            // the sidecar; this way the user gets a `.py.<env>` shadow
-            // showing the remote code, not a redundant copy of an
-            // identical-to-local `.json`.
-            let conflict_path = crate::paths::shadow_path_for(&prompt_path, env);
+            // Shadow-file fallback. Write the remote bytes (the same
+            // content the prompt would have shown) to the shadow parked
+            // under `.rdc/conflicts/<env>/` (mirroring `prompt_path`'s
+            // env-tree relpath), keep local on disk, pin the lockfile to
+            // the prior base so subsequent runs re-prompt. When the
+            // prompt was redirected to the sidecar, the shadow anchors on
+            // the sidecar; this way the user gets the remote code, not a
+            // redundant copy of an identical-to-local `.json`.
+            let conflict_path = ctx.paths.conflict_shadow_path(&prompt_path);
             write_atomic(&conflict_path, &prompt_remote_bytes)?;
             progress.event(Action::Warn, &format!(
                 "{} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
@@ -1789,25 +1791,25 @@ fn sidecar_path_for_remote(local_path: &Path, remote_bytes: &[u8]) -> PathBuf {
     local_path.with_extension("py")
 }
 
-/// Compute the `<file>.<env>-deleted` marker path for `local_path`.
-/// Mirrors [`crate::paths::shadow_path_for`]'s format with a `-deleted`
-/// suffix — matches what [`crate::paths::is_shadow_artifact`] already
-/// recognises so snapshot walkers and `_index.md` regeneration skip it
-/// just like the conflict-skip shadow.
-fn deleted_marker_path(local_path: &Path, env: &str) -> PathBuf {
-    let shadow = crate::paths::shadow_path_for(local_path, env);
+/// Compute the remote-delete marker path for `local_path`: the file's
+/// conflict shadow ([`crate::paths::Paths::conflict_shadow_path`], under
+/// `.rdc/conflicts/<env>/`) with a `-deleted` suffix appended. The whole
+/// conflicts tree is gitignored, so the marker never clutters `envs/`.
+fn deleted_marker_path(paths: &crate::paths::Paths, local_path: &Path) -> PathBuf {
+    let shadow = paths.conflict_shadow_path(local_path);
     let mut s = shadow.into_os_string();
     s.push("-deleted");
     PathBuf::from(s)
 }
 
 /// Sweep stale conflict artifacts for a file whose conflict has just been
-/// RESOLVED: the `<file>.<env>` shadow (left by an earlier non-TTY run or
-/// an explicit `[s]kip`) and the `<file>.<env>-deleted` marker. Once the
-/// user picks `[k]`/`[r]`/`[e]` the shadow's content is consumed or stale
-/// either way; leaving it on disk misleads (it no longer reflects any
-/// pending decision). Idempotent — missing files are no-ops. Skip-style
-/// outcomes must NOT call this: their artifacts are the deferral.
+/// RESOLVED: the conflict shadow (left by an earlier non-TTY run or an
+/// explicit `[s]kip`) and the `-deleted` marker, both under
+/// `.rdc/conflicts/<env>/`. Once the user picks `[k]`/`[r]`/`[e]` the
+/// shadow's content is consumed or stale either way; leaving it on disk
+/// misleads (it no longer reflects any pending decision). Idempotent —
+/// missing files are no-ops. Skip-style outcomes must NOT call this: their
+/// artifacts are the deferral.
 /// Recompute the canonical combined hash of an object's CURRENT on-disk
 /// state (JSON + sidecars), using exactly the same per-kind helpers the
 /// scanner uses, so the result is comparable to lockfile base hashes.
@@ -1844,14 +1846,13 @@ fn local_disk_hash(refs: &RemoteDeleteRefs) -> Option<String> {
 
 /// Mirror an env-side deletion locally: remove the JSON file, any code
 /// sidecar (both runtime extensions for hooks), a schema's `formulas/`
-/// directory, and a stale `<file>.<env>-deleted` marker; drop the
-/// lockfile entry. Shared by the `[r]` prompt arm and the clean
+/// directory, and a stale `-deleted` marker (under `.rdc/conflicts/<env>/`);
+/// drop the lockfile entry. Shared by the `[r]` prompt arm and the clean
 /// `RemoteDelete` auto-resolve path.
 fn delete_local_object(
     ctx: &mut crate::cli::pull::common::PullCtx<'_>,
     it: &ClassifiedItem,
     refs: &RemoteDeleteRefs,
-    env: &str,
 ) -> Result<()> {
     let local_path = &refs.local_path;
     // For split-file kinds, pick the sidecar extension from the local
@@ -1882,14 +1883,14 @@ fn delete_local_object(
             std::fs::remove_dir_all(&formulas_dir).ok();
         }
     }
-    let _ = std::fs::remove_file(deleted_marker_path(local_path, env));
+    let _ = std::fs::remove_file(deleted_marker_path(ctx.paths, local_path));
     drop_lockfile_entry(ctx, &it.kind, &it.slug);
     Ok(())
 }
 
-fn sweep_conflict_artifacts(local_path: &Path, env: &str) {
-    let _ = std::fs::remove_file(crate::paths::shadow_path_for(local_path, env));
-    let _ = std::fs::remove_file(deleted_marker_path(local_path, env));
+fn sweep_conflict_artifacts(paths: &crate::paths::Paths, local_path: &Path) {
+    let _ = std::fs::remove_file(paths.conflict_shadow_path(local_path));
+    let _ = std::fs::remove_file(deleted_marker_path(paths, local_path));
 }
 
 /// Drop a `(kind, slug)` entry from the lockfile. Used by the
@@ -2008,7 +2009,7 @@ async fn prune_mdh_orphans<R: BufRead>(
                     == Some(h.as_str())
             });
         if unchanged {
-            let _ = std::fs::remove_file(deleted_marker_path(&indexes_path, &env));
+            let _ = std::fs::remove_file(deleted_marker_path(ctx.paths, &indexes_path));
             remove_mdh_dataset(ctx, &slug, &indexes_path);
             progress.event(Action::Delete, &format!("mdh/{slug} (deleted on {env})"));
             pruned += 1;
@@ -2017,7 +2018,7 @@ async fn prune_mdh_orphans<R: BufRead>(
 
         // Non-tty: defer with a marker, never silently delete local files.
         if !interactive {
-            let marker = deleted_marker_path(&indexes_path, &env);
+            let marker = deleted_marker_path(ctx.paths, &indexes_path);
             write_atomic(&marker, b"")?;
             progress.event(
                 Action::Warn,
@@ -2066,7 +2067,7 @@ async fn prune_mdh_orphans<R: BufRead>(
                 );
             }
             Resolution::Skip => {
-                let marker = deleted_marker_path(&indexes_path, &env);
+                let marker = deleted_marker_path(ctx.paths, &indexes_path);
                 write_atomic(&marker, b"")?;
                 progress.event(
                     Action::Warn,
@@ -2785,7 +2786,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     let still_clean =
                         recorded_base.is_some() && local_disk_hash(&refs) == recorded_base;
                     if still_clean {
-                        delete_local_object(ctx, it, &refs, &env)?;
+                        delete_local_object(ctx, it, &refs)?;
                         progress.event(
                             Action::Delete,
                             &format!("{}/{} (deleted on {env})", it.kind, it.slug),
@@ -2801,7 +2802,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     // local file already has bytes; for
                     // LocalDeleteRemoteEdit we just restored it above.
                     if local_path.exists() {
-                        let marker = deleted_marker_path(&local_path, &env);
+                        let marker = deleted_marker_path(ctx.paths, &local_path);
                         write_atomic(&marker, b"")?;
                         progress.event(
                             Action::Warn,
@@ -2972,11 +2973,11 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             // Mirror the env's deletion: remove local +
                             // sidecars + marker, drop the lockfile entry.
                             // No push action — env already doesn't have it.
-                            delete_local_object(ctx, it, &refs, &env)?;
+                            delete_local_object(ctx, it, &refs)?;
                         }
                     }
                     Resolution::Skip => {
-                        let marker = deleted_marker_path(&local_path, &env);
+                        let marker = deleted_marker_path(ctx.paths, &local_path);
                         write_atomic(&marker, b"")?;
                         progress.event(
                             Action::Warn,
@@ -3904,8 +3905,9 @@ mod tests {
         let classified = classified_for(&fixture);
         let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
-        let shadow = crate::paths::shadow_path_for(&fixture.local_path, "test");
-        let marker = deleted_marker_path(&fixture.local_path, "test");
+        let shadow = fixture.paths.conflict_shadow_path(&fixture.local_path);
+        let marker = deleted_marker_path(&fixture.paths, &fixture.local_path);
+        std::fs::create_dir_all(shadow.parent().unwrap()).unwrap();
         std::fs::write(&shadow, b"{}").unwrap();
         std::fs::write(&marker, b"").unwrap();
 
@@ -3949,7 +3951,8 @@ mod tests {
         let classified = classified_for(&fixture);
         let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
-        let shadow = crate::paths::shadow_path_for(&fixture.local_path, "test");
+        let shadow = fixture.paths.conflict_shadow_path(&fixture.local_path);
+        std::fs::create_dir_all(shadow.parent().unwrap()).unwrap();
         std::fs::write(&shadow, b"{}").unwrap();
 
         {
@@ -4027,7 +4030,7 @@ mod tests {
         );
 
         // Shadow file at `<local>.<env>` carries the remote bytes.
-        let shadow = crate::paths::shadow_path_for(&fixture.local_path, "test");
+        let shadow = fixture.paths.conflict_shadow_path(&fixture.local_path);
         assert!(
             shadow.exists(),
             "shadow file should be written at {}",
@@ -4107,7 +4110,7 @@ mod tests {
 
         assert!(outcome.promoted_to_push.is_empty());
 
-        let shadow = crate::paths::shadow_path_for(&fixture.local_path, "test");
+        let shadow = fixture.paths.conflict_shadow_path(&fixture.local_path);
         assert!(shadow.exists(), "non-tty fallback must write a shadow file");
 
         let local_after = std::fs::read(&fixture.local_path).unwrap();
@@ -4456,7 +4459,8 @@ mod tests {
         let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
 
         // Stale marker from an earlier deferral must be swept by the auto path.
-        let marker = deleted_marker_path(&fixture.local_path, "test");
+        let marker = deleted_marker_path(&fixture.paths, &fixture.local_path);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, b"").unwrap();
 
         let outcome = {
@@ -4534,7 +4538,7 @@ mod tests {
             !fixture.local_path.exists(),
             "local file must be removed without a marker in non-TTY too"
         );
-        let marker = deleted_marker_path(&fixture.local_path, "test");
+        let marker = deleted_marker_path(&fixture.paths, &fixture.local_path);
         assert!(!marker.exists(), "no deferral marker for the clean class");
         assert!(
             fixture
@@ -4592,7 +4596,7 @@ mod tests {
             "the mid-run edit must survive — auto-delete on stale classification is data loss"
         );
         assert!(
-            deleted_marker_path(&fixture.local_path, "test").exists(),
+            deleted_marker_path(&fixture.paths, &fixture.local_path).exists(),
             "[s] defers with a marker like any genuine conflict"
         );
         assert!(
@@ -4690,7 +4694,8 @@ mod tests {
         let mirror = seed_mdh_dataset(&paths, &mut lockfile, "vendors-2");
         let ix = paths.dataset_dir("vendors-2").join("indexes.json");
         // Stale marker from an earlier deferral must be swept too.
-        let marker = deleted_marker_path(&ix, "test");
+        let marker = deleted_marker_path(&paths, &ix);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, b"").unwrap();
 
         let client = RossumClient::new(
@@ -4775,7 +4780,7 @@ mod tests {
         assert_eq!(pruned, 0, "skip defers — nothing pruned");
         assert!(ix.exists(), "modified dataset must survive [s]");
         assert!(
-            deleted_marker_path(&ix, "test").exists(),
+            deleted_marker_path(&paths, &ix).exists(),
             "deferral marker must be written"
         );
         assert!(
@@ -4913,7 +4918,7 @@ mod tests {
             "lockfile entry must survive non-tty"
         );
         assert!(
-            deleted_marker_path(&indexes_path, "test").exists(),
+            deleted_marker_path(&paths, &indexes_path).exists(),
             "a -deleted marker must be written"
         );
     }
@@ -4964,7 +4969,7 @@ mod tests {
             "[s] keeps the lockfile entry"
         );
         assert!(
-            deleted_marker_path(&indexes_path, "test").exists(),
+            deleted_marker_path(&paths, &indexes_path).exists(),
             "[s] writes a -deleted marker"
         );
     }
@@ -5018,7 +5023,7 @@ mod tests {
         );
         assert!(!mirror.exists(), "[k] drops the base-cache mirror");
         assert!(
-            !deleted_marker_path(&indexes_path, "test").exists(),
+            !deleted_marker_path(&paths, &indexes_path).exists(),
             "[k] writes no marker"
         );
     }
@@ -5245,12 +5250,7 @@ mod tests {
         assert!(outcome.promoted_to_push.is_empty(), "skip never promotes");
 
         // Marker file at `<local>.<env>-deleted` exists.
-        let marker = {
-            let shadow = crate::paths::shadow_path_for(&fixture.local_path, "test");
-            let mut s = shadow.into_os_string();
-            s.push("-deleted");
-            std::path::PathBuf::from(s)
-        };
+        let marker = deleted_marker_path(&fixture.paths, &fixture.local_path);
         assert!(
             marker.exists(),
             "deleted-marker should be written at {}",
@@ -5309,12 +5309,7 @@ mod tests {
 
         assert!(outcome.promoted_to_push.is_empty());
 
-        let marker = {
-            let shadow = crate::paths::shadow_path_for(&fixture.local_path, "test");
-            let mut s = shadow.into_os_string();
-            s.push("-deleted");
-            std::path::PathBuf::from(s)
-        };
+        let marker = deleted_marker_path(&fixture.paths, &fixture.local_path);
         assert!(
             marker.exists(),
             "non-tty fallback must write the deleted-marker"
@@ -5401,12 +5396,7 @@ mod tests {
         assert_eq!(std::fs::read(&local_path).unwrap(), remote_bytes);
 
         // Marker written too.
-        let marker = {
-            let shadow = crate::paths::shadow_path_for(&local_path, "test");
-            let mut s = shadow.into_os_string();
-            s.push("-deleted");
-            std::path::PathBuf::from(s)
-        };
+        let marker = deleted_marker_path(&paths, &local_path);
         assert!(marker.exists(), "deleted-marker should be written");
     }
 
@@ -5463,12 +5453,7 @@ mod tests {
         );
 
         // No marker file should be written for BothDeleted.
-        let marker = {
-            let shadow = crate::paths::shadow_path_for(&fixture.local_path, "test");
-            let mut s = shadow.into_os_string();
-            s.push("-deleted");
-            std::path::PathBuf::from(s)
-        };
+        let marker = deleted_marker_path(&fixture.paths, &fixture.local_path);
         assert!(
             !marker.exists(),
             "BothDeleted must not write a deleted-marker"
@@ -5508,7 +5493,7 @@ mod tests {
         }
 
         assert!(!fixture.local_path.exists(), "AllRemote on LERD must delete the local file");
-        let marker = deleted_marker_path(&fixture.local_path, "test");
+        let marker = deleted_marker_path(&fixture.paths, &fixture.local_path);
         assert!(!marker.exists(), "no skip marker — the sticky resolved it, no prompt ran");
         assert!(
             fixture.lockfile.objects.get("labels").and_then(|m| m.get("audit-hold")).is_none(),
@@ -5698,7 +5683,7 @@ mod tests {
 
         // Shadow file written next to the .py (not the .json) since the
         // prompt was redirected to the code sidecar.
-        let shadow = crate::paths::shadow_path_for(&py_path, "test");
+        let shadow = paths.conflict_shadow_path(&py_path);
         assert!(
             shadow.exists(),
             "shadow file should land next to the .py sidecar: {}",

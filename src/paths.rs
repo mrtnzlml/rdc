@@ -77,6 +77,28 @@ impl Paths {
             .join(format!("{}.base", self.env))
     }
 
+    /// `<root>/.rdc/conflicts/<env>/<relpath>` — where sync parks the
+    /// remote side of an unresolved conflict (the non-interactive shadow)
+    /// and the `<relpath>-deleted` remote-delete marker. Mirrors the env
+    /// tree one-to-one, exactly like [`base_cache_root`](Self::base_cache_root):
+    /// the env is encoded in the directory path, so the shadow keeps the
+    /// source file's normal name (no `.<env>` filename suffix). The whole
+    /// tree is gitignored (see `cli::init::write_gitignore`) so shadows
+    /// stay out of the working tree and out of commits.
+    ///
+    /// `relpath` is `local_path` relative to [`env_root`](Self::env_root);
+    /// a path that isn't under the env tree falls back to the full
+    /// `local_path` (defensive — production callers always pass an
+    /// env-tree path).
+    pub fn conflict_shadow_path(&self, local_path: &Path) -> PathBuf {
+        let relpath = local_path.strip_prefix(self.env_root()).unwrap_or(local_path);
+        self.root
+            .join(".rdc")
+            .join("conflicts")
+            .join(&self.env)
+            .join(relpath)
+    }
+
     /// `<root>/envs/<env>/organization.json`
     pub fn organization_file(&self) -> PathBuf {
         self.env_root().join("organization.json")
@@ -222,9 +244,13 @@ impl Paths {
     }
 }
 
-/// Returns true if this filename is a sync-generated shadow artifact for the
-/// given env. Snapshot walkers use this to skip the conflict-skip shadow
-/// (`<file>.<env>`) and the remote-delete marker (`<file>.<env>-deleted`).
+/// Returns true if this filename is a LEGACY sibling shadow artifact for
+/// the given env: the conflict-skip shadow (`<file>.<env>`) or the
+/// remote-delete marker (`<file>.<env>-deleted`). Newer runs write both
+/// under the gitignored `.rdc/conflicts/<env>/` tree (see
+/// [`Paths::conflict_shadow_path`]) so they never appear inside `envs/`;
+/// this predicate remains so snapshot walkers keep skipping any old-style
+/// siblings still sitting in a project's env tree (backward compat).
 ///
 /// Corner case: env names that are suffixes of each other (e.g. `dev` and
 /// `dev-deleted`) would alias here — a project that defines both as real
@@ -234,19 +260,6 @@ impl Paths {
 /// possible but never seen in practice.
 pub fn is_shadow_artifact(name: &str, env: &str) -> bool {
     name.ends_with(&format!(".{env}")) || name.ends_with(&format!(".{env}-deleted"))
-}
-
-/// Compute the sibling shadow-file path for a local file under sync.
-/// Returns `<local_path>.<env>` (e.g. `x.json.production`).
-/// For local paths with no `file_name()` (rare; defensive), falls back to
-/// `<parent>/shadow.<env>` — and to bare `shadow.<env>` if the parent is
-/// also absent.
-pub fn shadow_path_for(local_path: &Path, env: &str) -> PathBuf {
-    let parent = local_path.parent().unwrap_or_else(|| Path::new(""));
-    match local_path.file_name().and_then(|f| f.to_str()) {
-        Some(name) => parent.join(format!("{name}.{env}")),
-        None => parent.join(format!("shadow.{env}")),
-    }
 }
 
 #[cfg(test)]
@@ -437,29 +450,33 @@ mod tests {
     }
 
     #[test]
-    fn shadow_path_for_json_file() {
+    fn conflict_shadow_path_mirrors_env_tree_json_file() {
+        // The shadow keeps the source file's name and mirrors the env-tree
+        // relpath under `.rdc/conflicts/<env>/` — no `.<env>` suffix.
+        let p = Paths::for_env("/proj", "dev");
         assert_eq!(
-            shadow_path_for(Path::new("envs/test/labels/audit-hold.json"), "production"),
-            PathBuf::from("envs/test/labels/audit-hold.json.production")
+            p.conflict_shadow_path(Path::new("/proj/envs/dev/labels/audit-hold.json")),
+            Path::new("/proj/.rdc/conflicts/dev/labels/audit-hold.json")
         );
     }
 
     #[test]
-    fn shadow_path_for_py_file() {
+    fn conflict_shadow_path_mirrors_env_tree_py_sidecar() {
+        let p = Paths::for_env("/proj", "dev");
         assert_eq!(
-            shadow_path_for(Path::new("envs/test/hooks/x.py"), "dev"),
-            PathBuf::from("envs/test/hooks/x.py.dev")
+            p.conflict_shadow_path(Path::new("/proj/envs/dev/hooks/x.py")),
+            Path::new("/proj/.rdc/conflicts/dev/hooks/x.py")
         );
     }
 
     #[test]
-    fn shadow_path_for_path_with_no_filename_falls_back() {
-        // `Path::new("/")` has no `file_name()` and its `parent()` is
-        // `None`, so the fallback parent is `""` and the result is
-        // `shadow.<env>` with no parent prefix.
+    fn conflict_shadow_path_falls_back_when_outside_env_tree() {
+        // A path not under `env_root()` is used verbatim as the relpath
+        // (defensive — production callers always pass an env-tree path).
+        let p = Paths::for_env("/proj", "dev");
         assert_eq!(
-            shadow_path_for(Path::new("/"), "dev"),
-            PathBuf::from("shadow.dev")
+            p.conflict_shadow_path(Path::new("stray.json")),
+            Path::new("/proj/.rdc/conflicts/dev/stray.json")
         );
     }
 

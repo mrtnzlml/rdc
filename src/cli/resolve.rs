@@ -1132,9 +1132,10 @@ impl CombinedFileOutcome {
 ///
 /// - `local_bytes == remote_bytes` → no-op (no prompt, no write); returns
 ///   `Resolved(local_bytes)`.
-/// - `interactive == false` → legacy shadow-file: writes
-///   `<local_path>.<env>`, keeps local on disk, returns
-///   `PreserveBase(local_bytes)` — the caller must NOT advance the
+/// - `interactive == false` → shadow-file: writes the remote side to
+///   `.rdc/conflicts/<env>/<relpath>` (see
+///   [`crate::paths::Paths::conflict_shadow_path`]), keeps local on disk,
+///   returns `PreserveBase(local_bytes)` — the caller must NOT advance the
 ///   combined-hash lockfile entry because the conflict is unresolved.
 /// - `interactive == true && bytes differ` → prompt the user via
 ///   [`prompt_resolve`] with `[label_index/label_total]`. On `[k]eep`,
@@ -1152,7 +1153,7 @@ pub fn resolve_combined_file(
     local_bytes: &[u8],
     remote_bytes: &[u8],
     interactive: bool,
-    env: &str,
+    paths: &crate::paths::Paths,
 ) -> Result<CombinedFileOutcome> {
     use crate::snapshot::writer::write_atomic;
 
@@ -1161,7 +1162,7 @@ pub fn resolve_combined_file(
     }
 
     if !interactive {
-        let conflict_path = crate::paths::shadow_path_for(local_path, env);
+        let conflict_path = paths.conflict_shadow_path(local_path);
         write_atomic(&conflict_path, remote_bytes)?;
         let log = crate::log::Log::new(detect_color_mode());
         log.event(
@@ -1187,7 +1188,7 @@ pub fn resolve_combined_file(
         label_total,
         local_path,
         remote_bytes,
-        env,
+        paths.env(),
     )?;
     match resolution {
         Resolution::KeepLocal => Ok(CombinedFileOutcome::Resolved(local_bytes.to_vec())),
@@ -1229,7 +1230,7 @@ pub fn resolve_combined_file(
             Ok(CombinedFileOutcome::PreserveBase(edited))
         }
         Resolution::Skip => {
-            let conflict_path = crate::paths::shadow_path_for(local_path, env);
+            let conflict_path = paths.conflict_shadow_path(local_path);
             write_atomic(&conflict_path, remote_bytes)?;
             let log = crate::log::Log::new(detect_color_mode());
             log.event(
@@ -2303,9 +2304,11 @@ mod tests {
     #[test]
     fn resolve_combined_file_noop_when_equal() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("a.py");
+        let paths = crate::paths::Paths::for_env(dir.path(), "test");
+        std::fs::create_dir_all(paths.env_root()).unwrap();
+        let path = paths.env_root().join("a.py");
         std::fs::write(&path, b"same\n").unwrap();
-        let out = resolve_combined_file(1, 2, &path, b"same\n", b"same\n", true, "test").unwrap();
+        let out = resolve_combined_file(1, 2, &path, b"same\n", b"same\n", true, &paths).unwrap();
         assert_eq!(out.bytes(), b"same\n");
         // Bytes-equal sides are a "Resolved" outcome — caller may advance.
         assert!(
@@ -2313,16 +2316,18 @@ mod tests {
             "equal bytes must not preserve base"
         );
         // No shadow file written.
-        assert!(!dir.path().join("a.py.test").exists());
+        assert!(!paths.conflict_shadow_path(&path).exists());
     }
 
     #[test]
     fn resolve_combined_file_writes_shadow_when_non_interactive() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("a.py");
+        let paths = crate::paths::Paths::for_env(dir.path(), "test");
+        std::fs::create_dir_all(paths.env_root()).unwrap();
+        let path = paths.env_root().join("a.py");
         std::fs::write(&path, b"local\n").unwrap();
         let out =
-            resolve_combined_file(1, 1, &path, b"local\n", b"remote\n", false, "test").unwrap();
+            resolve_combined_file(1, 1, &path, b"local\n", b"remote\n", false, &paths).unwrap();
         assert_eq!(out.bytes(), b"local\n");
         // Non-interactive shadow-skip MUST signal preserve-base so the
         // caller does not advance the entity's combined hash.
@@ -2331,7 +2336,7 @@ mod tests {
             "non-interactive shadow-fallback must signal preserve-base"
         );
         assert_eq!(
-            std::fs::read(dir.path().join("a.py.test")).unwrap(),
+            std::fs::read(paths.conflict_shadow_path(&path)).unwrap(),
             b"remote\n"
         );
         // Local file untouched.

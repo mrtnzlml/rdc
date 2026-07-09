@@ -326,7 +326,7 @@ fn write_schema_for_queue(
                     local_json,
                     &remote_json_bytes,
                     ctx.interactive,
-                    ctx.paths.env(),
+                    ctx.paths,
                 )?;
                 let mut preserve_base = json_outcome.is_preserve_base();
                 let resolved_json = json_outcome.into_bytes();
@@ -350,7 +350,7 @@ fn write_schema_for_queue(
                         &local_bytes,
                         remote_bytes,
                         ctx.interactive,
-                        ctx.paths.env(),
+                        ctx.paths,
                     )?;
                     preserve_base |= outcome.is_preserve_base();
                     resolved_formulas.push((field_id.clone(), outcome.into_bytes()));
@@ -372,12 +372,15 @@ fn write_schema_for_queue(
                     )
                 }
             } else {
-                // Legacy shadow-file flow — unresolved by construction.
-                // Preserve the prior lockfile base so the next pull/sync
-                // re-classifies this schema as a conflict.
-                let env = ctx.paths.env();
-                let remote_path = crate::paths::shadow_path_for(&schema_path, env);
-                let remote_formulas_dir = queue_dir.join(format!("formulas.{env}"));
+                // Non-interactive shadow-file flow — unresolved by
+                // construction. Preserve the prior lockfile base so the
+                // next pull/sync re-classifies this schema as a conflict.
+                // The remote side is parked in the gitignored
+                // `.rdc/conflicts/<env>/` tree, mirroring the queue's
+                // `schema.json` + `formulas/` layout.
+                let remote_path = ctx.paths.conflict_shadow_path(&schema_path);
+                let remote_formulas_dir =
+                    ctx.paths.conflict_shadow_path(&queue_dir.join("formulas"));
                 crate::snapshot::writer::write_atomic(&remote_path, &remote_json_bytes)?;
                 if !remote_formulas.is_empty() {
                     std::fs::create_dir_all(&remote_formulas_dir)

@@ -694,10 +694,11 @@ pub fn apply_pull_action(
                     &remote_hash,
                     progress,
                     env,
+                    paths,
                     base_hash,
                 )?
             } else {
-                shadow_file_conflict(local_path, remote_bytes, progress, env, base_hash)?
+                shadow_file_conflict(local_path, remote_bytes, progress, paths, base_hash)?
             };
             // Only update the cache when the lockfile entry actually
             // advanced. Shadow-skip preserves `base_hash`, leaving the
@@ -714,8 +715,9 @@ pub fn apply_pull_action(
     }
 }
 
-/// The legacy shadow-file behavior for a conflict: write
-/// `<file>.<env>`, keep local on disk. Used when `interactive == false`
+/// The shadow-file behavior for a conflict: write the remote side to
+/// `.rdc/conflicts/<env>/<relpath>` (see [`crate::paths::Paths::conflict_shadow_path`]),
+/// keep local on disk. Used when `interactive == false`
 /// (CI/non-TTY/--yes) and as a fallback from the resolver when the user
 /// picks `[s]kip`.
 ///
@@ -729,11 +731,16 @@ fn shadow_file_conflict(
     local_path: &Path,
     remote_bytes: &[u8],
     progress: &Arc<Log>,
-    env: &str,
+    paths: Option<&crate::paths::Paths>,
     base_hash: Option<&str>,
 ) -> Result<String> {
     use crate::snapshot::writer::write_atomic;
-    let conflict_path = crate::paths::shadow_path_for(local_path, env);
+    // Park the remote side under the gitignored `.rdc/conflicts/<env>/`
+    // tree (mirroring the env-tree relpath) instead of as a sibling of the
+    // source file. Production always threads a `Paths`; the `None` guard is
+    // defensive (a caller with no project root can't place the shadow).
+    let paths = paths.context("conflict shadow requires a project Paths")?;
+    let conflict_path = paths.conflict_shadow_path(local_path);
     write_atomic(&conflict_path, remote_bytes)?;
     progress.event(Action::Warn, &format!(
         "{} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
@@ -761,6 +768,7 @@ fn resolve_conflict_interactive(
     remote_hash: &str,
     progress: &Arc<Log>,
     env: &str,
+    paths: Option<&crate::paths::Paths>,
     base_hash: Option<&str>,
 ) -> Result<String> {
     use crate::cli::resolve::{PullAborted, Resolution, prompt_resolve};
@@ -817,7 +825,7 @@ fn resolve_conflict_interactive(
             }
         }
         Resolution::Skip => {
-            shadow_file_conflict(local_path, remote_bytes, progress, env, base_hash)
+            shadow_file_conflict(local_path, remote_bytes, progress, paths, base_hash)
         }
         Resolution::Abort => Err(anyhow::Error::new(PullAborted)),
         Resolution::KeepLocalAll | Resolution::KeepRemoteAll => {
@@ -941,11 +949,13 @@ mod tests {
     }
 
     #[test]
-    fn apply_conflict_non_interactive_writes_remote_sibling() {
+    fn apply_conflict_non_interactive_writes_remote_shadow() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("x.json");
+        let paths = Paths::for_env(dir.path(), "test");
+        std::fs::create_dir_all(paths.env_root()).unwrap();
+        let path = paths.env_root().join("x.json");
         std::fs::write(&path, b"local").unwrap();
-        // interactive=false → legacy shadow-file behavior.
+        // interactive=false → non-interactive shadow-file behavior.
         let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
         let _ = apply_pull_action(
             PullAction::Conflict,
@@ -956,14 +966,14 @@ mod tests {
             &p,
             "test",
             None,
-            None,
+            Some(&paths),
         )
         .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"local");
         assert_eq!(
-            std::fs::read(dir.path().join("x.json.test")).unwrap(),
+            std::fs::read(paths.conflict_shadow_path(&path)).unwrap(),
             b"remote",
-            "shadow file should be named after the env"
+            "shadow should land in the .rdc/conflicts/<env>/ tree"
         );
     }
 
@@ -1062,7 +1072,9 @@ mod tests {
     #[test]
     fn shadow_file_skip_does_not_advance_lockfile_base() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("x.json");
+        let paths = Paths::for_env(dir.path(), "test");
+        std::fs::create_dir_all(paths.env_root()).unwrap();
+        let path = paths.env_root().join("x.json");
         let local_before = b"{\"local\":true}";
         std::fs::write(&path, local_before).unwrap();
         let remote = b"{\"remote\":true}";
@@ -1078,7 +1090,7 @@ mod tests {
             &p,
             "test",
             Some(&prior_base),
-            None,
+            Some(&paths),
         )
         .unwrap();
         // Lockfile must NOT advance — recorded hash equals prior base.
@@ -1087,7 +1099,7 @@ mod tests {
             "shadow-skip must preserve lockfile base"
         );
         // Shadow file carries remote bytes.
-        let shadow = dir.path().join("x.json.test");
+        let shadow = paths.conflict_shadow_path(&path);
         assert!(shadow.exists(), "shadow file should be written");
         assert_eq!(std::fs::read(&shadow).unwrap(), remote);
         // Local file unchanged.
@@ -1101,7 +1113,9 @@ mod tests {
     #[test]
     fn shadow_file_skip_with_no_prior_base_falls_back_to_local_hash() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("x.json");
+        let paths = Paths::for_env(dir.path(), "test");
+        std::fs::create_dir_all(paths.env_root()).unwrap();
+        let path = paths.env_root().join("x.json");
         let local = b"{\"local\":true}";
         std::fs::write(&path, local).unwrap();
         let remote = b"{\"remote\":true}";
@@ -1115,7 +1129,7 @@ mod tests {
             &p,
             "test",
             None, // no prior base
-            None,
+            Some(&paths),
         )
         .unwrap();
         assert_eq!(recorded, content_hash(local, &Lockfile::default()));
@@ -1127,7 +1141,9 @@ mod tests {
     #[test]
     fn two_consecutive_pulls_with_shadow_skip_keep_re_prompting() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("x.json");
+        let paths = Paths::for_env(dir.path(), "test");
+        std::fs::create_dir_all(paths.env_root()).unwrap();
+        let path = paths.env_root().join("x.json");
         let local = b"{\"local\":true}";
         std::fs::write(&path, local).unwrap();
         let remote = b"{\"remote\":true}";
@@ -1146,7 +1162,7 @@ mod tests {
             &p,
             "test",
             Some(&base_hash),
-            None,
+            Some(&paths),
         )
         .unwrap();
         assert_eq!(recorded1, base_hash, "first pull preserves base");

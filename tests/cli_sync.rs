@@ -4232,15 +4232,15 @@ async fn sync_hook_code_only_divergence_does_not_silently_push() {
         "lockfile base must remain pinned so the next sync re-prompts"
     );
 
-    // Shadow file written next to the .py sidecar (the prompt
-    // redirected away from the JSON, so the shadow lives next to the
-    // code).
+    // Shadow file parked under `.rdc/conflicts/dev/` mirroring the .py
+    // sidecar's env-tree relpath (the prompt redirected away from the
+    // JSON, so the shadow anchors on the code).
     let shadow = project
         .path()
-        .join("envs/dev/hooks/ap-reject-if-no-doc-id.py.dev");
+        .join(".rdc/conflicts/dev/hooks/ap-reject-if-no-doc-id.py");
     assert!(
         shadow.exists(),
-        "shadow file should land next to the .py: {}",
+        "shadow file should land in the conflicts tree next to the .py: {}",
         shadow.display()
     );
     let shadow_body = std::fs::read(&shadow).unwrap();
@@ -5856,7 +5856,7 @@ async fn sync_after_rebuild_lock_in_sync_label_yields_clean_and_rebuilds_lockfil
     // No shadow file landed — Clean means "no conflict, no prompt".
     let shadow = project
         .path()
-        .join("envs/dev/labels/rebuild-lock-stable.json.dev");
+        .join(".rdc/conflicts/dev/labels/rebuild-lock-stable.json");
     assert!(
         !shadow.exists(),
         "Clean post-rebuild-lock must not produce a shadow file at {}",
@@ -5981,11 +5981,11 @@ async fn sync_after_rebuild_lock_diverged_label_does_not_panic_and_does_not_sile
         "local edit must survive the conflict path: {local_after}"
     );
 
-    // Shadow file is written next to the local file so the user sees
-    // the env-side body.
+    // Shadow file is written under `.rdc/conflicts/dev/` so the user
+    // sees the env-side body.
     let shadow = project
         .path()
-        .join("envs/dev/labels/rebuild-lock-diverged.json.dev");
+        .join(".rdc/conflicts/dev/labels/rebuild-lock-diverged.json");
     assert!(
         shadow.exists(),
         "BothDiverged in non-TTY mode must produce a shadow file at {}",
@@ -7701,9 +7701,12 @@ async fn sync_legacy_edited_engine_surfaces_conflict() {
         "conflict: user's local edit must survive; got:\n{local_after}"
     );
 
-    // A shadow file must have been written next to the local file, containing
-    // the new-codec remote bytes (so the user can inspect the remote side).
-    let shadow_path = engine_path.with_extension("json.dev");
+    // A shadow file must have been written under `.rdc/conflicts/dev/`,
+    // containing the new-codec remote bytes (so the user can inspect the
+    // remote side).
+    let shadow_path = project
+        .path()
+        .join(".rdc/conflicts/dev/engines/remote-name-engine/engine.json");
     assert!(
         shadow_path.exists(),
         "conflict: shadow file must be created at {}",

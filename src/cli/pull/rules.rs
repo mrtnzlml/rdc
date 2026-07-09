@@ -184,7 +184,7 @@ pub async fn process(
                         local_json,
                         &proposed_json,
                         ctx.interactive && symmetric,
-                        ctx.paths.env(),
+                        ctx.paths,
                     )?;
 
                     // Same preserve-base intent tracking as `pull::hooks`.
@@ -202,7 +202,7 @@ pub async fn process(
                                 loc.as_bytes(),
                                 rem.as_bytes(),
                                 ctx.interactive,
-                                ctx.paths.env(),
+                                ctx.paths,
                             )?;
                             preserve_base |= code_outcome.is_preserve_base();
                             let bytes = code_outcome.into_bytes();
@@ -217,9 +217,9 @@ pub async fn process(
                         // Asymmetric — fall back to shadow for the .py side.
                         // Unresolved → preserve the prior lockfile base.
                         if let Some(remote_code_str) = &proposed_code {
-                            let env = ctx.paths.env();
-                            let py_remote_path =
-                                ctx.paths.rules_dir().join(format!("{slug}.py.{env}"));
+                            let py_remote_path = ctx
+                                .paths
+                                .conflict_shadow_path(&ctx.paths.rules_dir().join(format!("{slug}.py")));
                             crate::snapshot::writer::write_atomic(
                                 &py_remote_path,
                                 remote_code_str.as_bytes(),

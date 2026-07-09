@@ -462,12 +462,19 @@ fn write_gitignore(root: &Path) -> Result<()> {
     // `state::base_cache`). Like the advisory lock file, it's
     // local-only and regenerated on the next sync, so it must not
     // be committed.
+    //
+    // `/.rdc/conflicts` — sync parks the remote side of an unresolved
+    // conflict (and its `-deleted` marker) under `.rdc/conflicts/<env>/`
+    // (see `paths::Paths::conflict_shadow_path`). These are transient
+    // review artifacts consumed when the conflict is resolved, so they
+    // must not be committed.
     const PATTERNS: &[&str] = &[
         "/target",
         "/secrets",
         "/.rdc/cache",
         "/.rdc/state/*.lock",
         "/.rdc/state/*.base",
+        "/.rdc/conflicts",
     ];
 
     if !path.exists() {

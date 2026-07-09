@@ -229,7 +229,7 @@ pub async fn process(
                         local_json,
                         &proposed_json,
                         ctx.interactive && symmetric,
-                        ctx.paths.env(),
+                        ctx.paths,
                     )?;
 
                     // Track preserve-base intent across both sub-files of the
@@ -250,7 +250,7 @@ pub async fn process(
                                     loc.as_bytes(),
                                     rem.as_bytes(),
                                     ctx.interactive,
-                                    ctx.paths.env(),
+                                    ctx.paths,
                                 )?;
                                 preserve_base |= code_outcome.is_preserve_base();
                                 let bytes = code_outcome.into_bytes();
@@ -274,9 +274,9 @@ pub async fn process(
                         // side mirrors that here. Either way the conflict is
                         // unresolved → preserve the prior lockfile base.
                         if let Some(remote_code_str) = &proposed_code {
-                            let env = ctx.paths.env();
-                            let code_remote_path =
-                                ctx.paths.hooks_dir().join(format!("{slug}.{ext}.{env}"));
+                            let code_remote_path = ctx.paths.conflict_shadow_path(
+                                &ctx.paths.hooks_dir().join(format!("{slug}.{ext}")),
+                            );
                             crate::snapshot::writer::write_atomic(
                                 &code_remote_path,
                                 remote_code_str.as_bytes(),
