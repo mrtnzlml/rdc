@@ -139,9 +139,25 @@ pub async fn push(
                 // sync that was interrupted between POST /hooks/create and
                 // the follow-up PATCH; that committed write predates this
                 // cycle, so the Phase-1 list already saw it.
-                let template_url = typed.hook_template().expect("check_store_extension_anomaly guarantees hook_template is Some for store extensions");
+                let template_url_src = typed.hook_template().expect("check_store_extension_anomaly guarantees hook_template is Some for store extensions");
+                // The snapshot carries the SOURCE env's hook_template URL, whose
+                // host 404s here. Store templates are Rossum-global by id, so
+                // retarget the host to THIS env (keeping the id) before install,
+                // orphan-matching, and the reconcile PATCH. Falls back to the raw
+                // URL if it isn't a `/hook_templates/<id>` URL.
+                let template_url = crate::cli::deploy::store_extensions::retarget_hook_template(
+                    template_url_src,
+                    &lockfile.api_base,
+                )
+                .unwrap_or_else(|| template_url_src.to_string());
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert(
+                        "hook_template".to_string(),
+                        serde_json::Value::String(template_url.clone()),
+                    );
+                }
                 let installed_id = match crate::cli::deploy::store_extensions::find_orphan(
-                    catalog_hooks, &typed.name, template_url,
+                    catalog_hooks, &typed.name, &template_url,
                 ) {
                     Some(orphan) => {
                         progress.event(Action::Info, &format!(
@@ -170,6 +186,14 @@ pub async fn push(
                 };
                 let mut body = serde_json::to_value(&typed)
                     .with_context(|| format!("serializing hook '{slug}' for store-extension PATCH"))?;
+                // `typed` still holds the source-env hook_template; keep the
+                // reconcile PATCH pointed at the retargeted (this-env) template.
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert(
+                        "hook_template".to_string(),
+                        serde_json::Value::String(template_url.clone()),
+                    );
+                }
                 // Strip server-managed fields (`status`, `test`, …) so the
                 // PATCH matches the CREATE contract and never echoes the
                 // redacted sentinel back to the API.
