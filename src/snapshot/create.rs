@@ -77,6 +77,21 @@ fn kind_specific_strip(kind: &str) -> &'static [&'static str] {
     }
 }
 
+/// True if `field` is one [`strip_for_create`] removes for `kind` — a
+/// server-managed field (universal self-identity like `url`, or a kind-specific
+/// server-derived back-reference like a queue's `hooks`/`webhooks`/`rules`).
+///
+/// The deferred-relink pass uses this to never PATCH a field the create body
+/// stripped: such a field only reaches the deferred set because it happened to
+/// hold `rdc://` refs at create time, but the server owns it (it's populated
+/// from the child side — e.g. `queue.webhooks` from each `hook.queues`). PATCHing
+/// it back is at best a no-op and at worst a 400 — a queue's `webhooks` accepts
+/// only `/webhooks/<id>` URLs, which the resolver never emits (it produces
+/// `/hooks/<id>`), yielding "Invalid hyperlink - Incorrect URL match".
+pub fn is_server_stripped(kind: &str, field: &str) -> bool {
+    UNIVERSAL_SERVER_FIELDS.contains(&field) || kind_specific_strip(kind).contains(&field)
+}
+
 /// Mutate `body` to remove server-managed fields for the given kind.
 /// Idempotent: calling twice is the same as once.
 pub fn strip_for_create(body: &mut Value, kind: &str) {
@@ -265,6 +280,21 @@ pub fn strip_patch_extra(extra: &mut IndexMap<String, Value>, kind: &str, cross_
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn is_server_stripped_covers_universal_and_kind_specific() {
+        // universal: self-identity `url` is stripped for every kind
+        assert!(is_server_stripped("queues", "url"));
+        assert!(is_server_stripped("engines", "url"));
+        // kind-specific back-references on a queue
+        assert!(is_server_stripped("queues", "webhooks"));
+        assert!(is_server_stripped("queues", "hooks"));
+        assert!(is_server_stripped("queues", "rules"));
+        // a genuine cross-reference on a queue is NOT stripped (must relink)
+        assert!(!is_server_stripped("queues", "engine"));
+        // hooks' `queues` is a real forward ref, not stripped
+        assert!(!is_server_stripped("hooks", "queues"));
+    }
 
     #[test]
     fn strip_patch_extra_removes_server_fields_like_create() {
