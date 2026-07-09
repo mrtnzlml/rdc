@@ -11,7 +11,17 @@
 
 /// Top-level and nested JSON keys removed from the canonical projection
 /// before content_hash is computed.
-pub const NOISE_FIELDS: &[&str] = &["modified_at", "modifier"];
+///
+/// - `modified_at` / `modifier`: stamped by the server on every touch.
+/// - `training_enabled`: a per-queue (and org-default) engine-training toggle
+///   that Rossum RESETS to `false` when a queue is created. Because the server
+///   overrides whatever value is posted, the deployed value never matches the
+///   source, and it is a per-env policy anyway (you train in dev, not in a
+///   throwaway test clone). Left in the hash it makes `migrate`+`sync`
+///   perpetually conflict (source `true` vs deployed `false`) with no way to
+///   converge, since migrate cannot observe the remote. Excluding it from the
+///   hash keeps drift detection stable; the on-disk value is untouched.
+pub const NOISE_FIELDS: &[&str] = &["modified_at", "modifier", "training_enabled"];
 
 /// Walk `value` and remove any object key whose name is in NOISE_FIELDS.
 /// Recurses into nested objects and arrays. Mutates in place.
@@ -385,6 +395,20 @@ mod tests {
             canonicalize_for_hash(a, &crate::state::Lockfile::default()),
             canonicalize_for_hash(b, &crate::state::Lockfile::default()),
             "a trailing-whitespace-only difference must not affect the content hash"
+        );
+    }
+
+    #[test]
+    fn canonicalize_ignores_training_enabled() {
+        // Rossum resets `training_enabled` to false on queue creation, so the
+        // deployed value never matches the migrated source; excluding it from
+        // the hash prevents a perpetual, unconvergeable migrate+sync conflict.
+        let a = br#"{"name":"Q","training_enabled":true}"#;
+        let b = br#"{"name":"Q","training_enabled":false}"#;
+        assert_eq!(
+            canonicalize_for_hash(a, &crate::state::Lockfile::default()),
+            canonicalize_for_hash(b, &crate::state::Lockfile::default()),
+            "training_enabled is server-controlled + per-env; it must not drive drift"
         );
     }
 
