@@ -486,18 +486,23 @@ impl RossumClient {
         TBody: serde::Serialize,
         TResp: serde::de::DeserializeOwned,
     {
-        // Guard before any network call: a typed body's `extra` (e.g. queue
-        // `engine`, engine `training_queues`) can still carry an unresolved
-        // `rdc://` ref. Serialise once and refuse rather than ship it.
-        let body_value =
+        // Serialise once so we can (a) drop the server-assigned self-identity
+        // (`id`/`url`) — which a PATCH ignores anyway, and which may carry a
+        // stale `rdc://` self-reference that `migrate` left behind (see
+        // `strip_self_identity`) — and (b) guard the result against any
+        // unresolved `rdc://` cross-reference before it reaches the wire. The
+        // stripped value is what we send, so a stale self-url can neither trip
+        // the guard nor 400 as an invalid hyperlink.
+        let mut body_value =
             serde_json::to_value(body).context("serializing PATCH body for portable-ref check")?;
+        strip_self_identity(&mut body_value);
         ensure_no_residual_refs(path, &body_value)?;
         let url = format!("{}{}", self.base_url, path);
         let resp = retry::send_with_retry(
             || self.http
                 .patch(&url)
                 .header("Authorization", format!("token {}", self.token))
-                .json(body),
+                .json(&body_value),
             &format!("PATCH {url}"),
             progress,
             Some(&self.limiter),
@@ -597,6 +602,30 @@ pub async fn login(api_base: &str, username: &str, password: &str) -> Result<Str
 /// match."]}`. Refusing here turns that into a precise, actionable error that
 /// names the request and the offending ref(s) instead of leaking a dangling
 /// reference onto the wire.
+/// Strip the server-assigned self-identity fields (`id`, `url`) from an
+/// outgoing object body. Rossum assigns both; a PATCH addresses its object by
+/// the URL path (`/email_templates/123`) and ignores them in the payload, and
+/// create bodies drop them via [`crate::snapshot::create::strip_for_create`].
+///
+/// The reason this matters for correctness — not just tidiness: `migrate`
+/// rewrites an object's *cross-references* (`queue`, `workspace`, …) when it
+/// remaps slugs across orgs, but it does not rewrite an object's *own* `url`
+/// self-reference for kinds outside its substitution set (email_templates,
+/// engine_fields). After a queue-slug remap, such an object's typed `url` still
+/// embeds the pre-migrate slug as `rdc://<kind>/…/<old-slug>/…`. That ref
+/// resolves to nothing in the target env, so it survives push-side resolution
+/// and reaches the wire — where [`ensure_no_residual_refs`] refuses it (and, if
+/// it slipped through, Rossum would 400 it as an invalid hyperlink). Removing
+/// self-identity here makes every PATCH robust against a stale self-url
+/// regardless of how the on-disk snapshot was produced, while leaving genuine
+/// cross-references intact for the guard to validate.
+fn strip_self_identity(body: &mut serde_json::Value) {
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("id");
+        obj.remove("url");
+    }
+}
+
 fn ensure_no_residual_refs(path: &str, body: &serde_json::Value) -> Result<()> {
     let refs = crate::snapshot::refs::residual_rdc_refs(body);
     if refs.is_empty() {
@@ -645,6 +674,59 @@ mod tests {
             "engine": "https://x.rossum.app/api/v1/engines/383",
         });
         assert!(ensure_no_residual_refs("/queues/1", &body).is_ok());
+    }
+
+    #[test]
+    fn strip_self_identity_removes_top_level_id_and_url() {
+        let mut body = json!({
+            "id": 14081767,
+            "url": "https://x.rossum.app/api/v1/email_templates/14081767",
+            "name": "X",
+            "queue": "https://x.rossum.app/api/v1/queues/5",
+        });
+        strip_self_identity(&mut body);
+        assert!(body.get("id").is_none(), "id must be stripped");
+        assert!(body.get("url").is_none(), "url must be stripped");
+        assert_eq!(body.get("name").and_then(|v| v.as_str()), Some("X"));
+        assert!(body.get("queue").is_some(), "cross-ref fields survive");
+    }
+
+    /// The regression that motivated this: `migrate` rewrites cross-references
+    /// (`queue`, `workspace`) but not an object's OWN `url` self-reference, so
+    /// an email_template's typed `url` can still embed a pre-migrate queue slug
+    /// as `rdc://…`. On PATCH that stale self-url tripped the residual guard.
+    /// Stripping self-identity first makes the guard pass — the self-url is
+    /// server-assigned and never belongs on the wire.
+    #[test]
+    fn stale_self_url_is_stripped_so_patch_guard_passes() {
+        let mut body = json!({
+            "id": 14081767,
+            "url": "rdc://email_templates/ws-a/old-queue-slug/status-change-confirmed",
+            "name": "Status change",
+            "queue": "https://x.rossum.app/api/v1/queues/5",
+        });
+        strip_self_identity(&mut body);
+        assert!(
+            ensure_no_residual_refs("/email_templates/14081767", &body).is_ok(),
+            "a stale self-url must not block the PATCH once stripped"
+        );
+    }
+
+    /// Stripping self-identity must NOT mask a genuine dangling cross-reference:
+    /// a `queue`/`engine` still holding an unresolved `rdc://` ref must keep
+    /// tripping the guard.
+    #[test]
+    fn strip_self_identity_does_not_mask_a_real_cross_ref() {
+        let mut body = json!({
+            "id": 5,
+            "url": "https://x.rossum.app/api/v1/queues/5",
+            "engine": "rdc://engines/not-created-yet",
+        });
+        strip_self_identity(&mut body);
+        assert!(
+            ensure_no_residual_refs("/queues/5", &body).is_err(),
+            "a real dangling cross-ref must still be refused"
+        );
     }
 
     /// Integration: the POST choke point must refuse a body whose `engine`
