@@ -44,6 +44,36 @@ pub fn check_store_extension_anomaly(hook: &Hook, slug: &str, env: &str) -> Resu
     Ok(())
 }
 
+/// Re-target a `hook_template` URL to `api_base`, preserving the numeric
+/// template id.
+///
+/// Store templates are Rossum-global: the numeric id is the stable
+/// cross-environment identity (id 39 is "Master Data Hub" in every org),
+/// while the host is per-org (`<org>.rossum.app`). A snapshot promoted from
+/// another env therefore carries the SOURCE env's `hook_template` URL, which
+/// 404s when installed into the target org. Rewriting only the host (keeping
+/// the id) points the install at the target org's copy of the same template.
+///
+/// Matching by id — not by hook display name — is deliberate: store-extension
+/// hooks are routinely renamed (`Master Data Hub` → `MDH: GL codes`), so a
+/// name match would miss them.
+///
+/// Returns `None` when `url` is not a `/hook_templates/<id>` URL (leave it
+/// untouched); the caller falls back to the original string.
+pub fn retarget_hook_template(url: &str, api_base: &str) -> Option<String> {
+    let trimmed = url.trim_end_matches('/');
+    let (rest, id_str) = trimmed.rsplit_once('/')?;
+    let id: u64 = id_str.parse().ok()?;
+    if !rest.ends_with("/hook_templates") {
+        return None;
+    }
+    Some(format!(
+        "{}/hook_templates/{}",
+        api_base.trim_end_matches('/'),
+        id
+    ))
+}
+
 /// Extract `{name, hook_template, events, queues, token_owner}` from a
 /// full hook body and return them as the `POST /hooks/create` payload.
 /// Any field present but null counts as missing (matches the API).
@@ -68,6 +98,49 @@ pub fn build_install_body(full: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retarget_hook_template_rewrites_host_keeps_id() {
+        // Source-env (dev) template URL promoted to the target (test) env:
+        // the host changes, the id stays.
+        assert_eq!(
+            retarget_hook_template(
+                "https://acme-dev.rossum.app/api/v1/hook_templates/39",
+                "https://acme-test.rossum.app/api/v1"
+            )
+            .as_deref(),
+            Some("https://acme-test.rossum.app/api/v1/hook_templates/39")
+        );
+        // Trailing slash tolerated.
+        assert_eq!(
+            retarget_hook_template(
+                "https://acme-dev.rossum.app/api/v1/hook_templates/39/",
+                "https://acme-test.rossum.app/api/v1/"
+            )
+            .as_deref(),
+            Some("https://acme-test.rossum.app/api/v1/hook_templates/39")
+        );
+    }
+
+    #[test]
+    fn retarget_hook_template_ignores_non_template_urls() {
+        // A hooks URL (not a hook_templates URL) must not be rewritten.
+        assert!(
+            retarget_hook_template(
+                "https://acme-dev.rossum.app/api/v1/hooks/39",
+                "https://acme-test.rossum.app/api/v1"
+            )
+            .is_none()
+        );
+        // Non-numeric trailing segment.
+        assert!(
+            retarget_hook_template(
+                "https://acme-dev.rossum.app/api/v1/hook_templates/latest",
+                "https://acme-test.rossum.app/api/v1"
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn build_install_body_extracts_five_fields() {
