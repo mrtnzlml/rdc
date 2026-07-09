@@ -209,6 +209,14 @@ pub enum Command {
         /// Without any `--only`, migrate operates on the whole snapshot.
         #[arg(long = "only", value_name = "SELECTOR", action = clap::ArgAction::Append)]
         only: Vec<String>,
+        /// Carry `score_threshold` (per-datapoint, in schemas) and
+        /// `default_score_threshold` (per-queue) from the source env. By
+        /// default these are IGNORED: they are tuned per queue/organization and
+        /// expected to differ, so a matched target keeps its own values and a
+        /// brand-new object drops them (falling back to the queue/server
+        /// default). Pass this flag to migrate the thresholds too.
+        #[arg(long = "migrate-score-thresholds")]
+        migrate_score_thresholds: bool,
     },
     /// Set or refresh an env's API token. Validates the token before
     /// writing to `secrets/<env>.secrets.json` (mode 0600 on Unix).
@@ -334,7 +342,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                  the target snapshot locally, review the diff, then `rdc sync <tgt>` to push it."
             )
         }
-        Some(Command::Migrate { src, tgt, mirror, dry_run, only }) => {
+        Some(Command::Migrate { src, tgt, mirror, dry_run, only, migrate_score_thresholds }) => {
             let src = crate::cli::env_picker::pick_env("Migrate from which env (source)?", src)?;
             let tgt = crate::cli::env_picker::pick_env_excluding(
                 "Migrate to which env (target)?",
@@ -342,7 +350,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 &[&src],
             )?;
             // Pure-local: no remote calls, so no 401-retry wrapper needed.
-            crate::cli::migrate::run(&src, &tgt, mirror, dry_run, only)
+            crate::cli::migrate::run(&src, &tgt, mirror, dry_run, only, migrate_score_thresholds)
         }
         Some(Command::Auth { env, token, username }) => {
             let env = crate::cli::env_picker::pick_env("Set token for which env?", env)?;

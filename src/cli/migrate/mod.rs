@@ -291,6 +291,7 @@ fn overlay_for<'a>(
 ///
 /// `rel` is relative to the source env root; the destination is `remap_relative`
 /// joined onto `tgt_root`.
+#[allow(clippy::too_many_arguments)]
 fn transform_file(
     rel: &Path,
     src_root: &Path,
@@ -299,6 +300,7 @@ fn transform_file(
     subst: &BTreeMap<String, String>,
     overlay: Option<&Overlay>,
     tgt_org_url: &str,
+    migrate_score_thresholds: bool,
 ) -> Result<()> {
     let src_path = src_root.join(rel);
     let dst_rel = remap_relative(rel, mapping);
@@ -370,25 +372,219 @@ fn transform_file(
         }
     }
 
-    // Canonicalize a hook's `run_after` to a stable, env-independent order. The
-    // refs are now in portable `rdc://<slug>` form (post-subst), and `run_after`
-    // is an unordered dependency set, so sorting the slugs makes migrate emit no
-    // spurious reorder regardless of the source env's API ordering. No-op for
-    // non-hook files (they carry no `run_after`).
-    crate::snapshot::hook::sort_run_after(&mut value);
-    // Same for a hook's `queues` membership set: keep the portable slugs in
-    // sorted order so source envs pulled before the post-pass sort existed
-    // don't leak their id-ordering into the target snapshot. Unlike
-    // `run_after`, a `queues` array also exists on inboxes/schemas/workspaces
-    // where pull preserves API order — so this must stay hooks-only.
-    if rel.starts_with("hooks") {
-        crate::snapshot::hook::sort_queues(&mut value);
+    // Reconcile per-org confidence thresholds unless the user opted to carry
+    // them. `score_threshold` (per schema datapoint) and `default_score_threshold`
+    // (per queue) are tuned per queue/organization and expected to differ across
+    // envs, so by default a matched target keeps its own values and a brand-new
+    // object drops them (falling back to the queue/server default). Runs after
+    // overlay so an explicit overlay override still wins, and before the sort +
+    // serialize below.
+    if !migrate_score_thresholds
+        && let Some((kind, _)) = classify(rel)
+    {
+        reconcile_score_thresholds(&mut value, kind, &dst_path);
     }
+
+    // Canonicalize the order of every set-like reference array to stable,
+    // env-independent order. The refs are now in portable `rdc://<slug>` form
+    // (post-subst), and these arrays (`hook.run_after`/`queues`,
+    // `workspace.queues`, `schema.queues`, `rule.queues`, `engine.training_queues`,
+    // …) are unordered sets, so sorting the slugs makes migrate emit no spurious
+    // reorder regardless of the source env's API ordering. This is the SAME
+    // normalization the pull post-pass (`portabilize_refs`) applies, so a
+    // migrated snapshot is byte-identical to one freshly pulled from the target.
+    crate::snapshot::noise::sort_url_arrays(&mut value);
 
     let mut json = serde_json::to_vec_pretty(&value)?;
     json.push(b'\n');
     crate::snapshot::writer::write_atomic(&dst_path, &json)?;
     Ok(())
+}
+
+/// Reconcile per-org confidence thresholds so migrate does not carry them from
+/// the source env (see the module-level flag `--migrate-score-thresholds`).
+///
+/// The affected keys are `score_threshold` (on each schema datapoint, inside
+/// `content`) and `default_score_threshold` (on a queue). Both are tuned per
+/// queue/organization and expected to differ across envs. The rule mirrors
+/// [`reconcile_target_identity`] but reaches the two threshold fields wherever
+/// they sit:
+///
+/// - **Matched target** (`tgt_path` exists): the migrated object adopts the
+///   TARGET's threshold. For schemas, datapoints are matched by their stable
+///   `id`; for queues the single default is matched by key name (so its exact
+///   nesting — top-level or under `settings` — does not matter). Where the
+///   target has no threshold for a given field, the migrated field is dropped.
+/// - **New target** (no `tgt_path`): every threshold is dropped so the field
+///   falls back to the queue/server default.
+///
+/// A no-op for any kind other than `schemas` / `queues`.
+fn reconcile_score_thresholds(value: &mut serde_json::Value, kind: &str, tgt_path: &Path) {
+    // The target snapshot (if it exists) is the source of truth for thresholds.
+    // Absent/unparseable => brand-new object => `None` => every threshold drops.
+    let target: Option<serde_json::Value> = std::fs::read(tgt_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok());
+
+    match kind {
+        "schemas" => {
+            // Target's `datapoint id -> score_threshold` (only ids that carry
+            // one). Empty for a new target, so every source threshold drops.
+            let target_thresholds = target
+                .as_ref()
+                .map(collect_datapoint_thresholds)
+                .unwrap_or_default();
+            apply_datapoint_thresholds(value, &target_thresholds);
+        }
+        "queues" => {
+            const KEY: &str = "default_score_threshold";
+            match target.as_ref().and_then(|t| find_key_value(t, KEY)) {
+                // Matched target carries a default: adopt it. Update in place if
+                // the migrated body already has the key; otherwise mirror the
+                // target's placement (under `settings` or top-level) so the
+                // target org keeps its value.
+                Some(v) => {
+                    if !set_existing_key(value, KEY, &v) {
+                        let under_settings = target
+                            .as_ref()
+                            .and_then(|t| t.get("settings"))
+                            .and_then(|s| s.get(KEY))
+                            .is_some();
+                        if let Some(obj) = value.as_object_mut() {
+                            if under_settings {
+                                obj.entry("settings")
+                                    .or_insert_with(|| serde_json::json!({}))
+                                    .as_object_mut()
+                                    .map(|s| s.insert(KEY.to_string(), v));
+                            } else {
+                                obj.insert(KEY.to_string(), v);
+                            }
+                        }
+                    }
+                }
+                // New target, or target has no default: drop it everywhere so it
+                // falls back to the queue/server default.
+                None => remove_key_everywhere(value, KEY),
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect `id -> score_threshold` for every object that has BOTH a string `id`
+/// and a `score_threshold`, anywhere in the tree. Schema datapoint ids are
+/// unique within a schema, so this is an unambiguous per-field map.
+fn collect_datapoint_thresholds(
+    value: &serde_json::Value,
+) -> BTreeMap<String, serde_json::Value> {
+    let mut out = BTreeMap::new();
+    fn walk(value: &serde_json::Value, out: &mut BTreeMap<String, serde_json::Value>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let (Some(serde_json::Value::String(id)), Some(th)) =
+                    (map.get("id"), map.get("score_threshold"))
+                {
+                    out.insert(id.clone(), th.clone());
+                }
+                for v in map.values() {
+                    walk(v, out);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for v in arr {
+                    walk(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(value, &mut out);
+    out
+}
+
+/// For every object carrying a string `id`, adopt the target's threshold for
+/// that id (adding or overwriting `score_threshold`), or remove any existing
+/// `score_threshold` when the target has none for that id. Objects without an
+/// `id` are left alone but still recursed into.
+fn apply_datapoint_thresholds(
+    value: &mut serde_json::Value,
+    target: &BTreeMap<String, serde_json::Value>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let id = match map.get("id") {
+                Some(serde_json::Value::String(s)) => Some(s.clone()),
+                _ => None,
+            };
+            if let Some(id) = id {
+                match target.get(&id) {
+                    Some(th) => {
+                        map.insert("score_threshold".to_string(), th.clone());
+                    }
+                    None => {
+                        map.remove("score_threshold");
+                    }
+                }
+            }
+            for v in map.values_mut() {
+                apply_datapoint_thresholds(v, target);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                apply_datapoint_thresholds(v, target);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Recursively return a clone of the first value stored under `key` anywhere in
+/// `value` (depth-first). Used to read a scalar like `default_score_threshold`
+/// regardless of whether it sits top-level or nested (e.g. under `settings`).
+fn find_key_value(value: &serde_json::Value, key: &str) -> Option<serde_json::Value> {
+    match value {
+        serde_json::Value::Object(map) => map
+            .get(key)
+            .cloned()
+            .or_else(|| map.values().find_map(|v| find_key_value(v, key))),
+        serde_json::Value::Array(arr) => arr.iter().find_map(|v| find_key_value(v, key)),
+        _ => None,
+    }
+}
+
+/// Set `key` to `new` in the first object that ALREADY contains it (depth-first).
+/// Returns `true` if an existing key was updated, `false` if `key` was not found.
+fn set_existing_key(value: &mut serde_json::Value, key: &str, new: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.contains_key(key) {
+                map.insert(key.to_string(), new.clone());
+                return true;
+            }
+            map.values_mut().any(|v| set_existing_key(v, key, new))
+        }
+        serde_json::Value::Array(arr) => arr.iter_mut().any(|v| set_existing_key(v, key, new)),
+        _ => false,
+    }
+}
+
+/// Remove `key` from every object in the tree (depth-first).
+fn remove_key_everywhere(value: &mut serde_json::Value, key: &str) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.remove(key);
+            for v in map.values_mut() {
+                remove_key_everywhere(v, key);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                remove_key_everywhere(v, key);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Replace the source body's env-specific identity with the target's.
@@ -588,7 +784,14 @@ fn mirror_prune_paths(
 /// but not produced by the migration). `--dry-run` prints the plan and writes
 /// nothing. `--only <selector>` narrows the operation to matching
 /// `<kind>/<slug>` objects (reusing deploy's selection machinery).
-pub fn run(src: &str, tgt: &str, mirror: bool, dry_run: bool, only: Vec<String>) -> Result<()> {
+pub fn run(
+    src: &str,
+    tgt: &str,
+    mirror: bool,
+    dry_run: bool,
+    only: Vec<String>,
+    migrate_score_thresholds: bool,
+) -> Result<()> {
     if src == tgt {
         anyhow::bail!(
             "src and tgt envs are the same ('{src}'). Use two different envs for `rdc migrate`."
@@ -693,6 +896,7 @@ pub fn run(src: &str, tgt: &str, mirror: bool, dry_run: bool, only: Vec<String>)
                 &subst,
                 tgt_overlay.as_ref(),
                 &tgt_org_url,
+                migrate_score_thresholds,
             )
             .with_context(|| format!("migrating {}", rel.display()))?;
         }
@@ -1037,7 +1241,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2").unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true).unwrap();
 
         // File landed at the remapped path.
         let dst = tgt
@@ -1083,7 +1287,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2").unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true).unwrap();
 
         let dst = tgt.path().join("hooks/extractor-prod.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -1125,7 +1329,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2").unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true).unwrap();
 
         let dst = tgt.path().join("hooks/any-hook.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -1173,7 +1377,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2").unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true).unwrap();
 
         let dst = tgt.path().join("hooks/special-hook.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -1214,7 +1418,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2").unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true).unwrap();
 
         let dst = tgt.path().join("rules/some-rule.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -1287,6 +1491,7 @@ mod tests {
             &subst,
             None,
             "https://acme-test.rossum.app/api/v1/organizations/2",
+            true,
         )
         .unwrap();
 
@@ -1335,7 +1540,7 @@ mod tests {
         fs::write(&src_file, code).unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2").unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true).unwrap();
 
         let dst = tgt.path().join("hooks/extractor-prod.py");
         assert_eq!(
@@ -1439,5 +1644,204 @@ mod tests {
         )));
         // Non-sidecar code → false.
         assert!(!is_sidecar(Path::new("workspaces/main/workspace.py")));
+    }
+
+    // ---- score_threshold reconciliation (migrate default: ignore) ----
+
+    /// Write `value` as JSON to a fresh temp file and return (dir, path). The
+    /// TempDir is returned so the caller keeps it alive for the file's lifetime.
+    fn tgt_file(value: &serde_json::Value) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("obj.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn reconcile_schema_matched_adopts_target_per_datapoint_thresholds() {
+        // Source datapoints (nested in a section) carry the source org's
+        // thresholds; the target has its own tuning (amount tuned, vendor has
+        // none) and lacks `newfield` entirely.
+        let mut source = serde_json::json!({
+            "content": [{
+                "category": "section", "id": "header",
+                "children": [
+                    { "category": "datapoint", "id": "amount", "score_threshold": 0.5 },
+                    { "category": "datapoint", "id": "vendor", "score_threshold": 0.5 },
+                    { "category": "datapoint", "id": "newfield", "score_threshold": 0.5 }
+                ]
+            }]
+        });
+        let (_d, tgt) = tgt_file(&serde_json::json!({
+            "content": [{
+                "category": "section", "id": "header",
+                "children": [
+                    { "category": "datapoint", "id": "amount", "score_threshold": 0.9 },
+                    { "category": "datapoint", "id": "vendor" }
+                ]
+            }]
+        }));
+
+        reconcile_score_thresholds(&mut source, "schemas", &tgt);
+
+        let kids = &source["content"][0]["children"];
+        // amount: adopts the TARGET's tuned value.
+        assert_eq!(kids[0]["score_threshold"], serde_json::json!(0.9));
+        // vendor: target has the datapoint but no threshold → dropped.
+        assert!(kids[1].get("score_threshold").is_none(), "vendor threshold must be dropped");
+        // newfield: absent from target (a field being introduced) → dropped.
+        assert!(kids[2].get("score_threshold").is_none(), "new-field threshold must be dropped");
+    }
+
+    #[test]
+    fn reconcile_schema_new_target_drops_all_thresholds() {
+        let mut source = serde_json::json!({
+            "content": [{
+                "category": "section", "id": "header",
+                "children": [
+                    { "category": "datapoint", "id": "amount", "score_threshold": 0.5 },
+                    { "category": "datapoint", "id": "vendor", "score_threshold": 0.7 }
+                ]
+            }]
+        });
+        // Point at a path that does not exist (brand-new target object).
+        let missing = std::path::Path::new("/nonexistent/does-not-exist/schema.json");
+        reconcile_score_thresholds(&mut source, "schemas", missing);
+        let kids = &source["content"][0]["children"];
+        assert!(kids[0].get("score_threshold").is_none());
+        assert!(kids[1].get("score_threshold").is_none());
+    }
+
+    #[test]
+    fn reconcile_queue_matched_adopts_target_default_top_level() {
+        let mut source = serde_json::json!({ "name": "Q", "default_score_threshold": 0.5 });
+        let (_d, tgt) = tgt_file(&serde_json::json!({ "name": "Q", "default_score_threshold": 0.85 }));
+        reconcile_score_thresholds(&mut source, "queues", &tgt);
+        assert_eq!(source["default_score_threshold"], serde_json::json!(0.85));
+    }
+
+    #[test]
+    fn reconcile_queue_matched_adopts_target_default_under_settings() {
+        // Position-agnostic: the key nested under `settings` must still be
+        // matched by name and take the target's value.
+        let mut source = serde_json::json!({
+            "name": "Q", "settings": { "default_score_threshold": 0.5 }
+        });
+        let (_d, tgt) = tgt_file(&serde_json::json!({
+            "name": "Q", "settings": { "default_score_threshold": 0.85 }
+        }));
+        reconcile_score_thresholds(&mut source, "queues", &tgt);
+        assert_eq!(source["settings"]["default_score_threshold"], serde_json::json!(0.85));
+    }
+
+    #[test]
+    fn reconcile_queue_new_target_drops_default() {
+        let mut source = serde_json::json!({ "name": "Q", "default_score_threshold": 0.5 });
+        let missing = std::path::Path::new("/nonexistent/does-not-exist/queue.json");
+        reconcile_score_thresholds(&mut source, "queues", missing);
+        assert!(source.get("default_score_threshold").is_none());
+    }
+
+    #[test]
+    fn transform_file_carries_thresholds_when_opted_in() {
+        // With --migrate-score-thresholds (the `true` arg), the source's
+        // per-datapoint threshold survives verbatim even against a matched
+        // target that tuned it differently.
+        use std::fs;
+        let src = tempfile::TempDir::new().unwrap();
+        let tgt = tempfile::TempDir::new().unwrap();
+        let rel = Path::new("workspaces/main/queues/invoices/schema.json");
+
+        let src_file = src.path().join(rel);
+        fs::create_dir_all(src_file.parent().unwrap()).unwrap();
+        fs::write(
+            &src_file,
+            serde_json::to_vec(&serde_json::json!({
+                "name": "S",
+                "content": [{ "category": "datapoint", "id": "amount", "score_threshold": 0.5 }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Matched target with a different tuned threshold.
+        let dst = tgt.path().join(rel);
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        fs::write(
+            &dst,
+            serde_json::to_vec(&serde_json::json!({
+                "name": "S",
+                "content": [{ "category": "datapoint", "id": "amount", "score_threshold": 0.9 }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let m = Mapping::default();
+        let subst = build_subst(&m);
+        transform_file(
+            rel, src.path(), tgt.path(), &m, &subst, None,
+            "https://tgt.example/api/v1/organizations/2",
+            /* migrate_score_thresholds = */ true,
+        )
+        .unwrap();
+
+        let out: serde_json::Value =
+            serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
+        assert_eq!(
+            out["content"][0]["score_threshold"],
+            serde_json::json!(0.5),
+            "opting in must carry the SOURCE threshold verbatim"
+        );
+    }
+
+    #[test]
+    fn transform_file_ignores_thresholds_by_default() {
+        // Without the flag (default), a matched target keeps its own tuning.
+        use std::fs;
+        let src = tempfile::TempDir::new().unwrap();
+        let tgt = tempfile::TempDir::new().unwrap();
+        let rel = Path::new("workspaces/main/queues/invoices/schema.json");
+
+        let src_file = src.path().join(rel);
+        fs::create_dir_all(src_file.parent().unwrap()).unwrap();
+        fs::write(
+            &src_file,
+            serde_json::to_vec(&serde_json::json!({
+                "name": "S",
+                "content": [{ "category": "datapoint", "id": "amount", "score_threshold": 0.5 }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let dst = tgt.path().join(rel);
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        fs::write(
+            &dst,
+            serde_json::to_vec(&serde_json::json!({
+                "name": "S",
+                "content": [{ "category": "datapoint", "id": "amount", "score_threshold": 0.9 }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let m = Mapping::default();
+        let subst = build_subst(&m);
+        transform_file(
+            rel, src.path(), tgt.path(), &m, &subst, None,
+            "https://tgt.example/api/v1/organizations/2",
+            /* migrate_score_thresholds = */ false,
+        )
+        .unwrap();
+
+        let out: serde_json::Value =
+            serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
+        assert_eq!(
+            out["content"][0]["score_threshold"],
+            serde_json::json!(0.9),
+            "default must preserve the TARGET's tuned threshold"
+        );
     }
 }
