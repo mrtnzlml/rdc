@@ -83,8 +83,9 @@ async fn live_conflicts_deletes() {
         String::from_utf8_lossy(&confl.stderr)
     );
 
-    // The exact shadow file path: <full-filename>.<env>, i.e. <slug>.json.test
-    let shadow = format!("envs/test/labels/{lslug}.json.test");
+    // The shadow is parked under the gitignored `.rdc/conflicts/<env>/`
+    // tree, mirroring the label's env-tree relpath (keeps its normal name).
+    let shadow = format!(".rdc/conflicts/test/labels/{lslug}.json");
     assert!(
         project.exists(&shadow),
         "shadow file must be written on a non-interactive content conflict; expected: {shadow}"

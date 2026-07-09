@@ -47,6 +47,10 @@ fn init_creates_expected_files() {
     // is regenerated on the next sync, so it shouldn't be committed —
     // the on-disk env tree + lockfile remain the canonical source.
     assert!(gitignore.contains("/.rdc/state/*.base"));
+    // Unresolved-conflict shadows (and `-deleted` markers) are parked
+    // under `.rdc/conflicts/<env>/` — transient review artifacts, not
+    // committable state.
+    assert!(gitignore.contains("/.rdc/conflicts"));
 
     // Generated files under .rdc/ (lockfile, mapping) are marked so
     // GitHub collapses their diffs and excludes them from language stats.
