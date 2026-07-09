@@ -9814,3 +9814,93 @@ async fn sync_push_email_template_posts_when_no_match() {
         "lockfile must record the newly created id 9001; lockfile: {lf_raw}"
     );
 }
+
+/// Persist-on-abort: when a push creates some objects and then fails, the
+/// lockfile must be saved with the objects already committed to the remote —
+/// otherwise a re-run re-creates them (duplicating, since name isn't unique).
+///
+/// Scenario: a new local workspace (POST succeeds) plus a new local label whose
+/// POST the server rejects (500). The workspace is pushed first, so it lands and
+/// must be recorded; the label push then aborts the sync. Afterwards the on-disk
+/// lockfile must contain the workspace and NOT the label.
+#[tokio::test]
+async fn sync_push_abort_persists_partial_progress_to_lockfile() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &[]).await;
+
+    // Workspace create succeeds.
+    Mock::given(method("POST"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": 5001,
+            "url": format!("{}/api/v1/workspaces/5001", server.uri()),
+            "name": "Persist WS",
+            "organization": format!("{}/api/v1/organizations/1", server.uri()),
+            "queues": []
+        })))
+        .mount(&server)
+        .await;
+    // Label create fails — this aborts the push AFTER the workspace landed.
+    Mock::given(method("POST"))
+        .and(path("/api/v1/labels"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // Local-authored new workspace + new label (neither in the lockfile).
+    let ws_dir = project.path().join("envs/dev/workspaces/persist-ws");
+    std::fs::create_dir_all(&ws_dir).unwrap();
+    std::fs::write(
+        ws_dir.join("workspace.json"),
+        serde_json::to_string_pretty(&serde_json::json!({ "name": "Persist WS" })).unwrap(),
+    )
+    .unwrap();
+    let labels_dir = project.path().join("envs/dev/labels");
+    std::fs::create_dir_all(&labels_dir).unwrap();
+    std::fs::write(
+        labels_dir.join("persist-label.json"),
+        serde_json::to_string_pretty(&serde_json::json!({ "name": "Persist Label" })).unwrap(),
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    assert!(result.is_err(), "sync must fail when the label POST 500s");
+
+    let lf: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        lf.pointer("/objects/workspaces/persist-ws/id"),
+        Some(&serde_json::json!(5001)),
+        "the workspace committed before the failure must be persisted in the lockfile: {lf}"
+    );
+    assert!(
+        lf.pointer("/objects/labels/persist-label").is_none(),
+        "the label that failed to create must NOT be in the lockfile: {lf}"
+    );
+}
