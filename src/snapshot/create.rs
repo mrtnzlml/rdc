@@ -238,6 +238,18 @@ pub fn strip_for_cross_env_patch(body: &mut Value, kind: &str) {
     if kind == "engine_fields" {
         obj.remove("name");
     }
+    // A queue's `generic_engine` is a per-env URL: the host is the env's org
+    // subdomain (`https://<org>-<env>.rossum.app/.../generic_engines/<id>`) while
+    // the id is a cluster-stable built-in. Rossum rewrites the host to the
+    // target org when the queue is stored, so a cross-env migrate that carries
+    // the source host leaks it and conflicts forever (source host vs the
+    // server-normalized target host). Like `organization`/`hook_template`, strip
+    // it so the cross-env compare + migrate restore the TARGET's value instead of
+    // importing the source env's host. Within-env create/PATCH still send it
+    // (this only affects cross-env bodies + the migrate env-field set).
+    if kind == "queues" {
+        obj.remove("generic_engine");
+    }
 }
 
 /// Partial-update analogue of [`strip_for_create`] / [`strip_for_cross_env_patch`].
@@ -294,6 +306,25 @@ mod tests {
         assert!(!is_server_stripped("queues", "engine"));
         // hooks' `queues` is a real forward ref, not stripped
         assert!(!is_server_stripped("hooks", "queues"));
+    }
+
+    #[test]
+    fn cross_env_patch_strips_queue_generic_engine() {
+        // A queue's `generic_engine` is a per-env host URL (Rossum rewrites the
+        // host to the target org on store). Stripping it from cross-env bodies
+        // lets migrate/reconcile restore the TARGET's value rather than leaking
+        // the source env host, which otherwise conflicts forever.
+        let mut q: Value = json!({
+            "name": "Q",
+            "generic_engine": "https://acme-dev.rossum.app/api/v1/generic_engines/5",
+            "settings": { "x": 1 }
+        });
+        strip_for_cross_env_patch(&mut q, "queues");
+        assert!(
+            q.get("generic_engine").is_none(),
+            "queue generic_engine must be stripped from cross-env bodies"
+        );
+        assert!(q.get("settings").is_some(), "real deployable content survives");
     }
 
     #[test]
