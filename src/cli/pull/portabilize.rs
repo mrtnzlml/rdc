@@ -20,7 +20,19 @@ use crate::state::Lockfile;
 /// so the next `sync` classification sees the object as `Clean`.
 ///
 /// Objects with no portable refs are skipped (no file write, no re-hash).
-pub fn portabilize_refs(paths: &Paths, lockfile: &mut Lockfile) -> Result<()> {
+///
+/// `active_conflicts` is the set of `(kind, slug)` that THIS sync surfaced as an
+/// open conflict (a conflict-class item — see the caller). Their local file is
+/// left byte-untouched so the user can resolve it against the parked remote
+/// shadow. Any OTHER object that still has a lingering shadow has a STALE
+/// shadow (the conflict was resolved, or the object now syncs cleanly, but the
+/// shadow from an earlier non-TTY `[s]kip` was never swept) — that shadow is
+/// pruned here so the object portabilizes and stops re-syncing forever.
+pub fn portabilize_refs(
+    paths: &Paths,
+    lockfile: &mut Lockfile,
+    active_conflicts: &std::collections::BTreeSet<(String, String)>,
+) -> Result<()> {
     // Snapshot the (kind, slug) list to avoid borrow conflicts while we
     // mutate the lockfile entries below.
     let entries: Vec<(String, String)> = lockfile
@@ -38,14 +50,27 @@ pub fn portabilize_refs(paths: &Paths, lockfile: &mut Lockfile) -> Result<()> {
         if !path.exists() {
             continue;
         }
-        // A conflicted object has a shadow parked under
-        // `.rdc/conflicts/<env>/` — the local was kept verbatim for the
-        // user to resolve against the remote shadow. Leave it
-        // byte-untouched: don't migrate its refs while the user is
-        // mid-resolution. It converges on the next sync once the conflict
-        // is resolved.
-        if paths.conflict_shadow_path(&path).exists() {
-            continue;
+        // Conflict-shadow handling. A shadow parked under `.rdc/conflicts/<env>/`
+        // marks an object whose local side was kept verbatim for the user to
+        // resolve against the remote.
+        let shadow_path = paths.conflict_shadow_path(&path);
+        if shadow_path.exists() {
+            if active_conflicts.contains(&(kind.clone(), slug.clone())) {
+                // Still an open conflict THIS run: leave the local file
+                // byte-untouched so the diff against the remote shadow stays
+                // meaningful. It converges once the conflict is resolved.
+                continue;
+            }
+            // STALE shadow: the object is no longer in conflict (resolved, or it
+            // now syncs cleanly), but the shadow lingered from an earlier
+            // non-TTY `[s]kip`. Left in place it makes this pass skip the object
+            // forever, so its refs never portabilize and it re-syncs on every
+            // run (observed as a perpetual migrate+sync churn). Prune the stale
+            // shadow (and any `-deleted` marker) so the object can converge.
+            let _ = std::fs::remove_file(&shadow_path);
+            let mut marker = shadow_path.clone().into_os_string();
+            marker.push("-deleted");
+            let _ = std::fs::remove_file(std::path::PathBuf::from(marker));
         }
 
         // Read and parse. A read error on a file we just confirmed exists is a
@@ -264,6 +289,87 @@ mod tests {
         })
     }
 
+    /// A STALE conflict shadow (the object is NOT in the current run's conflict
+    /// set) must be PRUNED and the object portabilized — otherwise the pass
+    /// skips it forever, its raw URLs never convert, and it re-syncs on every
+    /// run (the migrate+sync churn this fix targets).
+    #[test]
+    fn portabilize_refs_prunes_stale_shadow_and_portabilizes() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+
+        const WS_SLUG: &str = "acme-ws";
+        const WS_URL: &str = "https://example.rossum.app/api/v1/workspaces/1001";
+        const LABEL_SLUG: &str = "ap-label";
+
+        let mut lockfile = Lockfile::default();
+        seed_entry(&mut lockfile, "workspaces", WS_SLUG, 1001);
+        seed_entry(&mut lockfile, "labels", LABEL_SLUG, 42);
+
+        let mut label_bytes =
+            serde_json::to_vec_pretty(&label_json_with_workspace_url(WS_URL)).unwrap();
+        label_bytes.push(b'\n');
+        let label_path = paths.labels_dir().join(format!("{LABEL_SLUG}.json"));
+        write_file(&label_path, &label_bytes);
+
+        // A lingering (stale) conflict shadow for this label.
+        let shadow = paths.conflict_shadow_path(&label_path);
+        write_file(&shadow, b"{\"stale\":true}\n");
+        assert!(shadow.exists());
+
+        // Empty active-conflict set → the shadow is stale.
+        portabilize_refs(&paths, &mut lockfile, &std::collections::BTreeSet::new())
+            .expect("portabilize_refs must succeed");
+
+        // The stale shadow is gone, and the label portabilized despite it.
+        assert!(!shadow.exists(), "stale shadow must be pruned");
+        let on_disk = fs::read_to_string(&label_path).unwrap();
+        assert!(
+            on_disk.contains(&format!("rdc://workspaces/{WS_SLUG}")) && !on_disk.contains(WS_URL),
+            "label must portabilize once the stale shadow is pruned:\n{on_disk}"
+        );
+    }
+
+    /// An ACTIVE conflict (the object IS in the current run's conflict set)
+    /// must be left byte-untouched and its shadow preserved — the user is still
+    /// resolving it against the parked remote.
+    #[test]
+    fn portabilize_refs_preserves_active_conflict_shadow_and_skips() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+
+        const WS_SLUG: &str = "acme-ws";
+        const WS_URL: &str = "https://example.rossum.app/api/v1/workspaces/1001";
+        const LABEL_SLUG: &str = "ap-label";
+
+        let mut lockfile = Lockfile::default();
+        seed_entry(&mut lockfile, "workspaces", WS_SLUG, 1001);
+        seed_entry(&mut lockfile, "labels", LABEL_SLUG, 42);
+
+        let mut label_bytes =
+            serde_json::to_vec_pretty(&label_json_with_workspace_url(WS_URL)).unwrap();
+        label_bytes.push(b'\n');
+        let label_path = paths.labels_dir().join(format!("{LABEL_SLUG}.json"));
+        write_file(&label_path, &label_bytes);
+        let before = fs::read(&label_path).unwrap();
+
+        let shadow = paths.conflict_shadow_path(&label_path);
+        write_file(&shadow, b"{\"remote\":true}\n");
+
+        // The label IS actively conflicted this run → protect it.
+        let mut active = std::collections::BTreeSet::new();
+        active.insert(("labels".to_string(), LABEL_SLUG.to_string()));
+        portabilize_refs(&paths, &mut lockfile, &active).expect("portabilize_refs must succeed");
+
+        // Shadow preserved, local file untouched (still raw URL) for resolution.
+        assert!(shadow.exists(), "active-conflict shadow must be preserved");
+        assert_eq!(
+            fs::read(&label_path).unwrap(),
+            before,
+            "active-conflict local file must be left byte-untouched"
+        );
+    }
+
     #[test]
     fn portabilize_refs_rewrites_url_and_updates_hash() {
         let tmp = TempDir::new().unwrap();
@@ -312,7 +418,8 @@ mod tests {
             .content_hash = Some(pre_hash.clone());
 
         // Run the portabilize pass.
-        portabilize_refs(&paths, &mut lockfile).expect("portabilize_refs must succeed");
+        portabilize_refs(&paths, &mut lockfile, &std::collections::BTreeSet::new())
+            .expect("portabilize_refs must succeed");
 
         // (a) The label file now contains `rdc://workspaces/<slug>` and
         //     no raw workspace URL.
@@ -402,7 +509,8 @@ mod tests {
             .unwrap()
             .content_hash = Some(stable_hash.clone());
 
-        portabilize_refs(&paths, &mut lockfile).expect("portabilize_refs must succeed");
+        portabilize_refs(&paths, &mut lockfile, &std::collections::BTreeSet::new())
+            .expect("portabilize_refs must succeed");
 
         // The lockfile hash must be unchanged (skip-if-unchanged).
         let post_hash = lockfile
@@ -461,7 +569,8 @@ mod tests {
             .unwrap()
             .content_hash = Some(pre.clone());
 
-        portabilize_refs(&paths, &mut lockfile).expect("portabilize_refs must succeed");
+        portabilize_refs(&paths, &mut lockfile, &std::collections::BTreeSet::new())
+            .expect("portabilize_refs must succeed");
 
         let after_bytes = fs::read(&path).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&after_bytes).unwrap();
@@ -518,7 +627,8 @@ mod tests {
             .unwrap()
             .content_hash = Some(pre.clone());
 
-        portabilize_refs(&paths, &mut lockfile).expect("portabilize_refs must succeed");
+        portabilize_refs(&paths, &mut lockfile, &std::collections::BTreeSet::new())
+            .expect("portabilize_refs must succeed");
 
         // The on-disk BYTES must change: the file is rewritten with run_after
         // in canonical sorted order (this is the symptom the user hit — a
@@ -593,7 +703,8 @@ mod tests {
             .unwrap()
             .content_hash = Some(pre.clone());
 
-        portabilize_refs(&paths, &mut lockfile).expect("portabilize_refs must succeed");
+        portabilize_refs(&paths, &mut lockfile, &std::collections::BTreeSet::new())
+            .expect("portabilize_refs must succeed");
 
         let after_bytes = fs::read(&path).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&after_bytes).unwrap();
@@ -614,7 +725,7 @@ mod tests {
         seed_entry(&mut lockfile, "labels", "ghost-label", 777);
 
         // Must not panic or error.
-        portabilize_refs(&paths, &mut lockfile)
+        portabilize_refs(&paths, &mut lockfile, &std::collections::BTreeSet::new())
             .expect("portabilize_refs must succeed even with missing files");
     }
 }

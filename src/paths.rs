@@ -99,6 +99,14 @@ impl Paths {
             .join(relpath)
     }
 
+    /// `<root>/.rdc/conflicts/<env>/` — the root of this env's conflict-shadow
+    /// tree (parent of every [`conflict_shadow_path`](Self::conflict_shadow_path)).
+    /// Used by `doctor --rebuild-lock` to discard the whole tree for a true
+    /// clean-slate rebuild.
+    pub fn conflicts_root(&self) -> PathBuf {
+        self.root.join(".rdc").join("conflicts").join(&self.env)
+    }
+
     /// `<root>/envs/<env>/organization.json`
     pub fn organization_file(&self) -> PathBuf {
         self.env_root().join("organization.json")

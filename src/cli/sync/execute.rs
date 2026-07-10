@@ -3675,8 +3675,30 @@ pub async fn run(
         // Post-pass: rewrite portable-kind URLs in every snapshotted file to
         // `rdc://<kind>/<slug>` form and re-record the lockfile `content_hash`
         // so the next `sync` sees the object as Clean (no phantom drift).
-        crate::cli::pull::portabilize::portabilize_refs(ctx.paths, ctx.lockfile)
-            .context("portabilizing snapshot references")?;
+        //
+        // Objects that are STILL in conflict this run keep a parked shadow and
+        // must be left byte-untouched; every other object's lingering shadow is
+        // stale and is pruned by the pass so it can portabilize. Shadows are
+        // only ever written for conflict-class items, so the conflict-class set
+        // is exactly the set to protect.
+        let active_conflicts: std::collections::BTreeSet<(String, String)> = classified
+            .iter()
+            .filter(|it| {
+                matches!(
+                    it.class,
+                    SyncClass::BothDiverged
+                        | SyncClass::LocalEditRemoteDelete
+                        | SyncClass::LocalDeleteRemoteEdit
+                )
+            })
+            .map(|it| (it.kind.clone(), it.slug.clone()))
+            .collect();
+        crate::cli::pull::portabilize::portabilize_refs(
+            ctx.paths,
+            ctx.lockfile,
+            &active_conflicts,
+        )
+        .context("portabilizing snapshot references")?;
     }
 
     Ok(outcome)

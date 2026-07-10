@@ -98,6 +98,17 @@ pub(crate) fn clear_managed_snapshot(paths: &Paths) -> Result<()> {
         std::fs::remove_dir_all(&base)
             .with_context(|| format!("removing base cache {}", base.display()))?;
     }
+    // Discard the conflict-shadow tree too. A clean rebuild re-pulls with no
+    // merge base, so every object lands as a plain Write — there are no
+    // conflicts to preserve. Left behind, a STALE shadow makes the pull
+    // post-pass (`portabilize_refs`) skip that object forever, so its refs
+    // never portabilize and it re-syncs on every run. Clearing the tree makes
+    // `--rebuild-lock` a true clean-slate recovery for that churn.
+    let conflicts = paths.conflicts_root();
+    if conflicts.exists() {
+        std::fs::remove_dir_all(&conflicts)
+            .with_context(|| format!("removing conflict shadows {}", conflicts.display()))?;
+    }
     Ok(())
 }
 
@@ -125,6 +136,9 @@ mod tests {
         // Base-cache mirror.
         std::fs::create_dir_all(paths.base_cache_root().join("hooks")).unwrap();
         std::fs::write(paths.base_cache_root().join("hooks/h.json"), b"{}").unwrap();
+        // Conflict-shadow tree (stale shadows from an earlier interrupted sync).
+        std::fs::create_dir_all(paths.conflicts_root().join("rules")).unwrap();
+        std::fs::write(paths.conflicts_root().join("rules/r.json"), b"{}").unwrap();
 
         clear_managed_snapshot(&paths).unwrap();
 
@@ -133,6 +147,7 @@ mod tests {
         assert!(!env_root.join("organization.json").exists(), "organization.json must be removed");
         assert!(!env_root.join("_index.md").exists(), "_index.md must be removed");
         assert!(!paths.base_cache_root().exists(), "base cache must be removed");
+        assert!(!paths.conflicts_root().exists(), "stale conflict shadows must be removed");
         assert!(env_root.join("overlay/keep.py").exists(), "deploy overlay must be preserved");
         assert!(env_root.join("tests/keep_test.py").exists(), "customer files must be preserved");
     }
