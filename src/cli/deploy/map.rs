@@ -47,22 +47,26 @@ pub fn auto_match(mapping: &mut Mapping, src_paths: &Paths, tgt_paths: &Paths) -
     Ok(added)
 }
 
-/// Return the mapping entries whose SOURCE slug is absent from the src snapshot,
-/// each formatted as `  kind/src_slug -> tgt_slug` and sorted. Auto-matched
+/// Return the mapping entries whose SOURCE slug is absent from the src
+/// snapshot, as sorted `(kind, src_slug, tgt_slug)` triples. Auto-matched
 /// entries always exist (they're listed off disk), so in practice this only
 /// surfaces hand-curated mapping-file entries — a typo, a stale cross-env rename
 /// whose source object was renamed/removed, or a leftover after a
 /// `doctor --rebuild-lock` changed slugs.
 ///
 /// A stale entry is DEAD: there is no source object to migrate, and a renamed
-/// object auto-matches by its new (identical) slug — so migrate IGNORES these
-/// and merely warns (see the caller), rather than hard-failing. Hard-failing
-/// here previously blocked recovery: after a rebuild reassigned slugs, every
-/// pre-rebuild mapping entry was "stale" and `migrate` refused to run at all.
+/// object auto-matches by its new (identical) slug — so migrate PRUNES these
+/// from the persisted mapping (see [`prune_stale_sources`]) rather than
+/// hard-failing or warning on every run. Hard-failing here previously blocked
+/// recovery: after a rebuild reassigned slugs, every pre-rebuild mapping entry
+/// was "stale" and `migrate` refused to run at all.
 ///
 /// `hook_templates` is intentionally excluded — it pairs cross-cluster URLs,
 /// not on-disk source objects.
-pub fn stale_mapping_sources(mapping: &Mapping, src_paths: &Paths) -> Result<Vec<String>> {
+pub fn stale_mapping_sources(
+    mapping: &Mapping,
+    src_paths: &Paths,
+) -> Result<Vec<(String, String, String)>> {
     use std::collections::HashSet;
     let env = src_paths.env();
 
@@ -98,16 +102,39 @@ pub fn stale_mapping_sources(mapping: &Mapping, src_paths: &Paths) -> Result<Vec
         ("engine_fields", &mapping.engine_fields, &engine_fields),
     ];
 
-    let mut missing: Vec<String> = Vec::new();
+    let mut missing: Vec<(String, String, String)> = Vec::new();
     for (kind, map, existing) in kinds {
         for (src_slug, tgt_slug) in map {
             if !existing.contains(src_slug) {
-                missing.push(format!("  {kind}/{src_slug} -> {tgt_slug}"));
+                missing.push((kind.to_string(), src_slug.clone(), tgt_slug.clone()));
             }
         }
     }
     missing.sort();
     Ok(missing)
+}
+
+/// Remove the given stale `(kind, src_slug, _)` entries from `mapping`, so a
+/// subsequent `Mapping::save` persists the pruned file and the dead entries
+/// never surface again. Unknown kinds are ignored (defensive; the triples come
+/// from [`stale_mapping_sources`], which only emits the kinds matched below).
+pub fn prune_stale_sources(mapping: &mut Mapping, stale: &[(String, String, String)]) {
+    for (kind, src_slug, _) in stale {
+        let map = match kind.as_str() {
+            "workspaces" => &mut mapping.workspaces,
+            "hooks" => &mut mapping.hooks,
+            "rules" => &mut mapping.rules,
+            "labels" => &mut mapping.labels,
+            "queues" => &mut mapping.queues,
+            "schemas" => &mut mapping.schemas,
+            "inboxes" => &mut mapping.inboxes,
+            "email_templates" => &mut mapping.email_templates,
+            "engines" => &mut mapping.engines,
+            "engine_fields" => &mut mapping.engine_fields,
+            _ => continue,
+        };
+        map.remove(src_slug);
+    }
 }
 
 fn match_kind(
@@ -535,16 +562,27 @@ mod tests {
         mapping.queues.insert("ghost-q".into(), "renamed-q".into()); // missing source
         mapping.engines.insert("ghost-engine".into(), "x".into()); // missing source
 
-        // No hard error — stale entries are returned for the caller to warn on.
+        // No hard error — stale entries are returned for the caller to prune.
         let stale = stale_mapping_sources(&mapping, &src_paths).unwrap();
-        let joined = stale.join("\n");
-        assert_eq!(stale.len(), 2, "exactly the two dead entries: {joined}");
-        assert!(joined.contains("ghost-q"), "must list the missing queue: {joined}");
-        assert!(joined.contains("ghost-engine"), "must list the missing engine: {joined}");
+        assert_eq!(stale.len(), 2, "exactly the two dead entries: {stale:?}");
         assert!(
-            !joined.contains("real-q") && !joined.contains("real-engine"),
-            "must not flag sources that DO exist: {joined}"
+            stale.contains(&("queues".into(), "ghost-q".into(), "renamed-q".into())),
+            "must list the missing queue: {stale:?}"
         );
+        assert!(
+            stale.contains(&("engines".into(), "ghost-engine".into(), "x".into())),
+            "must list the missing engine: {stale:?}"
+        );
+        assert!(
+            !stale.iter().any(|(_, s, _)| s == "real-q" || s == "real-engine"),
+            "must not flag sources that DO exist: {stale:?}"
+        );
+
+        // Pruning removes exactly the dead entries and keeps the live ones.
+        prune_stale_sources(&mut mapping, &stale);
+        assert_eq!(mapping.queues.len(), 1, "{:?}", mapping.queues);
+        assert!(mapping.queues.contains_key("real-q"));
+        assert!(mapping.engines.is_empty(), "{:?}", mapping.engines);
     }
 
     #[test]

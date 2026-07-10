@@ -43,6 +43,17 @@ const REGULAR_DROP_TIMEOUT: Duration = Duration::from_secs(10);
 /// several seconds for non-trivial mappings; 60s leaves headroom.
 const SEARCH_DROP_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Maximum time to wait for a just-created index to REGISTER in the
+/// remote listing. Both index kinds appear in their list almost
+/// immediately after a successful create (regular in-progress builds
+/// are listed; Atlas Search registers before the background build
+/// finishes) — so an index still absent after this window almost
+/// certainly failed to build. The canonical failure: a UNIQUE index
+/// over data that already contains duplicate key values — the Data
+/// Storage API ACKs the create, the async build fails, and no error
+/// ever reaches the creator.
+const CREATE_MATERIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Push local index edits for one MDH dataset to the remote. Drops
 /// first (avoiding name collisions when a definition has changed),
 /// then creates. On any API failure the function returns the error and
@@ -155,13 +166,30 @@ pub async fn push_dataset(
 
     let ops = apply_diff(client, collection_name, slug, &plan, progress).await?;
 
+    // The Data Storage API ACKs creates and builds asynchronously; a failed
+    // build (e.g. a unique index over duplicate data) silently never appears.
+    // Verify every create registered, warn for the ones that didn't, and
+    // exclude them from the op count — they changed nothing.
+    let missing = verify_creates_materialized(
+        client,
+        collection_name,
+        slug,
+        &plan,
+        CREATE_MATERIALIZE_TIMEOUT,
+        progress,
+    )
+    .await?;
+    let ops = ops.saturating_sub(missing);
+
     // Refresh the lockfile content_hash AND the base cache only when the push
-    // fully reconciled remote to local (no skipped removals). Refreshing on a
-    // skipped removal would make the next sync's `local_hash == base` gate skip
-    // the dataset and silently forget the pending removal. Writing the base
-    // cache here restores the cache↔lockfile hash invariant (the old code
-    // refreshed the lockfile but never the base cache).
-    let fully_applied = ops > 0 && !skipped;
+    // fully reconciled remote to local (no skipped removals, every create
+    // materialized). Refreshing on a skipped removal would make the next
+    // sync's `local_hash == base` gate skip the dataset and silently forget
+    // the pending removal; refreshing on a vanished create would record an
+    // index the remote does not have. Writing the base cache here restores
+    // the cache↔lockfile hash invariant (the old code refreshed the lockfile
+    // but never the base cache).
+    let fully_applied = ops > 0 && !skipped && missing == 0;
     if fully_applied {
         let hash = content_hash(&local_raw, &crate::state::Lockfile::default());
         let map = lockfile
@@ -281,6 +309,103 @@ pub(crate) async fn apply_diff(
         ops += 1;
     }
     Ok(ops)
+}
+
+/// Poll the remote listings until every index just created by
+/// [`apply_diff`] has REGISTERED, or `timeout` expires. Returns how many
+/// never appeared, warning for each: the Data Storage API ACKs
+/// `indexes/create` / `search_indexes/create` and builds asynchronously,
+/// and a failed build vanishes without any error surfacing to the
+/// creator — most commonly a UNIQUE index whose keys are violated by
+/// duplicate values already in the collection. Callers subtract the
+/// count from their op tally (a vanished create changed nothing) and
+/// treat the push as not-fully-applied so the retry stays armed for
+/// after the user fixes the data.
+pub(crate) async fn verify_creates_materialized(
+    client: &DataStorageClient,
+    collection_name: &str,
+    slug: &str,
+    plan: &DiffPlan,
+    timeout: Duration,
+    progress: &Arc<Log>,
+) -> Result<usize> {
+    let name_of = |def: &Value| def.get("name").and_then(|n| n.as_str()).map(str::to_string);
+    let want_regular: Vec<Value> = plan.create_regular.clone();
+    let want_search: Vec<String> = plan.create_search.iter().filter_map(name_of).collect();
+    if want_regular.is_empty() && want_search.is_empty() {
+        return Ok(0);
+    }
+
+    let listed_names = |list: &[Value]| -> BTreeSet<String> {
+        list.iter()
+            .filter_map(|ix| ix.get("name").and_then(|n| n.as_str()).map(str::to_string))
+            .collect()
+    };
+
+    let start = Instant::now();
+    loop {
+        let mut missing_regular: Vec<&Value> = Vec::new();
+        if !want_regular.is_empty() {
+            let have = listed_names(
+                &client
+                    .list_indexes(collection_name, Some(progress.clone()))
+                    .await
+                    .with_context(|| {
+                        format!("verifying created indexes on '{collection_name}'")
+                    })?,
+            );
+            missing_regular = want_regular
+                .iter()
+                .filter(|def| name_of(def).is_some_and(|n| !have.contains(&n)))
+                .collect();
+        }
+        let mut missing_search: Vec<&String> = Vec::new();
+        if !want_search.is_empty() {
+            let have = listed_names(
+                &client
+                    .list_search_indexes(collection_name, Some(progress.clone()))
+                    .await
+                    .with_context(|| {
+                        format!("verifying created search indexes on '{collection_name}'")
+                    })?,
+            );
+            missing_search = want_search.iter().filter(|n| !have.contains(*n)).collect();
+        }
+
+        if missing_regular.is_empty() && missing_search.is_empty() {
+            return Ok(0);
+        }
+        if start.elapsed() >= timeout {
+            for def in &missing_regular {
+                let name = name_of(def).unwrap_or_default();
+                let unique_hint = if def.get("unique").and_then(|u| u.as_bool()).unwrap_or(false)
+                {
+                    " It is a UNIQUE index — the collection most likely contains duplicate \
+                     values for its key(s); deduplicate the data and re-run."
+                } else {
+                    ""
+                };
+                progress.event(
+                    Action::Warn,
+                    &format!(
+                        "mdh/{slug} regular index '{name}' on '{collection_name}' was accepted \
+                         but never materialized (the async build likely failed).{unique_hint}"
+                    ),
+                );
+            }
+            for name in &missing_search {
+                progress.event(
+                    Action::Warn,
+                    &format!(
+                        "mdh/{slug} search index '{name}' on '{collection_name}' was accepted \
+                         but never materialized (the async build likely failed)."
+                    ),
+                );
+            }
+            return Ok(missing_regular.len() + missing_search.len());
+        }
+        tokio::time::sleep(DROP_POLL_INTERVAL).await;
+    }
 }
 
 /// Poll `list_indexes` until the named regular index is gone (or the
@@ -724,5 +849,118 @@ mod tests {
     #[test]
     fn gate_interactive_without_flag_prompts() {
         assert_eq!(classify_delete_gate(1, false, true), DeleteGate::Prompt);
+    }
+
+    // --- create-materialization verification -------------------------
+    //
+    // The Data Storage API ACKs `indexes/create` and builds asynchronously;
+    // a failed build (e.g. a unique index over data that already contains
+    // duplicate key values) vanishes WITHOUT any error ever reaching the
+    // creator. `verify_creates_materialized` polls the list until every
+    // just-created index appears or the timeout expires, so the push can
+    // surface the silent failure instead of reporting success.
+
+    fn test_log() -> Arc<crate::log::Log> {
+        crate::log::Log::new(crate::cli::resolve::ColorMode::Plain)
+    }
+
+    #[tokio::test]
+    async fn verify_reports_create_that_never_materializes() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // The created index never appears in the listing.
+        Mock::given(method("POST"))
+            .and(path("/v1/indexes/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": "ok", "message": "",
+                "result": [{ "v": 2, "name": "_id_", "key": { "_id": 1 } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DataStorageClient::new(server.uri(), "tok".to_string()).unwrap();
+        let plan = DiffPlan {
+            create_regular: vec![json!({"name": "ix_u", "key": {"a": 1}, "unique": true})],
+            ..Default::default()
+        };
+        let missing = verify_creates_materialized(
+            &client,
+            "vendors",
+            "vendors",
+            &plan,
+            Duration::ZERO,
+            &test_log(),
+        )
+        .await
+        .expect("verification listing should succeed");
+        assert_eq!(missing, 1, "the never-materializing create must be reported");
+    }
+
+    #[tokio::test]
+    async fn verify_passes_when_created_index_appears() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/indexes/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": "ok", "message": "",
+                "result": [
+                    { "v": 2, "name": "_id_", "key": { "_id": 1 } },
+                    { "v": 2, "name": "ix_u", "key": { "a": 1 }, "unique": true }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search_indexes/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": "ok", "message": "",
+                "result": [{ "name": "sx", "latestDefinition": { "mappings": { "dynamic": true } } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DataStorageClient::new(server.uri(), "tok".to_string()).unwrap();
+        let plan = DiffPlan {
+            create_regular: vec![json!({"name": "ix_u", "key": {"a": 1}, "unique": true})],
+            create_search: vec![json!({"name": "sx", "mappings": {"dynamic": true}})],
+            ..Default::default()
+        };
+        let missing = verify_creates_materialized(
+            &client,
+            "vendors",
+            "vendors",
+            &plan,
+            Duration::ZERO,
+            &test_log(),
+        )
+        .await
+        .expect("verification listing should succeed");
+        assert_eq!(missing, 0, "materialized creates must not be reported");
+    }
+
+    #[tokio::test]
+    async fn verify_makes_no_requests_without_creates() {
+        // No mocks mounted: any request would 404 and error the client —
+        // an empty plan must return without touching the network.
+        let server = wiremock::MockServer::start().await;
+        let client = DataStorageClient::new(server.uri(), "tok".to_string()).unwrap();
+        let missing = verify_creates_materialized(
+            &client,
+            "vendors",
+            "vendors",
+            &DiffPlan::default(),
+            Duration::ZERO,
+            &test_log(),
+        )
+        .await
+        .expect("empty plan must verify trivially");
+        assert_eq!(missing, 0);
+        assert!(
+            server.received_requests().await.unwrap_or_default().is_empty(),
+            "no creates → no verification requests"
+        );
     }
 }

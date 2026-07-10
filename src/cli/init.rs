@@ -171,7 +171,7 @@ pub async fn run(env_specs: Vec<String>) -> Result<()> {
             for env in &syncable {
                 println!();
                 match crate::cli::sync::run(env, true, false, false, false, false).await {
-                    Ok(()) => {
+                    Ok(_outcome) => {
                         synced.insert(env.clone());
                     }
                     Err(e) => {

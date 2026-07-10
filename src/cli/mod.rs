@@ -334,6 +334,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     crate::cli::sync::run(&env, interactive, dry_run, allow_deletes, no_push, no_pull)
                 })
                 .await
+                .map(|_outcome| ())
             }
         }
         Some(Command::Deploy { .. }) => {
@@ -382,10 +383,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 ///
 /// Non-TTY contexts (CI, piped) skip the prompt and surface the
 /// original error annotated with a hint to run `rdc auth <env>`.
-async fn with_401_retry<F, Fut>(env: &str, op: F) -> anyhow::Result<()>
+async fn with_401_retry<T, F, Fut>(env: &str, op: F) -> anyhow::Result<T>
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<()>>,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
     let first = op().await;
     match first {

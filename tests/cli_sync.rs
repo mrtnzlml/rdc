@@ -9554,14 +9554,29 @@ async fn sync_push_email_template_adopts_existing_by_type() {
         "modified_at": "2026-04-20T08:00:00Z"
     });
 
-    // Stateful listing: always returns the existing remote template.
+    // Stateful listing modeling the server-side race the adopt path exists
+    // for: Rossum auto-creates the typed default template as a side effect
+    // of queue creation, BETWEEN the cycle's catalog listing and the push.
+    // Calls #1 (cycle-1 catalog) and #2 (cycle-2 catalog) return an empty
+    // list — the default doesn't exist yet as far as the classifier knows,
+    // so it is never pulled into a sibling file (which would claim id 555
+    // and correctly block this adoption — see `pick_adoption_id`). Call #3+
+    // (the push driver's adoption listing) returns the auto-created 555.
     let existing_tpl_for_list = existing_remote_tpl.clone();
+    let list_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let list_calls_for_mock = list_calls.clone();
     Mock::given(method("GET"))
         .and(path("/api/v1/email_templates"))
         .respond_with(move |_req: &Request| {
+            let n = list_calls_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let results = if n < 2 {
+                serde_json::json!([])
+            } else {
+                serde_json::json!([existing_tpl_for_list.clone()])
+            };
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
-                "results": [existing_tpl_for_list.clone()]
+                "results": results
             }))
         })
         .mount(&server)
@@ -9912,4 +9927,313 @@ async fn sync_push_abort_persists_partial_progress_to_lockfile() {
         lf.pointer("/objects/labels/persist-label").is_none(),
         "the label that failed to create must NOT be in the lockfile: {lf}"
     );
+}
+
+/// A `LocalCreate` whose POST the server refuses (400 — e.g. a second
+/// email template of a unique type on one queue) is skipped by the push
+/// driver. The cycle summary must NOT count it as "changed": nothing on
+/// the remote changed. Before the fix, the plan-time tally reported every
+/// planned push regardless of what the driver actually committed.
+#[tokio::test]
+async fn sync_failed_template_create_is_not_counted_as_changed() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &[]).await;
+
+    // The server refuses the create: unique-typed template already exists.
+    Mock::given(method("POST"))
+        .and(path("/api/v1/email_templates"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "detail": "Cannot create template with unique type: rejection_default"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // Local-only template (no lockfile entry) → classified LocalCreate.
+    let tpl = project
+        .path()
+        .join("envs/dev/workspaces/main/queues/invoices/email-templates/rejection-2.json");
+    std::fs::create_dir_all(tpl.parent().unwrap()).unwrap();
+    std::fs::write(
+        &tpl,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "Default rejection template",
+            "subject": "Rejected",
+            "type": "rejection_default",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    let outcome = result.expect("a refused create must not abort the sync");
+    assert_eq!(
+        outcome.items_pushed, 0,
+        "a create the server refused (and the driver skipped) is not a change"
+    );
+}
+
+/// An MDH index create that MATERIALIZES on the remote is a real write and
+/// must count as "changed". Before the fix, MDH writes (which bypass the
+/// classifier) were invisible in the cycle summary.
+#[tokio::test]
+async fn sync_mdh_index_create_counts_as_changed_when_materialized() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &[]).await;
+
+    use wiremock::matchers::body_partial_json;
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/collections/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "ok", "message": "",
+            "result": [{
+                "name": "vendors", "type": "collection", "options": {},
+                "idIndex": { "v": 2, "key": { "_id": 1 }, "name": "_id_" }
+            }]
+        })))
+        .mount(&server)
+        .await;
+    // First indexes/list (the push driver's remote leg): index absent.
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/indexes/list"))
+        .and(body_partial_json(serde_json::json!({"collectionName": "vendors"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "ok", "message": "",
+            "result": [{ "v": 2, "name": "_id_", "key": { "_id": 1 } }]
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    // Every later indexes/list (materialization check + stage-3 pull):
+    // the created index is present.
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/indexes/list"))
+        .and(body_partial_json(serde_json::json!({"collectionName": "vendors"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "ok", "message": "",
+            "result": [
+                { "v": 2, "name": "_id_", "key": { "_id": 1 } },
+                { "v": 2, "name": "v_idx", "key": { "a": 1 } }
+            ]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/search_indexes/list"))
+        .and(body_partial_json(serde_json::json!({"collectionName": "vendors"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "ok", "message": "", "result": []
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/indexes/create"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "ok", "message": ""
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // Local dataset with an index the remote collection lacks.
+    let ds_dir = project.path().join("envs/dev/mdh/vendors");
+    std::fs::create_dir_all(&ds_dir).unwrap();
+    std::fs::write(
+        ds_dir.join("indexes.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "regular": [{ "key": { "a": 1 }, "name": "v_idx" }],
+            "search": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    let outcome = result.expect("sync with an MDH index create should succeed");
+    assert_eq!(
+        outcome.items_pushed, 1,
+        "a materialized MDH index create is a real remote write and must be counted"
+    );
+}
+
+/// An MDH index create the Data Storage API accepts but never builds (the
+/// canonical case: a UNIQUE index over data with duplicate key values) must
+/// reach a PER-RUN IDENTICAL steady state: every sync retries the create,
+/// warns that it never materialized, keeps the local (desired-state) file,
+/// and preserves the lockfile base so the NEXT run retries again.
+///
+/// Regression shape: the pull's generic KeepLocal branch used to advance the
+/// lockfile base to the local content, so the next sync's push gate
+/// (`local_hash == base`) skipped the retry and the pull then REVERTED the
+/// local file — a period-2 oscillation (push+warn one run, silent revert the
+/// next).
+#[tokio::test]
+async fn sync_mdh_unmaterialized_index_reaches_stable_retry_state() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &[]).await;
+
+    use wiremock::matchers::body_partial_json;
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/collections/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "ok", "message": "",
+            "result": [{
+                "name": "vendors", "type": "collection", "options": {},
+                "idIndex": { "v": 2, "key": { "_id": 1 }, "name": "_id_" }
+            }]
+        })))
+        .mount(&server)
+        .await;
+    // The unique index NEVER materializes: every listing only has `_id_`.
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/indexes/list"))
+        .and(body_partial_json(serde_json::json!({"collectionName": "vendors"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "ok", "message": "",
+            "result": [{ "v": 2, "name": "_id_", "key": { "_id": 1 } }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/search_indexes/list"))
+        .and(body_partial_json(serde_json::json!({"collectionName": "vendors"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "ok", "message": "", "result": []
+        })))
+        .mount(&server)
+        .await;
+    // The create is ACKed on every attempt — and must be RETRIED on every
+    // sync while the local desired state still carries the index (2 syncs
+    // with the local edit → 2 create attempts).
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/indexes/create"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "ok", "message": ""
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // Sync 1: baseline pull — records the remote form (no custom indexes)
+    // in the lockfile and base cache.
+    let r1 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+
+    // Simulate `rdc migrate` landing a unique index the remote data can't
+    // hold (the source env has it; the target's rows violate uniqueness).
+    let ix_path = project.path().join("envs/dev/mdh/vendors/indexes.json");
+    std::fs::write(
+        &ix_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "regular": [{ "key": { "a": 1 }, "name": "v_uniq", "unique": true }],
+            "search": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Sync 2: pushes the create (ACKed, never builds), warns, keeps local.
+    let r2 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    // Sync 3: MUST retry the create (not skip via a poisoned base) and MUST
+    // NOT revert the local file to the remote form.
+    let r3 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+
+    std::env::set_current_dir(&prev_cwd).unwrap();
+    r1.expect("baseline sync must succeed");
+    let o2 = r2.expect("sync with unmaterialized create must succeed");
+    let o3 = r3.expect("repeat sync must succeed");
+
+    assert_eq!(
+        o2.items_pushed, 0,
+        "an ACKed-but-never-built create is not a remote change"
+    );
+    assert_eq!(
+        o3.items_pushed, 0,
+        "steady state: the retry is still not a remote change"
+    );
+    let on_disk = std::fs::read_to_string(&ix_path).unwrap();
+    assert!(
+        on_disk.contains("v_uniq"),
+        "the local desired-state index must survive the pull (no revert): {on_disk}"
+    );
+    // The `.expect(2)` on the create mock (verified on MockServer drop)
+    // proves sync 3 retried instead of skipping via an advanced base.
 }

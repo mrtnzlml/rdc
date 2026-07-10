@@ -42,35 +42,45 @@ pub(crate) async fn push_classified(
     catalog_hooks: &[crate::model::Hook],
     relink: &mut Vec<relink::DeferredRelink>,
     progress: &Arc<Log>,
-) -> Result<()> {
+) -> Result<(usize, usize)> {
+    // Aggregate (pushed, skipped) across every per-kind driver so the
+    // cycle summary can reconcile its plan-time tally with what was
+    // actually written (a driver skip — refused create, drift skip,
+    // adopt-remote — is NOT a remote change).
+    let mut pushed = 0usize;
+    let mut skipped = 0usize;
+    let mut tally = |counts: (usize, usize)| {
+        pushed += counts.0;
+        skipped += counts.1;
+    };
     if !changes.workspaces.is_empty() {
-        workspaces::push(paths, client, lockfile, interactive, &changes.workspaces, progress, env).await
-            .with_context(|| format!("pushing workspaces for env '{env}'"))?;
+        tally(workspaces::push(paths, client, lockfile, interactive, &changes.workspaces, progress, env).await
+            .with_context(|| format!("pushing workspaces for env '{env}'"))?);
     }
     if !changes.schemas.is_empty() {
-        schemas::push(paths, client, lockfile, interactive, &changes.schemas, progress, env).await
-            .with_context(|| format!("pushing schemas for env '{env}'"))?;
+        tally(schemas::push(paths, client, lockfile, interactive, &changes.schemas, progress, env).await
+            .with_context(|| format!("pushing schemas for env '{env}'"))?);
     }
     if !changes.queues.is_empty() {
-        queues::push(paths, client, lockfile, interactive, &changes.queues, relink, progress, env).await
-            .with_context(|| format!("pushing queues for env '{env}'"))?;
+        tally(queues::push(paths, client, lockfile, interactive, &changes.queues, relink, progress, env).await
+            .with_context(|| format!("pushing queues for env '{env}'"))?);
     }
     if !changes.inboxes.is_empty() {
-        inboxes::push(paths, client, lockfile, interactive, &changes.inboxes, progress, env).await
-            .with_context(|| format!("pushing inboxes for env '{env}'"))?;
+        tally(inboxes::push(paths, client, lockfile, interactive, &changes.inboxes, progress, env).await
+            .with_context(|| format!("pushing inboxes for env '{env}'"))?);
     }
     if !changes.email_templates.is_empty() {
-        email_templates::push(paths, client, lockfile, interactive, &changes.email_templates, progress, env).await
-            .with_context(|| format!("pushing email templates for env '{env}'"))?;
+        tally(email_templates::push(paths, client, lockfile, interactive, &changes.email_templates, progress, env).await
+            .with_context(|| format!("pushing email templates for env '{env}'"))?);
     }
     // Hooks always go through `push` (no early-skip on empty `changes`)
     // so the secrets-only pass inside it can detect changes to
     // `secrets/<env>.hook-secrets.json` that aren't accompanied by a
     // hook JSON/code edit. The function returns (0, 0) when neither
     // content nor secrets have drifted.
-    hooks::push(paths, client, lockfile, interactive, &changes.hooks, catalog_hooks, relink, progress, env)
+    tally(hooks::push(paths, client, lockfile, interactive, &changes.hooks, catalog_hooks, relink, progress, env)
         .await
-        .with_context(|| format!("pushing hooks for env '{env}'"))?;
+        .with_context(|| format!("pushing hooks for env '{env}'"))?);
     // Labels before rules: a rule's `actions` can reference a label
     // (`rdc://labels/<slug>`), and `rules::push` resolves those refs at
     // create time. Labels are leaf objects (they reference only the
@@ -78,20 +88,20 @@ pub(crate) async fn push_classified(
     // resolve against the lockfile instead of failing with "Invalid
     // hyperlink - No URL match".
     if !changes.labels.is_empty() {
-        labels::push(paths, client, lockfile, interactive, &changes.labels, progress, env).await
-            .with_context(|| format!("pushing labels for env '{env}'"))?;
+        tally(labels::push(paths, client, lockfile, interactive, &changes.labels, progress, env).await
+            .with_context(|| format!("pushing labels for env '{env}'"))?);
     }
     if !changes.rules.is_empty() {
-        rules::push(paths, client, lockfile, interactive, &changes.rules, progress, env).await
-            .with_context(|| format!("pushing rules for env '{env}'"))?;
+        tally(rules::push(paths, client, lockfile, interactive, &changes.rules, progress, env).await
+            .with_context(|| format!("pushing rules for env '{env}'"))?);
     }
     if !changes.engines.is_empty() {
-        engines::push(paths, client, lockfile, interactive, &changes.engines, relink, progress, env).await
-            .with_context(|| format!("pushing engines for env '{env}'"))?;
+        tally(engines::push(paths, client, lockfile, interactive, &changes.engines, relink, progress, env).await
+            .with_context(|| format!("pushing engines for env '{env}'"))?);
     }
     if !changes.engine_fields.is_empty() {
-        engine_fields::push(paths, client, lockfile, interactive, &changes.engine_fields, progress, env).await
-            .with_context(|| format!("pushing engine fields for env '{env}'"))?;
+        tally(engine_fields::push(paths, client, lockfile, interactive, &changes.engine_fields, progress, env).await
+            .with_context(|| format!("pushing engine fields for env '{env}'"))?);
     }
-    Ok(())
+    Ok((pushed, skipped))
 }
