@@ -271,14 +271,17 @@ pub(crate) async fn run_cycle(
 
     // Surface queue-slug collisions: two queue dirs sharing a slug across
     // workspaces collapse onto one lockfile entry, so one is re-pushed every
-    // sync forever (a silent non-idempotency). A fresh pull assigns unique
-    // slugs, so warn the user to re-pull rather than let it churn undiagnosed.
+    // sync forever (a silent non-idempotency). This only happens in a snapshot
+    // that predates global slug dedup; a plain re-pull does NOT fix it (it
+    // matches the stale dirs) — only `doctor --rebuild-lock` (clean rebuild)
+    // reassigns unique slugs. Direct the user there rather than let it churn.
     for (slug, wss) in crate::cli::push::scan::detect_slug_collisions(&paths) {
         progress.event(
             Action::Warn,
             &format!(
                 "queue slug '{slug}' exists in {} workspaces ({}); they collide on one lockfile \
-                 entry and will re-push every sync — re-pull '{env}' to assign unique slugs",
+                 entry and will re-push every sync — run `rdc doctor {env} --rebuild-lock` to \
+                 reassign unique slugs",
                 wss.len(),
                 wss.join(", "),
             ),
