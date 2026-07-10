@@ -96,12 +96,31 @@ fn strip_server_managed(set: &IndexSet) -> IndexSet {
             obj.shift_remove("v");
         }
     }
-    let search: Vec<Value> = set
+    let mut search: Vec<Value> = set
         .search
         .iter()
         .filter_map(normalize_search_index)
         .collect();
+    // Canonically name-sort both lists. The Data Storage list endpoints return
+    // indexes in an order that is unstable across environments; writing that raw
+    // order to disk makes `migrate` (source order) and `sync`'s pull-leg (target
+    // order) rewrite the same `indexes.json` on every run (a hash-flip ping-pong,
+    // since array element order is significant to the content hash). A stable
+    // name-sort makes the on-disk form deterministic and the workflow idempotent.
+    sort_indexes_by_name(&mut regular);
+    sort_indexes_by_name(&mut search);
     IndexSet { regular, search }
+}
+
+/// Sort an index list by the `name` field, with the full canonical JSON as a
+/// tiebreaker so the order is total and deterministic even in the (unexpected)
+/// case of a missing or duplicate name.
+fn sort_indexes_by_name(list: &mut [Value]) {
+    list.sort_by(|a, b| {
+        let an = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let bn = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        an.cmp(bn).then_with(|| a.to_string().cmp(&b.to_string()))
+    });
 }
 
 /// Reshape a search-index list response to the create-body shape.
@@ -414,5 +433,31 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let remote = BTreeSet::new();
         assert!(local_only_dataset_slugs(&tmp.path().join("nope"), &remote).is_empty());
+    }
+
+    #[test]
+    fn strip_server_managed_sorts_indexes_by_name_deterministically() {
+        use serde_json::json;
+        // The Data Storage list endpoints return indexes in an unstable order
+        // that differs across environments. Writing that raw order to disk makes
+        // `migrate` (dev order) and `sync`'s pull-leg (target order) ping-pong
+        // the same file forever. Canonically name-sorting the on-disk form is
+        // what keeps the snapshot deterministic and the workflow idempotent.
+        let set = IndexSet {
+            regular: vec![
+                json!({ "name": "b_idx", "key": { "b": 1 } }),
+                json!({ "name": "a_idx", "key": { "a": 1 } }),
+            ],
+            search: vec![
+                json!({ "name": "z_search", "mappings": { "dynamic": true } }),
+                json!({ "name": "m_search", "mappings": { "dynamic": false } }),
+            ],
+        };
+        let out = strip_server_managed(&set);
+        let regular: Vec<&str> =
+            out.regular.iter().map(|i| i["name"].as_str().unwrap()).collect();
+        let search: Vec<&str> = out.search.iter().map(|i| i["name"].as_str().unwrap()).collect();
+        assert_eq!(regular, vec!["a_idx", "b_idx"], "regular indexes must be name-sorted");
+        assert_eq!(search, vec!["m_search", "z_search"], "search indexes must be name-sorted");
     }
 }
