@@ -3611,31 +3611,54 @@ pub async fn run(
                         );
                         continue;
                     };
-                    // Nothing to create when there are no index definitions —
-                    // rdc never creates an empty collection on its own (the Data
-                    // Storage API materializes a collection only through its
-                    // indexes or its row data, and rdc manages the index schema,
-                    // not the data). Surface the skip so a source data-only
-                    // collection that never appears on the target isn't a silent
-                    // mystery — the user's "I don't see all collections" case.
                     let local_bytes = match std::fs::read(&indexes_path) {
                         Ok(b) => b,
                         Err(_) => continue,
                     };
-                    match serde_json::from_slice::<crate::model::IndexSet>(&local_bytes) {
-                        Ok(s) if s.regular.is_empty() && s.search.is_empty() => {
-                            progress.event(
-                                Action::Skip,
-                                &format!(
-                                    "mdh/{slug} (no index definitions — a data-only collection \
-                                     isn't created on the target; rdc deploys MDH index schemas, \
-                                     not row data)"
-                                ),
+                    // An index-less ("data-only") source collection has no index
+                    // schema for the create-via-indexes path (`push_dataset`) to
+                    // act on — `push_dataset` would be a no-op and the collection
+                    // would never appear on the target. Create the bare collection
+                    // explicitly (`POST /v1/collections/create`) so a full mirror
+                    // includes it, then record its (empty) index set as the base so
+                    // the next sync sees it Clean. rdc still never touches row data.
+                    if let Ok(s) = serde_json::from_slice::<crate::model::IndexSet>(&local_bytes)
+                        && s.regular.is_empty()
+                        && s.search.is_empty()
+                    {
+                        catalog
+                            .mdh
+                            .client
+                            .create_collection(&name, Some(progress.clone()))
+                            .await
+                            .with_context(|| {
+                                format!("creating empty mdh collection '{name}' for mdh/{slug}")
+                            })?;
+                        let hash = crate::state::content_hash(
+                            &local_bytes,
+                            &crate::state::Lockfile::default(),
+                        );
+                        ctx.lockfile
+                            .objects
+                            .entry("mdh_indexes".to_string())
+                            .or_default()
+                            .insert(
+                                slug.clone(),
+                                crate::state::ObjectEntry {
+                                    id: 0,
+                                    modified_at: None,
+                                    content_hash: Some(hash),
+                                    secrets_hash: None,
+                                },
                             );
-                            continue;
-                        }
-                        Ok(_) => {}
-                        Err(_) => continue, // malformed → the pull path surfaces it
+                        crate::state::base_cache::write(ctx.paths, &indexes_path, &local_bytes)
+                            .with_context(|| format!("writing base cache for mdh/{slug}"))?;
+                        progress.event(
+                            Action::Post,
+                            &format!("mdh/{slug} created empty collection '{name}'"),
+                        );
+                        created_local_only.push(slug);
+                        continue;
                     }
                     crate::cli::push::mdh::push_dataset(
                         &catalog.mdh.client,
