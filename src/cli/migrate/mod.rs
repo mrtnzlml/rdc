@@ -301,6 +301,7 @@ fn transform_file(
     overlay: Option<&Overlay>,
     tgt_org_url: &str,
     migrate_score_thresholds: bool,
+    src_lockfile: &crate::state::Lockfile,
 ) -> Result<()> {
     let src_path = src_root.join(rel);
     let dst_rel = remap_relative(rel, mapping);
@@ -331,6 +332,22 @@ fn transform_file(
         std::fs::read(&src_path).with_context(|| format!("reading {}", src_path.display()))?;
     let mut value: serde_json::Value = serde_json::from_slice(&raw)
         .with_context(|| format!("parsing JSON {}", src_path.display()))?;
+
+    // Re-portabilize the source body against the SOURCE lockfile before slug
+    // substitution. A source snapshot pulled before the portabilization fixes
+    // (e.g. the webhooks→hooks endpoint mapping) can still carry raw
+    // `https://<src-host>/…/<id>` URLs for tracked objects — most visibly a
+    // queue's `webhooks` back-reference array, but also any nested ref that
+    // escaped an older pull. Left as-is they pass through `subst` unchanged
+    // (it only matches whole `rdc://` strings) and leak the source host into
+    // the target, conflicting forever. Converting them here to
+    // `rdc://<kind>/<src-slug>` lets the `subst` pass below remap them to the
+    // target slug, so migrate output stays byte-identical to a fresh target
+    // pull regardless of how stale the source snapshot is. Untracked kinds
+    // (users, `generic_engines`, organization) are left as raw URLs — they are
+    // not deployable refs and are reconciled/stripped separately. An empty
+    // lockfile (tests) makes this a no-op.
+    crate::snapshot::refs::portabilize_value(&mut value, src_lockfile);
 
     // Whole-string rdc:// substitution: a ref is always a standalone field
     // value, never a substring of a template/formula, so we only replace when
@@ -887,6 +904,10 @@ pub fn run(
     let selection = crate::cli::deploy::selection::resolve(&only, &src_paths, &tgt_paths)?;
 
     let subst = build_subst(&mapping);
+    // Source lockfile: used to re-portabilize any stale raw URLs in the source
+    // snapshot (see `transform_file`). Missing/unparseable → empty (no-op), so
+    // migrate still runs; it just can't recover raw URLs the source carries.
+    let src_lockfile = crate::state::Lockfile::load(&src_paths.lockfile()).unwrap_or_default();
     let tgt_overlay = Overlay::load(&tgt_paths.overlay_file()).with_context(|| {
         format!(
             "loading tgt overlay from {}",
@@ -956,6 +977,7 @@ pub fn run(
                 tgt_overlay.as_ref(),
                 &tgt_org_url,
                 migrate_score_thresholds,
+                &src_lockfile,
             )
             .with_context(|| format!("migrating {}", rel.display()))?;
         }
@@ -1300,7 +1322,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default()).unwrap();
 
         // File landed at the remapped path.
         let dst = tgt
@@ -1315,6 +1337,72 @@ mod tests {
         assert_eq!(v["hooks"][0], "rdc://hooks/extractor");
         // unrelated field untouched
         assert_eq!(v["name"], "Invoices");
+    }
+
+    #[test]
+    fn transform_reportabilizes_stale_source_urls_then_remaps() {
+        use crate::state::{Lockfile, ObjectEntry};
+        use std::fs;
+        let src = tempfile::TempDir::new().unwrap();
+        let tgt = tempfile::TempDir::new().unwrap();
+
+        let mut m = Mapping::default();
+        m.workspaces.insert("main".into(), "main".into()); // identity (path)
+        m.queues.insert("invoices".into(), "invoices".into()); // identity (path)
+        m.hooks.insert("my-hook".into(), "my-hook-prod".into());
+
+        let rel = Path::new("workspaces/main/queues/invoices/queue.json");
+        let src_file = src.path().join(rel);
+        fs::create_dir_all(src_file.parent().unwrap()).unwrap();
+        fs::write(
+            &src_file,
+            serde_json::to_vec(&serde_json::json!({
+                "name": "Q",
+                // Stale raw URL on the LEGACY /webhooks/ endpoint — the form a
+                // source pulled before the portabilization fixes carries.
+                "webhooks": ["https://src.example/api/v1/webhooks/99"],
+                // Already-portable ref on the new endpoint (must still remap).
+                "hooks": ["rdc://hooks/my-hook"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Source lockfile tracks the hook (id 99) under slug `my-hook`, so
+        // `/webhooks/99` resolves (webhooks→hooks by id).
+        let mut src_lock = Lockfile {
+            api_base: "https://src.example/api/v1".into(),
+            ..Lockfile::default()
+        };
+        src_lock.upsert(
+            "hooks",
+            "my-hook",
+            ObjectEntry { id: 99, modified_at: None, content_hash: None, secrets_hash: None },
+        );
+
+        let subst = build_subst(&m);
+        transform_file(
+            rel,
+            src.path(),
+            tgt.path(),
+            &m,
+            &subst,
+            None,
+            "https://tgt.example/api/v1/organizations/2",
+            true,
+            &src_lock,
+        )
+        .unwrap();
+
+        let dst = tgt.path().join("workspaces/main/queues/invoices/queue.json");
+        let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
+        // The stale /webhooks/99 URL was re-portabilized to rdc://hooks/my-hook,
+        // then remapped to the target slug — the source host never leaks.
+        assert_eq!(
+            v["webhooks"][0], "rdc://hooks/my-hook-prod",
+            "stale source webhooks URL must portabilize + remap, not leak the source host"
+        );
+        assert_eq!(v["hooks"][0], "rdc://hooks/my-hook-prod");
     }
 
     #[test]
@@ -1346,7 +1434,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default()).unwrap();
 
         let dst = tgt.path().join("hooks/extractor-prod.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -1388,7 +1476,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default()).unwrap();
 
         let dst = tgt.path().join("hooks/any-hook.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -1436,7 +1524,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default()).unwrap();
 
         let dst = tgt.path().join("hooks/special-hook.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -1477,7 +1565,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default()).unwrap();
 
         let dst = tgt.path().join("rules/some-rule.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -1551,6 +1639,7 @@ mod tests {
             None,
             "https://acme-test.rossum.app/api/v1/organizations/2",
             true,
+            &crate::state::Lockfile::default(),
         )
         .unwrap();
 
@@ -1599,7 +1688,7 @@ mod tests {
         fs::write(&src_file, code).unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default()).unwrap();
 
         let dst = tgt.path().join("hooks/extractor-prod.py");
         assert_eq!(
@@ -1872,6 +1961,7 @@ mod tests {
             rel, src.path(), tgt.path(), &m, &subst, None,
             "https://tgt.example/api/v1/organizations/2",
             /* migrate_score_thresholds = */ true,
+            &crate::state::Lockfile::default(),
         )
         .unwrap();
 
@@ -1922,6 +2012,7 @@ mod tests {
             rel, src.path(), tgt.path(), &m, &subst, None,
             "https://tgt.example/api/v1/organizations/2",
             /* migrate_score_thresholds = */ false,
+            &crate::state::Lockfile::default(),
         )
         .unwrap();
 
