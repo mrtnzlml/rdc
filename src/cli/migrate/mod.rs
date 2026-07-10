@@ -992,11 +992,29 @@ pub fn run(
 
     let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
 
-    // Mapping: load, auto-match same-slug pairs, validate sources, persist.
+    // Mapping: load, auto-match same-slug pairs, warn on any stale entries, persist.
     let mapping_file = src_paths.mapping_file(src, tgt);
     let mut mapping = Mapping::load(&mapping_file)?;
     let added = crate::cli::deploy::map::auto_match(&mut mapping, &src_paths, &tgt_paths)?;
-    crate::cli::deploy::map::validate_mapping_sources(&mapping, &src_paths, &mapping_file)?;
+    // Stale mapping entries (source slug no longer exists — e.g. a leftover
+    // after `doctor --rebuild-lock` reassigned slugs) are DEAD: there's nothing
+    // to migrate for them, and a renamed object auto-matches by its new slug.
+    // Warn and ignore rather than hard-fail, so a rebuild doesn't block migrate.
+    // The file is left as-is (the user tidies it when convenient); the apply
+    // loops simply never consult an entry whose source object is absent.
+    let stale = crate::cli::deploy::map::stale_mapping_sources(&mapping, &src_paths)?;
+    if !stale.is_empty() {
+        log.event(
+            crate::log::Action::Warn,
+            &format!(
+                "ignoring {} stale mapping entr{} in {} (source object no longer exists in '{src}'):\n{}",
+                stale.len(),
+                if stale.len() == 1 { "y" } else { "ies" },
+                mapping_file.display(),
+                stale.join("\n"),
+            ),
+        );
+    }
     if !dry_run {
         std::fs::create_dir_all(src_paths.mapping_dir())
             .with_context(|| format!("creating {}", src_paths.mapping_dir().display()))?;
