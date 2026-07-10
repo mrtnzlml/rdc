@@ -208,10 +208,13 @@ fn migrate_dry_run_writes_nothing() {
     );
 }
 
-/// `validate_mapping_sources` aborts before any write when the mapping names a
-/// source object that doesn't exist on disk.
+/// A stale mapping entry (its source object doesn't exist on disk) must NOT
+/// abort migrate. It's a dead mapping — nothing to migrate for it — so migrate
+/// ignores it (warns) and proceeds to migrate the real objects. This keeps
+/// recovery unblocked after a `doctor --rebuild-lock` reassigns slugs, which
+/// leaves every pre-rebuild mapping entry "stale".
 #[test]
-fn migrate_errors_on_stale_mapping_source() {
+fn migrate_ignores_stale_mapping_source() {
     let project = init_two_env_project();
     let root = project.path();
     write(
@@ -233,15 +236,16 @@ fn migrate_errors_on_stale_mapping_source() {
     let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true);
     std::env::set_current_dir(&prev).unwrap();
 
-    let err = result.expect_err("stale mapping source must abort migrate");
-    let msg = format!("{err:#}");
+    // Migrate SUCCEEDS despite the stale entry (previously it hard-failed).
+    result.expect("stale mapping source must not abort migrate");
+    // The real object was migrated; the dead `ghost` entry produced nothing.
     assert!(
-        msg.contains("ghost"),
-        "error must name the missing source: {msg}"
+        root.join("envs/prod/hooks/extractor.json").exists(),
+        "the real source hook must be migrated"
     );
     assert!(
-        !root.join("envs/prod/hooks/extractor.json").exists(),
-        "no target files written when validation fails"
+        !root.join("envs/prod/hooks/ghost.json").exists(),
+        "a dead mapping entry must not fabricate a target object"
     );
 }
 

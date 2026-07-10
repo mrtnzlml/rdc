@@ -47,21 +47,22 @@ pub fn auto_match(mapping: &mut Mapping, src_paths: &Paths, tgt_paths: &Paths) -
     Ok(added)
 }
 
-/// Fail if any source slug referenced by the mapping is absent from the src
-/// snapshot. Auto-matched entries always exist (they're listed off disk), so
-/// in practice this only catches hand-curated mapping-file entries — a typo or
-/// a stale cross-env rename whose source object was renamed/removed. The deploy
-/// used to warn and silently skip such entries deep in the apply loops (so the
-/// object the user meant to deploy never got deployed); this stops the deploy
-/// up front, before any remote writes, with the full list of offenders.
+/// Return the mapping entries whose SOURCE slug is absent from the src snapshot,
+/// each formatted as `  kind/src_slug -> tgt_slug` and sorted. Auto-matched
+/// entries always exist (they're listed off disk), so in practice this only
+/// surfaces hand-curated mapping-file entries — a typo, a stale cross-env rename
+/// whose source object was renamed/removed, or a leftover after a
+/// `doctor --rebuild-lock` changed slugs.
+///
+/// A stale entry is DEAD: there is no source object to migrate, and a renamed
+/// object auto-matches by its new (identical) slug — so migrate IGNORES these
+/// and merely warns (see the caller), rather than hard-failing. Hard-failing
+/// here previously blocked recovery: after a rebuild reassigned slugs, every
+/// pre-rebuild mapping entry was "stale" and `migrate` refused to run at all.
 ///
 /// `hook_templates` is intentionally excluded — it pairs cross-cluster URLs,
 /// not on-disk source objects.
-pub fn validate_mapping_sources(
-    mapping: &Mapping,
-    src_paths: &Paths,
-    mapping_file: &Path,
-) -> Result<()> {
+pub fn stale_mapping_sources(mapping: &Mapping, src_paths: &Paths) -> Result<Vec<String>> {
     use std::collections::HashSet;
     let env = src_paths.env();
 
@@ -105,18 +106,8 @@ pub fn validate_mapping_sources(
             }
         }
     }
-    if !missing.is_empty() {
-        missing.sort();
-        anyhow::bail!(
-            "deploy mapping references {} source object(s) that don't exist in '{}':\n{}\n\n\
-             Fix the mapping file ({}): remove the stale entries or correct the source slugs, then re-run.",
-            missing.len(),
-            env,
-            missing.join("\n"),
-            mapping_file.display(),
-        );
-    }
-    Ok(())
+    missing.sort();
+    Ok(missing)
 }
 
 fn match_kind(
@@ -533,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_mapping_sources_errors_on_missing_source() {
+    fn stale_mapping_sources_lists_missing_sources_only() {
         let src = tempfile::TempDir::new().unwrap();
         let src_paths = Paths::for_env(src.path(), "src");
         write_queue(&src_paths, "ws", "real-q"); // queue.json + schema.json
@@ -544,19 +535,20 @@ mod tests {
         mapping.queues.insert("ghost-q".into(), "renamed-q".into()); // missing source
         mapping.engines.insert("ghost-engine".into(), "x".into()); // missing source
 
-        let mf = src.path().join("map.toml");
-        let err = validate_mapping_sources(&mapping, &src_paths, &mf).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("ghost-q"), "must name the missing queue: {msg}");
-        assert!(msg.contains("ghost-engine"), "must name the missing engine: {msg}");
+        // No hard error — stale entries are returned for the caller to warn on.
+        let stale = stale_mapping_sources(&mapping, &src_paths).unwrap();
+        let joined = stale.join("\n");
+        assert_eq!(stale.len(), 2, "exactly the two dead entries: {joined}");
+        assert!(joined.contains("ghost-q"), "must list the missing queue: {joined}");
+        assert!(joined.contains("ghost-engine"), "must list the missing engine: {joined}");
         assert!(
-            !msg.contains("real-q") && !msg.contains("real-engine"),
-            "must not flag sources that DO exist: {msg}"
+            !joined.contains("real-q") && !joined.contains("real-engine"),
+            "must not flag sources that DO exist: {joined}"
         );
     }
 
     #[test]
-    fn validate_mapping_sources_ok_when_all_present() {
+    fn stale_mapping_sources_empty_when_all_present() {
         let src = tempfile::TempDir::new().unwrap();
         let src_paths = Paths::for_env(src.path(), "src");
         write_queue(&src_paths, "ws", "real-q");
@@ -565,8 +557,7 @@ mod tests {
         mapping.queues.insert("real-q".into(), "renamed-on-tgt".into());
         mapping.schemas.insert("real-q".into(), "real-q".into());
 
-        let mf = src.path().join("map.toml");
-        assert!(validate_mapping_sources(&mapping, &src_paths, &mf).is_ok());
+        assert!(stale_mapping_sources(&mapping, &src_paths).unwrap().is_empty());
     }
 
     /// Two queues with the same NAME live in different workspaces. The sync
