@@ -61,6 +61,25 @@ impl DataStorageClient {
         self.post_envelope("/v1/collections/list", json!({"nameOnly": false}), progress).await
     }
 
+    /// `POST /v1/collections/create` with `{collectionName}` — create an EMPTY
+    /// collection (no indexes beyond the implicit `_id_`, no documents). Used to
+    /// materialize an index-less "data-only" collection on a target env: such a
+    /// collection has no index schema for the normal create-via-indexes path
+    /// ([`push_dataset`]) to act on, so without this it would never appear on the
+    /// target. Response body is the resultless `{success: true}` envelope.
+    pub async fn create_collection(
+        &self,
+        collection: &str,
+        progress: ProgressHandle,
+    ) -> Result<()> {
+        self.post_envelope_void(
+            "/v1/collections/create",
+            json!({ "collectionName": collection }),
+            progress,
+        )
+        .await
+    }
+
     /// `POST /v1/indexes/list` with `{collectionName, nameOnly: false}` —
     /// regular MongoDB-style indexes (incl. the implicit `_id_` index).
     pub async fn list_indexes(&self, collection: &str, progress: ProgressHandle) -> Result<Vec<Value>> {
@@ -289,5 +308,64 @@ mod tests {
         let e: Envelope<Value> = serde_json::from_str(raw).unwrap();
         assert_eq!(e.code, "ok");
         assert!(e.result.is_none(), "write responses have no result");
+    }
+
+    /// `create_collection` must POST `/v1/collections/create` with exactly
+    /// `{"collectionName": <name>}` and accept the `{success:true}` envelope.
+    /// The `body_json` matcher makes the mock respond ONLY to that exact body,
+    /// so a wrong endpoint/payload yields no match → the call errors → test fails.
+    #[tokio::test]
+    async fn create_collection_posts_expected_endpoint_and_payload() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/collections/create"))
+            .and(body_json(json!({ "collectionName": "PO_LINE_DESC_SYNONYMS" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": "ok",
+                "message": "",
+                "result": { "success": true }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = DataStorageClient::new(server.uri(), "TOKEN".into()).unwrap();
+        client
+            .create_collection("PO_LINE_DESC_SYNONYMS", None)
+            .await
+            .expect("create_collection should succeed on an ok envelope");
+        // `.expect(1)` on drop verifies exactly one matching request was made.
+    }
+
+    /// A non-ok envelope (e.g. permission error) must surface as an error, not
+    /// be swallowed — the caller aborts the sync so the collection isn't
+    /// silently missing.
+    #[tokio::test]
+    async fn create_collection_errors_on_non_ok_envelope() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/collections/create"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": "error",
+                "message": "permission denied"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DataStorageClient::new(server.uri(), "TOKEN".into()).unwrap();
+        let err = client
+            .create_collection("X", None)
+            .await
+            .expect_err("non-ok envelope must be an error");
+        assert!(
+            format!("{err:#}").contains("permission denied"),
+            "error should carry the API message: {err:#}"
+        );
     }
 }
