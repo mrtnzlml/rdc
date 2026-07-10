@@ -626,6 +626,45 @@ pub fn decide_pull_action(
     Ok((action, remote_hash))
 }
 
+/// Three-way pull decision for objects hashed via a combined (json + sidecar)
+/// hash — schemas, rules, hooks — from already-computed hashes.
+///
+/// [`decide_pull_action`] handles single-file objects and hashes the bytes
+/// itself; the combined-hash drivers compute their own `schema_combined_hash`
+/// / `rule_combined_hash` / `hook_combined_hash` and call this with the
+/// results. It reproduces `decide_pull_action`'s logic EXACTLY, including its
+/// `local == remote` short-circuit: when the two sides agree, any drift from
+/// the recorded base is stale-base noise (classically, after `migrate`
+/// rewrote the object to the form that was then deployed), NOT a conflict.
+///
+/// Historically each driver inlined the three-way `match` WITHOUT this
+/// short-circuit, so the `(false, false)` arm reported a spurious conflict on
+/// every first `sync` after `migrate` even though local and remote were
+/// byte-for-byte identical. Sharing one implementation keeps the three in
+/// lock-step with `decide_pull_action`.
+///
+/// `local_combined` is `None` when there is no local file on disk.
+pub(crate) fn classify_combined_pull(
+    base: Option<&str>,
+    local_combined: Option<&str>,
+    remote_combined: &str,
+) -> PullAction {
+    let (Some(base), Some(local)) = (base, local_combined) else {
+        // No recorded base, or no local file → take remote.
+        return PullAction::Write;
+    };
+    if local == remote_combined {
+        // Sides agree — converged, not a conflict. The caller records
+        // `remote_combined` as the new base, so the next sync sees Clean.
+        return PullAction::NoChange;
+    }
+    match (local == base, remote_combined == base) {
+        (true, _) => PullAction::Write,
+        (false, true) => PullAction::KeepLocal,
+        (false, false) => PullAction::Conflict,
+    }
+}
+
 /// Apply the decision to the filesystem and return the hash that should be
 /// recorded in the lockfile (which differs depending on the action).
 ///
@@ -837,6 +876,65 @@ fn resolve_conflict_interactive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_combined_pull_converged_sides_are_not_a_conflict() {
+        // local == remote but both differ from a STALE base — the `migrate`
+        // case: migrate rewrote the object to the form that was then
+        // deployed, so local and remote agree while the recorded base still
+        // reflects the pre-migrate state. Both-differ-from-base must NOT be
+        // reported as a conflict when the two sides actually agree. This is
+        // the shared regression guard for schemas, rules, and hooks.
+        assert_eq!(
+            classify_combined_pull(Some("STALE_BASE"), Some("AGREE"), "AGREE"),
+            PullAction::NoChange
+        );
+    }
+
+    #[test]
+    fn classify_combined_pull_all_equal_is_nochange() {
+        assert_eq!(
+            classify_combined_pull(Some("X"), Some("X"), "X"),
+            PullAction::NoChange
+        );
+    }
+
+    #[test]
+    fn classify_combined_pull_true_conflict_still_conflicts() {
+        // local, remote, base ALL differ → a genuine conflict survives.
+        assert_eq!(
+            classify_combined_pull(Some("BASE"), Some("LOCAL"), "REMOTE"),
+            PullAction::Conflict
+        );
+    }
+
+    #[test]
+    fn classify_combined_pull_local_unchanged_takes_remote() {
+        assert_eq!(
+            classify_combined_pull(Some("BASE"), Some("BASE"), "REMOTE"),
+            PullAction::Write
+        );
+    }
+
+    #[test]
+    fn classify_combined_pull_remote_unchanged_keeps_local() {
+        assert_eq!(
+            classify_combined_pull(Some("BASE"), Some("LOCAL"), "BASE"),
+            PullAction::KeepLocal
+        );
+    }
+
+    #[test]
+    fn classify_combined_pull_no_base_or_no_local_writes() {
+        assert_eq!(
+            classify_combined_pull(None, Some("L"), "R"),
+            PullAction::Write
+        );
+        assert_eq!(
+            classify_combined_pull(Some("B"), None, "R"),
+            PullAction::Write
+        );
+    }
 
     #[test]
     fn inboxes_by_queue_maps_by_attached_queue_id() {
