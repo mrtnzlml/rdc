@@ -372,6 +372,42 @@ fn transform_file(
         reconcile_target_identity(&mut value, &dst_path, codec, tgt_org_url);
     }
 
+    // `reconcile_target_identity` restores env-field values verbatim from the
+    // TARGET snapshot, which may itself carry stale raw source-host URLs — most
+    // visibly a queue's `webhooks` back-reference array (a reverse-ref field
+    // pulled before the webhooks→hooks portabilization fix, or carried in by an
+    // earlier leaky migrate). Those restored refs skipped the portabilize/subst
+    // above (they were injected after it), so re-run both: portabilize converts
+    // any source-host ref the source lockfile can resolve to `rdc://<src-slug>`,
+    // and subst remaps that to `rdc://<tgt-slug>`. Idempotent for values already
+    // in portable form, and a no-op for genuine target-host env refs (the source
+    // lockfile can't resolve a different host), so legit env-specific fields
+    // (e.g. a matched target's `modified_by`) are left intact.
+    crate::snapshot::refs::portabilize_value(&mut value, src_lockfile);
+    walk_strings_mut(&mut value, &mut |s| {
+        if let Some(replacement) = subst.get(s.as_str()) {
+            *s = replacement.clone();
+        }
+    });
+
+    // Drop any residual SOURCE-HOST URL from the target-restored reverse-ref env
+    // fields (e.g. a queue's `users` access list a contaminated target carried,
+    // or `workflows`). These fields are reverse-membership lists stripped on
+    // push, and the portabilize pass above already converted every ref the
+    // source lockfile can resolve — so a leftover source-host entry is an
+    // unresolvable, non-deployable ref that is meaningless in the target
+    // (verified: the target env's queues carry no such users). Removing it keeps
+    // the migrated snapshot free of the source host. Scoped to env fields via
+    // `cross_env_body`, so deployable content (a hook's lookup `settings`, …) is
+    // never touched here — an unresolvable source-host ref there is a source
+    // data bug the user must fix, not something migrate may silently rewrite.
+    if let Some((kind, _)) = classify(rel)
+        && let Some(codec) = crate::snapshot::codec::codec(kind)
+        && let Some(src_host) = url_host(&src_lockfile.api_base)
+    {
+        strip_source_host_env_refs(&mut value, codec, &src_host);
+    }
+
     // Apply the tgt overlay for this object. A kind-wide default lives under the
     // reserved `"*"` slug (e.g. `[hooks."*"]`) and is applied FIRST; the
     // per-object entry (`[hooks.<slug>]`) is applied SECOND so it wins on any
@@ -436,6 +472,73 @@ fn transform_file(
     json.push(b'\n');
     crate::snapshot::writer::write_atomic(&dst_path, &json)?;
     Ok(())
+}
+
+/// The bare `host[:port]` of an API base URL, e.g.
+/// `https://org-dev.rossum.app/api/v1` -> `org-dev.rossum.app`. Returns `None`
+/// for a malformed/empty base (an empty lockfile in tests), so callers skip
+/// source-host handling rather than match everything.
+fn url_host(api_base: &str) -> Option<String> {
+    let (_scheme, rest) = api_base.split_once("://")?;
+    rest.split('/')
+        .next()
+        .filter(|h| !h.is_empty())
+        .map(str::to_owned)
+}
+
+/// Strip SOURCE-HOST references from a value's reverse-ref / server-assigned
+/// ENV fields — the top-level keys `cross_env_body` removes (`users`,
+/// `workflows`, `webhooks`, … and an inbox's `email` for the relevant kinds).
+/// Called after portabilization, so any value still carrying the source host is
+/// an unresolvable, non-deployable leftover a contaminated target snapshot
+/// restored; the source host is meaningless in the target, so we clean it:
+///   - array field: drop the entries that reference the source host;
+///   - string field (e.g. `email`): drop the field entirely, so `rdc sync`
+///     re-reads the target's server-assigned value.
+/// Matches the bare host as a substring, covering both URLs
+/// (`https://<host>/…`) and emails (`<local>@<host>`). Scoped to env fields via
+/// `cross_env_body`, so deployable content (a hook's lookup `settings`, …) is
+/// never touched here — an unresolvable source-host ref there is a source data
+/// bug the user must fix, not something migrate may silently rewrite.
+fn strip_source_host_env_refs(
+    value: &mut serde_json::Value,
+    codec: &'static dyn crate::snapshot::codec::KindCodec,
+    src_host: &str,
+) {
+    if !value.is_object() {
+        return;
+    }
+    // Env fields = top-level keys present in the full body but removed by
+    // `cross_env_body` (probe on a clone so `value` is untouched). Same
+    // derivation `reconcile_target_identity` uses.
+    let mut probe = value.clone();
+    codec.cross_env_body(&mut probe);
+    let kept: std::collections::BTreeSet<String> = probe
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    let env_fields: Vec<String> = value
+        .as_object()
+        .map(|m| m.keys().filter(|k| !kept.contains(*k)).cloned().collect())
+        .unwrap_or_default();
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    for field in env_fields {
+        let drop_field = match obj.get_mut(&field) {
+            Some(serde_json::Value::Array(arr)) => {
+                arr.retain(
+                    |v| !matches!(v, serde_json::Value::String(s) if s.contains(src_host)),
+                );
+                false
+            }
+            Some(serde_json::Value::String(s)) => s.contains(src_host),
+            _ => false,
+        };
+        if drop_field {
+            obj.remove(&field);
+        }
+    }
 }
 
 /// Reconcile per-org confidence thresholds so migrate does not carry them from
@@ -1153,6 +1256,72 @@ fn split_ext(leaf: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_host_extracts_bare_host() {
+        assert_eq!(
+            url_host("https://org-dev.rossum.app/api/v1").as_deref(),
+            Some("org-dev.rossum.app")
+        );
+        // Empty / malformed base → None (tests run with an empty lockfile, so
+        // source-host handling must no-op rather than match everything).
+        assert_eq!(url_host(""), None);
+        assert_eq!(url_host("no-scheme"), None);
+        assert_eq!(url_host("https://"), None);
+    }
+
+    #[test]
+    fn strip_source_host_env_refs_cleans_env_fields_only() {
+        let codec = crate::snapshot::codec::codec("queues").unwrap();
+        let host = "org-dev.rossum.app";
+        let mut v = serde_json::json!({
+            // deployable content (a field cross_env_body KEEPS) — must be left
+            // untouched even if it carries a source-host ref.
+            "name": "q",
+            "settings": { "lookup": [format!("https://{host}/api/v1/queues/999")] },
+            // reverse-ref ENV array field: drop only the source-host entries,
+            // keep rdc:// and other hosts.
+            "users": [
+                format!("https://{host}/api/v1/users/1"),
+                "rdc://hooks/keep-me",
+                "https://org-test.rossum.app/api/v1/users/2"
+            ],
+            "webhooks": [format!("https://{host}/api/v1/webhooks/5")]
+        });
+        strip_source_host_env_refs(&mut v, codec, host);
+        assert_eq!(
+            v["users"],
+            serde_json::json!(["rdc://hooks/keep-me", "https://org-test.rossum.app/api/v1/users/2"]),
+            "only the source-host user entry must be dropped"
+        );
+        assert_eq!(v["webhooks"], serde_json::json!([]), "source-host webhook must be dropped");
+        assert_eq!(
+            v["settings"],
+            serde_json::json!({ "lookup": [format!("https://{host}/api/v1/queues/999")] }),
+            "deployable content (a kept field) must NOT be touched"
+        );
+    }
+
+    #[test]
+    fn strip_source_host_env_refs_drops_string_email_env_field() {
+        // An inbox's `email` is a server-assigned string env field. A
+        // contaminated target restoring a source-host address (`…@<src-host>`)
+        // must be dropped entirely so `rdc sync` re-reads the target's own.
+        let codec = crate::snapshot::codec::codec("inboxes").unwrap();
+        let host = "org-dev.rossum.app";
+        let mut v = serde_json::json!({
+            "name": "in",
+            "email": format!("inbox-abc@{host}")
+        });
+        strip_source_host_env_refs(&mut v, codec, host);
+        assert!(v.get("email").is_none(), "source-host email must be dropped: {v}");
+        assert_eq!(v["name"], "in", "deployable content untouched");
+
+        // A target-host email is legit env identity — keep it.
+        let mut v2 = serde_json::json!({ "name": "in", "email": "inbox-abc@org-test.rossum.app" });
+        strip_source_host_env_refs(&mut v2, codec, host);
+        assert_eq!(v2["email"], "inbox-abc@org-test.rossum.app", "target-host email must be kept");
+    }
 
     fn mapping_with_renames() -> Mapping {
         let mut m = Mapping::default();
