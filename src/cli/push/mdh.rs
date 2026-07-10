@@ -51,7 +51,10 @@ const SEARCH_DROP_TIMEOUT: Duration = Duration::from_secs(60);
 /// certainly failed to build. The canonical failure: a UNIQUE index
 /// over data that already contains duplicate key values — the Data
 /// Storage API ACKs the create, the async build fails, and no error
-/// ever reaches the creator.
+/// ever reaches the creator. That case is normally caught upfront by
+/// [`preflight_doomed_unique_creates`] (no create issued, no wait);
+/// this verification remains as the backstop for every other silent
+/// build failure.
 const CREATE_MATERIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Push local index edits for one MDH dataset to the remote. Drops
@@ -164,12 +167,23 @@ pub async fn push_dataset(
         }
     }
 
+    // A unique index over data that already contains duplicate key values is
+    // doomed: the API ACKs the create, the async build fails, and the index
+    // silently never appears — re-attempted on every subsequent sync (a
+    // futile write + a 10s materialization wait each run). Detect that data
+    // state upfront with a cheap aggregation and drop the doomed creates
+    // from the plan; the dataset stays not-fully-applied, so the create
+    // retries automatically once the data has been deduplicated.
+    let doomed =
+        preflight_doomed_unique_creates(client, collection_name, slug, &mut plan, progress)
+            .await;
+
     let ops = apply_diff(client, collection_name, slug, &plan, progress).await?;
 
     // The Data Storage API ACKs creates and builds asynchronously; a failed
-    // build (e.g. a unique index over duplicate data) silently never appears.
-    // Verify every create registered, warn for the ones that didn't, and
-    // exclude them from the op count — they changed nothing.
+    // build silently never appears. Verify every create registered, warn for
+    // the ones that didn't, and exclude them from the op count — they
+    // changed nothing.
     let missing = verify_creates_materialized(
         client,
         collection_name,
@@ -183,13 +197,14 @@ pub async fn push_dataset(
 
     // Refresh the lockfile content_hash AND the base cache only when the push
     // fully reconciled remote to local (no skipped removals, every create
-    // materialized). Refreshing on a skipped removal would make the next
-    // sync's `local_hash == base` gate skip the dataset and silently forget
-    // the pending removal; refreshing on a vanished create would record an
-    // index the remote does not have. Writing the base cache here restores
-    // the cache↔lockfile hash invariant (the old code refreshed the lockfile
-    // but never the base cache).
-    let fully_applied = ops > 0 && !skipped && missing == 0;
+    // materialized, no doomed unique creates withheld). Refreshing on a
+    // skipped removal would make the next sync's `local_hash == base` gate
+    // skip the dataset and silently forget the pending removal; refreshing on
+    // a vanished or withheld create would record an index the remote does not
+    // have. Writing the base cache here restores the cache↔lockfile hash
+    // invariant (the old code refreshed the lockfile but never the base
+    // cache).
+    let fully_applied = ops > 0 && !skipped && missing == 0 && doomed == 0;
     if fully_applied {
         let hash = content_hash(&local_raw, &crate::state::Lockfile::default());
         let map = lockfile
@@ -406,6 +421,119 @@ pub(crate) async fn verify_creates_materialized(
         }
         tokio::time::sleep(DROP_POLL_INTERVAL).await;
     }
+}
+
+/// Build the duplicate-key detection pipeline for a unique regular-index
+/// definition, or `None` when the definition isn't eligible for the
+/// preflight. Eligible: `unique: true`, plain field-name keys, and no
+/// `sparse` / `partialFilterExpression` (those scope uniqueness to a
+/// subset of documents the plain `$group` below doesn't model — such
+/// creates go straight to the attempt-and-verify path).
+///
+/// The pipeline groups every document by the index's key fields and
+/// counts groups with more than one member:
+/// `[{$group: {_id: {k0: "$f0", …}, n: {$sum: 1}}}, {$match: {n: {$gt: 1}}},
+///   {$count: "dupGroups"}]`
+/// — an empty result means the data can satisfy the unique constraint.
+/// Group-`_id` subfields are positional (`k0`, `k1`, …) because dotted
+/// index paths (`id.poId`) are not valid document keys there.
+pub(crate) fn unique_dup_key_pipeline(def: &Value) -> Option<Value> {
+    if !def.get("unique").and_then(|u| u.as_bool()).unwrap_or(false) {
+        return None;
+    }
+    if def.get("sparse").and_then(|s| s.as_bool()).unwrap_or(false)
+        || def.get("partialFilterExpression").is_some()
+    {
+        return None;
+    }
+    let key = def.get("key")?.as_object()?;
+    if key.is_empty() {
+        return None;
+    }
+    let mut group_id = serde_json::Map::new();
+    for (i, field) in key.keys().enumerate() {
+        // `$`-prefixed key names are not real field paths (e.g. the `$**`
+        // wildcard spec) — and can't be unique anyway. Bail defensively.
+        if field.starts_with('$') {
+            return None;
+        }
+        group_id.insert(format!("k{i}"), Value::String(format!("${field}")));
+    }
+    Some(serde_json::json!([
+        { "$group": { "_id": group_id, "n": { "$sum": 1 } } },
+        { "$match": { "n": { "$gt": 1 } } },
+        { "$count": "dupGroups" }
+    ]))
+}
+
+/// Remove from `plan` every unique regular-index create whose key is
+/// already violated by duplicate values in the collection — the async
+/// build would inevitably fail (silently), so attempting it is a futile
+/// remote write plus a full materialization wait, repeated every sync
+/// until the data is fixed. A withheld create also cancels its paired
+/// same-name drop, so a changed-definition recreate never destroys the
+/// existing index only to fail rebuilding it.
+///
+/// Returns the number of creates withheld; the caller treats any
+/// non-zero count as not-fully-applied so the dataset is re-examined
+/// (and the create re-attempted) on the next sync — statelessly
+/// self-healing once the data has been deduplicated. An aggregation
+/// failure (older Data Storage without `data/aggregate`, oversized
+/// collection, …) leaves the create in the plan: the attempt-and-verify
+/// path handles it exactly as before.
+pub(crate) async fn preflight_doomed_unique_creates(
+    client: &DataStorageClient,
+    collection_name: &str,
+    slug: &str,
+    plan: &mut DiffPlan,
+    progress: &Arc<Log>,
+) -> usize {
+    let mut withheld: Vec<String> = Vec::new();
+    for def in &plan.create_regular {
+        let Some(name) = def.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(pipeline) = unique_dup_key_pipeline(def) else {
+            continue;
+        };
+        let dup_groups = match client
+            .aggregate(collection_name, &pipeline, Some(progress.clone()))
+            .await
+        {
+            Ok(result) => result
+                .first()
+                .and_then(|doc| doc.get("dupGroups"))
+                .and_then(|n| n.as_u64())
+                .unwrap_or(0),
+            // Preflight is best-effort: on any aggregation failure fall
+            // through to the normal create + materialization verify.
+            Err(_) => continue,
+        };
+        if dup_groups == 0 {
+            continue;
+        }
+        progress.event(
+            Action::Warn,
+            &format!(
+                "mdh/{slug} withholding unique index '{name}' on '{collection_name}': the \
+                 collection contains {dup_groups} duplicate key group(s) its build would \
+                 fail on; deduplicate the data and re-run sync"
+            ),
+        );
+        withheld.push(name.to_string());
+    }
+    if withheld.is_empty() {
+        return 0;
+    }
+    plan.create_regular.retain(|def| {
+        def.get("name")
+            .and_then(|v| v.as_str())
+            .is_none_or(|n| !withheld.iter().any(|w| w == n))
+    });
+    // Keep the existing definition alive rather than dropping it for a
+    // recreate that cannot build.
+    plan.drop_regular.retain(|n| !withheld.contains(n));
+    withheld.len()
 }
 
 /// Poll `list_indexes` until the named regular index is gone (or the
@@ -939,6 +1067,270 @@ mod tests {
         .await
         .expect("verification listing should succeed");
         assert_eq!(missing, 0, "materialized creates must not be reported");
+    }
+
+    // --- unique-index duplicate-key preflight -------------------------
+    //
+    // A unique index over data that already contains duplicate key values
+    // can never build: the API ACKs the create and the async build fails
+    // silently, so every sync re-attempts the create and waits out the
+    // full materialization timeout. The preflight detects the doomed data
+    // state with one cheap aggregation and withholds the create instead.
+
+    #[test]
+    fn dup_pipeline_built_for_plain_unique_index() {
+        let def = json!({
+            "name": "vendors_unique_id",
+            "key": { "id.erpAcct": 1, "id.erpName": 1, "id.vendorId": 1 },
+            "unique": true
+        });
+        let p = unique_dup_key_pipeline(&def).expect("plain unique index is eligible");
+        assert_eq!(
+            p,
+            json!([
+                { "$group": { "_id": {
+                    "k0": "$id.erpAcct", "k1": "$id.erpName", "k2": "$id.vendorId"
+                }, "n": { "$sum": 1 } } },
+                { "$match": { "n": { "$gt": 1 } } },
+                { "$count": "dupGroups" }
+            ])
+        );
+    }
+
+    #[test]
+    fn dup_pipeline_skips_non_unique_sparse_partial_and_wildcard() {
+        let non_unique = json!({"name": "ix", "key": {"a": 1}});
+        assert!(unique_dup_key_pipeline(&non_unique).is_none(), "not unique");
+
+        let sparse = json!({"name": "ix", "key": {"a": 1}, "unique": true, "sparse": true});
+        assert!(
+            unique_dup_key_pipeline(&sparse).is_none(),
+            "sparse uniqueness only covers docs bearing the fields"
+        );
+
+        let partial = json!({
+            "name": "ix", "key": {"a": 1}, "unique": true,
+            "partialFilterExpression": {"a": {"$exists": true}}
+        });
+        assert!(
+            unique_dup_key_pipeline(&partial).is_none(),
+            "partial uniqueness only covers matching docs"
+        );
+
+        let wildcard = json!({"name": "ix", "key": {"$**": 1}, "unique": true});
+        assert!(unique_dup_key_pipeline(&wildcard).is_none(), "$-prefixed key is not a field");
+
+        let empty_key = json!({"name": "ix", "key": {}, "unique": true});
+        assert!(unique_dup_key_pipeline(&empty_key).is_none(), "empty key spec");
+    }
+
+    /// Duplicate data present → the doomed create is withheld (and its
+    /// paired same-name drop cancelled, preserving the existing index);
+    /// clean sibling creates stay in the plan.
+    #[tokio::test]
+    async fn preflight_withholds_doomed_unique_create_and_paired_drop() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/aggregate"))
+            .and(body_partial_json(json!({"collectionName": "PO_CANCELS"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": "ok", "message": "", "result": [{ "dupGroups": 9 }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // No create/drop mocks: any write reaching the server would 404.
+
+        let client = DataStorageClient::new(server.uri(), "tok".to_string()).unwrap();
+        let mut plan = DiffPlan {
+            // Changed-def recreate pair for the doomed index…
+            drop_regular: vec!["ix_u".to_string()],
+            create_regular: vec![
+                json!({"name": "ix_u", "key": {"a": 1}, "unique": true}),
+                // …plus an untouched non-unique sibling create.
+                json!({"name": "ix_plain", "key": {"b": 1}}),
+            ],
+            ..Default::default()
+        };
+        let doomed = preflight_doomed_unique_creates(
+            &client,
+            "PO_CANCELS",
+            "po-cancels",
+            &mut plan,
+            &test_log(),
+        )
+        .await;
+        assert_eq!(doomed, 1);
+        assert_eq!(
+            plan.create_regular,
+            vec![json!({"name": "ix_plain", "key": {"b": 1}})],
+            "only the doomed unique create is withheld"
+        );
+        assert!(
+            plan.drop_regular.is_empty(),
+            "the paired drop must be cancelled so the old index survives: {plan:?}"
+        );
+    }
+
+    /// No duplicates → the plan is untouched and the create proceeds.
+    #[tokio::test]
+    async fn preflight_passes_clean_unique_create_through() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/aggregate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": "ok", "message": "", "result": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = DataStorageClient::new(server.uri(), "tok".to_string()).unwrap();
+        let mut plan = DiffPlan {
+            create_regular: vec![json!({"name": "ix_u", "key": {"a": 1}, "unique": true})],
+            ..Default::default()
+        };
+        let doomed = preflight_doomed_unique_creates(
+            &client, "VENDORS", "vendors", &mut plan, &test_log(),
+        )
+        .await;
+        assert_eq!(doomed, 0);
+        assert_eq!(plan.create_regular.len(), 1, "clean create stays planned");
+    }
+
+    /// Aggregation unavailable (e.g. older Data Storage) → best-effort
+    /// fallback: the create stays planned for the attempt-and-verify path.
+    #[tokio::test]
+    async fn preflight_falls_back_on_aggregate_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/aggregate"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = DataStorageClient::new(server.uri(), "tok".to_string()).unwrap();
+        let mut plan = DiffPlan {
+            drop_regular: vec!["ix_u".to_string()],
+            create_regular: vec![json!({"name": "ix_u", "key": {"a": 1}, "unique": true})],
+            ..Default::default()
+        };
+        let doomed = preflight_doomed_unique_creates(
+            &client, "VENDORS", "vendors", &mut plan, &test_log(),
+        )
+        .await;
+        assert_eq!(doomed, 0);
+        assert_eq!(plan.create_regular.len(), 1);
+        assert_eq!(plan.drop_regular.len(), 1);
+    }
+
+    /// Non-unique creates never trigger an aggregation at all.
+    #[tokio::test]
+    async fn preflight_makes_no_requests_for_non_unique_creates() {
+        // No mocks mounted: any request would 404 — but a 404 only causes
+        // fallback, so additionally assert zero requests were received.
+        let server = wiremock::MockServer::start().await;
+        let client = DataStorageClient::new(server.uri(), "tok".to_string()).unwrap();
+        let mut plan = DiffPlan {
+            create_regular: vec![json!({"name": "ix_plain", "key": {"b": 1}})],
+            ..Default::default()
+        };
+        let doomed = preflight_doomed_unique_creates(
+            &client, "VENDORS", "vendors", &mut plan, &test_log(),
+        )
+        .await;
+        assert_eq!(doomed, 0);
+        assert_eq!(plan.create_regular.len(), 1);
+        assert!(
+            server.received_requests().await.unwrap_or_default().is_empty(),
+            "non-unique creates must not be preflighted"
+        );
+    }
+
+    /// End-to-end through `push_dataset`: a doomed unique create must leave
+    /// the lockfile and base cache untouched (dataset stays not-fully-applied
+    /// so the create retries once the data is deduplicated), perform ZERO
+    /// index writes, and report 0 ops. Any create/drop reaching the server
+    /// would 404 and error the push — the mocks below only answer the reads.
+    #[tokio::test]
+    async fn push_dataset_withholds_doomed_create_and_keeps_retry_armed() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/indexes/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": "ok", "message": "",
+                "result": [{ "v": 2, "name": "_id_", "key": { "_id": 1 } }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search_indexes/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": "ok", "message": "", "result": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/aggregate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": "ok", "message": "", "result": [{ "dupGroups": 2 }]
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = crate::paths::Paths::for_env(dir.path(), "test");
+        let dataset_dir = paths.dataset_dir("vendors");
+        std::fs::create_dir_all(&dataset_dir).unwrap();
+        let indexes_path = dataset_dir.join("indexes.json");
+        std::fs::write(
+            &indexes_path,
+            serde_json::to_vec_pretty(&json!({
+                "regular": [{ "key": { "id.vendorId": 1 }, "name": "ix_u", "unique": true }],
+                "search": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let client = DataStorageClient::new(server.uri(), "tok".to_string()).unwrap();
+        let mut lockfile = Lockfile::default();
+        let ops = push_dataset(
+            &client,
+            &mut lockfile,
+            "VENDORS",
+            "vendors",
+            &indexes_path,
+            &paths,
+            false,
+            false,
+            &test_log(),
+        )
+        .await
+        .expect("withholding a doomed create is not an error");
+        assert_eq!(ops, 0, "a withheld create performs no write ops");
+        assert!(
+            lockfile
+                .objects
+                .get("mdh_indexes")
+                .and_then(|m| m.get("vendors"))
+                .is_none(),
+            "lockfile must stay unrefreshed so the next sync retries the create"
+        );
+        assert!(
+            crate::state::base_cache::read(&paths, &indexes_path)
+                .unwrap()
+                .is_none(),
+            "base cache must stay unwritten so the next sync retries the create"
+        );
     }
 
     #[tokio::test]
