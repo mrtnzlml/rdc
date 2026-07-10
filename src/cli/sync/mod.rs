@@ -269,6 +269,22 @@ pub(crate) async fn run_cycle(
     // matches `push --dry-run` byte for byte.
     let (_scanned, changes, tombstones) = crate::cli::push::scan::scan(&paths, &lockfile)?;
 
+    // Surface queue-slug collisions: two queue dirs sharing a slug across
+    // workspaces collapse onto one lockfile entry, so one is re-pushed every
+    // sync forever (a silent non-idempotency). A fresh pull assigns unique
+    // slugs, so warn the user to re-pull rather than let it churn undiagnosed.
+    for (slug, wss) in crate::cli::push::scan::detect_slug_collisions(&paths) {
+        progress.event(
+            Action::Warn,
+            &format!(
+                "queue slug '{slug}' exists in {} workspaces ({}); they collide on one lockfile \
+                 entry and will re-push every sync — re-pull '{env}' to assign unique slugs",
+                wss.len(),
+                wss.join(", "),
+            ),
+        );
+    }
+
     // Phase 3: classify. The adapter re-runs each pull driver's
     // canonical hashing so the recomputed remote hashes match what the
     // lockfile recorded on last pull.

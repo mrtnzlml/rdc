@@ -935,9 +935,81 @@ fn find_engine_field_path(paths: &Paths, composite_key: &str) -> Option<std::pat
     None
 }
 
+/// Detect queue-slug collisions: the same queue directory name under more than
+/// one workspace. Queue / schema / inbox lockfile entries are keyed by this
+/// slug ALONE, so a collision collapses two distinct queues onto one lockfile
+/// entry — [`scan`]'s per-kind `BTreeMap` (keyed by slug) silently keeps one,
+/// and the other is classified as changed on every sync, pushed forever, its
+/// base clobbering the winner's (a permanent non-idempotency). A fresh pull
+/// assigns globally-unique slugs, so a collision means the on-disk snapshot
+/// predates that dedup and should be re-pulled. Returns `slug -> sorted
+/// workspace slugs` only for slugs present in more than one workspace.
+pub fn detect_slug_collisions(paths: &Paths) -> BTreeMap<String, Vec<String>> {
+    let mut by_slug: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let Ok(ws_entries) = std::fs::read_dir(paths.workspaces_dir()) else {
+        return BTreeMap::new();
+    };
+    for ws in ws_entries.flatten() {
+        if !ws.path().is_dir() {
+            continue;
+        }
+        let ws_slug = ws.file_name().to_string_lossy().to_string();
+        let Ok(q_entries) = std::fs::read_dir(paths.queues_dir(&ws_slug)) else {
+            continue;
+        };
+        for q in q_entries.flatten() {
+            // Only real queues (a queue.json present) count — partial-state
+            // dirs are not lockfile-keyed and can't collide.
+            if q.path().join("queue.json").is_file() {
+                let slug = q.file_name().to_string_lossy().to_string();
+                by_slug.entry(slug).or_default().push(ws_slug.clone());
+            }
+        }
+    }
+    by_slug.retain(|_, wss| {
+        wss.sort();
+        wss.dedup();
+        wss.len() > 1
+    });
+    by_slug
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detect_slug_collisions_finds_cross_workspace_dupes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        // Two workspaces each with a queue dir named "invoices" (collision),
+        // plus a unique "credit-memos" in one — only the collision is reported.
+        for (ws, q) in [
+            ("main", "invoices"),
+            ("phase-1", "invoices"),
+            ("main", "credit-memos"),
+        ] {
+            let qd = paths.queue_dir(ws, q);
+            std::fs::create_dir_all(&qd).unwrap();
+            std::fs::write(qd.join("queue.json"), b"{}").unwrap();
+        }
+        let cols = detect_slug_collisions(&paths);
+        assert_eq!(cols.len(), 1, "only the colliding slug is reported: {cols:?}");
+        assert_eq!(cols.get("invoices").unwrap(), &vec!["main".to_string(), "phase-1".to_string()]);
+        assert!(!cols.contains_key("credit-memos"), "unique slug must not be reported");
+    }
+
+    #[test]
+    fn detect_slug_collisions_ignores_dirs_without_queue_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        // Same slug in two workspaces, but one dir lacks queue.json (partial) →
+        // not a real queue → no collision.
+        std::fs::create_dir_all(paths.queue_dir("main", "invoices")).unwrap();
+        std::fs::write(paths.queue_dir("main", "invoices").join("queue.json"), b"{}").unwrap();
+        std::fs::create_dir_all(paths.queue_dir("phase-1", "invoices")).unwrap(); // no queue.json
+        assert!(detect_slug_collisions(&paths).is_empty());
+    }
 
     #[test]
     fn change_list_from_classified_groups_push_side_items_by_kind() {
