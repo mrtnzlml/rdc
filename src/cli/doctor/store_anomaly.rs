@@ -26,6 +26,12 @@ use anyhow::{Context, Result, anyhow};
 /// Walk the local snapshot's `hooks/` directory and return every hook
 /// with `extension_source: "rossum_store"` AND `hook_template: null`.
 /// Returns `(slug, hook)` pairs sorted by slug.
+///
+/// Hooks with `id == 0` are excluded: an id-0 hook has never been deployed to
+/// THIS env (e.g. a `migrate` output not yet `sync`ed), so there is nothing to
+/// cure here — Cure B/A act on the remote object by id, and a `PATCH /hooks/0`
+/// just 404s. It will be created correctly on the next deploy; any anomaly
+/// surfaces on the env where it actually lives.
 pub fn find_anomalies(paths: &Paths) -> Result<Vec<(String, Hook)>> {
     let hooks_dir = paths.hooks_dir();
     let mut out = Vec::new();
@@ -45,7 +51,7 @@ pub fn find_anomalies(paths: &Paths) -> Result<Vec<(String, Hook)>> {
             .unwrap_or("")
             .to_string();
         let hook = crate::snapshot::hook::read_hook(&hooks_dir, &slug)?;
-        if hook.is_store_extension() && hook.hook_template().is_none() {
+        if hook.id != 0 && hook.is_store_extension() && hook.hook_template().is_none() {
             out.push((slug, hook));
         }
     }
@@ -537,6 +543,34 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, "anomalous");
         assert_eq!(out[0].1.id, 42);
+    }
+
+    /// An anomalous store-extension hook that is NOT deployed on this env
+    /// (`id == 0`, e.g. a `migrate` output not yet `sync`ed) must be EXCLUDED —
+    /// there's no remote object to cure, and Cure A/B would `PATCH /hooks/0` and
+    /// 404. It'll be created correctly on deploy.
+    #[test]
+    fn find_anomalies_excludes_undeployed_id_zero_hooks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hooks_dir = tmp.path().join("envs/dev/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(
+            hooks_dir.join("not-deployed.json"),
+            serde_json::to_string_pretty(&json!({
+                "id": 0, "url": "", "name": "Not Deployed", "type": "webhook",
+                "queues": [], "events": [], "config": {"private": true},
+                "extension_source": "rossum_store"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        let out = find_anomalies(&paths).unwrap();
+        assert!(
+            out.is_empty(),
+            "an id-0 (undeployed) store-extension anomaly must be excluded: {out:?}"
+        );
     }
 
     #[test]
