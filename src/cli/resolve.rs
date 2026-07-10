@@ -262,16 +262,25 @@ pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
     mode: ColorMode,
     bulk: Option<&BulkPrompt>,
 ) -> Result<Resolution> {
-    // Strip noise fields before diff display so the user only sees real
-    // changes. modified_at server-churn must not appear in the resolver.
-    let local_canonical = crate::snapshot::noise::canonicalize_for_hash(
-        local_bytes,
-        &crate::state::Lockfile::default(),
-    );
-    let remote_canonical = crate::snapshot::noise::canonicalize_for_hash(
-        remote_bytes,
-        &crate::state::Lockfile::default(),
-    );
+    // Canonicalize both sides for display. Two goals: strip server-churn noise
+    // (`modified_at`) so only real changes show, AND render every reference in
+    // the SAME form. The remote arrives already portabilized to `rdc://`, while
+    // the local file — especially when it's perpetually conflicted, so the pull
+    // post-pass keeps skipping its portabilization — is still raw `https://…`.
+    // Canonicalizing both against an EMPTY lockfile left them mixed (local
+    // `https://…/webhooks/<id>` next to remote `rdc://hooks/<slug>`), burying
+    // the real change. Load the env lockfile so the local side portabilizes to
+    // match: identical refs then collapse (auto-resolving pure-representation
+    // conflicts) and the diff shows only the genuine change. Deriving it from
+    // cwd + `env` keeps this self-contained; an unloadable lockfile falls back
+    // to empty (prior behavior).
+    let lockfile = std::env::current_dir()
+        .ok()
+        .map(|cwd| crate::paths::Paths::for_env(&cwd, env))
+        .and_then(|p| crate::state::Lockfile::load(&p.lockfile()).ok())
+        .unwrap_or_default();
+    let local_canonical = crate::snapshot::noise::canonicalize_for_hash(local_bytes, &lockfile);
+    let remote_canonical = crate::snapshot::noise::canonicalize_for_hash(remote_bytes, &lockfile);
 
     if local_canonical == remote_canonical {
         return Ok(Resolution::KeepLocal);
