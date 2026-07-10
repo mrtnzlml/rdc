@@ -399,6 +399,39 @@ mod tests {
     }
 
     #[test]
+    fn canonicalize_portabilizes_hooks_and_webhooks_endpoints_via_lockfile() {
+        // With a populated lockfile, canonicalize must convert BOTH the new
+        // `/hooks/<id>` and the legacy `/webhooks/<id>` endpoint URLs to the
+        // same `rdc://hooks/<slug>` — so a queue's `hooks` and `webhooks` arrays
+        // don't render in mixed forms (the conflict-diff confusion). Both use the
+        // same hook id.
+        use crate::state::{Lockfile, ObjectEntry};
+        let mut lf = Lockfile {
+            api_base: "https://x.rossum.app/api/v1".into(),
+            ..Lockfile::default()
+        };
+        lf.upsert(
+            "hooks",
+            "validator",
+            ObjectEntry { id: 55, modified_at: None, content_hash: None, secrets_hash: None },
+        );
+        let hooks_form = br#"{"hooks":["https://x.rossum.app/api/v1/hooks/55"]}"#;
+        let webhooks_form = br#"{"webhooks":["https://x.rossum.app/api/v1/webhooks/55"]}"#;
+        let hc = canonicalize_for_hash(hooks_form, &lf);
+        let wc = canonicalize_for_hash(webhooks_form, &lf);
+        assert!(
+            String::from_utf8_lossy(&hc).contains("rdc://hooks/validator"),
+            "/hooks/<id> must portabilize: {}",
+            String::from_utf8_lossy(&hc)
+        );
+        assert!(
+            String::from_utf8_lossy(&wc).contains("rdc://hooks/validator"),
+            "/webhooks/<id> must portabilize to the SAME hook ref: {}",
+            String::from_utf8_lossy(&wc)
+        );
+    }
+
+    #[test]
     fn canonicalize_ignores_training_enabled() {
         // Rossum resets `training_enabled` to false on queue creation, so the
         // deployed value never matches the migrated source; excluding it from
