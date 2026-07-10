@@ -152,9 +152,11 @@ pub async fn run(
     allow_deletes: bool,
     no_push: bool,
     no_pull: bool,
-) -> Result<()> {
+) -> Result<CycleOutcome> {
     // One-shot wrapper. Watch mode goes through `cli::sync::watch::run_watch`.
     // Argument validation lives in `run_cycle` so watch mode benefits too.
+    // The outcome is returned so callers (and tests) can observe what the
+    // cycle actually changed.
     let cwd = std::env::current_dir().context("getting current directory")?;
     let paths = Paths::for_env(&cwd, env);
     let _lock = crate::cli::sync::lock::EnvLock::acquire(
@@ -172,8 +174,7 @@ pub async fn run(
         None,
         None,
     )
-    .await?;
-    Ok(())
+    .await
 }
 
 /// One reconciliation pass: list remote, scan local, classify, execute,

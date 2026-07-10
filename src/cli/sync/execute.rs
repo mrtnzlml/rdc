@@ -3338,7 +3338,7 @@ pub async fn run(
         {
             let env = ctx.paths.env().to_string();
             let mut relink_items: Vec<crate::cli::push::relink::DeferredRelink> = Vec::new();
-            crate::cli::push::push_classified(
+            let (_pushed, push_skipped) = crate::cli::push::push_classified(
                 ctx.paths,
                 ctx.client,
                 ctx.lockfile,
@@ -3350,6 +3350,13 @@ pub async fn run(
                 progress,
             )
             .await?;
+            // Reconcile the plan-time tally with what the drivers actually
+            // wrote: a skipped item (refused create, drift skip, adopt-remote)
+            // changed nothing on the remote, so it must not be reported as
+            // "changed". Promoted conflict items were never pre-counted, so a
+            // skip among them could over-subtract — `saturating_sub` bounds
+            // that interactive-only edge at zero.
+            outcome.items_pushed = outcome.items_pushed.saturating_sub(push_skipped);
 
             if !relink_items.is_empty() {
                 let failures = crate::cli::push::relink::run_relink(
@@ -3560,7 +3567,10 @@ pub async fn run(
                     if Some(local_hash.as_str()) == base {
                         continue;
                     }
-                    crate::cli::push::mdh::push_dataset(
+                    // MDH bypasses the classifier, so its writes are invisible
+                    // to the plan-time tally — count the actually-performed
+                    // ops here so the cycle summary reflects them.
+                    outcome.items_pushed += crate::cli::push::mdh::push_dataset(
                         &catalog.mdh.client,
                         ctx.lockfile,
                         &collection.name,
@@ -3657,10 +3667,11 @@ pub async fn run(
                             Action::Post,
                             &format!("mdh/{slug} created empty collection '{name}'"),
                         );
+                        outcome.items_pushed += 1;
                         created_local_only.push(slug);
                         continue;
                     }
-                    crate::cli::push::mdh::push_dataset(
+                    outcome.items_pushed += crate::cli::push::mdh::push_dataset(
                         &catalog.mdh.client,
                         ctx.lockfile,
                         &name,

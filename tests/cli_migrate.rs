@@ -210,23 +210,30 @@ fn migrate_dry_run_writes_nothing() {
 
 /// A stale mapping entry (its source object doesn't exist on disk) must NOT
 /// abort migrate. It's a dead mapping — nothing to migrate for it — so migrate
-/// ignores it (warns) and proceeds to migrate the real objects. This keeps
-/// recovery unblocked after a `doctor --rebuild-lock` reassigns slugs, which
-/// leaves every pre-rebuild mapping entry "stale".
+/// PRUNES it from the persisted mapping file (self-healing; no recurring
+/// warning) and proceeds to migrate the real objects. This keeps recovery
+/// unblocked after a `doctor --rebuild-lock` reassigns slugs, which leaves
+/// every pre-rebuild mapping entry "stale".
 #[test]
-fn migrate_ignores_stale_mapping_source() {
+fn migrate_prunes_stale_mapping_source() {
     let project = init_two_env_project();
     let root = project.path();
     write(
         &root.join("envs/test/hooks/extractor.json"),
         &serde_json::json!({ "name": "Extractor" }),
     );
+    // A live hand-curated entry for a real source object must SURVIVE the
+    // prune (only dead entries go).
+    write(
+        &root.join("envs/test/hooks/renamer.json"),
+        &serde_json::json!({ "name": "Renamer" }),
+    );
 
     let map_dir = root.join(".rdc/map");
     std::fs::create_dir_all(&map_dir).unwrap();
     std::fs::write(
         map_dir.join("test-to-prod.toml"),
-        "version = 1\n\n[hooks]\n\"ghost\" = \"ghost-prod\"\n",
+        "version = 1\n\n[hooks]\n\"ghost\" = \"ghost-prod\"\n\"renamer\" = \"renamer-prod\"\n",
     )
     .unwrap();
 
@@ -246,6 +253,47 @@ fn migrate_ignores_stale_mapping_source() {
     assert!(
         !root.join("envs/prod/hooks/ghost.json").exists(),
         "a dead mapping entry must not fabricate a target object"
+    );
+    // The stale entry is PRUNED from the persisted mapping file so it never
+    // warns again; the live hand-curated rename survives.
+    let map_after = std::fs::read_to_string(map_dir.join("test-to-prod.toml")).unwrap();
+    assert!(
+        !map_after.contains("ghost"),
+        "stale mapping entry must be pruned from the mapping file: {map_after}"
+    );
+    assert!(
+        map_after.contains("renamer = \"renamer-prod\""),
+        "live hand-curated mapping entry must survive the prune: {map_after}"
+    );
+}
+
+/// `--dry-run` must not rewrite the mapping file — the stale entry stays
+/// until a real (writing) migrate prunes it.
+#[test]
+fn migrate_dry_run_does_not_prune_mapping_file() {
+    let project = init_two_env_project();
+    let root = project.path();
+    write(
+        &root.join("envs/test/hooks/extractor.json"),
+        &serde_json::json!({ "name": "Extractor" }),
+    );
+
+    let map_dir = root.join(".rdc/map");
+    std::fs::create_dir_all(&map_dir).unwrap();
+    let map_body = "version = 1\n\n[hooks]\n\"ghost\" = \"ghost-prod\"\n";
+    std::fs::write(map_dir.join("test-to-prod.toml"), map_body).unwrap();
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", false, true, vec![], true);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("dry-run migrate should succeed");
+
+    let map_after = std::fs::read_to_string(map_dir.join("test-to-prod.toml")).unwrap();
+    assert_eq!(
+        map_after, map_body,
+        "dry-run must leave the mapping file byte-identical"
     );
 }
 
@@ -921,5 +969,173 @@ fn migrate_overlay_shadow_replaces_nodejs_hook_js_sidecar() {
         std::fs::read_to_string(root.join("envs/prod/hooks/webhook.js")).unwrap(),
         "// prod\n",
         "the .js hook sidecar shadow must be applied"
+    );
+}
+
+// --- un-creatable duplicate unique-typed email templates ------------------
+//
+// The Rossum API enforces per-queue uniqueness for certain email-template
+// types (`rejection_default`, `email_with_no_processable_attachments`): a
+// queue can hold at most ONE template of such a type, and creating a second
+// returns `400 Cannot create template with unique type: <type>`. A source env
+// can still carry historical duplicates (created server-side before the
+// constraint). Mirroring those into a target snapshot plants files that
+// `rdc sync` will POST → 400 → warn on EVERY run, forever. Migrate must
+// instead keep only the copies the target can actually hold.
+
+/// Helper: write a minimal email template into `envs/<env>/workspaces/main/
+/// queues/invoices/email-templates/<slug>.json`.
+fn write_template(root: &std::path::Path, env: &str, slug: &str, id: u64, ty: &str) {
+    write(
+        &root.join(format!(
+            "envs/{env}/workspaces/main/queues/invoices/email-templates/{slug}.json"
+        )),
+        &serde_json::json!({
+            "id": id,
+            "name": "Default rejection template",
+            "type": ty,
+            "queue": "rdc://queues/invoices",
+            "url": format!("rdc://email_templates/main/invoices/{slug}"),
+        }),
+    );
+}
+
+/// Helper: write a target-env lockfile granting remote identity to the given
+/// email-template compound keys (`<ws>/<q>/<slug>`).
+fn write_tgt_lockfile(root: &std::path::Path, env: &str, keys: &[&str]) {
+    let mut templates = serde_json::Map::new();
+    for (i, key) in keys.iter().enumerate() {
+        templates.insert(
+            key.to_string(),
+            serde_json::json!({"id": 500 + i as u64, "modified_at": null, "content_hash": "x"}),
+        );
+    }
+    let lf = serde_json::json!({
+        "version": 3,
+        "api_base": "https://prod.example/api/v1",
+        "objects": { "email_templates": templates },
+    });
+    write(&root.join(format!(".rdc/state/{env}.lock.json")), &lf);
+}
+
+/// Source queue holds TWO `rejection_default` templates (a historical
+/// duplicate); the target only has remote identity for the first. The second
+/// is un-creatable on the target (unique type) → migrate must NOT produce it,
+/// and `--mirror` must prune a stale copy left by an earlier migrate.
+#[test]
+fn migrate_mirror_skips_second_unique_typed_template_per_queue() {
+    let project = init_two_env_project();
+    let root = project.path();
+
+    write_template(root, "test", "default-rejection-template", 100, "rejection_default");
+    write_template(root, "test", "default-rejection-template-2", 200, "rejection_default");
+    // Target lockfile: only the plain slug exists remotely on prod.
+    write_tgt_lockfile(root, "prod", &["main/invoices/default-rejection-template"]);
+    // Stale copy of the duplicate from an earlier (pre-fix) migrate.
+    write_template(root, "prod", "default-rejection-template-2", 0, "rejection_default");
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", true, false, vec![], true);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("migrate --mirror should succeed");
+
+    assert!(
+        root.join("envs/prod/workspaces/main/queues/invoices/email-templates/default-rejection-template.json").exists(),
+        "the identity-backed template must be migrated"
+    );
+    assert!(
+        !root.join("envs/prod/workspaces/main/queues/invoices/email-templates/default-rejection-template-2.json").exists(),
+        "the un-creatable duplicate must be skipped and its stale copy pruned"
+    );
+}
+
+/// When the target holds BOTH duplicates remotely (its own historical pair),
+/// both are patchable — migrate must keep mirroring both.
+#[test]
+fn migrate_keeps_unique_typed_duplicates_that_exist_on_target() {
+    let project = init_two_env_project();
+    let root = project.path();
+
+    write_template(root, "test", "default-rejection-template", 100, "rejection_default");
+    write_template(root, "test", "default-rejection-template-2", 200, "rejection_default");
+    write_tgt_lockfile(
+        root,
+        "prod",
+        &[
+            "main/invoices/default-rejection-template",
+            "main/invoices/default-rejection-template-2",
+        ],
+    );
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", true, false, vec![], true);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("migrate --mirror should succeed");
+
+    assert!(
+        root.join("envs/prod/workspaces/main/queues/invoices/email-templates/default-rejection-template.json").exists()
+    );
+    assert!(
+        root.join("envs/prod/workspaces/main/queues/invoices/email-templates/default-rejection-template-2.json").exists(),
+        "a duplicate the target actually holds (lockfile identity) must keep mirroring"
+    );
+}
+
+/// Fresh target (no lockfile identity for either): exactly ONE of the
+/// duplicates is creatable — keep the lowest source id, deterministically.
+#[test]
+fn migrate_keeps_lowest_id_unique_typed_duplicate_on_fresh_target() {
+    let project = init_two_env_project();
+    let root = project.path();
+
+    // The `-2` slug carries the LOWER id: the keep-rule is id-based, not
+    // slug-suffix-based.
+    write_template(root, "test", "default-rejection-template", 200, "rejection_default");
+    write_template(root, "test", "default-rejection-template-2", 100, "rejection_default");
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", true, false, vec![], true);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("migrate --mirror should succeed");
+
+    assert!(
+        root.join("envs/prod/workspaces/main/queues/invoices/email-templates/default-rejection-template-2.json").exists(),
+        "the lowest-id duplicate must be kept"
+    );
+    assert!(
+        !root.join("envs/prod/workspaces/main/queues/invoices/email-templates/default-rejection-template.json").exists(),
+        "the higher-id duplicate must be skipped (only one is creatable)"
+    );
+}
+
+/// Non-unique types (e.g. `custom`) may repeat on a queue — duplicates of
+/// those must migrate untouched.
+#[test]
+fn migrate_leaves_custom_type_duplicates_alone() {
+    let project = init_two_env_project();
+    let root = project.path();
+
+    write_template(root, "test", "status-change", 100, "custom");
+    write_template(root, "test", "status-change-2", 200, "custom");
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", true, false, vec![], true);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("migrate --mirror should succeed");
+
+    assert!(
+        root.join("envs/prod/workspaces/main/queues/invoices/email-templates/status-change.json").exists()
+    );
+    assert!(
+        root.join("envs/prod/workspaces/main/queues/invoices/email-templates/status-change-2.json").exists(),
+        "custom-type duplicates are creatable and must both migrate"
     );
 }

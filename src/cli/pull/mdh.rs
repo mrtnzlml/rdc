@@ -356,17 +356,33 @@ pub async fn process(
             if i_action == PullAction::Conflict {
                 conflicts += 1;
             }
-            let i_recorded = apply_pull_action(
-                i_action,
-                &ix_path,
-                &ix_proposed,
-                i_remote_hash,
-                ctx.interactive,
-                progress,
-                ctx.paths.env(),
-                ix_base.as_deref(),
-                Some(ctx.paths),
-            )?;
+            // KeepLocal — the local file diverged, remote is unchanged from
+            // base. Because MDH bypasses the classifier, this pull runs on
+            // EVERY cycle right AFTER the push; landing here means the push
+            // did NOT reconcile local → remote this cycle (an index create
+            // that never materialized, `--no-push`, or a gated delete skip).
+            // The local edit is therefore still PENDING. The generic
+            // `apply_pull_action` would advance base to the LOCAL content —
+            // which starves the next cycle's push gate (`local_hash == base`)
+            // and makes the cycle after REVERT the file (period-2 churn).
+            // Preserve the prior base instead: the push retries every cycle
+            // until it actually reconciles (e.g. the user deduplicates the
+            // data violating a unique index and the create finally builds).
+            let i_recorded = if i_action == PullAction::KeepLocal {
+                ix_base.clone().unwrap_or(i_remote_hash)
+            } else {
+                apply_pull_action(
+                    i_action,
+                    &ix_path,
+                    &ix_proposed,
+                    i_remote_hash,
+                    ctx.interactive,
+                    progress,
+                    ctx.paths.env(),
+                    ix_base.as_deref(),
+                    Some(ctx.paths),
+                )?
+            };
             record_object(ctx.lockfile, "mdh_indexes", slug, 0, None, Some(i_recorded));
             Ok(())
         })();

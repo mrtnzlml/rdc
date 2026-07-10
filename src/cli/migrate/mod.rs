@@ -932,17 +932,22 @@ fn should_skip(name: &str, env: &str) -> bool {
 /// Plan a `--mirror` prune: target-env relative paths that would NOT be
 /// produced by migrating the source snapshot. These are tgt-only objects the
 /// user must delete to make tgt mirror src exactly. The returned paths are
-/// relative to the *target* env root.
+/// relative to the *target* env root. `skip` holds source-relative paths the
+/// migration refuses to produce (un-creatable unique-typed email-template
+/// duplicates) — their target counterparts count as NOT produced, so a stale
+/// copy left by an earlier migrate gets pruned.
 fn mirror_prune_paths(
     src_root: &Path,
     src_env: &str,
     tgt_root: &Path,
     tgt_env: &str,
     mapping: &Mapping,
+    skip: &std::collections::BTreeSet<PathBuf>,
 ) -> Result<Vec<PathBuf>> {
     use std::collections::BTreeSet;
     let produced: BTreeSet<PathBuf> = enumerate_files(src_root, src_env)?
         .into_iter()
+        .filter(|rel| !skip.contains(rel))
         .map(|rel| remap_relative(&rel, mapping))
         .collect();
     let existing = enumerate_files(tgt_root, tgt_env)?;
@@ -950,6 +955,112 @@ fn mirror_prune_paths(
         .into_iter()
         .filter(|rel| !produced.contains(rel))
         .collect())
+}
+
+/// Email-template `type`s the Rossum API enforces as ONE-per-queue. Creating
+/// a second template of such a type on a queue fails with `400 Cannot create
+/// template with unique type: <type>`. (Historical duplicates can still exist
+/// server-side — created before the constraint — which is exactly what makes
+/// a source snapshot carry them.)
+const UNIQUE_EMAIL_TEMPLATE_TYPES: [&str; 2] =
+    ["rejection_default", "email_with_no_processable_attachments"];
+
+/// Source-relative email-template paths that `migrate` must NOT produce:
+/// members of a (target queue, unique type) group of size > 1 that the target
+/// cannot hold. Per group: keep every member whose migrated slug has a REAL
+/// remote identity in the target lockfile (it exists on the target env —
+/// patchable); when none has one, keep the single lowest-source-id member
+/// (exactly one fresh create is admissible; the choice is deterministic).
+/// Everything else in the group is skipped. Groups of size 1 and non-unique
+/// types (e.g. `custom`) are never touched.
+fn unique_template_skips(
+    files: &[PathBuf],
+    src_root: &Path,
+    mapping: &Mapping,
+    tgt_lockfile: &crate::state::Lockfile,
+) -> std::collections::BTreeSet<PathBuf> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// One template in a (target queue, unique type) group:
+    /// (source rel path, target lockfile key, source id).
+    type Member = (PathBuf, String, u64);
+    let mut groups: BTreeMap<(PathBuf, String), Vec<Member>> = BTreeMap::new();
+    for rel in files {
+        let comps: Vec<String> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        // workspaces/<ws>/queues/<q>/email-templates/<t>.json
+        let is_template = comps.len() == 6
+            && comps[0] == "workspaces"
+            && comps[2] == "queues"
+            && comps[4] == "email-templates"
+            && comps[5].ends_with(".json");
+        if !is_template {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(src_root.join(rel)) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(ty) = v.get("type").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        if !UNIQUE_EMAIL_TEMPLATE_TYPES.contains(&ty) {
+            continue;
+        }
+        let dst = remap_relative(rel, mapping);
+        let dst_comps: Vec<String> = dst
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        if dst_comps.len() != 6 {
+            continue;
+        }
+        let stem = dst_comps[5].trim_end_matches(".json");
+        let lockfile_key = format!("{}/{}/{stem}", dst_comps[1], dst_comps[3]);
+        let id = v.get("id").and_then(|i| i.as_u64()).unwrap_or(0);
+        groups
+            .entry((dst.parent().expect("template path has a parent").to_path_buf(), ty.to_string()))
+            .or_default()
+            .push((rel.clone(), lockfile_key, id));
+    }
+
+    let mut skips: BTreeSet<PathBuf> = BTreeSet::new();
+    for ((_queue_dir, _ty), mut members) in groups {
+        if members.len() < 2 {
+            continue;
+        }
+        let backed: Vec<bool> = members
+            .iter()
+            .map(|(_, key, _)| {
+                tgt_lockfile
+                    .objects
+                    .get("email_templates")
+                    .and_then(|m| m.get(key))
+                    .map(|e| e.id != 0)
+                    .unwrap_or(false)
+            })
+            .collect();
+        if backed.iter().any(|b| *b) {
+            // The target already holds these — keep exactly those, skip the
+            // rest (no fresh create can succeed while the type is occupied).
+            for (i, (rel, _, _)) in members.iter().enumerate() {
+                if !backed[i] {
+                    skips.insert(rel.clone());
+                }
+            }
+        } else {
+            // Fresh target: exactly one create is admissible — lowest id wins.
+            members.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+            for (rel, _, _) in members.into_iter().skip(1) {
+                skips.insert(rel);
+            }
+        }
+    }
+    skips
 }
 
 /// `rdc migrate <src> <tgt>` — pure-local snapshot→snapshot transform.
@@ -992,26 +1103,32 @@ pub fn run(
 
     let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
 
-    // Mapping: load, auto-match same-slug pairs, warn on any stale entries, persist.
+    // Mapping: load, auto-match same-slug pairs, prune stale entries, persist.
     let mapping_file = src_paths.mapping_file(src, tgt);
     let mut mapping = Mapping::load(&mapping_file)?;
     let added = crate::cli::deploy::map::auto_match(&mut mapping, &src_paths, &tgt_paths)?;
     // Stale mapping entries (source slug no longer exists — e.g. a leftover
-    // after `doctor --rebuild-lock` reassigned slugs) are DEAD: there's nothing
-    // to migrate for them, and a renamed object auto-matches by its new slug.
-    // Warn and ignore rather than hard-fail, so a rebuild doesn't block migrate.
-    // The file is left as-is (the user tidies it when convenient); the apply
-    // loops simply never consult an entry whose source object is absent.
+    // after `doctor --rebuild-lock` reassigned slugs, or the source object was
+    // deleted) are DEAD: there's nothing to migrate for them, and a renamed
+    // object auto-matches by its new slug. Prune them from the persisted file
+    // (self-healing — a dead entry would otherwise resurface on every run)
+    // rather than hard-fail, so a rebuild doesn't block migrate.
     let stale = crate::cli::deploy::map::stale_mapping_sources(&mapping, &src_paths)?;
     if !stale.is_empty() {
+        crate::cli::deploy::map::prune_stale_sources(&mut mapping, &stale);
+        let listing: Vec<String> = stale
+            .iter()
+            .map(|(kind, s, t)| format!("  {kind}/{s} -> {t}"))
+            .collect();
         log.event(
-            crate::log::Action::Warn,
+            crate::log::Action::Info,
             &format!(
-                "ignoring {} stale mapping entr{} in {} (source object no longer exists in '{src}'):\n{}",
+                "{} {} stale mapping entr{} from {} (source object no longer exists in '{src}'):\n{}",
+                if dry_run { "would prune" } else { "pruned" },
                 stale.len(),
                 if stale.len() == 1 { "y" } else { "ies" },
                 mapping_file.display(),
-                stale.join("\n"),
+                listing.join("\n"),
             ),
         );
     }
@@ -1052,6 +1169,31 @@ pub fn run(
 
     let files = enumerate_files(&src_root, src)?;
 
+    // Un-creatable duplicate unique-typed email templates: when the SOURCE
+    // queue holds more than one template of a per-queue-unique type, the
+    // target can only hold the copies it already has (plus at most one fresh
+    // create) — the Rossum API refuses the rest with `400 Cannot create
+    // template with unique type`. Producing them would make every subsequent
+    // `rdc sync <tgt>` retry the doomed POST forever. Skip them here instead
+    // (and let `--mirror` prune stale copies of them from the target tree).
+    let tgt_lockfile = crate::state::Lockfile::load(&tgt_paths.lockfile()).unwrap_or_default();
+    let unique_tpl_skips = unique_template_skips(&files, &src_root, &mapping, &tgt_lockfile);
+    if !unique_tpl_skips.is_empty() {
+        let listing: Vec<String> = unique_tpl_skips
+            .iter()
+            .map(|p| format!("  {}", p.display()))
+            .collect();
+        log.event(
+            crate::log::Action::Info,
+            &format!(
+                "skipping {} email template(s) un-creatable on '{tgt}' (another template of \
+                 the same unique type already occupies the target queue):\n{}",
+                unique_tpl_skips.len(),
+                listing.join("\n"),
+            ),
+        );
+    }
+
     // Validate the target env's `overlay/` shadow dir before writing anything:
     // every shadow must mirror a sidecar this migration produces. Built from the
     // FULL source enumeration (not the `--only` subset), so scoping with `--only`
@@ -1067,6 +1209,10 @@ pub fn run(
     let mut renamed = 0usize;
 
     for rel in &files {
+        // Un-creatable duplicate unique-typed email templates (see above).
+        if unique_tpl_skips.contains(rel) {
+            continue;
+        }
         // `--only`: keep a file only when its classified (kind, slug) is in the
         // selection. Files with no classifiable object (workflows, mdh) are
         // skipped under an active selection — the user narrowed scope.
@@ -1107,7 +1253,8 @@ pub fn run(
     // `--mirror`: prune target-only objects.
     let mut pruned = 0usize;
     if mirror {
-        let prune = mirror_prune_paths(&src_root, src, &tgt_root, tgt, &mapping)?;
+        let prune =
+            mirror_prune_paths(&src_root, src, &tgt_root, tgt, &mapping, &unique_tpl_skips)?;
         for rel in &prune {
             pruned += 1;
             if dry_run {
