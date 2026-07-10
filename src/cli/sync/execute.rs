@@ -3612,13 +3612,28 @@ pub async fn run(
                         continue;
                     };
                     // Nothing to create when there are no index definitions —
-                    // rdc never creates an empty collection on its own.
+                    // rdc never creates an empty collection on its own (the Data
+                    // Storage API materializes a collection only through its
+                    // indexes or its row data, and rdc manages the index schema,
+                    // not the data). Surface the skip so a source data-only
+                    // collection that never appears on the target isn't a silent
+                    // mystery — the user's "I don't see all collections" case.
                     let local_bytes = match std::fs::read(&indexes_path) {
                         Ok(b) => b,
                         Err(_) => continue,
                     };
                     match serde_json::from_slice::<crate::model::IndexSet>(&local_bytes) {
-                        Ok(s) if s.regular.is_empty() && s.search.is_empty() => continue,
+                        Ok(s) if s.regular.is_empty() && s.search.is_empty() => {
+                            progress.event(
+                                Action::Skip,
+                                &format!(
+                                    "mdh/{slug} (no index definitions — a data-only collection \
+                                     isn't created on the target; rdc deploys MDH index schemas, \
+                                     not row data)"
+                                ),
+                            );
+                            continue;
+                        }
                         Ok(_) => {}
                         Err(_) => continue, // malformed → the pull path surfaces it
                     }
