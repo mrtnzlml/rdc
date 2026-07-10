@@ -3501,17 +3501,24 @@ pub async fn run(
             )
             .await?;
         }
-        // MDH dispatch — runs unconditionally for every server-listed
-        // collection (classifier bypass; see catalog setup in
-        // `sync::run_cycle`). Two stages:
+        // MDH dispatch — gated on `available` (MDH provisioned on this env;
+        // a 404 yields `available == false`, so we never touch a cluster
+        // without Data Storage). Enters even at zero collections so a
+        // fresh-but-enabled env still gets its local datasets created.
+        // Classifier bypass; see catalog setup in `sync::run_cycle`. Stages
+        // (1–2 under `!no_push`; 3 always; 4 under a non-empty listing):
         //
-        // 1. Push: for any dataset whose local indexes.json has drifted
-        //    from the lockfile baseline, dispatch the push driver to
-        //    drop+create the delta on the server. Gated on `!no_push`
-        //    so audit mode (`--no-push`) stays read-only.
-        // 2. Pull: idempotent re-read of the now-aligned remote.
-        //    Per-file `decide_pull_action` keeps disk bytes stable.
-        if !catalog.mdh.collections.is_empty() {
+        // 1. Drift push: existing collections whose local indexes.json
+        //    drifted from the lockfile baseline → drop+create the delta.
+        // 2. Create: brand-new local datasets whose collection is absent on
+        //    this env and that were never synced (no lockfile entry) →
+        //    create the collection + its indexes. Strictly additive: an
+        //    existing collection is never touched by this stage.
+        // 3. Pull: idempotent re-read of the now-aligned remote.
+        // 4. Orphan prune: previously-synced datasets whose collection was
+        //    deleted remotely. Kept gated on a NON-EMPTY listing so a
+        //    transient empty/404 can never mass-delete every local dataset.
+        if catalog.mdh.available {
             use std::collections::HashSet as HashSetForSlugs;
             let mut slug_to_collection: BTreeMap<String, &crate::model::Collection> =
                 BTreeMap::new();
@@ -3522,7 +3529,15 @@ pub async fn run(
                 slug_to_collection.insert(slug, c);
             }
 
+            // Slugs whose collection this cycle's stage 2 just created. They
+            // now exist remotely, but `catalog.mdh.collections` is the stale
+            // pre-create listing, so stage 4 must be told about them —
+            // otherwise it would false-orphan the dataset we just created
+            // (its fresh lockfile entry would look absent from the server).
+            let mut created_local_only: Vec<String> = Vec::new();
+
             if !no_push {
+                // Stage 1: existing collections — index drift push.
                 for (slug, collection) in &slug_to_collection {
                     let indexes_path = ctx.paths.dataset_dir(slug).join("indexes.json");
                     if !indexes_path.exists() {
@@ -3559,8 +3574,74 @@ pub async fn run(
                     .await
                     .with_context(|| format!("pushing local index edits for mdh/{slug}"))?;
                 }
+
+                // Stage 2: create collections absent on this env yet.
+                let remote_slugs: BTreeSet<String> =
+                    slug_to_collection.keys().cloned().collect();
+                for slug in crate::cli::pull::mdh::local_only_dataset_slugs(
+                    &ctx.paths.mdh_dir(),
+                    &remote_slugs,
+                ) {
+                    // A local-only dataset that was synced before (has a
+                    // lockfile entry) is an orphan, not a new dataset — leave
+                    // it to stage 4's prune.
+                    if ctx
+                        .lockfile
+                        .objects
+                        .get("mdh_indexes")
+                        .and_then(|m| m.get(&slug))
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    let dataset_dir = ctx.paths.dataset_dir(&slug);
+                    let indexes_path = dataset_dir.join("indexes.json");
+                    // Need the real collection name to create it — the slug
+                    // is lossy and cannot recover it.
+                    let Some(name) = crate::cli::pull::mdh::read_collection_name(&dataset_dir)
+                    else {
+                        progress.event(
+                            Action::Warn,
+                            &format!(
+                                "mdh/{slug}: no collection name recorded ({}); cannot create \
+                                 its collection on this env. Re-pull the source env with a \
+                                 current rdc to record the name, then re-run.",
+                                crate::cli::pull::mdh::COLLECTION_MANIFEST
+                            ),
+                        );
+                        continue;
+                    };
+                    // Nothing to create when there are no index definitions —
+                    // rdc never creates an empty collection on its own.
+                    let local_bytes = match std::fs::read(&indexes_path) {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    };
+                    match serde_json::from_slice::<crate::model::IndexSet>(&local_bytes) {
+                        Ok(s) if s.regular.is_empty() && s.search.is_empty() => continue,
+                        Ok(_) => {}
+                        Err(_) => continue, // malformed → the pull path surfaces it
+                    }
+                    crate::cli::push::mdh::push_dataset(
+                        &catalog.mdh.client,
+                        ctx.lockfile,
+                        &name,
+                        &slug,
+                        &indexes_path,
+                        ctx.paths,
+                        allow_deletes,
+                        ctx.interactive,
+                        progress,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("creating mdh collection + indexes for mdh/{slug}")
+                    })?;
+                    created_local_only.push(slug);
+                }
             }
 
+            // Stage 3: pull-back (no-op when there are no collections).
             let mut subset: BTreeSet<(String, String)> = BTreeSet::new();
             for slug in slug_to_collection.keys() {
                 subset.insert(("mdh".to_string(), slug.clone()));
@@ -3568,25 +3649,27 @@ pub async fn run(
             let listed = crate::cli::pull::mdh::MdhListed {
                 client: catalog.mdh.client.clone(),
                 collections: catalog.mdh.collections.clone(),
+                available: catalog.mdh.available,
             };
             crate::cli::pull::mdh::process(ctx, listed, &subset, progress).await?;
 
-            // Reconcile datasets the env no longer lists: an `mdh_indexes`
-            // lockfile slug absent from the server's collection set is an
-            // orphan (its collection was deleted on the env). MDH bypasses
-            // the classifier, so without this the dataset would persist on
-            // disk forever. Guarded by the non-empty-collections gate above,
-            // so a transient empty / 404 listing (MDH disabled) can never
-            // mass-delete every local dataset.
-            let remote_slugs: BTreeSet<String> = slug_to_collection.keys().cloned().collect();
-            outcome.remote_deletes_resolved += prune_mdh_orphans(
-                ctx,
-                &remote_slugs,
-                CoordinatorStdin::new(),
-                interactive,
-                progress,
-            )
-            .await?;
+            // Stage 4: orphan prune. Gated on a NON-EMPTY remote listing so a
+            // transient empty/404 (MDH disabled) can never mass-delete every
+            // local dataset. Include stage-2 creations so the prune doesn't
+            // false-orphan the datasets we just created.
+            if !slug_to_collection.is_empty() {
+                let mut remote_slugs: BTreeSet<String> =
+                    slug_to_collection.keys().cloned().collect();
+                remote_slugs.extend(created_local_only);
+                outcome.remote_deletes_resolved += prune_mdh_orphans(
+                    ctx,
+                    &remote_slugs,
+                    CoordinatorStdin::new(),
+                    interactive,
+                    progress,
+                )
+                .await?;
+            }
         }
 
         // Post-pass: rewrite portable-kind URLs in every snapshotted file to
@@ -3660,6 +3743,7 @@ mod tests {
                 )
                 .unwrap(),
                 collections: vec![],
+                available: false,
             },
         }
     }

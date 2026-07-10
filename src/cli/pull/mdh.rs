@@ -12,6 +12,62 @@ use std::sync::Arc;
 
 const KIND: &str = "mdh";
 
+/// Per-dataset manifest filename. Persists the MDH collection's server
+/// `name` — the single identity field that is NOT recoverable from the
+/// on-disk dataset slug (`slugify` is lossy, e.g. `PO_CANCELS` and
+/// `po cancels` both slug to `po-cancels`). Required to (re)create a
+/// collection on an env that does not have it yet.
+pub(crate) const COLLECTION_MANIFEST: &str = "collection.json";
+
+/// Canonical on-disk bytes for a collection manifest: pretty JSON with a
+/// trailing newline, matching every other snapshot file.
+pub(crate) fn collection_manifest_bytes(name: &str) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec_pretty(&serde_json::json!({ "name": name }))
+        .expect("serializing collection manifest (a single-key object never fails)");
+    bytes.push(b'\n');
+    bytes
+}
+
+/// Read a dataset's collection name from its manifest. Returns `None` when
+/// the manifest is absent (a legacy dataset predating the manifest) or
+/// unparseable — never panics; the caller warns and skips.
+pub(crate) fn read_collection_name(dataset_dir: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(dataset_dir.join(COLLECTION_MANIFEST)).ok()?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    value.get("name")?.as_str().map(str::to_owned)
+}
+
+/// Local dataset slugs that have an `indexes.json` on disk but whose slug is
+/// NOT in `remote_slugs` (their collection is absent on the env). These are
+/// the datasets a deploy may need to create. Slugs present in `remote_slugs`
+/// are handled by the remote-driven path and deliberately excluded here, so
+/// this never touches an existing collection. Sorted for deterministic order.
+pub(crate) fn local_only_dataset_slugs(
+    mdh_dir: &std::path::Path,
+    remote_slugs: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(mdh_dir) else {
+        return out; // no local mdh dir → nothing to create
+    };
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let Some(slug) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if remote_slugs.contains(&slug) {
+            continue; // handled by the remote-driven path; never touched here
+        }
+        if entry.path().join("indexes.json").is_file() {
+            out.push(slug);
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Strip server-only fields from an index set so the user only sees /
 /// round-trips the fields they can actually edit. Two flavors:
 ///
@@ -83,6 +139,14 @@ fn normalize_search_index(remote: &Value) -> Option<Value> {
 pub struct MdhListed {
     pub client: DataStorageClient,
     pub collections: Vec<Collection>,
+    /// Whether MDH is provisioned on this env. `true` when the collection
+    /// listing succeeded (even with zero collections); `false` when the
+    /// Data Storage endpoint 404s (MDH not enabled on the cluster). A 404
+    /// and a genuinely-empty listing both yield `collections == []`, so this
+    /// flag is the only way to tell them apart — the deploy uses it to gate
+    /// collection creation (create on a fresh-but-enabled env; never attempt
+    /// it against a cluster without MDH).
+    pub available: bool,
 }
 
 /// Phase 1: list MDH collections (or return an empty list if MDH is not
@@ -92,11 +156,13 @@ pub async fn list(env_cfg: &EnvConfig, token: &str, progress: &Arc<Log>) -> Resu
     let client = DataStorageClient::new(base, token.to_string())
         .context("constructing Data Storage client")?;
 
-    let collections = match client.list_collections(Some(progress.clone())).await {
-        Ok(c) => c,
+    let (collections, available) = match client.list_collections(Some(progress.clone())).await {
+        Ok(c) => (c, true),
         Err(e) if anyhow_has_status(&e, 404) => {
-            // MDH not enabled on this cluster — quietly skip.
-            Vec::new()
+            // MDH not enabled on this cluster — quietly skip. `available:
+            // false` keeps the deploy from attempting collection creation
+            // against a cluster that has no Data Storage service.
+            (Vec::new(), false)
         }
         Err(e) => return Err(e.context("listing MDH collections")),
     };
@@ -104,6 +170,7 @@ pub async fn list(env_cfg: &EnvConfig, token: &str, progress: &Arc<Log>) -> Resu
     Ok(MdhListed {
         client,
         collections,
+        available,
     })
 }
 
@@ -126,6 +193,7 @@ pub async fn process(
     let MdhListed {
         client,
         collections,
+        available: _,
     } = listed;
 
     if collections.is_empty() {
@@ -137,12 +205,11 @@ pub async fn process(
 
     let mut dir_created = false;
 
-    // === Sub-phase A: assign slugs, ensure dataset_dir exists, and run the
-    //            one-shot migration for projects that pre-date the
-    //            collection.json removal (delete the stale file, drop the
-    //            redundant `mdh_collections` lockfile entry). The
-    //            indexes.json write itself happens in sub-phase C after
-    //            the parallel fetches.
+    // === Sub-phase A: assign slugs, ensure dataset_dir exists, and persist
+    //            each collection's `name` manifest (the one identity field
+    //            the slug cannot recover). Also drops the redundant legacy
+    //            `mdh_collections` lockfile entry. The indexes.json write
+    //            itself happens in sub-phase C after the parallel fetches.
     let mut dataset_dirs: Vec<(String, std::path::PathBuf, Collection)> = Vec::new();
     for c in collections {
         let slug = slugify_unique(&c.name, &used);
@@ -162,21 +229,24 @@ pub async fn process(
         std::fs::create_dir_all(&dataset_dir)
             .with_context(|| format!("creating {}", dataset_dir.display()))?;
 
-        // Migration: pre-2.x projects carry a `collection.json` next to
-        // `indexes.json` plus an `mdh_collections.<slug>` lockfile entry.
-        // The collection metadata is entirely server-managed (uuid,
-        // options, idIndex) and offers no user-editable surface, so we
-        // drop it. Cleanup is idempotent: subsequent syncs find nothing
-        // to remove and stay quiet.
-        let legacy_coll_path = dataset_dir.join("collection.json");
-        if legacy_coll_path.exists() {
-            std::fs::remove_file(&legacy_coll_path)
-                .with_context(|| format!("removing legacy {}", legacy_coll_path.display()))?;
-            progress.event(
-                Action::Info,
-                &format!("migrated mdh/{slug}: removed obsolete collection.json"),
-            );
+        // Persist the collection's server `name` to a minimal manifest.
+        // `slugify` is lossy, so the slug cannot recover the name; a deploy
+        // to an env that lacks the collection needs it to (re)create the
+        // collection. Written deterministically (server-authoritative
+        // identity) — idempotent, and it also overwrites any legacy
+        // full-metadata `collection.json` a pre-manifest project carried.
+        let manifest_path = dataset_dir.join(COLLECTION_MANIFEST);
+        let manifest_bytes = collection_manifest_bytes(&c.name);
+        let needs_write = std::fs::read(&manifest_path)
+            .map(|existing| existing != manifest_bytes)
+            .unwrap_or(true);
+        if needs_write {
+            std::fs::write(&manifest_path, &manifest_bytes)
+                .with_context(|| format!("writing {}", manifest_path.display()))?;
         }
+        // Legacy: pre-manifest projects also carry a redundant
+        // `mdh_collections.<slug>` lockfile entry. Drop it — the on-disk
+        // manifest is the source of truth for the collection name now.
         if let Some(map) = ctx.lockfile.objects.get_mut("mdh_collections")
             && map.remove(&slug).is_some()
         {
@@ -292,4 +362,57 @@ pub async fn process(
     }
 
     Ok((dataset_dirs.len(), conflicts))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collection_manifest_round_trips_name() {
+        // The manifest persists the one identity field the on-disk slug
+        // cannot recover (slugify is lossy). Bytes must be the canonical
+        // pretty-JSON-plus-newline shared by every other snapshot file, and
+        // reading them back must yield the exact name.
+        let bytes = collection_manifest_bytes("PO_CANCELS");
+        assert_eq!(bytes, b"{\n  \"name\": \"PO_CANCELS\"\n}\n");
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(COLLECTION_MANIFEST), &bytes).unwrap();
+        assert_eq!(read_collection_name(dir.path()).as_deref(), Some("PO_CANCELS"));
+    }
+
+    #[test]
+    fn read_collection_name_tolerates_absent_and_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        // No manifest → None (a legacy dataset predating the manifest).
+        assert_eq!(read_collection_name(dir.path()), None);
+        // Malformed JSON → None (never panics; caller warns + skips).
+        std::fs::write(dir.path().join(COLLECTION_MANIFEST), b"not json").unwrap();
+        assert_eq!(read_collection_name(dir.path()), None);
+    }
+
+    #[test]
+    fn local_only_dataset_slugs_excludes_remote_and_requires_indexes() {
+        // `a` is local-only with indexes → a create candidate.
+        // `b` exists remotely → handled by the remote-driven path, never here.
+        // `c` has no indexes.json → not a dataset, skipped.
+        let mdh = tempfile::tempdir().unwrap();
+        for slug in ["a", "b", "c"] {
+            std::fs::create_dir_all(mdh.path().join(slug)).unwrap();
+        }
+        std::fs::write(mdh.path().join("a/indexes.json"), b"{}").unwrap();
+        std::fs::write(mdh.path().join("b/indexes.json"), b"{}").unwrap();
+
+        let remote: BTreeSet<String> = ["b".to_string()].into_iter().collect();
+        assert_eq!(local_only_dataset_slugs(mdh.path(), &remote), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn local_only_dataset_slugs_missing_dir_is_empty() {
+        // No mdh dir at all (env never had MDH) → nothing to create.
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = BTreeSet::new();
+        assert!(local_only_dataset_slugs(&tmp.path().join("nope"), &remote).is_empty());
+    }
 }
