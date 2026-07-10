@@ -4,12 +4,15 @@
 //! `<base>/v1/<resource>/<verb>` with a JSON body, and every response is
 //! wrapped in `{code, message, result}`. Collection CRUD
 //! (`collections/create`, `collections/drop`, `collections/rename`) and
-//! row-data verbs (`data/find`, `data/insert_*`) are intentionally not
-//! implemented here — the snapshot scope is collection metadata +
-//! indexes, not the row data itself, and dataset creation/removal is a
-//! UI-side concern. Index CRUD (`indexes/create`, `indexes/drop`, and
-//! the corresponding `search_indexes/*`) IS implemented to support
-//! user edits to `envs/<env>/mdh/<slug>/indexes.json` being pushed.
+//! row-data WRITE verbs (`data/insert_*`, `data/update_*`, …) are
+//! intentionally not implemented here — the snapshot scope is collection
+//! metadata + indexes, not the row data itself, and dataset
+//! creation/removal is a UI-side concern. Index CRUD (`indexes/create`,
+//! `indexes/drop`, and the corresponding `search_indexes/*`) IS
+//! implemented to support user edits to
+//! `envs/<env>/mdh/<slug>/indexes.json` being pushed, and the read-only
+//! `data/aggregate` is implemented for the unique-index duplicate-key
+//! preflight (rdc still never mutates row data).
 //!
 //! Base URL convention: `<host>/svc/data-storage/api`. For example,
 //! `https://elis.rossum.ai/svc/data-storage/api`. We append `/v1/...` per
@@ -75,6 +78,28 @@ impl DataStorageClient {
         self.post_envelope_void(
             "/v1/collections/create",
             json!({ "collectionName": collection }),
+            progress,
+        )
+        .await
+    }
+
+    /// `POST /v1/data/aggregate` — run a read-only MongoDB aggregation
+    /// pipeline against a collection and return the result documents.
+    /// Used by the unique-index duplicate-key preflight: a `$group` over
+    /// the index's key fields detects data that would make the async
+    /// index build fail before any create is attempted.
+    pub async fn aggregate(
+        &self,
+        collection: &str,
+        pipeline: &Value,
+        progress: ProgressHandle,
+    ) -> Result<Vec<Value>> {
+        self.post_envelope(
+            "/v1/data/aggregate",
+            json!({
+                "collectionName": collection,
+                "pipeline": pipeline,
+            }),
             progress,
         )
         .await
