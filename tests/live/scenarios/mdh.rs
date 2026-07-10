@@ -196,3 +196,87 @@ async fn live_mdh_index_lifecycle() {
 
     drop(teardown);
 }
+
+/// Regression: a local dataset whose collection does NOT exist on the env yet
+/// must have its collection + indexes CREATED on sync. Before the fix the
+/// deploy iterated only server-listed collections, so a brand-new local
+/// dataset was silently skipped and its indexes never created ("MDH indexes
+/// are not being created when there are no relevant collections existing
+/// yet"). The dataset is authored by hand — there is nothing remote to pull —
+/// then synced; the collection + index must appear on the server. Strictly
+/// additive: it only creates a per-run throwaway collection, never a real one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live: needs RDC_LIVE_* env"]
+async fn live_mdh_creates_collection_when_absent() {
+    let Some(cfg) = LiveConfig::from_env() else {
+        eprintln!("{}", LiveConfig::skip_reason());
+        return;
+    };
+    let run_id = RunId::new();
+    let coll = mdh_collection_name(&run_id);
+    // The on-disk dataset slug is what rdc derives from the collection name.
+    let slug = rdc::slug::slugify(&coll);
+    let raw = MdhRaw::connect(&cfg).expect("connect mdh");
+
+    // MDH must be provisioned on the target org; skip cleanly otherwise (a
+    // non-MDH cluster 404s the collection listing).
+    if raw.list_collection_names().await.is_err() {
+        eprintln!("SKIP live_mdh_creates_collection_when_absent: MDH not available on this org");
+        return;
+    }
+
+    // Teardown FIRST (drops the collection on any panic).
+    let teardown = Teardown::with_mdh(
+        LiveClient::connect(&cfg).expect("connect (teardown)"),
+        run_id.clone(),
+        cfg.clone(),
+    );
+
+    // Precondition: the collection does not exist yet — this is the whole point.
+    let before = raw.list_collection_names().await.expect("list collections");
+    assert!(!before.contains(&coll), "precondition: {coll} must not exist yet");
+
+    // Author a local-only dataset: a name manifest (nothing remote to pull, so
+    // the name — which the lossy slug cannot recover — must be persisted) plus
+    // one regular index.
+    let project = ProjectFixture::init(&cfg, &["test", "prod"]).expect("init project");
+    let dataset_dir = project.path().join(format!("envs/test/mdh/{slug}"));
+    std::fs::create_dir_all(&dataset_dir).expect("create dataset dir");
+    std::fs::write(
+        dataset_dir.join("collection.json"),
+        format!("{{\n  \"name\": \"{coll}\"\n}}\n"),
+    )
+    .expect("write collection.json");
+    std::fs::write(
+        dataset_dir.join("indexes.json"),
+        serde_json::to_vec_pretty(&json!({
+            "regular": [{ "name": "ix_new", "key": { "a": 1 } }],
+            "search": []
+        }))
+        .unwrap(),
+    )
+    .expect("write indexes.json");
+
+    // Sync: stage 2 must create the collection + its index.
+    let out = project.run_rdc(&["sync", "test"]);
+    assert!(out.status.success(), "sync failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // The collection now exists on the server and carries ix_new.
+    let after = raw.list_collection_names().await.expect("list collections");
+    assert!(after.contains(&coll), "collection {coll} must be created: {after:?}");
+    raw.wait_for_regular_index(&coll, "ix_new", true).await.expect("ix_new created");
+
+    // Idempotent: a second sync makes no further changes and still succeeds.
+    let out = project.run_rdc(&["sync", "test"]);
+    assert!(
+        out.status.success(),
+        "idempotent re-sync failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        remote_regular_names(&raw, &coll).await.contains(&"ix_new".to_string()),
+        "ix_new must persist after idempotent re-sync"
+    );
+
+    drop(teardown);
+}

@@ -2263,12 +2263,13 @@ async fn sync_pulls_same_named_field_under_two_engines_with_clean_slugs() {
 /// Pull-side for an MDH dataset: the Data Storage service returns one
 /// collection plus its indexes, and `sync` must write `indexes.json`
 /// (stripped of the implicit `_id_` index and the server-set `v`
-/// field) under `envs/dev/mdh/<slug>/`. No `collection.json` is
-/// written — collection metadata is server-managed and offers no
-/// editable surface. MDH is pull-only at this stage, so this only
-/// exercises the pull-side branch of the executor.
+/// field) under `envs/dev/mdh/<slug>/`, plus a minimal `collection.json`
+/// manifest persisting the collection's server `name` — the one identity
+/// field the lossy slug cannot recover, needed to (re)create the
+/// collection on an env that lacks it. MDH is pull-only at this stage, so
+/// this only exercises the pull-side branch of the executor.
 #[tokio::test]
-async fn sync_writes_local_mdh_indexes_without_collection_json() {
+async fn sync_writes_local_mdh_indexes_and_collection_manifest() {
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
@@ -2371,13 +2372,17 @@ async fn sync_writes_local_mdh_indexes_without_collection_json() {
         );
     }
 
-    // collection.json was removed in the MDH cleanup pass: it carried
-    // only server-managed metadata (uuid, options, idIndex) that the
-    // user can't edit, so there's no value in writing it to disk.
+    // collection.json persists the collection's server `name` (the one
+    // identity field the on-disk slug can't recover). It carries ONLY the
+    // name — none of the server-managed metadata (uuid, options, idIndex)
+    // the legacy file did. A deploy to an env lacking the collection reads
+    // this to (re)create it.
     let collection_path = project.path().join("envs/dev/mdh/vendors/collection.json");
-    assert!(
-        !collection_path.exists(),
-        "collection.json must NOT be written; it's pure server metadata"
+    let manifest = std::fs::read_to_string(&collection_path)
+        .expect("collection.json must be written with the collection name");
+    assert_eq!(
+        manifest, "{\n  \"name\": \"vendors\"\n}\n",
+        "collection.json must carry a minimal name-only manifest"
     );
     let indexes_path = project.path().join("envs/dev/mdh/vendors/indexes.json");
     assert!(
@@ -2401,7 +2406,8 @@ async fn sync_writes_local_mdh_indexes_without_collection_json() {
     );
 
     let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
-    // `mdh_collections` is no longer recorded — collection.json is gone.
+    // The collection name lives in the on-disk manifest, not the lockfile:
+    // `mdh_collections` must not be recorded (only `mdh_indexes` is).
     assert!(
         !lf_raw.contains("\"mdh_collections\""),
         "lockfile must NOT record mdh_collections: {lf_raw}"

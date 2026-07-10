@@ -1371,6 +1371,7 @@ mod tests {
                 )
                 .unwrap(),
                 collections: vec![],
+                available: false,
             },
         }
     }
