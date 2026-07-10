@@ -133,24 +133,16 @@ pub async fn process(
                 .get(KIND)
                 .and_then(|m| m.get(&slug))
                 .and_then(|e| e.content_hash.clone());
-            let action = match (base_hash.as_deref(), &pre_local_json) {
-                (None, _) => PullAction::Write,
-                (_, None) => PullAction::Write,
-                (Some(base), Some(local_json)) => {
-                    // Use codec-compatible combined_hash for local disk bytes
-                    // so the three-way merge works correctly after the
-                    // one-time rehash.
-                    let local_combined =
-                        crate::state::hook_combined_hash(local_json, &pre_local_code, ctx.lockfile);
-                    let local_matches = local_combined == base;
-                    let remote_matches = remote_combined_hash == base;
-                    match (local_matches, remote_matches) {
-                        (true, _) => PullAction::Write,
-                        (false, true) => PullAction::KeepLocal,
-                        (false, false) => PullAction::Conflict,
-                    }
-                }
-            };
+            // Use codec-compatible combined_hash for local disk bytes so the
+            // three-way merge works correctly after the one-time rehash.
+            let local_combined = pre_local_json
+                .as_ref()
+                .map(|lj| crate::state::hook_combined_hash(lj, &pre_local_code, ctx.lockfile));
+            let action = super::common::classify_combined_pull(
+                base_hash.as_deref(),
+                local_combined.as_deref(),
+                &remote_combined_hash,
+            );
 
             if action == PullAction::Conflict {
                 conflicts += 1;

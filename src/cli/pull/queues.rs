@@ -265,21 +265,14 @@ fn write_schema_for_queue(
         .get(KIND_SCHEMAS)
         .and_then(|m| m.get(&w.q_slug))
         .and_then(|e| e.content_hash.clone());
-    let s_action = match (schema_base.as_deref(), &pre_local_json) {
-        (None, _) => PullAction::Write,
-        (_, None) => PullAction::Write,
-        (Some(base), Some(local_json)) => {
-            let local_combined =
-                crate::state::schema_combined_hash(local_json, &pre_local_formulas, ctx.lockfile);
-            let local_matches = local_combined == base;
-            let remote_matches = remote_combined_hash == base;
-            match (local_matches, remote_matches) {
-                (true, _) => PullAction::Write,
-                (false, true) => PullAction::KeepLocal,
-                (false, false) => PullAction::Conflict,
-            }
-        }
-    };
+    let local_combined = pre_local_json
+        .as_ref()
+        .map(|lj| crate::state::schema_combined_hash(lj, &pre_local_formulas, ctx.lockfile));
+    let s_action = super::common::classify_combined_pull(
+        schema_base.as_deref(),
+        local_combined.as_deref(),
+        &remote_combined_hash,
+    );
 
     let schema_recorded = match s_action {
         PullAction::Write => {
