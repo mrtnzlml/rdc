@@ -68,6 +68,134 @@ pub(crate) fn local_only_dataset_slugs(
     out
 }
 
+/// Direction of a predicted MDH op, so the dry-run planner can file it under
+/// the right section ("would pull" vs "would push").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MdhPlanDir {
+    Pull,
+    Push,
+}
+
+/// One MDH operation a real sync would perform, predicted purely from the
+/// already-listed catalog + the lockfile + local files — with NO extra
+/// network round-trips. The `line` is ready to render as `- {line}`.
+#[derive(Debug, Clone)]
+pub(crate) struct MdhPlanItem {
+    pub dir: MdhPlanDir,
+    /// Display line including the `mdh/<slug>` prefix plus the trailing note
+    /// / action, e.g. `mdh/vendors (new)` or `mdh/vendors PATCH`.
+    pub line: String,
+}
+
+/// Predict the MDH operations `sync` would perform, for `--dry-run`.
+///
+/// MDH bypasses the classifier (see `sync::execute`), so its would-be writes
+/// never rode the dry-run plan — a preview reported `0 would pull` while a
+/// real sync then created a whole new local dataset dir. This mirrors the
+/// executor's MDH stages closely enough to preview the STRUCTURAL deltas with
+/// no network beyond the collection listing the scan already fetched:
+///
+/// - would push (only when `!no_push`): local `indexes.json` drift on an
+///   existing collection (executor stage 1) and a brand-new local-only
+///   dataset that was never synced (stage 2);
+/// - would pull: an env collection with no local dataset dir (stage 3,
+///   "new") and a previously-synced dataset whose collection is gone on the
+///   env (stage 4 orphan prune), gated on a non-empty listing.
+///
+/// NOT predicted: remote-side index BODY edits to a collection that already
+/// exists locally — detecting those needs a per-collection index fetch. The
+/// executor's pull still applies them; this is a bounded, documented gap, not
+/// a silent one.
+pub(crate) fn plan_mdh(
+    listed: &MdhListed,
+    lockfile: &crate::state::Lockfile,
+    paths: &crate::paths::Paths,
+    no_push: bool,
+) -> Vec<MdhPlanItem> {
+    let mut items = Vec::new();
+    if !listed.available {
+        return items;
+    }
+
+    // Slug every env collection exactly as the executor does (listing order,
+    // unique dedup) so predicted slugs match the real run byte-for-byte.
+    let mut used: HashSet<String> = HashSet::new();
+    let mut remote_slugs: BTreeSet<String> = BTreeSet::new();
+    for c in &listed.collections {
+        let slug = slugify_unique(&c.name, &used);
+        used.insert(slug.clone());
+        remote_slugs.insert(slug);
+    }
+
+    let mdh_base = lockfile.objects.get("mdh_indexes");
+    let base_hash = |slug: &str| -> Option<String> {
+        mdh_base
+            .and_then(|m| m.get(slug))
+            .and_then(|e| e.content_hash.clone())
+    };
+
+    if !no_push {
+        // Stage 1: index drift on an existing collection — local
+        // `indexes.json` hash differs from the lockfile baseline → PATCH.
+        for slug in &remote_slugs {
+            let indexes_path = paths.dataset_dir(slug).join("indexes.json");
+            let Ok(bytes) = std::fs::read(&indexes_path) else {
+                continue;
+            };
+            let local_hash =
+                crate::state::content_hash(&bytes, &crate::state::Lockfile::default());
+            if base_hash(slug).as_deref() != Some(local_hash.as_str()) {
+                items.push(MdhPlanItem {
+                    dir: MdhPlanDir::Push,
+                    line: format!("mdh/{slug} PATCH"),
+                });
+            }
+        }
+
+        // Stage 2: a local-only dataset absent on the env and never synced
+        // (no lockfile entry) → POST (create the collection). A local-only
+        // dataset that WAS synced is an orphan, left to stage 4's prune.
+        for slug in local_only_dataset_slugs(&paths.mdh_dir(), &remote_slugs) {
+            if base_hash(&slug).is_some() {
+                continue;
+            }
+            items.push(MdhPlanItem {
+                dir: MdhPlanDir::Push,
+                line: format!("mdh/{slug} POST"),
+            });
+        }
+    }
+
+    // Stage 3 (structural pull): an env collection with no local
+    // `indexes.json` → the pull would create the dataset dir locally.
+    for slug in &remote_slugs {
+        if !paths.dataset_dir(slug).join("indexes.json").is_file() {
+            items.push(MdhPlanItem {
+                dir: MdhPlanDir::Pull,
+                line: format!("mdh/{slug} (new)"),
+            });
+        }
+    }
+
+    // Stage 4: orphan prune — a previously-synced dataset whose collection is
+    // gone on the env. Gated on a NON-EMPTY listing, matching the executor's
+    // guard against a transient empty/404 mass-deleting every local dataset.
+    if !remote_slugs.is_empty()
+        && let Some(m) = mdh_base
+    {
+        for slug in m.keys() {
+            if !remote_slugs.contains(slug) {
+                items.push(MdhPlanItem {
+                    dir: MdhPlanDir::Pull,
+                    line: format!("mdh/{slug} (delete local; deleted on env)"),
+                });
+            }
+        }
+    }
+
+    items
+}
+
 /// Strip server-only fields from an index set so the user only sees /
 /// round-trips the fields they can actually edit. Two flavors:
 ///
@@ -449,6 +577,118 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let remote = BTreeSet::new();
         assert!(local_only_dataset_slugs(&tmp.path().join("nope"), &remote).is_empty());
+    }
+
+    /// `plan_mdh` must predict every STRUCTURAL MDH delta a real sync would
+    /// perform — the four executor stages — purely from the listed catalog +
+    /// lockfile + local files, with no network. This is what lets
+    /// `sync --dry-run` preview MDH (which bypasses the classifier).
+    #[test]
+    fn plan_mdh_previews_all_structural_deltas() {
+        use crate::state::{Lockfile, ObjectEntry, content_hash};
+
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(root.path(), "dev");
+        std::fs::create_dir_all(paths.mdh_dir()).unwrap();
+
+        // Local datasets on disk: `clean` (matches baseline), `drift` (local
+        // edit vs baseline), `localcreate` (never synced, env-absent).
+        let clean_bytes = b"{\n  \"regular\": [],\n  \"search\": []\n}\n".to_vec();
+        let drift_bytes = b"{\n  \"regular\": [{ \"name\": \"x\" }],\n  \"search\": []\n}\n".to_vec();
+        for (slug, bytes) in [
+            ("clean", &clean_bytes),
+            ("drift", &drift_bytes),
+            ("localcreate", &clean_bytes),
+        ] {
+            let dir = paths.dataset_dir(slug);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("indexes.json"), bytes).unwrap();
+        }
+
+        // Lockfile baseline. `clean`'s hash matches on disk → no op. `drift`
+        // records a stale hash → PATCH. `orphan` was synced before but has no
+        // env collection and no local dir → delete-local. `localcreate` has NO
+        // entry (never synced) → create.
+        let entry = |h: &str| ObjectEntry {
+            id: 0,
+            modified_at: None,
+            content_hash: Some(h.to_string()),
+            secrets_hash: None,
+        };
+        let mut mdh = std::collections::BTreeMap::new();
+        mdh.insert(
+            "clean".to_string(),
+            entry(&content_hash(&clean_bytes, &Lockfile::default())),
+        );
+        mdh.insert("drift".to_string(), entry("0000stalehash0000"));
+        mdh.insert("orphan".to_string(), entry("0000orphanhash000"));
+        let mut lf = Lockfile::default();
+        lf.objects.insert("mdh_indexes".to_string(), mdh);
+
+        // The env lists clean, drift, and a brand-new collection with no local
+        // dir. `orphan` and `localcreate` are deliberately absent from the env.
+        let collections = ["clean", "drift", "brandnew"]
+            .iter()
+            .map(|n| Collection {
+                name: n.to_string(),
+                extra: Default::default(),
+            })
+            .collect();
+        let listed = MdhListed {
+            client: DataStorageClient::new("http://unused.invalid".to_string(), "t".to_string())
+                .unwrap(),
+            collections,
+            available: true,
+        };
+
+        let mut got: Vec<(MdhPlanDir, String)> = plan_mdh(&listed, &lf, &paths, false)
+            .into_iter()
+            .map(|i| (i.dir, i.line))
+            .collect();
+        got.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(
+            got,
+            vec![
+                (MdhPlanDir::Pull, "mdh/brandnew (new)".to_string()),
+                (MdhPlanDir::Push, "mdh/drift PATCH".to_string()),
+                (MdhPlanDir::Push, "mdh/localcreate POST".to_string()),
+                (
+                    MdhPlanDir::Pull,
+                    "mdh/orphan (delete local; deleted on env)".to_string()
+                ),
+            ],
+            "must preview new/drift/create/orphan and skip the clean dataset"
+        );
+
+        // `--no-push` drops the push-side ops; the pulls survive.
+        let np: Vec<String> = plan_mdh(&listed, &lf, &paths, true)
+            .into_iter()
+            .map(|i| i.line)
+            .collect();
+        assert!(np.contains(&"mdh/brandnew (new)".to_string()));
+        assert!(np.contains(&"mdh/orphan (delete local; deleted on env)".to_string()));
+        assert!(
+            !np.iter().any(|l| l.contains("PATCH") || l.contains("POST")),
+            "no-push must suppress MDH pushes: {np:?}"
+        );
+    }
+
+    /// MDH not provisioned on the env (`available == false`) → an empty plan.
+    /// A dry-run must never predict ops against a cluster without Data Storage.
+    #[test]
+    fn plan_mdh_unavailable_env_yields_no_plan() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(root.path(), "dev");
+        let listed = MdhListed {
+            client: DataStorageClient::new("http://unused.invalid".to_string(), "t".to_string())
+                .unwrap(),
+            collections: vec![Collection {
+                name: "vendors".to_string(),
+                extra: Default::default(),
+            }],
+            available: false,
+        };
+        assert!(plan_mdh(&listed, &crate::state::Lockfile::default(), &paths, false).is_empty());
     }
 
     #[test]
