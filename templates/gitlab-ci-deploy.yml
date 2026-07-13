@@ -30,7 +30,7 @@
 # straight back to the remote.
 
 variables:
-  RDC_VERSION: "v0.3.0"  # latest release; see
+  RDC_VERSION: "v0.4.0"  # latest release; see
                           # https://github.com/mrtnzlml/rdc/releases
 
 stages:
