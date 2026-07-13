@@ -311,6 +311,21 @@ pub(crate) async fn run_cycle(
     if dry_run {
         use crate::cli::sync::classify::SyncClass;
 
+        // MDH bypasses the classifier, so its would-be writes are invisible
+        // to the classified plan above. Predict them from the already-listed
+        // catalog + lockfile + local files (no extra network) and fold them
+        // into the same pull/push sections so the preview is faithful.
+        let mdh_plan =
+            crate::cli::pull::mdh::plan_mdh(&catalog.mdh, &lockfile, &paths, no_push);
+        let mdh_pull: Vec<&crate::cli::pull::mdh::MdhPlanItem> = mdh_plan
+            .iter()
+            .filter(|i| i.dir == crate::cli::pull::mdh::MdhPlanDir::Pull)
+            .collect();
+        let mdh_push: Vec<&crate::cli::pull::mdh::MdhPlanItem> = mdh_plan
+            .iter()
+            .filter(|i| i.dir == crate::cli::pull::mdh::MdhPlanDir::Push)
+            .collect();
+
         // Pull-side items (would write local). A clean `RemoteDelete`
         // auto-resolves by mirroring the env's deletion locally, so it
         // belongs here — not under "would prompt".
@@ -323,7 +338,8 @@ pub(crate) async fn run_cycle(
                 )
             })
             .collect();
-        if !pull_items.is_empty() {
+        let pull_count = pull_items.len() + mdh_pull.len();
+        if pull_count > 0 {
             progress.event(Action::Plan, "would pull");
             let mut body = String::new();
             use std::fmt::Write as _;
@@ -334,6 +350,9 @@ pub(crate) async fn run_cycle(
                     _ => "",
                 };
                 let _ = writeln!(body, "- {}/{}{}", it.kind, it.slug, note);
+            }
+            for it in &mdh_pull {
+                let _ = writeln!(body, "- {}", it.line);
             }
             progress.block(&body);
         }
@@ -348,7 +367,8 @@ pub(crate) async fn run_cycle(
                 )
             })
             .collect();
-        if !push_items.is_empty() {
+        let push_count = push_items.len() + mdh_push.len();
+        if push_count > 0 {
             progress.event(Action::Plan, "would push");
             let mut body = String::new();
             use std::fmt::Write as _;
@@ -360,6 +380,9 @@ pub(crate) async fn run_cycle(
                     _ => "",
                 };
                 let _ = writeln!(body, "- {}/{} {}", it.kind, it.slug, action);
+            }
+            for it in &mdh_push {
+                let _ = writeln!(body, "- {}", it.line);
             }
             progress.block(&body);
         }
@@ -416,8 +439,8 @@ pub(crate) async fn run_cycle(
                 Action::Done,
                 &format!(
                     "Dry run: {} would push, {} would pull, {} would prompt{} (no writes)",
-                    push_items.len(),
-                    pull_items.len(),
+                    push_count,
+                    pull_count,
                     prompt_items.len(),
                     parse_suffix,
                 ),

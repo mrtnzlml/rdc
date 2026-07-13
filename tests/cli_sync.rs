@@ -2422,6 +2422,124 @@ async fn sync_writes_local_mdh_indexes_and_collection_manifest() {
     );
 }
 
+/// `--dry-run` must PREVIEW MDH pulls. MDH bypasses the classifier, so its
+/// would-be writes never rode the dry-run plan: a preview reported
+/// `0 would pull` while a real sync then created a whole new local dataset
+/// dir (regression). A collection present on the env but absent on disk must
+/// now surface under "would pull" as `mdh/<slug> (new)` and count toward the
+/// summary — WITHOUT any extra network round-trips (the preview must not
+/// fetch per-collection index bodies; the collection listing from the scan
+/// is enough to predict the structural pull).
+#[tokio::test]
+async fn sync_dry_run_previews_new_mdh_collection_under_pull() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &[]).await;
+
+    // Phase 1 (seed): MDH is enabled but empty. Phase 2 (preview): a new
+    // collection has appeared on the env. Stateful so the seed sync
+    // establishes a clean local baseline (org pulled, no datasets) and the
+    // later dry-run sees exactly one env-only collection.
+    let n = Arc::new(AtomicUsize::new(0));
+    let counter = n.clone();
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/collections/list"))
+        .respond_with(move |_req: &Request| {
+            let first = counter.fetch_add(1, Ordering::SeqCst) == 0;
+            let result = if first {
+                serde_json::json!([])
+            } else {
+                serde_json::json!([
+                    {
+                        "name": "vendors",
+                        "type": "collection",
+                        "options": {},
+                        "idIndex": { "v": 2, "key": { "_id": 1 }, "name": "_id_" }
+                    }
+                ])
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "ok",
+                "message": "",
+                "result": result
+            }))
+        })
+        .mount(&server)
+        .await;
+    // Deliberately DO NOT mock the index endpoints: a faithful, network-free
+    // preview must never reach them. wiremock 404s any unmocked path, so a
+    // stray fetch would surface as an error rather than pass silently.
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // Seed: pull the clean baseline (org local, MDH enabled but empty).
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("seed sync should succeed");
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    let dry = assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev", "--dry-run"])
+        .output()
+        .unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&dry.stdout),
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    assert!(dry.status.success(), "dry-run must succeed: {all}");
+    assert!(
+        all.contains("mdh/vendors (new)"),
+        "a new env-only MDH collection must be previewed under would-pull: {all}"
+    );
+    assert!(
+        all.contains("1 would pull"),
+        "the new MDH collection must count toward would-pull: {all}"
+    );
+
+    // The preview makes no writes: no local dataset dir is created.
+    assert!(
+        !project.path().join("envs/dev/mdh/vendors").exists(),
+        "dry-run must not create the MDH dataset dir on disk"
+    );
+
+    // The preview is network-free beyond the collection listing: it must
+    // never fetch per-collection index bodies during a dry run.
+    for req in server.received_requests().await.unwrap_or_default() {
+        let p = req.url.path();
+        assert!(
+            !p.contains("/indexes/list") && !p.contains("/search_indexes/list"),
+            "dry-run must not fetch MDH index bodies: {} {}",
+            req.method,
+            p
+        );
+    }
+}
+
 /// Pull-side RemoteCreate for a hook. The env exposes a function hook
 /// with `config.code` populated; sync must write `<slug>.json` (with
 /// `code` stripped) AND a sibling `<slug>.py` carrying the extracted
