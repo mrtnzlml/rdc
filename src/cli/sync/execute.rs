@@ -3721,6 +3721,40 @@ pub async fn run(
             }
         }
 
+        // Same-pass queue back-ref refresh (idempotency). Creating, deleting,
+        // or re-queueing a child (rule / hook / inbox) makes the server
+        // update the *other* side of the link: each affected queue's
+        // server-derived `rules` / `hooks` / `webhooks` collection. rdc
+        // strips those from every outbound body and never authors them, and
+        // the Phase-1 catalog the pull phase above consumed predates the
+        // push, so the affected queues would otherwise stay stale on disk
+        // until the NEXT sync — making a single `sync` that touches a child
+        // non-idempotent. Re-fetch and refresh queue.json (only) for the
+        // queues that were Clean this cycle so the back-ref lands in this
+        // same pass. See `pull::queues::refresh_backrefs`.
+        let child_membership_pushed = !no_push
+            && classified.iter().any(|it| {
+                matches!(it.kind.as_str(), "rules" | "hooks" | "inboxes")
+                    && matches!(
+                        it.class,
+                        SyncClass::LocalCreate
+                            | SyncClass::LocalEdit
+                            | SyncClass::LocalDelete
+                            | SyncClass::BothDiverged
+                            | SyncClass::LocalEditRemoteDelete
+                            | SyncClass::LocalDeleteRemoteEdit
+                    )
+            });
+        if child_membership_pushed {
+            let eligible: BTreeSet<String> = classified
+                .iter()
+                .filter(|it| it.kind == "queues" && matches!(it.class, SyncClass::Clean))
+                .map(|it| it.slug.clone())
+                .collect();
+            outcome.items_pulled +=
+                crate::cli::pull::queues::refresh_backrefs(ctx, &eligible, progress).await?;
+        }
+
         // Post-pass: rewrite portable-kind URLs in every snapshotted file to
         // `rdc://<kind>/<slug>` form and re-record the lockfile `content_hash`
         // so the next `sync` sees the object as Clean (no phantom drift).

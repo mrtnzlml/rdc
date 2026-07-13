@@ -8422,6 +8422,251 @@ async fn push_create_rule() {
     );
 }
 
+/// Idempotency regression: creating a rule that TARGETS an existing queue
+/// mutates that queue's server-derived `rules` back-reference on the remote.
+/// rdc strips `rules` from every outbound body, so the push driver never
+/// refreshes it, and the Phase-1 catalog predates the POST — so before the
+/// fix the queue's on-disk snapshot only caught up on the *next* sync,
+/// leaving a single sync non-idempotent (the queue showed as changed on the
+/// immediate re-sync). The executor now re-fetches affected queues after the
+/// push (`pull::queues::refresh_backrefs`), so the back-ref lands in the SAME
+/// pass and the re-sync is a clean no-op.
+#[tokio::test]
+async fn push_create_rule_refreshes_target_queue_backref_same_pass() {
+    let server = MockServer::start().await;
+    let ws_url = format!("{}/api/v1/workspaces/800", server.uri());
+    let queue_url = format!("{}/api/v1/queues/100", server.uri());
+    let schema_url = format!("{}/api/v1/schemas/200", server.uri());
+    let rule_url = format!("{}/api/v1/rules/8888", server.uri());
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // 1 workspace holding the queue.
+    let workspaces_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [{
+            "id": 800,
+            "url": ws_url,
+            "name": "Invoices AP",
+            "organization": format!("{}/api/v1/organizations/1", server.uri()),
+            "queues": [queue_url.clone()],
+            "modified_at": "2026-04-20T08:00:00Z"
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(workspaces_body))
+        .mount(&server)
+        .await;
+
+    // Shared flag: bumped by POST /rules, read by GET /queues + GET /rules so
+    // the queue's `rules` back-ref and the rule listing reflect the rule only
+    // once it has actually been created (mirrors real Rossum server behavior).
+    let rule_created = Arc::new(AtomicUsize::new(0));
+
+    // Stateful GET /queues: `rules` empty until the rule is POSTed, then
+    // carries the new rule URL — exactly the server-side back-ref update.
+    {
+        let flag = rule_created.clone();
+        let queue_url = queue_url.clone();
+        let schema_url = schema_url.clone();
+        let rule_url = rule_url.clone();
+        let ws = format!("{}/api/v1/workspaces/800", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/api/v1/queues"))
+            .respond_with(move |_req: &Request| {
+                let rules = if flag.load(Ordering::SeqCst) > 0 {
+                    serde_json::json!([rule_url.clone()])
+                } else {
+                    serde_json::json!([])
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+                    "results": [{
+                        "id": 100,
+                        "url": queue_url.clone(),
+                        "name": "Cost Invoices",
+                        "workspace": ws.clone(),
+                        "schema": schema_url.clone(),
+                        "rules": rules,
+                        "modified_at": "2026-04-20T08:00:00Z"
+                    }]
+                }))
+            })
+            .mount(&server)
+            .await;
+    }
+
+    // Schema for the queue (fetched by id during queue-child prefetch).
+    let schema_body = serde_json::json!({
+        "id": 200,
+        "url": schema_url,
+        "name": "Cost Invoices Schema",
+        "queues": [queue_url.clone()],
+        "content": [{
+            "category": "section",
+            "id": "header",
+            "label": "Header",
+            "children": [ { "category": "datapoint", "id": "invoice_id", "type": "string" } ]
+        }],
+        "modified_at": "2026-04-10T09:00:00Z"
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schemas/200"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(schema_body))
+        .mount(&server)
+        .await;
+
+    // Stateful GET /rules: empty before the create, then the created rule.
+    let created_rule = serde_json::json!({
+        "id": 8888,
+        "url": rule_url.clone(),
+        "name": "Total Amount Check",
+        "queues": [queue_url.clone()],
+        "trigger_condition": "",
+        "modified_at": "2026-05-01T08:00:00Z"
+    });
+    {
+        let flag = rule_created.clone();
+        let created = created_rule.clone();
+        Mock::given(method("GET"))
+            .and(path("/api/v1/rules"))
+            .respond_with(move |_req: &Request| {
+                let results = if flag.load(Ordering::SeqCst) > 0 {
+                    serde_json::json!([created.clone()])
+                } else {
+                    serde_json::json!([])
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+                    "results": results
+                }))
+            })
+            .mount(&server)
+            .await;
+    }
+
+    // POST /rules: create + flip the flag so subsequent GETs reflect it.
+    {
+        let flag = rule_created.clone();
+        let created = created_rule.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/v1/rules"))
+            .respond_with(move |_req: &Request| {
+                flag.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(201).set_body_json(created.clone())
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    mock_empty_lists_except(
+        &server,
+        &["/api/v1/workspaces", "/api/v1/queues", "/api/v1/rules"],
+    )
+    .await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let queue_json_path = project
+        .path()
+        .join("envs/dev/workspaces/invoices-ap/queues/cost-invoices/queue.json");
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // Sync #1: pull the queue tree into a Clean local snapshot (no rule yet).
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("initial pull sync should succeed");
+    let queue_before = std::fs::read_to_string(&queue_json_path).unwrap();
+    assert!(
+        !queue_before.contains("rdc://rules/"),
+        "precondition: queue has no rule back-ref before the rule is created: {queue_before}"
+    );
+
+    // Seed a NEW local rule that targets the pulled queue (LocalCreate). The
+    // `.py` sidecar carries the trigger_condition, exactly as pull writes it.
+    let rules_dir = project.path().join("envs/dev/rules");
+    std::fs::create_dir_all(&rules_dir).unwrap();
+    let local_rule = serde_json::json!({
+        "id": 0,
+        "url": "",
+        "name": "Total Amount Check",
+        "queues": ["rdc://queues/cost-invoices"]
+    });
+    let mut bytes = serde_json::to_vec_pretty(&local_rule).unwrap();
+    bytes.push(b'\n');
+    std::fs::write(rules_dir.join("total-amount-check.json"), &bytes).unwrap();
+    std::fs::write(rules_dir.join("total-amount-check.py"), b"").unwrap();
+
+    // Sync #2: POST the rule AND refresh the queue back-ref in the same pass.
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("rule-create sync should succeed");
+    let reqs_after_create = server.received_requests().await.unwrap_or_default();
+    // Capture queue.json state RIGHT AFTER the creating sync — before any
+    // re-sync could paper over a stale snapshot. This is the discriminating
+    // read: without the same-pass refresh the back-ref only appears on sync #3.
+    let queue_after_create = std::fs::read_to_string(&queue_json_path).unwrap();
+
+    // Sync #3: must be a clean no-op — proves the back-ref converged in one pass.
+    rdc::cli::sync::run("dev", false, false, false, false, false)
+        .await
+        .expect("re-sync should succeed and be idempotent");
+    let reqs_after_resync = server.received_requests().await.unwrap_or_default();
+    let queue_after_resync = std::fs::read_to_string(&queue_json_path).unwrap();
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    // The discriminating assertion: after the SAME sync that created the rule,
+    // the queue's on-disk back-ref already reflects it.
+    assert!(
+        queue_after_create.contains("rdc://rules/total-amount-check"),
+        "queue.json must carry the new rule's portable back-ref after the \
+         creating sync (same pass): {queue_after_create}"
+    );
+
+    assert_eq!(
+        count_mutations(&reqs_after_create, "/api/v1/rules"),
+        1,
+        "exactly one POST /rules should have happened"
+    );
+
+    // Idempotency: sync #3 wrote nothing new — the queue.json captured right
+    // after sync #2 already equals its state after sync #3 (byte-stable), which
+    // can only hold if the back-ref converged inside sync #2.
+    assert_eq!(
+        queue_after_create, queue_after_resync,
+        "queue.json must be byte-stable across the idempotent re-sync"
+    );
+    let _ = &queue_before;
+    let created_then = count_mutations(&reqs_after_create, "/api/v1/queues")
+        + count_mutations(&reqs_after_create, "/api/v1/rules");
+    let created_total = count_mutations(&reqs_after_resync, "/api/v1/queues")
+        + count_mutations(&reqs_after_resync, "/api/v1/rules");
+    assert_eq!(
+        created_then, created_total,
+        "the idempotent re-sync must issue no further queue/rule mutations"
+    );
+}
+
 /// Keystone test: dependency-ordered CREATE of a brand-new workspace + its
 /// queue + the queue's schema, all seeded locally with no lockfile entries
 /// and `rdc://` portable refs. `sync` must POST them in dependency order

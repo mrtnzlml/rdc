@@ -231,6 +231,125 @@ pub async fn process(
     Ok(counts)
 }
 
+/// Same-pass refresh of queues' server-derived back-reference collections
+/// after a push that created / deleted / re-queued child objects.
+///
+/// A rule, hook, or inbox carries a `queues` field; creating, deleting, or
+/// re-queueing one makes the server update the *other* side of that link —
+/// each affected queue's `rules` / `hooks` / `webhooks` collection. rdc
+/// strips those from every outbound body ([`crate::snapshot::create::strip_for_create`])
+/// and never authors them, so the push drivers don't refresh them; and the
+/// Phase-1 catalog that classify + the pull phase consumed was fetched
+/// *before* the push, so it can't see the change either. Without this step
+/// the affected queues' on-disk snapshot stays stale until the *next* sync
+/// pulls them — i.e. a single `sync` that creates a rule is not idempotent
+/// (an immediate re-sync reports the queues changed).
+///
+/// This re-fetches the queue list once (fresh, post-push) and rewrites
+/// **only** `queue.json` for eligible queues whose canonical bytes drifted
+/// from the recorded base. Schema + inbox are intentionally left untouched:
+/// a schema PATCHed earlier in this same cycle would be reverted if it were
+/// re-pulled from the (pre-push) Phase-1 catalog.
+///
+/// `eligible` holds the queue slugs that were `Clean` this cycle. A queue
+/// with a real local edit (already pushed by the queue driver) or an
+/// unresolved conflict is never in this set, so the three-way
+/// [`decide_pull_action`] here can only resolve to `Write` (a server-only
+/// back-ref change) or `NoChange` — never a surprising conflict that could
+/// clobber a local edit.
+///
+/// Returns the number of `queue.json` files actually rewritten.
+pub async fn refresh_backrefs(
+    ctx: &mut PullCtx<'_>,
+    eligible: &BTreeSet<String>,
+    progress: &Arc<Log>,
+) -> Result<usize> {
+    if eligible.is_empty() {
+        return Ok(0);
+    }
+    let queues = list(ctx, progress).await?;
+    let mut refreshed = 0usize;
+    for q in &queues {
+        // Only touch queues that were Clean this cycle (id-pinned slug).
+        let Some(q_slug) = ctx
+            .lockfile
+            .slug_for_id(KIND_QUEUES, q.id)
+            .map(|s| s.to_string())
+        else {
+            continue;
+        };
+        if !eligible.contains(&q_slug) {
+            continue;
+        }
+        let Some(ws_url) = &q.workspace else {
+            continue;
+        };
+        let Some(ws_slug) = ctx
+            .lockfile
+            .slug_for_url("workspaces", ws_url)
+            .map(|s| s.to_string())
+        else {
+            continue;
+        };
+        let queue_path = ctx.paths.queue_dir(&ws_slug, &q_slug).join("queue.json");
+
+        // Canonical bytes exactly as the pull driver would write them
+        // (redact counts, strip modified_at, then portabilize refs).
+        let value = serde_json::to_value(q)?;
+        let art = crate::snapshot::codec::codec(KIND_QUEUES)
+            .unwrap()
+            .disk_bytes(&value)
+            .with_context(|| format!("serializing queue '{q_slug}' for back-ref refresh"))?;
+        let proposed = crate::cli::pull::common::portabilize_proposed(&art.json, &*ctx.lockfile);
+
+        let base = ctx
+            .lockfile
+            .objects
+            .get(KIND_QUEUES)
+            .and_then(|m| m.get(&q_slug))
+            .and_then(|e| e.content_hash.clone());
+        let (action, remote_hash) =
+            decide_pull_action(&queue_path, base.as_deref(), &proposed)?;
+        // Eligible == Clean this cycle, so local == base; the only drift is
+        // the server-owned back-ref → Write. Anything else means the
+        // classifier and this refresh disagree about local state; skip
+        // defensively rather than risk clobbering an edit.
+        if action != PullAction::Write {
+            continue;
+        }
+        let recorded = apply_pull_action(
+            action,
+            &queue_path,
+            &proposed,
+            remote_hash,
+            ctx.interactive,
+            progress,
+            ctx.paths.env(),
+            base.as_deref(),
+            Some(ctx.paths),
+        )?;
+        record_object(
+            ctx.lockfile,
+            KIND_QUEUES,
+            &q_slug,
+            q.id,
+            q.modified_at().map(|s| s.to_string()),
+            Some(recorded),
+        );
+        refreshed += 1;
+    }
+    if refreshed > 0 {
+        progress.event(
+            Action::Pull,
+            &format!(
+                "queues ({refreshed} back-ref{} refreshed)",
+                if refreshed == 1 { "" } else { "s" }
+            ),
+        );
+    }
+    Ok(refreshed)
+}
+
 fn write_schema_for_queue(
     ctx: &mut PullCtx<'_>,
     counts: &mut QueueCounts,
