@@ -288,6 +288,27 @@ impl GenericMapping {
         }
         Ok(())
     }
+
+    /// Project the N-way table onto one ordered pair, yielding the per-kind
+    /// `src_slug -> tgt_slug` [`Mapping`] that `migrate` consumes. Only rows that
+    /// name BOTH envs with DIFFERING slugs contribute; everything else is left to
+    /// the identity fallback in `tgt_slug`. Rows are matched by the SOURCE env's
+    /// column so same-slug objects in other tracks never cross-match.
+    pub fn orient(&self, src_env: &str, tgt_env: &str) -> Mapping {
+        let mut m = Mapping::default();
+        for kind in Self::KINDS {
+            let rows = self.kind_rows(kind).expect("KINDS entry has rows");
+            let dest = m.kind_map_mut(kind).expect("KINDS entry is a mappable kind");
+            for row in rows {
+                if let (Some(s), Some(t)) = (row.get(src_env), row.get(tgt_env)) {
+                    if s != t {
+                        dest.insert(s.clone(), t.clone());
+                    }
+                }
+            }
+        }
+        m
+    }
 }
 
 #[cfg(test)]
@@ -411,5 +432,39 @@ version = 1
         ]));
         let envs = BTreeSet::from(["dev".to_string(), "prod".to_string()]);
         assert!(g.validate(&envs).is_ok());
+    }
+
+    #[test]
+    fn orient_emits_only_divergent_pairs_for_the_direction() {
+        let mut g = GenericMapping::default();
+        g.hooks.push(BTreeMap::from([
+            ("dev".to_string(), "master-data-hub".to_string()),
+            ("test".to_string(), "mdh-test".to_string()),
+            ("prod".to_string(), "mdh-prod".to_string()),
+        ]));
+        // dev -> prod
+        let m = g.orient("dev", "prod");
+        assert_eq!(m.lookup_tgt_slug("hooks", "master-data-hub"), Some("mdh-prod"));
+        // reverse prod -> dev reads the same row
+        let r = g.orient("prod", "dev");
+        assert_eq!(r.lookup_tgt_slug("hooks", "mdh-prod"), Some("master-data-hub"));
+        // a pair not present in the row (dev->test uses different value) still works
+        let t = g.orient("dev", "test");
+        assert_eq!(t.lookup_tgt_slug("hooks", "master-data-hub"), Some("mdh-test"));
+    }
+
+    #[test]
+    fn orient_is_keyed_by_source_env_column_not_any_column() {
+        // A row describing the eu track must NOT match a lookup for the us track,
+        // even if a slug value coincides.
+        let mut g = GenericMapping::default();
+        g.queues.push(BTreeMap::from([
+            ("dev-eu".to_string(), "invoices".to_string()),
+            ("prod-eu".to_string(), "invoices-prod".to_string()),
+        ]));
+        // Migrating dev-us -> test-us: no dev-us column in the row => no match =>
+        // absent from the oriented map => tgt_slug falls back to identity.
+        let m = g.orient("dev-us", "test-us");
+        assert_eq!(m.lookup_tgt_slug("queues", "invoices"), None);
     }
 }
