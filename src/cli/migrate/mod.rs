@@ -224,6 +224,87 @@ fn validate_overlay_dir(
     Ok(())
 }
 
+/// The reserved kind-wide-default overlay key. Not a valid Rossum slug, so it
+/// never targets a single object — it is exempt from the "every key must target
+/// a produced object" validation.
+const OVERLAY_WILDCARD: &str = "*";
+
+/// An `overlay.toml` key that targets no object the migration produces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DanglingOverlayKey {
+    pub kind: &'static str,
+    pub key: String,
+    /// The existing slugs of that kind the migration DOES produce — offered as
+    /// suggestions (a dangling key is usually a since-renamed or mistyped slug).
+    pub existing: Vec<String>,
+}
+
+/// Return every non-`"*"` overlay key that targets no object in `produced`.
+///
+/// `produced` maps each overlay kind to the set of TARGET-env slugs the
+/// migration writes (overlays are keyed by target slug). A key absent from that
+/// set would be silently ignored during migrate, letting the source env's value
+/// promote unchanged — e.g. a hook renamed after the overlay was written leaves
+/// `[hooks.<old-slug>]` dangling and its per-env override (SFTP credentials, an
+/// `active=false`, a prod URL) never applies. Callers turn these into a hard
+/// error via [`format_dangling_overlay_error`].
+pub(crate) fn dangling_overlay_keys(
+    overlay: &Overlay,
+    produced: &BTreeMap<&'static str, std::collections::BTreeSet<String>>,
+) -> Vec<DanglingOverlayKey> {
+    let mut out = Vec::new();
+    for (kind, entries) in overlay.kind_maps() {
+        let have = produced.get(kind);
+        for key in entries.keys() {
+            if key == OVERLAY_WILDCARD {
+                continue;
+            }
+            let present = have.is_some_and(|s| s.contains(key));
+            if !present {
+                let existing = have.map(|s| s.iter().cloned().collect()).unwrap_or_default();
+                out.push(DanglingOverlayKey {
+                    kind,
+                    key: key.clone(),
+                    existing,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Build the hard-error message for [`dangling_overlay_keys`] offenders. Names
+/// each dangling `[kind.key]` and lists the existing slugs of that kind so the
+/// user can fix the slug or drop the entry. The reserved `"*"` default is noted
+/// as exempt.
+pub(crate) fn format_dangling_overlay_error(
+    offenders: &[DanglingOverlayKey],
+    _src: &str,
+    tgt: &str,
+) -> String {
+    let mut body = String::new();
+    for o in offenders {
+        body.push_str(&format!("  - [{}.{}]", o.kind, o.key));
+        if o.existing.is_empty() {
+            body.push_str(&format!("  (no {} are migrated)\n", o.kind));
+        } else {
+            body.push_str(&format!(
+                "  (existing {}: {})\n",
+                o.kind,
+                o.existing.join(", ")
+            ));
+        }
+    }
+    format!(
+        "envs/{tgt}/overlay.toml has override(s) targeting no object this migration produces:\n\
+         {body}\
+         Each non-\"*\" key must be the TARGET-env slug of a migrated object — a slug left stale \
+         after the object was renamed (e.g. by `rdc doctor`) or a typo. Rename the key to one of \
+         the existing slugs listed above, or remove the entry. (The kind-wide `\"*\"` default is \
+         exempt.)"
+    )
+}
+
 fn classify_workspace(comps: &[String]) -> Option<(&'static str, String)> {
     let ws = comps.get(1)?;
     let leaf = comps.last()?;
@@ -1205,6 +1286,29 @@ pub fn run(
         .collect();
     validate_overlay_dir(&tgt_paths.overlay_dir(), &produced_sidecars)?;
 
+    // Validate `overlay.toml` KEYS the same way the shadow dir is validated: every
+    // non-`"*"` key must target an object this migration produces, else its per-env
+    // override would be silently ignored — letting the source value promote
+    // unchanged (dev SFTP creds into test, a missing `active=false`, a stale URL).
+    // Built from the FULL enumeration (independent of `--only`, like the shadow
+    // check) so scoping never false-flags a valid key. Runs before any write.
+    if let Some(ov) = tgt_overlay.as_ref() {
+        let mut produced_slugs: BTreeMap<&'static str, std::collections::BTreeSet<String>> =
+            BTreeMap::new();
+        for rel in &files {
+            if let Some((kind, src_slug)) = classify(rel) {
+                produced_slugs
+                    .entry(kind)
+                    .or_default()
+                    .insert(tgt_slug(&mapping, kind, &src_slug));
+            }
+        }
+        let dangling = dangling_overlay_keys(ov, &produced_slugs);
+        if !dangling.is_empty() {
+            anyhow::bail!(format_dangling_overlay_error(&dangling, src, tgt));
+        }
+    }
+
     let mut copied = 0usize;
     let mut renamed = 0usize;
 
@@ -2079,6 +2183,93 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let produced = std::collections::BTreeSet::new();
         assert!(validate_overlay_dir(&dir.path().join("overlay"), &produced).is_ok());
+    }
+
+    fn produced_map(
+        pairs: &[(&'static str, &[&str])],
+    ) -> std::collections::BTreeMap<&'static str, std::collections::BTreeSet<String>> {
+        pairs
+            .iter()
+            .map(|(kind, slugs)| {
+                (
+                    *kind,
+                    slugs.iter().map(|s| s.to_string()).collect::<std::collections::BTreeSet<_>>(),
+                )
+            })
+            .collect()
+    }
+
+    fn overlay_with_hook(slug: &str) -> Overlay {
+        let mut ov = Overlay::default();
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert("active".to_string(), serde_json::json!(false));
+        ov.hooks.insert(slug.to_string(), fields);
+        ov
+    }
+
+    #[test]
+    fn dangling_overlay_keys_flags_key_with_no_produced_object() {
+        // The overlay targets `sftp-import-initial-load` but the migration only
+        // produces `sftp-import-master-data` (the hook was renamed) — the key is
+        // dangling and its override would silently never apply.
+        let ov = overlay_with_hook("sftp-import-initial-load");
+        let produced = produced_map(&[("hooks", &["sftp-import-master-data", "validator"])]);
+        let offenders = dangling_overlay_keys(&ov, &produced);
+        assert_eq!(offenders.len(), 1);
+        assert_eq!(offenders[0].kind, "hooks");
+        assert_eq!(offenders[0].key, "sftp-import-initial-load");
+        // Suggestions are the existing slugs of that kind, sorted.
+        assert_eq!(
+            offenders[0].existing,
+            vec!["sftp-import-master-data".to_string(), "validator".to_string()]
+        );
+    }
+
+    #[test]
+    fn dangling_overlay_keys_accepts_a_produced_key() {
+        let ov = overlay_with_hook("validator");
+        let produced = produced_map(&[("hooks", &["validator"])]);
+        assert!(dangling_overlay_keys(&ov, &produced).is_empty());
+    }
+
+    #[test]
+    fn dangling_overlay_keys_exempts_the_wildcard_default() {
+        // `[hooks."*"]` is the kind-wide default, not a real slug — never flagged,
+        // even when nothing of that kind is produced.
+        let ov = overlay_with_hook("*");
+        let produced = produced_map(&[]);
+        assert!(dangling_overlay_keys(&ov, &produced).is_empty());
+    }
+
+    #[test]
+    fn dangling_overlay_keys_flags_kind_with_nothing_produced() {
+        // A real (non-wildcard) key of a kind the migration produces none of is
+        // still dangling; the suggestion list is simply empty.
+        let ov = overlay_with_hook("some-hook");
+        let produced = produced_map(&[]);
+        let offenders = dangling_overlay_keys(&ov, &produced);
+        assert_eq!(offenders.len(), 1);
+        assert!(offenders[0].existing.is_empty());
+    }
+
+    #[test]
+    fn format_dangling_overlay_error_lists_key_and_existing_slugs() {
+        let offenders = vec![DanglingOverlayKey {
+            kind: "hooks",
+            key: "sftp-import-initial-load".to_string(),
+            existing: vec![
+                "sftp-import-master-data".to_string(),
+                "validator".to_string(),
+            ],
+        }];
+        let msg = format_dangling_overlay_error(&offenders, "dev-ap", "test-ap");
+        assert!(msg.contains("sftp-import-initial-load"), "names the dangling key: {msg}");
+        assert!(msg.contains("hooks"), "names the kind: {msg}");
+        assert!(msg.contains("test-ap"), "names the tgt overlay env: {msg}");
+        assert!(
+            msg.contains("sftp-import-master-data"),
+            "suggests the existing slugs: {msg}"
+        );
     }
 
     #[test]
