@@ -237,38 +237,24 @@ pub enum Command {
         #[arg(long, conflicts_with = "token")]
         username: Option<String>,
     },
-    /// Diagnose and fix the local snapshot for `<env>` in one pass. Runs
-    /// every fix automatically and only prompts where a real decision is
-    /// needed. Without `<env>`, picks interactively from `rdc.toml`.
+    /// Diagnose and fix the local snapshot for `<env>` in one pass. Fully
+    /// offline; every fix is mechanical and applied automatically. Without
+    /// `<env>`, picks interactively from `rdc.toml`.
     ///
     /// Steps, in order:
     /// 1. Report local changes not yet pushed to the remote, so you know
-    ///    what's at stake before anything destructive.
+    ///    what's on disk but not yet on the server.
     /// 2. Rename any local file whose slug no longer matches its JSON
-    ///    `name` — offline, cascade-aware (queue / workspace renames move
-    ///    the whole subtree), applied automatically.
-    /// 3. Fix hooks with `extension_source: "rossum_store"` and
-    ///    `hook_template: null` (created when a client PATCHes the marker
-    ///    without going through `/hooks/create`) — prompts per hook to
-    ///    convert to custom (one PATCH, id preserved) or reinstall as a
-    ///    store extension (new id, dependents rewired).
-    /// 4. Offer to rebuild the lockfile by re-pulling from the remote —
-    ///    overwrites local snapshot files; local edits not on the remote
-    ///    are LOST. Interactively this is an explicit confirm (default No);
-    ///    it is skipped under `--yes` / non-TTY unless `--rebuild-lock` is
-    ///    passed to authorize it directly.
+    ///    `name` — cascade-aware (queue / workspace renames move the whole
+    ///    subtree), applied automatically.
+    /// 3. Prune base-cache entries whose env-tree counterpart no longer
+    ///    exists (deleted object, renamed slug after pull).
     Doctor {
         #[arg(add = ArgValueCandidates::new(env_name_candidates))]
         env: Option<String>,
-        /// Authorize the destructive lockfile rebuild directly, skipping the
-        /// interactive confirm (for scripts / `--yes`). Re-pulls from remote
-        /// and overwrites local snapshot files; local edits not on the
-        /// remote are LOST.
-        #[arg(long = "rebuild-lock")]
-        rebuild_lock: bool,
-        /// Preview every step without writing, prompting, or calling the remote.
-        #[arg(long)]
-        check: bool,
+        /// Preview every step without writing.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
     /// Download and install the latest rdc release in place. Replaces
     /// the running binary atomically; keeps the previous binary as
@@ -357,9 +343,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let env = crate::cli::env_picker::pick_env("Set token for which env?", env)?;
             crate::cli::auth::run(&env, token, username).await
         }
-        Some(Command::Doctor { env, rebuild_lock, check }) => {
+        Some(Command::Doctor { env, dry_run }) => {
             let env = crate::cli::env_picker::pick_env("Which env to run the doctor on?", env)?;
-            with_401_retry(&env, || crate::cli::doctor::run(&env, rebuild_lock, check, cli.yes)).await
+            // doctor is fully offline — no `with_401_retry` wrapper needed.
+            crate::cli::doctor::run(&env, dry_run).await
         }
         Some(Command::Upgrade { version, check }) => {
             let target = match version {

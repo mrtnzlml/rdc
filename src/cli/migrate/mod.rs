@@ -1188,12 +1188,11 @@ pub fn run(
     let mapping_file = src_paths.mapping_file(src, tgt);
     let mut mapping = Mapping::load(&mapping_file)?;
     let added = crate::cli::deploy::map::auto_match(&mut mapping, &src_paths, &tgt_paths)?;
-    // Stale mapping entries (source slug no longer exists — e.g. a leftover
-    // after `doctor --rebuild-lock` reassigned slugs, or the source object was
-    // deleted) are DEAD: there's nothing to migrate for them, and a renamed
-    // object auto-matches by its new slug. Prune them from the persisted file
-    // (self-healing — a dead entry would otherwise resurface on every run)
-    // rather than hard-fail, so a rebuild doesn't block migrate.
+    // Stale mapping entries (source slug no longer exists — e.g. the source
+    // object was renamed or deleted) are DEAD: there's nothing to migrate for
+    // them, and a renamed object auto-matches by its new slug. Prune them from
+    // the persisted file (self-healing — a dead entry would otherwise resurface
+    // on every run) rather than hard-fail, so a rename doesn't block migrate.
     let stale = crate::cli::deploy::map::stale_mapping_sources(&mapping, &src_paths)?;
     if !stale.is_empty() {
         crate::cli::deploy::map::prune_stale_sources(&mut mapping, &stale);

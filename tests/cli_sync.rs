@@ -5829,12 +5829,12 @@ async fn sync_schema_conflict_json_and_formula_both_edited_never_silently_pushes
 }
 
 // ====================================================================
-// Regression: `rdc doctor --rebuild-lock` followed by `rdc sync` must
-// not panic on the classifier's `(local_changed=true, local_tombstoned=
-// false, remote_present=true, locked_present=false)` cell. This used to
-// fall into the catch-all panic arm because no class covered the
-// "lockfile-missing, both sides present" state — a state the rebuild-
-// lock workflow legitimately produces.
+// Regression: a lockfile wipe (e.g. deleting a corrupted lockfile)
+// followed by `rdc sync` must not panic on the classifier's
+// `(local_changed=true, local_tombstoned=false, remote_present=true,
+// locked_present=false)` cell. This used to fall into the catch-all
+// panic arm because no class covered the "lockfile-missing, both sides
+// present" state — a state a lockfile wipe legitimately produces.
 //
 // Both sub-cases are covered:
 //   1. Local matches remote byte-for-byte → classify as `Clean`, sync
@@ -5845,10 +5845,10 @@ async fn sync_schema_conflict_json_and_formula_both_edited_never_silently_pushes
 //      and never silently PATCHes the user's local edit onto remote.
 // ====================================================================
 
-/// Sub-case 1: post-`rebuild-lock` with local==remote. Sync must classify
+/// Sub-case 1: post-lockfile-wipe with local==remote. Sync must classify
 /// the label as `Clean`, rebuild the lockfile entry, and issue zero writes.
 #[tokio::test]
-async fn sync_after_rebuild_lock_in_sync_label_yields_clean_and_rebuilds_lockfile() {
+async fn sync_after_lockfile_wipe_in_sync_label_yields_clean_and_rebuilds_lockfile() {
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
@@ -5858,7 +5858,7 @@ async fn sync_after_rebuild_lock_in_sync_label_yields_clean_and_rebuilds_lockfil
         .await;
 
     // A single stable label served by every listing call. The body
-    // hashes identically across the initial sync, the post-rebuild sync,
+    // hashes identically across the initial sync, the post-wipe sync,
     // and any drift re-list during push (there is no push here).
     let label_body = serde_json::json!({
         "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
@@ -5866,7 +5866,7 @@ async fn sync_after_rebuild_lock_in_sync_label_yields_clean_and_rebuilds_lockfil
             {
                 "id": 42,
                 "url": format!("{}/api/v1/labels/42", server.uri()),
-                "name": "Rebuild Lock Stable",
+                "name": "Lockfile Wipe Stable",
                 "organization": format!("{}/api/v1/organizations/1", server.uri()),
                 "color": "#abcdef",
                 "modified_at": "2026-05-14T08:00:00Z"
@@ -5916,15 +5916,16 @@ async fn sync_after_rebuild_lock_in_sync_label_yields_clean_and_rebuilds_lockfil
 
     let label_path = project
         .path()
-        .join("envs/dev/labels/rebuild-lock-stable.json");
+        .join("envs/dev/labels/lockfile-wipe-stable.json");
     assert!(label_path.exists(), "first sync writes the label file");
 
     // Snapshot the local bytes so we can later prove they survive the
-    // rebuild-lock → sync round trip byte-for-byte.
+    // lockfile-wipe → sync round trip byte-for-byte.
     let local_before = std::fs::read(&label_path).unwrap();
 
-    // Simulate `rdc doctor --rebuild-lock`: wipe the lockfile but leave
-    // the local snapshot file on disk. The remote still serves the same
+    // Simulate a lockfile wipe (e.g. deleting a corrupted lockfile): remove
+    // the lockfile but leave the local snapshot file on disk. The remote
+    // still serves the same
     // body. Classifier will see: local_changed=true (no lockfile to
     // compare), remote_present=true, locked_present=false → the
     // previously-panicking cell.
@@ -5936,7 +5937,7 @@ async fn sync_after_rebuild_lock_in_sync_label_yields_clean_and_rebuilds_lockfil
     // dispatches through pull driver to rebuild the lockfile entry.
     let result = rdc::cli::sync::run("dev", false, false, false, false, false).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
-    result.expect("post-rebuild-lock sync must not panic when local==remote");
+    result.expect("post-wipe sync must not panic when local==remote");
 
     // Local file still there with the canonical body. The pull driver
     // may re-write byte-identical content; the bytes on disk must still
@@ -5944,7 +5945,7 @@ async fn sync_after_rebuild_lock_in_sync_label_yields_clean_and_rebuilds_lockfil
     let local_after = std::fs::read(&label_path).unwrap();
     assert_eq!(
         local_before, local_after,
-        "Clean post-rebuild-lock must not corrupt or alter local bytes"
+        "Clean post-wipe must not corrupt or alter local bytes"
     );
 
     // No mutating API calls hit the mock — Clean is pull-and-record only.
@@ -5969,33 +5970,33 @@ async fn sync_after_rebuild_lock_in_sync_label_yields_clean_and_rebuilds_lockfil
     let lf_raw = std::fs::read_to_string(&lockfile_path).unwrap();
     let lf: serde_json::Value = serde_json::from_str(&lf_raw).unwrap();
     let recorded = lf
-        .pointer("/objects/labels/rebuild-lock-stable/content_hash")
+        .pointer("/objects/labels/lockfile-wipe-stable/content_hash")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     assert!(
         recorded.is_some(),
-        "post-rebuild-lock sync must rebuild the lockfile entry: {lf_raw}"
+        "post-wipe sync must rebuild the lockfile entry: {lf_raw}"
     );
 
     // No shadow file landed — Clean means "no conflict, no prompt".
     let shadow = project
         .path()
-        .join(".rdc/conflicts/dev/labels/rebuild-lock-stable.json");
+        .join(".rdc/conflicts/dev/labels/lockfile-wipe-stable.json");
     assert!(
         !shadow.exists(),
-        "Clean post-rebuild-lock must not produce a shadow file at {}",
+        "Clean post-wipe must not produce a shadow file at {}",
         shadow.display()
     );
 }
 
-/// Sub-case 2: post-`rebuild-lock` with local != remote. Sync must
+/// Sub-case 2: post-lockfile-wipe with local != remote. Sync must
 /// classify the label as `BothDiverged`. In non-TTY mode the resolver
 /// falls back to the shadow file path, no PATCH lands, and the lockfile
 /// stays unset so the next sync re-prompts. This is the load-bearing
 /// case — pre-fix it would have panicked; pre-hardening it would have
 /// silently overwritten the user's local edit onto remote.
 #[tokio::test]
-async fn sync_after_rebuild_lock_diverged_label_does_not_panic_and_does_not_silently_push() {
+async fn sync_after_lockfile_wipe_diverged_label_does_not_panic_and_does_not_silently_push() {
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
@@ -6011,7 +6012,7 @@ async fn sync_after_rebuild_lock_diverged_label_does_not_panic_and_does_not_sile
             {
                 "id": 73,
                 "url": format!("{}/api/v1/labels/73", server.uri()),
-                "name": "Rebuild Lock Diverged",
+                "name": "Lockfile Wipe Diverged",
                 "organization": format!("{}/api/v1/organizations/1", server.uri()),
                 "color": "#aa0000",
                 "modified_at": "2026-05-14T08:00:00Z"
@@ -6061,7 +6062,7 @@ async fn sync_after_rebuild_lock_diverged_label_does_not_panic_and_does_not_sile
 
     let label_path = project
         .path()
-        .join("envs/dev/labels/rebuild-lock-diverged.json");
+        .join("envs/dev/labels/lockfile-wipe-diverged.json");
     assert!(label_path.exists(), "first sync writes the label file");
 
     // Locally edit the label so it no longer matches the remote body.
@@ -6071,7 +6072,7 @@ async fn sync_after_rebuild_lock_diverged_label_does_not_panic_and_does_not_sile
     let local_edited_bytes = format!("{}\n", serde_json::to_string_pretty(&v).unwrap());
     std::fs::write(&label_path, &local_edited_bytes).unwrap();
 
-    // Simulate `rdc doctor --rebuild-lock`: wipe the lockfile. The
+    // Simulate a lockfile wipe (e.g. deleting a corrupted lockfile). The
     // local edit stays on disk. Remote still serves the original body.
     let lockfile_path = project.path().join(".rdc/state/dev.lock.json");
     std::fs::remove_file(&lockfile_path).unwrap();
@@ -6082,7 +6083,7 @@ async fn sync_after_rebuild_lock_diverged_label_does_not_panic_and_does_not_sile
     // re-prompts.
     let result = rdc::cli::sync::run("dev", false, false, false, false, false).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
-    result.expect("post-rebuild-lock diverged sync must not panic");
+    result.expect("post-wipe diverged sync must not panic");
 
     // No PATCH/POST/DELETE on the label.
     let patch_calls = server
@@ -6094,7 +6095,7 @@ async fn sync_after_rebuild_lock_diverged_label_does_not_panic_and_does_not_sile
         .count();
     assert_eq!(
         patch_calls, 0,
-        "BothDiverged post-rebuild-lock must NOT be silently PATCHed (saw {patch_calls} PATCH calls)"
+        "BothDiverged post-wipe must NOT be silently PATCHed (saw {patch_calls} PATCH calls)"
     );
 
     // Local edit survives — the user's edit is not discarded by the
@@ -6109,7 +6110,7 @@ async fn sync_after_rebuild_lock_diverged_label_does_not_panic_and_does_not_sile
     // sees the env-side body.
     let shadow = project
         .path()
-        .join(".rdc/conflicts/dev/labels/rebuild-lock-diverged.json");
+        .join(".rdc/conflicts/dev/labels/lockfile-wipe-diverged.json");
     assert!(
         shadow.exists(),
         "BothDiverged in non-TTY mode must produce a shadow file at {}",
@@ -6123,7 +6124,7 @@ async fn sync_after_rebuild_lock_diverged_label_does_not_panic_and_does_not_sile
     let lf_raw = std::fs::read_to_string(&lockfile_path).unwrap();
     let lf: serde_json::Value = serde_json::from_str(&lf_raw).unwrap();
     let recorded = lf
-        .pointer("/objects/labels/rebuild-lock-diverged/content_hash")
+        .pointer("/objects/labels/lockfile-wipe-diverged/content_hash")
         .and_then(|v| v.as_str());
     assert!(
         recorded.is_none(),

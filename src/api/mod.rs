@@ -417,7 +417,7 @@ impl RossumClient {
             // API's page order (each page is itself `ordering=id`) so the merged
             // list is a deterministic, id-ordered sequence. Without this, a
             // same-named object's name-derived slug `-2` suffix would depend on
-            // response timing on a first pull / `rdc doctor --rebuild-lock`.
+            // response timing on a first pull.
             rest.sort_by_key(|(n, _)| *n);
             for (_, page) in rest {
                 raw.extend(page);
