@@ -367,7 +367,34 @@ pub(crate) async fn run_cycle(
                 )
             })
             .collect();
-        let push_count = push_items.len() + mdh_push.len();
+
+        // Secret-only hook pushes bypass the content classifier: a hook whose
+        // `secrets/<env>.hook-secrets.json` entry drifted while its JSON/code is
+        // unchanged is classified as unchanged (or absent from `classified`
+        // entirely), yet the real sync always runs the hooks secrets-only pass
+        // (and counts its PATCHes). Predict it here so the dry-run count matches.
+        // Exclude only hooks that are being CONTENT-pushed — their content PATCH
+        // already carries the secret and updates `secrets_hash`, so the real
+        // secrets-only pass skips them. An in-sync or pulled hook with secret
+        // drift is a genuine secret-only push and must stay.
+        let pushed_hooks: std::collections::BTreeSet<&str> = push_items
+            .iter()
+            .filter(|c| c.kind == "hooks")
+            .map(|c| c.slug.as_str())
+            .collect();
+        let hook_secrets = crate::secrets::load_hook_secrets(paths.root(), paths.env())?;
+        let (secret_push_all, secret_dangling_all) =
+            crate::cli::push::plan_secret_pushes(&hook_secrets, &lockfile);
+        let secret_only: Vec<&String> = secret_push_all
+            .iter()
+            .filter(|s| !pushed_hooks.contains(s.as_str()))
+            .collect();
+        let secret_dangling: Vec<&String> = secret_dangling_all
+            .iter()
+            .filter(|s| !pushed_hooks.contains(s.as_str()))
+            .collect();
+
+        let push_count = push_items.len() + mdh_push.len() + secret_only.len();
         if push_count > 0 {
             progress.event(Action::Plan, "would push");
             let mut body = String::new();
@@ -383,6 +410,9 @@ pub(crate) async fn run_cycle(
             }
             for it in &mdh_push {
                 let _ = writeln!(body, "- {}", it.line);
+            }
+            for slug in &secret_only {
+                let _ = writeln!(body, "- hooks/{slug} PATCH (secrets)");
             }
             progress.block(&body);
         }
@@ -411,6 +441,19 @@ pub(crate) async fn run_cycle(
                     _ => "",
                 };
                 let _ = writeln!(body, "- {}/{} -- {}", it.kind, it.slug, tag);
+            }
+            progress.block(&body);
+        }
+
+        // Secret entries whose slug matches no hook (typo, or a slug left stale
+        // after a rename) — the real sync warns and skips them. Surface the same
+        // warning in the preview so a mis-keyed secret is visible before a push.
+        if !secret_dangling.is_empty() {
+            progress.event(Action::Plan, "would warn");
+            let mut body = String::new();
+            use std::fmt::Write as _;
+            for slug in &secret_dangling {
+                let _ = writeln!(body, "- hooks/{slug} -- secret entry has no matching hook");
             }
             progress.block(&body);
         }

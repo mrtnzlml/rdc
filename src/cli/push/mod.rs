@@ -11,6 +11,9 @@ mod email_templates;
 mod engine_fields;
 mod engines;
 mod hooks;
+/// Re-exported for the `--dry-run` planner in [`crate::cli::sync`], which needs
+/// to predict the hooks secrets-only pass network-free.
+pub(crate) use hooks::plan_secret_pushes;
 mod inboxes;
 mod labels;
 pub mod mdh;
