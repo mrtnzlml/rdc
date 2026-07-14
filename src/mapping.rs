@@ -309,6 +309,90 @@ impl GenericMapping {
         }
         m
     }
+
+    /// Convert legacy per-pair mappings into one N-way table. Each input tuple is
+    /// `(env_a, env_b, mapping)` where `mapping` is a legacy `src -> tgt` map read
+    /// from `<env_a>-to-<env_b>.toml`. Identity pairs are dropped; non-identity
+    /// pairs become edges `(env_a, src) — (env_b, tgt)` joined into connected
+    /// components (one row per component). A component that forces one env to two
+    /// slugs is a hard error. `hook_templates` never enters (it is not a `KINDS`
+    /// entry and the legacy `Mapping` no longer carries it).
+    pub fn from_legacy(files: &[(String, String, Mapping)]) -> Result<GenericMapping> {
+        let mut out = GenericMapping::default();
+        for kind in Self::KINDS {
+            let mut rows: Vec<BTreeMap<String, String>> = Vec::new();
+            for (env_a, env_b, m) in files {
+                let Some(map) = m.kind_map(kind) else { continue };
+                for (src, tgt) in map {
+                    if src == tgt {
+                        continue; // identity — no row needed
+                    }
+                    merge_legacy_edge(&mut rows, env_a, src, env_b, tgt, kind)?;
+                }
+            }
+            *out.kind_rows_mut(kind).expect("KINDS entry is mappable") = rows;
+        }
+        Ok(out)
+    }
+}
+
+/// Insert `(env -> slug)` into `row`, hard-erroring if `env` already holds a
+/// different slug (an inconsistent legacy edge set).
+fn insert_legacy_node(
+    row: &mut BTreeMap<String, String>,
+    env: &str,
+    slug: &str,
+    kind: &str,
+) -> Result<()> {
+    match row.get(env) {
+        Some(existing) if existing != slug => anyhow::bail!(
+            "inconsistent legacy mapping for {kind}: env '{env}' maps to both \
+             '{existing}' and '{slug}'; resolve the conflict in the legacy \
+             .rdc/map/*.toml files before migrating"
+        ),
+        _ => {
+            row.insert(env.to_string(), slug.to_string());
+            Ok(())
+        }
+    }
+}
+
+/// Union the edge `(a_env, a_slug) — (b_env, b_slug)` into `rows`, keyed by
+/// `(env, slug)` nodes. Merges the two endpoints' rows when both already exist.
+fn merge_legacy_edge(
+    rows: &mut Vec<BTreeMap<String, String>>,
+    a_env: &str,
+    a_slug: &str,
+    b_env: &str,
+    b_slug: &str,
+    kind: &str,
+) -> Result<()> {
+    let ai = rows
+        .iter()
+        .position(|r| r.get(a_env).map(String::as_str) == Some(a_slug));
+    let bi = rows
+        .iter()
+        .position(|r| r.get(b_env).map(String::as_str) == Some(b_slug));
+    match (ai, bi) {
+        (Some(i), Some(j)) if i == j => Ok(()),
+        (Some(i), Some(j)) => {
+            let jrow = rows.remove(j);
+            let i2 = if j < i { i - 1 } else { i };
+            for (env, slug) in &jrow {
+                insert_legacy_node(&mut rows[i2], env, slug, kind)?;
+            }
+            Ok(())
+        }
+        (Some(i), None) => insert_legacy_node(&mut rows[i], b_env, b_slug, kind),
+        (None, Some(j)) => insert_legacy_node(&mut rows[j], a_env, a_slug, kind),
+        (None, None) => {
+            let mut row = BTreeMap::new();
+            row.insert(a_env.to_string(), a_slug.to_string());
+            row.insert(b_env.to_string(), b_slug.to_string());
+            rows.push(row);
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -466,5 +550,49 @@ version = 1
         // absent from the oriented map => tgt_slug falls back to identity.
         let m = g.orient("dev-us", "test-us");
         assert_eq!(m.lookup_tgt_slug("queues", "invoices"), None);
+    }
+
+    #[test]
+    fn from_legacy_joins_transitively_and_drops_identity() {
+        // dev->test renames a hook; test->prod renames it further. The two edges
+        // share the test node and must join into one 3-env row. Identity pairs are
+        // dropped entirely.
+        let mut dev_test = Mapping::default();
+        dev_test.hooks.insert("mdh".into(), "mdh-test".into());
+        dev_test.hooks.insert("validator".into(), "validator".into()); // identity
+        let mut test_prod = Mapping::default();
+        test_prod.hooks.insert("mdh-test".into(), "mdh-prod".into());
+
+        let g = GenericMapping::from_legacy(&[
+            ("dev".to_string(), "test".to_string(), dev_test),
+            ("test".to_string(), "prod".to_string(), test_prod),
+        ])
+        .unwrap();
+
+        assert_eq!(g.hooks.len(), 1, "identity dropped, one joined row");
+        let row = &g.hooks[0];
+        assert_eq!(row.get("dev").map(String::as_str), Some("mdh"));
+        assert_eq!(row.get("test").map(String::as_str), Some("mdh-test"));
+        assert_eq!(row.get("prod").map(String::as_str), Some("mdh-prod"));
+    }
+
+    #[test]
+    fn from_legacy_hard_errors_on_inconsistency() {
+        // dev->prod maps x to y; dev->test maps x to z; prod->test says y to w
+        // (not z) — inconsistent: node y (== object x) forced to test=z and test=w.
+        let mut dev_prod = Mapping::default();
+        dev_prod.queues.insert("x".into(), "y".into());
+        let mut dev_test = Mapping::default();
+        dev_test.queues.insert("x".into(), "z".into());
+        let mut prod_test = Mapping::default();
+        prod_test.queues.insert("y".into(), "w".into());
+
+        let err = GenericMapping::from_legacy(&[
+            ("dev".to_string(), "prod".to_string(), dev_prod),
+            ("dev".to_string(), "test".to_string(), dev_test),
+            ("prod".to_string(), "test".to_string(), prod_test),
+        ])
+        .unwrap_err();
+        assert!(format!("{err}").contains("inconsistent"));
     }
 }
