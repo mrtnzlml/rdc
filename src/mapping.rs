@@ -260,11 +260,40 @@ impl GenericMapping {
             _ => return None,
         })
     }
+
+    /// Reject rows that reference an env not in `rdc.toml`, or that map the same
+    /// `(env, slug)` in more than one row of a kind (which would make orientation
+    /// ambiguous). Both are hard errors so a hand-edit typo fails loudly.
+    pub fn validate(&self, known_envs: &std::collections::BTreeSet<String>) -> Result<()> {
+        for kind in Self::KINDS {
+            let rows = self.kind_rows(kind).expect("KINDS entry has rows");
+            let mut seen: std::collections::BTreeSet<(String, String)> =
+                std::collections::BTreeSet::new();
+            for row in rows {
+                for (env, slug) in row {
+                    if !known_envs.contains(env) {
+                        anyhow::bail!(
+                            ".rdc/mapping.toml: {kind} row references unknown env \
+                             '{env}' (not defined in rdc.toml)"
+                        );
+                    }
+                    if !seen.insert((env.clone(), slug.clone())) {
+                        anyhow::bail!(
+                            ".rdc/mapping.toml: {kind} maps ({env}, {slug}) in more \
+                             than one row — each (env, slug) must be unique per kind"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use tempfile::TempDir;
 
     #[test]
@@ -345,4 +374,42 @@ version = 1
         assert!(g.is_empty());
     }
 
+    #[test]
+    fn validate_rejects_unknown_env() {
+        let mut g = GenericMapping::default();
+        g.hooks.push(BTreeMap::from([
+            ("dev".to_string(), "h".to_string()),
+            ("staging".to_string(), "h2".to_string()),
+        ]));
+        let envs = BTreeSet::from(["dev".to_string(), "prod".to_string()]);
+        let err = g.validate(&envs).unwrap_err();
+        assert!(format!("{err}").contains("staging"));
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_env_slug_across_rows() {
+        let mut g = GenericMapping::default();
+        g.queues.push(BTreeMap::from([
+            ("dev".to_string(), "invoices".to_string()),
+            ("prod".to_string(), "invoices-a".to_string()),
+        ]));
+        g.queues.push(BTreeMap::from([
+            ("dev".to_string(), "invoices".to_string()),
+            ("prod".to_string(), "invoices-b".to_string()),
+        ]));
+        let envs = BTreeSet::from(["dev".to_string(), "prod".to_string()]);
+        let err = g.validate(&envs).unwrap_err();
+        assert!(format!("{err}").contains("invoices"));
+    }
+
+    #[test]
+    fn validate_accepts_well_formed() {
+        let mut g = GenericMapping::default();
+        g.queues.push(BTreeMap::from([
+            ("dev".to_string(), "invoices".to_string()),
+            ("prod".to_string(), "invoices-prod".to_string()),
+        ]));
+        let envs = BTreeSet::from(["dev".to_string(), "prod".to_string()]);
+        assert!(g.validate(&envs).is_ok());
+    }
 }
