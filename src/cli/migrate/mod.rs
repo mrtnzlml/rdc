@@ -17,12 +17,116 @@
 //! Afterwards the user reviews `git diff` and runs `rdc sync <tgt>` to push.
 //! `rdc deploy` is untouched; `migrate` is added alongside it.
 
-use crate::mapping::Mapping;
+use crate::mapping::{GenericMapping, Mapping};
 use crate::overlay::{Overlay, apply_overrides};
 use crate::snapshot::refs::{RDC_SCHEME, walk_strings_mut};
 use anyhow::{Context, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+/// Recover `(env_a, env_b)` from a legacy `<a>-to-<b>` file stem by matching
+/// both sides against known envs. Robust to hyphens in env names: it accepts
+/// the split where both halves are real envs.
+fn parse_legacy_env_pair(stem: &str, known_envs: &BTreeSet<String>) -> Option<(String, String)> {
+    for a in known_envs {
+        if let Some(rest) = stem.strip_prefix(&format!("{a}-to-")) {
+            if known_envs.contains(rest) {
+                return Some((a.clone(), rest.to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// Load `.rdc/mapping.toml`, or convert legacy per-pair files once if it is
+/// absent. On conversion: parse each legacy file, union its edges, write the
+/// generic file (unless empty), and delete the legacy files — a clean git diff.
+/// A dry run reports the conversion without writing or deleting.
+fn load_or_migrate_mapping(
+    src_paths: &crate::paths::Paths,
+    known_envs: &BTreeSet<String>,
+    dry_run: bool,
+    log: &crate::log::Log,
+) -> Result<GenericMapping> {
+    let generic_path = src_paths.mapping_file();
+    if generic_path.exists() {
+        return GenericMapping::load(&generic_path);
+    }
+    let legacy = src_paths.legacy_mapping_files();
+    if legacy.is_empty() {
+        return Ok(GenericMapping::default());
+    }
+
+    let mut parsed: Vec<(String, String, Mapping)> = Vec::new();
+    for path in &legacy {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let Some((a, b)) = parse_legacy_env_pair(stem, known_envs) else {
+            log.event(
+                crate::log::Action::Info,
+                &format!(
+                    "skipping legacy mapping file {} (env pair not in rdc.toml)",
+                    path.display()
+                ),
+            );
+            continue;
+        };
+        parsed.push((a, b, Mapping::load(path)?));
+    }
+
+    let generic = GenericMapping::from_legacy(&parsed)?;
+
+    let verb = if dry_run { "would migrate" } else { "migrated" };
+    log.event(
+        crate::log::Action::Info,
+        &format!(
+            "{verb} {} legacy mapping file(s) -> {}",
+            legacy.len(),
+            generic_path.display()
+        ),
+    );
+
+    if !dry_run {
+        if !generic.is_empty() {
+            generic.save(&generic_path)?;
+        }
+        for path in &legacy {
+            std::fs::remove_file(path)
+                .with_context(|| format!("removing legacy mapping {}", path.display()))?;
+        }
+    }
+    Ok(generic)
+}
+
+/// Count how many primary objects this migration will CREATE vs UPDATE in the
+/// target, by whether the remapped target JSON already exists. Mirrors the
+/// selection gate of the write loop. Used only for the migrate summary.
+fn count_create_update(
+    files: &[PathBuf],
+    tgt_root: &Path,
+    mapping: &Mapping,
+    selection: &Option<crate::cli::deploy::selection::Selection>,
+) -> (usize, usize) {
+    let mut create = 0usize;
+    let mut update = 0usize;
+    for rel in files {
+        let Some((kind, slug)) = classify(rel) else { continue };
+        if let Some(sel) = selection {
+            if !sel.contains(kind, &slug) {
+                continue;
+            }
+        }
+        let dst = remap_relative(rel, mapping);
+        if tgt_root.join(&dst).exists() {
+            update += 1;
+        } else {
+            create += 1;
+        }
+    }
+    (create, update)
+}
 
 /// Every portable kind that can appear as a `rdc://` reference target, paired
 /// with its `Mapping` accessor. `engine_fields`/`email_templates` are never
@@ -1524,6 +1628,39 @@ fn split_ext(leaf: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn parse_legacy_env_pair_handles_hyphenated_envs() {
+        let envs = BTreeSet::from([
+            "dev-eu".to_string(),
+            "test-eu".to_string(),
+            "prod-eu".to_string(),
+        ]);
+        assert_eq!(
+            parse_legacy_env_pair("dev-eu-to-test-eu", &envs),
+            Some(("dev-eu".to_string(), "test-eu".to_string()))
+        );
+        assert_eq!(parse_legacy_env_pair("unrelated", &envs), None);
+    }
+
+    #[test]
+    fn count_create_update_counts_by_target_file_presence() {
+        use crate::mapping::Mapping;
+        let dir = tempfile::TempDir::new().unwrap();
+        let tgt_root = dir.path().join("prod");
+        // An existing target hook => update; a missing one => create.
+        std::fs::create_dir_all(tgt_root.join("hooks")).unwrap();
+        std::fs::write(tgt_root.join("hooks").join("existing.json"), b"{}").unwrap();
+
+        let files = vec![
+            PathBuf::from("hooks/existing.json"),
+            PathBuf::from("hooks/brand-new.json"),
+        ];
+        let (create, update) =
+            count_create_update(&files, &tgt_root, &Mapping::default(), &None);
+        assert_eq!((create, update), (1, 1));
+    }
 
     #[test]
     fn url_host_extracts_bare_host() {
