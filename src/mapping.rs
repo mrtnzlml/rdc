@@ -149,6 +149,119 @@ impl Mapping {
     }
 }
 
+/// On-disk, direction-free slug map for a whole project. Each entry is a
+/// logical object; each environment names its own slug. Only objects whose
+/// slug DIFFERS across envs are stored — identical slugs map 1:1 by default.
+/// Oriented into a per-pair [`Mapping`] via [`orient`] for `migrate`.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct GenericMapping {
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schemas: Vec<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queues: Vec<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inboxes: Vec<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub email_templates: Vec<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engines: Vec<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engine_fields: Vec<BTreeMap<String, String>>,
+}
+
+impl Default for GenericMapping {
+    fn default() -> Self {
+        Self {
+            version: 2,
+            workspaces: Vec::new(),
+            hooks: Vec::new(),
+            rules: Vec::new(),
+            labels: Vec::new(),
+            schemas: Vec::new(),
+            queues: Vec::new(),
+            inboxes: Vec::new(),
+            email_templates: Vec::new(),
+            engines: Vec::new(),
+            engine_fields: Vec::new(),
+        }
+    }
+}
+
+impl GenericMapping {
+    pub const KINDS: [&'static str; 10] = [
+        "workspaces", "hooks", "rules", "labels", "schemas",
+        "queues", "inboxes", "email_templates", "engines", "engine_fields",
+    ];
+
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let g: GenericMapping = toml::from_str(&raw)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        Ok(g)
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let s = toml::to_string_pretty(self).context("serializing mapping")?;
+        crate::snapshot::writer::write_atomic(path, s.as_bytes())?;
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        Self::KINDS
+            .iter()
+            .all(|k| self.kind_rows(k).map(|r| r.is_empty()).unwrap_or(true))
+    }
+
+    pub fn kind_rows(&self, kind: &str) -> Option<&Vec<BTreeMap<String, String>>> {
+        Some(match kind {
+            "workspaces" => &self.workspaces,
+            "hooks" => &self.hooks,
+            "rules" => &self.rules,
+            "labels" => &self.labels,
+            "schemas" => &self.schemas,
+            "queues" => &self.queues,
+            "inboxes" => &self.inboxes,
+            "email_templates" => &self.email_templates,
+            "engines" => &self.engines,
+            "engine_fields" => &self.engine_fields,
+            _ => return None,
+        })
+    }
+
+    pub fn kind_rows_mut(&mut self, kind: &str) -> Option<&mut Vec<BTreeMap<String, String>>> {
+        Some(match kind {
+            "workspaces" => &mut self.workspaces,
+            "hooks" => &mut self.hooks,
+            "rules" => &mut self.rules,
+            "labels" => &mut self.labels,
+            "schemas" => &mut self.schemas,
+            "queues" => &mut self.queues,
+            "inboxes" => &mut self.inboxes,
+            "email_templates" => &mut self.email_templates,
+            "engines" => &mut self.engines,
+            "engine_fields" => &mut self.engine_fields,
+            _ => return None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +311,38 @@ version = 1
         assert_eq!(loaded.engine_fields.get("my-engine/total"), Some(&"my-engine/total".to_string()));
         assert!(!loaded.engine_fields.contains_key("amount"));
         assert!(!loaded.engine_fields.contains_key("item-qty"));
+    }
+
+    #[test]
+    fn generic_mapping_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("mapping.toml");
+        let mut g = GenericMapping::default();
+        g.queues.push(BTreeMap::from([
+            ("dev".to_string(), "invoices".to_string()),
+            ("prod".to_string(), "invoices-prod".to_string()),
+        ]));
+        g.hooks.push(BTreeMap::from([
+            ("dev".to_string(), "master-data-hub".to_string()),
+            ("prod".to_string(), "mdh-prod".to_string()),
+        ]));
+        g.save(&path).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("version = 2"));
+        assert!(raw.contains("[[queues]]"));
+        assert!(!raw.contains("[[labels]]"), "empty kinds are omitted");
+
+        let loaded = GenericMapping::load(&path).unwrap();
+        assert_eq!(loaded, g);
+    }
+
+    #[test]
+    fn generic_mapping_load_defaults_when_missing() {
+        let dir = TempDir::new().unwrap();
+        let g = GenericMapping::load(&dir.path().join("nope.toml")).unwrap();
+        assert_eq!(g.version, 2);
+        assert!(g.is_empty());
     }
 
 }
