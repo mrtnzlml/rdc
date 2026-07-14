@@ -519,3 +519,113 @@ pub async fn push(
 
     Ok((pushed + secrets_pushed, skipped))
 }
+
+/// Predict the secrets-only pass for `--dry-run`, network-free. Classifies each
+/// slug in the local hook-secrets file exactly as [`push`]'s secrets-only pass
+/// does, so the dry-run count matches the real run (which counts secret-only
+/// PATCHes in its total). Returns `(would_push, dangling)`, both sorted:
+///   - `would_push`: slugs with a lockfile entry whose `secrets_hash` differs
+///     from the local secret hash (including `None`, i.e. never pushed). The
+///     sync content classifier can't see these — a hook's JSON/code is unchanged
+///     while its secret (in the separate `secrets/<env>.hook-secrets.json`)
+///     drifted — so without this the dry-run undercounts the push.
+///   - `dangling`: slugs with NO lockfile entry — a typo or a slug left stale
+///     after a rename; the real pass warns and skips them (no id to target).
+pub fn plan_secret_pushes(
+    hook_secrets: &HookSecrets,
+    lockfile: &crate::state::Lockfile,
+) -> (Vec<String>, Vec<String>) {
+    let mut would_push = Vec::new();
+    let mut dangling = Vec::new();
+    for slug in hook_secrets.slugs() {
+        let local_hash = hook_secrets_hash(&hook_secrets.filled_kv_for_slug(slug));
+        match lockfile
+            .objects
+            .get("hooks")
+            .and_then(|m| m.get(slug.as_str()))
+        {
+            None => dangling.push(slug.clone()),
+            Some(entry) => {
+                if entry.secrets_hash.as_deref() != Some(local_hash.as_str()) {
+                    would_push.push(slug.clone());
+                }
+            }
+        }
+    }
+    would_push.sort();
+    dangling.sort();
+    (would_push, dangling)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{Lockfile, ObjectEntry};
+
+    fn secrets_with(entries: &[(&str, &str)]) -> HookSecrets {
+        // Write a hook-secrets file and load it through the real reader.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        let hooks: serde_json::Map<String, serde_json::Value> = entries
+            .iter()
+            .map(|(slug, val)| (slug.to_string(), serde_json::json!({ "password": *val })))
+            .collect();
+        let body = serde_json::json!({ "hooks": hooks });
+        std::fs::write(
+            dir.path().join("secrets/dev.hook-secrets.json"),
+            serde_json::to_string(&body).unwrap(),
+        )
+        .unwrap();
+        load_hook_secrets(dir.path(), "dev").unwrap()
+    }
+
+    fn entry(id: u64, secrets_hash: Option<&str>) -> ObjectEntry {
+        ObjectEntry {
+            id,
+            modified_at: None,
+            content_hash: None,
+            secrets_hash: secrets_hash.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn plan_secret_pushes_flags_drift_and_dangling_but_not_in_sync() {
+        let hs = secrets_with(&[
+            ("in-sync", "v1"),
+            ("drifted", "v2"),
+            ("dangling", "v3"),
+        ]);
+        let insync_hash = hook_secrets_hash(&hs.filled_kv_for_slug("in-sync"));
+
+        let mut lf = Lockfile::default();
+        // in-sync: lockfile hash matches local -> no push.
+        lf.upsert("hooks", "in-sync", entry(1, Some(&insync_hash)));
+        // drifted: lockfile hash differs -> secret-only push (classifier misses it).
+        lf.upsert("hooks", "drifted", entry(2, Some("stale-hash")));
+        // dangling: no lockfile entry at all -> warning, not a push.
+
+        let (would_push, dangling) = plan_secret_pushes(&hs, &lf);
+        assert_eq!(would_push, vec!["drifted".to_string()]);
+        assert_eq!(dangling, vec!["dangling".to_string()]);
+    }
+
+    #[test]
+    fn plan_secret_pushes_treats_none_secrets_hash_as_drift() {
+        // A hook that has never had its secret pushed (secrets_hash: None) but now
+        // has a local secret must be planned as a push.
+        let hs = secrets_with(&[("h", "v")]);
+        let mut lf = Lockfile::default();
+        lf.upsert("hooks", "h", entry(1, None));
+        let (would_push, dangling) = plan_secret_pushes(&hs, &lf);
+        assert_eq!(would_push, vec!["h".to_string()]);
+        assert!(dangling.is_empty());
+    }
+
+    #[test]
+    fn plan_secret_pushes_empty_when_no_secrets() {
+        let hs = secrets_with(&[]);
+        let (would_push, dangling) = plan_secret_pushes(&hs, &Lockfile::default());
+        assert!(would_push.is_empty());
+        assert!(dangling.is_empty());
+    }
+}
