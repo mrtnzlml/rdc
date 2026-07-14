@@ -120,9 +120,31 @@ impl Paths {
         self.root.join(".rdc").join("map")
     }
 
-    /// `<root>/.rdc/map/<src>-to-<tgt>.toml`
-    pub fn mapping_file(&self, src: &str, tgt: &str) -> PathBuf {
-        self.mapping_dir().join(format!("{src}-to-{tgt}.toml"))
+    /// `<root>/.rdc/mapping.toml` — the single, direction-free slug map.
+    pub fn mapping_file(&self) -> PathBuf {
+        self.root.join(".rdc").join("mapping.toml")
+    }
+
+    /// Legacy per-pair mapping files `<root>/.rdc/map/<a>-to-<b>.toml`, if any.
+    /// Superseded by [`mapping_file`]; enumerated only to migrate them once.
+    pub fn legacy_mapping_files(&self) -> Vec<PathBuf> {
+        let dir = self.mapping_dir();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension().and_then(|s| s.to_str()) == Some("toml")
+                    && p.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.contains("-to-"))
+                        .unwrap_or(false)
+            })
+            .collect();
+        out.sort();
+        out
     }
 
     /// `<root>/envs/<env>/hooks/`
@@ -318,9 +340,35 @@ mod tests {
     #[test]
     fn mapping_file_path() {
         assert_eq!(
-            p().mapping_file("test", "prod"),
-            Path::new("/proj/.rdc/map/test-to-prod.toml")
+            p().mapping_file(),
+            Path::new("/proj/.rdc/mapping.toml")
         );
+    }
+
+    #[test]
+    fn legacy_mapping_files_lists_pair_files_sorted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = Paths::for_env(dir.path(), "dev");
+        std::fs::create_dir_all(paths.mapping_dir()).unwrap();
+        std::fs::write(paths.mapping_dir().join("test-to-prod.toml"), b"").unwrap();
+        std::fs::write(paths.mapping_dir().join("dev-to-test.toml"), b"").unwrap();
+        // Not a legacy pair file — must be ignored.
+        std::fs::write(paths.mapping_dir().join("notes.txt"), b"").unwrap();
+
+        assert_eq!(
+            paths.legacy_mapping_files(),
+            vec![
+                paths.mapping_dir().join("dev-to-test.toml"),
+                paths.mapping_dir().join("test-to-prod.toml"),
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_mapping_files_empty_when_dir_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = Paths::for_env(dir.path(), "dev");
+        assert!(paths.legacy_mapping_files().is_empty());
     }
 
     #[test]
