@@ -791,9 +791,7 @@ so the sentinel never reaches the server.
   remote calls); review with `git diff`, then `rdc sync <tgt>` to push;
   `--dry-run` previews, `--only <kind>/<slug>` narrows scope
 - `rdc doctor <env>` — realign stale local slugs after
-  a remote rename (offline)
-- `rdc doctor <env> --rebuild-lock` — recover from a corrupted
-  lockfile by re-syncing everything
+  a remote rename and prune orphan base-cache entries (offline)
 
 ## Conflicts & drift
 

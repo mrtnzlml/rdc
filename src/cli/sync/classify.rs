@@ -95,7 +95,7 @@ pub fn classify(
             (true,  false, false, true) => SyncClass::LocalEditRemoteDelete,
             (false, true,  true,  true) if remote_hash != base_hash => SyncClass::LocalDeleteRemoteEdit,
 
-            // Lockfile entry missing (e.g., after `rdc doctor --rebuild-lock`
+            // Lockfile entry missing (e.g., an empty lockfile
             // or a fresh checkout where the file pre-exists), local and
             // remote both present. If they agree, treat as `Clean` — the
             // executor will record the hash, effectively rebuilding the
@@ -300,30 +300,30 @@ mod tests {
         assert_eq!(class_of(&result, "v1"), &SyncClass::LocalDeleteRemoteEdit);
     }
 
-    /// Regression: simulates a post-`rdc doctor --rebuild-lock` state where
-    /// the lockfile is empty but local and remote happen to be byte-equivalent.
+    /// Regression: simulates an empty-lockfile state (fresh checkout /
+    /// deleted lockfile) where local and remote happen to be byte-equivalent.
     /// `scan` reports the local file as changed (no lockfile entry to compare
     /// against), the remote listing has the same hash, and the classifier
     /// must mark the item `Clean` so the executor rebuilds the lockfile entry
     /// without any prompts or writes.
     #[test]
-    fn classify_rebuild_lock_matching_hashes_yields_clean() {
+    fn classify_empty_lockfile_matching_hashes_yields_clean() {
         let result = classify(
             &m(&[("email_templates", "x", "h_same")]), // remote
             &m(&[("email_templates", "x", "h_same")]), // scan changes (local)
             &BTreeSet::new(),
-            &BTreeMap::new(), // locked is EMPTY (post `--rebuild-lock`)
+            &BTreeMap::new(), // locked is EMPTY
         );
         assert_eq!(class_of(&result, "x"), &SyncClass::Clean);
     }
 
-    /// Regression: companion to the above — post-`--rebuild-lock` state
-    /// where local and remote disagree. With no base to compare against,
+    /// Regression: companion to the above — empty-lockfile state where
+    /// local and remote disagree. With no base to compare against,
     /// any divergence is a user-resolution conflict. The classifier MUST
     /// emit `BothDiverged` so the resolver fires; never a one-sided write
     /// class that would silently overwrite local edits.
     #[test]
-    fn classify_rebuild_lock_diverged_hashes_yields_both_diverged() {
+    fn classify_empty_lockfile_diverged_hashes_yields_both_diverged() {
         let result = classify(
             &m(&[("email_templates", "x", "h_remote")]),
             &m(&[("email_templates", "x", "h_local")]),

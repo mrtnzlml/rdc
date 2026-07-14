@@ -274,15 +274,15 @@ pub(crate) async fn run_cycle(
     // workspaces collapse onto one lockfile entry, so one is re-pushed every
     // sync forever (a silent non-idempotency). This only happens in a snapshot
     // that predates global slug dedup; a plain re-pull does NOT fix it (it
-    // matches the stale dirs) — only `doctor --rebuild-lock` (clean rebuild)
-    // reassigns unique slugs. Direct the user there rather than let it churn.
+    // matches the stale dirs) — the fix is to delete the duplicate queue dirs
+    // and re-pull so global dedup reassigns unique slugs.
     for (slug, wss) in crate::cli::push::scan::detect_slug_collisions(&paths) {
         progress.event(
             Action::Warn,
             &format!(
                 "queue slug '{slug}' exists in {} workspaces ({}); they collide on one lockfile \
-                 entry and will re-push every sync — run `rdc doctor {env} --rebuild-lock` to \
-                 reassign unique slugs",
+                 entry and will re-push every sync — delete the duplicate queue dir(s) and \
+                 re-run `rdc sync {env}` to re-pull with unique slugs",
                 wss.len(),
                 wss.join(", "),
             ),
@@ -620,8 +620,8 @@ pub fn from_catalog_scan_lockfile(
     let mut scan_tombstones: BTreeSet<(String, String)> = BTreeSet::new();
     let mut locked: BTreeMap<(String, String), String> = BTreeMap::new();
 
-    // Augment the lockfile with any catalog objects it's missing (e.g. after
-    // `doctor --rebuild-lock` wipes it). Reference normalization needs the
+    // Augment the lockfile with any catalog objects it's missing (e.g. an
+    // empty lockfile on a fresh checkout). Reference normalization needs the
     // object's URL in the lockfile to rewrite a remote URL to its `rdc://`
     // form; without this the remote (URL) and the on-disk snapshot (rdc://)
     // canonicalize differently and an unchanged object false-conflicts on the

@@ -50,9 +50,8 @@ pub fn auto_match(mapping: &mut Mapping, src_paths: &Paths, tgt_paths: &Paths) -
 /// Return the mapping entries whose SOURCE slug is absent from the src
 /// snapshot, as sorted `(kind, src_slug, tgt_slug)` triples. Auto-matched
 /// entries always exist (they're listed off disk), so in practice this only
-/// surfaces hand-curated mapping-file entries — a typo, a stale cross-env rename
-/// whose source object was renamed/removed, or a leftover after a
-/// `doctor --rebuild-lock` changed slugs.
+/// surfaces hand-curated mapping-file entries — a typo, or a stale cross-env
+/// rename whose source object was renamed/removed.
 ///
 /// A stale entry is DEAD: there is no source object to migrate, and a renamed
 /// object auto-matches by its new (identical) slug — so migrate PRUNES these

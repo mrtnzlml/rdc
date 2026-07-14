@@ -87,7 +87,7 @@ async fn list_hooks_paginates_until_done() {
 /// so they can COMPLETE out of order. The merged result must still be in page
 /// order (= the API's `ordering=id` order), otherwise name-derived slug `-2`
 /// suffixes for same-named objects spanning a page boundary become
-/// timing-dependent on a first pull / `rdc doctor --rebuild-lock`. Here page 3
+/// timing-dependent on a first pull. Here page 3
 /// responds immediately while page 2 is delayed, so completion order is [3, 2];
 /// the returned ids must still be [1, 2, 3].
 #[tokio::test]

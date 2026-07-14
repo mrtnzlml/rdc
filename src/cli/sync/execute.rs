@@ -155,7 +155,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
     // Side-map of `workspace_url → slug` populated alongside
     // `workspace_by_slug`. Used by the queue loop below as a fallback
     // when `ctx.lockfile.slug_for_url("workspaces", …)` misses — which
-    // it does on `doctor --rebuild-lock` (lockfile starts empty) and any
+    // it does when the lockfile starts empty (fresh checkout) and any
     // resume path where queues were created on remote in a prior failed
     // run but the lockfile was never persisted. Without this, every
     // queue silently `continue`s and the conflict resolver reports
@@ -1318,9 +1318,9 @@ fn resolve_one_conflict<R: BufRead>(
         // run still completes without blocking on stdin. The local file
         // stays as-is and the lockfile is pinned to the prior base —
         // advancing it would let the conflict silently disappear on
-        // subsequent runs. When there is no prior base (post-`rdc doctor
-        // --rebuild-lock` with diverged sides, or any first-encounter
-        // conflict), record `None` for the content_hash so the next sync
+        // subsequent runs. When there is no prior base (empty lockfile
+        // with diverged sides, or any first-encounter conflict), record
+        // `None` for the content_hash so the next sync
         // re-classifies as `BothDiverged` and re-prompts — recording
         // local hash here would make the next sync see a one-sided
         // `RemoteEdit` and silently overwrite the local edit.
@@ -1686,8 +1686,8 @@ fn resolve_one_conflict<R: BufRead>(
                 "{} partially resolved (markers retained); lockfile base preserved; re-run to resolve",
                 edit_target.display(),
             ));
-            // When base is absent (post-`rdc doctor --rebuild-lock`, or any
-            // first-encounter conflict), record `None` for the content_hash
+            // When base is absent (empty lockfile, or any first-encounter
+            // conflict), record `None` for the content_hash
             // so the next sync re-classifies as `BothDiverged` and re-prompts
             // — recording local hash here would let the next sync see a
             // one-sided `RemoteEdit` and silently overwrite the local edit.
@@ -1717,8 +1717,8 @@ fn resolve_one_conflict<R: BufRead>(
                 prompt_path.display(),
                 conflict_path.display(),
             ));
-            // When base is absent (post-`rdc doctor --rebuild-lock`, or any
-            // first-encounter conflict), record `None` for the content_hash
+            // When base is absent (empty lockfile, or any first-encounter
+            // conflict), record `None` for the content_hash
             // so the next sync re-classifies as `BothDiverged` and re-prompts
             // — recording local hash here would let the next sync see a
             // one-sided `RemoteEdit` and silently overwrite the local edit.
@@ -2168,7 +2168,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
     let mut workspace_by_slug: BTreeMap<String, &crate::model::Workspace> = BTreeMap::new();
     // Same `workspace_url → slug` side-map as the resolve_conflicts
     // path, used below to map queue.workspace URLs to slugs when the
-    // lockfile is empty (rebuild-lock or partial-deploy resume).
+    // lockfile is empty (fresh checkout or partial-deploy resume).
     let mut ws_url_to_slug: BTreeMap<String, String> = BTreeMap::new();
     {
         let mut used: HashSet<String> = HashSet::new();
@@ -3380,8 +3380,8 @@ pub async fn run(
         // driver's own `subset.contains(...)` guard.
         //
         // Also include `Clean` items whose lockfile entry is missing
-        // (`base_hash` is `None`) — this is the post-`rdc doctor
-        // --rebuild-lock` "in sync but no lockfile entry" case. Routing
+        // (`base_hash` is `None`) — the "in sync but no lockfile entry"
+        // case (empty lockfile / fresh checkout). Routing
         // through the pull driver is a safe no-op write (the bytes
         // canonicalize equal) and lets `record_object` rebuild the
         // lockfile entry so the next sync sees it as truly `Clean`.

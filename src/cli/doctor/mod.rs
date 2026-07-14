@@ -1,33 +1,20 @@
 //! `rdc doctor <env>` — diagnose and fix a local snapshot in one pass.
 //!
-//! Runs every fix automatically, prompting only where a real decision is
-//! required:
+//! Fully offline: no API calls, no prompts. Every fix is mechanical and
+//! applied automatically.
 //!
-//! 1. **Pre-flight** (offline): scan for local changes not yet pushed to the
-//!    remote and surface them, so the user knows what's at stake before any
-//!    destructive step.
-//! 2. **Slug renames** (offline, automatic): rename local files whose slug no
-//!    longer matches their JSON `name`. Cascade-aware; no decision to make.
-//! 3. **Canonical key order** (offline, automatic): rewrite any on-disk
-//!    JSON file whose top-level key order has drifted from what a fresh
-//!    `rdc sync` would produce. Cosmetic only (`content_hash` is
-//!    invariant under key-order changes), so it never invalidates the
-//!    lockfile. Fixes the legacy case of hooks pulled before
-//!    `HOOK_KEY_ORDER` existed.
-//! 4. **Store-anomaly hooks** (online): hooks with `extension_source:
-//!    "rossum_store"` and `hook_template: null`. Per hook the user picks the
-//!    cure (Convert / Reinstall / Skip).
-//! 5. **Rebuild lockfile** (online, DESTRUCTIVE): re-pull from remote,
-//!    overwriting local snapshot files. Offered behind a confirm (default
-//!    No) that names how many unpushed changes would be lost. Skipped under
-//!    `--yes` / non-TTY — destruction is never auto-authorized.
+//! 1. **Pre-flight** (report-only): scan for local changes not yet pushed to
+//!    the remote and surface them, so the user knows what's on disk but not
+//!    yet on the server.
+//! 2. **Slug renames** (automatic): rename local files whose slug no longer
+//!    matches their JSON `name`. Cascade-aware; no decision to make.
+//! 3. **Base-cache GC** (automatic): drop `.rdc/state/<env>.base/` files whose
+//!    env-tree counterpart no longer exists (deleted object, renamed slug
+//!    after pull, etc.).
 //!
-//! `--check` previews every step without writing or prompting.
+//! `--dry-run` previews every step without writing.
 
-pub mod canonicalize_keys;
-pub mod rebuild_lock;
 pub mod rename_slugs;
-pub mod store_anomaly;
 
 use crate::config::ProjectConfig;
 use crate::log::{Action, Log};
@@ -35,7 +22,7 @@ use crate::paths::Paths;
 use crate::state::Lockfile;
 use anyhow::{Context, Result, anyhow};
 
-pub async fn run(env: &str, rebuild_lock: bool, check: bool, yes: bool) -> Result<()> {
+pub async fn run(env: &str, dry_run: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let cfg = ProjectConfig::load(&cwd.join("rdc.toml"))?;
     let api_base = cfg
@@ -64,33 +51,25 @@ pub async fn run(env: &str, rebuild_lock: bool, check: bool, yes: bool) -> Resul
         );
     }
 
-    // Slug-realign and store-anomaly both read (and the cure mutates) the
-    // lockfile, so they can't run without one. Skip them when it's missing —
-    // that's the recovery case `--rebuild-lock` below exists for.
+    // Slug-realign reads the lockfile, so it can't run without one. Skip it
+    // when the lockfile is missing — run `rdc sync` first to create one.
     if paths.lockfile().exists() {
         // 2. Slug renames — mechanical, applied automatically.
         log.event(Action::Doctor, "checking slug alignment");
         rename_slugs::run(
-            env, check, /* yes = auto-apply, no per-rename prompt */ true,
+            env, dry_run, /* yes = auto-apply, no per-rename prompt */ true,
         )
         .await?;
 
-        // 3. Canonical key order — mechanical, applied automatically.
-        //    Hash-invariant, so it can run independently of the lockfile
-        //    state (we still gate on lockfile presence for ordering with
-        //    the other "read the lockfile, then fix" steps).
-        log.event(Action::Doctor, "checking canonical key order");
-        canonicalize_keys::run(&paths, check, &log)?;
-
-        // 4. Base-cache GC — drop `.rdc/state/<env>.base/` files whose
+        // 3. Base-cache GC — drop `.rdc/state/<env>.base/` files whose
         //    env-tree counterpart no longer exists (deleted object,
-        //    renamed slug after pull, etc.). Best-effort; check-mode
+        //    renamed slug after pull, etc.). Best-effort; dry-run
         //    reports what would be removed without writing.
         log.event(Action::Doctor, "checking base cache for orphans");
-        if check {
+        if dry_run {
             log.event(
                 Action::Info,
-                "would prune orphan base cache entries (use without --check to apply)",
+                "would prune orphan base cache entries (run without --dry-run to apply)",
             );
         } else {
             let pruned = crate::state::base_cache::prune_orphans(&paths)?;
@@ -103,20 +82,12 @@ pub async fn run(env: &str, rebuild_lock: bool, check: bool, yes: bool) -> Resul
                 );
             }
         }
-
-        // 5. Store-anomaly hooks — per-hook decision, prompted (unless --yes/non-TTY).
-        log.event(Action::Doctor, "checking store-extension hooks");
-        store_anomaly::run(env, check, yes).await?;
     } else {
         log.event(
             Action::Skip,
-            "slug-realign + canonicalize + store-anomaly checks skipped — no lockfile yet (sync first, or rebuild below)",
+            "slug-realign + base-cache checks skipped — no lockfile yet (run `rdc sync` first)",
         );
     }
-
-    // 4. Rebuild lockfile — destructive; explicit confirm, or `--rebuild-lock`
-    //    to authorize it directly.
-    maybe_rebuild_lock(env, &paths, &api_base, rebuild_lock, check, yes, &log).await?;
 
     log.event(Action::Done, &format!("doctor finished for env '{env}'"));
     Ok(())
@@ -135,78 +106,4 @@ fn count_unpushed(paths: &Paths, api_base: &str) -> Result<usize> {
     lockfile.api_base = api_base.to_string();
     let (_scanned, changes, tombstones) = crate::cli::push::scan::scan(paths, &lockfile)?;
     Ok(changes.total() + tombstones.total())
-}
-
-/// Offer the destructive lockfile rebuild. `--check` only reports that it's
-/// available. Otherwise it prompts (default No) and refuses to proceed
-/// without an explicit `y`; `--yes` / non-TTY skip it entirely so a scripted
-/// run never silently discards local edits. The prompt re-counts unpushed
-/// changes (the earlier fixes may have changed the total) and names how many
-/// would be lost.
-async fn maybe_rebuild_lock(
-    env: &str,
-    paths: &Paths,
-    api_base: &str,
-    force: bool,
-    check: bool,
-    yes: bool,
-    log: &std::sync::Arc<Log>,
-) -> Result<()> {
-    if check {
-        log.event(
-            Action::Info,
-            "would offer to rebuild the lockfile from remote (re-pull; discards local edits)",
-        );
-        return Ok(());
-    }
-
-    let unpushed = count_unpushed(paths, api_base)?;
-    let loss = if unpushed > 0 {
-        format!(" — {unpushed} unpushed local change(s) will be LOST")
-    } else {
-        String::new()
-    };
-
-    // `--rebuild-lock` is explicit authorization: run it directly, no confirm
-    // (it works under --yes / non-TTY precisely because the flag is consent).
-    if force {
-        log.event(
-            Action::Doctor,
-            &format!("rebuilding lockfile (--rebuild-lock){loss}"),
-        );
-        return rebuild_lock::run(env).await;
-    }
-    // No flag: only offer it interactively. Under --yes / non-TTY there's no
-    // way to authorize destruction, so skip rather than wipe edits silently.
-    if !crate::cli::resolve::is_interactive(yes) {
-        log.event(
-            Action::Skip,
-            "rebuild-lock skipped — pass --rebuild-lock to authorize it under --yes / non-TTY",
-        );
-        return Ok(());
-    }
-
-    let prompt = format!(
-        "Rebuild the lockfile by re-pulling '{env}' from the remote? \
-         Overwrites local snapshot files{loss}"
-    );
-    let proceed = match inquire::Confirm::new(&prompt)
-        .with_default(false)
-        .with_help_message(
-            "discards local edits not present on the remote; backs up the old lockfile first",
-        )
-        .prompt()
-    {
-        Ok(b) => b,
-        // Esc / Ctrl+C = don't rebuild.
-        Err(inquire::error::InquireError::OperationCanceled)
-        | Err(inquire::error::InquireError::OperationInterrupted) => false,
-        Err(e) => return Err(anyhow!("rebuild-lock prompt failed: {e}")),
-    };
-    if proceed {
-        rebuild_lock::run(env).await?;
-    } else {
-        log.event(Action::Skip, "rebuild-lock declined");
-    }
-    Ok(())
 }

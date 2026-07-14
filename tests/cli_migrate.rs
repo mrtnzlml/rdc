@@ -211,9 +211,9 @@ fn migrate_dry_run_writes_nothing() {
 /// A stale mapping entry (its source object doesn't exist on disk) must NOT
 /// abort migrate. It's a dead mapping — nothing to migrate for it — so migrate
 /// PRUNES it from the persisted mapping file (self-healing; no recurring
-/// warning) and proceeds to migrate the real objects. This keeps recovery
-/// unblocked after a `doctor --rebuild-lock` reassigns slugs, which leaves
-/// every pre-rebuild mapping entry "stale".
+/// warning) and proceeds to migrate the real objects. This keeps migrate
+/// unblocked when a source object is renamed or removed, which leaves its
+/// old mapping entry "stale".
 #[test]
 fn migrate_prunes_stale_mapping_source() {
     let project = init_two_env_project();
