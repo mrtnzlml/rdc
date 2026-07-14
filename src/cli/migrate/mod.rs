@@ -1288,39 +1288,15 @@ pub fn run(
 
     let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
 
-    // Mapping: load, auto-match same-slug pairs, prune stale entries, persist.
-    let mapping_file = src_paths.mapping_file(src, tgt);
-    let mut mapping = Mapping::load(&mapping_file)?;
-    let added = crate::cli::deploy::map::auto_match(&mut mapping, &src_paths, &tgt_paths)?;
-    // Stale mapping entries (source slug no longer exists — e.g. the source
-    // object was renamed or deleted) are DEAD: there's nothing to migrate for
-    // them, and a renamed object auto-matches by its new slug. Prune them from
-    // the persisted file (self-healing — a dead entry would otherwise resurface
-    // on every run) rather than hard-fail, so a rename doesn't block migrate.
-    let stale = crate::cli::deploy::map::stale_mapping_sources(&mapping, &src_paths)?;
-    if !stale.is_empty() {
-        crate::cli::deploy::map::prune_stale_sources(&mut mapping, &stale);
-        let listing: Vec<String> = stale
-            .iter()
-            .map(|(kind, s, t)| format!("  {kind}/{s} -> {t}"))
-            .collect();
-        log.event(
-            crate::log::Action::Info,
-            &format!(
-                "{} {} stale mapping entr{} from {} (source object no longer exists in '{src}'):\n{}",
-                if dry_run { "would prune" } else { "pruned" },
-                stale.len(),
-                if stale.len() == 1 { "y" } else { "ies" },
-                mapping_file.display(),
-                listing.join("\n"),
-            ),
-        );
-    }
-    if !dry_run {
-        std::fs::create_dir_all(src_paths.mapping_dir())
-            .with_context(|| format!("creating {}", src_paths.mapping_dir().display()))?;
-        mapping.save(&mapping_file)?;
-    }
+    let project_cfg = crate::config::ProjectConfig::load(&cwd.join("rdc.toml"))?;
+    let known_envs: std::collections::BTreeSet<String> =
+        project_cfg.envs.keys().cloned().collect();
+
+    // Slug map: load the generic .rdc/mapping.toml (converting legacy per-pair
+    // files once if needed), validate it, and orient onto this direction.
+    let generic = load_or_migrate_mapping(&src_paths, &known_envs, dry_run, &log)?;
+    generic.validate(&known_envs)?;
+    let mapping = generic.orient(src, tgt);
 
     // Optional `--only` selection filter (reuses deploy's pure-fs machinery).
     let selection = crate::cli::deploy::selection::resolve(&only, &src_paths, &tgt_paths)?;
@@ -1340,7 +1316,6 @@ pub fn run(
     // The target env's organization URL, used to set `organization` on objects
     // that are NEW in tgt (a cross-env create would otherwise carry the source
     // env's org). Matched objects take their org from the existing tgt file.
-    let project_cfg = crate::config::ProjectConfig::load(&cwd.join("rdc.toml"))?;
     let tgt_env_cfg = project_cfg
         .envs
         .get(tgt)
@@ -1352,6 +1327,10 @@ pub fn run(
     );
 
     let files = enumerate_files(&src_root, src)?;
+
+    let tgt_was_empty =
+        !tgt_root.exists() || enumerate_files(&tgt_root, tgt)?.is_empty();
+    let (creates, updates) = count_create_update(&files, &tgt_root, &mapping, &selection);
 
     // Un-creatable duplicate unique-typed email templates: when the SOURCE
     // queue holds more than one template of a per-queue-unique type, the
@@ -1480,10 +1459,23 @@ pub fn run(
     log.event(
         crate::log::Action::Done,
         &format!(
-            "{verb} {copied} file(s) ({renamed} renamed, {pruned} pruned, {added} auto-matched) \
+            "{verb} {copied} file(s) ({renamed} renamed, {pruned} pruned) \
              envs/{src} -> envs/{tgt}"
         ),
     );
+    log.event(
+        crate::log::Action::Info,
+        &format!("-> {tgt}: {updates} update, {creates} create"),
+    );
+    if tgt_was_empty {
+        log.event(
+            crate::log::Action::Info,
+            &format!(
+                "'{tgt}' is empty; this migrate creates {creates} object(s). \
+                 Author envs/{tgt}/overlay.toml for env-specific values."
+            ),
+        );
+    }
     if !dry_run {
         log.event(
             crate::log::Action::Info,
