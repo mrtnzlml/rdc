@@ -43,11 +43,6 @@ pub struct Mapping {
     /// Engine field slug → engine field slug.
     #[serde(default)]
     pub engine_fields: BTreeMap<String, String>,
-    /// Cross-cluster hook_template URL pairs, built by `rdc deploy` on first
-    /// run and persisted so subsequent deploys don't re-list `/hook_templates`
-    /// on the target cluster. Hand-editable for forced overrides.
-    #[serde(default)]
-    pub hook_templates: BTreeMap<String, String>,
 }
 
 impl Default for Mapping {
@@ -64,7 +59,6 @@ impl Default for Mapping {
             email_templates: BTreeMap::new(),
             engines: BTreeMap::new(),
             engine_fields: BTreeMap::new(),
-            hook_templates: BTreeMap::new(),
         }
     }
 }
@@ -134,6 +128,25 @@ impl Mapping {
             _ => return None,
         })
     }
+
+    /// Mutable sibling of [`kind_map`], used by [`GenericMapping::orient`] to
+    /// populate a fresh oriented `Mapping`. Same kind set; `None` for
+    /// non-deployable kinds.
+    pub fn kind_map_mut(&mut self, kind: &str) -> Option<&mut BTreeMap<String, String>> {
+        Some(match kind {
+            "workspaces" => &mut self.workspaces,
+            "hooks" => &mut self.hooks,
+            "rules" => &mut self.rules,
+            "labels" => &mut self.labels,
+            "queues" => &mut self.queues,
+            "schemas" => &mut self.schemas,
+            "inboxes" => &mut self.inboxes,
+            "email_templates" => &mut self.email_templates,
+            "engines" => &mut self.engines,
+            "engine_fields" => &mut self.engine_fields,
+            _ => return None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -187,22 +200,4 @@ version = 1
         assert!(!loaded.engine_fields.contains_key("item-qty"));
     }
 
-    #[test]
-    fn hook_templates_section_round_trips() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test_to_prod.toml");
-        let mut m = Mapping::default();
-        m.hook_templates.insert(
-            "https://test.rossum.app/api/v1/hook_templates/39".into(),
-            "https://prod.rossum.app/api/v1/hook_templates/41".into(),
-        );
-        m.save(&path).unwrap();
-
-        let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("[hook_templates]"));
-        assert!(raw.contains("hook_templates/39"));
-
-        let loaded = Mapping::load(&path).unwrap();
-        assert_eq!(loaded, m);
-    }
 }
