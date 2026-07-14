@@ -27,9 +27,13 @@
 //! reflect cascades that just happened (so a queue under a renamed
 //! workspace sees the new `ws_slug`).
 //!
-//! Overlay (`overlay.toml`) and mapping files (`.rdc/map/*.toml`) that
-//! reference old slugs become orphans. We warn but do not modify those
-//! files — they are user-authored configs.
+//! Overlay (`overlay.toml`) keys that reference a renamed slug are rewritten in
+//! place — `[hooks.<old>]` becomes `[hooks.<new>]` (and the compound
+//! `email_templates`/`engine_fields` segments cascade) — so a rename never
+//! leaves a dangling per-env override for `rdc migrate` to silently drop. The
+//! rewrite is surgical (table headers only), preserving comments and values.
+//! Mapping files (`.rdc/map/*.toml`) are still only warned about — `rdc migrate`
+//! self-heals their stale entries.
 
 use crate::paths::Paths;
 use crate::slug::slugify;
@@ -433,6 +437,8 @@ pub struct ApplyStats {
     pub applied: usize,
     pub skipped: usize,
     pub orphan_warnings: Vec<String>,
+    /// One line per overlay.toml key auto-renamed to follow an applied rename.
+    pub overlay_updates: Vec<String>,
 }
 
 /// Apply the pending list. Mutates lockfile in place; caller is
@@ -457,6 +463,10 @@ pub fn apply(
     // ws/q segment embeds a renamed slug. These are mid-string, not whole
     // tokens, so they need a separate prefix rewrite.
     let mut prefix_subst: Vec<(String, String)> = Vec::new();
+    // Renames that were actually applied, in order — used to keep the env's
+    // overlay.toml keys in sync (rename `[hooks.<old>]` -> `[hooks.<new>]` etc.)
+    // so a doctor rename never leaves a dangling override for `rdc migrate`.
+    let mut applied_renames: Vec<PendingRename> = Vec::new();
 
     // Process in priority order: workspaces, queues, leaves. The list
     // is already sorted by `detect`.
@@ -481,6 +491,7 @@ pub fn apply(
                 stats.orphan_warnings.extend(orphan_msgs);
                 ref_subst.extend(ref_subst_pairs(&p));
                 prefix_subst.extend(compound_prefix_pairs(&p));
+                applied_renames.push(p.clone());
                 // Cascade in-memory pending updates: if we just renamed
                 // a workspace, later Queue / EmailTemplate entries
                 // referencing the old ws_slug need their ws_slug
@@ -498,6 +509,16 @@ pub fn apply(
     if !ref_subst.is_empty() || !prefix_subst.is_empty() {
         rewrite_refs_in_tree(paths, &ref_subst, &prefix_subst)?;
         refresh_lockfile_hashes(paths, lockfile)?;
+    }
+
+    // Keep the env's overlay.toml keys aligned with the renames just applied, so
+    // a per-env override never dangles after a slug changes. Runs independently
+    // of the ref sweep — an email-template-only rename has no whole-token refs
+    // but can still carry an overlay key.
+    if !applied_renames.is_empty() {
+        let (overlay_updates, overlay_missed) = apply_overlay_rewrites(paths, &applied_renames)?;
+        stats.overlay_updates.extend(overlay_updates);
+        stats.orphan_warnings.extend(overlay_missed);
     }
 
     Ok(stats)
@@ -1008,17 +1029,233 @@ fn rewrite_compound_prefix(
     }
 }
 
-/// Scan overlay.toml and any .rdc/map/*.toml file for textual
-/// references to the old slug; return one warning string per file that
-/// matches. We don't rewrite — the user is in control of those files.
+/// An overlay.toml key rewrite implied by a rename. `WholeKey` renames a single
+/// table key (`[hooks.<old>]` -> `[hooks.<new>]`); `Segment` rewrites the Nth
+/// `/`-segment of every compound key of a kind (an engine rename moves the
+/// `<engine>` segment of each `engine_fields` key; a queue/workspace rename
+/// moves a segment of each `email_templates` key).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OverlayRewrite {
+    WholeKey {
+        kind: &'static str,
+        old: String,
+        new: String,
+    },
+    Segment {
+        kind: &'static str,
+        segment: usize,
+        old: String,
+        new: String,
+    },
+}
+
+/// The overlay.toml key rewrites a single applied rename implies. Overlays are
+/// keyed by slug per kind (hooks/rules/labels/engines/queues/schemas/inboxes/
+/// engine_fields/email_templates); a rename changing such a slug must move the
+/// matching overlay key or the per-env override silently dangles. Overlays have
+/// no workspaces/workflows/workflow_steps kinds, so those renames only cascade
+/// into the compound `email_templates` keys that embed them.
+fn overlay_rewrites_for(p: &PendingRename) -> Vec<OverlayRewrite> {
+    let whole = |kind, old: &str, new: &str| OverlayRewrite::WholeKey {
+        kind,
+        old: old.to_string(),
+        new: new.to_string(),
+    };
+    let seg = |kind, segment, old: &str, new: &str| OverlayRewrite::Segment {
+        kind,
+        segment,
+        old: old.to_string(),
+        new: new.to_string(),
+    };
+    match p {
+        PendingRename::Hook { old, new } => vec![whole("hooks", old, new)],
+        PendingRename::Rule { old, new } => vec![whole("rules", old, new)],
+        PendingRename::Label { old, new } => vec![whole("labels", old, new)],
+        PendingRename::EngineField { old, new } => vec![whole("engine_fields", old, new)],
+        PendingRename::EmailTemplate { ws, q, old, new } => vec![whole(
+            "email_templates",
+            &format!("{ws}/{q}/{old}"),
+            &format!("{ws}/{q}/{new}"),
+        )],
+        PendingRename::Engine { old, new } => {
+            vec![whole("engines", old, new), seg("engine_fields", 0, old, new)]
+        }
+        PendingRename::Queue { old, new, .. } => vec![
+            whole("queues", old, new),
+            whole("schemas", old, new),
+            whole("inboxes", old, new),
+            seg("email_templates", 1, old, new),
+        ],
+        PendingRename::Workspace { old, new } => vec![seg("email_templates", 0, old, new)],
+        PendingRename::Workflow { .. } | PendingRename::WorkflowStep { .. } => Vec::new(),
+    }
+}
+
+/// The overlay kinds, matching [`crate::overlay::Overlay::kind_maps`].
+const OVERLAY_KINDS: [&str; 9] = [
+    "hooks",
+    "rules",
+    "labels",
+    "schemas",
+    "queues",
+    "inboxes",
+    "email_templates",
+    "engines",
+    "engine_fields",
+];
+
+/// Enumerate the keys present under each overlay kind table. Best-effort: a
+/// parse failure yields an empty map (nothing to rewrite).
+fn overlay_keys_by_kind(text: &str) -> std::collections::BTreeMap<&'static str, Vec<String>> {
+    let mut out = std::collections::BTreeMap::new();
+    let Ok(toml::Value::Table(table)) = toml::from_str::<toml::Value>(text) else {
+        return out;
+    };
+    for kind in OVERLAY_KINDS {
+        if let Some(sub) = table.get(kind).and_then(|v| v.as_table())
+            && !sub.is_empty()
+        {
+            out.insert(kind, sub.keys().cloned().collect::<Vec<String>>());
+        }
+    }
+    out
+}
+
+/// Expand [`OverlayRewrite`]s into concrete `(kind, old_key, new_key)` pairs
+/// against the overlay's actual keys. `WholeKey` yields a pair only when the key
+/// is present; `Segment` yields one pair per existing compound key whose Nth
+/// `/`-segment matches, with that segment swapped.
+fn concrete_overlay_pairs(
+    rewrites: &[OverlayRewrite],
+    existing: &std::collections::BTreeMap<&'static str, Vec<String>>,
+) -> Vec<(&'static str, String, String)> {
+    let mut out = Vec::new();
+    for r in rewrites {
+        match r {
+            OverlayRewrite::WholeKey { kind, old, new } => {
+                if existing.get(kind).is_some_and(|ks| ks.iter().any(|k| k == old)) {
+                    out.push((*kind, old.clone(), new.clone()));
+                }
+            }
+            OverlayRewrite::Segment {
+                kind,
+                segment,
+                old,
+                new,
+            } => {
+                let Some(keys) = existing.get(kind) else {
+                    continue;
+                };
+                for k in keys {
+                    let parts: Vec<&str> = k.splitn(3, '/').collect();
+                    if parts.get(*segment).copied() == Some(old.as_str()) {
+                        let mut owned: Vec<String> = parts.iter().map(|s| s.to_string()).collect();
+                        owned[*segment] = new.clone();
+                        out.push((*kind, k.clone(), owned.join("/")));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Surgically rewrite overlay.toml table headers, renaming `[kind.old]` ->
+/// `[kind.new]` for each `(kind, old, new)` pair. Line-based and quote-aware
+/// (bare, `"..."`, or `'...'`), so comments, values, formatting, and unrelated
+/// tables (including `[hooks."*"]`) are preserved byte-for-byte — mirroring the
+/// surgical ref sweep, not a lossy parse/re-serialize round-trip. The closing
+/// `]` anchors the match so a slug never matches a longer sibling
+/// (`[hooks.cost]` never matches `[hooks.cost-invoices]`). Returns the updated
+/// text and the pairs actually applied.
+fn rewrite_overlay_text(
+    text: &str,
+    pairs: &[(&'static str, String, String)],
+) -> (String, Vec<(&'static str, String, String)>) {
+    let mut changed = Vec::new();
+    let mut lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
+    for line in lines.iter_mut() {
+        let indent_len = line.len() - line.trim_start().len();
+        let indent = line[..indent_len].to_string();
+        let body = line[indent_len..].to_string();
+        'pairs: for (kind, old, new) in pairs {
+            for (open, close) in [("", ""), ("\"", "\""), ("'", "'")] {
+                let header = format!("[{kind}.{open}{old}{close}]");
+                if let Some(rest) = body.strip_prefix(header.as_str())
+                    && (rest.is_empty() || rest.trim_start().starts_with('#'))
+                {
+                    let new_header = format!("[{kind}.{open}{new}{close}]");
+                    *line = format!("{indent}{new_header}{rest}");
+                    changed.push((*kind, old.clone(), new.clone()));
+                    break 'pairs;
+                }
+            }
+        }
+    }
+    (lines.join("\n"), changed)
+}
+
+/// Rewrite the env's `overlay.toml` so its keys follow the applied renames, in
+/// order. Reads the file once (no-op when absent/unparsable), and for each
+/// rename expands its [`OverlayRewrite`]s against the CURRENT text's keys before
+/// applying them — so a workspace rename and a queue rename under it compose
+/// correctly on the same compound `email_templates` key. Writes back atomically.
+///
+/// Returns `(updated, missed)`: `updated` describes each renamed key; `missed`
+/// flags a key that IS present in the overlay but written as a dotted inline key
+/// (not a `[table]` header) so the surgical rewrite couldn't reach it — the user
+/// must fix those by hand (and `rdc migrate` will hard-error on them otherwise).
+fn apply_overlay_rewrites(
+    paths: &Paths,
+    applied: &[PendingRename],
+) -> Result<(Vec<String>, Vec<String>)> {
+    let path = paths.overlay_file();
+    if !path.exists() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let original =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let mut text = original.clone();
+    let mut updated = Vec::new();
+    let mut missed = Vec::new();
+    for p in applied {
+        let rewrites = overlay_rewrites_for(p);
+        if rewrites.is_empty() {
+            continue;
+        }
+        let existing = overlay_keys_by_kind(&text);
+        let pairs = concrete_overlay_pairs(&rewrites, &existing);
+        if pairs.is_empty() {
+            continue;
+        }
+        let (new_text, changed) = rewrite_overlay_text(&text, &pairs);
+        for (kind, old, new) in &changed {
+            updated.push(format!("  {}: [{kind}.{old}] -> [{kind}.{new}]", path.display()));
+        }
+        for (kind, old, _new) in pairs.iter().filter(|pr| !changed.contains(pr)) {
+            missed.push(format!(
+                "  {} keys {kind}/{old} via a non-[table] form; update manually",
+                path.display()
+            ));
+        }
+        text = new_text;
+    }
+    if text != original {
+        crate::snapshot::writer::write_atomic(&path, text.as_bytes())?;
+    }
+    Ok((updated, missed))
+}
+
+/// Scan any `.rdc/map/*.toml` file for textual references to the old slug;
+/// return one warning per file that matches. Mapping files are user-authored and
+/// `rdc migrate` self-heals stale entries, so we warn rather than rewrite.
+/// (overlay.toml is handled separately by [`apply_overlay_rewrites`], which
+/// renames its keys in place rather than warning.)
 fn collect_orphans(paths: &Paths, kind: &str, old: &str, out: &mut Vec<String>) {
     let needle = format!("\"{old}\"");
     let dotted = format!(".{old}]");
-    let candidates: Vec<std::path::PathBuf> = std::iter::once(paths.overlay_file())
-        .chain(list_mapping_files(paths))
-        .collect();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    for path in candidates {
+    for path in list_mapping_files(paths) {
         if !path.exists() {
             continue;
         }
@@ -1088,8 +1325,14 @@ pub async fn run_within_env(env: &str, check: bool, yes: bool) -> Result<()> {
         "env '{env}': {} renames applied, {} skipped",
         stats.applied, stats.skipped
     );
+    if !stats.overlay_updates.is_empty() {
+        println!("updated overlay.toml keys to follow the renames:");
+        for u in &stats.overlay_updates {
+            println!("{u}");
+        }
+    }
     if !stats.orphan_warnings.is_empty() {
-        println!("note: overlay / mapping files reference renamed slugs:");
+        println!("note: mapping / overlay files still reference renamed slugs:");
         for w in &stats.orphan_warnings {
             println!("{w}");
         }
@@ -2073,5 +2316,197 @@ mod tests {
         let q = std::fs::read_to_string(qdir.join("queue.json")).unwrap();
         assert!(q.contains(r#""rdc://workflows/new-flow""#), "queue workflow ref: {q}");
         assert!(!q.contains("old-wf"), "no stale workflow slug in queue: {q}");
+    }
+
+    // ---- overlay.toml key rewriting on rename (doctor keeps overlays in sync) ----
+
+    #[test]
+    fn overlay_rewrites_for_hook_is_a_whole_key() {
+        let p = PendingRename::Hook { old: "a".into(), new: "b".into() };
+        assert_eq!(
+            overlay_rewrites_for(&p),
+            vec![OverlayRewrite::WholeKey { kind: "hooks", old: "a".into(), new: "b".into() }]
+        );
+    }
+
+    #[test]
+    fn overlay_rewrites_for_engine_cascades_to_engine_fields() {
+        let p = PendingRename::Engine { old: "e1".into(), new: "e2".into() };
+        assert_eq!(
+            overlay_rewrites_for(&p),
+            vec![
+                OverlayRewrite::WholeKey { kind: "engines", old: "e1".into(), new: "e2".into() },
+                OverlayRewrite::Segment {
+                    kind: "engine_fields",
+                    segment: 0,
+                    old: "e1".into(),
+                    new: "e2".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn overlay_rewrites_for_queue_covers_schema_inbox_and_templates() {
+        let p = PendingRename::Queue { ws: "ws".into(), old: "q1".into(), new: "q2".into() };
+        assert_eq!(
+            overlay_rewrites_for(&p),
+            vec![
+                OverlayRewrite::WholeKey { kind: "queues", old: "q1".into(), new: "q2".into() },
+                OverlayRewrite::WholeKey { kind: "schemas", old: "q1".into(), new: "q2".into() },
+                OverlayRewrite::WholeKey { kind: "inboxes", old: "q1".into(), new: "q2".into() },
+                OverlayRewrite::Segment {
+                    kind: "email_templates",
+                    segment: 1,
+                    old: "q1".into(),
+                    new: "q2".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn overlay_rewrites_for_workspace_only_touches_email_templates() {
+        // Overlays have no `workspaces` kind — only the email-template prefix moves.
+        let p = PendingRename::Workspace { old: "w1".into(), new: "w2".into() };
+        assert_eq!(
+            overlay_rewrites_for(&p),
+            vec![OverlayRewrite::Segment {
+                kind: "email_templates",
+                segment: 0,
+                old: "w1".into(),
+                new: "w2".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn overlay_rewrites_for_workflow_kinds_is_empty() {
+        // Overlays cannot key workflows / workflow_steps.
+        assert!(
+            overlay_rewrites_for(&PendingRename::Workflow { old: "a".into(), new: "b".into() })
+                .is_empty()
+        );
+        assert!(
+            overlay_rewrites_for(&PendingRename::WorkflowStep {
+                old: "a/s".into(),
+                new: "a/s2".into()
+            })
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn concrete_overlay_pairs_expands_segment_against_existing_keys() {
+        let rewrites = vec![OverlayRewrite::Segment {
+            kind: "email_templates",
+            segment: 1,
+            old: "q1".into(),
+            new: "q2".into(),
+        }];
+        let mut existing: std::collections::BTreeMap<&'static str, Vec<String>> =
+            std::collections::BTreeMap::new();
+        existing.insert(
+            "email_templates",
+            vec!["ws/q1/t1".into(), "ws/q1/t2".into(), "ws/other/t3".into()],
+        );
+        let pairs = concrete_overlay_pairs(&rewrites, &existing);
+        assert!(pairs.contains(&("email_templates", "ws/q1/t1".into(), "ws/q2/t1".into())));
+        assert!(pairs.contains(&("email_templates", "ws/q1/t2".into(), "ws/q2/t2".into())));
+        assert!(!pairs.iter().any(|(_, o, _)| o == "ws/other/t3"));
+    }
+
+    #[test]
+    fn concrete_overlay_pairs_whole_key_only_when_present() {
+        let rewrites =
+            vec![OverlayRewrite::WholeKey { kind: "hooks", old: "a".into(), new: "b".into() }];
+        let mut existing: std::collections::BTreeMap<&'static str, Vec<String>> =
+            std::collections::BTreeMap::new();
+        existing.insert("hooks", vec!["a".into(), "c".into()]);
+        assert_eq!(
+            concrete_overlay_pairs(&rewrites, &existing),
+            vec![("hooks", "a".to_string(), "b".to_string())]
+        );
+        let empty: std::collections::BTreeMap<&'static str, Vec<String>> =
+            std::collections::BTreeMap::new();
+        assert!(concrete_overlay_pairs(&rewrites, &empty).is_empty());
+    }
+
+    #[test]
+    fn rewrite_overlay_text_renames_flat_header_preserving_comments_and_body() {
+        let text = "version = 1\n\n[hooks.\"*\"]\ntoken_owner = \"svc\"\n\n# sftp creds\n[hooks.sftp-import-initial-load]\nsettings.credentials.host = \"h\"\n";
+        let (out, changed) = rewrite_overlay_text(
+            text,
+            &[("hooks", "sftp-import-initial-load".into(), "sftp-import-master-data".into())],
+        );
+        assert!(out.contains("[hooks.sftp-import-master-data]"), "renamed: {out}");
+        assert!(!out.contains("[hooks.sftp-import-initial-load]"), "old gone: {out}");
+        assert!(out.contains("[hooks.\"*\"]"), "wildcard untouched: {out}");
+        assert!(out.contains("# sftp creds"), "comment preserved: {out}");
+        assert!(out.contains("settings.credentials.host = \"h\""), "body preserved: {out}");
+        assert_eq!(changed.len(), 1);
+    }
+
+    #[test]
+    fn rewrite_overlay_text_renames_quoted_compound_header() {
+        let text = "[email_templates.\"ws/q1/t1\"]\nname = \"x\"\n";
+        let (out, changed) = rewrite_overlay_text(
+            text,
+            &[("email_templates", "ws/q1/t1".into(), "ws/q2/t1".into())],
+        );
+        assert!(out.contains("[email_templates.\"ws/q2/t1\"]"), "compound rewritten: {out}");
+        assert_eq!(changed.len(), 1);
+    }
+
+    #[test]
+    fn rewrite_overlay_text_no_false_prefix_match() {
+        // `[hooks.cost]` must NOT match `[hooks.cost-invoices]`.
+        let text = "[hooks.cost-invoices]\nname = \"x\"\n";
+        let (out, changed) =
+            rewrite_overlay_text(text, &[("hooks", "cost".into(), "price".into())]);
+        assert_eq!(out, text, "unchanged");
+        assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn apply_hook_rename_rewrites_overlay_toml_key() {
+        use crate::state::ObjectEntry;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+        std::fs::write(
+            paths.hooks_dir().join("sftp-import-initial-load.json"),
+            r#"{"id":1,"name":"SFTP Import Master Data","queues":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            paths.overlay_file(),
+            "version = 1\n\n# sftp creds for this env\n[hooks.sftp-import-initial-load]\nsettings.credentials.host = \"h\"\n",
+        )
+        .unwrap();
+
+        let mut lockfile = Lockfile::default();
+        lockfile.upsert(
+            "hooks",
+            "sftp-import-initial-load",
+            ObjectEntry { id: 1, modified_at: None, content_hash: None, secrets_hash: None },
+        );
+
+        let pending = detect(&paths, &lockfile);
+        assert_eq!(
+            pending,
+            vec![PendingRename::Hook {
+                old: "sftp-import-initial-load".into(),
+                new: "sftp-import-master-data".into(),
+            }]
+        );
+
+        apply(&paths, &mut lockfile, pending, false).unwrap();
+
+        let ov = std::fs::read_to_string(paths.overlay_file()).unwrap();
+        assert!(ov.contains("[hooks.sftp-import-master-data]"), "overlay key renamed: {ov}");
+        assert!(!ov.contains("sftp-import-initial-load"), "old overlay key gone: {ov}");
+        assert!(ov.contains("# sftp creds for this env"), "comment preserved: {ov}");
+        assert!(ov.contains("settings.credentials.host = \"h\""), "body preserved: {ov}");
     }
 }
