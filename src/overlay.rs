@@ -113,6 +113,25 @@ impl Overlay {
     pub fn engine_field(&self, slug: &str) -> Option<&BTreeMap<String, Value>> {
         self.engine_fields.get(slug)
     }
+
+    /// Every override group as a `(kind, keys)` pair, using the same kind strings
+    /// the migrate driver dispatches on (see [`crate::cli::migrate`]). Lets a
+    /// caller iterate the whole overlay uniformly — e.g. to validate that each
+    /// key targets an object the migration actually produces.
+    #[allow(clippy::type_complexity)]
+    pub fn kind_maps(&self) -> [(&'static str, &BTreeMap<String, BTreeMap<String, Value>>); 9] {
+        [
+            ("hooks", &self.hooks),
+            ("rules", &self.rules),
+            ("labels", &self.labels),
+            ("schemas", &self.schemas),
+            ("queues", &self.queues),
+            ("inboxes", &self.inboxes),
+            ("email_templates", &self.email_templates),
+            ("engines", &self.engines),
+            ("engine_fields", &self.engine_fields),
+        ]
+    }
 }
 
 impl Default for Overlay {
