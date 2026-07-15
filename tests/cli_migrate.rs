@@ -181,8 +181,21 @@ version = 1
         b"def f(p):\n    return {}\n"
     );
 
-    // Mapping was persisted (auto-match would also fill same-slug pairs).
-    assert!(root.join(".rdc/map/test-to-prod.toml").exists());
+    // The legacy per-pair file is converted into the generic mapping and
+    // then deleted — a clean git diff, no more `.rdc/map/*.toml`.
+    assert!(
+        !root.join(".rdc/map/test-to-prod.toml").exists(),
+        "legacy mapping file must be deleted after conversion"
+    );
+    let mapping_after = std::fs::read_to_string(root.join(".rdc/mapping.toml")).unwrap();
+    assert!(
+        mapping_after.contains("main-prod"),
+        "converted mapping must carry the workspace rename: {mapping_after}"
+    );
+    assert!(
+        mapping_after.contains("invoices-prod"),
+        "converted mapping must carry the queue/schema rename: {mapping_after}"
+    );
 }
 
 /// `--dry-run` prints the plan and writes nothing to the target snapshot.
@@ -208,22 +221,22 @@ fn migrate_dry_run_writes_nothing() {
     );
 }
 
-/// A stale mapping entry (its source object doesn't exist on disk) must NOT
-/// abort migrate. It's a dead mapping — nothing to migrate for it — so migrate
-/// PRUNES it from the persisted mapping file (self-healing; no recurring
-/// warning) and proceeds to migrate the real objects. This keeps migrate
-/// unblocked when a source object is renamed or removed, which leaves its
-/// old mapping entry "stale".
+/// A mapping entry whose source object doesn't exist on disk (`ghost`) must
+/// NOT abort migrate, and must NOT fabricate a target object — there is
+/// simply nothing on the source side to migrate for it. There is no more
+/// stale-entry pruning: BOTH the dead `ghost` entry and the live `renamer`
+/// entry are converted verbatim into `.rdc/mapping.toml` rows (conversion is
+/// a pure legacy-file transform, blind to whether the source object still
+/// exists), and the legacy per-pair file is deleted once converted.
 #[test]
-fn migrate_prunes_stale_mapping_source() {
+fn migrate_converts_legacy_mapping_unmatched_rename_is_harmless() {
     let project = init_two_env_project();
     let root = project.path();
     write(
         &root.join("envs/test/hooks/extractor.json"),
         &serde_json::json!({ "name": "Extractor" }),
     );
-    // A live hand-curated entry for a real source object must SURVIVE the
-    // prune (only dead entries go).
+    // A live hand-curated rename for a real source object.
     write(
         &root.join("envs/test/hooks/renamer.json"),
         &serde_json::json!({ "name": "Renamer" }),
@@ -243,34 +256,39 @@ fn migrate_prunes_stale_mapping_source() {
     let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true);
     std::env::set_current_dir(&prev).unwrap();
 
-    // Migrate SUCCEEDS despite the stale entry (previously it hard-failed).
-    result.expect("stale mapping source must not abort migrate");
-    // The real object was migrated; the dead `ghost` entry produced nothing.
+    // Migrate SUCCEEDS despite the unmatched entry.
+    result.expect("an unmatched mapping source must not abort migrate");
+    // The real objects were migrated; the dead `ghost` entry produced nothing.
     assert!(
         root.join("envs/prod/hooks/extractor.json").exists(),
-        "the real source hook must be migrated"
+        "the identity-mapped source hook must be migrated"
+    );
+    assert!(
+        root.join("envs/prod/hooks/renamer-prod.json").exists(),
+        "the renamed source hook must be migrated under its target slug"
     );
     assert!(
         !root.join("envs/prod/hooks/ghost.json").exists(),
-        "a dead mapping entry must not fabricate a target object"
+        "a mapping entry with no source object must not fabricate a target object"
     );
-    // The stale entry is PRUNED from the persisted mapping file so it never
-    // warns again; the live hand-curated rename survives.
-    let map_after = std::fs::read_to_string(map_dir.join("test-to-prod.toml")).unwrap();
+
+    // The legacy file is converted then deleted — no more per-pair files.
     assert!(
-        !map_after.contains("ghost"),
-        "stale mapping entry must be pruned from the mapping file: {map_after}"
+        !map_dir.join("test-to-prod.toml").exists(),
+        "legacy mapping file must be deleted after conversion"
     );
+    let mapping_after = std::fs::read_to_string(root.join(".rdc/mapping.toml")).unwrap();
     assert!(
-        map_after.contains("renamer = \"renamer-prod\""),
-        "live hand-curated mapping entry must survive the prune: {map_after}"
+        mapping_after.contains("renamer-prod"),
+        "converted mapping must carry the renamer->renamer-prod rename: {mapping_after}"
     );
 }
 
-/// `--dry-run` must not rewrite the mapping file — the stale entry stays
-/// until a real (writing) migrate prunes it.
+/// `--dry-run` must not convert the legacy per-pair mapping file into
+/// `.rdc/mapping.toml`, nor delete it — the conversion (and its file-system
+/// side effects) only happens on a real (writing) migrate.
 #[test]
-fn migrate_dry_run_does_not_prune_mapping_file() {
+fn migrate_dry_run_does_not_convert_or_delete_legacy_mapping_file() {
     let project = init_two_env_project();
     let root = project.path();
     write(
@@ -293,7 +311,11 @@ fn migrate_dry_run_does_not_prune_mapping_file() {
     let map_after = std::fs::read_to_string(map_dir.join("test-to-prod.toml")).unwrap();
     assert_eq!(
         map_after, map_body,
-        "dry-run must leave the mapping file byte-identical"
+        "dry-run must leave the legacy mapping file byte-identical"
+    );
+    assert!(
+        !root.join(".rdc/mapping.toml").exists(),
+        "dry-run must not write the generic mapping file"
     );
 }
 
