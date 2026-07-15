@@ -58,6 +58,11 @@ fn load_or_migrate_mapping(
     }
 
     let mut parsed: Vec<(String, String, Mapping)> = Vec::new();
+    // Only the legacy files we actually parsed above — never the ones
+    // skipped because their env pair isn't in `rdc.toml`. Deleting a
+    // skipped file would silently destroy a mapping this run never
+    // converted; the cleanup loop below MUST use this list, not `legacy`.
+    let mut converted: Vec<PathBuf> = Vec::new();
     for path in &legacy {
         let stem = path
             .file_stem()
@@ -74,16 +79,20 @@ fn load_or_migrate_mapping(
             continue;
         };
         parsed.push((a, b, Mapping::load(path)?));
+        converted.push(path.clone());
     }
 
     let generic = GenericMapping::from_legacy(&parsed)?;
+    // Validate BEFORE persisting/deleting anything: an invalid conversion
+    // must neither be saved nor cost us the legacy files it came from.
+    generic.validate(known_envs)?;
 
     let verb = if dry_run { "would migrate" } else { "migrated" };
     log.event(
         crate::log::Action::Info,
         &format!(
             "{verb} {} legacy mapping file(s) -> {}",
-            legacy.len(),
+            converted.len(),
             generic_path.display()
         ),
     );
@@ -92,7 +101,7 @@ fn load_or_migrate_mapping(
         if !generic.is_empty() {
             generic.save(&generic_path)?;
         }
-        for path in &legacy {
+        for path in &converted {
             std::fs::remove_file(path)
                 .with_context(|| format!("removing legacy mapping {}", path.display()))?;
         }
@@ -102,16 +111,22 @@ fn load_or_migrate_mapping(
 
 /// Count how many primary objects this migration will CREATE vs UPDATE in the
 /// target, by whether the remapped target JSON already exists. Mirrors the
-/// selection gate of the write loop. Used only for the migrate summary.
+/// selection gate AND the un-creatable-unique-template skip of the write
+/// loop (`skip`), so the summary never overcounts files the write loop will
+/// actually skip. Used only for the migrate summary.
 fn count_create_update(
     files: &[PathBuf],
     tgt_root: &Path,
     mapping: &Mapping,
     selection: &Option<crate::cli::deploy::selection::Selection>,
+    skip: &BTreeSet<PathBuf>,
 ) -> (usize, usize) {
     let mut create = 0usize;
     let mut update = 0usize;
     for rel in files {
+        if skip.contains(rel) {
+            continue;
+        }
         let Some((kind, slug)) = classify(rel) else { continue };
         if let Some(sel) = selection {
             if !sel.contains(kind, &slug) {
@@ -1330,7 +1345,6 @@ pub fn run(
 
     let tgt_was_empty =
         !tgt_root.exists() || enumerate_files(&tgt_root, tgt)?.is_empty();
-    let (creates, updates) = count_create_update(&files, &tgt_root, &mapping, &selection);
 
     // Un-creatable duplicate unique-typed email templates: when the SOURCE
     // queue holds more than one template of a per-queue-unique type, the
@@ -1341,6 +1355,10 @@ pub fn run(
     // (and let `--mirror` prune stale copies of them from the target tree).
     let tgt_lockfile = crate::state::Lockfile::load(&tgt_paths.lockfile()).unwrap_or_default();
     let unique_tpl_skips = unique_template_skips(&files, &src_root, &mapping, &tgt_lockfile);
+    // Computed AFTER unique_tpl_skips so the summary counts never include
+    // files the write loop below will skip as un-creatable duplicates.
+    let (creates, updates) =
+        count_create_update(&files, &tgt_root, &mapping, &selection, &unique_tpl_skips);
     if !unique_tpl_skips.is_empty() {
         let listing: Vec<String> = unique_tpl_skips
             .iter()
@@ -1637,6 +1655,41 @@ mod tests {
     }
 
     #[test]
+    fn load_or_migrate_mapping_deletes_only_converted_legacy_files() {
+        use crate::mapping::Mapping;
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = crate::paths::Paths::for_env(dir.path(), "dev");
+        std::fs::create_dir_all(paths.mapping_dir()).unwrap();
+
+        // Known pair (dev/test both in rdc.toml) -> parsed, converted, and
+        // its legacy file deleted.
+        let known_path = paths.mapping_dir().join("dev-to-test.toml");
+        let mut known_mapping = Mapping::default();
+        known_mapping.hooks.insert("a".to_string(), "b".to_string());
+        known_mapping.save(&known_path).unwrap();
+
+        // Unknown pair ("prod" is not in rdc.toml) -> skipped, and its
+        // legacy file MUST survive on disk (never parsed as TOML either).
+        let unknown_path = paths.mapping_dir().join("dev-to-prod.toml");
+        std::fs::write(&unknown_path, b"not valid mapping toml, never parsed").unwrap();
+
+        let known_envs: BTreeSet<String> = BTreeSet::from(["dev".to_string(), "test".to_string()]);
+        let log = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+
+        let generic = load_or_migrate_mapping(&paths, &known_envs, false, &log).unwrap();
+        assert!(!generic.is_empty(), "the known-pair edge should have been converted");
+
+        assert!(
+            !known_path.exists(),
+            "the converted legacy file must be deleted after a non-dry-run migration"
+        );
+        assert!(
+            unknown_path.exists(),
+            "a legacy file skipped for an unknown env pair must NOT be deleted (data loss)"
+        );
+    }
+
+    #[test]
     fn count_create_update_counts_by_target_file_presence() {
         use crate::mapping::Mapping;
         let dir = tempfile::TempDir::new().unwrap();
@@ -1649,8 +1702,13 @@ mod tests {
             PathBuf::from("hooks/existing.json"),
             PathBuf::from("hooks/brand-new.json"),
         ];
-        let (create, update) =
-            count_create_update(&files, &tgt_root, &Mapping::default(), &None);
+        let (create, update) = count_create_update(
+            &files,
+            &tgt_root,
+            &Mapping::default(),
+            &None,
+            &BTreeSet::new(),
+        );
         assert_eq!((create, update), (1, 1));
     }
 
