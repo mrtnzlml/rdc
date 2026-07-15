@@ -78,9 +78,9 @@ impl Mapping {
 
     /// Drop legacy flat-key entries from `engine_fields` and
     /// `workflow_steps` so a mapping file written before per-parent
-    /// scoping doesn't carry stale slugs forward. The auto-match in
-    /// `cli::deploy::map` repopulates these sections with composite
-    /// `<parent>/<child>` keys on the next `rdc deploy` run.
+    /// scoping doesn't carry stale slugs forward. Stale flat-key entries
+    /// are simply dropped on load; the N-way mapping is hand-authored so
+    /// nothing repopulates them.
     fn migrate_legacy_nested_keys(&mut self) {
         self.engine_fields.retain(|src, tgt| {
             src.contains('/') && tgt.contains('/')

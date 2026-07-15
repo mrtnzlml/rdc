@@ -172,7 +172,12 @@ Proceed with deletion? [y/N] y
 
 ## `rdc migrate`
 
-Promotes one env's snapshot to another, in two reviewable steps. `rdc migrate <src> <tgt>` is pure-local — zero remote calls: it copies `envs/<src>/` into `envs/<tgt>/`, renaming slugs per the auto-matched mapping (stored at `.rdc/map/<src>-to-<tgt>.toml`, hand-editable for renames), rewriting portable `rdc://<kind>/<slug>` references, and applying the target env's `overlay.toml`. Pushing is a separate, explicit step.
+Promotes one env's snapshot to another, in two reviewable steps. `rdc migrate <src> <tgt>` is pure-local — zero remote calls: it copies `envs/<src>/` into `envs/<tgt>/`, renaming slugs per the mapping, rewriting portable `rdc://<kind>/<slug>` references, and applying the target env's `overlay.toml`. Pushing is a separate, explicit step.
+
+Slug alignment across envs lives in one hand-editable file,
+`.rdc/mapping.toml`: each entry is a logical object, and each environment
+names its own slug. Objects whose slug is identical everywhere need no entry
+(they map 1:1). The file is often empty or absent.
 
 ```sh
 rdc migrate test prod --dry-run   # preview the per-file plan
@@ -218,6 +223,27 @@ rdc migrate test prod --migrate-score-thresholds # promote thresholds too
 ### Hook secrets
 
 Hook secret values are never copied between envs — they live in each env's gitignored `secrets/<env>.hook-secrets.json`. On push, `rdc sync` injects only filled values; keys still holding the placeholder sentinel are skipped, so a half-edited template never leaks a literal to the API.
+
+### Replicate an existing env into a new one
+
+Attending an existing project usually means bringing PROD *down* into a fresh
+DEV/TEST to iterate safely — the reverse of promotion. It is the same two
+steps, run backwards:
+
+```sh
+rdc init                 # add the target env (its org must already exist)
+rdc migrate prod dev     # copy prod's snapshot into envs/dev/ locally
+git diff                 # review
+rdc sync dev             # create the objects in the dev org
+```
+
+`migrate` reports how many objects it will create vs update. When the target
+is empty, every object is a create — author `envs/dev/overlay.toml` for the
+values that must differ (token owners, external URLs, names) before syncing.
+
+Because slug alignment is direction-free (`.rdc/mapping.toml`), promoting the
+same objects back up later (`rdc migrate dev prod`) patches the originals
+rather than duplicating them.
 
 ## Commands
 

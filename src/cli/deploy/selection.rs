@@ -205,8 +205,7 @@ pub(crate) fn glob_matches(pattern: &str, text: &str) -> bool {
 }
 
 /// List slugs from the local snapshot. The layout is kind-specific; these
-/// scanners mirror the cross-env auto-matching enumerators used by
-/// `deploy::map`.
+/// scanners enumerate the kinds whose slugs the selection filter can operate on.
 pub(crate) fn list_slugs(paths: &Paths, kind: &str) -> Result<Vec<String>> {
     match kind {
         "workspaces" => list_workspace_slugs(paths),
