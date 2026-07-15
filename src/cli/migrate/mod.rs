@@ -50,7 +50,13 @@ fn load_or_migrate_mapping(
 ) -> Result<GenericMapping> {
     let generic_path = src_paths.mapping_file();
     if generic_path.exists() {
-        return GenericMapping::load(&generic_path);
+        let generic = GenericMapping::load(&generic_path)?;
+        // Validate the existing, hand-authored file every time it's loaded —
+        // this is the ONLY place the happy path (no legacy conversion) runs
+        // validation, so a duplicate-(env,slug) row still hard-errors and an
+        // unknown-env row still gets warned about.
+        log_mapping_warnings(log, &generic.validate(known_envs)?);
+        return Ok(generic);
     }
     let legacy = src_paths.legacy_mapping_files();
     if legacy.is_empty() {
@@ -84,8 +90,10 @@ fn load_or_migrate_mapping(
 
     let generic = GenericMapping::from_legacy(&parsed)?;
     // Validate BEFORE persisting/deleting anything: an invalid conversion
-    // must neither be saved nor cost us the legacy files it came from.
-    generic.validate(known_envs)?;
+    // must neither be saved nor cost us the legacy files it came from. A
+    // duplicate-(env,slug) row still hard-errors via `?`; an unknown-env row
+    // is only ever a warning, logged below.
+    log_mapping_warnings(log, &generic.validate(known_envs)?);
 
     let verb = if dry_run { "would migrate" } else { "migrated" };
     log.event(
@@ -107,6 +115,14 @@ fn load_or_migrate_mapping(
         }
     }
     Ok(generic)
+}
+
+/// Log each `GenericMapping::validate` warning (e.g. a row referencing an env
+/// no longer in `rdc.toml`) via `log`, one event per warning.
+fn log_mapping_warnings(log: &crate::log::Log, warnings: &[String]) {
+    for w in warnings {
+        log.event(crate::log::Action::Warn, w);
+    }
 }
 
 /// Count how many primary objects this migration will CREATE vs UPDATE in the
@@ -1309,9 +1325,12 @@ pub fn run(
         project_cfg.envs.keys().cloned().collect();
 
     // Slug map: load the generic .rdc/mapping.toml (converting legacy per-pair
-    // files once if needed), validate it, and orient onto this direction.
+    // files once if needed), validating it — logging warnings for unknown-env
+    // rows and hard-erroring on ambiguous (env,slug) duplicates — and orient
+    // onto this direction. `load_or_migrate_mapping` validates on both the
+    // existing-file path and the just-converted path, so no second validate
+    // call is needed here.
     let generic = load_or_migrate_mapping(&src_paths, &known_envs, dry_run, &log)?;
-    generic.validate(&known_envs)?;
     let mapping = generic.orient(src, tgt);
 
     // Optional `--only` selection filter (reuses deploy's pure-fs machinery).
@@ -1343,6 +1362,31 @@ pub fn run(
     );
 
     let files = enumerate_files(&src_root, src)?;
+
+    // Guardrail: warn (don't abort) when an oriented mapping row's SOURCE slug
+    // has no matching object on disk in '<src>'. This restores the check the
+    // old (now-removed) `stale_mapping_sources` provided: a hand-edited
+    // mapping.toml row can go stale after the object it names is renamed or
+    // deleted, and without a warning the rename simply and silently never
+    // applies — indistinguishable from a typo.
+    let src_object_keys: BTreeSet<(&'static str, String)> =
+        files.iter().filter_map(|rel| classify(rel)).collect();
+    for kind in GenericMapping::KINDS {
+        let Some(map) = mapping.kind_map(kind) else {
+            continue;
+        };
+        for src_slug in map.keys() {
+            if !src_object_keys.contains(&(kind, src_slug.clone())) {
+                log.event(
+                    crate::log::Action::Warn,
+                    &format!(
+                        "mapping entry {kind}/{src_slug} has no matching object in \
+                         '{src}' (likely a typo or a stale row) — this rename won't apply"
+                    ),
+                );
+            }
+        }
+    }
 
     let tgt_was_empty =
         !tgt_root.exists() || enumerate_files(&tgt_root, tgt)?.is_empty();

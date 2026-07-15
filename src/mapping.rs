@@ -154,8 +154,15 @@ impl Mapping {
 /// logical object; each environment names its own slug. Only objects whose
 /// slug DIFFERS across envs are stored — identical slugs map 1:1 by default.
 /// Oriented into a per-pair [`Mapping`] via [`orient`] for `migrate`.
+/// Default for [`GenericMapping::version`] when a hand-authored
+/// `mapping.toml` omits the field entirely.
+fn default_generic_mapping_version() -> u32 {
+    2
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct GenericMapping {
+    #[serde(default = "default_generic_mapping_version")]
     pub version: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspaces: Vec<BTreeMap<String, String>>,
@@ -262,10 +269,19 @@ impl GenericMapping {
         })
     }
 
-    /// Reject rows that reference an env not in `rdc.toml`, or that map the same
-    /// `(env, slug)` in more than one row of a kind (which would make orientation
-    /// ambiguous). Both are hard errors so a hand-edit typo fails loudly.
-    pub fn validate(&self, known_envs: &std::collections::BTreeSet<String>) -> Result<()> {
+    /// Validate mapping rows against known envs and row uniqueness.
+    ///
+    /// A row referencing an env not in `rdc.toml` is NOT a hard error — envs get
+    /// renamed/retired and a hand-authored mapping can lag `rdc.toml` briefly —
+    /// so it is reported back as a warning string for the caller to log instead.
+    /// Mapping the same `(env, slug)` in more than one row of a kind IS a hard
+    /// error: it would make orientation ambiguous (which row does a lookup by
+    /// that env/slug mean?), and there is no safe automatic resolution.
+    pub fn validate(
+        &self,
+        known_envs: &std::collections::BTreeSet<String>,
+    ) -> Result<Vec<String>> {
+        let mut warnings = Vec::new();
         for kind in Self::KINDS {
             let rows = self.kind_rows(kind).expect("KINDS entry has rows");
             let mut seen: std::collections::BTreeSet<(String, String)> =
@@ -273,10 +289,10 @@ impl GenericMapping {
             for row in rows {
                 for (env, slug) in row {
                     if !known_envs.contains(env) {
-                        anyhow::bail!(
+                        warnings.push(format!(
                             ".rdc/mapping.toml: {kind} row references unknown env \
                              '{env}' (not defined in rdc.toml)"
-                        );
+                        ));
                     }
                     if !seen.insert((env.clone(), slug.clone())) {
                         anyhow::bail!(
@@ -287,7 +303,7 @@ impl GenericMapping {
                 }
             }
         }
-        Ok(())
+        Ok(warnings)
     }
 
     /// Project the N-way table onto one ordered pair, yielding the per-kind
@@ -313,11 +329,19 @@ impl GenericMapping {
 
     /// Convert legacy per-pair mappings into one N-way table. Each input tuple is
     /// `(env_a, env_b, mapping)` where `mapping` is a legacy `src -> tgt` map read
-    /// from `<env_a>-to-<env_b>.toml`. Identity pairs are dropped; non-identity
-    /// pairs become edges `(env_a, src) — (env_b, tgt)` joined into connected
-    /// components (one row per component). A component that forces one env to two
-    /// slugs is a hard error. `hook_templates` never enters (it is not a `KINDS`
-    /// entry and the legacy `Mapping` no longer carries it).
+    /// from `<env_a>-to-<env_b>.toml`. EVERY edge — including identity
+    /// (`src == tgt`) — is fed into the join so an env whose only link to a
+    /// diverged object is an identity edge (e.g. `dev-to-test` has `mdh`->`mdh`
+    /// while `test-to-prod` has `mdh`->`mdh-prod`) still ends up connected into
+    /// that object's row; dropping identity edges up front would silently omit
+    /// `dev` from the row and make `orient` fall back to the wrong identity slug.
+    /// Edges join into connected components (one row per component); a component
+    /// that forces one env to two slugs is a hard error. Once every kind's rows
+    /// are built, rows that end up carrying only ONE distinct slug value (i.e.
+    /// no real divergence — every env in the row agrees) are dropped, so the
+    /// persisted file stays renames-only while every genuinely-diverged object
+    /// keeps its full set of env columns. `hook_templates` never enters (it is
+    /// not a `KINDS` entry and the legacy `Mapping` no longer carries it).
     pub fn from_legacy(files: &[(String, String, Mapping)]) -> Result<GenericMapping> {
         let mut out = GenericMapping::default();
         for kind in Self::KINDS {
@@ -325,12 +349,13 @@ impl GenericMapping {
             for (env_a, env_b, m) in files {
                 let Some(map) = m.kind_map(kind) else { continue };
                 for (src, tgt) in map {
-                    if src == tgt {
-                        continue; // identity — no row needed
-                    }
                     merge_legacy_edge(&mut rows, env_a, src, env_b, tgt, kind)?;
                 }
             }
+            // Keep only rows expressing a real divergence — pure-identity
+            // connectivity rows (every env column holds the same slug) add
+            // nothing over the identity fallback and would just bloat the file.
+            rows.retain(|row| row.values().collect::<std::collections::BTreeSet<_>>().len() > 1);
             *out.kind_rows_mut(kind).expect("KINDS entry is mappable") = rows;
         }
         Ok(out)
@@ -481,15 +506,34 @@ version = 1
     }
 
     #[test]
-    fn validate_rejects_unknown_env() {
+    fn generic_mapping_deserializes_hand_authored_file_without_version() {
+        // A hand-authored mapping.toml is expected to omit boilerplate like
+        // `version` entirely; it must still parse (defaulting to the current
+        // schema version) instead of hard-failing on a missing field.
+        let g: GenericMapping = toml::from_str("[[hooks]]\ndev = \"a\"\nprod = \"b\"\n").unwrap();
+        assert_eq!(g.version, 2);
+        assert_eq!(
+            g.hooks,
+            vec![BTreeMap::from([
+                ("dev".to_string(), "a".to_string()),
+                ("prod".to_string(), "b".to_string()),
+            ])]
+        );
+    }
+
+    #[test]
+    fn validate_warns_on_unknown_env_instead_of_erroring() {
         let mut g = GenericMapping::default();
         g.hooks.push(BTreeMap::from([
             ("dev".to_string(), "h".to_string()),
             ("staging".to_string(), "h2".to_string()),
         ]));
         let envs = BTreeSet::from(["dev".to_string(), "prod".to_string()]);
-        let err = g.validate(&envs).unwrap_err();
-        assert!(format!("{err}").contains("staging"));
+        let warnings = g.validate(&envs).expect("unknown env is a warning, not an error");
+        assert!(
+            warnings.iter().any(|w| w.contains("staging")),
+            "warnings must name the unknown env: {warnings:?}"
+        );
     }
 
     #[test]
@@ -516,7 +560,7 @@ version = 1
             ("prod".to_string(), "invoices-prod".to_string()),
         ]));
         let envs = BTreeSet::from(["dev".to_string(), "prod".to_string()]);
-        assert!(g.validate(&envs).is_ok());
+        assert_eq!(g.validate(&envs).unwrap(), Vec::<String>::new());
     }
 
     #[test]
@@ -556,8 +600,9 @@ version = 1
     #[test]
     fn from_legacy_joins_transitively_and_drops_identity() {
         // dev->test renames a hook; test->prod renames it further. The two edges
-        // share the test node and must join into one 3-env row. Identity pairs are
-        // dropped entirely.
+        // share the test node and must join into one 3-env row. The separate,
+        // pure-identity `validator` row (every env agrees on the slug) carries no
+        // real divergence and is dropped by the post-join `retain`.
         let mut dev_test = Mapping::default();
         dev_test.hooks.insert("mdh".into(), "mdh-test".into());
         dev_test.hooks.insert("validator".into(), "validator".into()); // identity
@@ -575,6 +620,46 @@ version = 1
         assert_eq!(row.get("dev").map(String::as_str), Some("mdh"));
         assert_eq!(row.get("test").map(String::as_str), Some("mdh-test"));
         assert_eq!(row.get("prod").map(String::as_str), Some("mdh-prod"));
+    }
+
+    #[test]
+    fn from_legacy_preserves_env_linked_only_by_identity_edge() {
+        // dev-to-test has only an IDENTITY edge for `mdh` (dev and test agree on
+        // the slug); test-to-prod diverges it to `mdh-prod`. `dev` is connected to
+        // the diverged object ONLY via that identity edge — dropping identity
+        // edges up front (the old behavior) would omit `dev` from the joined row
+        // entirely, and `orient("dev", "prod")` would then fall back to identity
+        // and hand back the WRONG (source) slug instead of `mdh-prod`.
+        let mut dev_test = Mapping::default();
+        dev_test.hooks.insert("mdh".into(), "mdh".into()); // identity
+        let mut test_prod = Mapping::default();
+        test_prod.hooks.insert("mdh".into(), "mdh-prod".into());
+
+        let g = GenericMapping::from_legacy(&[
+            ("dev".to_string(), "test".to_string(), dev_test),
+            ("test".to_string(), "prod".to_string(), test_prod),
+        ])
+        .unwrap();
+
+        assert_eq!(g.hooks.len(), 1, "the diverged object's row must survive retain");
+        let row = &g.hooks[0];
+        assert_eq!(
+            row,
+            &BTreeMap::from([
+                ("dev".to_string(), "mdh".to_string()),
+                ("test".to_string(), "mdh".to_string()),
+                ("prod".to_string(), "mdh-prod".to_string()),
+            ]),
+            "dev must be PRESENT in the row even though it only ever appears via \
+             an identity edge"
+        );
+
+        let oriented = g.orient("dev", "prod");
+        assert_eq!(
+            oriented.lookup_tgt_slug("hooks", "mdh"),
+            Some("mdh-prod"),
+            "dev->prod must resolve through the joined row, not fall back to identity"
+        );
     }
 
     #[test]
