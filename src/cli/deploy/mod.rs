@@ -4,7 +4,6 @@
 //! and its remote create/apply machinery were removed.
 
 pub mod create;
-pub mod map;
 pub mod realign;
 pub(crate) mod selection;
 pub mod store_extensions;
