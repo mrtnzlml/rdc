@@ -1,6 +1,7 @@
-//! Env-pair mapping — connects src slug ↔ tgt slug per kind. Built and
-//! consumed by `rdc deploy` (auto-matched on each run, then persisted to
-//! disk so subsequent deploys keep the same alignment).
+//! Env-pair mapping — connects src slug ↔ tgt slug per kind. [`Mapping`] is
+//! the in-memory, oriented view of one (src, tgt) pair, projected via
+//! [`GenericMapping::orient`] from the hand-authored, N-way `.rdc/mapping.toml`.
+//! Consumed by `rdc migrate` to rewrite slugs and `rdc://` refs between envs.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -11,8 +12,8 @@ use std::path::Path;
 pub struct Mapping {
     pub version: u32,
     /// Workspace slug → workspace slug. Workspaces themselves are pull-only
-    /// in `rdc deploy` (we don't PATCH them across envs), but their URLs are
-    /// referenced by queues, so the mapping is needed to rewrite
+    /// at the Rossum API (we never PATCH them across envs), but their URLs
+    /// are referenced by queues, so the mapping is needed to rewrite
     /// `queue.workspace` from the src URL to the tgt URL.
     #[serde(default)]
     pub workspaces: BTreeMap<String, String>,
@@ -33,8 +34,8 @@ pub struct Mapping {
     pub inboxes: BTreeMap<String, String>,
     /// Email-template compound key `<ws>/<q>/<template>` → compound key.
     /// The `<ws>` and `<q>` segments may differ between src and tgt envs;
-    /// auto-match in `rdc map` uses the full key, but the file is
-    /// hand-editable for renames.
+    /// orientation matches rows by the full key, and `.rdc/mapping.toml`
+    /// is hand-editable for renames.
     #[serde(default)]
     pub email_templates: BTreeMap<String, String>,
     /// Engine slug → engine slug.
@@ -102,7 +103,7 @@ impl Mapping {
 
     /// Look up the tgt slug for a `(kind, src_slug)` pair. Returns `None`
     /// if the kind isn't deployable or the pair isn't mapped. Used by
-    /// the URL-rewrite step inside `rdc deploy`.
+    /// the URL-rewrite step inside `rdc migrate`.
     pub fn lookup_tgt_slug(&self, kind: &str, src_slug: &str) -> Option<&str> {
         self.kind_map(kind)
             .and_then(|m| m.get(src_slug).map(|s| s.as_str()))

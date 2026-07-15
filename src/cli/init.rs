@@ -811,8 +811,9 @@ prompt is `[k]` (force-push), `[r]` (adopt remote), `[s]` (skip),
 1. `rdc sync dev` and `rdc sync prod` so both lockfiles are populated.
 2. `rdc migrate dev prod --dry-run` — preview the local file transform.
 3. `rdc migrate dev prod` — copy dev's snapshot into `envs/prod/`,
-   renaming slugs per the auto-matched mapping (stored at
-   `.rdc/map/dev-to-prod.toml`; hand-edit for renames), rewriting
+   renaming slugs per the mapping (one hand-editable file,
+   `.rdc/mapping.toml`, where each environment names its own slug for
+   an object; objects with identical slugs need no entry), rewriting
    portable `rdc://` refs, and applying prod's `overlay.toml`.
 4. Review the result with `git diff`, then `rdc sync prod` to push —
    sync creates missing objects in dependency order.

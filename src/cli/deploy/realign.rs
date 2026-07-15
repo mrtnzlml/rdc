@@ -32,8 +32,9 @@
 //! `email_templates`/`engine_fields` segments cascade) — so a rename never
 //! leaves a dangling per-env override for `rdc migrate` to silently drop. The
 //! rewrite is surgical (table headers only), preserving comments and values.
-//! Mapping files (`.rdc/map/*.toml`) are still only warned about — `rdc migrate`
-//! self-heals their stale entries.
+//! The mapping (`.rdc/mapping.toml`, and any legacy `.rdc/map/*.toml`) is
+//! hand-authored and only warned about — `rdc migrate` no longer self-heals
+//! stale slug references in it.
 
 use crate::paths::Paths;
 use crate::slug::slugify;
@@ -1246,9 +1247,10 @@ fn apply_overlay_rewrites(
     Ok((updated, missed))
 }
 
-/// Scan any `.rdc/map/*.toml` file for textual references to the old slug;
-/// return one warning per file that matches. Mapping files are user-authored and
-/// `rdc migrate` self-heals stale entries, so we warn rather than rewrite.
+/// Scan `.rdc/mapping.toml` (and any legacy `.rdc/map/*.toml` file) for
+/// textual references to the old slug; return one warning per file that
+/// matches. The mapping is hand-authored and `rdc migrate` no longer
+/// self-heals stale slug references, so we warn rather than rewrite.
 /// (overlay.toml is handled separately by [`apply_overlay_rewrites`], which
 /// renames its keys in place rather than warning.)
 fn collect_orphans(paths: &Paths, kind: &str, old: &str, out: &mut Vec<String>) {
@@ -1275,15 +1277,21 @@ fn collect_orphans(paths: &Paths, kind: &str, old: &str, out: &mut Vec<String>) 
 }
 
 fn list_mapping_files(paths: &Paths) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mapping_file = paths.mapping_file();
+    if mapping_file.exists() {
+        out.push(mapping_file);
+    }
     let dir = paths.mapping_dir();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("toml"))
-        .collect()
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        out.extend(
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("toml")),
+        );
+    }
+    out
 }
 
 /// Entry point used by `rdc doctor <env>`.
@@ -2508,5 +2516,23 @@ mod tests {
         assert!(!ov.contains("sftp-import-initial-load"), "old overlay key gone: {ov}");
         assert!(ov.contains("# sftp creds for this env"), "comment preserved: {ov}");
         assert!(ov.contains("settings.credentials.host = \"h\""), "body preserved: {ov}");
+    }
+
+    #[test]
+    fn collect_orphans_reports_stale_slug_in_mapping_toml() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        std::fs::create_dir_all(paths.mapping_file().parent().unwrap()).unwrap();
+        std::fs::write(
+            paths.mapping_file(),
+            "version = 2\n\n[[hooks]]\ndev = \"old-hook\"\nprod = \"old-hook-prod\"\n",
+        )
+        .unwrap();
+
+        let mut orphans = Vec::new();
+        collect_orphans(&paths, "hooks", "old-hook", &mut orphans);
+        assert_eq!(orphans.len(), 1, "{orphans:?}");
+        assert!(orphans[0].contains("mapping.toml"), "{orphans:?}");
+        assert!(orphans[0].contains("hooks/old-hook"), "{orphans:?}");
     }
 }

@@ -282,6 +282,10 @@ fn migrate_converts_legacy_mapping_unmatched_rename_is_harmless() {
         mapping_after.contains("renamer-prod"),
         "converted mapping must carry the renamer->renamer-prod rename: {mapping_after}"
     );
+    assert!(
+        mapping_after.contains("ghost-prod"),
+        "converted mapping must also carry the dead ghost->ghost-prod rename: {mapping_after}"
+    );
 }
 
 /// `--dry-run` must not convert the legacy per-pair mapping file into

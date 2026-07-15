@@ -1265,10 +1265,11 @@ fn unique_template_skips(
 
 /// `rdc migrate <src> <tgt>` — pure-local snapshot→snapshot transform.
 ///
-/// Copies `envs/<src>/` into `envs/<tgt>/`, renaming slugs per the auto-matched
-/// and hand-curated [`Mapping`], substituting `rdc://<kind>/<src>` refs to their
-/// `<tgt>` slug in JSON content, and applying the target overlay. Makes zero
-/// remote calls — afterward the user reviews `git diff` and runs `rdc sync <tgt>`.
+/// Copies `envs/<src>/` into `envs/<tgt>/`, renaming slugs per the hand-authored,
+/// oriented [`Mapping`] (projected from `.rdc/mapping.toml`), substituting
+/// `rdc://<kind>/<src>` refs to their `<tgt>` slug in JSON content, and applying
+/// the target overlay. Makes zero remote calls — afterward the user reviews
+/// `git diff` and runs `rdc sync <tgt>`.
 ///
 /// `--mirror` additionally deletes target-only objects (files present in tgt
 /// but not produced by the migration). `--dry-run` prints the plan and writes
