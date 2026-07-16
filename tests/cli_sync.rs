@@ -2948,7 +2948,7 @@ async fn sync_remote_create_writes_local_rule() {
 /// the test can assert against later. The same URLs (with `server.uri()`)
 /// are referenced by every nested object so the adapter resolves
 /// queue → workspace and template → queue cleanly.
-async fn mount_queue_tree_fixture(server: &MockServer) {
+async fn mount_queue_tree_core(server: &MockServer) {
     let ws_url = format!("{}/api/v1/workspaces/800", server.uri());
     let queue_url = format!("{}/api/v1/queues/100", server.uri());
     let schema_url = format!("{}/api/v1/schemas/200", server.uri());
@@ -3039,7 +3039,14 @@ async fn mount_queue_tree_fixture(server: &MockServer) {
         .respond_with(ResponseTemplate::new(200).set_body_json(inboxes_body))
         .mount(server)
         .await;
+}
 
+/// Mounts the full queue tree: the core (workspace, queue, schema, inbox)
+/// plus a single email template scoped to the queue.
+async fn mount_queue_tree_fixture(server: &MockServer) {
+    mount_queue_tree_core(server).await;
+
+    let queue_url = format!("{}/api/v1/queues/100", server.uri());
     let email_templates_body = serde_json::json!({
         "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
         "results": [
@@ -3560,6 +3567,120 @@ async fn sync_clean_queue_tree_no_writes() {
     assert_eq!(
         tpl_mtime, tpl_mtime_after,
         "email template must not be rewritten"
+    );
+}
+
+/// Regression: an email template that appears on the remote AFTER its owning
+/// queue is already in sync must still be pulled to disk.
+///
+/// The email_templates pull driver resolves a template's on-disk location via
+/// `ctx.queue_locations`, which is populated as a side effect of the queue
+/// pull driver — but only for queues that are themselves in the pull subset.
+/// When the queue tree is already clean and the ONLY change is a new email
+/// template, the queue subset is empty, the queue driver never runs, and
+/// `queue_locations` stays empty. Before the fix the driver then found no
+/// location for the template's queue and silently dropped the write, so the
+/// pull was never persisted and every later sync re-classified the same
+/// template as "new" (non-idempotent).
+#[tokio::test]
+async fn sync_pulls_email_template_added_after_queue_tree_synced() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // First sync: the queue tree exists on the remote but NO email template
+    // yet (email_templates listing is empty, served by mock_empty_lists_except
+    // because it is not in the override list).
+    mount_queue_tree_core(&server).await;
+    mock_empty_lists_except(
+        &server,
+        &["/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes"],
+    )
+    .await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
+    )
+    .await
+    .expect("first sync should succeed (queue tree, no email template yet)");
+
+    let cost_dir = project
+        .path()
+        .join("envs/dev/workspaces/invoices-ap/queues/cost-invoices");
+    let tpl_path = cost_dir.join("email-templates/rejection-notice.json");
+    assert!(
+        cost_dir.join("queue.json").exists(),
+        "queue tree must be pulled by the first sync"
+    );
+    assert!(
+        !tpl_path.exists(),
+        "no email template exists on the remote during the first sync"
+    );
+
+    // The remote gains a new email template on the (unchanged) queue.
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+    mount_queue_tree_fixture(&server).await;
+    mock_empty_lists_except(
+        &server,
+        &[
+            "/api/v1/workspaces",
+            "/api/v1/queues",
+            "/api/v1/inboxes",
+            "/api/v1/email_templates",
+        ],
+    )
+    .await;
+
+    // Second sync: queue tree is Clean, so the only pull is the new template.
+    rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
+    )
+    .await
+    .expect("second sync should succeed and pull the new email template");
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    // The email-template-only pull must be persisted to disk and recorded in
+    // the lockfile — otherwise the next sync re-classifies it as "new" forever.
+    assert!(
+        tpl_path.exists(),
+        "email template added after the queue was clean must be pulled to {}",
+        tpl_path.display()
+    );
+    let lf_raw = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    assert!(
+        lf_raw.contains("invoices-ap/cost-invoices/rejection-notice"),
+        "email template compound key must be recorded in the lockfile: {lf_raw}"
     );
 }
 
@@ -10629,4 +10750,296 @@ async fn sync_mdh_unmaterialized_index_reaches_stable_retry_state() {
     );
     // The `.expect(2)` on the create mock (verified on MockServer drop)
     // proves sync 3 retried instead of skipping via an advanced base.
+}
+
+/// Shared mock setup for the two queue-relocation regression tests below.
+/// Two workspaces exist from the start — "Invoices AP" (id 800, slug
+/// `invoices-ap`) and "Invoices EU" (id 801, slug `invoices-eu`) — and one
+/// queue (id 700, "Cost Invoices") starts out under workspace A, with an
+/// attached inbox (id 900) so the "edited" test has a file to edit that is
+/// independent of the move itself (no schema is attached — the tests don't
+/// need one). Toggling the returned flag makes every subsequent
+/// `/api/v1/queues` response report the SAME queue id living under
+/// workspace B instead, simulating the remote moving it.
+async fn mount_relocatable_queue_env(server: &MockServer) -> Arc<std::sync::atomic::AtomicBool> {
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(server)
+        .await;
+
+    let org_url = format!("{}/api/v1/organizations/1", server.uri());
+    let ws_a_url = format!("{}/api/v1/workspaces/800", server.uri());
+    let ws_b_url = format!("{}/api/v1/workspaces/801", server.uri());
+    let queue_url = format!("{}/api/v1/queues/700", server.uri());
+    let inbox_url = format!("{}/api/v1/inboxes/900", server.uri());
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "total": 2, "total_pages": 1, "next": null, "previous": null },
+            "results": [
+                {
+                    "id": 800, "url": ws_a_url, "name": "Invoices AP",
+                    "organization": org_url, "queues": [],
+                    "modified_at": "2026-04-20T08:00:00Z"
+                },
+                {
+                    "id": 801, "url": ws_b_url, "name": "Invoices EU",
+                    "organization": org_url, "queues": [],
+                    "modified_at": "2026-04-20T08:00:00Z"
+                }
+            ]
+        })))
+        .mount(server)
+        .await;
+
+    let moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let moved_clone = moved.clone();
+    let ws_a_url_clone = ws_a_url.clone();
+    let ws_b_url_clone = ws_b_url.clone();
+    let queue_url_clone = queue_url.clone();
+    let inbox_url_clone = inbox_url.clone();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .respond_with(move |_req: &Request| {
+            let (workspace, modified_at) = if moved_clone.load(Ordering::SeqCst) {
+                (ws_b_url_clone.clone(), "2026-05-01T00:00:00Z")
+            } else {
+                (ws_a_url_clone.clone(), "2026-04-20T08:00:00Z")
+            };
+            let body = serde_json::json!({
+                "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+                "results": [{
+                    "id": 700,
+                    "url": queue_url_clone,
+                    "name": "Cost Invoices",
+                    "workspace": workspace,
+                    "schema": serde_json::Value::Null,
+                    "inbox": inbox_url_clone,
+                    "modified_at": modified_at
+                }]
+            });
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(server)
+        .await;
+
+    // The inbox is independent of the queue's workspace — its remote body
+    // never changes across the move, so an EDIT to the local copy (used by
+    // the "edited" test below) can never entangle with the "queues" kind's
+    // own RemoteEdit classification the way editing `queue.json` itself
+    // would (that file's remote content IS what changes on a move).
+    Mock::given(method("GET"))
+        .and(path("/api/v1/inboxes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "total_pages": 1, "next": null },
+            "results": [{
+                "id": 900,
+                "url": inbox_url,
+                "name": "Cost Invoices Inbox",
+                "email": "cost-invoices@mock.rossum.app",
+                "queues": [queue_url],
+                "filters": [],
+                "modified_at": "2026-04-20T08:00:00Z"
+            }]
+        })))
+        .mount(server)
+        .await;
+
+    mock_empty_lists_except(
+        server,
+        &["/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes"],
+    )
+    .await;
+
+    moved
+}
+
+/// Regression for the pull-side non-idempotency bug: a queue's slug is
+/// GLOBAL id-pinned, so when the remote moves a queue to a different
+/// workspace, the OLD workspace's dir (same slug) is left behind unless
+/// `pull::queues::process` self-heals it. When the stale copy has no
+/// un-synced local edits, the driver must delete it outright — otherwise the
+/// two dirs collide on one lockfile entry and the queue re-pushes forever.
+#[tokio::test]
+async fn sync_relocates_queue_after_remote_workspace_move_when_clean() {
+    let server = MockServer::start().await;
+    let moved = mount_relocatable_queue_env(&server).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let ws_a_queue_dir = project
+        .path()
+        .join("envs/dev/workspaces/invoices-ap/queues/cost-invoices");
+    let ws_b_queue_dir = project
+        .path()
+        .join("envs/dev/workspaces/invoices-eu/queues/cost-invoices");
+
+    // First sync: seed the queue under workspace A.
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev"])
+        .assert()
+        .success();
+    assert!(
+        ws_a_queue_dir.join("queue.json").exists(),
+        "seed sync must place the queue under workspace A"
+    );
+    assert!(!ws_b_queue_dir.exists());
+
+    // Remote now reports the same queue id under workspace B.
+    moved.store(true, Ordering::SeqCst);
+
+    let out = assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "relocate sync should succeed:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("relocated queue"),
+        "relocate sync must log the self-heal: {stderr}"
+    );
+
+    assert!(
+        !ws_a_queue_dir.exists(),
+        "stale workspace-A copy must be removed after a clean relocate"
+    );
+    assert!(
+        ws_b_queue_dir.join("queue.json").exists(),
+        "queue must now live under workspace B"
+    );
+
+    // Idempotency: a follow-up dry-run reports no collision and nothing left
+    // to pull for this queue.
+    let out = assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev", "--dry-run"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "dry-run after relocate should succeed:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("collide"),
+        "no collision should remain after the self-heal:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("0 would pull"),
+        "relocated queue must not need re-pulling:\n{stderr}"
+    );
+}
+
+/// Same remote move as above, but the stale workspace-A copy has an
+/// un-synced local edit — to `inbox.json`, not `queue.json`. (Editing
+/// `queue.json` itself would conflate with the move: that file's remote
+/// content is EXACTLY what changes on a move, so an edit there makes the
+/// classifier see a genuine `BothDiverged` conflict on the "queues" kind
+/// itself and route it to the sync-level conflict resolver instead of
+/// `pull::queues::process` — a real, but different, pre-existing safety net.
+/// This test isolates the driver's own self-heal check by editing a file
+/// that's independent of the move, and runs with `--no-push` so the
+/// unrelated inbox `LocalEdit` doesn't also need a PATCH mock.)
+///
+/// The self-heal must NOT delete the stale copy — losing a user's local
+/// edit is far worse than leaving a stray directory and a warning — so the
+/// old dir (with the edit intact) must survive the sync, and a warning must
+/// be logged so the user knows to resolve it manually.
+#[tokio::test]
+async fn sync_keeps_stale_queue_dir_when_locally_edited_after_remote_workspace_move() {
+    let server = MockServer::start().await;
+    let moved = mount_relocatable_queue_env(&server).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let ws_a_queue_dir = project
+        .path()
+        .join("envs/dev/workspaces/invoices-ap/queues/cost-invoices");
+    let ws_b_queue_dir = project
+        .path()
+        .join("envs/dev/workspaces/invoices-eu/queues/cost-invoices");
+
+    // First sync: seed the queue (+ inbox) under workspace A.
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev"])
+        .assert()
+        .success();
+
+    // Local edit to the workspace-A copy's inbox BEFORE the remote reports
+    // the move — an un-synced change the self-heal must not clobber.
+    let inbox_json_path = ws_a_queue_dir.join("inbox.json");
+    let before = std::fs::read(&inbox_json_path).unwrap();
+    let mut v: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    v["name"] = serde_json::json!("Cost Invoices Inbox (local edit)");
+    let mut edited = serde_json::to_vec_pretty(&v).unwrap();
+    edited.push(b'\n');
+    std::fs::write(&inbox_json_path, &edited).unwrap();
+
+    // Remote now reports the same queue id under workspace B.
+    moved.store(true, Ordering::SeqCst);
+
+    let out = assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev", "--no-push"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "sync with an edited stale copy should still succeed:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("un-synced edits"),
+        "must warn about the un-synced edit instead of silently deleting it: {stderr}"
+    );
+
+    assert!(
+        ws_a_queue_dir.exists(),
+        "stale workspace-A dir must be preserved, not deleted"
+    );
+    let after = std::fs::read(&inbox_json_path).unwrap();
+    assert_eq!(
+        after, edited,
+        "the local inbox edit must survive the sync untouched"
+    );
+
+    assert!(
+        ws_b_queue_dir.join("queue.json").exists(),
+        "queue must still be written under the new workspace despite the stale-dir warning"
+    );
 }
