@@ -1,3 +1,4 @@
+use crate::cli::resolve::ConflictStrategy;
 use clap::builder::styling::{AnsiColor, Color, Effects, RgbColor, Style, Styles};
 use clap::{Parser, Subcommand};
 use clap_complete::{ArgValueCandidates, CompletionCandidate};
@@ -127,6 +128,16 @@ pub enum Command {
         /// Deploy mode: write local edits to the remote but never overwrite local files.
         #[arg(long = "no-pull", conflicts_with = "no_push")]
         no_pull: bool,
+        /// Resolve every `BothDiverged` conflict non-interactively, without
+        /// reading stdin: `use-remote` overwrites local with the env's copy
+        /// (lockfile records the remote hash); `keep-local` keeps local as-is
+        /// and pushes it to the env; `skip` always writes the shadow-file
+        /// fallback (same as the non-TTY default). Overrides the interactive
+        /// prompt even on a TTY. Without this flag, behavior is unchanged:
+        /// interactive prompt on a TTY, shadow-file skip on `--yes`/non-TTY.
+        /// Not supported together with `--watch`.
+        #[arg(long = "conflict", value_enum, conflicts_with = "watch")]
+        conflict: Option<ConflictStrategy>,
         /// Watch local files + poll the env continuously; reconcile on each event.
         /// On a TTY, pressing Enter triggers a cycle immediately (ignored while
         /// a cycle is already running).
@@ -288,6 +299,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             allow_deletes,
             no_push,
             no_pull,
+            conflict,
             watch,
             poll_interval,
             no_poll,
@@ -317,7 +329,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 .await
             } else {
                 with_401_retry(&env, || {
-                    crate::cli::sync::run(&env, interactive, dry_run, allow_deletes, no_push, no_pull)
+                    crate::cli::sync::run(
+                        &env,
+                        interactive,
+                        dry_run,
+                        allow_deletes,
+                        no_push,
+                        no_pull,
+                        conflict,
+                    )
                 })
                 .await
                 .map(|_outcome| ())

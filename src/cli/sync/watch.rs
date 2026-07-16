@@ -87,6 +87,7 @@ pub async fn run_watch(
             allow_deletes,
             no_push,
             no_pull,
+            None, // conflict_strategy: `--conflict` is not supported under `--watch`
             Some(renderer.clone()),
             None,
             None,
@@ -333,7 +334,7 @@ pub(crate) async fn event_loop(
                 }
                 let _outcome = match crate::cli::sync::run_cycle(
                     env, interactive, false, allow_deletes, no_push, no_pull,
-                    renderer.clone(), None, None,
+                    None, renderer.clone(), None, None,
                 ).await {
                     Ok(o) => o,
                     Err(e) if crate::api::anyhow_has_status(&e, 401) => {
@@ -354,7 +355,7 @@ pub(crate) async fn event_loop(
                         crate::cli::auth::refresh_token_for_401(env).await?;
                         crate::cli::sync::run_cycle(
                             env, interactive, false, allow_deletes, no_push, no_pull,
-                            renderer.clone(), None, None,
+                            None, renderer.clone(), None, None,
                         ).await?
                     }
                     Err(e) if is_transient_network_error(&e) => {
