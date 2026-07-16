@@ -56,6 +56,25 @@ fn load_or_migrate_mapping(
         // validation, so a duplicate-(env,slug) row still hard-errors and an
         // unknown-env row still gets warned about.
         log_mapping_warnings(log, &generic.validate(known_envs)?);
+        // A committed `.rdc/mapping.toml` is authoritative and legacy per-pair
+        // files are NEVER read once it exists. If any linger — one that
+        // reappeared via a branch switch/merge, or one left behind because an
+        // earlier conversion skipped it as malformed — warn instead of ignoring
+        // it silently: the renames it encodes are being dropped, and the user
+        // must fold them into `.rdc/mapping.toml` (then delete the file).
+        let leftover = src_paths.legacy_mapping_files();
+        if !leftover.is_empty() {
+            log.event(
+                crate::log::Action::Warn,
+                &format!(
+                    "{} legacy .rdc/map/*.toml file(s) are present alongside \
+                     .rdc/mapping.toml and are IGNORED: {}. Fold any renames they \
+                     encode into .rdc/mapping.toml, then delete them.",
+                    leftover.len(),
+                    display_paths(&leftover),
+                ),
+            );
+        }
         return Ok(generic);
     }
     let legacy = src_paths.legacy_mapping_files();
@@ -84,11 +103,44 @@ fn load_or_migrate_mapping(
             );
             continue;
         };
-        parsed.push((a, b, Mapping::load(path)?));
+        // A malformed legacy file must NOT abort the whole conversion — before
+        // the generic file existed, `migrate <src> <tgt>` read only its own
+        // pair file, so an unrelated bad file (a stray hand edit in some other
+        // pair) never blocked it. Warn, skip it, and crucially leave it on disk
+        // (not in `converted`, so the cleanup loop never deletes it): the user
+        // fixes or removes it, and the leftover-legacy warning above then
+        // surfaces it on the next run.
+        let m = match Mapping::load(path) {
+            Ok(m) => m,
+            Err(e) => {
+                log.event(
+                    crate::log::Action::Warn,
+                    &format!(
+                        "skipping malformed legacy mapping file {} ({e:#}); it is \
+                         left in place — fix or remove it, then re-run migrate to \
+                         convert it",
+                        path.display()
+                    ),
+                );
+                continue;
+            }
+        };
+        parsed.push((a, b, m));
         converted.push(path.clone());
     }
 
-    let generic = GenericMapping::from_legacy(&parsed)?;
+    // A genuine cross-file slug conflict (one env mapped to two different slugs)
+    // is unrepresentable in a single N-way row and MUST NOT be silently
+    // resolved, so `from_legacy` hard-errors — but nothing has been written or
+    // deleted yet, so no data is lost. Attribute the exact files being unioned
+    // so the abort is actionable (which .rdc/map/*.toml to reconcile).
+    let generic = GenericMapping::from_legacy(&parsed).with_context(|| {
+        format!(
+            "converting legacy mapping files ({}) into {}",
+            display_paths(&converted),
+            generic_path.display(),
+        )
+    })?;
     // Validate BEFORE persisting/deleting anything: an invalid conversion
     // must neither be saved nor cost us the legacy files it came from. A
     // duplicate-(env,slug) row still hard-errors via `?`; an unknown-env row
@@ -125,6 +177,15 @@ fn log_mapping_warnings(log: &crate::log::Log, warnings: &[String]) {
     }
 }
 
+/// Comma-join a list of paths for a human-facing log/error message.
+fn display_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Count how many primary objects this migration will CREATE vs UPDATE in the
 /// target, by whether the remapped target JSON already exists. Mirrors the
 /// selection gate AND the un-creatable-unique-template skip of the write
@@ -143,9 +204,19 @@ fn count_create_update(
         if skip.contains(rel) {
             continue;
         }
-        let Some((kind, slug)) = classify(rel) else { continue };
+        // `classify` covers the `rdc://`-target kinds; `classify_managed_primary`
+        // adds the workflow / MDH primary leaves it intentionally ignores but the
+        // write loop still copies — without them a migrate that writes only
+        // workflow/mdh objects reported "0 create" (an undercount).
+        let Some((kind, slug)) = classify(rel).or_else(|| classify_managed_primary(rel)) else {
+            continue;
+        };
         if let Some(sel) = selection {
-            if !sel.contains(kind, &slug) {
+            // workflows/mdh carry no classifiable object identity, so the write
+            // loop skips them whenever `--only` is active (see its
+            // `classify_for_selection` gate); mirror that here so the count
+            // matches what is actually written.
+            if matches!(kind, "workflows" | "mdh") || !sel.contains(kind, &slug) {
                 continue;
             }
         }
@@ -458,6 +529,32 @@ fn classify_workspace(comps: &[String]) -> Option<(&'static str, String)> {
             let q = &comps[3];
             leaf.strip_suffix(".json")
                 .map(|t| ("email_templates", format!("{ws}/{q}/{t}")))
+        }
+        _ => None,
+    }
+}
+
+/// The PRIMARY object leaf for the managed dirs that [`classify`] deliberately
+/// ignores because they are never `rdc://` reference targets, overlay units, or
+/// substitution keys: `workflows/<slug>/workflow.json` and
+/// `mdh/<slug>/indexes.json`. Returns `None` for their sidecars (workflow
+/// `steps/*.json`, extra index files) so each object counts exactly once.
+///
+/// Used ONLY by the migrate summary count, which must include the workflow and
+/// MDH objects the write loop copies — keeping it out of `classify` proper
+/// preserves that function's None-for-workflows/mdh contract that overlay-key
+/// validation, `--only` selection, and the substitution map all rely on.
+fn classify_managed_primary(rel: &Path) -> Option<(&'static str, String)> {
+    let comps: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    match comps.first().map(String::as_str) {
+        Some("workflows") if comps.len() == 3 && comps[2] == "workflow.json" => {
+            Some(("workflows", comps[1].clone()))
+        }
+        Some("mdh") if comps.len() == 3 && comps[2] == "indexes.json" => {
+            Some(("mdh", comps[1].clone()))
         }
         _ => None,
     }
@@ -1106,6 +1203,39 @@ fn enumerate_files(env_root: &Path, env: &str) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+/// Whether `env_root` holds ANY managed leaf, short-circuiting on the first one
+/// found. The migrate summary only needs the boolean, so this avoids
+/// `enumerate_files`'s full walk + collect + sort. Uses the same managed-leaf
+/// definition (`should_skip` + `is_managed_leaf`, skipping `__pycache__`) so the
+/// two agree on what "empty" means. A read error (e.g. a vanished dir) is
+/// treated as "no file here" — this is an advisory hint, never a gate.
+fn env_tree_has_managed_file(env_root: &Path, env: &str) -> bool {
+    fn any_managed(dir: &Path, env: &str) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                if name == "__pycache__" {
+                    continue;
+                }
+                if any_managed(&entry.path(), env) {
+                    return true;
+                }
+            } else if !should_skip(&name, env) && is_managed_leaf(&name) {
+                return true;
+            }
+        }
+        false
+    }
+    MANAGED_DIRS.iter().any(|dir| {
+        let managed = env_root.join(dir);
+        managed.exists() && any_managed(&managed, env)
+    })
+}
+
 /// File extensions rdc actually writes inside a managed dir: `.json` (objects),
 /// `.py` (hook / rule / schema-formula code), `.js` (Node.js hook code).
 /// Anything else sitting next to them — `.pyc` bytecode, `.DS_Store`, editor
@@ -1392,8 +1522,10 @@ pub fn run(
         }
     }
 
-    let tgt_was_empty =
-        !tgt_root.exists() || enumerate_files(&tgt_root, tgt)?.is_empty();
+    // Only the boolean is needed, so probe with an early-exit scan instead of
+    // `enumerate_files(..).is_empty()`, which walks + collects + sorts the whole
+    // target tree just to discard it.
+    let tgt_was_empty = !tgt_root.exists() || !env_tree_has_managed_file(&tgt_root, tgt);
 
     // Un-creatable duplicate unique-typed email templates: when the SOURCE
     // queue holds more than one template of a per-queue-unique type, the
