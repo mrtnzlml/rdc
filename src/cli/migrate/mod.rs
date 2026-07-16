@@ -752,7 +752,11 @@ fn strip_source_host_env_refs(
             _ => false,
         };
         if drop_field {
-            obj.remove(&field);
+            // shift_remove (not swap_remove) so removing a field preserves the
+            // order of the surviving keys — otherwise the on-disk key order
+            // depends on which fields were dropped, and migrate's output flips
+            // between the create and update paths (non-deterministic bytes).
+            obj.shift_remove(&field);
         }
     }
 }
@@ -861,7 +865,7 @@ fn reconcile_training_enabled(value: &mut serde_json::Value, kind: &str, tgt_pat
             obj.insert(KEY.to_string(), v);
         }
         None => {
-            obj.remove(KEY);
+            obj.shift_remove(KEY);
         }
     }
 }
@@ -917,7 +921,7 @@ fn apply_datapoint_thresholds(
                         map.insert("score_threshold".to_string(), th.clone());
                     }
                     None => {
-                        map.remove("score_threshold");
+                        map.shift_remove("score_threshold");
                     }
                 }
             }
@@ -968,7 +972,7 @@ fn set_existing_key(value: &mut serde_json::Value, key: &str, new: &serde_json::
 fn remove_key_everywhere(value: &mut serde_json::Value, key: &str) {
     match value {
         serde_json::Value::Object(map) => {
-            map.remove(key);
+            map.shift_remove(key);
             for v in map.values_mut() {
                 remove_key_everywhere(v, key);
             }
@@ -1041,7 +1045,7 @@ fn reconcile_target_identity(
                         obj.insert(field, tgt_field.clone());
                     }
                     None => {
-                        obj.remove(&field);
+                        obj.shift_remove(&field);
                     }
                 }
             }
@@ -1056,7 +1060,7 @@ fn reconcile_target_identity(
             // lists — the subst already remapped them to tgt slugs, and the
             // server reconciles reverse-ref lists on create.
             for field in crate::snapshot::create::UNIVERSAL_SERVER_FIELDS {
-                obj.remove(*field);
+                obj.shift_remove(*field);
             }
             if had_org {
                 obj.insert(

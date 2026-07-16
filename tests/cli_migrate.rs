@@ -601,6 +601,87 @@ fn migrate_preserves_target_identity_for_matched_object() {
     assert_eq!(h["events"][0], "annotation_content.started", "src content (events) migrated");
 }
 
+/// Determinism: migrating the same source snapshot twice must produce
+/// byte-identical target files. The first run CREATES the target object (no
+/// target file, so `reconcile_target_identity` strips the universal server
+/// fields); the second run sees the file it just wrote and takes the MATCHED
+/// path (restores/removes the env fields). Those two paths remove a different
+/// set of keys, and JSON object key removal must not reorder the surviving
+/// keys — otherwise the on-disk bytes flip between runs (non-deterministic,
+/// noisy `git diff`) even though the content is identical. Regression for the
+/// `Map::remove` (swap-remove) key-scramble in the migrate transform.
+#[test]
+fn migrate_inbox_byte_deterministic_across_create_then_update() {
+    let project = init_two_env_project();
+    let root = project.path();
+
+    // SOURCE (test) inbox with env-specific fields (id/url/email/modified_by)
+    // interleaved with kept deployable fields, matching a real pulled inbox.
+    write(
+        &root.join("envs/test/workspaces/main/workspace.json"),
+        &serde_json::json!({ "name": "Main" }),
+    );
+    write(
+        &root.join("envs/test/workspaces/main/queues/invoices/inbox.json"),
+        &serde_json::json!({
+            "id": 10,
+            "url": "https://test.example/api/v1/inboxes/10",
+            "name": "Invoices Inbox",
+            "email": "invoices@test.example.rossum.app",
+            "queues": ["rdc://queues/invoices"],
+            "email_prefix": "invoices",
+            "bounce_email_to": null,
+            "metadata": {},
+            "filters": { "allowed_senders": [] },
+            "dmarc_check_action": "accept",
+            "modified_by": "https://test.example/api/v1/users/1"
+        }),
+    );
+
+    // A source lockfile carrying the env's api_base makes migrate run its
+    // source-host cleanup: the inbox `email` (whose domain is the source host)
+    // is dropped on the CREATE path but is already absent from the target on
+    // the UPDATE path — so the two paths strip a different key set. Without a
+    // deterministic write order this flips the surviving keys' order between
+    // runs. (This mirrors a real pulled snapshot, where the lockfile always
+    // records api_base.)
+    write(
+        &root.join(".rdc/state/test.lock.json"),
+        &serde_json::json!({
+            "version": 3,
+            "api_base": "https://test.example/api/v1",
+            "objects": {}
+        }),
+    );
+
+    let inbox = root.join("envs/prod/workspaces/main/queues/invoices/inbox.json");
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+
+    // First migrate: target inbox does not exist yet → CREATE path.
+    rdc::cli::migrate::run("test", "prod", false, false, vec![], true)
+        .expect("first migrate should succeed");
+    let after_create = std::fs::read(&inbox).expect("inbox written by first migrate");
+
+    // Second migrate: target inbox now exists → MATCHED/UPDATE path.
+    rdc::cli::migrate::run("test", "prod", false, false, vec![], true)
+        .expect("second migrate should succeed");
+    let after_update = std::fs::read(&inbox).expect("inbox present after second migrate");
+
+    std::env::set_current_dir(&prev).unwrap();
+
+    assert_eq!(
+        after_create,
+        after_update,
+        "migrate must be byte-deterministic: create-path and update-path output differ.\n\
+         CREATE:\n{}\nUPDATE:\n{}",
+        String::from_utf8_lossy(&after_create),
+        String::from_utf8_lossy(&after_update),
+    );
+}
+
 /// Helper: write a minimal src+tgt queue tree (queue.json + schema.json) with an
 /// identity mapping, where the schema has one datapoint and the queue has a
 /// `default_score_threshold`. `src_th`/`tgt_th` set the per-datapoint threshold;
