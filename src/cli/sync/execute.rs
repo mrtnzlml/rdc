@@ -3530,10 +3530,16 @@ pub async fn run(
             )
             .await?;
         }
-        // email_templates — flat compound slug `<ws>/<q>/<tpl>`. The
-        // driver consults `ctx.queue_locations` (populated by the queues
-        // dispatch above) to derive the on-disk path.
+        // email_templates — flat compound slug `<ws>/<q>/<tpl>`. The driver
+        // consults `ctx.queue_locations` to derive the on-disk path. The
+        // queues dispatch above only records locations for queues in ITS
+        // subset, which is empty when the only change this cycle is a new
+        // email template on an otherwise-clean queue. Locate every catalog
+        // queue first so such a template still resolves its queue and is
+        // actually written (else the pull is silently dropped and re-detected
+        // as "new" on every subsequent sync — not idempotent).
         if let Some(subset) = subsets.get("email_templates") {
+            crate::cli::pull::queues::locate_queues(ctx, &catalog.queues);
             crate::cli::pull::email_templates::process(
                 ctx,
                 catalog.email_templates.clone(),

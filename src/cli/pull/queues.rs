@@ -54,6 +54,53 @@ pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<Log>) -> Result<Vec<Queue>> 
     )
 }
 
+/// Populate `ctx.queue_locations` (queue URL → (ws_slug, q_slug)) for EVERY
+/// queue in the catalog, using the exact same global id-pinned slug
+/// derivation as [`process`].
+///
+/// [`process`] records a queue's location only for queues it actually writes
+/// (those in its subset), but [`crate::cli::pull::email_templates::process`]
+/// needs the location of a template's owning queue even when that queue is
+/// unchanged this cycle. An email-template-only pull leaves the queue subset
+/// empty, so the queue driver never runs (or runs over a different subset)
+/// and `queue_locations` would otherwise not cover the template's queue —
+/// making the driver silently drop the write (never idempotent). Call this
+/// before the email_templates dispatch to guarantee full coverage.
+///
+/// Uses `entry(..).or_insert(..)` so any authoritative location already
+/// written by [`process`] this cycle (with a freshly-assigned slug for a
+/// brand-new queue) is preserved, and the pass is safe to run before or
+/// after [`process`]. Slug derivation is pure (reads only the lockfile), so
+/// it never issues a request and matches the on-disk layout exactly.
+pub fn locate_queues(ctx: &mut PullCtx<'_>, queues: &[Queue]) {
+    let mut used_q_slugs: HashSet<String> = ctx
+        .lockfile
+        .objects
+        .get(KIND_QUEUES)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    for q in queues {
+        let Some(ws_url) = q.workspace.as_ref() else {
+            continue;
+        };
+        let Some(ws_slug) = ctx
+            .lockfile
+            .slug_for_url("workspaces", ws_url)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let q_slug = match ctx.lockfile.slug_for_id(KIND_QUEUES, q.id) {
+            Some(existing) => existing.to_string(),
+            None => slugify_unique(&q.name, &used_q_slugs),
+        };
+        used_q_slugs.insert(q_slug.clone());
+        ctx.queue_locations
+            .entry(q.url.clone())
+            .or_insert((ws_slug, q_slug));
+    }
+}
+
 /// Phase 2: process listed queues — filter, slug, write queue.json + schema +
 /// inbox. Also populates `ctx.queue_locations` for email_templates.
 ///
