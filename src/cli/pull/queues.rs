@@ -130,6 +130,22 @@ pub async fn process(
             std::fs::create_dir_all(&queue_dir)
                 .with_context(|| format!("creating {}", queue_dir.display()))?;
 
+            // The queue's slug is GLOBAL id-pinned (see the `used_q_slugs`
+            // doc above), so if the remote moved this queue to a different
+            // workspace since the last pull, its OLD workspace dir under the
+            // same slug is now stale. Left alone, the two dirs would collide
+            // on the one lockfile entry keyed by `q_slug` and the queue would
+            // re-push on every sync forever (never idempotent) — today
+            // `sync::mod`'s `detect_slug_collisions` only WARNS about this
+            // after the fact. Self-heal here, before this queue's
+            // new-location files are written below, so the collision never
+            // has a chance to persist across a sync cycle.
+            if let Some(stale_dir) = find_stale_queue_dir(ctx.paths, &ws_slug, &q_slug, q.id)
+                && stale_dir != queue_dir
+            {
+                reconcile_moved_queue(ctx, &q_slug, &ws_slug, &stale_dir, progress)?;
+            }
+
             ctx.queue_locations
                 .insert(q.url.clone(), (ws_slug.clone(), q_slug.clone()));
 
@@ -582,4 +598,169 @@ fn write_inbox_for_queue(
     );
     counts.inboxes += 1;
     Ok(())
+}
+
+/// Locate a STALE pre-move copy of queue `q_id`/`q_slug`: a
+/// `<other_ws>/queues/<q_slug>/queue.json` under any workspace OTHER than
+/// `current_ws_slug` whose parsed `"id"` matches `q_id`.
+///
+/// Matching on the parsed id (not just the directory's slug name) is what
+/// makes this safe — the slug alone can't be trusted to prove identity, but
+/// slugs are id-pinned and globally unique (see the `used_q_slugs` doc in
+/// [`process`]), so a *different* queue could never legitimately share this
+/// exact slug. Finding `<ws_slug>/queues/<q_slug>/queue.json` with a
+/// matching id under a different workspace therefore means: this is the same
+/// queue, and the remote moved it since the last pull.
+fn find_stale_queue_dir(
+    paths: &crate::paths::Paths,
+    current_ws_slug: &str,
+    q_slug: &str,
+    q_id: u64,
+) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(paths.workspaces_dir()).ok()?;
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let ws_slug = entry.file_name().to_string_lossy().into_owned();
+        if ws_slug == current_ws_slug {
+            continue;
+        }
+        let candidate = paths.queue_dir(&ws_slug, q_slug);
+        let Ok(bytes) = std::fs::read(candidate.join("queue.json")) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        if value.get("id").and_then(|v| v.as_u64()) == Some(q_id) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Self-heal a queue that moved workspace on the remote: delete the stale
+/// pre-move dir when it's provably unedited (see
+/// [`is_stale_queue_dir_clean`]), otherwise warn and leave it in place.
+///
+/// SAFETY: losing a user's un-synced local edit is far worse than leaving a
+/// stray directory and a warning, so any doubt about "clean" must resolve to
+/// "edited" (handled inside `is_stale_queue_dir_clean`, which this function
+/// trusts without a second opinion).
+fn reconcile_moved_queue(
+    ctx: &PullCtx<'_>,
+    q_slug: &str,
+    new_ws_slug: &str,
+    stale_dir: &std::path::Path,
+    progress: &Arc<Log>,
+) -> Result<()> {
+    let old_ws_slug = stale_dir
+        .parent() // .../queues
+        .and_then(|queues_dir| queues_dir.parent()) // .../<ws_slug>
+        .and_then(|ws_dir| ws_dir.file_name())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "?".to_string());
+
+    if is_stale_queue_dir_clean(ctx, q_slug, stale_dir)? {
+        std::fs::remove_dir_all(stale_dir)
+            .with_context(|| format!("removing stale queue dir {}", stale_dir.display()))?;
+        progress.event(
+            Action::Info,
+            &format!(
+                "relocated queue '{q_slug}': workspace '{old_ws_slug}' -> '{new_ws_slug}' \
+                 (removed stale copy after remote move)"
+            ),
+        );
+    } else {
+        progress.event(
+            Action::Warn,
+            &format!(
+                "queue '{q_slug}' moved to workspace '{new_ws_slug}' on the remote, but the \
+                 local copy in '{old_ws_slug}' has un-synced edits — not auto-removed (resolve \
+                 manually to avoid losing them)"
+            ),
+        );
+    }
+    Ok(())
+}
+
+/// Whether the stale pre-move queue dir has NO un-synced local edits, i.e.
+/// it's safe to delete outright.
+///
+/// Checks `queue.json`, `schema.json` (+ `formulas/*.py`), and `inbox.json` —
+/// whichever of these are present in `dir` — against the lockfile's recorded
+/// base `content_hash` for `q_slug`. The hash computations mirror EXACTLY
+/// what this driver's own write path already does for a "current" queue, so
+/// "clean" here means precisely what the three-way merge means elsewhere in
+/// this file:
+///   - `queue.json` / `inbox.json`: `content_hash` over `Lockfile::default()`,
+///     the same call [`decide_pull_action`] makes internally for these
+///     single-file kinds.
+///   - `schema.json` + `formulas/`: `schema_combined_hash` over `ctx.lockfile`,
+///     the same call [`write_schema_for_queue`] makes for its `local_combined`.
+///
+/// Conservative by construction: a file present with no recorded base, or
+/// whose hash doesn't match the recorded base, makes the WHOLE dir not
+/// clean — never guess.
+fn is_stale_queue_dir_clean(ctx: &PullCtx<'_>, q_slug: &str, dir: &std::path::Path) -> Result<bool> {
+    // queue.json always exists — it's how `find_stale_queue_dir` identified
+    // this dir in the first place.
+    let queue_path = dir.join("queue.json");
+    let Some(queue_base) = ctx
+        .lockfile
+        .objects
+        .get(KIND_QUEUES)
+        .and_then(|m| m.get(q_slug))
+        .and_then(|e| e.content_hash.as_deref())
+    else {
+        return Ok(false);
+    };
+    let queue_bytes = std::fs::read(&queue_path)
+        .with_context(|| format!("reading {}", queue_path.display()))?;
+    if crate::state::content_hash(&queue_bytes, &crate::state::Lockfile::default()) != queue_base {
+        return Ok(false);
+    }
+
+    let schema_path = dir.join("schema.json");
+    if schema_path.exists() {
+        let Some(schema_base) = ctx
+            .lockfile
+            .objects
+            .get(KIND_SCHEMAS)
+            .and_then(|m| m.get(q_slug))
+            .and_then(|e| e.content_hash.as_deref())
+        else {
+            return Ok(false);
+        };
+        let schema_bytes = std::fs::read(&schema_path)
+            .with_context(|| format!("reading {}", schema_path.display()))?;
+        let formulas = crate::snapshot::schema::read_local_formulas(dir)?;
+        let combined = crate::state::schema_combined_hash(&schema_bytes, &formulas, ctx.lockfile);
+        if combined != schema_base {
+            return Ok(false);
+        }
+    }
+
+    let inbox_path = dir.join("inbox.json");
+    if inbox_path.exists() {
+        let Some(inbox_base) = ctx
+            .lockfile
+            .objects
+            .get(KIND_INBOXES)
+            .and_then(|m| m.get(q_slug))
+            .and_then(|e| e.content_hash.as_deref())
+        else {
+            return Ok(false);
+        };
+        let inbox_bytes = std::fs::read(&inbox_path)
+            .with_context(|| format!("reading {}", inbox_path.display()))?;
+        if crate::state::content_hash(&inbox_bytes, &crate::state::Lockfile::default())
+            != inbox_base
+        {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
