@@ -681,4 +681,65 @@ version = 1
         .unwrap_err();
         assert!(format!("{err}").contains("inconsistent"));
     }
+
+    /// Drift guard for the parallel 10-kind lists (struct fields, `Default`,
+    /// `KINDS`, `kind_rows`, `kind_rows_mut`). Adding a deployable kind means
+    /// touching all of them; miss `KINDS` and that kind silently drops out of
+    /// `validate`/`orient`/`is_empty`/`from_legacy` with no compile error. This
+    /// ties the struct's serialized fields to `KINDS` in BOTH directions:
+    ///   - the struct literal below names every field, so adding a Vec field
+    ///     fails to compile here until the author updates it (a prompt to also
+    ///     touch `KINDS`);
+    ///   - the assertions then fail unless the new field is in `KINDS` too, and
+    ///     every `KINDS` entry resolves through `kind_rows`/`kind_rows_mut`.
+    #[test]
+    fn kinds_list_matches_struct_fields_and_accessors() {
+        let row = || {
+            let mut m = BTreeMap::new();
+            m.insert("dev".to_string(), "a".to_string());
+            m
+        };
+        // Exhaustive struct literal: adding a mapping Vec field to
+        // GenericMapping breaks THIS line until the author updates it.
+        let full = GenericMapping {
+            version: 2,
+            workspaces: vec![row()],
+            hooks: vec![row()],
+            rules: vec![row()],
+            labels: vec![row()],
+            schemas: vec![row()],
+            queues: vec![row()],
+            inboxes: vec![row()],
+            email_templates: vec![row()],
+            engines: vec![row()],
+            engine_fields: vec![row()],
+        };
+
+        let value = serde_json::to_value(&full).expect("serialize GenericMapping");
+        let obj = value.as_object().expect("GenericMapping serializes to a map");
+        let serialized: std::collections::BTreeSet<&str> = obj
+            .keys()
+            .map(String::as_str)
+            .filter(|k| *k != "version")
+            .collect();
+        let declared: std::collections::BTreeSet<&str> =
+            GenericMapping::KINDS.iter().copied().collect();
+        assert_eq!(
+            serialized, declared,
+            "GenericMapping kind fields and KINDS have drifted: a new mapping \
+             field must be added to KINDS (and kind_rows/kind_rows_mut), and \
+             KINDS must not name a nonexistent field"
+        );
+
+        for kind in GenericMapping::KINDS {
+            assert!(
+                full.kind_rows(kind).is_some(),
+                "kind_rows has no arm for KINDS entry '{kind}'"
+            );
+            assert!(
+                full.clone().kind_rows_mut(kind).is_some(),
+                "kind_rows_mut has no arm for KINDS entry '{kind}'"
+            );
+        }
+    }
 }

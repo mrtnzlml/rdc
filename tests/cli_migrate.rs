@@ -1246,3 +1246,229 @@ fn migrate_leaves_custom_type_duplicates_alone() {
         "custom-type duplicates are creatable and must both migrate"
     );
 }
+
+/// Capture a migrate run's stderr (where the CLI logs) so warnings/summaries
+/// can be asserted. Uses the binary (a subprocess), so — unlike the in-process
+/// `migrate::run` tests — it does not touch the process cwd and needs no
+/// `cwd_lock`.
+fn migrate_stderr(root: &std::path::Path, args: &[&str]) -> String {
+    let mut argv = vec!["migrate"];
+    argv.extend_from_slice(args);
+    let assert = assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(root)
+        .args(&argv)
+        .assert()
+        .success();
+    String::from_utf8_lossy(&assert.get_output().stderr).into_owned()
+}
+
+/// [3] A malformed legacy `.rdc/map/*.toml` unrelated to the requested
+/// direction must NOT abort the one-time conversion (before the generic file
+/// existed, `migrate <src> <tgt>` only read its own pair file). The good pair
+/// converts and is deleted; the malformed file is WARNED about and LEFT on disk
+/// so the mapping it encodes is never silently destroyed.
+#[test]
+fn migrate_skips_malformed_legacy_file_and_converts_the_good_ones() {
+    let project = TempDir::new().unwrap();
+    let root = project.path();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(root)
+        .args([
+            "init",
+            "--env",
+            "test=https://test.example/api/v1:1",
+            "--env",
+            "prod=https://prod.example/api/v1:2",
+            "--env",
+            "dev=https://dev.example/api/v1:3",
+        ])
+        .assert()
+        .success();
+
+    let map_dir = root.join(".rdc/map");
+    std::fs::create_dir_all(&map_dir).unwrap();
+    // Good, well-formed legacy pair with a real rename.
+    std::fs::write(
+        map_dir.join("test-to-prod.toml"),
+        "version = 1\n\n[queues]\n\"invoices\" = \"invoices-prod\"\n",
+    )
+    .unwrap();
+    // Unrelated MALFORMED file whose pair IS in rdc.toml, so it reaches the
+    // `Mapping::load` that used to `?`-abort the whole conversion.
+    std::fs::write(map_dir.join("test-to-dev.toml"), "this is not valid toml {{{").unwrap();
+
+    let stderr = migrate_stderr(root, &["test", "prod"]);
+
+    assert!(
+        stderr.contains("skipping malformed legacy mapping file"),
+        "must warn about + skip the malformed file, not abort: {stderr}"
+    );
+    let generic = std::fs::read_to_string(root.join(".rdc/mapping.toml"))
+        .expect(".rdc/mapping.toml must be written from the good pair");
+    assert!(
+        generic.contains("invoices") && generic.contains("invoices-prod"),
+        "the good rename must land in mapping.toml: {generic}"
+    );
+    assert!(
+        !map_dir.join("test-to-prod.toml").exists(),
+        "the converted good legacy file must be deleted"
+    );
+    assert!(
+        map_dir.join("test-to-dev.toml").exists(),
+        "the malformed legacy file must be LEFT in place, never deleted"
+    );
+}
+
+/// [8] With a committed `.rdc/mapping.toml`, legacy `.rdc/map/*.toml` files are
+/// never read — but a lingering one (reappeared via a branch/merge, or left by
+/// a malformed-skip) must be WARNED about, not silently ignored, since the
+/// renames it encodes are being dropped. The file is not modified.
+#[test]
+fn migrate_warns_about_leftover_legacy_files_beside_generic_mapping() {
+    let project = init_two_env_project();
+    let root = project.path();
+    std::fs::create_dir_all(root.join(".rdc")).unwrap();
+    std::fs::write(root.join(".rdc/mapping.toml"), "version = 2\n").unwrap();
+    let map_dir = root.join(".rdc/map");
+    std::fs::create_dir_all(&map_dir).unwrap();
+    std::fs::write(
+        map_dir.join("test-to-prod.toml"),
+        "version = 1\n\n[queues]\n\"invoices\" = \"invoices-prod\"\n",
+    )
+    .unwrap();
+
+    let stderr = migrate_stderr(root, &["test", "prod"]);
+
+    assert!(
+        stderr.contains("are present alongside") && stderr.contains("IGNORED"),
+        "must warn that leftover legacy files are ignored: {stderr}"
+    );
+    assert!(
+        map_dir.join("test-to-prod.toml").exists(),
+        "the leftover legacy file must not be deleted"
+    );
+}
+
+/// [11] The migrate summary counts workflow/MDH objects, which `classify`
+/// ignores. Migrating a source that holds only a workflow into an empty target
+/// must report `1 create`, not `0` (the pre-fix undercount).
+#[test]
+fn migrate_summary_counts_workflow_objects() {
+    let project = init_two_env_project();
+    let root = project.path();
+    write(
+        &root.join("envs/test/workflows/ap-flow/workflow.json"),
+        &serde_json::json!({ "name": "AP Flow", "type": "approval" }),
+    );
+
+    let stderr = migrate_stderr(root, &["test", "prod"]);
+
+    assert!(
+        stderr.contains("1 create"),
+        "the workflow object must be counted as a create: {stderr}"
+    );
+    assert!(
+        root.join("envs/prod/workflows/ap-flow/workflow.json").exists(),
+        "the workflow must actually be migrated to the target"
+    );
+}
+
+/// Stale-source guardrail: a `.rdc/mapping.toml` row whose SOURCE slug names no
+/// object on disk must WARN (otherwise the intended rename silently never
+/// applies, indistinguishable from a typo).
+#[test]
+fn migrate_warns_when_mapping_source_slug_is_absent() {
+    let project = init_two_env_project();
+    let root = project.path();
+    std::fs::create_dir_all(root.join(".rdc")).unwrap();
+    std::fs::write(
+        root.join(".rdc/mapping.toml"),
+        "version = 2\n\n[[queues]]\ntest = \"ghost\"\nprod = \"ghost-prod\"\n",
+    )
+    .unwrap();
+
+    let stderr = migrate_stderr(root, &["test", "prod"]);
+
+    assert!(
+        stderr.contains("mapping entry queues/ghost has no matching object"),
+        "must warn that the stale mapping source slug has no object: {stderr}"
+    );
+}
+
+/// [4] A genuine cross-file slug conflict (one env forced to two slugs) is
+/// unrepresentable in a single N-way file, so the one-time conversion ABORTS
+/// rather than silently pick a winner — but the error names the legacy files
+/// being converted (actionable) and nothing is written or deleted (no data
+/// lost). `migrate dev prod` aborting on a conflict that also involves `test`
+/// is the deliberate cost of a global, faithful conversion.
+#[test]
+fn migrate_aborts_with_file_attribution_on_inconsistent_legacy_files() {
+    let project = TempDir::new().unwrap();
+    let root = project.path();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(root)
+        .args([
+            "init",
+            "--env",
+            "test=https://test.example/api/v1:1",
+            "--env",
+            "prod=https://prod.example/api/v1:2",
+            "--env",
+            "dev=https://dev.example/api/v1:3",
+        ])
+        .assert()
+        .success();
+
+    // dev->prod: x->y ; dev->test: x->z ; prod->test: y->w — object x's node is
+    // forced to test=z AND (via y) test=w: inconsistent.
+    let map_dir = root.join(".rdc/map");
+    std::fs::create_dir_all(&map_dir).unwrap();
+    std::fs::write(
+        map_dir.join("dev-to-prod.toml"),
+        "version = 1\n\n[queues]\n\"x\" = \"y\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        map_dir.join("dev-to-test.toml"),
+        "version = 1\n\n[queues]\n\"x\" = \"z\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        map_dir.join("prod-to-test.toml"),
+        "version = 1\n\n[queues]\n\"y\" = \"w\"\n",
+    )
+    .unwrap();
+
+    let out = assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(root)
+        .args(["migrate", "dev", "prod"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "an inconsistent conversion must abort (non-zero exit)"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("inconsistent"),
+        "error must explain the inconsistency: {stderr}"
+    );
+    assert!(
+        stderr.contains("converting legacy mapping files"),
+        "error must attribute the legacy files being converted: {stderr}"
+    );
+    // Nothing written or deleted on the abort.
+    assert!(
+        map_dir.join("dev-to-prod.toml").exists(),
+        "legacy files must be preserved when conversion aborts"
+    );
+    assert!(
+        !root.join(".rdc/mapping.toml").exists(),
+        "no .rdc/mapping.toml may be written when conversion aborts"
+    );
+}
