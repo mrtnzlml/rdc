@@ -34,6 +34,7 @@ pub async fn sync_no_push(cwd: &Path, env: &str, token: &str) -> Result<CycleOut
         false, // allow_deletes
         true,  // no_push  <-- the embedding contract
         false, // no_pull
+        None,  // conflict_strategy (embedding never resolves BothDiverged interactively)
         None,
         Some(cwd),
         Some(token.to_string()),

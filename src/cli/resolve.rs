@@ -98,6 +98,29 @@ impl BulkChoice {
     }
 }
 
+/// Non-interactive conflict-resolution strategy for `rdc sync --conflict`.
+///
+/// When set, every `BothDiverged` conflict resolves this way WITHOUT ever
+/// reading stdin: `UseRemote`/`KeepLocal` seed the resolver's sticky bulk
+/// choice (see `execute::resolve_one_conflict`'s `sticky_now`) so the
+/// existing `BulkChoice::AllRemote`/`AllLocal` write-back path applies to
+/// every item, exactly as if the user had typed `[R]`/`[K]` and confirmed.
+/// `Skip` always takes the legacy shadow-file fallback (the same path a
+/// non-TTY run takes by default). An explicit strategy overrides the
+/// interactive prompt even when stdin is a TTY; the default (flag absent,
+/// `None`) leaves existing behavior — interactive prompt on a TTY,
+/// shadow-file skip on `--yes`/non-TTY — unchanged.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[value(rename_all = "kebab-case")]
+pub enum ConflictStrategy {
+    /// Resolve every conflict as `[r] use <env>`.
+    UseRemote,
+    /// Resolve every conflict as `[k] keep local`.
+    KeepLocal,
+    /// Resolve every conflict as `[s] skip` (shadow-file fallback).
+    Skip,
+}
+
 /// Supplied by the sync executor to enable the in-prompt "apply to all
 /// remaining" escape hatch. When passed `Some`, the prompt shows
 /// `[K]`/`[R]` and, on selection, prints the matching summary + a

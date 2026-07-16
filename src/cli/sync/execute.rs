@@ -35,8 +35,8 @@
 
 use crate::cli::pull::common::{PullCtx, RemoteCatalog};
 use crate::cli::resolve::{
-    BulkChoice, BulkPrompt, PullAborted, Resolution, detect_color_mode, prompt_remote_delete,
-    prompt_remote_delete_with_color, prompt_resolve_with_bytes_and_color,
+    BulkChoice, BulkPrompt, ConflictStrategy, PullAborted, Resolution, detect_color_mode,
+    prompt_remote_delete, prompt_remote_delete_with_color, prompt_resolve_with_bytes_and_color,
 };
 use crate::cli::stdin_coord::CoordinatorStdin;
 use crate::cli::sync::classify::{ClassifiedItem, SyncClass};
@@ -119,12 +119,20 @@ fn build_bulk_prompt(
 /// Today only `labels` are wired (matching Task 14/15 scope); other
 /// kinds fall through with a warning. Add per-kind arms as their
 /// adapters arrive.
+///
+/// `conflict_strategy`: when `Some`, every item resolves per
+/// [`ConflictStrategy`] without reading `input` at all — see
+/// `resolve_one_conflict`'s `sticky_now` seeding. `None` preserves the
+/// existing behavior (interactive prompt on a TTY, shadow-file skip
+/// otherwise).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_conflicts<R: BufRead>(
     ctx: &mut PullCtx<'_>,
     catalog: &RemoteCatalog,
     classified: &[ClassifiedItem],
     mut input: R,
     interactive: bool,
+    conflict_strategy: Option<ConflictStrategy>,
     progress: &Arc<Log>,
     bulk_sticky: &mut Option<BulkChoice>,
 ) -> Result<ConflictOutcome> {
@@ -606,6 +614,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
             &mut input,
             &mut stderr_lock,
             interactive,
+            conflict_strategy,
             &env,
             progress,
             &mut outcome,
@@ -1094,6 +1103,7 @@ fn resolve_one_conflict<R: BufRead>(
     input: &mut R,
     stderr_lock: &mut std::io::StderrLock<'_>,
     interactive: bool,
+    conflict_strategy: Option<ConflictStrategy>,
     env: &str,
     progress: &Arc<Log>,
     outcome: &mut ConflictOutcome,
@@ -1313,7 +1323,16 @@ fn resolve_one_conflict<R: BufRead>(
         return Ok(());
     }
 
-    if !interactive {
+    // Shadow-file fallback fires when: the caller explicitly asked for
+    // `--conflict skip` (always shadows, regardless of TTY), OR no
+    // strategy was given AND the run is non-interactive (the pre-existing
+    // `--yes`/non-TTY default). An explicit `use-remote`/`keep-local`
+    // strategy must NOT shadow — it falls through to the resolution path
+    // below, which seeds `sticky_now` and applies the resolution without
+    // ever reading stdin.
+    if matches!(conflict_strategy, Some(ConflictStrategy::Skip))
+        || (conflict_strategy.is_none() && !interactive)
+    {
         // Non-TTY/--yes: fall back to legacy shadow-file behavior so the
         // run still completes without blocking on stdin. The local file
         // stays as-is and the lockfile is pinned to the prior base —
@@ -1404,7 +1423,19 @@ fn resolve_one_conflict<R: BufRead>(
     // Wrap all prompt reads in `with_prompt` so the grid renderer
     // suspends its draw region for the duration of the stdin read.
     // For the log renderer this is a transparent no-op.
-    let sticky_now: Option<BulkChoice> = *bulk_sticky;
+    //
+    // An explicit `--conflict use-remote`/`keep-local` strategy takes
+    // priority over any in-prompt sticky "apply to all" choice (there is
+    // no prompt to have made one from) and is recomputed fresh on every
+    // item rather than persisted into `*bulk_sticky` — every branch below
+    // already reduces `Some(sticky_now)` to `b.resolution()` without
+    // touching `input`, so seeding it here is what makes the whole
+    // resolution non-interactive, including on a TTY.
+    let sticky_now: Option<BulkChoice> = match conflict_strategy {
+        Some(ConflictStrategy::UseRemote) => Some(BulkChoice::AllRemote),
+        Some(ConflictStrategy::KeepLocal) => Some(BulkChoice::AllLocal),
+        Some(ConflictStrategy::Skip) | None => *bulk_sticky,
+    };
     let prompt_out: std::cell::RefCell<Option<PromptOutcome>> = std::cell::RefCell::new(None);
     progress.with_prompt(|| -> anyhow::Result<_> {
         let computed: PromptOutcome = if json_canonicalize_equal && sidecar_diverges {
@@ -3071,6 +3102,7 @@ fn find_engine_field_engine_slug(paths: &crate::paths::Paths, field_slug: &str) 
 /// `interactive` flows through to the conflict resolver and the push
 /// driver's drift prompt; on the pull side each per-kind driver consults
 /// `ctx.interactive` (set by the caller to the same value).
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     ctx: &mut PullCtx<'_>,
     catalog: &RemoteCatalog,
@@ -3079,6 +3111,7 @@ pub async fn run(
     no_pull: bool,
     allow_deletes: bool,
     interactive: bool,
+    conflict_strategy: Option<ConflictStrategy>,
     progress: &Arc<Log>,
 ) -> Result<crate::cli::sync::CycleOutcome> {
     // Tally cycle counters up front by inspecting the static classification.
@@ -3132,6 +3165,7 @@ pub async fn run(
         classified,
         CoordinatorStdin::new(),
         interactive,
+        conflict_strategy,
         progress,
         &mut bulk_sticky,
     )
@@ -3987,6 +4021,7 @@ mod tests {
                 &classified,
                 Cursor::new(b"k\n"),
                 true,
+                None,
                 &progress,
                 &mut None,
             )
@@ -4047,6 +4082,7 @@ mod tests {
                 &classified,
                 Cursor::new(b"r\n"),
                 true,
+                None,
                 &progress,
                 &mut None,
             )
@@ -4084,6 +4120,163 @@ mod tests {
         assert_eq!(recorded, content_hash(&remote_bytes, &fixture.lockfile));
     }
 
+    /// `--conflict use-remote`: resolves a BothDiverged conflict exactly like
+    /// a scripted `r\n`, but WITHOUT reading stdin — empty input, non-interactive.
+    /// Proves the strategy seeds the resolver's sticky choice so the local file
+    /// is overwritten with remote bytes and the lockfile records the remote hash,
+    /// with no shadow file and no prompt.
+    #[tokio::test]
+    async fn conflict_strategy_use_remote_resolves_without_stdin() {
+        let mut fixture = setup_conflict_fixture();
+        let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
+        let classified = classified_for(&fixture);
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                interactive: false,
+            };
+            resolve_conflicts(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b""), // empty stdin: proves the strategy reads no prompt
+                false,            // non-interactive
+                Some(crate::cli::resolve::ConflictStrategy::UseRemote),
+                &progress,
+                &mut None,
+            )
+            .await
+            .expect("use-remote strategy should resolve without stdin")
+        };
+
+        assert!(
+            outcome.promoted_to_push.is_empty(),
+            "remote wins on use-remote → no push"
+        );
+        let remote_bytes = crate::cli::pull::common::portabilize_proposed(
+            &label_bytes(&fixture.remote_label),
+            &fixture.lockfile,
+        );
+        let local_after = std::fs::read(&fixture.local_path).unwrap();
+        assert_eq!(
+            local_after, remote_bytes,
+            "use-remote must overwrite local with the remote bytes"
+        );
+        let recorded = fixture
+            .lockfile
+            .objects
+            .get("labels")
+            .and_then(|m| m.get("audit-hold"))
+            .and_then(|e| e.content_hash.clone())
+            .unwrap();
+        assert_eq!(recorded, content_hash(&remote_bytes, &fixture.lockfile));
+        assert!(
+            !fixture
+                .paths
+                .conflict_shadow_path(&fixture.local_path)
+                .exists(),
+            "use-remote resolves in place — no shadow file"
+        );
+    }
+
+    /// `--conflict keep-local`: keeps the local file untouched WITHOUT reading
+    /// stdin. No shadow file is written (that is the skip path, not keep-local).
+    #[tokio::test]
+    async fn conflict_strategy_keep_local_resolves_without_stdin() {
+        let mut fixture = setup_conflict_fixture();
+        let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
+        let classified = classified_for(&fixture);
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+        let local_before = std::fs::read(&fixture.local_path).unwrap();
+
+        {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                interactive: false,
+            };
+            resolve_conflicts(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b""),
+                false,
+                Some(crate::cli::resolve::ConflictStrategy::KeepLocal),
+                &progress,
+                &mut None,
+            )
+            .await
+            .expect("keep-local strategy should resolve without stdin");
+        }
+
+        let local_after = std::fs::read(&fixture.local_path).unwrap();
+        assert_eq!(
+            local_after, local_before,
+            "keep-local must leave the local file unchanged"
+        );
+        assert!(
+            !fixture
+                .paths
+                .conflict_shadow_path(&fixture.local_path)
+                .exists(),
+            "keep-local must not write a shadow file"
+        );
+    }
+
+    /// `--conflict skip` takes the shadow-file path EVEN on a TTY (an explicit
+    /// skip overrides the interactive prompt): local is preserved and the remote
+    /// lands at the shadow path, with no stdin read.
+    #[tokio::test]
+    async fn conflict_strategy_skip_writes_shadow_even_on_tty() {
+        let mut fixture = setup_conflict_fixture();
+        let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
+        let classified = classified_for(&fixture);
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+        let local_before = std::fs::read(&fixture.local_path).unwrap();
+
+        {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                interactive: true, // TTY; explicit skip must still bypass the prompt
+            };
+            resolve_conflicts(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b""),
+                true,
+                Some(crate::cli::resolve::ConflictStrategy::Skip),
+                &progress,
+                &mut None,
+            )
+            .await
+            .expect("skip strategy should resolve without stdin");
+        }
+
+        let local_after = std::fs::read(&fixture.local_path).unwrap();
+        assert_eq!(
+            local_after, local_before,
+            "skip must preserve the local file"
+        );
+        assert!(
+            fixture
+                .paths
+                .conflict_shadow_path(&fixture.local_path)
+                .exists(),
+            "skip must write the remote to the shadow path"
+        );
+    }
+
     /// A stale shadow (and `-deleted` marker) left by an earlier
     /// non-TTY skip must be swept when the conflict is finally resolved
     /// with [r] — the shadow's content is now consumed/stale either way.
@@ -4114,6 +4307,7 @@ mod tests {
                 &classified,
                 Cursor::new(b"r\n"),
                 true,
+                None,
                 &progress,
                 &mut None,
             )
@@ -4158,6 +4352,7 @@ mod tests {
                 &classified,
                 Cursor::new(b"k\n"),
                 true,
+                None,
                 &progress,
                 &mut None,
             )
@@ -4206,6 +4401,7 @@ mod tests {
                 &classified,
                 Cursor::new(b"s\n"),
                 true,
+                None,
                 &progress,
                 &mut None,
             )
@@ -4290,6 +4486,7 @@ mod tests {
                 &classified,
                 Cursor::new(b""),
                 false,
+                None,
                 &progress,
                 &mut None,
             )
@@ -4341,6 +4538,7 @@ mod tests {
                 &classified,
                 Cursor::new(b"a\n"),
                 true,
+                None,
                 &progress,
                 &mut None,
             )
@@ -4394,6 +4592,7 @@ mod tests {
                 &classified,
                 Cursor::new(b""),
                 true,
+                None,
                 &progress,
                 &mut None,
             )
@@ -4442,6 +4641,7 @@ mod tests {
                 &classified,
                 Cursor::new(b"R\ny\n"),
                 true,
+                None,
                 &progress,
                 &mut sticky,
             )
@@ -4497,6 +4697,7 @@ mod tests {
                 &classified,
                 Cursor::new(b"K\ny\n"),
                 true,
+                None,
                 &progress,
                 &mut sticky,
             )
@@ -4548,6 +4749,7 @@ mod tests {
                 &classified,
                 Cursor::new(b"R\nn\nk\n"),
                 true,
+                None,
                 &progress,
                 &mut sticky,
             )
@@ -5839,6 +6041,7 @@ mod tests {
                 &classified,
                 Cursor::new(b""),
                 true,
+                None,
                 &progress,
                 &mut None,
             )
@@ -5914,6 +6117,7 @@ mod tests {
                 &classified,
                 Cursor::new(b"k\n"),
                 true,
+                None,
                 &progress,
                 &mut None,
             )
@@ -5984,6 +6188,7 @@ mod tests {
                 &classified,
                 Cursor::new(b"r\n"),
                 true,
+                None,
                 &progress,
                 &mut None,
             )
@@ -6114,6 +6319,7 @@ mod tests {
                 &classified,
                 Cursor::new(b"r\n"),
                 true,
+                None,
                 &progress,
                 &mut None,
             )
@@ -6280,6 +6486,7 @@ mod tests {
                 &classified,
                 Cursor::new(b""),
                 true,
+                None,
                 &progress,
                 &mut None,
             )
@@ -6434,6 +6641,7 @@ mod tests {
                 &classified,
                 Cursor::new(b""),
                 true,
+                None,
                 &progress,
                 &mut None,
             )
@@ -6684,6 +6892,7 @@ mod tests {
                 &classified,
                 Cursor::new(b""),
                 true,
+                None,
                 &progress,
                 &mut None,
             )
@@ -6877,6 +7086,7 @@ mod tests {
                 &classified,
                 Cursor::new(b"r\n"),
                 true,
+                None,
                 &progress,
                 &mut None,
             )

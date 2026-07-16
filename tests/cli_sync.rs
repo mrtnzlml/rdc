@@ -150,6 +150,7 @@ async fn sync_clean_env_does_no_writes() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -277,6 +278,7 @@ async fn sync_remote_create_writes_local_label() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -377,7 +379,7 @@ async fn sync_clean_label_no_writes() {
     let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("first sync should succeed");
 
@@ -399,7 +401,7 @@ async fn sync_clean_label_no_writes() {
 
     // Second sync: nothing should change. The label is on the env, on
     // disk, and in the lockfile with a matching hash → Clean.
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("clean-state second sync should succeed");
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -519,6 +521,7 @@ async fn sync_local_edit_only_patches_remote_label() {
     rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await
     .expect("first sync should succeed");
@@ -545,7 +548,7 @@ async fn sync_local_edit_only_patches_remote_label() {
         std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
 
     // Second sync: classifier sees LocalEdit; executor must PATCH.
-    let result = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let result = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
 
     result.expect("second sync should succeed and PATCH the remote label");
@@ -661,6 +664,7 @@ async fn sync_no_push_skips_local_edit() {
     rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await
     .expect("first sync should succeed");
@@ -682,7 +686,7 @@ async fn sync_no_push_skips_local_edit() {
         std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
 
     // Second sync with --no-push: the LocalEdit must be ignored.
-    let result = rdc::cli::sync::run("dev", false, false, false, /* no_push = */ true, false).await;
+    let result = rdc::cli::sync::run("dev", false, false, false, /* no_push = */ true, false, None).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
 
     result.expect("sync --no-push should succeed");
@@ -775,6 +779,7 @@ async fn sync_no_pull_skips_remote_change() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ true,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -874,7 +879,7 @@ async fn sync_dry_run_lists_clean_remote_delete_under_pull() {
     let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("seed sync should succeed");
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -982,7 +987,7 @@ async fn sync_surfaces_parse_errors_and_refuses_partial_push() {
     let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("seed sync should succeed");
 
@@ -1022,7 +1027,7 @@ async fn sync_surfaces_parse_errors_and_refuses_partial_push() {
     // Real sync: refuses before ANY remote write (wiremock .expect(0)
     // guards both PATCH endpoints on Drop).
     std::env::set_current_dir(project.path()).unwrap();
-    let err = rdc::cli::sync::run("dev", false, false, false, false, false)
+    let err = rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect_err("sync must refuse to push with an unparseable local file");
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -1095,7 +1100,7 @@ async fn sync_dry_run_makes_zero_writes() {
     let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("seed sync should succeed");
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -1207,6 +1212,7 @@ async fn sync_no_push_and_no_pull_together_errors() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ true, /* no_pull = */ true,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -1274,6 +1280,7 @@ async fn sync_remote_create_writes_local_workflow() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -1399,6 +1406,7 @@ async fn sync_remote_create_writes_local_workflow_step() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -1528,7 +1536,7 @@ async fn sync_pulls_same_named_step_under_two_workflows_with_clean_slugs() {
     let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
-    let result = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let result = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
     result.expect("sync should succeed");
 
@@ -1601,6 +1609,7 @@ async fn sync_remote_create_writes_local_organization() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -1704,6 +1713,7 @@ async fn sync_remote_create_writes_local_workspace() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -1802,6 +1812,7 @@ async fn sync_remote_create_writes_local_engine() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -1903,6 +1914,7 @@ async fn sync_redacts_engine_agenda_id_on_disk() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -1989,6 +2001,7 @@ async fn sync_redacts_hook_status_on_disk() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -2088,6 +2101,7 @@ async fn sync_remote_create_writes_local_engine_field() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -2222,6 +2236,7 @@ async fn sync_pulls_same_named_field_under_two_engines_with_clean_slugs() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -2346,6 +2361,7 @@ async fn sync_writes_local_mdh_indexes_and_collection_manifest() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -2495,7 +2511,7 @@ async fn sync_dry_run_previews_new_mdh_collection_under_pull() {
     let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("seed sync should succeed");
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -2603,6 +2619,7 @@ async fn sync_remote_create_writes_local_hook() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -2728,6 +2745,7 @@ async fn sync_remote_create_writes_local_js_hook() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -2859,6 +2877,7 @@ async fn sync_remote_create_writes_local_rule() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -3091,6 +3110,7 @@ async fn sync_remote_create_writes_local_queue_tree() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -3344,6 +3364,7 @@ async fn sync_portabilizes_and_sorts_queue_hook_and_webhook_arrays() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -3428,6 +3449,7 @@ async fn sync_clean_queue_tree_no_writes() {
     rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await
     .expect("first sync should succeed");
@@ -3483,6 +3505,7 @@ async fn sync_clean_queue_tree_no_writes() {
     rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await
     .expect("second sync should succeed (clean state)");
@@ -4173,6 +4196,7 @@ async fn sync_watch_does_not_deadlock_with_one_shot_sync() {
             "dev", /* interactive = */ false, /* dry_run = */ false,
             /* allow_deletes = */ false, /* no_push = */ false,
             /* no_pull = */ false,
+            None,
         ));
         let _ = one_shot_tx.send(res);
     });
@@ -4299,7 +4323,7 @@ async fn sync_hook_code_only_divergence_does_not_silently_push() {
     std::env::set_current_dir(project.path()).unwrap();
 
     // Seed.
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("first sync should succeed");
 
@@ -4317,7 +4341,7 @@ async fn sync_hook_code_only_divergence_does_not_silently_push() {
         std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
 
     // Second sync — remote now serves the modified-code hook.
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("second sync should succeed (no silent push)");
 
@@ -4487,7 +4511,7 @@ async fn sync_both_diverged_hook_does_not_silently_push() {
     std::env::set_current_dir(project.path()).unwrap();
 
     // First sync — seeds the lockfile with base bytes.
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("first sync should succeed");
 
@@ -4510,7 +4534,7 @@ async fn sync_both_diverged_hook_does_not_silently_push() {
     // Second sync — remote now serves the modified hook. Both sides have
     // diverged from the lockfile-recorded base → classifier MUST emit
     // BothDiverged, and the non-TTY fallback MUST NOT push.
-    let result = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let result = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
 
     result.expect("second sync should succeed (no push, conflict deferred)");
@@ -4825,7 +4849,7 @@ async fn run_hook_conflict_scenario(variant: HookConflictVariant) {
     std::env::set_current_dir(project.path()).unwrap();
 
     // Seed.
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("first sync should succeed");
 
@@ -4872,7 +4896,7 @@ async fn run_hook_conflict_scenario(variant: HookConflictVariant) {
     // resolver falls back to shadow-file behavior and NO PATCH/POST/
     // DELETE may land. For the auto-merge variants (`JsonBothEdited`,
     // `LocalJsonRemoteCode`) exactly one PATCH of the merged hook lands.
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("second sync should succeed");
 
@@ -4942,7 +4966,7 @@ async fn run_hook_conflict_scenario(variant: HookConflictVariant) {
         // the hook Clean — no further mutating request, local union
         // events preserved (not reverted).
         let muts_before = hook_mutation_bodies.len();
-        rdc::cli::sync::run("dev", false, false, false, false, false)
+        rdc::cli::sync::run("dev", false, false, false, false, false, None)
             .await
             .expect("idempotency sync should succeed");
         let muts_after = server
@@ -5304,7 +5328,7 @@ async fn run_rule_conflict_scenario(variant: RuleConflictVariant) {
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
 
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("first sync should succeed");
 
@@ -5344,7 +5368,7 @@ async fn run_rule_conflict_scenario(variant: RuleConflictVariant) {
     let lf_before =
         std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
 
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("second sync should succeed (no silent write)");
 
@@ -5390,7 +5414,7 @@ async fn run_rule_conflict_scenario(variant: RuleConflictVariant) {
         // so a re-sync must classify Clean — no further mutations, the
         // local name edit not reverted.
         std::env::set_current_dir(project.path()).unwrap();
-        rdc::cli::sync::run("dev", false, false, false, false, false)
+        rdc::cli::sync::run("dev", false, false, false, false, false, None)
             .await
             .expect("idempotency sync should succeed");
         std::env::set_current_dir(&prev_cwd).unwrap();
@@ -5703,7 +5727,7 @@ async fn run_schema_conflict_scenario(variant: SchemaConflictVariant) {
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
 
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("first sync should succeed");
 
@@ -5749,7 +5773,7 @@ async fn run_schema_conflict_scenario(variant: SchemaConflictVariant) {
     let lf_before =
         std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
 
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("second sync should succeed (no silent write)");
 
@@ -5910,7 +5934,7 @@ async fn sync_after_lockfile_wipe_in_sync_label_yields_clean_and_rebuilds_lockfi
     std::env::set_current_dir(project.path()).unwrap();
 
     // First sync: pulls the label and seeds the lockfile.
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("first sync seeds the lockfile");
 
@@ -5935,7 +5959,7 @@ async fn sync_after_lockfile_wipe_in_sync_label_yields_clean_and_rebuilds_lockfi
     // Second sync: this would have panicked pre-fix. With the fix in
     // place, the canonical hashes match → classify as Clean → executor
     // dispatches through pull driver to rebuild the lockfile entry.
-    let result = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let result = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
     result.expect("post-wipe sync must not panic when local==remote");
 
@@ -6056,7 +6080,7 @@ async fn sync_after_lockfile_wipe_diverged_label_does_not_panic_and_does_not_sil
     std::env::set_current_dir(project.path()).unwrap();
 
     // First sync seeds local + lockfile from remote.
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("first sync seeds the lockfile");
 
@@ -6081,7 +6105,7 @@ async fn sync_after_lockfile_wipe_diverged_label_does_not_panic_and_does_not_sil
     // local_hash != remote_hash → BothDiverged. Non-TTY → shadow file
     // fallback, no push, base preserved (None) so the next sync
     // re-prompts.
-    let result = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let result = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
     result.expect("post-wipe diverged sync must not panic");
 
@@ -6247,6 +6271,7 @@ async fn sync_pushes_local_edits_before_pulling_remote_changes() {
     rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await
     .expect("seed sync should succeed");
@@ -6389,7 +6414,7 @@ async fn sync_hook_secrets_only_edit_triggers_force_patch() {
     // Seed sync — pulls the hook, populates lockfile. No PATCH expected
     // here (the `.expect(1)` on the PATCH mock covers the WHOLE test;
     // the second sync below is what fires it).
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("seed sync should succeed");
 
@@ -6402,12 +6427,12 @@ async fn sync_hook_secrets_only_edit_triggers_force_patch() {
 
     // Second sync — hook JSON/code is unchanged on disk and on remote;
     // only the secrets file changed. The force-PATCH pass should fire.
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("secrets-only force PATCH should succeed");
 
     // Third sync — secrets_hash now matches; should be a no-op.
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("third sync should be a no-op");
 
@@ -6660,7 +6685,7 @@ async fn sync_auto_merges_disjoint_label_edits_without_prompting() {
     std::env::set_current_dir(project.path()).unwrap();
 
     // First sync — seeds lockfile + base cache from phase 1.
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("first sync");
 
@@ -6679,7 +6704,7 @@ async fn sync_auto_merges_disjoint_label_edits_without_prompting() {
     // Second sync — the 3-way merge accepts both disjoint edits, then
     // (because a local-side field survived the merge) PATCHes the merged
     // result back so the remote receives the local color.
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("second sync auto-merges and pushes");
 
@@ -6734,7 +6759,7 @@ async fn sync_auto_merges_disjoint_label_edits_without_prompting() {
     let mutations_before =
         count_object_mutations(server.received_requests().await.unwrap_or_default());
 
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("third sync is idempotent");
 
@@ -6918,7 +6943,7 @@ async fn sync_hook_with_overlay_no_phantom_drift() {
 
     // First sync: pull writes the hook (overlay-stripped) and records the
     // post-overlay combined hash in the lockfile.
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("first sync should succeed");
 
@@ -6941,7 +6966,7 @@ async fn sync_hook_with_overlay_no_phantom_drift() {
     // Second sync: API still serves the same hook body. The classifier must
     // see the recorded hash == on-disk hash == remote hash → Clean. No file
     // rewrites, no API mutations. This is the phantom-drift regression.
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("second sync should succeed (clean state)");
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -7071,7 +7096,7 @@ async fn sync_workspace_modified_at_change_is_clean() {
 
     // First sync: pull writes the workspace (modified_at stripped) and
     // records the post-strip hash in the lockfile.
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("first sync should succeed");
 
@@ -7098,7 +7123,7 @@ async fn sync_workspace_modified_at_change_is_clean() {
     // Second sync: API now serves the workspace with a bumped `modified_at`.
     // The classifier MUST see Clean (no RemoteEdit, no file rewrite, no
     // lockfile mutation). This is the phantom-drift regression.
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("second sync should succeed (clean state despite bumped modified_at)");
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -7209,7 +7234,7 @@ async fn push_hook_patch_body_omits_status() {
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
 
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("seed sync should succeed");
 
@@ -7230,7 +7255,7 @@ async fn push_hook_patch_body_omits_status() {
     )
     .unwrap();
 
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("push sync should succeed");
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -7339,7 +7364,7 @@ async fn push_engine_patch_redacts_agenda_id_on_disk() {
     std::env::set_current_dir(project.path()).unwrap();
 
     // Seed sync: pulls the engine and records the lockfile baseline.
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("seed sync should succeed");
 
@@ -7370,7 +7395,7 @@ async fn push_engine_patch_redacts_agenda_id_on_disk() {
 
     // Second sync: LocalEdit → push PATCH; must write codec bytes + redacted
     // agenda_id to disk, not the raw `patched_agenda_id` from the server.
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("push sync should succeed");
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -7575,7 +7600,7 @@ async fn sync_legacy_unedited_engine_converges_silently() {
         let _cwd_guard = cwd_lock();
         let prev_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(project.path()).unwrap();
-        let r = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+        let r = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
         std::env::set_current_dir(&prev_cwd).unwrap();
         r
     };
@@ -7649,7 +7674,7 @@ async fn sync_legacy_unedited_engine_converges_silently() {
         let _cwd_guard2 = cwd_lock();
         let prev_cwd2 = std::env::current_dir().unwrap();
         std::env::set_current_dir(project.path()).unwrap();
-        rdc::cli::sync::run("dev", false, false, false, false, false)
+        rdc::cli::sync::run("dev", false, false, false, false, false, None)
             .await
             .expect("second sync must succeed (fully clean after migration)");
         std::env::set_current_dir(&prev_cwd2).unwrap();
@@ -7793,7 +7818,7 @@ async fn sync_legacy_edited_engine_surfaces_conflict() {
     std::env::set_current_dir(project.path()).unwrap();
     // Sync must succeed (conflicts are non-fatal in non-interactive mode; they
     // surface as shadow files and a lockfile freeze, not an error return).
-    let result = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let result = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
 
     result.expect("sync with locally-edited legacy engine must not return an error");
@@ -7968,6 +7993,7 @@ async fn sync_keeps_same_named_queues_distinct_across_workspaces() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -8157,7 +8183,7 @@ async fn sync_delete_skips_failed_and_continues_batch() {
 
     // First sync: pull the three labels so local files + lockfile entries
     // exist. This is the standard seed pattern used across this file.
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("seed sync should succeed");
 
@@ -8180,6 +8206,7 @@ async fn sync_delete_skips_failed_and_continues_batch() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ true, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -8356,12 +8383,12 @@ async fn push_create_label() {
     let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
-    let r1 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let r1 = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
 
     // Snapshot mutations after the first sync, then run a second sync to
     // assert idempotency, before restoring CWD.
     let reqs_after_first = server.received_requests().await.unwrap_or_default();
-    let r2 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let r2 = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
 
     r1.expect("first sync (label create) should succeed");
@@ -8500,9 +8527,9 @@ async fn push_create_rule() {
     let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
-    let r1 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let r1 = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
     let reqs_after_first = server.received_requests().await.unwrap_or_default();
-    let r2 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let r2 = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
 
     r1.expect("first sync (rule create) should succeed");
@@ -8712,7 +8739,7 @@ async fn push_create_rule_refreshes_target_queue_backref_same_pass() {
     std::env::set_current_dir(project.path()).unwrap();
 
     // Sync #1: pull the queue tree into a Clean local snapshot (no rule yet).
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("initial pull sync should succeed");
     let queue_before = std::fs::read_to_string(&queue_json_path).unwrap();
@@ -8737,7 +8764,7 @@ async fn push_create_rule_refreshes_target_queue_backref_same_pass() {
     std::fs::write(rules_dir.join("total-amount-check.py"), b"").unwrap();
 
     // Sync #2: POST the rule AND refresh the queue back-ref in the same pass.
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("rule-create sync should succeed");
     let reqs_after_create = server.received_requests().await.unwrap_or_default();
@@ -8747,7 +8774,7 @@ async fn push_create_rule_refreshes_target_queue_backref_same_pass() {
     let queue_after_create = std::fs::read_to_string(&queue_json_path).unwrap();
 
     // Sync #3: must be a clean no-op — proves the back-ref converged in one pass.
-    rdc::cli::sync::run("dev", false, false, false, false, false)
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("re-sync should succeed and be idempotent");
     let reqs_after_resync = server.received_requests().await.unwrap_or_default();
@@ -8977,9 +9004,9 @@ async fn push_create_dependency_ordered_workspace_schema_queue() {
     let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
-    let r1 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let r1 = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
     let reqs_after_first = server.received_requests().await.unwrap_or_default();
-    let r2 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let r2 = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
 
     r1.expect("first sync (dependency-ordered create) should succeed");
@@ -9263,7 +9290,7 @@ async fn push_create_inbox_and_email_template() {
     let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
-    let pull = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let pull = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
 
     // Now seed the NEW inbox + email template under the existing queue, both
     // with `rdc://queues/cost-invoices` refs.
@@ -9292,9 +9319,9 @@ async fn push_create_inbox_and_email_template() {
     b.push(b'\n');
     std::fs::write(tpl_dir.join("rejection-notice.json"), &b).unwrap();
 
-    let r2 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let r2 = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
     let reqs_after_create = server.received_requests().await.unwrap_or_default();
-    let r3 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let r3 = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
 
     pull.expect("initial pull sync should succeed");
@@ -9781,7 +9808,7 @@ async fn sync_push_hook_run_after_deferred_relink() {
 
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
-    let result = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let result = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
 
     result.expect("sync with hook run_after deferred relink must succeed");
@@ -10001,7 +10028,7 @@ async fn sync_push_email_template_adopts_existing_by_type() {
     std::env::set_current_dir(project.path()).unwrap();
 
     // Initial pull: lands workspace+queue+schema in the lockfile (Clean).
-    let pull = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let pull = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
 
     // Seed the new email template file with `rejection_default` type.
     let q_dir = project
@@ -10022,7 +10049,7 @@ async fn sync_push_email_template_adopts_existing_by_type() {
 
     // Sync: the template has no lockfile entry; the remote has a
     // `rejection_default` for queue/100 → adopt path → PATCH, no POST.
-    let r2 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let r2 = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
 
     pull.expect("initial pull must succeed");
@@ -10168,7 +10195,7 @@ async fn sync_push_email_template_posts_when_no_match() {
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
 
-    let pull = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let pull = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
 
     let q_dir = project
         .path()
@@ -10187,7 +10214,7 @@ async fn sync_push_email_template_posts_when_no_match() {
     std::fs::write(tpl_dir.join("rejection-default.json"), &b).unwrap();
 
     // Sync: no matching remote template → must POST.
-    let r2 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let r2 = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
 
     pull.expect("initial pull must succeed");
@@ -10273,7 +10300,7 @@ async fn sync_push_abort_persists_partial_progress_to_lockfile() {
     let _cwd_guard = cwd_lock();
     let prev_cwd = std::env::current_dir().unwrap();
     std::env::set_current_dir(project.path()).unwrap();
-    let result = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let result = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
     std::env::set_current_dir(&prev_cwd).unwrap();
 
     assert!(result.is_err(), "sync must fail when the label POST 500s");
@@ -10354,6 +10381,7 @@ async fn sync_failed_template_create_is_not_counted_as_changed() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -10465,6 +10493,7 @@ async fn sync_mdh_index_create_counts_as_changed_when_materialized() {
     let result = rdc::cli::sync::run(
         "dev", /* interactive = */ false, /* dry_run = */ false,
         /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
     )
     .await;
     std::env::set_current_dir(&prev_cwd).unwrap();
@@ -10559,7 +10588,7 @@ async fn sync_mdh_unmaterialized_index_reaches_stable_retry_state() {
 
     // Sync 1: baseline pull — records the remote form (no custom indexes)
     // in the lockfile and base cache.
-    let r1 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let r1 = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
 
     // Simulate `rdc migrate` landing a unique index the remote data can't
     // hold (the source env has it; the target's rows violate uniqueness).
@@ -10575,10 +10604,10 @@ async fn sync_mdh_unmaterialized_index_reaches_stable_retry_state() {
     .unwrap();
 
     // Sync 2: pushes the create (ACKed, never builds), warns, keeps local.
-    let r2 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let r2 = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
     // Sync 3: MUST retry the create (not skip via a poisoned base) and MUST
     // NOT revert the local file to the remote form.
-    let r3 = rdc::cli::sync::run("dev", false, false, false, false, false).await;
+    let r3 = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
 
     std::env::set_current_dir(&prev_cwd).unwrap();
     r1.expect("baseline sync must succeed");

@@ -111,6 +111,7 @@ pub mod lock;
 pub mod watch;
 
 use crate::api::RossumClient;
+use crate::cli::resolve::ConflictStrategy;
 use crate::config::ProjectConfig;
 use crate::log::{Action, Log};
 use crate::paths::Paths;
@@ -152,6 +153,7 @@ pub async fn run(
     allow_deletes: bool,
     no_push: bool,
     no_pull: bool,
+    conflict_strategy: Option<ConflictStrategy>,
 ) -> Result<CycleOutcome> {
     // One-shot wrapper. Watch mode goes through `cli::sync::watch::run_watch`.
     // Argument validation lives in `run_cycle` so watch mode benefits too.
@@ -170,6 +172,7 @@ pub async fn run(
         allow_deletes,
         no_push,
         no_pull,
+        conflict_strategy,
         None,
         None,
         None,
@@ -192,6 +195,7 @@ pub async fn run(
 /// All three current callers — `cli::sync::run`, `cli::sync::watch::run_watch`,
 /// and `cli::sync::embed::sync_no_push` — acquire it before invoking. New
 /// callers must do the same.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_cycle(
     env: &str,
     interactive: bool,
@@ -199,6 +203,7 @@ pub(crate) async fn run_cycle(
     allow_deletes: bool,
     no_push: bool,
     no_pull: bool,
+    conflict_strategy: Option<ConflictStrategy>,
     renderer: Option<Arc<Log>>,
     cwd_override: Option<&std::path::Path>,
     token_override: Option<String>,
@@ -528,6 +533,7 @@ pub(crate) async fn run_cycle(
             no_pull,
             allow_deletes,
             interactive,
+            conflict_strategy,
             &progress,
         )
         .await
