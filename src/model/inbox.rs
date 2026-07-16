@@ -11,7 +11,11 @@ pub struct Inbox {
     #[serde(default, deserialize_with = "crate::model::null_as_default")]
     pub url: String,
     pub name: String,
-    #[serde(default)]
+    // `email` is server-assigned. `migrate` strips it (env-specific), leaving
+    // it empty on a migrated inbox; skip serializing an empty value so a PATCH
+    // OMITS it (the Rossum API rejects `email: ""` with "may not be blank" and
+    // preserves the remote's own address when the field is absent).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub email: String,
     /// URL of the queue this inbox is attached to.
     pub queues: Vec<String>,
@@ -48,5 +52,38 @@ mod tests {
         assert_eq!(inbox.queues.len(), 1);
         let round_trip = serde_json::to_value(&inbox).unwrap();
         assert_eq!(round_trip, payload);
+    }
+
+    #[test]
+    fn empty_email_is_omitted_on_serialize() {
+        // `migrate` strips an inbox's env-specific `email`, so a migrated
+        // inbox deserializes with `email == ""`. Serializing it for a PATCH
+        // must OMIT `email` entirely: sending `email: ""` makes the Rossum
+        // API reject the whole PATCH ("email: This field may not be blank"),
+        // whereas omitting it leaves the remote's server-assigned address
+        // intact.
+        let inbox = Inbox {
+            id: 0,
+            url: String::new(),
+            name: "Cost Invoices Inbox".into(),
+            email: String::new(),
+            queues: vec!["rdc://queues/cost-invoices".into()],
+            extra: IndexMap::new(),
+        };
+        let v = serde_json::to_value(&inbox).unwrap();
+        assert!(
+            v.get("email").is_none(),
+            "empty email must be omitted from the serialized payload, got: {v}"
+        );
+        // A non-empty email still serializes normally.
+        let with_email = Inbox {
+            email: "cost-invoices@org.rossum.app".into(),
+            ..inbox
+        };
+        let v2 = serde_json::to_value(&with_email).unwrap();
+        assert_eq!(
+            v2.get("email").and_then(|e| e.as_str()),
+            Some("cost-invoices@org.rossum.app")
+        );
     }
 }
