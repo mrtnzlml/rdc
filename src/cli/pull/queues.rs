@@ -128,6 +128,13 @@ pub async fn process(
     schemas_by_queue_id: &BTreeMap<u64, Schema>,
     inboxes_by_queue_id: &BTreeMap<u64, Inbox>,
     subset: &BTreeSet<(String, String)>,
+    // `(kind, slug)` of queue-nested objects (schemas / inboxes, keyed by the
+    // queue slug) that were PUSHED earlier in this same sync cycle. Their
+    // Sub-phase B re-pull is skipped: the schema/inbox map here comes from the
+    // PRE-PUSH Phase-1 catalog, so re-writing a just-pushed object would revert
+    // the push locally and force a second sync (non-idempotent). Empty for a
+    // plain `pull` (no push phase).
+    pushed_nested: &BTreeSet<(String, String)>,
     progress: &Arc<Log>,
 ) -> Result<QueueCounts> {
     // Queue slug identity is GLOBAL, not per-workspace. The lockfile and the
@@ -273,10 +280,21 @@ pub async fn process(
     // Decisions mutate shared state (lockfile, conflict counts), so the
     // loop is intentionally sequential.
     for w in &work {
-        if let Some(schema) = schemas_by_queue_id.get(&w.q.id) {
+        // Skip a schema/inbox that was PUSHED this cycle: its bytes here are the
+        // stale pre-push catalog, and its own push already left local == remote.
+        // Re-writing it would revert the push and break single-pass convergence.
+        let schema_pushed =
+            pushed_nested.contains(&(KIND_SCHEMAS.to_string(), w.q_slug.clone()));
+        let inbox_pushed =
+            pushed_nested.contains(&(KIND_INBOXES.to_string(), w.q_slug.clone()));
+        if let Some(schema) = schemas_by_queue_id.get(&w.q.id)
+            && !schema_pushed
+        {
             write_schema_for_queue(ctx, &mut counts, w, schema, progress)?;
         }
-        if let Some(inbox) = inboxes_by_queue_id.get(&w.q.id) {
+        if let Some(inbox) = inboxes_by_queue_id.get(&w.q.id)
+            && !inbox_pushed
+        {
             write_inbox_for_queue(ctx, &mut counts, w, inbox, progress)?;
         }
     }

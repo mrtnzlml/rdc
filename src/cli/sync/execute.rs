@@ -3516,6 +3516,21 @@ pub async fn run(
                 queue_subset.insert(("queues".to_string(), it.slug.clone()));
             }
         }
+        // Schemas / inboxes PUSHED this cycle. The queue-pull below writes a
+        // queue's schema+inbox from the PRE-PUSH Phase-1 catalog whenever the
+        // queue is in the subset (e.g. its OWN back-ref drifted, or a SIBLING
+        // nested object is a RemoteEdit). Re-writing a just-pushed schema/inbox
+        // from that stale catalog reverts the push locally and forces a second
+        // sync — so the driver skips them (their push already synced local +
+        // remote).
+        let pushed_nested: BTreeSet<(String, String)> = classified
+            .iter()
+            .filter(|it| {
+                (it.kind == "schemas" || it.kind == "inboxes")
+                    && matches!(it.class, SyncClass::LocalEdit | SyncClass::LocalCreate)
+            })
+            .map(|it| (it.kind.clone(), it.slug.clone()))
+            .collect();
         if !queue_subset.is_empty() {
             // queues::process also writes `ctx.queue_locations` which the
             // email_templates dispatch below needs. It's a side effect of
@@ -3526,6 +3541,7 @@ pub async fn run(
                 &catalog.schemas_by_queue_id,
                 &catalog.inboxes_by_queue_id,
                 &queue_subset,
+                &pushed_nested,
                 progress,
             )
             .await?;

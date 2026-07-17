@@ -8934,6 +8934,206 @@ async fn push_create_rule_refreshes_target_queue_backref_same_pass() {
     );
 }
 
+/// Regression: a schema PATCHed (LocalEdit) in the SAME cycle its queue is
+/// pulled must NOT be clobbered by the queue-pull driver's schema re-write.
+///
+/// The queue-pull `process` writes each pulled queue's schema/inbox from the
+/// PRE-PUSH Phase-1 catalog. When the queue enters the pull subset for its own
+/// reason (here: its inbox changed on the remote — RemoteEdit) while the schema
+/// was pushed this cycle, re-writing the schema from the stale catalog reverts
+/// the just-pushed edit locally, so the very next sync re-detects it and pushes
+/// again — the mirror chain needs 2+ passes to converge. Sub-phase B must skip
+/// schemas/inboxes pushed this cycle.
+#[tokio::test]
+async fn queue_pull_does_not_clobber_same_cycle_pushed_schema() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let server = MockServer::start().await;
+    let ws_url = format!("{}/api/v1/workspaces/800", server.uri());
+    let queue_url = format!("{}/api/v1/queues/100", server.uri());
+    let schema_url = format!("{}/api/v1/schemas/200", server.uri());
+    let inbox_url = format!("{}/api/v1/inboxes/300", server.uri());
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let workspaces_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [{
+            "id": 800, "url": ws_url, "name": "Invoices AP",
+            "organization": format!("{}/api/v1/organizations/1", server.uri()),
+            "queues": [queue_url.clone()],
+            "modified_at": "2026-04-20T08:00:00Z"
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(workspaces_body))
+        .mount(&server)
+        .await;
+
+    // Queue is static (never changes) — it enters the pull subset only because
+    // its INBOX is a RemoteEdit this cycle.
+    let queues_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [{
+            "id": 100, "url": queue_url.clone(), "name": "Cost Invoices",
+            "workspace": ws_url.clone(), "schema": schema_url.clone(), "inbox": inbox_url.clone(),
+            "modified_at": "2026-04-20T08:00:00Z"
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(queues_body))
+        .mount(&server)
+        .await;
+
+    // Stateful GET /schemas/200: the label is "Header" until the schema is
+    // PATCHed, then "Header EDITED" (mirrors the server storing the push).
+    let schema_of = |label: &str| {
+        serde_json::json!({
+            "id": 200, "url": schema_url.clone(), "name": "Cost Invoices Schema",
+            "queues": [queue_url.clone()],
+            "content": [{
+                "category": "section", "id": "header", "label": label,
+                "children": [{ "category": "datapoint", "id": "invoice_id", "type": "string" }]
+            }],
+            "modified_at": "2026-04-10T09:00:00Z"
+        })
+    };
+    let schema_old = schema_of("Header");
+    let schema_new = schema_of("Header EDITED");
+    let schema_pushed = Arc::new(AtomicBool::new(false));
+    {
+        let flag = schema_pushed.clone();
+        let (old, new) = (schema_old.clone(), schema_new.clone());
+        Mock::given(method("GET"))
+            .and(path("/api/v1/schemas/200"))
+            .respond_with(move |_req: &Request| {
+                let body = if flag.load(Ordering::SeqCst) { new.clone() } else { old.clone() };
+                ResponseTemplate::new(200).set_body_json(body)
+            })
+            .mount(&server)
+            .await;
+    }
+    {
+        let flag = schema_pushed.clone();
+        let new = schema_new.clone();
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/schemas/200"))
+            .respond_with(move |_req: &Request| {
+                flag.store(true, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(new.clone())
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    // Stateful GET /inboxes: email flips once the test sets `inbox_changed`,
+    // making the inbox a RemoteEdit that pulls the whole queue tree.
+    let inbox_changed = Arc::new(AtomicBool::new(false));
+    {
+        let flag = inbox_changed.clone();
+        let inbox_url = inbox_url.clone();
+        let queue_url = queue_url.clone();
+        Mock::given(method("GET"))
+            .and(path("/api/v1/inboxes"))
+            .respond_with(move |_req: &Request| {
+                let email = if flag.load(Ordering::SeqCst) {
+                    "cost-new@mock.rossum.app"
+                } else {
+                    "cost-old@mock.rossum.app"
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "pagination": { "total_pages": 1, "next": null },
+                    "results": [{
+                        "id": 300, "url": inbox_url.clone(), "name": "Cost Invoices Inbox",
+                        "email": email, "queues": [queue_url.clone()],
+                        "modified_at": "2026-04-10T09:00:00Z", "filters": []
+                    }]
+                }))
+            })
+            .mount(&server)
+            .await;
+    }
+
+    mock_empty_lists_except(
+        &server,
+        &["/api/v1/workspaces", "/api/v1/queues", "/api/v1/inboxes"],
+    )
+    .await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+    let schema_path = project
+        .path()
+        .join("envs/dev/workspaces/invoices-ap/queues/cost-invoices/schema.json");
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // Sync #1: pull the queue tree Clean.
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("initial pull sync should succeed");
+
+    // Locally edit the schema (LocalEdit -> will PATCH).
+    let before = std::fs::read_to_string(&schema_path).unwrap();
+    assert!(before.contains("\"Header\""), "precondition: pulled label: {before}");
+    std::fs::write(&schema_path, before.replace("\"Header\"", "\"Header EDITED\"")).unwrap();
+
+    // The inbox changes on the remote -> RemoteEdit -> pulls the whole tree.
+    inbox_changed.store(true, Ordering::SeqCst);
+
+    // Sync #2: PATCH the schema (push) AND pull the queue tree (inbox RemoteEdit)
+    // in the SAME pass.
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("push+pull sync should succeed");
+    let schema_after_push = std::fs::read_to_string(&schema_path).unwrap();
+
+    // Sync #3: must be a clean no-op — proves single-pass convergence.
+    let outcome3 = rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("re-sync should succeed and be idempotent");
+    let reqs = server.received_requests().await.unwrap_or_default();
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    // Discriminating assertion: the same-cycle queue-pull must NOT have reverted
+    // the pushed schema edit.
+    assert!(
+        schema_after_push.contains("Header EDITED"),
+        "schema edit pushed this cycle must survive the same-cycle queue-pull, \
+         not be clobbered by the pre-push catalog: {schema_after_push}"
+    );
+    // Exactly one schema PATCH across the whole run (no re-push on sync #3).
+    assert_eq!(
+        count_mutations(&reqs, "/api/v1/schemas/200"),
+        1,
+        "the schema must be PATCHed exactly once — a 2nd push means it was clobbered then re-pushed"
+    );
+    // Sync #3 changed nothing.
+    assert_eq!(
+        outcome3.items_pushed + outcome3.items_pulled,
+        0,
+        "the mirror chain must converge in a single pass (sync #3 is a no-op)"
+    );
+}
+
 /// Keystone test: dependency-ordered CREATE of a brand-new workspace + its
 /// queue + the queue's schema, all seeded locally with no lockfile entries
 /// and `rdc://` portable refs. `sync` must POST them in dependency order
