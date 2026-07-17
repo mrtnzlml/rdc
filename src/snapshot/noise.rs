@@ -74,30 +74,40 @@ pub fn canonicalize_for_hash(bytes: &[u8], lockfile: &crate::state::Lockfile) ->
     serde_json::to_vec(&value).unwrap_or_else(|_| bytes.to_vec())
 }
 
-/// Recursively trim trailing whitespace from every string leaf.
+/// Trim trailing whitespace from the presentational email_template `subject` /
+/// `message` fields ONLY — never from any other string.
 ///
-/// Rossum normalizes stored text by stripping trailing whitespace: an
-/// email_template `message` posted as `…</p>\n` is returned as `…</p>`. Because
-/// the server always strips it, a difference that is ONLY trailing whitespace
-/// can never be pushed — so it must not register as drift, or a `migrate` output
-/// (which keeps the source's trailing `\n`) and a fresh `pull` (server stripped
-/// it) would conflict on every run. Leading and internal whitespace are left
-/// intact: they are semantic in multiline text and code.
+/// Those two fields carry rendered HTML/text whose trailing whitespace is
+/// cosmetic, and their round-trip is unstable (a `message` authored as `…</p>\n`
+/// may come back trimmed), so a trailing-whitespace-only difference there must
+/// not register as drift — else a `migrate` output (keeps the source's `\n`) and
+/// a fresh `pull` would conflict on every run.
+///
+/// Every OTHER string is left verbatim. An earlier version trimmed all string
+/// leaves on the assumption "the server always strips trailing whitespace" — but
+/// that is false: the server PRESERVES trailing whitespace in structured data
+/// (verified for MDH `$concat` label builders like `["Line ", val, " — ", val]`,
+/// which render `"Line 5 — ABC"`). Trimming those silently corrupted the mirror
+/// on `migrate` and MASKED the corruption in the hash, so `sync` never repaired
+/// it. Restricting the trim to `subject`/`message` keeps that data faithful while
+/// preserving the email drift-tolerance the trim was introduced for.
 pub(crate) fn trim_trailing_whitespace(value: &mut serde_json::Value) {
     match value {
-        serde_json::Value::String(s) => {
-            let trimmed = s.trim_end();
-            if trimmed.len() != s.len() {
-                *s = trimmed.to_string();
-            }
-        }
         serde_json::Value::Array(items) => {
             for item in items.iter_mut() {
                 trim_trailing_whitespace(item);
             }
         }
         serde_json::Value::Object(map) => {
-            for v in map.values_mut() {
+            for (key, v) in map.iter_mut() {
+                if matches!(key.as_str(), "subject" | "message")
+                    && let serde_json::Value::String(s) = v
+                {
+                    let trimmed = s.trim_end();
+                    if trimmed.len() != s.len() {
+                        *s = trimmed.to_string();
+                    }
+                }
                 trim_trailing_whitespace(v);
             }
         }
@@ -455,6 +465,56 @@ mod tests {
             canonicalize_for_hash(a, &crate::state::Lockfile::default()),
             canonicalize_for_hash(b, &crate::state::Lockfile::default()),
             "internal whitespace is semantic and must remain significant"
+        );
+    }
+
+    #[test]
+    fn trim_trailing_whitespace_only_touches_email_message_and_subject() {
+        // The trim exists ONLY for the presentational email_template `subject` /
+        // `message` fields (server normalizes those). It must NEVER touch other
+        // strings: MDH `$concat` label builders rely on trailing spaces
+        // (`["Line ", val, " — ", val]` renders `"Line 5 — ABC"`), and the server
+        // preserves them — trimming there silently corrupts the mirror.
+        let mut v = json!({
+            "subject": "Invoice ready ",
+            "message": "<p>Dear sender</p>\n",
+            "settings": { "$concat": ["Line ", "v", " — ", "w"] },
+            "label": "keep me ",
+        });
+        trim_trailing_whitespace(&mut v);
+        assert_eq!(v["subject"], json!("Invoice ready"), "email subject is trimmed");
+        assert_eq!(v["message"], json!("<p>Dear sender</p>"), "email message is trimmed");
+        assert_eq!(
+            v["settings"]["$concat"],
+            json!(["Line ", "v", " — ", "w"]),
+            "MDH $concat separators must be preserved verbatim"
+        );
+        assert_eq!(v["label"], json!("keep me "), "non-email strings must be preserved");
+    }
+
+    #[test]
+    fn canonicalize_preserves_trailing_ws_outside_email_fields() {
+        // A trailing-whitespace-only difference in a NON-email data value must be
+        // SIGNIFICANT to the hash, so `sync` detects it as drift and can repair a
+        // remote that lost it. (Regression: previously masked, hiding corruption.)
+        let with = br#"{"settings":{"$concat":["Line ","x"]}}"#;
+        let without = br#"{"settings":{"$concat":["Line","x"]}}"#;
+        assert_ne!(
+            canonicalize_for_hash(with, &crate::state::Lockfile::default()),
+            canonicalize_for_hash(without, &crate::state::Lockfile::default()),
+            "trailing whitespace in a data field is meaningful and must affect the hash"
+        );
+    }
+
+    #[test]
+    fn canonicalize_still_ignores_trailing_ws_in_email_subject() {
+        // Retain the c534d10 drift-tolerance for the email fields specifically.
+        let a = br#"{"subject":"Invoice ready "}"#;
+        let b = br#"{"subject":"Invoice ready"}"#;
+        assert_eq!(
+            canonicalize_for_hash(a, &crate::state::Lockfile::default()),
+            canonicalize_for_hash(b, &crate::state::Lockfile::default()),
+            "email subject trailing whitespace must stay drift-tolerant"
         );
     }
 }
