@@ -46,6 +46,22 @@ pub async fn push(
                 .with_context(|| format!("POST /rules (creating '{slug}')"));
             let created = create_result?;
             let (created_json, created_code) = serialize_rule(&created)?;
+            // Register the new rule's id NOW so its own `url` (and any ref to an
+            // already-created object) portabilizes to `rdc://`. Concrete env URLs
+            // must never touch disk, even transiently (an interrupted sync whose
+            // portabilize post-pass never runs would freeze them into the snapshot).
+            lockfile.upsert(
+                "rules",
+                slug,
+                ObjectEntry {
+                    id: created.id,
+                    modified_at: created.modified_at().map(|s| s.to_string()),
+                    content_hash: None,
+                    secrets_hash: None,
+                },
+            );
+            let created_json =
+                crate::cli::pull::common::portabilize_proposed(&created_json, lockfile);
             let created_hash = rule_combined_hash(&created_json, &created_code, lockfile);
             write_atomic(local_json_path, &created_json)
                 .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
@@ -122,6 +138,10 @@ pub async fn push(
                     }
                 }
                 PushDriftOutcome::Adopt => {
+                    // Portabilize the adopted remote so concrete env URLs never
+                    // land on disk (the rule is lockfile-pinned; refs resolve).
+                    let remote_json =
+                        crate::cli::pull::common::portabilize_proposed(&remote_json, lockfile);
                     write_atomic(local_json_path, &remote_json).with_context(|| {
                         format!("adopting remote into {}", local_json_path.display())
                     })?;
@@ -169,6 +189,10 @@ pub async fn push(
 
         // Refresh local file with the codec's canonical form.
         let (updated_json, updated_code) = serialize_rule(&updated)?;
+        // Re-portabilize the server response so concrete env URLs never land on
+        // disk (the rule is lockfile-pinned, so self + refs resolve to rdc://).
+        let updated_json =
+            crate::cli::pull::common::portabilize_proposed(&updated_json, lockfile);
         let updated_hash = rule_combined_hash(&updated_json, &updated_code, lockfile);
         crate::state::base_cache::write_disk_and_cache(
             paths,

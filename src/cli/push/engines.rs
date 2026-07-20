@@ -60,7 +60,22 @@ pub async fn push(
             let created_art = codec
                 .disk_bytes(&serde_json::to_value(&created).context("serializing created engine")?)
                 .context("codec disk_bytes for created engine")?;
-            let created_bytes = created_art.json;
+            // Register the new engine's id NOW so its own `url` (and any ref to
+            // an already-created object) portabilizes to `rdc://`. Concrete env
+            // URLs must never touch disk, even transiently (an interrupted sync
+            // whose portabilize post-pass never runs would freeze them in).
+            lockfile.upsert(
+                "engines",
+                slug,
+                ObjectEntry {
+                    id: created.id,
+                    modified_at: created.modified_at().map(|s| s.to_string()),
+                    content_hash: None,
+                    secrets_hash: None,
+                },
+            );
+            let created_bytes =
+                crate::cli::pull::common::portabilize_proposed(&created_art.json, lockfile);
             let created_hash = combined_hash(&created_bytes, &created_art.sidecars, lockfile);
             write_atomic(path, &created_bytes)
                 .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
@@ -150,6 +165,10 @@ pub async fn push(
                     }
                 }
                 PushDriftOutcome::Adopt => {
+                    // Portabilize the adopted remote so concrete env URLs never
+                    // land on disk (the engine is lockfile-pinned; refs resolve).
+                    let remote_bytes =
+                        crate::cli::pull::common::portabilize_proposed(&remote_bytes, lockfile);
                     write_atomic(path, &remote_bytes)
                         .with_context(|| format!("adopting remote into {}", path.display()))?;
                     lockfile.upsert(
@@ -215,7 +234,10 @@ pub async fn push(
                     .context("serializing updated engine for disk write")?,
             )
             .context("codec disk_bytes for updated engine")?;
-        let updated_bytes = updated_art.json;
+        // Re-portabilize the server response so concrete env URLs never land on
+        // disk (the engine is lockfile-pinned, so self + refs resolve to rdc://).
+        let updated_bytes =
+            crate::cli::pull::common::portabilize_proposed(&updated_art.json, lockfile);
         let updated_hash = combined_hash(&updated_bytes, &updated_art.sidecars, lockfile);
         crate::state::base_cache::write_disk_and_cache(paths, path, &updated_bytes)
             .with_context(|| format!("writing post-push canonical form for engine '{slug}'"))?;

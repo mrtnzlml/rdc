@@ -115,8 +115,13 @@ pub async fn run_relink(
                 // on Clean.
                 if let Some(c) = codec(&it.kind) {
                     let art = c.disk_bytes(&updated)?;
-                    let hash = combined_hash(&art.json, &art.sidecars, lockfile);
-                    crate::state::base_cache::write_disk_and_cache(paths, &it.path, &art.json)?;
+                    // Portabilize so concrete env URLs never land on disk. Relink
+                    // runs after every object exists + is lockfile-pinned, so self
+                    // and all relinked refs resolve back to rdc://.
+                    let json =
+                        crate::cli::pull::common::portabilize_proposed(&art.json, lockfile);
+                    let hash = combined_hash(&json, &art.sidecars, lockfile);
+                    crate::state::base_cache::write_disk_and_cache(paths, &it.path, &json)?;
                     let modified_at = updated
                         .get("modified_at")
                         .and_then(|v| v.as_str())

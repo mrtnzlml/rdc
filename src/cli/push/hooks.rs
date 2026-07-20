@@ -225,6 +225,23 @@ pub async fn push(
             // it stays canonical even if the local JSON declared a
             // different runtime.
             let (created_json, created_code) = serialize_hook(&created)?;
+            // Register the new hook's id NOW so its own `url` (and any ref to an
+            // already-created object) portabilizes to `rdc://` below. Concrete
+            // env URLs must never be written to disk — not even transiently: an
+            // interrupted sync (whose portabilize post-pass never runs) would
+            // otherwise freeze the raw response's env URLs into the snapshot.
+            lockfile.upsert(
+                "hooks",
+                slug,
+                ObjectEntry {
+                    id: created.id,
+                    modified_at: created.modified_at().map(|s| s.to_string()),
+                    content_hash: None,
+                    secrets_hash: None,
+                },
+            );
+            let created_json =
+                crate::cli::pull::common::portabilize_proposed(&created_json, lockfile);
             let created_hash = hook_combined_hash(&created_json, &created_code, lockfile);
             let created_ext = hook_code_extension(&created);
             write_atomic(local_json_path, &created_json)
@@ -330,6 +347,10 @@ pub async fn push(
                     }
                 }
                 PushDriftOutcome::Adopt => {
+                    // Portabilize the adopted remote so concrete env URLs never
+                    // land on disk (the hook is lockfile-pinned; self + refs resolve).
+                    let remote_json =
+                        crate::cli::pull::common::portabilize_proposed(&remote_json, lockfile);
                     write_atomic(local_json_path, &remote_json).with_context(|| {
                         format!("adopting remote into {}", local_json_path.display())
                     })?;
@@ -408,6 +429,11 @@ pub async fn push(
         // Refresh local file with the codec's canonical form (matches
         // what next pull would write) and update lockfile to match.
         let (updated_json, updated_code) = serialize_hook(&updated)?;
+        // Re-portabilize the server response so concrete env URLs never land on
+        // disk. The hook is already lockfile-pinned, so its `url` and every
+        // cross-ref resolve back to `rdc://`.
+        let updated_json =
+            crate::cli::pull::common::portabilize_proposed(&updated_json, lockfile);
         let updated_hash = hook_combined_hash(&updated_json, &updated_code, lockfile);
         let updated_ext = hook_code_extension(&updated);
         crate::state::base_cache::write_disk_and_cache(
@@ -627,5 +653,223 @@ mod tests {
         let (would_push, dangling) = plan_secret_pushes(&hs, &Lockfile::default());
         assert!(would_push.is_empty());
         assert!(dangling.is_empty());
+    }
+
+    /// Regression: pushing a hook must NEVER write concrete env URLs to disk.
+    /// The post-POST/PATCH write-back serializes the server response (which
+    /// carries concrete `https://…/hooks/<id>` URLs); it must be re-portabilized
+    /// to `rdc://<kind>/<slug>` form before landing on disk. Otherwise an
+    /// interrupted sync (whose portabilize post-pass never runs) freezes concrete
+    /// env-specific URLs into the portable snapshot — silent data corruption.
+    #[tokio::test]
+    async fn push_create_hook_writes_portable_refs_not_concrete_urls() {
+        use crate::paths::Paths;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let api = format!("{}/api/v1", server.uri());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        let hooks_dir = paths.hooks_dir();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+
+        // Local hook on disk with portable rdc:// refs (self url + queue ref).
+        let local = serde_json::json!({
+            "name": "My Hook",
+            "type": "function",
+            "url": "rdc://hooks/my-hook",
+            "queues": ["rdc://queues/q1"],
+            "events": ["annotation_content"],
+            "config": { "runtime": "python3.12" }
+        });
+        std::fs::write(
+            hooks_dir.join("my-hook.json"),
+            serde_json::to_vec_pretty(&local).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(hooks_dir.join("my-hook.py"), b"x = 1\n").unwrap();
+
+        // Lockfile: queue q1 tracked so the create payload's rdc://queues/q1
+        // resolves; no hooks/my-hook entry -> this is the create (POST) path.
+        let mut lockfile = Lockfile {
+            api_base: api.clone(),
+            ..Lockfile::default()
+        };
+        lockfile.upsert(
+            "queues",
+            "q1",
+            ObjectEntry {
+                id: 100,
+                modified_at: None,
+                content_hash: Some("h".into()),
+                secrets_hash: None,
+            },
+        );
+
+        // POST /hooks returns the created hook with CONCRETE, env-specific urls.
+        let created = serde_json::json!({
+            "id": 500,
+            "url": format!("{api}/hooks/500"),
+            "name": "My Hook",
+            "type": "function",
+            "queues": [format!("{api}/queues/100")],
+            "events": ["annotation_content"],
+            "config": { "runtime": "python3.12", "code": "x = 1\n" }
+        });
+        Mock::given(method("POST"))
+            .and(path("/api/v1/hooks"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(created))
+            .mount(&server)
+            .await;
+
+        let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
+        let progress =
+            std::sync::Arc::new(crate::log::Log::new(crate::cli::resolve::ColorMode::Plain));
+        let mut relink = Vec::new();
+        let mut changes = BTreeMap::new();
+        changes.insert("my-hook".to_string(), hooks_dir.join("my-hook.json"));
+
+        let (pushed, _skipped) = push(
+            &paths, &client, &mut lockfile, false, &changes, &[], &mut relink, &progress, "dev",
+        )
+        .await
+        .expect("push should succeed");
+        assert_eq!(pushed, 1, "the hook should be created");
+
+        let on_disk = std::fs::read_to_string(hooks_dir.join("my-hook.json")).unwrap();
+        assert!(
+            !on_disk.contains(&server.uri()),
+            "concrete env URL must NEVER be written to disk:\n{on_disk}"
+        );
+        assert!(
+            on_disk.contains("rdc://hooks/my-hook"),
+            "hook self-url must be portable rdc://:\n{on_disk}"
+        );
+        assert!(
+            on_disk.contains("rdc://queues/q1"),
+            "queue membership must be portable rdc://:\n{on_disk}"
+        );
+    }
+
+    /// Regression (PATCH path — the reported incident): editing an existing hook
+    /// and pushing must NOT de-portabilize its refs. The PATCH response carries
+    /// concrete env URLs (self `url`, `queues`, `run_after`); they must be
+    /// rewritten to `rdc://` before the on-disk write, so a sync that later
+    /// aborts (skipping the portabilize post-pass) never freezes them in.
+    #[tokio::test]
+    async fn push_patch_hook_keeps_portable_refs_not_concrete_urls() {
+        use crate::paths::Paths;
+        use crate::snapshot::hook::serialize_hook;
+        use crate::state::hook_combined_hash;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let api = format!("{}/api/v1", server.uri());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        let hooks_dir = paths.hooks_dir();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+
+        let local = serde_json::json!({
+            "name": "My Hook",
+            "type": "function",
+            "url": "rdc://hooks/my-hook",
+            "queues": ["rdc://queues/q1"],
+            "run_after": ["rdc://hooks/upstream"],
+            "events": ["annotation_content"],
+            "config": { "runtime": "python3.12" }
+        });
+        std::fs::write(
+            hooks_dir.join("my-hook.json"),
+            serde_json::to_vec_pretty(&local).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(hooks_dir.join("my-hook.py"), b"x = 2\n").unwrap();
+
+        // Lockfile: queue q1, the upstream hook, and my-hook itself all pinned so
+        // every ref (and the self-url) resolves back to rdc://.
+        let mut lockfile = Lockfile {
+            api_base: api.clone(),
+            ..Lockfile::default()
+        };
+        lockfile.upsert(
+            "queues",
+            "q1",
+            ObjectEntry { id: 100, modified_at: None, content_hash: Some("h".into()), secrets_hash: None },
+        );
+        lockfile.upsert(
+            "hooks",
+            "upstream",
+            ObjectEntry { id: 400, modified_at: None, content_hash: Some("h".into()), secrets_hash: None },
+        );
+        lockfile.upsert(
+            "hooks",
+            "my-hook",
+            ObjectEntry { id: 500, modified_at: None, content_hash: None, secrets_hash: None },
+        );
+
+        // The remote hook (concrete urls). base := its canonical hash so the
+        // drift check sees no remote drift and proceeds to PATCH.
+        let remote = serde_json::json!({
+            "id": 500,
+            "url": format!("{api}/hooks/500"),
+            "name": "My Hook",
+            "type": "function",
+            "queues": [format!("{api}/queues/100")],
+            "run_after": [format!("{api}/hooks/400")],
+            "events": ["annotation_content"],
+            "config": { "runtime": "python3.12", "code": "x = 2\n" }
+        });
+        let remote_hook: crate::model::Hook = serde_json::from_value(remote.clone()).unwrap();
+        let (rj, rc) = serialize_hook(&remote_hook).unwrap();
+        let base = hook_combined_hash(&rj, &rc, &lockfile);
+        lockfile.upsert(
+            "hooks",
+            "my-hook",
+            ObjectEntry { id: 500, modified_at: None, content_hash: Some(base), secrets_hash: None },
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/hooks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pagination": { "next": null }, "results": [remote.clone()]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/hooks/500"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(remote))
+            .mount(&server)
+            .await;
+
+        let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
+        let progress =
+            std::sync::Arc::new(crate::log::Log::new(crate::cli::resolve::ColorMode::Plain));
+        let mut relink = Vec::new();
+        let mut changes = BTreeMap::new();
+        changes.insert("my-hook".to_string(), hooks_dir.join("my-hook.json"));
+
+        let (pushed, _skipped) = push(
+            &paths, &client, &mut lockfile, false, &changes, &[], &mut relink, &progress, "dev",
+        )
+        .await
+        .expect("push should succeed");
+        assert_eq!(pushed, 1, "the hook should be patched");
+
+        let on_disk = std::fs::read_to_string(hooks_dir.join("my-hook.json")).unwrap();
+        assert!(
+            !on_disk.contains(&server.uri()),
+            "concrete env URL must NEVER be written to disk:\n{on_disk}"
+        );
+        assert!(on_disk.contains("rdc://hooks/my-hook"), "self-url portable:\n{on_disk}");
+        assert!(on_disk.contains("rdc://queues/q1"), "queue ref portable:\n{on_disk}");
+        assert!(
+            on_disk.contains("rdc://hooks/upstream"),
+            "run_after ref portable:\n{on_disk}"
+        );
     }
 }
