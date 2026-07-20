@@ -52,6 +52,22 @@ pub async fn push(
                 .with_context(|| format!("POST /schemas (creating for queue '{q_slug}')"));
             let created = create_result?;
             let (created_json, created_formulas) = serialize_schema(&created)?;
+            // Register the new schema's id NOW so its own `url` (and its `queues`
+            // back-ref) portabilizes to `rdc://`. Concrete env URLs must never
+            // touch disk, even transiently (an interrupted sync whose portabilize
+            // post-pass never runs would freeze them into the snapshot).
+            lockfile.upsert(
+                "schemas",
+                q_slug,
+                ObjectEntry {
+                    id: created.id,
+                    modified_at: created.modified_at().map(|s| s.to_string()),
+                    content_hash: None,
+                    secrets_hash: None,
+                },
+            );
+            let created_json =
+                crate::cli::pull::common::portabilize_proposed(&created_json, lockfile);
             let created_hash = schema_combined_hash(&created_json, &created_formulas, lockfile);
             write_schema_bytes(queue_dir, &created_json, &created_formulas).with_context(|| {
                 format!("writing post-create canonical form for schema '{q_slug}'")
@@ -122,7 +138,10 @@ pub async fn push(
                 }
                 PushDriftOutcome::Adopt => {
                     // Schema is a combined-hash kind — adopt both
-                    // the JSON and every formula from remote.
+                    // the JSON and every formula from remote. Portabilize first
+                    // so concrete env URLs never land on disk (schema is pinned).
+                    let remote_json =
+                        crate::cli::pull::common::portabilize_proposed(&remote_json, lockfile);
                     write_schema_bytes(queue_dir, &remote_json, &remote_formulas)
                         .with_context(|| format!("adopting remote schema for queue '{q_slug}'"))?;
                     lockfile.upsert(
@@ -163,6 +182,10 @@ pub async fn push(
         let updated = patch_result?;
 
         let (updated_json, updated_formulas) = serialize_schema(&updated)?;
+        // Re-portabilize the server response so concrete env URLs never land on
+        // disk (the schema is lockfile-pinned, so self + `queues` resolve to rdc://).
+        let updated_json =
+            crate::cli::pull::common::portabilize_proposed(&updated_json, lockfile);
         let updated_hash = schema_combined_hash(&updated_json, &updated_formulas, lockfile);
         write_schema_bytes(queue_dir, &updated_json, &updated_formulas)
             .with_context(|| format!("writing post-push canonical form for schema '{q_slug}'"))?;
