@@ -442,18 +442,36 @@ pub async fn push(
             &updated_json,
         )
         .with_context(|| format!("writing post-push canonical form for '{slug}'"))?;
+        let code_path = hooks_dir.join(format!("{slug}.{updated_ext}"));
         if let Some(code) = &updated_code {
             write_hook_code(&hooks_dir, slug, code, updated_ext)
                 .with_context(|| format!("writing hook code for '{slug}'"))?;
+            // Mirror the code sidecar into the base cache so a later
+            // `BothDiverged` conflict can 3-way-merge the code against a real
+            // base — matching what `pull::hooks` does. Without this the base
+            // cache holds the `.json` but not the `.py`, and the conflict
+            // resolver falls back to a manual prompt (`base_cache::read` → None).
+            crate::state::base_cache::write(paths, &code_path, code.as_bytes())
+                .with_context(|| format!("caching base hook code for '{slug}'"))?;
+        } else {
+            // Post-PATCH the hook has no code (e.g. a function→webhook change):
+            // drop the primary sidecar from disk and the base cache so the
+            // snapshot stays canonical.
+            if code_path.exists() {
+                std::fs::remove_file(&code_path)
+                    .with_context(|| format!("removing stale {}", code_path.display()))?;
+            }
+            crate::state::base_cache::forget(paths, &code_path)?;
         }
-        // Sweep a stale sidecar if the post-PATCH runtime differs from
-        // what the local disk still carries.
+        // Sweep a stale sidecar if the post-PATCH runtime differs from what the
+        // local disk still carries — from disk AND the base cache mirror.
         let other_updated_ext = if updated_ext == "py" { "js" } else { "py" };
         let stale_updated = hooks_dir.join(format!("{slug}.{other_updated_ext}"));
         if stale_updated.exists() {
             std::fs::remove_file(&stale_updated)
                 .with_context(|| format!("removing stale {}", stale_updated.display()))?;
         }
+        crate::state::base_cache::forget(paths, &stale_updated)?;
         let _ = local_ext; // PATCH path: post-PATCH ext drives layout
 
         lockfile.upsert(
@@ -870,6 +888,129 @@ mod tests {
         assert!(
             on_disk.contains("rdc://hooks/upstream"),
             "run_after ref portable:\n{on_disk}"
+        );
+    }
+
+    /// Regression: after a hook PATCH push, the extracted code sidecar must be
+    /// mirrored into the base cache — exactly as the pull path does (see
+    /// `pull::hooks`, "Cache the code sidecar so a future 3-way merge") — so a
+    /// later `BothDiverged` conflict can 3-way-merge the code against a real
+    /// base. Before the fix the push wrote the `.py` only to the working tree,
+    /// leaving the base cache with the hook `.json` but no `.py` (observed on a
+    /// live env), which forces the conflict resolver to fall back to a manual
+    /// prompt (`base_cache::read` → `None`).
+    #[tokio::test]
+    async fn push_patch_hook_caches_code_sidecar_to_base() {
+        use crate::paths::Paths;
+        use crate::snapshot::hook::serialize_hook;
+        use crate::state::hook_combined_hash;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let api = format!("{}/api/v1", server.uri());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        let hooks_dir = paths.hooks_dir();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+
+        let local = serde_json::json!({
+            "name": "My Hook",
+            "type": "function",
+            "url": "rdc://hooks/my-hook",
+            "queues": [],
+            "events": ["annotation_content"],
+            "config": { "runtime": "python3.12" }
+        });
+        std::fs::write(
+            hooks_dir.join("my-hook.json"),
+            serde_json::to_vec_pretty(&local).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(hooks_dir.join("my-hook.py"), b"x = 2\n").unwrap();
+
+        let mut lockfile = Lockfile {
+            api_base: api.clone(),
+            ..Lockfile::default()
+        };
+        // Register the hook's id BEFORE computing the base hash so the remote
+        // self-url portabilizes to rdc:// consistently (the hash is ref-aware).
+        lockfile.upsert(
+            "hooks",
+            "my-hook",
+            ObjectEntry {
+                id: 500,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        // The remote hook (concrete urls) carries the code. base := its combined
+        // hash so the drift check sees no remote drift and proceeds to PATCH.
+        let remote = serde_json::json!({
+            "id": 500,
+            "url": format!("{api}/hooks/500"),
+            "name": "My Hook",
+            "type": "function",
+            "queues": [],
+            "events": ["annotation_content"],
+            "config": { "runtime": "python3.12", "code": "x = 2\n" }
+        });
+        let remote_hook: crate::model::Hook = serde_json::from_value(remote.clone()).unwrap();
+        let (rj, rc) = serialize_hook(&remote_hook).unwrap();
+        let base = hook_combined_hash(&rj, &rc, &lockfile);
+        lockfile.upsert(
+            "hooks",
+            "my-hook",
+            ObjectEntry {
+                id: 500,
+                modified_at: None,
+                content_hash: Some(base),
+                secrets_hash: None,
+            },
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/hooks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pagination": { "next": null }, "results": [remote.clone()]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/hooks/500"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(remote))
+            .mount(&server)
+            .await;
+
+        let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
+        let progress =
+            std::sync::Arc::new(crate::log::Log::new(crate::cli::resolve::ColorMode::Plain));
+        let mut relink = Vec::new();
+        let mut changes = BTreeMap::new();
+        changes.insert("my-hook".to_string(), hooks_dir.join("my-hook.json"));
+
+        let (pushed, _skipped) = push(
+            &paths, &client, &mut lockfile, false, &changes, &[], &mut relink, &progress, "dev",
+        )
+        .await
+        .expect("push should succeed");
+        assert_eq!(pushed, 1, "the hook should be patched");
+
+        // The code sidecar must be mirrored into the base cache, byte-exact.
+        let code_path = hooks_dir.join("my-hook.py");
+        let base_py = crate::state::base_cache::cache_mirror(&paths, &code_path)
+            .expect("code path is under env root");
+        assert!(
+            base_py.exists(),
+            "base cache must contain the hook code sidecar:\n{}",
+            base_py.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&base_py).unwrap(),
+            "x = 2\n",
+            "base cached code must match the pushed code"
         );
     }
 }
