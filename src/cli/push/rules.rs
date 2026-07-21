@@ -203,10 +203,19 @@ pub async fn push(
         if let Some(code) = &updated_code {
             write_rule_code(&rules_dir, slug, code)
                 .with_context(|| format!("writing rule code for '{slug}'"))?;
-        } else if local_py_path.exists() {
-            // Server dropped the trigger_condition; remove the stale .py.
-            std::fs::remove_file(&local_py_path)
-                .with_context(|| format!("removing stale {}", local_py_path.display()))?;
+            // Mirror the `.py` into the base cache (matching `pull::rules`) so a
+            // later `BothDiverged` conflict can 3-way-merge the code against a
+            // real base instead of falling back to a manual prompt.
+            crate::state::base_cache::write(paths, &local_py_path, code.as_bytes())
+                .with_context(|| format!("caching base rule code for '{slug}'"))?;
+        } else {
+            // Server dropped the trigger_condition; remove the stale .py from
+            // disk AND the base cache so the snapshot stays canonical.
+            if local_py_path.exists() {
+                std::fs::remove_file(&local_py_path)
+                    .with_context(|| format!("removing stale {}", local_py_path.display()))?;
+            }
+            crate::state::base_cache::forget(paths, &local_py_path)?;
         }
 
         lockfile.upsert(
@@ -224,4 +233,122 @@ pub async fn push(
     }
 
     Ok((pushed, skipped))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::paths::Paths;
+    use crate::snapshot::rule::serialize_rule;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Regression: after a rule PATCH push, the extracted `trigger_condition`
+    /// sidecar (`<slug>.py`) must be mirrored into the base cache — exactly as
+    /// `pull::rules` does — so a later `BothDiverged` conflict can 3-way-merge
+    /// the code against a real base. Before the fix the push wrote the `.py`
+    /// only to the working tree, leaving the base cache without it.
+    #[tokio::test]
+    async fn push_patch_rule_caches_code_sidecar_to_base() {
+        let server = MockServer::start().await;
+        let api = format!("{}/api/v1", server.uri());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        let rules_dir = paths.rules_dir();
+        std::fs::create_dir_all(&rules_dir).unwrap();
+
+        let local = serde_json::json!({
+            "name": "My Rule",
+            "url": "rdc://rules/my-rule",
+            "queues": [],
+            "trigger": "annotation_content",
+            "rule_actions": []
+        });
+        std::fs::write(
+            rules_dir.join("my-rule.json"),
+            serde_json::to_vec_pretty(&local).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(rules_dir.join("my-rule.py"), b"amount > 0\n").unwrap();
+
+        let mut lockfile = Lockfile {
+            api_base: api.clone(),
+            ..Lockfile::default()
+        };
+        // Register the id before computing base so the self-url portabilizes.
+        lockfile.upsert(
+            "rules",
+            "my-rule",
+            ObjectEntry {
+                id: 700,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        // Remote rule carries the trigger_condition (extracted to the .py).
+        let remote = serde_json::json!({
+            "id": 700,
+            "url": format!("{api}/rules/700"),
+            "name": "My Rule",
+            "queues": [],
+            "trigger": "annotation_content",
+            "rule_actions": [],
+            "trigger_condition": "amount > 0\n"
+        });
+        let remote_rule: crate::model::Rule = serde_json::from_value(remote.clone()).unwrap();
+        let (rj, rc) = serialize_rule(&remote_rule).unwrap();
+        let base = rule_combined_hash(&rj, &rc, &lockfile);
+        lockfile.upsert(
+            "rules",
+            "my-rule",
+            ObjectEntry {
+                id: 700,
+                modified_at: None,
+                content_hash: Some(base),
+                secrets_hash: None,
+            },
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/rules"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pagination": { "next": null }, "results": [remote.clone()]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/rules/700"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(remote))
+            .mount(&server)
+            .await;
+
+        let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
+        let progress =
+            std::sync::Arc::new(crate::log::Log::new(crate::cli::resolve::ColorMode::Plain));
+        let mut changes = BTreeMap::new();
+        changes.insert("my-rule".to_string(), rules_dir.join("my-rule.json"));
+
+        let (pushed, _skipped) = push(
+            &paths, &client, &mut lockfile, false, &changes, &progress, "dev",
+        )
+        .await
+        .expect("push should succeed");
+        assert_eq!(pushed, 1, "the rule should be patched");
+
+        let code_path = rules_dir.join("my-rule.py");
+        let base_py = crate::state::base_cache::cache_mirror(&paths, &code_path)
+            .expect("code path is under env root");
+        assert!(
+            base_py.exists(),
+            "base cache must contain the rule code sidecar:\n{}",
+            base_py.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&base_py).unwrap(),
+            "amount > 0\n",
+            "base cached code must match the pushed code"
+        );
+    }
 }
