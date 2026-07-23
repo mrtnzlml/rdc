@@ -113,10 +113,10 @@ pub fn strip_for_create(body: &mut Value, kind: &str) {
 /// Different intent from `kind_specific_strip` above: that removes a
 /// key entirely from outgoing POST/PATCH bodies; this rewrites an
 /// *incoming* value into a constant so the on-disk bytes are stable
-/// across syncs. The two lists may overlap (queue's `counts` appears
-/// in both — stripped from outbound payloads because the server
-/// rejects it on PATCH, and redacted in inbound payloads because it
-/// churns every time a document changes status), but they're
+/// across syncs. The two lists may overlap (a queue's `counts` and
+/// `rir_url` appear in both — stripped from outbound payloads because
+/// the server rejects them on PATCH, and redacted in inbound payloads
+/// because they are noisy/non-portable server-set values), but they're
 /// independent and the duplication is intentional.
 ///
 /// Add a new field here when a runtime aggregate (or other server-set
@@ -128,7 +128,16 @@ pub fn strip_for_create(body: &mut Value, kind: &str) {
 /// codec did before the fix).
 pub fn redact_on_pull(kind: &str) -> &'static [&'static str] {
     match kind {
-        "queues" => &["counts"],
+        // `counts` is a runtime aggregate that churns on every document status
+        // change. `rir_url` is a per-cluster, server-managed internal RIR
+        // service URL (`http://…svc.cluster.local`) that Rossum assigns:
+        // read-only, non-portable, and 400s if echoed back — so it's also
+        // stripped from outbound bodies by `kind_specific_strip`. Redacting it
+        // on pull keeps the concrete internal hostname out of tracked files
+        // (a cross-env / cross-cluster leak) and stops it from producing a
+        // spurious pull whenever a `migrate`d snapshot's `rir_url` disagrees
+        // with the target remote's value.
+        "queues" => &["counts", "rir_url"],
         // `status` is the runtime health of the hook; Rossum updates it
         // on every fire. Without redaction, every `rdc sync` rewrites
         // hooks/<slug>.json with a fresh status string and the git diff
