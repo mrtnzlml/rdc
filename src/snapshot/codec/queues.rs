@@ -98,6 +98,36 @@ mod tests {
     }
 
     #[test]
+    fn disk_json_redacts_rir_url() {
+        // `rir_url` is a per-cluster, server-managed internal RIR service URL
+        // (e.g. `http://…svc.cluster.local`). It is stripped from outbound
+        // PATCH/POST bodies (the API 400s on it), so it must likewise be
+        // redacted on pull — otherwise the concrete internal hostname lands in
+        // tracked files, leaks across envs via `migrate`, and produces a
+        // spurious cross-env pull whenever the target remote's value differs.
+        let codec = Queues;
+        let v = json!({
+            "id": 10,
+            "url": "https://example/api/v1/queues/10",
+            "name": "Invoices",
+            "rir_url": "http://acme-api.prod-rir.svc.cluster.local",
+            "modified_at": "2026-05-01T12:00:00Z"
+        });
+        let art = codec.disk_bytes(&v).unwrap();
+        let disk_str = std::str::from_utf8(&art.json).unwrap();
+        assert!(
+            !disk_str.contains("acme-api.prod-rir.svc.cluster.local"),
+            "concrete per-cluster rir_url must not leak onto disk; got:\n{disk_str}"
+        );
+        let disk: Value = serde_json::from_slice(&art.json).unwrap();
+        assert_eq!(
+            disk.get("rir_url").and_then(|v| v.as_str()),
+            Some(REDACTED_VALUE_SENTINEL),
+            "rir_url must be redacted to the sentinel on disk; got:\n{disk_str}"
+        );
+    }
+
+    #[test]
     fn no_sidecars() {
         let codec = Queues;
         let v = sample_queue_value();

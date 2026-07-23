@@ -46,6 +46,7 @@ fn sample_queue() -> serde_json::Value {
             "importing": 2,
             "exported": 50
         },
+        "rir_url": "http://acme.prod-rir.svc.cluster.local",
         "automation_level": "never",
         "modified_at": "2026-05-15T10:30:00Z"
     })
