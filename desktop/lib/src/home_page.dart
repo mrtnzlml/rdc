@@ -51,13 +51,17 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _chooseParent() async {
-    final path = await getDirectoryPath(confirmButtonText: 'Choose');
-    if (path != null) await _run(() => state.setParentFolder(path));
+    await _run(() async {
+      final path = await getDirectoryPath(confirmButtonText: 'Choose');
+      if (path != null) await state.setParentFolder(path);
+    });
   }
 
   Future<void> _openExisting() async {
-    final path = await getDirectoryPath(confirmButtonText: 'Open');
-    if (path != null) await _run(() => state.openExisting(path));
+    await _run(() async {
+      final path = await getDirectoryPath(confirmButtonText: 'Open');
+      if (path != null) await state.openExisting(path);
+    });
   }
 
   Future<void> _addConnection() async {
