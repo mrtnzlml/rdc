@@ -133,10 +133,10 @@ impl Drop for Teardown {
                 if let Some(cfg) = cfg {
                     // Drop only THIS run's throwaway collection.
                     let coll = crate::support::mdh::mdh_collection_name(run_id);
-                    if let Ok(raw) = crate::support::mdh::MdhRaw::connect(cfg) {
-                        if let Err(e) = rt.block_on(raw.drop_collection(&coll)) {
-                            eprintln!("teardown(mdh): drop {coll} failed (continuing): {e:#}");
-                        }
+                    if let Ok(raw) = crate::support::mdh::MdhRaw::connect(cfg)
+                        && let Err(e) = rt.block_on(raw.drop_collection(&coll))
+                    {
+                        eprintln!("teardown(mdh): drop {coll} failed (continuing): {e:#}");
                     }
                 }
             });

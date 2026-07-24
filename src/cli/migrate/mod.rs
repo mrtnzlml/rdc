@@ -29,10 +29,10 @@ use std::path::{Path, PathBuf};
 /// the split where both halves are real envs.
 fn parse_legacy_env_pair(stem: &str, known_envs: &BTreeSet<String>) -> Option<(String, String)> {
     for a in known_envs {
-        if let Some(rest) = stem.strip_prefix(&format!("{a}-to-")) {
-            if known_envs.contains(rest) {
-                return Some((a.clone(), rest.to_string()));
-            }
+        if let Some(rest) = stem.strip_prefix(&format!("{a}-to-"))
+            && known_envs.contains(rest)
+        {
+            return Some((a.clone(), rest.to_string()));
         }
     }
     None
@@ -808,6 +808,7 @@ fn url_host(api_base: &str) -> Option<String> {
 ///   - array field: drop the entries that reference the source host;
 ///   - string field (e.g. `email`): drop the field entirely, so `rdc sync`
 ///     re-reads the target's server-assigned value.
+///
 /// Matches the bare host as a substring, covering both URLs
 /// (`https://<host>/…`) and emails (`<local>@<host>`). Scoped to env fields via
 /// `cross_env_body`, so deployable content (a hook's lookup `settings`, …) is

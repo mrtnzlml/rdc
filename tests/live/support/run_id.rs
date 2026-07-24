@@ -15,7 +15,7 @@ impl RunId {
         let pid = std::process::id() as u128;
         // base36 of (nanos XOR-mixed with pid), lowercase alnum only.
         let mixed = nanos.wrapping_mul(1_000_003).wrapping_add(pid);
-        RunId(format!("{}", to_base36(mixed)))
+        RunId(to_base36(mixed).to_string())
     }
 
     pub fn as_str(&self) -> &str {
