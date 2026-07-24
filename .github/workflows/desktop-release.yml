@@ -1,18 +1,15 @@
-# Build and release the macOS desktop app on `desktop-v*` tags.
+# Build and release the cross-platform "Rossum Local" desktop app (Flutter +
+# flutter_rust_bridge) for macOS, Windows, and Linux on `desktop-v*` tags.
 #
-# Required GitHub repository secrets (Settings → Secrets and variables → Actions):
+# The Rust bridge (desktop/rust, crate `rdc_bridge`) is compiled automatically
+# by Cargokit during `flutter build`, so each job needs a Rust toolchain + the
+# Flutter SDK. The FRB-generated Dart/Rust glue is committed, so no codegen
+# toolchain is required in CI.
 #
-#   APPLE_CERTIFICATE              base64-encoded .p12 of the Developer ID Application cert
-#   APPLE_CERTIFICATE_PASSWORD     unlock password for the .p12
-#   APPLE_SIGNING_IDENTITY         e.g. "Developer ID Application: Rossum AG (TEAMID)"
-#   APPLE_ID                       Apple ID with App Store Connect access
-#   APPLE_TEAM_ID                  10-character team id
-#   APPLE_APP_SPECIFIC_PASSWORD    app-specific password for notarytool
-#   TAURI_SIGNING_PRIVATE_KEY      contents of ~/.tauri/rossum-local.key (Ed25519 updater key)
-#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD   passphrase for the Ed25519 key (empty if none)
-#
-# These secrets are required before the workflow can produce a notarized DMG.
-# Until they're configured, manual `desktop-v*` tags will fail the workflow.
+# macOS signing/notarization reuses the existing Developer ID secrets:
+#   APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
+#   APPLE_ID, APPLE_TEAM_ID, APPLE_APP_SPECIFIC_PASSWORD
+# Windows/Linux code signing is deferred.
 
 name: Desktop release
 
@@ -21,29 +18,55 @@ on:
     tags:
       - "desktop-v*"
 
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: "3.44.8"
+
 jobs:
   build:
-    runs-on: macos-14
-    environment: desktop-release
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: macos
+          - os: windows-latest
+            target: windows
+          - os: ubuntu-latest
+            target: linux
     timeout-minutes: 60
-
+    defaults:
+      run:
+        working-directory: desktop
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
         with:
-          targets: x86_64-apple-darwin,aarch64-apple-darwin
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
 
-      - name: Install tauri-cli
-        run: cargo install tauri-cli --version "^2.0.0" --locked
+      - name: Linux build dependencies
+        if: matrix.target == 'linux'
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libgtk-3-dev clang cmake pkg-config liblzma-dev
 
-      - name: Install Node + TypeScript
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
+      - name: Flutter pub get
+        run: flutter pub get
 
+      # ---------------- macOS: build, sign, notarize, DMG ----------------
       - name: Import Apple Developer ID certificate
+        if: matrix.target == 'macos'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -52,53 +75,81 @@ jobs:
           security create-keychain -p actions build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p actions build.keychain
-          security import $RUNNER_TEMP/cert.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security import $RUNNER_TEMP/cert.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
-          security list-keychains -d user -s build.keychain $(security list-keychains -d user | tr -d \")
 
-      - name: Build, sign, notarize, staple
+      - name: Build macOS app
+        if: matrix.target == 'macos'
+        run: flutter build macos --release
+
+      - name: Sign, notarize, and package DMG
+        if: matrix.target == 'macos'
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          cd desktop
-          cargo tauri build --target universal-apple-darwin
+          APP=$(ls -d build/macos/Build/Products/Release/*.app | head -1)
+          codesign --deep --force --options runtime --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" "$APP"
+          DMG="RossumLocal-${GITHUB_REF_NAME#desktop-v}.dmg"
+          hdiutil create -volname "Rossum Local" -srcfolder "$APP" -ov -format UDZO "$DMG"
+          xcrun notarytool submit "$DMG" --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" --password "$APPLE_PASSWORD" --wait
+          xcrun stapler staple "$DMG"
+          mkdir -p dist && mv "$DMG" dist/
 
-      - name: Generate latest.json for updater feed
+      # ---------------- Windows: build + zip ----------------
+      - name: Build Windows app
+        if: matrix.target == 'windows'
+        run: flutter build windows --release
+
+      - name: Package Windows zip
+        if: matrix.target == 'windows'
+        shell: pwsh
         run: |
-          VERSION=${GITHUB_REF_NAME#desktop-v}
-          DMG=$(ls desktop/target/universal-apple-darwin/release/bundle/dmg/*.dmg)
-          SIG=$(cat $DMG.sig)
-          cat > rossum-local-latest.json <<EOF
-          {
-            "version": "$VERSION",
-            "notes": "See https://github.com/mrtnzlml/rdc/releases/tag/$GITHUB_REF_NAME",
-            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "platforms": {
-              "darwin-aarch64": {
-                "signature": "$SIG",
-                "url": "https://github.com/mrtnzlml/rdc/releases/download/$GITHUB_REF_NAME/$(basename $DMG)"
-              },
-              "darwin-x86_64": {
-                "signature": "$SIG",
-                "url": "https://github.com/mrtnzlml/rdc/releases/download/$GITHUB_REF_NAME/$(basename $DMG)"
-              }
-            }
-          }
-          EOF
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $ver = "${env:GITHUB_REF_NAME}" -replace '^desktop-v',''
+          Compress-Archive -Path build/windows/x64/runner/Release/* `
+            -DestinationPath "dist/RossumLocal-$ver-windows-x64.zip"
+        # TODO: build a proper installer (MSIX or Inno Setup) as a follow-up.
 
-      - name: Upload to GitHub Release
+      # ---------------- Linux: build + tarball ----------------
+      - name: Build Linux app
+        if: matrix.target == 'linux'
+        run: flutter build linux --release
+
+      - name: Package Linux tarball
+        if: matrix.target == 'linux'
+        run: |
+          mkdir -p dist
+          ver="${GITHUB_REF_NAME#desktop-v}"
+          tar czf "dist/RossumLocal-$ver-linux-x64.tar.gz" \
+            -C build/linux/x64/release/bundle .
+        # TODO: build an AppImage and/or .deb as a follow-up.
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rossum-local-${{ matrix.target }}
+          path: desktop/dist/*
+          retention-days: 1
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            desktop/target/universal-apple-darwin/release/bundle/dmg/*.dmg
-            desktop/target/universal-apple-darwin/release/bundle/dmg/*.dmg.sig
-            rossum-local-latest.json
-          fail_on_unmatched_files: true
+          files: artifacts/*
           generate_release_notes: true
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

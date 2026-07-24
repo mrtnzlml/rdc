@@ -56,7 +56,12 @@ panic = "abort"
 opt-level = 3
 
 [workspace]
-members = [".", "rdc-ffi"]
+members = ["."]
+# The desktop GUI's Rust bridge (desktop/rust, crate `rdc_bridge`) is its own
+# workspace so it does not inherit this workspace's panic = "abort"
+# (flutter_rust_bridge needs unwinding to convert Rust panics into Dart
+# exceptions). It depends on `rdc` via a path dependency.
+exclude = ["desktop"]
 
 [workspace.package]
 edition = "2024"
