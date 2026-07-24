@@ -36,19 +36,18 @@ mod tests {
         // every body whose config.code_file points at a sidecar must exist
         for o in &m.objects {
             let raw = std::fs::read_to_string(dir.join(&o.body)).unwrap();
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                if let Some(code_file) = v
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
+                && let Some(code_file) = v
                     .get("config")
                     .and_then(|c| c.get("code_file"))
                     .and_then(|f| f.as_str())
-                {
-                    assert!(
-                        dir.join(code_file).exists(),
-                        "missing code_file sidecar for {}: {}",
-                        o.key,
-                        code_file
-                    );
-                }
+            {
+                assert!(
+                    dir.join(code_file).exists(),
+                    "missing code_file sidecar for {}: {}",
+                    o.key,
+                    code_file
+                );
             }
         }
         // every dependency resolves and there are no cycles
@@ -59,11 +58,11 @@ mod tests {
         for o in &m.objects {
             let raw = std::fs::read_to_string(dir.join(&o.body)).unwrap();
             for tok in raw.split('"') {
-                if let Some(rest) = tok.strip_prefix('@') {
-                    if let Some((kind, key)) = rest.split_once('/') {
-                        let ok = (kind == "organization" && key == "self") || keys.contains(key);
-                        assert!(ok, "{} references unknown placeholder @{}/{}", o.body, kind, key);
-                    }
+                if let Some(rest) = tok.strip_prefix('@')
+                    && let Some((kind, key)) = rest.split_once('/')
+                {
+                    let ok = (kind == "organization" && key == "self") || keys.contains(key);
+                    assert!(ok, "{} references unknown placeholder @{}/{}", o.body, kind, key);
                 }
             }
         }

@@ -18,8 +18,9 @@ use std::sync::Arc;
 /// match at all) — the caller then POSTs a fresh template.
 ///
 /// The `claimed` gate is what makes multi-template-per-name queues safe: two
-/// local siblings that share a name (e.g. two custom "Annotation status change
-/// - received" templates on the same queue) must adopt DISTINCT remote ids.
+/// local siblings that share a name (e.g. two custom "Annotation status
+/// change - received" templates on the same queue) must adopt DISTINCT remote
+/// ids.
 /// Without it, `find`-by-name collapses both onto the first match, orphaning
 /// the sibling remote (deleted under `--allow-deletes` = data loss) and leaving
 /// the surviving binding perpetually mismatched (churn). Selecting the lowest

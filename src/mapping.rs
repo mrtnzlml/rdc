@@ -317,10 +317,10 @@ impl GenericMapping {
             let rows = self.kind_rows(kind).expect("KINDS entry has rows");
             let dest = m.kind_map_mut(kind).expect("KINDS entry is a mappable kind");
             for row in rows {
-                if let (Some(s), Some(t)) = (row.get(src_env), row.get(tgt_env)) {
-                    if s != t {
-                        dest.insert(s.clone(), t.clone());
-                    }
+                if let (Some(s), Some(t)) = (row.get(src_env), row.get(tgt_env))
+                    && s != t
+                {
+                    dest.insert(s.clone(), t.clone());
                 }
             }
         }

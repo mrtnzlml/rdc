@@ -101,10 +101,10 @@ impl LiveClient {
                 }
             }
             let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            if name.starts_with(prefix) {
-                if let Some(id) = v.get("id").and_then(|i| i.as_u64()) {
-                    out.push((id, name.to_string()));
-                }
+            if name.starts_with(prefix)
+                && let Some(id) = v.get("id").and_then(|i| i.as_u64())
+            {
+                out.push((id, name.to_string()));
             }
         }
         Ok(out)
@@ -122,12 +122,12 @@ impl LiveClient {
             if soft_deleted {
                 continue;
             }
-            if q.name.starts_with(prefix) {
-                if let Some(url) = q.schema.as_deref() {
-                    if let Some(id) = url.trim_end_matches('/').rsplit('/').next().and_then(|s| s.parse::<u64>().ok()) {
-                        out.push(id);
-                    }
-                }
+            if q.name.starts_with(prefix)
+                && let Some(url) = q.schema.as_deref()
+                && let Some(id) =
+                    url.trim_end_matches('/').rsplit('/').next().and_then(|s| s.parse::<u64>().ok())
+            {
+                out.push(id);
             }
         }
         Ok(out)
@@ -193,42 +193,42 @@ impl LiveClient {
                 .list_labels(None)
                 .await?
                 .into_iter()
-                .map(|x| serde_json::to_value(x))
+                .map(serde_json::to_value)
                 .collect::<Result<_, _>>()?,
             "queue" => self
                 .inner
                 .list_queues(None)
                 .await?
                 .into_iter()
-                .map(|x| serde_json::to_value(x))
+                .map(serde_json::to_value)
                 .collect::<Result<_, _>>()?,
             "hook" => self
                 .inner
                 .list_hooks(None)
                 .await?
                 .into_iter()
-                .map(|x| serde_json::to_value(x))
+                .map(serde_json::to_value)
                 .collect::<Result<_, _>>()?,
             "rule" => self
                 .inner
                 .list_rules(None)
                 .await?
                 .into_iter()
-                .map(|x| serde_json::to_value(x))
+                .map(serde_json::to_value)
                 .collect::<Result<_, _>>()?,
             "inbox" => self
                 .inner
                 .list_inboxes(None)
                 .await?
                 .into_iter()
-                .map(|x| serde_json::to_value(x))
+                .map(serde_json::to_value)
                 .collect::<Result<_, _>>()?,
             "workspace" => self
                 .inner
                 .list_workspaces(None)
                 .await?
                 .into_iter()
-                .map(|x| serde_json::to_value(x))
+                .map(serde_json::to_value)
                 .collect::<Result<_, _>>()?,
             other => anyhow::bail!("find_listed_value: unsupported kind '{other}'"),
         };
