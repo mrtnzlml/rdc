@@ -317,11 +317,20 @@ pub(crate) async fn run_cycle(
         use crate::cli::sync::classify::SyncClass;
 
         // MDH bypasses the classifier, so its would-be writes are invisible
-        // to the classified plan above. Predict them from the already-listed
-        // catalog + lockfile + local files (no extra network) and fold them
-        // into the same pull/push sections so the preview is faithful.
-        let mdh_plan =
+        // to the classified plan above. `plan_mdh` predicts the STRUCTURAL
+        // deltas (new/create/drift/orphan) from the already-listed catalog +
+        // lockfile + local files with no extra network.
+        let mut mdh_plan =
             crate::cli::pull::mdh::plan_mdh(&catalog.mdh, &lockfile, &paths, no_push);
+        // Structural scan can't see a remote index-BODY edit (e.g. an index
+        // rename) on a collection that already exists locally — detecting that
+        // needs the env's index defs. Fetch them per local collection (the same
+        // fetches a real sync's pull performs) so the preview matches what the
+        // run would actually write, rather than silently under-reporting it.
+        mdh_plan.extend(
+            crate::cli::pull::mdh::plan_mdh_index_edits(&catalog.mdh, &lockfile, &paths, &progress)
+                .await?,
+        );
         let mdh_pull: Vec<&crate::cli::pull::mdh::MdhPlanItem> = mdh_plan
             .iter()
             .filter(|i| i.dir == crate::cli::pull::mdh::MdhPlanDir::Pull)

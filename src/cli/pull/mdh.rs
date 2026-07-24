@@ -196,6 +196,82 @@ pub(crate) fn plan_mdh(
     items
 }
 
+/// Forecast whether a real sync would PULL (overwrite) a collection's local
+/// `indexes.json` with the env's index definitions — the remote-side index
+/// BODY edit that [`plan_mdh`]'s no-network structural scan cannot see. Reuses
+/// the executor's exact three-way decision ([`decide_pull_action`]) so the
+/// preview matches the real run. Returns a plan item only for `Write` (a clean
+/// overwrite); `NoChange` is a no-op and `KeepLocal`/`Conflict` are
+/// local-edit / both-diverged states the push or resolver owns — not a pull. A
+/// missing local file is `plan_mdh` stage 3's "(new)" case, handled there.
+fn index_edit_item(
+    slug: &str,
+    ix_path: &std::path::Path,
+    base_hash: Option<&str>,
+    proposed: &[u8],
+) -> Result<Option<MdhPlanItem>> {
+    // A missing local file is a create, not an index-body edit — leave it to
+    // `plan_mdh` stage 3 so it is not forecast twice.
+    if !ix_path.is_file() {
+        return Ok(None);
+    }
+    let (action, _remote_hash) = decide_pull_action(ix_path, base_hash, proposed)?;
+    Ok(match action {
+        PullAction::Write => Some(MdhPlanItem {
+            dir: MdhPlanDir::Pull,
+            line: format!("mdh/{slug} (index update)"),
+        }),
+        // NoChange: local already matches remote. KeepLocal / Conflict: the
+        // local file diverged — a push or the resolver owns those, not a pull.
+        PullAction::NoChange | PullAction::KeepLocal | PullAction::Conflict => None,
+    })
+}
+
+/// Network-backed companion to [`plan_mdh`]: for each env collection that
+/// already has a local dataset dir, fetch its index definitions and forecast a
+/// pull when they would overwrite the local `indexes.json`. Closes `plan_mdh`'s
+/// documented gap (remote index-body edits on a locally-present collection) at
+/// the cost of one index-list pair per local collection — the same fetches the
+/// real sync's pull performs. Collections with no local dir are left to
+/// `plan_mdh` stage 3 ("(new)").
+pub(crate) async fn plan_mdh_index_edits(
+    listed: &MdhListed,
+    lockfile: &crate::state::Lockfile,
+    paths: &crate::paths::Paths,
+    progress: &Arc<Log>,
+) -> Result<Vec<MdhPlanItem>> {
+    let mut items = Vec::new();
+    if !listed.available {
+        return Ok(items);
+    }
+    // Slug every collection exactly as the executor / `plan_mdh` do (listing
+    // order, unique dedup) so forecast slugs match the real run byte-for-byte.
+    let mut used: HashSet<String> = HashSet::new();
+    for c in &listed.collections {
+        let slug = slugify_unique(&c.name, &used);
+        used.insert(slug.clone());
+
+        let ix_path = paths.dataset_dir(&slug).join("indexes.json");
+        // No local dataset dir → `plan_mdh` stage 3 already forecasts "(new)";
+        // don't fetch (nothing to compare against) or double-report.
+        if !ix_path.is_file() {
+            continue;
+        }
+
+        let set = fetch_index_set(&listed.client, &c.name, progress).await?;
+        let proposed = proposed_index_bytes(&set)?;
+        let base = lockfile
+            .objects
+            .get("mdh_indexes")
+            .and_then(|m| m.get(&slug))
+            .and_then(|e| e.content_hash.clone());
+        if let Some(item) = index_edit_item(&slug, &ix_path, base.as_deref(), &proposed)? {
+            items.push(item);
+        }
+    }
+    Ok(items)
+}
+
 /// Strip server-only fields from an index set so the user only sees /
 /// round-trips the fields they can actually edit. Two flavors:
 ///
@@ -280,6 +356,40 @@ fn normalize_search_index(remote: &Value) -> Option<Value> {
     Some(Value::Object(out))
 }
 
+/// Serialize a fetched index set into the exact on-disk `indexes.json` bytes a
+/// pull would write: server-managed fields stripped (`_id_`, `v`, search-index
+/// status envelope), name-sorted, then run through the `mdh` codec. The single
+/// source of truth for both the pull write (`process`) and the dry-run forecast
+/// (`plan_mdh_index_edits`) — sharing it is what keeps the preview from ever
+/// disagreeing with what the real sync would actually write.
+fn proposed_index_bytes(set: &IndexSet) -> Result<Vec<u8>> {
+    let trimmed = strip_server_managed(set);
+    let value = serde_json::to_value(&trimmed).context("serializing index set as value")?;
+    let art = crate::snapshot::codec::codec(KIND)
+        .expect("mdh codec is registered")
+        .disk_bytes(&value)
+        .context("serializing index set via codec")?;
+    Ok(art.json)
+}
+
+/// Fetch a collection's regular + search index definitions from the env.
+/// Shared by the pull write path and the dry-run index-edit forecast.
+async fn fetch_index_set(
+    client: &DataStorageClient,
+    collection_name: &str,
+    progress: &Arc<Log>,
+) -> Result<IndexSet> {
+    let regular = client
+        .list_indexes(collection_name, Some(progress.clone()))
+        .await
+        .with_context(|| format!("listing indexes for '{collection_name}'"))?;
+    let search = client
+        .list_search_indexes(collection_name, Some(progress.clone()))
+        .await
+        .with_context(|| format!("listing search indexes for '{collection_name}'"))?;
+    Ok(IndexSet { regular, search })
+}
+
 /// Opaque listed state for MDH — the client handle plus the collection list.
 /// We carry the client here because it's constructed from env_cfg + token,
 /// which live in `run_drivers` scope.
@@ -349,6 +459,11 @@ pub async fn process(
 
     let mut used: HashSet<String> = HashSet::new();
     let mut conflicts = 0usize;
+    // Slugs whose local representation actually changed THIS cycle (manifest
+    // (re)written or indexes.json pulled). MDH bypasses the classifier and
+    // this runs over every dataset each cycle, so the reported count must be
+    // changed-only — a `BTreeSet` de-dupes a dataset that changed both files.
+    let mut changed: BTreeSet<String> = BTreeSet::new();
 
     let mut dir_created = false;
 
@@ -390,6 +505,7 @@ pub async fn process(
         if needs_write {
             std::fs::write(&manifest_path, &manifest_bytes)
                 .with_context(|| format!("writing {}", manifest_path.display()))?;
+            changed.insert(slug.clone());
         }
         // Legacy: pre-manifest projects also carry a redundant
         // `mdh_collections.<slug>` lockfile entry. Drop it — the on-disk
@@ -430,15 +546,8 @@ pub async fn process(
     .map(|(slug, name)| {
         let progress = progress.clone();
         async move {
-            let regular = client_ref
-                .list_indexes(&name, Some(progress.clone()))
-                .await
-                .with_context(|| format!("listing indexes for '{name}'"))?;
-            let search = client_ref
-                .list_search_indexes(&name, Some(progress.clone()))
-                .await
-                .with_context(|| format!("listing search indexes for '{name}'"))?;
-            Ok::<_, anyhow::Error>((slug, IndexSet { regular, search }))
+            let set = fetch_index_set(client_ref, &name, &progress).await?;
+            Ok::<_, anyhow::Error>((slug, set))
         }
     })
     .buffer_unordered(crate::cli::pull::common::PULL_FANOUT)
@@ -460,18 +569,11 @@ pub async fn process(
         let Some(index_set) = by_slug.get(slug) else {
             continue;
         };
-        let trimmed = strip_server_managed(index_set);
-
-        let ix_result: Result<()> = (|| {
+        let ix_action: PullAction = (|| -> Result<PullAction> {
             let ix_path = dataset_dir.join("indexes.json");
 
-            // Use KindCodec for byte + hash production.
-            let value = serde_json::to_value(&trimmed).context("serializing index set as value")?;
-            let art = crate::snapshot::codec::codec(KIND)
-                .unwrap()
-                .disk_bytes(&value)
-                .context("serializing index set via codec")?;
-            let ix_proposed = art.json;
+            // Serialize to the exact on-disk bytes a pull would write.
+            let ix_proposed = proposed_index_bytes(index_set)?;
 
             let ix_base = ctx
                 .lockfile
@@ -512,19 +614,28 @@ pub async fn process(
                 )?
             };
             record_object(ctx.lockfile, "mdh_indexes", slug, 0, None, Some(i_recorded));
-            Ok(())
-        })();
-        ix_result?;
+            Ok(i_action)
+        })()?;
+        // `Write` overwrote the local indexes.json; `Conflict` wrote merged
+        // bytes / a shadow. `NoChange` and `KeepLocal` left the file alone.
+        if matches!(ix_action, PullAction::Write | PullAction::Conflict) {
+            changed.insert(slug.clone());
+        }
     }
 
-    if !dataset_dirs.is_empty() {
+    // Report datasets that actually changed this cycle — NOT the total
+    // processed. MDH runs over every dataset each cycle, so a no-op re-pull
+    // must stay silent (matching the classifier-driven drivers) instead of
+    // claiming it pulled everything.
+    let changed_count = changed.len();
+    if changed_count > 0 {
         progress.event(
             Action::Pull,
-            &format!("mdh_datasets ({} pulled)", dataset_dirs.len()),
+            &format!("mdh_datasets ({changed_count} pulled)"),
         );
     }
 
-    Ok((dataset_dirs.len(), conflicts))
+    Ok((changed_count, conflicts))
 }
 
 #[cfg(test)]
@@ -715,5 +826,199 @@ mod tests {
         let search: Vec<&str> = out.search.iter().map(|i| i["name"].as_str().unwrap()).collect();
         assert_eq!(regular, vec!["a_idx", "b_idx"], "regular indexes must be name-sorted");
         assert_eq!(search, vec!["m_search", "z_search"], "search indexes must be name-sorted");
+    }
+
+    /// MDH bypasses the classifier, so `process` runs over EVERY dataset on
+    /// every cycle. Its `mdh_datasets (N pulled)` count must therefore report
+    /// datasets actually changed this cycle — not the total processed — or a
+    /// no-op re-pull falsely claims "N pulled". First pull materializes the
+    /// dataset (1 changed); an immediate identical re-pull changes nothing (0).
+    #[tokio::test]
+    async fn process_counts_only_changed_datasets() {
+        use crate::state::Lockfile;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/indexes/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "ok",
+                "result": [
+                    { "name": "_id_", "key": { "_id": 1 }, "v": 2 },
+                    { "name": "vendors_name_idx", "key": { "name": 1 }, "v": 2 }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search_indexes/list"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "code": "ok", "result": [] })),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        std::fs::create_dir_all(paths.mdh_dir()).unwrap();
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        // `ctx.client` (RossumClient) is unused by the MDH pull — the
+        // DataStorageClient in `listed` is what talks to the mock server.
+        let rossum = crate::api::RossumClient::new(
+            "https://unused.invalid/api/v1".to_string(),
+            "t".to_string(),
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::default();
+        let subset: BTreeSet<(String, String)> =
+            [("mdh".to_string(), "vendors".to_string())].into_iter().collect();
+        let mk_listed = || MdhListed {
+            client: DataStorageClient::new(server.uri(), "t".to_string()).unwrap(),
+            collections: vec![Collection {
+                name: "vendors".to_string(),
+                extra: Default::default(),
+            }],
+            available: true,
+        };
+
+        let (changed1, conflicts1) = {
+            let mut ctx = PullCtx {
+                paths: &paths,
+                client: &rossum,
+                lockfile: &mut lockfile,
+                queue_locations: std::collections::BTreeMap::new(),
+                interactive: false,
+            };
+            process(&mut ctx, mk_listed(), &subset, &progress).await.unwrap()
+        };
+        assert_eq!(conflicts1, 0);
+        assert_eq!(changed1, 1, "first pull writes the dataset → 1 changed");
+
+        let (changed2, _c2) = {
+            let mut ctx = PullCtx {
+                paths: &paths,
+                client: &rossum,
+                lockfile: &mut lockfile,
+                queue_locations: std::collections::BTreeMap::new(),
+                interactive: false,
+            };
+            process(&mut ctx, mk_listed(), &subset, &progress).await.unwrap()
+        };
+        assert_eq!(
+            changed2, 0,
+            "a no-op re-pull must report 0 changed, not the dataset total"
+        );
+    }
+
+    /// The pure three-way core of the index-edit forecast. A remote index body
+    /// that differs from an unedited local file (local == base) → the pull
+    /// would overwrite it → forecast a pull. Identical remote → no forecast.
+    /// Missing local file → no forecast (that is `plan_mdh` stage 3's "new").
+    #[test]
+    fn index_edit_item_flags_remote_index_body_edit() {
+        use crate::state::{Lockfile, content_hash};
+        let tmp = tempfile::tempdir().unwrap();
+        let ix_path = tmp.path().join("indexes.json");
+        let local = b"{\n  \"regular\": [ { \"name\": \"acct_v2\" } ],\n  \"search\": []\n}\n";
+        std::fs::write(&ix_path, local).unwrap();
+        let base = content_hash(local, &Lockfile::default());
+
+        // Remote renamed the index; local is unedited (== base) → clean pull.
+        let proposed = b"{\n  \"regular\": [ { \"name\": \"acct\" } ],\n  \"search\": []\n}\n";
+        let item = index_edit_item("gl-codes", &ix_path, Some(&base), proposed).unwrap();
+        assert_eq!(
+            item.map(|i| (i.dir, i.line)),
+            Some((MdhPlanDir::Pull, "mdh/gl-codes (index update)".to_string())),
+            "a remote index-body edit on an unedited local file must be forecast as a pull"
+        );
+
+        // Remote identical to local → nothing to pull.
+        assert!(
+            index_edit_item("gl-codes", &ix_path, Some(&base), local)
+                .unwrap()
+                .is_none(),
+            "identical remote must not be forecast"
+        );
+
+        // No local file → stage 3 "(new)" territory, not an index update.
+        assert!(
+            index_edit_item("gone", &tmp.path().join("nope.json"), Some(&base), proposed)
+                .unwrap()
+                .is_none(),
+            "missing local file is not an index-update forecast"
+        );
+    }
+
+    /// End-to-end: `plan_mdh_index_edits` fetches the env's index defs and
+    /// forecasts a pull when they differ from an unedited local `indexes.json`.
+    /// This is the gap `plan_mdh` alone (no network) cannot see.
+    #[tokio::test]
+    async fn plan_mdh_index_edits_forecasts_remote_index_change() {
+        use crate::state::{Lockfile, content_hash};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Env now advertises index name "acct"; local snapshot has "acct_v2".
+        Mock::given(method("POST"))
+            .and(path("/v1/indexes/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "ok",
+                "result": [ { "name": "acct", "key": { "accountName": 1 } } ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search_indexes/list"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "code": "ok", "result": [] })),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        let dir = paths.dataset_dir("gl-codes");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Local snapshot carries the OLD index name; record it as the base so
+        // the file reads as unedited (local == base) → a clean pull.
+        let local = b"{\n  \"regular\": [\n    {\n      \"key\": {\n        \"accountName\": 1\n      },\n      \"name\": \"acct_v2\"\n    }\n  ],\n  \"search\": []\n}\n";
+        std::fs::write(dir.join("indexes.json"), local).unwrap();
+        let mut lockfile = Lockfile::default();
+        let mut mdh = std::collections::BTreeMap::new();
+        mdh.insert(
+            "gl-codes".to_string(),
+            crate::state::ObjectEntry {
+                id: 0,
+                modified_at: None,
+                content_hash: Some(content_hash(local, &Lockfile::default())),
+                secrets_hash: None,
+            },
+        );
+        lockfile.objects.insert("mdh_indexes".to_string(), mdh);
+
+        let listed = MdhListed {
+            client: DataStorageClient::new(server.uri(), "t".to_string()).unwrap(),
+            collections: vec![Collection {
+                name: "gl-codes".to_string(),
+                extra: Default::default(),
+            }],
+            available: true,
+        };
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+
+        let items = plan_mdh_index_edits(&listed, &lockfile, &paths, &progress)
+            .await
+            .unwrap();
+        let lines: Vec<(MdhPlanDir, String)> =
+            items.into_iter().map(|i| (i.dir, i.line)).collect();
+        assert_eq!(
+            lines,
+            vec![(MdhPlanDir::Pull, "mdh/gl-codes (index update)".to_string())],
+            "a remote index-body edit must be forecast as a would-pull"
+        );
     }
 }
