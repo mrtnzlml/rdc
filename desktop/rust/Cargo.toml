@@ -1,0 +1,27 @@
+[package]
+name = "rdc_bridge"
+version = "0.1.0"
+edition = "2021"
+
+# Own workspace: deliberately does NOT join the parent rdc workspace, which
+# sets panic = "abort". flutter_rust_bridge needs unwinding to convert Rust
+# panics into Dart exceptions, so the bridge builds with the default unwind.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+flutter_rust_bridge = "=2.12.0"
+rdc = { path = "../.." }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time", "io-util", "io-std", "sync", "signal", "parking_lot"] }
+trash = "5"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }

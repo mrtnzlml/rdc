@@ -283,3 +283,39 @@ bookmarks / Liquid Glass; iOS/Android.
 - UniFFI Kotlin/JVM via JNA: https://mozilla.github.io/uniffi-rs/latest/kotlin/gradle.html
 - Tauri v2 webview per platform (Linux WebKitGTK): https://v2.tauri.app/reference/webview-versions/ , https://github.com/orgs/tauri-apps/discussions/8524
 - Avalonia (MIT, Skia): https://avaloniaui.net/ ; Slint licensing: https://slint.dev/blog/making-slint-desktop-ready
+
+## 13. Implementation status (as built, 2026-07-24)
+
+Implemented on branch `desktop-flutter`. Toolchain: **Flutter 3.44.8** (Dart
+3.12.2), **flutter_rust_bridge 2.12.0**, Rust 1.95, Xcode 26.6, CocoaPods 1.17.
+
+**Deviations from the design above (all deliberate, verified):**
+- The bridge crate lives at **`desktop/rust/`** (FRB's default location, wired
+  via Cargokit) rather than a top-level `rdc-bridge/`, and its package is named
+  **`rdc_bridge`** (cargo underscore form). It is its **own cargo workspace**
+  (the parent workspace `exclude`s `desktop/`) so it does not inherit
+  `panic = "abort"` — FRB needs unwinding to convert panics to Dart exceptions.
+- Progress uses an FRB `StreamSink<SyncPhase>` exposed to Dart as
+  `Stream<SyncPhase>`; the correct Rust import is
+  `crate::frb_generated::StreamSink` (not `flutter_rust_bridge::StreamSink`).
+- `SyncPhase` (a data-carrying enum) makes FRB generate a Dart **freezed** union,
+  so `freezed`/`freezed_annotation`/`build_runner` were added as Dart deps.
+- App-private settings use **`dart:io` JSON** (`~/.rossum_local/settings.json`),
+  not `shared_preferences`, to avoid an extra native plugin/pod. The only Dart
+  plugin is `file_selector` (native folder dialogs); trash/reveal are in Rust.
+- Flutter package/dir is `desktop/` with bundle id **`ai.rossum.local`** and
+  product name **"Rossum Local"** (set in `macos/Runner/Configs/AppInfo.xcconfig`).
+- The retired `macos/` (SwiftUI) and `rdc-ffi/` (UniFFI) dirs were deleted; the
+  root workspace is now `members = ["."]`.
+
+**Verification (all green):**
+- `cargo test` in `desktop/rust`: 4/4 (ported discover/credential logic).
+- Integration test against the real native library (`flutter test
+  integration_test -d macos`): 4/4 — `rdcVersion`, add→list→validate round-trip
+  (writes real `rdc.toml` + `secrets/`), empty-token rejection, non-project
+  rejection.
+- `flutter analyze lib`: no issues.
+- `flutter build macos --debug`: builds **"Rossum Local.app"** with
+  `rdc_bridge.framework` embedded; the app launches and runs.
+- Windows/Linux builds are wired but not exercised on this macOS host; CI covers
+  them via the three-OS matrix in `.github/workflows/desktop-release.yml`.
