@@ -14,12 +14,12 @@ void main() {
     addTearDown(tester.view.resetDevicePixelRatio);
 
     // Default Settings() → no parent folder → empty state; no Rust/network.
-    await tester.pumpWidget(RossumLocalApp(state: AppState(Settings())));
+    await tester.pumpWidget(RdcApp(state: AppState(Settings())));
     await tester.pumpAndSettle();
 
     expect(find.text('Choose folder…'), findsOneWidget);
     await expectLater(
-      find.byType(RossumLocalApp),
+      find.byType(RdcApp),
       matchesGoldenFile('goldens/empty_state.png'),
     );
   });

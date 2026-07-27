@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 
+import 'error_text.dart';
 import 'rust/api/rdc.dart';
 import 'settings.dart';
 
@@ -79,7 +80,7 @@ class AppState extends ChangeNotifier {
         _settings.save();
       }
     } catch (e) {
-      lastError = '$e';
+      lastError = errorText(e);
     }
 
     connections = byFolder.values.toList()
@@ -103,10 +104,21 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> editCredentialsEntry(
-      String folder, EditCredentialsInput input) async {
-    await editCredentials(folder: folder, input: input);
+  Future<void> editConnectionEntry(
+      ConnItem item, EditConnectionInput input) async {
+    final updated =
+        await editConnection(folder: item.summary.folder, input: input);
+    // If an external connection's folder was renamed, follow it in settings.
+    if (item.isExternal && updated.folder != item.summary.folder) {
+      final i = _settings.externalPaths.indexOf(item.summary.folder);
+      if (i >= 0) {
+        _settings.externalPaths[i] = updated.folder;
+        _settings.save();
+      }
+    }
     await reload();
+    selectedFolder = updated.folder;
+    notifyListeners();
   }
 
   Future<void> openExisting(String path) async {
@@ -163,7 +175,7 @@ class AppState extends ChangeNotifier {
       },
       onError: (Object e) {
         syncState[folder] = SyncState.error;
-        syncMessage[folder] = '$e';
+        syncMessage[folder] = errorText(e);
         notifyListeners();
       },
     );

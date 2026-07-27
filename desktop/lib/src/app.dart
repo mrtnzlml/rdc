@@ -3,15 +3,15 @@ import 'package:flutter/material.dart';
 import 'app_state.dart';
 import 'home_page.dart';
 
-class RossumLocalApp extends StatelessWidget {
-  const RossumLocalApp({super.key, required this.state});
+class RdcApp extends StatelessWidget {
+  const RdcApp({super.key, required this.state});
   final AppState state;
 
   @override
   Widget build(BuildContext context) {
     const seed = Color(0xFF3B5BFF);
     return MaterialApp(
-      title: 'Rossum Local',
+      title: 'rdc',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(colorSchemeSeed: seed, useMaterial3: true),
       darkTheme: ThemeData(

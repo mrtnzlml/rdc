@@ -300,11 +300,11 @@ Implemented on branch `desktop-flutter`. Toolchain: **Flutter 3.44.8** (Dart
   `crate::frb_generated::StreamSink` (not `flutter_rust_bridge::StreamSink`).
 - `SyncPhase` (a data-carrying enum) makes FRB generate a Dart **freezed** union,
   so `freezed`/`freezed_annotation`/`build_runner` were added as Dart deps.
-- App-private settings use **`dart:io` JSON** (`~/.rossum_local/settings.json`),
+- App-private settings use **`dart:io` JSON** (`~/.rdc-desktop/settings.json`),
   not `shared_preferences`, to avoid an extra native plugin/pod. The only Dart
   plugin is `file_selector` (native folder dialogs); trash/reveal are in Rust.
-- Flutter package/dir is `desktop/` with bundle id **`ai.rossum.local`** and
-  product name **"Rossum Local"** (set in `macos/Runner/Configs/AppInfo.xcconfig`).
+- Flutter package/dir is `desktop/` with bundle id **`com.mrtnzlml.rdc`** and
+  product name **"rdc"** (set in `macos/Runner/Configs/AppInfo.xcconfig`).
 - The retired `macos/` (SwiftUI) and `rdc-ffi/` (UniFFI) dirs were deleted; the
   root workspace is now `members = ["."]`.
 
@@ -315,7 +315,34 @@ Implemented on branch `desktop-flutter`. Toolchain: **Flutter 3.44.8** (Dart
   (writes real `rdc.toml` + `secrets/`), empty-token rejection, non-project
   rejection.
 - `flutter analyze lib`: no issues.
-- `flutter build macos --debug`: builds **"Rossum Local.app"** with
+- `flutter build macos --debug`: builds **"rdc.app"** with
   `rdc_bridge.framework` embedded; the app launches and runs.
 - Windows/Linux builds are wired but not exercised on this macOS host; CI covers
   them via the three-OS matrix in `.github/workflows/desktop-release.yml`.
+
+## 14. Post-review fixes (2026-07-27)
+
+Maintainer testing on macOS surfaced several issues, all fixed and re-verified:
+
+- **Folder picker did nothing** — the Flutter macOS template shipped
+  `com.apple.security.app-sandbox = true`, contrary to the "no sandbox" design.
+  A sandboxed app can't run `NSOpenPanel`. Disabled the sandbox in both
+  entitlement files (direct notarized distribution uses the hardened runtime).
+- **Remove/Trash failed with AppleScript `-1743`** — the `trash` crate's default
+  Finder backend needs Apple Events permission. Switched macOS to
+  `DeleteMethod::NsFileManager` (no Apple Events).
+- **Errors were raw** (`AnyhowException(...)`, `Os { code: 1, … }`) — added a Dart
+  `errorText()` that strips the exception wrappers; applied to the snackbar,
+  both dialogs, and the sync path. Underlying text stays copyable.
+- **API base / org ID weren't editable** — replaced the credentials-only
+  `edit_credentials` with `edit_connection`, which edits name, api_base, org_id,
+  and (optionally) credentials, renaming the folder when the name changes. It
+  rewrites rdc.toml via `rdc::config::ProjectConfig` (lossless, same as the CLI);
+  credentials are only rewritten when new ones are supplied.
+- **Renamed the app** "Rossum Local" → **"rdc"** (bundle id `com.mrtnzlml.rdc`,
+  settings `~/.rdc-desktop` with one-time migration from `~/.rossum_local`),
+  across macOS/Windows/Linux runners, the Dart UI, CI, and docs.
+
+Re-verified: `cargo test` 4/4, `flutter analyze` clean, `flutter build macos`
+→ `rdc.app` (`com.mrtnzlml.rdc`), integration tests (incl. trash + edit-with-rename)
+green against the real native library.

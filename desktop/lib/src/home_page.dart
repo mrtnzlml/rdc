@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 
 import 'app_state.dart';
 import 'dialogs.dart';
+import 'error_text.dart';
 import 'rust/api/rdc.dart';
 import 'update_check.dart';
 
@@ -44,7 +45,7 @@ class _HomePageState extends State<HomePage> {
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: SelectableText('$e')),
+          SnackBar(content: SelectableText(errorText(e))),
         );
       }
     }
@@ -71,10 +72,10 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Future<void> _editCredentials(ConnItem item) async {
+  Future<void> _editConnection(ConnItem item) async {
     await showDialog<bool>(
       context: context,
-      builder: (_) => EditCredentialsDialog(state: state, item: item),
+      builder: (_) => EditConnectionDialog(state: state, item: item),
     );
   }
 
@@ -104,7 +105,7 @@ class _HomePageState extends State<HomePage> {
   void _about() {
     showAboutDialog(
       context: context,
-      applicationName: 'Rossum Local',
+      applicationName: 'rdc',
       applicationVersion: 'v$kAppVersion  •  rdc core embedded',
       children: const [
         Text('Cross-platform desktop front-end for the rdc core '
@@ -121,7 +122,7 @@ class _HomePageState extends State<HomePage> {
         final hasParent = state.parentFolder != null;
         return Scaffold(
           appBar: AppBar(
-            title: const Text('Rossum Local'),
+            title: const Text('rdc'),
             actions: [
               if (hasParent)
                 IconButton(
@@ -142,7 +143,7 @@ class _HomePageState extends State<HomePage> {
                 },
                 itemBuilder: (_) => const [
                   PopupMenuItem(value: 'folder', child: Text('Change parent folder…')),
-                  PopupMenuItem(value: 'about', child: Text('About Rossum Local')),
+                  PopupMenuItem(value: 'about', child: Text('About rdc')),
                 ],
               ),
             ],
@@ -160,7 +161,7 @@ class _HomePageState extends State<HomePage> {
                       child: _Detail(
                         state: state,
                         onSync: (i) => state.sync(i),
-                        onEdit: _editCredentials,
+                        onEdit: _editConnection,
                         onReveal: (i) => _run(() => state.reveal(i.summary.folder)),
                         onRemove: _confirmRemove,
                       ),
@@ -321,8 +322,8 @@ class _Detail extends StatelessWidget {
               ),
               OutlinedButton.icon(
                 onPressed: () => onEdit(item),
-                icon: const Icon(Icons.key),
-                label: const Text('Edit credentials'),
+                icon: const Icon(Icons.edit_outlined),
+                label: const Text('Edit…'),
               ),
               OutlinedButton.icon(
                 onPressed: () => onReveal(item),
