@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import 'app_state.dart';
+import 'error_text.dart';
 import 'rust/api/rdc.dart';
 
 /// Shared credential form used by both Add and Edit. Collects a token or a
@@ -113,7 +114,7 @@ class _AddConnectionDialogState extends State<AddConnectionDialog> {
     } catch (e) {
       setState(() {
         _busy = false;
-        _error = '$e';
+        _error = errorText(e);
       });
     }
   }
@@ -179,16 +180,23 @@ class _AddConnectionDialogState extends State<AddConnectionDialog> {
   }
 }
 
-class EditCredentialsDialog extends StatefulWidget {
-  const EditCredentialsDialog({super.key, required this.state, required this.item});
+/// Edit an existing connection: the same fields as creation (name, API base,
+/// org ID, authentication). Credentials are optional — leaving them blank keeps
+/// the current ones. Changing the name renames the connection's folder.
+class EditConnectionDialog extends StatefulWidget {
+  const EditConnectionDialog({super.key, required this.state, required this.item});
   final AppState state;
   final ConnItem item;
 
   @override
-  State<EditCredentialsDialog> createState() => _EditCredentialsDialogState();
+  State<EditConnectionDialog> createState() => _EditConnectionDialogState();
 }
 
-class _EditCredentialsDialogState extends State<EditCredentialsDialog> {
+class _EditConnectionDialogState extends State<EditConnectionDialog> {
+  late final _name = TextEditingController(text: widget.item.summary.name);
+  late final _apiBase = TextEditingController(text: widget.item.summary.apiBase);
+  late final _orgId =
+      TextEditingController(text: widget.item.summary.orgId.toString());
   final _token = TextEditingController();
   final _username = TextEditingController();
   final _password = TextEditingController();
@@ -198,21 +206,33 @@ class _EditCredentialsDialogState extends State<EditCredentialsDialog> {
 
   @override
   void dispose() {
-    for (final c in [_token, _username, _password]) {
+    for (final c in [_name, _apiBase, _orgId, _token, _username, _password]) {
       c.dispose();
     }
     super.dispose();
   }
 
   Future<void> _submit() async {
+    final org = BigInt.tryParse(_orgId.text.trim());
+    if (_name.text.trim().isEmpty) {
+      setState(() => _error = 'Name is required.');
+      return;
+    }
+    if (org == null) {
+      setState(() => _error = 'Organization ID must be a number.');
+      return;
+    }
     setState(() {
       _busy = true;
       _error = null;
     });
     try {
-      await widget.state.editCredentialsEntry(
-        widget.item.summary.folder,
-        EditCredentialsInput(
+      await widget.state.editConnectionEntry(
+        widget.item,
+        EditConnectionInput(
+          name: _name.text.trim(),
+          apiBase: _apiBase.text.trim(),
+          orgId: org,
           authKind: _auth,
           token: _auth == AuthKind.token ? _token.text : null,
           username: _auth == AuthKind.password ? _username.text : null,
@@ -223,7 +243,7 @@ class _EditCredentialsDialogState extends State<EditCredentialsDialog> {
     } catch (e) {
       setState(() {
         _busy = false;
-        _error = '$e';
+        _error = errorText(e);
       });
     }
   }
@@ -231,24 +251,52 @@ class _EditCredentialsDialogState extends State<EditCredentialsDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: Text('Edit credentials — ${widget.item.summary.name}'),
+      title: Text('Edit — ${widget.item.summary.name}'),
       content: SizedBox(
         width: 440,
-        child: _CredentialFields(
-          auth: _auth,
-          onAuthChanged: (a) => setState(() => _auth = a),
-          token: _token,
-          username: _username,
-          password: _password,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              TextField(
+                controller: _name,
+                decoration: const InputDecoration(labelText: 'Name'),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _apiBase,
+                decoration: const InputDecoration(labelText: 'API base URL'),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _orgId,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(labelText: 'Organization ID'),
+              ),
+              const SizedBox(height: 16),
+              _CredentialFields(
+                auth: _auth,
+                onAuthChanged: (a) => setState(() => _auth = a),
+                token: _token,
+                username: _username,
+                password: _password,
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Leave credentials blank to keep the current ones.',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+              if (_error != null) ...[
+                const SizedBox(height: 12),
+                SelectableText(_error!,
+                    style: TextStyle(color: Theme.of(context).colorScheme.error)),
+              ],
+            ],
+          ),
         ),
       ),
       actions: [
-        if (_error != null)
-          Padding(
-            padding: const EdgeInsets.only(right: 8),
-            child: SelectableText(_error!,
-                style: TextStyle(color: Theme.of(context).colorScheme.error)),
-          ),
         TextButton(
           onPressed: _busy ? null : () => Navigator.of(context).pop(false),
           child: const Text('Cancel'),

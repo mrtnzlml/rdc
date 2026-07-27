@@ -73,8 +73,14 @@ pub struct AddConnectionInput {
 }
 
 #[derive(Debug, Clone)]
-pub struct EditCredentialsInput {
+pub struct EditConnectionInput {
+    /// The connection name; if it changes, the folder is renamed.
+    pub name: String,
+    pub api_base: String,
+    pub org_id: u64,
     pub auth_kind: AuthKind,
+    /// Credentials are optional on edit: leave all blank to keep the existing
+    /// ones. Provide new values (matching `auth_kind`) to replace them.
     pub token: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
@@ -169,21 +175,79 @@ pub fn validate_existing_project(path: String) -> Result<ConnectionSummary> {
 
 // ---------------------------------------------------------------- edit
 
-/// Replace a Connection's stored credentials. Existing secrets are wiped first
-/// so a token↔password mode flip leaves no stale fields behind.
-pub fn edit_credentials(folder: String, input: EditCredentialsInput) -> Result<()> {
-    let folder = PathBuf::from(folder);
+/// Update a Connection's settings, renaming its folder if the name changed.
+/// `api_base`/`org_id` are rewritten through rdc's own config writer so the
+/// file matches the CLI's format exactly. Credentials are only touched when
+/// new ones are supplied (blank = keep existing). Returns the (possibly moved)
+/// Connection so the caller can reselect it.
+pub fn edit_connection(folder: String, input: EditConnectionInput) -> Result<ConnectionSummary> {
+    let mut folder = PathBuf::from(&folder);
     if !folder.join("rdc.toml").exists() {
         return Err(anyhow!("Connection not found"));
     }
-    let _ = std::fs::remove_file(folder.join("secrets/main.secrets.json"));
-    write_credentials(
-        &folder,
-        input.auth_kind,
-        input.token.as_deref(),
-        input.username.as_deref(),
-        input.password.as_deref(),
-    )
+
+    // Rename the folder when the name (slug) changed.
+    let parent = folder
+        .parent()
+        .ok_or_else(|| anyhow!("Connection has no parent folder"))?
+        .to_path_buf();
+    let current_slug = folder
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let used: HashSet<String> = discover::scan(&parent)
+        .iter()
+        .map(|c| c.name().to_string())
+        .filter(|n| n != &current_slug)
+        .collect();
+    let desired_slug = rdc::slug::slugify_unique(&input.name, &used);
+    if desired_slug != current_slug {
+        let new_folder = parent.join(&desired_slug);
+        if new_folder.exists() {
+            return Err(anyhow!(
+                "A connection named \"{}\" already exists here.",
+                input.name
+            ));
+        }
+        std::fs::rename(&folder, &new_folder).map_err(|e| anyhow!("renaming the connection: {e}"))?;
+        folder = new_folder;
+    }
+
+    // Rewrite api_base/org_id through rdc's own config (canonical + lossless).
+    let toml_path = folder.join("rdc.toml");
+    let mut cfg = rdc::config::ProjectConfig::load(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
+    let env = cfg
+        .envs
+        .get_mut("main")
+        .ok_or_else(|| anyhow!("This project has no `main` environment."))?;
+    env.api_base = input.api_base.trim_end_matches('/').to_string();
+    env.org_id = input.org_id;
+    cfg.save(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
+
+    // Only replace credentials if new ones were supplied.
+    let has_new_credentials = match input.auth_kind {
+        AuthKind::Token => input.token.as_deref().is_some_and(|s| !s.is_empty()),
+        AuthKind::Password => {
+            input.username.as_deref().is_some_and(|s| !s.is_empty())
+                || input.password.as_deref().is_some_and(|s| !s.is_empty())
+        }
+    };
+    if has_new_credentials {
+        let _ = std::fs::remove_file(folder.join("secrets/main.secrets.json"));
+        write_credentials(
+            &folder,
+            input.auth_kind,
+            input.token.as_deref(),
+            input.username.as_deref(),
+            input.password.as_deref(),
+        )?;
+    }
+
+    discover::inspect(&folder)
+        .as_ref()
+        .map(ConnectionSummary::from)
+        .ok_or_else(|| anyhow!("Connection not found after edit"))
 }
 
 // ---------------------------------------------------------------- sync
@@ -225,7 +289,23 @@ pub fn sync_connection(
 
 /// Move a managed Connection's folder to the OS trash/recycle bin.
 pub fn trash_connection(folder: String) -> Result<()> {
-    trash::delete(PathBuf::from(&folder)).map_err(|e| anyhow!("moving to trash: {e}"))
+    let path = PathBuf::from(&folder);
+    #[cfg(target_os = "macos")]
+    {
+        // Use NSFileManager rather than the default Finder/AppleScript backend,
+        // which requires Apple Events ("Automation") permission the app does not
+        // have (error -1743). NSFileManager needs no such permission.
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        let mut ctx = trash::TrashContext::default();
+        ctx.set_delete_method(DeleteMethod::NsFileManager);
+        ctx.delete(&path)
+            .map_err(|e| anyhow!("Couldn't move the folder to the Trash: {e}"))?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        trash::delete(&path).map_err(|e| anyhow!("Couldn't move the folder to the Trash: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Reveal a path in the OS file manager (Finder / Explorer / file manager).

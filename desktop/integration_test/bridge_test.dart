@@ -86,4 +86,67 @@ void main() {
       dir.deleteSync(recursive: true);
     }
   });
+
+  test('trashConnection removes the folder (no Apple Events needed)', () async {
+    final parent = Directory.systemTemp.createTempSync('rdc_it_trash');
+    try {
+      final added = await addConnection(
+        parent: parent.path,
+        input: AddConnectionInput(
+          name: 'Trash Me',
+          apiBase: 'https://example.test/api/v1',
+          orgId: BigInt.from(3),
+          authKind: AuthKind.token,
+          token: 'tok',
+        ),
+      );
+      final folder = '${parent.path}/${added.id}';
+      expect(Directory(folder).existsSync(), true);
+      // Must not throw the AppleScript/-1743 error the Finder backend did.
+      await trashConnection(folder: folder);
+      expect(Directory(folder).existsSync(), false);
+    } finally {
+      parent.deleteSync(recursive: true);
+    }
+  });
+
+  test('editConnection updates api_base/org_id and renames the folder',
+      () async {
+    final parent = Directory.systemTemp.createTempSync('rdc_it_edit');
+    try {
+      final added = await addConnection(
+        parent: parent.path,
+        input: AddConnectionInput(
+          name: 'before',
+          apiBase: 'https://old.test/api/v1',
+          orgId: BigInt.from(1),
+          authKind: AuthKind.token,
+          token: 'tok',
+        ),
+      );
+      final updated = await editConnection(
+        folder: '${parent.path}/${added.id}',
+        input: EditConnectionInput(
+          name: 'after',
+          apiBase: 'https://new.test/api/v1/',
+          orgId: BigInt.from(99),
+          authKind: AuthKind.token,
+          token: null, // blank → keep existing credentials
+        ),
+      );
+      expect(updated.id, 'after');
+      expect(Directory('${parent.path}/${added.id}').existsSync(), false);
+      expect(Directory('${parent.path}/after').existsSync(), true);
+      expect(updated.apiBase, 'https://new.test/api/v1'); // trailing slash trimmed
+      expect(updated.orgId, BigInt.from(99));
+      // credentials were left blank, so token auth is preserved
+      expect(updated.authKind, AuthKind.token);
+      expect(
+        File('${parent.path}/after/secrets/main.secrets.json').existsSync(),
+        true,
+      );
+    } finally {
+      parent.deleteSync(recursive: true);
+    }
+  });
 }

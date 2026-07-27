@@ -5,10 +5,10 @@
 // 'flutter create' template.
 
 // The application's name. By default this is also the title of the Flutter window.
-PRODUCT_NAME = Rossum Local
+PRODUCT_NAME = rdc
 
 // The application's bundle identifier
-PRODUCT_BUNDLE_IDENTIFIER = ai.rossum.local
+PRODUCT_BUNDLE_IDENTIFIER = com.mrtnzlml.rdc
 
 // The copyright displayed in application information
-PRODUCT_COPYRIGHT = Copyright © 2026 ai.rossum. All rights reserved.
+PRODUCT_COPYRIGHT = Copyright © 2026 mrtnzlml. All rights reserved.

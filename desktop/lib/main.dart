@@ -9,5 +9,5 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await RustLib.init();
   final state = AppState(Settings.load());
-  runApp(RossumLocalApp(state: state));
+  runApp(RdcApp(state: state));
 }

@@ -30,12 +30,15 @@ Future<ConnectionSummary> addConnection({
 Future<ConnectionSummary> validateExistingProject({required String path}) =>
     RustLib.instance.api.crateApiRdcValidateExistingProject(path: path);
 
-/// Replace a Connection's stored credentials. Existing secrets are wiped first
-/// so a token↔password mode flip leaves no stale fields behind.
-Future<void> editCredentials({
+/// Update a Connection's settings, renaming its folder if the name changed.
+/// `api_base`/`org_id` are rewritten through rdc's own config writer so the
+/// file matches the CLI's format exactly. Credentials are only touched when
+/// new ones are supplied (blank = keep existing). Returns the (possibly moved)
+/// Connection so the caller can reselect it.
+Future<ConnectionSummary> editConnection({
   required String folder,
-  required EditCredentialsInput input,
-}) => RustLib.instance.api.crateApiRdcEditCredentials(
+  required EditConnectionInput input,
+}) => RustLib.instance.api.crateApiRdcEditConnection(
   folder: folder,
   input: input,
 );
@@ -154,13 +157,23 @@ class ConnectionSummary {
           fileCount == other.fileCount;
 }
 
-class EditCredentialsInput {
+class EditConnectionInput {
+  /// The connection name; if it changes, the folder is renamed.
+  final String name;
+  final String apiBase;
+  final BigInt orgId;
   final AuthKind authKind;
+
+  /// Credentials are optional on edit: leave all blank to keep the existing
+  /// ones. Provide new values (matching `auth_kind`) to replace them.
   final String? token;
   final String? username;
   final String? password;
 
-  const EditCredentialsInput({
+  const EditConnectionInput({
+    required this.name,
+    required this.apiBase,
+    required this.orgId,
     required this.authKind,
     this.token,
     this.username,
@@ -169,6 +182,9 @@ class EditCredentialsInput {
 
   @override
   int get hashCode =>
+      name.hashCode ^
+      apiBase.hashCode ^
+      orgId.hashCode ^
       authKind.hashCode ^
       token.hashCode ^
       username.hashCode ^
@@ -177,8 +193,11 @@ class EditCredentialsInput {
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is EditCredentialsInput &&
+      other is EditConnectionInput &&
           runtimeType == other.runtimeType &&
+          name == other.name &&
+          apiBase == other.apiBase &&
+          orgId == other.orgId &&
           authKind == other.authKind &&
           token == other.token &&
           username == other.username &&

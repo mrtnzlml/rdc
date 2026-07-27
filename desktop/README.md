@@ -1,4 +1,4 @@
-# Rossum Local (desktop app)
+# rdc (desktop app)
 
 Cross-platform desktop front-end for the rdc core — **macOS, Windows, and
 Linux** — built with [Flutter](https://flutter.dev) and
@@ -49,7 +49,7 @@ flutter run -d macos      # or: -d windows / -d linux
 To produce a release bundle:
 
 ```sh
-flutter build macos       # build/macos/Build/Products/Release/Rossum Local.app
+flutter build macos       # build/macos/Build/Products/Release/rdc.app
 flutter build windows     # build/windows/x64/runner/Release/
 flutter build linux       # build/linux/x64/release/bundle/
 ```

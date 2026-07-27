@@ -38,7 +38,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -2087751268;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 2140695709;
 
 // Section: executor
 
@@ -82,7 +82,7 @@ fn wire__crate__api__rdc__add_connection_impl(
         },
     )
 }
-fn wire__crate__api__rdc__edit_credentials_impl(
+fn wire__crate__api__rdc__edit_connection_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -90,7 +90,7 @@ fn wire__crate__api__rdc__edit_credentials_impl(
 ) {
     FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
         flutter_rust_bridge::for_generated::TaskInfo {
-            debug_name: "edit_credentials",
+            debug_name: "edit_connection",
             port: Some(port_),
             mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
         },
@@ -105,12 +105,12 @@ fn wire__crate__api__rdc__edit_credentials_impl(
             let mut deserializer =
                 flutter_rust_bridge::for_generated::SseDeserializer::new(message);
             let api_folder = <String>::sse_decode(&mut deserializer);
-            let api_input = <crate::api::rdc::EditCredentialsInput>::sse_decode(&mut deserializer);
+            let api_input = <crate::api::rdc::EditConnectionInput>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| {
                 transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
                     (move || {
-                        let output_ok = crate::api::rdc::edit_credentials(api_folder, api_input)?;
+                        let output_ok = crate::api::rdc::edit_connection(api_folder, api_input)?;
                         Ok(output_ok)
                     })(),
                 )
@@ -456,14 +456,20 @@ impl SseDecode for crate::api::rdc::ConnectionSummary {
     }
 }
 
-impl SseDecode for crate::api::rdc::EditCredentialsInput {
+impl SseDecode for crate::api::rdc::EditConnectionInput {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_name = <String>::sse_decode(deserializer);
+        let mut var_apiBase = <String>::sse_decode(deserializer);
+        let mut var_orgId = <u64>::sse_decode(deserializer);
         let mut var_authKind = <crate::api::rdc::AuthKind>::sse_decode(deserializer);
         let mut var_token = <Option<String>>::sse_decode(deserializer);
         let mut var_username = <Option<String>>::sse_decode(deserializer);
         let mut var_password = <Option<String>>::sse_decode(deserializer);
-        return crate::api::rdc::EditCredentialsInput {
+        return crate::api::rdc::EditConnectionInput {
+            name: var_name,
+            api_base: var_apiBase,
+            org_id: var_orgId,
             auth_kind: var_authKind,
             token: var_token,
             username: var_username,
@@ -597,7 +603,7 @@ fn pde_ffi_dispatcher_primary_impl(
     // Codec=Pde (Serialization + dispatch), see doc to use other codecs
     match func_id {
         1 => wire__crate__api__rdc__add_connection_impl(port, ptr, rust_vec_len, data_len),
-        2 => wire__crate__api__rdc__edit_credentials_impl(port, ptr, rust_vec_len, data_len),
+        2 => wire__crate__api__rdc__edit_connection_impl(port, ptr, rust_vec_len, data_len),
         3 => wire__crate__api__rdc__init_app_impl(port, ptr, rust_vec_len, data_len),
         4 => wire__crate__api__rdc__list_connections_impl(port, ptr, rust_vec_len, data_len),
         5 => wire__crate__api__rdc__rdc_version_impl(port, ptr, rust_vec_len, data_len),
@@ -695,9 +701,12 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::rdc::ConnectionSummary>
     }
 }
 // Codec=Dco (DartCObject based), see doc to use other codecs
-impl flutter_rust_bridge::IntoDart for crate::api::rdc::EditCredentialsInput {
+impl flutter_rust_bridge::IntoDart for crate::api::rdc::EditConnectionInput {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
+            self.name.into_into_dart().into_dart(),
+            self.api_base.into_into_dart().into_dart(),
+            self.org_id.into_into_dart().into_dart(),
             self.auth_kind.into_into_dart().into_dart(),
             self.token.into_into_dart().into_dart(),
             self.username.into_into_dart().into_dart(),
@@ -707,13 +716,13 @@ impl flutter_rust_bridge::IntoDart for crate::api::rdc::EditCredentialsInput {
     }
 }
 impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
-    for crate::api::rdc::EditCredentialsInput
+    for crate::api::rdc::EditConnectionInput
 {
 }
-impl flutter_rust_bridge::IntoIntoDart<crate::api::rdc::EditCredentialsInput>
-    for crate::api::rdc::EditCredentialsInput
+impl flutter_rust_bridge::IntoIntoDart<crate::api::rdc::EditConnectionInput>
+    for crate::api::rdc::EditConnectionInput
 {
-    fn into_into_dart(self) -> crate::api::rdc::EditCredentialsInput {
+    fn into_into_dart(self) -> crate::api::rdc::EditConnectionInput {
         self
     }
 }
@@ -807,9 +816,12 @@ impl SseEncode for crate::api::rdc::ConnectionSummary {
     }
 }
 
-impl SseEncode for crate::api::rdc::EditCredentialsInput {
+impl SseEncode for crate::api::rdc::EditConnectionInput {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.name, serializer);
+        <String>::sse_encode(self.api_base, serializer);
+        <u64>::sse_encode(self.org_id, serializer);
         <crate::api::rdc::AuthKind>::sse_encode(self.auth_kind, serializer);
         <Option<String>>::sse_encode(self.token, serializer);
         <Option<String>>::sse_encode(self.username, serializer);

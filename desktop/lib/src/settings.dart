@@ -18,9 +18,20 @@ class Settings {
     final home = Platform.environment['HOME'] ??
         Platform.environment['USERPROFILE'] ??
         Directory.current.path;
-    final dir = Directory('$home${Platform.pathSeparator}.rossum_local');
+    final sep = Platform.pathSeparator;
+    final dir = Directory('$home$sep.rdc-desktop');
     if (!dir.existsSync()) dir.createSync(recursive: true);
-    return File('${dir.path}${Platform.pathSeparator}settings.json');
+    final file = File('${dir.path}${sep}settings.json');
+    // One-time migration from the pre-rename ~/.rossum_local location.
+    if (!file.existsSync()) {
+      final legacy = File('$home$sep.rossum_local${sep}settings.json');
+      if (legacy.existsSync()) {
+        try {
+          file.writeAsStringSync(legacy.readAsStringSync());
+        } catch (_) {}
+      }
+    }
+    return file;
   }
 
   static Settings load() {

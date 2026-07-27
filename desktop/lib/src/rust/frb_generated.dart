@@ -66,7 +66,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.12.0';
 
   @override
-  int get rustContentHash => -2087751268;
+  int get rustContentHash => 2140695709;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -83,9 +83,9 @@ abstract class RustLibApi extends BaseApi {
     required AddConnectionInput input,
   });
 
-  Future<void> crateApiRdcEditCredentials({
+  Future<ConnectionSummary> crateApiRdcEditConnection({
     required String folder,
-    required EditCredentialsInput input,
+    required EditConnectionInput input,
   });
 
   Future<void> crateApiRdcInitApp();
@@ -154,16 +154,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   );
 
   @override
-  Future<void> crateApiRdcEditCredentials({
+  Future<ConnectionSummary> crateApiRdcEditConnection({
     required String folder,
-    required EditCredentialsInput input,
+    required EditConnectionInput input,
   }) {
     return handler.executeNormal(
       NormalTask(
         callFfi: (port_) {
           final serializer = SseSerializer(generalizedFrbRustBinding);
           sse_encode_String(folder, serializer);
-          sse_encode_box_autoadd_edit_credentials_input(input, serializer);
+          sse_encode_box_autoadd_edit_connection_input(input, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -172,18 +172,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           );
         },
         codec: SseCodec(
-          decodeSuccessData: sse_decode_unit,
+          decodeSuccessData: sse_decode_connection_summary,
           decodeErrorData: sse_decode_AnyhowException,
         ),
-        constMeta: kCrateApiRdcEditCredentialsConstMeta,
+        constMeta: kCrateApiRdcEditConnectionConstMeta,
         argValues: [folder, input],
         apiImpl: this,
       ),
     );
   }
 
-  TaskConstMeta get kCrateApiRdcEditCredentialsConstMeta => const TaskConstMeta(
-    debugName: "edit_credentials",
+  TaskConstMeta get kCrateApiRdcEditConnectionConstMeta => const TaskConstMeta(
+    debugName: "edit_connection",
     argNames: ["folder", "input"],
   );
 
@@ -452,11 +452,11 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  EditCredentialsInput dco_decode_box_autoadd_edit_credentials_input(
+  EditConnectionInput dco_decode_box_autoadd_edit_connection_input(
     dynamic raw,
   ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
-    return dco_decode_edit_credentials_input(raw);
+    return dco_decode_edit_connection_input(raw);
   }
 
   @protected
@@ -484,16 +484,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  EditCredentialsInput dco_decode_edit_credentials_input(dynamic raw) {
+  EditConnectionInput dco_decode_edit_connection_input(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 4)
-      throw Exception('unexpected arr length: expect 4 but see ${arr.length}');
-    return EditCredentialsInput(
-      authKind: dco_decode_auth_kind(arr[0]),
-      token: dco_decode_opt_String(arr[1]),
-      username: dco_decode_opt_String(arr[2]),
-      password: dco_decode_opt_String(arr[3]),
+    if (arr.length != 7)
+      throw Exception('unexpected arr length: expect 7 but see ${arr.length}');
+    return EditConnectionInput(
+      name: dco_decode_String(arr[0]),
+      apiBase: dco_decode_String(arr[1]),
+      orgId: dco_decode_u_64(arr[2]),
+      authKind: dco_decode_auth_kind(arr[3]),
+      token: dco_decode_opt_String(arr[4]),
+      username: dco_decode_opt_String(arr[5]),
+      password: dco_decode_opt_String(arr[6]),
     );
   }
 
@@ -627,11 +630,11 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  EditCredentialsInput sse_decode_box_autoadd_edit_credentials_input(
+  EditConnectionInput sse_decode_box_autoadd_edit_connection_input(
     SseDeserializer deserializer,
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
-    return (sse_decode_edit_credentials_input(deserializer));
+    return (sse_decode_edit_connection_input(deserializer));
   }
 
   @protected
@@ -666,15 +669,21 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  EditCredentialsInput sse_decode_edit_credentials_input(
+  EditConnectionInput sse_decode_edit_connection_input(
     SseDeserializer deserializer,
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_name = sse_decode_String(deserializer);
+    var var_apiBase = sse_decode_String(deserializer);
+    var var_orgId = sse_decode_u_64(deserializer);
     var var_authKind = sse_decode_auth_kind(deserializer);
     var var_token = sse_decode_opt_String(deserializer);
     var var_username = sse_decode_opt_String(deserializer);
     var var_password = sse_decode_opt_String(deserializer);
-    return EditCredentialsInput(
+    return EditConnectionInput(
+      name: var_name,
+      apiBase: var_apiBase,
+      orgId: var_orgId,
       authKind: var_authKind,
       token: var_token,
       username: var_username,
@@ -842,12 +851,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  void sse_encode_box_autoadd_edit_credentials_input(
-    EditCredentialsInput self,
+  void sse_encode_box_autoadd_edit_connection_input(
+    EditConnectionInput self,
     SseSerializer serializer,
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
-    sse_encode_edit_credentials_input(self, serializer);
+    sse_encode_edit_connection_input(self, serializer);
   }
 
   @protected
@@ -876,11 +885,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  void sse_encode_edit_credentials_input(
-    EditCredentialsInput self,
+  void sse_encode_edit_connection_input(
+    EditConnectionInput self,
     SseSerializer serializer,
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.name, serializer);
+    sse_encode_String(self.apiBase, serializer);
+    sse_encode_u_64(self.orgId, serializer);
     sse_encode_auth_kind(self.authKind, serializer);
     sse_encode_opt_String(self.token, serializer);
     sse_encode_opt_String(self.username, serializer);

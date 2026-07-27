@@ -1,4 +1,4 @@
-# Build and release the cross-platform "Rossum Local" desktop app (Flutter +
+# Build and release the cross-platform "rdc" desktop app (Flutter +
 # flutter_rust_bridge) for macOS, Windows, and Linux on `desktop-v*` tags.
 #
 # The Rust bridge (desktop/rust, crate `rdc_bridge`) is compiled automatically
@@ -93,8 +93,8 @@ jobs:
           APP=$(ls -d build/macos/Build/Products/Release/*.app | head -1)
           codesign --deep --force --options runtime --timestamp \
             --sign "$APPLE_SIGNING_IDENTITY" "$APP"
-          DMG="RossumLocal-${GITHUB_REF_NAME#desktop-v}.dmg"
-          hdiutil create -volname "Rossum Local" -srcfolder "$APP" -ov -format UDZO "$DMG"
+          DMG="rdc-${GITHUB_REF_NAME#desktop-v}.dmg"
+          hdiutil create -volname "rdc" -srcfolder "$APP" -ov -format UDZO "$DMG"
           xcrun notarytool submit "$DMG" --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" --password "$APPLE_PASSWORD" --wait
           xcrun stapler staple "$DMG"
@@ -112,7 +112,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           $ver = "${env:GITHUB_REF_NAME}" -replace '^desktop-v',''
           Compress-Archive -Path build/windows/x64/runner/Release/* `
-            -DestinationPath "dist/RossumLocal-$ver-windows-x64.zip"
+            -DestinationPath "dist/rdc-$ver-windows-x64.zip"
         # TODO: build a proper installer (MSIX or Inno Setup) as a follow-up.
 
       # ---------------- Linux: build + tarball ----------------
@@ -125,7 +125,7 @@ jobs:
         run: |
           mkdir -p dist
           ver="${GITHUB_REF_NAME#desktop-v}"
-          tar czf "dist/RossumLocal-$ver-linux-x64.tar.gz" \
+          tar czf "dist/rdc-$ver-linux-x64.tar.gz" \
             -C build/linux/x64/release/bundle .
         # TODO: build an AppImage and/or .deb as a follow-up.
 
