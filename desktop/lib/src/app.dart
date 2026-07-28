@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import 'app_state.dart';
+import 'console_theme.dart';
 import 'home_page.dart';
 
 class RdcApp extends StatelessWidget {
@@ -9,16 +10,11 @@ class RdcApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    const seed = Color(0xFF3B5BFF);
     return MaterialApp(
       title: 'rdc',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(colorSchemeSeed: seed, useMaterial3: true),
-      darkTheme: ThemeData(
-        colorSchemeSeed: seed,
-        brightness: Brightness.dark,
-        useMaterial3: true,
-      ),
+      theme: consoleTheme(Brightness.light),
+      darkTheme: consoleTheme(Brightness.dark),
       home: HomePage(state: state),
     );
   }
