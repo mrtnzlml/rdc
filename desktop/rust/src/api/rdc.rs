@@ -89,6 +89,8 @@ pub struct EditConnectionInput {
 #[derive(Debug, Clone)]
 pub enum SyncPhase {
     Started,
+    /// One line of rdc's real, rendered sync log (plain text, no color).
+    Log { line: String },
     Done { file_count: u64 },
     Error { message: String },
 }
@@ -265,15 +267,26 @@ pub fn sync_connection(
     let folder = PathBuf::from(folder);
     let _ = sink.add(SyncPhase::Started);
 
+    // Forward rdc's real, rendered log into the stream, line by line.
+    let forwarder = LineForwarder {
+        sink: sink.clone(),
+        buf: Vec::new(),
+    };
     let result: Result<u64> = block_on(async {
         rdc::cli::init::write_scaffold_files(&folder, "main", &api_base, org_id)?;
         let token = rdc::secrets::resolve_token(&folder, "main", &api_base).await?;
-        rdc::cli::sync::embed::sync_no_push(&folder, "main", &token).await?;
+        rdc::cli::sync::embed::sync_no_push_logged(&folder, "main", &token, Box::new(forwarder))
+            .await?;
         Ok(discover::count_files(&folder.join("envs/main")))
     });
 
     match result {
         Ok(file_count) => {
+            // run_cycle omits its closing summary when a renderer is supplied,
+            // so add our own completion line before the terminal Done phase.
+            let _ = sink.add(SyncPhase::Log {
+                line: format!("✓ done · {file_count} files"),
+            });
             let _ = sink.add(SyncPhase::Done { file_count });
         }
         Err(e) => {
@@ -283,6 +296,34 @@ pub fn sync_connection(
         }
     }
     Ok(())
+}
+
+/// A `std::io::Write` that splits rdc's rendered log output into whole lines
+/// and forwards each as `SyncPhase::Log`. rdc writes one newline-terminated
+/// line per event (plain text under `ColorMode::Plain`, non-TTY).
+struct LineForwarder {
+    sink: StreamSink<SyncPhase>,
+    buf: Vec<u8>,
+}
+
+impl std::io::Write for LineForwarder {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=nl).collect();
+            let text = String::from_utf8_lossy(&line)
+                .trim_end_matches(['\n', '\r'])
+                .to_string();
+            if !text.is_empty() {
+                let _ = self.sink.add(SyncPhase::Log { line: text });
+            }
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------- trash / reveal

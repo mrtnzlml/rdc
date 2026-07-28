@@ -55,11 +55,12 @@ extension SyncPhasePatterns on SyncPhase {
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeMap<TResult extends Object?>({TResult Function( SyncPhase_Started value)?  started,TResult Function( SyncPhase_Done value)?  done,TResult Function( SyncPhase_Error value)?  error,required TResult orElse(),}){
+@optionalTypeArgs TResult maybeMap<TResult extends Object?>({TResult Function( SyncPhase_Started value)?  started,TResult Function( SyncPhase_Log value)?  log,TResult Function( SyncPhase_Done value)?  done,TResult Function( SyncPhase_Error value)?  error,required TResult orElse(),}){
 final _that = this;
 switch (_that) {
 case SyncPhase_Started() when started != null:
-return started(_that);case SyncPhase_Done() when done != null:
+return started(_that);case SyncPhase_Log() when log != null:
+return log(_that);case SyncPhase_Done() when done != null:
 return done(_that);case SyncPhase_Error() when error != null:
 return error(_that);case _:
   return orElse();
@@ -79,11 +80,12 @@ return error(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult map<TResult extends Object?>({required TResult Function( SyncPhase_Started value)  started,required TResult Function( SyncPhase_Done value)  done,required TResult Function( SyncPhase_Error value)  error,}){
+@optionalTypeArgs TResult map<TResult extends Object?>({required TResult Function( SyncPhase_Started value)  started,required TResult Function( SyncPhase_Log value)  log,required TResult Function( SyncPhase_Done value)  done,required TResult Function( SyncPhase_Error value)  error,}){
 final _that = this;
 switch (_that) {
 case SyncPhase_Started():
-return started(_that);case SyncPhase_Done():
+return started(_that);case SyncPhase_Log():
+return log(_that);case SyncPhase_Done():
 return done(_that);case SyncPhase_Error():
 return error(_that);}
 }
@@ -99,11 +101,12 @@ return error(_that);}
 /// }
 /// ```
 
-@optionalTypeArgs TResult? mapOrNull<TResult extends Object?>({TResult? Function( SyncPhase_Started value)?  started,TResult? Function( SyncPhase_Done value)?  done,TResult? Function( SyncPhase_Error value)?  error,}){
+@optionalTypeArgs TResult? mapOrNull<TResult extends Object?>({TResult? Function( SyncPhase_Started value)?  started,TResult? Function( SyncPhase_Log value)?  log,TResult? Function( SyncPhase_Done value)?  done,TResult? Function( SyncPhase_Error value)?  error,}){
 final _that = this;
 switch (_that) {
 case SyncPhase_Started() when started != null:
-return started(_that);case SyncPhase_Done() when done != null:
+return started(_that);case SyncPhase_Log() when log != null:
+return log(_that);case SyncPhase_Done() when done != null:
 return done(_that);case SyncPhase_Error() when error != null:
 return error(_that);case _:
   return null;
@@ -122,10 +125,11 @@ return error(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function()?  started,TResult Function( BigInt fileCount)?  done,TResult Function( String message)?  error,required TResult orElse(),}) {final _that = this;
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function()?  started,TResult Function( String line)?  log,TResult Function( BigInt fileCount)?  done,TResult Function( String message)?  error,required TResult orElse(),}) {final _that = this;
 switch (_that) {
 case SyncPhase_Started() when started != null:
-return started();case SyncPhase_Done() when done != null:
+return started();case SyncPhase_Log() when log != null:
+return log(_that.line);case SyncPhase_Done() when done != null:
 return done(_that.fileCount);case SyncPhase_Error() when error != null:
 return error(_that.message);case _:
   return orElse();
@@ -145,10 +149,11 @@ return error(_that.message);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function()  started,required TResult Function( BigInt fileCount)  done,required TResult Function( String message)  error,}) {final _that = this;
+@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function()  started,required TResult Function( String line)  log,required TResult Function( BigInt fileCount)  done,required TResult Function( String message)  error,}) {final _that = this;
 switch (_that) {
 case SyncPhase_Started():
-return started();case SyncPhase_Done():
+return started();case SyncPhase_Log():
+return log(_that.line);case SyncPhase_Done():
 return done(_that.fileCount);case SyncPhase_Error():
 return error(_that.message);}
 }
@@ -164,10 +169,11 @@ return error(_that.message);}
 /// }
 /// ```
 
-@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function()?  started,TResult? Function( BigInt fileCount)?  done,TResult? Function( String message)?  error,}) {final _that = this;
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function()?  started,TResult? Function( String line)?  log,TResult? Function( BigInt fileCount)?  done,TResult? Function( String message)?  error,}) {final _that = this;
 switch (_that) {
 case SyncPhase_Started() when started != null:
-return started();case SyncPhase_Done() when done != null:
+return started();case SyncPhase_Log() when log != null:
+return log(_that.line);case SyncPhase_Done() when done != null:
 return done(_that.fileCount);case SyncPhase_Error() when error != null:
 return error(_that.message);case _:
   return null;
@@ -208,6 +214,72 @@ String toString() {
 
 
 
+
+/// @nodoc
+
+
+class SyncPhase_Log extends SyncPhase {
+  const SyncPhase_Log({required this.line}): super._();
+  
+
+ final  String line;
+
+/// Create a copy of SyncPhase
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$SyncPhase_LogCopyWith<SyncPhase_Log> get copyWith => _$SyncPhase_LogCopyWithImpl<SyncPhase_Log>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase_Log&&(identical(other.line, line) || other.line == line));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,line);
+
+@override
+String toString() {
+  return 'SyncPhase.log(line: $line)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $SyncPhase_LogCopyWith<$Res> implements $SyncPhaseCopyWith<$Res> {
+  factory $SyncPhase_LogCopyWith(SyncPhase_Log value, $Res Function(SyncPhase_Log) _then) = _$SyncPhase_LogCopyWithImpl;
+@useResult
+$Res call({
+ String line
+});
+
+
+
+
+}
+/// @nodoc
+class _$SyncPhase_LogCopyWithImpl<$Res>
+    implements $SyncPhase_LogCopyWith<$Res> {
+  _$SyncPhase_LogCopyWithImpl(this._self, this._then);
+
+  final SyncPhase_Log _self;
+  final $Res Function(SyncPhase_Log) _then;
+
+/// Create a copy of SyncPhase
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? line = null,}) {
+  return _then(SyncPhase_Log(
+line: null == line ? _self.line : line // ignore: cast_nullable_to_non_nullable
+as String,
+  ));
+}
+
+
+}
 
 /// @nodoc
 

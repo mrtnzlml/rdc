@@ -4,6 +4,7 @@ import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'ansi.dart';
 import 'app_state.dart';
 import 'console_theme.dart';
 import 'dialogs.dart';
@@ -48,6 +49,7 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   final FocusNode _focus = FocusNode(debugLabel: 'rdc-console');
+  double _listWidth = 200;
   AppState get state => widget.state;
 
   @override
@@ -238,6 +240,9 @@ class _HomePageState extends State<HomePage> {
               onEdit: _editConnection,
               onReveal: _reveal,
               onRemove: _confirmRemove,
+              sidebarWidth: _listWidth,
+              onResizeSidebar: (dx) =>
+                  setState(() => _listWidth = (_listWidth + dx).clamp(160.0, 480.0)),
             ),
           );
         },
@@ -260,6 +265,8 @@ class ConsoleMain extends StatelessWidget {
     this.onEdit,
     this.onReveal,
     this.onRemove,
+    this.sidebarWidth = 200,
+    this.onResizeSidebar,
   });
   final AppState state;
   final VoidCallback? onPalette;
@@ -267,6 +274,8 @@ class ConsoleMain extends StatelessWidget {
   final void Function(ConnItem)? onEdit;
   final void Function(ConnItem)? onReveal;
   final void Function(ConnItem)? onRemove;
+  final double sidebarWidth;
+  final ValueChanged<double>? onResizeSidebar;
 
   @override
   Widget build(BuildContext context) {
@@ -277,7 +286,8 @@ class ConsoleMain extends StatelessWidget {
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              SizedBox(width: 200, child: _ConnList(state: state)),
+              SizedBox(width: sidebarWidth, child: _ConnList(state: state)),
+              _Resizer(onDelta: onResizeSidebar ?? (_) {}),
               Expanded(
                 child: _Record(
                   state: state,
@@ -292,6 +302,31 @@ class ConsoleMain extends StatelessWidget {
         ),
         const _Footer(),
       ],
+    );
+  }
+}
+
+// ------------------------------------------------------------ resizer
+
+/// Draggable divider between the list and the record: a 1px line inside an 8px
+/// hit area, with a horizontal-resize cursor.
+class _Resizer extends StatelessWidget {
+  const _Resizer({required this.onDelta});
+  final ValueChanged<double> onDelta;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = ConsoleColors.of(context);
+    return MouseRegion(
+      cursor: SystemMouseCursors.resizeLeftRight,
+      child: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onHorizontalDragUpdate: (d) => onDelta(d.delta.dx),
+        child: SizedBox(
+          width: 8,
+          child: Center(child: Container(width: 1, color: c.line)),
+        ),
+      ),
     );
   }
 }
@@ -340,9 +375,16 @@ class _CommandBar extends StatelessWidget {
         children: [
           Text('rdc ▸', style: TextStyle(color: c.acc, fontWeight: FontWeight.w700, fontSize: 13)),
           const SizedBox(width: 10),
-          Flexible(child: context0),
-          if (chip != null) ...[const SizedBox(width: 12), chip],
-          const Spacer(),
+          // Left group takes all slack so ⌘K is always flush right.
+          Expanded(
+            child: Row(
+              children: [
+                Flexible(child: context0),
+                if (chip != null) ...[const SizedBox(width: 12), chip],
+              ],
+            ),
+          ),
+          const SizedBox(width: 12),
           _KbdHint(onTap: onPalette, label: '⌘K'),
         ],
       ),
@@ -406,21 +448,19 @@ class _ConnList extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = ConsoleColors.of(context);
-    return Container(
-      decoration: BoxDecoration(border: Border(right: BorderSide(color: c.line))),
-      child: state.connections.isEmpty
-          ? Center(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Text('no connections\n⌘K → new',
-                    textAlign: TextAlign.center, style: TextStyle(color: c.muted, fontSize: 12)),
-              ),
-            )
-          : ListView.builder(
-              padding: const EdgeInsets.symmetric(vertical: 8),
-              itemCount: state.connections.length,
-              itemBuilder: (context, i) => _ConnRow(state: state, item: state.connections[i]),
-            ),
+    if (state.connections.isEmpty) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Text('no connections\n⌘K → new',
+              textAlign: TextAlign.center, style: TextStyle(color: c.muted, fontSize: 12)),
+        ),
+      );
+    }
+    return ListView.builder(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      itemCount: state.connections.length,
+      itemBuilder: (context, i) => _ConnRow(state: state, item: state.connections[i]),
     );
   }
 }
@@ -680,19 +720,43 @@ class _SyncLog extends StatelessWidget {
     final c = ConsoleColors.of(context);
     final st = _statusOf(state, item);
     final msg = state.syncMessage[item.summary.folder];
+    final lines = state.syncLog[item.summary.folder] ?? const <String>[];
 
-    Widget line;
-    switch (st) {
-      case _St.running:
-        line = _logLine(c, prefix: '», ', prefixColor: c.acc, text: 'syncing…', textColor: c.ink);
-      case _St.error:
-        line = _logLine(c, prefix: '✕ ', prefixColor: c.err,
-            text: msg ?? 'sync failed', textColor: c.err);
-      case _St.synced:
-        line = _logLine(c, prefix: '✓ ', prefixColor: c.ok,
-            text: msg ?? 'up to date · ${_relTime(item.summary.lastSyncUnix)}', textColor: c.ok);
-      case _St.never:
-        line = _logLine(c, prefix: '— ', prefixColor: c.muted, text: 'not synced yet', textColor: c.muted);
+    Widget body;
+    if (lines.isNotEmpty) {
+      // rdc's real, rendered log (ANSI-colored) — full width, scrollable,
+      // latest line in view.
+      final spans = <InlineSpan>[];
+      for (var k = 0; k < lines.length; k++) {
+        spans.addAll(ansiSpans(lines[k], c, 12.5));
+        if (k < lines.length - 1) spans.add(const TextSpan(text: '\n'));
+      }
+      body = SizedBox(
+        width: double.infinity,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 168),
+          child: Scrollbar(
+            child: SingleChildScrollView(
+              reverse: true,
+              child: SelectableText.rich(
+                TextSpan(style: const TextStyle(fontSize: 12.5, height: 1.5), children: spans),
+              ),
+            ),
+          ),
+        ),
+      );
+    } else {
+      // No live log this session: one-line summary from the current state.
+      final (String prefix, Color pc, String text, Color tc) = switch (st) {
+        _St.running => ('», ', c.acc, 'syncing…', c.ink),
+        _St.error => ('✕ ', c.err, msg ?? 'sync failed', c.err),
+        _St.synced => ('✓ ', c.ok, msg ?? 'up to date · ${_relTime(item.summary.lastSyncUnix)}', c.ok),
+        _St.never => ('— ', c.muted, 'not synced yet', c.muted),
+      };
+      body = SelectableText.rich(TextSpan(style: const TextStyle(fontSize: 12.5), children: [
+        TextSpan(text: prefix, style: TextStyle(color: pc)),
+        TextSpan(text: text, style: TextStyle(color: tc)),
+      ]));
     }
 
     return Container(
@@ -714,21 +778,10 @@ class _SyncLog extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 8),
-          line,
+          body,
         ],
       ),
     );
-  }
-
-  Widget _logLine(ConsoleColors c,
-      {required String prefix, required Color prefixColor, required String text, required Color textColor}) {
-    return SelectableText.rich(TextSpan(
-      style: const TextStyle(fontSize: 12.5),
-      children: [
-        TextSpan(text: prefix, style: TextStyle(color: prefixColor)),
-        TextSpan(text: text, style: TextStyle(color: textColor)),
-      ],
-    ));
   }
 }
 

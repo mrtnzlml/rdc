@@ -10,6 +10,7 @@
 //! sync pipeline in no-push, non-interactive mode.
 
 use crate::cli::sync::CycleOutcome;
+use crate::log::Log;
 use anyhow::Result;
 use std::path::Path;
 
@@ -36,6 +37,41 @@ pub async fn sync_no_push(cwd: &Path, env: &str, token: &str) -> Result<CycleOut
         false, // no_pull
         None,  // conflict_strategy (embedding never resolves BothDiverged interactively)
         None,
+        Some(cwd),
+        Some(token.to_string()),
+    )
+    .await
+}
+
+/// Like [`sync_no_push`], but streams rdc's rendered progress log into
+/// `log_sink` — one `write` per line — so an embedder (the desktop app) can
+/// show the real sync log instead of a synthesized one.
+///
+/// Lines carry rdc's normal ANSI color (`ColorMode::Color`) so the embedder can
+/// preserve it; the log is non-TTY (scrollback-clean lines, no cursor redraws).
+/// Because a renderer is supplied, `run_cycle` omits its own cycle-closing
+/// summary event; the caller adds its own completion line.
+pub async fn sync_no_push_logged(
+    cwd: &Path,
+    env: &str,
+    token: &str,
+    log_sink: Box<dyn std::io::Write + Send>,
+) -> Result<CycleOutcome> {
+    let paths = crate::paths::Paths::for_env(cwd, env);
+    let _lock = crate::cli::sync::lock::EnvLock::acquire(
+        &paths.env_lock(),
+        std::time::Duration::from_secs(30),
+    )?;
+    let renderer = Log::for_sink(crate::cli::resolve::ColorMode::Color, log_sink);
+    crate::cli::sync::run_cycle(
+        env,
+        false, // interactive
+        false, // dry_run
+        false, // allow_deletes
+        true,  // no_push
+        false, // no_pull
+        None,  // conflict_strategy
+        Some(renderer),
         Some(cwd),
         Some(token.to_string()),
     )

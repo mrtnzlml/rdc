@@ -549,12 +549,16 @@ impl SseDecode for crate::api::rdc::SyncPhase {
                 return crate::api::rdc::SyncPhase::Started;
             }
             1 => {
+                let mut var_line = <String>::sse_decode(deserializer);
+                return crate::api::rdc::SyncPhase::Log { line: var_line };
+            }
+            2 => {
                 let mut var_fileCount = <u64>::sse_decode(deserializer);
                 return crate::api::rdc::SyncPhase::Done {
                     file_count: var_fileCount,
                 };
             }
-            2 => {
+            3 => {
                 let mut var_message = <String>::sse_decode(deserializer);
                 return crate::api::rdc::SyncPhase::Error {
                     message: var_message,
@@ -731,11 +735,14 @@ impl flutter_rust_bridge::IntoDart for crate::api::rdc::SyncPhase {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         match self {
             crate::api::rdc::SyncPhase::Started => [0.into_dart()].into_dart(),
+            crate::api::rdc::SyncPhase::Log { line } => {
+                [1.into_dart(), line.into_into_dart().into_dart()].into_dart()
+            }
             crate::api::rdc::SyncPhase::Done { file_count } => {
-                [1.into_dart(), file_count.into_into_dart().into_dart()].into_dart()
+                [2.into_dart(), file_count.into_into_dart().into_dart()].into_dart()
             }
             crate::api::rdc::SyncPhase::Error { message } => {
-                [2.into_dart(), message.into_into_dart().into_dart()].into_dart()
+                [3.into_dart(), message.into_into_dart().into_dart()].into_dart()
             }
             _ => {
                 unimplemented!("");
@@ -890,12 +897,16 @@ impl SseEncode for crate::api::rdc::SyncPhase {
             crate::api::rdc::SyncPhase::Started => {
                 <i32>::sse_encode(0, serializer);
             }
-            crate::api::rdc::SyncPhase::Done { file_count } => {
+            crate::api::rdc::SyncPhase::Log { line } => {
                 <i32>::sse_encode(1, serializer);
+                <String>::sse_encode(line, serializer);
+            }
+            crate::api::rdc::SyncPhase::Done { file_count } => {
+                <i32>::sse_encode(2, serializer);
                 <u64>::sse_encode(file_count, serializer);
             }
             crate::api::rdc::SyncPhase::Error { message } => {
-                <i32>::sse_encode(2, serializer);
+                <i32>::sse_encode(3, serializer);
                 <String>::sse_encode(message, serializer);
             }
             _ => {

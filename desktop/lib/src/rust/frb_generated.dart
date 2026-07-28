@@ -543,8 +543,10 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       case 0:
         return SyncPhase_Started();
       case 1:
-        return SyncPhase_Done(fileCount: dco_decode_u_64(raw[1]));
+        return SyncPhase_Log(line: dco_decode_String(raw[1]));
       case 2:
+        return SyncPhase_Done(fileCount: dco_decode_u_64(raw[1]));
+      case 3:
         return SyncPhase_Error(message: dco_decode_String(raw[1]));
       default:
         throw Exception("unreachable");
@@ -755,9 +757,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       case 0:
         return SyncPhase_Started();
       case 1:
+        var var_line = sse_decode_String(deserializer);
+        return SyncPhase_Log(line: var_line);
+      case 2:
         var var_fileCount = sse_decode_u_64(deserializer);
         return SyncPhase_Done(fileCount: var_fileCount);
-      case 2:
+      case 3:
         var var_message = sse_decode_String(deserializer);
         return SyncPhase_Error(message: var_message);
       default:
@@ -962,11 +967,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     switch (self) {
       case SyncPhase_Started():
         sse_encode_i_32(0, serializer);
-      case SyncPhase_Done(fileCount: final fileCount):
+      case SyncPhase_Log(line: final line):
         sse_encode_i_32(1, serializer);
+        sse_encode_String(line, serializer);
+      case SyncPhase_Done(fileCount: final fileCount):
+        sse_encode_i_32(2, serializer);
         sse_encode_u_64(fileCount, serializer);
       case SyncPhase_Error(message: final message):
-        sse_encode_i_32(2, serializer);
+        sse_encode_i_32(3, serializer);
         sse_encode_String(message, serializer);
     }
   }

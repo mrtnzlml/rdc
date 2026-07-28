@@ -301,6 +301,22 @@ impl Log {
         })
     }
 
+    /// Construct a Log that writes rendered lines into `sink`, with no in-place
+    /// TTY status updates (`is_tty = false`, so output stays scrollback-clean:
+    /// no `\r`/escape redraws, only whole `event`/milestone lines). For
+    /// embedders — e.g. the desktop app — that capture the log stream instead
+    /// of writing to a terminal. Pair with [`ColorMode::Plain`] for plain text.
+    pub(crate) fn for_sink(color: ColorMode, sink: Box<dyn Write + Send>) -> Arc<Self> {
+        Arc::new(Self {
+            color,
+            is_tty: false,
+            state: Mutex::new(LogState { out: sink, status_active: false }),
+            phase: Mutex::new(None),
+            #[cfg(test)]
+            fixed_time: None,
+        })
+    }
+
     /// Construct a Log that writes into the given sink. Test-only.
     #[cfg(test)]
     fn for_test(color: ColorMode, sink: Box<dyn Write + Send>) -> Arc<Self> {

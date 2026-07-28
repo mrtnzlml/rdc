@@ -37,6 +37,13 @@ AppState _seeded() {
   s.selectedFolder = '/tmp/acme-invoices';
   s.syncState['/tmp/globex-dev'] = SyncState.error;
   s.syncMessage['/tmp/globex-dev'] = "couldn't sign in (401)";
+  // ANSI-colored lines, exactly as rdc emits them (ColorMode::Color).
+  s.syncLog['/tmp/acme-invoices'] = [
+    '\x1B[2m14:12:03\x1B[0m \x1B[38;2;120;180;90mPULL\x1B[0m   schemas … 12 ok',
+    '\x1B[2m14:12:05\x1B[0m \x1B[38;2;120;180;90mPULL\x1B[0m   hooks … 8 ok',
+    '\x1B[2m14:12:07\x1B[0m \x1B[1;38;2;237;142;71mWRITE\x1B[0m  queues … 3 ok',
+    '✓ done · 128 files',
+  ];
   return s;
 }
 
