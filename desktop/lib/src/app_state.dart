@@ -31,6 +31,9 @@ class AppState extends ChangeNotifier {
   final Map<String, SyncState> syncState = {};
   final Map<String, String> syncMessage = {};
 
+  /// rdc's real, rendered sync-log lines from the current/last run, per folder.
+  final Map<String, List<String>> syncLog = {};
+
   String? get parentFolder => _settings.parentFolder;
 
   ConnItem? get selected {
@@ -152,6 +155,7 @@ class AppState extends ChangeNotifier {
     final folder = item.summary.folder;
     syncState[folder] = SyncState.running;
     syncMessage.remove(folder);
+    syncLog[folder] = <String>[];
     notifyListeners();
 
     syncConnection(
@@ -163,6 +167,8 @@ class AppState extends ChangeNotifier {
         switch (phase) {
           case SyncPhase_Started():
             syncState[folder] = SyncState.running;
+          case SyncPhase_Log(:final line):
+            (syncLog[folder] ??= <String>[]).add(line);
           case SyncPhase_Done(:final fileCount):
             syncState[folder] = SyncState.done;
             syncMessage[folder] = 'Pulled $fileCount files';

@@ -9,7 +9,8 @@ import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 part 'rdc.freezed.dart';
 
 // These functions are ignored because they are not marked as `pub`: `block_on`, `write_credentials`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `LineForwarder`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `flush`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `write`
 
 /// rdc's package version, surfaced to the app's About box.
 Future<String?> rdcVersion() => RustLib.instance.api.crateApiRdcRdcVersion();
@@ -209,6 +210,9 @@ sealed class SyncPhase with _$SyncPhase {
   const SyncPhase._();
 
   const factory SyncPhase.started() = SyncPhase_Started;
+
+  /// One line of rdc's real, rendered sync log (plain text, no color).
+  const factory SyncPhase.log({required String line}) = SyncPhase_Log;
   const factory SyncPhase.done({required BigInt fileCount}) = SyncPhase_Done;
   const factory SyncPhase.error({required String message}) = SyncPhase_Error;
 }
