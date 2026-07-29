@@ -1,5 +1,7 @@
 // Renders the MDH-style UI to PNGs for visual fidelity checks against the
 // approved proposal. Run: flutter test --update-goldens test/golden_mdh_test.dart
+import 'dart:io';
+
 import 'package:desktop/src/app.dart';
 import 'package:desktop/src/app_state.dart';
 import 'package:desktop/src/home_page.dart';
@@ -10,14 +12,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 ConnItem _conn(String name, int org,
-    {bool external = false, int? lastSync, int files = 0}) {
+    {bool external = false, int? lastSync, int files = 0, String? folder}) {
   return ConnItem(
     ConnectionSummary(
       id: name,
       name: name,
       apiBase: 'https://acme.rossum.app/api/v1',
       orgId: BigInt.from(org),
-      folder: '/tmp/Rossum/$name',
+      folder: folder ?? '/tmp/Rossum/$name',
       authKind: AuthKind.token,
       lastSyncUnix: lastSync,
       fileCount: BigInt.from(files),
@@ -46,6 +48,21 @@ AppState _seeded() {
   return s;
 }
 
+/// A real on-disk connection folder for the Files tab. Fixed basename so the
+/// breadcrumb width is deterministic across runs.
+Directory _filesFixture() {
+  final root = Directory('${Directory.systemTemp.path}/rdc_golden_conn');
+  if (root.existsSync()) root.deleteSync(recursive: true);
+  Directory('${root.path}/envs/main/hooks').createSync(recursive: true);
+  Directory('${root.path}/envs/main/queues').createSync(recursive: true);
+  File('${root.path}/envs/main/hooks/validate_invoice.json').writeAsStringSync('x' * 2000);
+  File('${root.path}/envs/main/queues/invoices.json').writeAsStringSync('x' * 4200);
+  File('${root.path}/mapping.toml').writeAsStringSync('x' * 320);
+  File('${root.path}/overlay.toml').writeAsStringSync('x' * 90);
+  File('${root.path}/.gitignore').writeAsStringSync('x' * 40); // hidden → skipped
+  return root;
+}
+
 Widget _wrap(Brightness b, Widget child) => MaterialApp(
       debugShowCheckedModeBanner: false,
       theme: mdhTheme(b),
@@ -69,14 +86,23 @@ void main() {
   });
 
   testWidgets('connection view — light', (t) async {
-    await shot(t, _wrap(Brightness.light, MdhScaffold(state: _seeded(), view: RailView.connections)), 'goldens/mdh_conn_light.png');
+    await shot(t, _wrap(Brightness.light, MdhScaffold(state: _seeded(), view: NavView.connection)), 'goldens/mdh_conn_light.png');
   });
 
   testWidgets('connection view — dark', (t) async {
-    await shot(t, _wrap(Brightness.dark, MdhScaffold(state: _seeded(), view: RailView.connections)), 'goldens/mdh_conn_dark.png');
+    await shot(t, _wrap(Brightness.dark, MdhScaffold(state: _seeded(), view: NavView.connection)), 'goldens/mdh_conn_dark.png');
   });
 
   testWidgets('fleet overview — light', (t) async {
-    await shot(t, _wrap(Brightness.light, MdhScaffold(state: _seeded(), view: RailView.overview)), 'goldens/mdh_fleet_light.png');
+    await shot(t, _wrap(Brightness.light, MdhScaffold(state: _seeded(), view: NavView.overview)), 'goldens/mdh_fleet_light.png');
+  });
+
+  testWidgets('files tab — light', (t) async {
+    final root = _filesFixture();
+    addTearDown(() => root.deleteSync(recursive: true));
+    final s = AppState(Settings(parentFolder: Directory.systemTemp.path));
+    s.connections = [_conn('acme-invoices', 123456, lastSync: 1000, files: 128, folder: root.path)];
+    s.selectedFolder = root.path;
+    await shot(t, _wrap(Brightness.light, MdhScaffold(state: s, view: NavView.connection, activeTab: 'files')), 'goldens/mdh_files_light.png');
   });
 }
