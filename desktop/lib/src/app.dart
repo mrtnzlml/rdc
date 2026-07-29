@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 
 import 'app_state.dart';
-import 'console_theme.dart';
 import 'home_page.dart';
+import 'mdh_theme.dart';
 
 class RdcApp extends StatelessWidget {
   const RdcApp({super.key, required this.state});
@@ -13,8 +13,8 @@ class RdcApp extends StatelessWidget {
     return MaterialApp(
       title: 'rdc',
       debugShowCheckedModeBanner: false,
-      theme: consoleTheme(Brightness.light),
-      darkTheme: consoleTheme(Brightness.dark),
+      theme: mdhTheme(Brightness.light),
+      darkTheme: mdhTheme(Brightness.dark),
       home: HomePage(state: state),
     );
   }

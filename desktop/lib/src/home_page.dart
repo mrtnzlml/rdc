@@ -2,17 +2,18 @@ import 'dart:io';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import 'ansi.dart';
 import 'app_state.dart';
-import 'console_theme.dart';
 import 'dialogs.dart';
 import 'error_text.dart';
+import 'mdh_theme.dart';
 import 'rust/api/rdc.dart';
 import 'update_check.dart';
 
-// ------------------------------------------------------------ status helpers
+// ------------------------------------------------------------ helpers
+
+enum RailView { connections, overview, settings }
 
 enum _St { running, error, synced, never }
 
@@ -27,42 +28,46 @@ _St _statusOf(AppState s, ConnItem it) {
   }
 }
 
-String _relTime(int? unix) {
+String _rel(int? unix) {
   if (unix == null) return 'never';
-  final then = DateTime.fromMillisecondsSinceEpoch(unix * 1000);
-  final d = DateTime.now().difference(then);
+  final d = DateTime.now()
+      .difference(DateTime.fromMillisecondsSinceEpoch(unix * 1000));
   if (d.inSeconds < 60) return 'now';
   if (d.inMinutes < 60) return '${d.inMinutes}m';
   if (d.inHours < 24) return '${d.inHours}h';
   return '${d.inDays}d';
 }
 
+String _host(String apiBase) {
+  var s = apiBase.replaceFirst(RegExp(r'^https?://'), '');
+  final slash = s.indexOf('/');
+  return slash >= 0 ? s.substring(0, slash) : s;
+}
+
+TextStyle _mono(Color color, double size, [FontWeight w = FontWeight.w400]) =>
+    TextStyle(color: color, fontSize: size, fontWeight: w,
+        fontFamily: kMonoFamily, fontFamilyFallback: kMonoFallback);
+
 // ------------------------------------------------------------ page
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key, required this.state});
   final AppState state;
-
   @override
   State<HomePage> createState() => _HomePageState();
 }
 
 class _HomePageState extends State<HomePage> {
-  final FocusNode _focus = FocusNode(debugLabel: 'rdc-console');
-  double _listWidth = 200;
   AppState get state => widget.state;
+  RailView _rail = RailView.connections;
+  double _listWidth = 250;
+  String _tab = 'overview';
 
   @override
   void initState() {
     super.initState();
     if (state.parentFolder != null) state.reload();
     _checkUpdate();
-  }
-
-  @override
-  void dispose() {
-    _focus.dispose();
-    super.dispose();
   }
 
   Future<void> _checkUpdate() async {
@@ -87,622 +92,424 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  void _refocus() {
-    if (mounted) _focus.requestFocus();
+  Future<void> _chooseParent() => _run(() async {
+        final p = await getDirectoryPath(confirmButtonText: 'Choose');
+        if (p != null) await state.setParentFolder(p);
+      });
+
+  Future<void> _openExisting() => _run(() async {
+        final p = await getDirectoryPath(confirmButtonText: 'Open');
+        if (p != null) await state.openExisting(p);
+      });
+
+  Future<void> _addConnection() =>
+      showDialog<bool>(context: context, builder: (_) => AddConnectionDialog(state: state));
+
+  Future<void> _editConnection(ConnItem i) =>
+      showDialog<bool>(context: context, builder: (_) => EditConnectionDialog(state: state, item: i));
+
+  Future<void> _reveal(ConnItem i) => _run(() => state.reveal(i.summary.folder));
+
+  Future<void> _confirmRemove(ConnItem i) async {
+    final ok = await showDialog<bool>(context: context, builder: (_) => RemoveDialog(item: i));
+    if (ok == true) await _run(() => state.removeOrDetach(i));
   }
 
-  Future<void> _chooseParent() async {
-    await _run(() async {
-      final path = await getDirectoryPath(confirmButtonText: 'Choose');
-      if (path != null) await state.setParentFolder(path);
-    });
-    _refocus();
-  }
-
-  Future<void> _openExisting() async {
-    await _run(() async {
-      final path = await getDirectoryPath(confirmButtonText: 'Open');
-      if (path != null) await state.openExisting(path);
-    });
-    _refocus();
-  }
-
-  Future<void> _addConnection() async {
-    await showDialog<bool>(context: context, builder: (_) => AddConnectionDialog(state: state));
-    _refocus();
-  }
-
-  Future<void> _editConnection(ConnItem item) async {
-    await showDialog<bool>(context: context, builder: (_) => EditConnectionDialog(state: state, item: item));
-    _refocus();
-  }
-
-  Future<void> _reveal(ConnItem item) async {
-    await _run(() => state.reveal(item.summary.folder));
-    _refocus();
-  }
-
-  Future<void> _confirmRemove(ConnItem item) async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => RemoveDialog(item: item),
-    );
-    if (ok == true) await _run(() => state.removeOrDetach(item));
-    _refocus();
-  }
-
-  void _about() {
-    showAboutDialog(
-      context: context,
-      applicationName: 'rdc',
-      applicationVersion: 'v$kAppVersion  •  rdc core embedded',
-      children: const [
-        Text('Cross-platform desktop front-end for the rdc core '
-            '(Flutter + flutter_rust_bridge).'),
-      ],
-    );
-  }
-
-  // ---- keyboard --------------------------------------------------------
-
-  void _move(int delta) {
-    final list = state.connections;
-    if (list.isEmpty) return;
-    final i = list.indexWhere((c) => c.summary.folder == state.selectedFolder);
-    final next = i < 0 ? 0 : (i + delta).clamp(0, list.length - 1);
-    state.select(list[next].summary.folder);
-  }
-
-  KeyEventResult _onKey(FocusNode node, KeyEvent e) {
-    if (e is! KeyDownEvent) return KeyEventResult.ignored;
-    final key = e.logicalKey;
-    if (HardwareKeyboard.instance.isMetaPressed && key == LogicalKeyboardKey.keyK) {
-      _openPalette();
-      return KeyEventResult.handled;
+  void _syncAll() {
+    for (final c in state.connections) {
+      state.sync(c);
     }
-    if (HardwareKeyboard.instance.isControlPressed && key == LogicalKeyboardKey.keyK) {
-      _openPalette();
-      return KeyEventResult.handled;
-    }
-    if (key == LogicalKeyboardKey.keyJ || key == LogicalKeyboardKey.arrowDown) {
-      _move(1);
-      return KeyEventResult.handled;
-    }
-    if (key == LogicalKeyboardKey.keyK || key == LogicalKeyboardKey.arrowUp) {
-      _move(-1);
-      return KeyEventResult.handled;
-    }
-    final sel = state.selected;
-    if (sel == null) return KeyEventResult.ignored;
-    if (key == LogicalKeyboardKey.keyS) {
-      state.sync(sel);
-      return KeyEventResult.handled;
-    }
-    if (key == LogicalKeyboardKey.keyE) {
-      _editConnection(sel);
-      return KeyEventResult.handled;
-    }
-    if (key == LogicalKeyboardKey.keyR) {
-      _reveal(sel);
-      return KeyEventResult.handled;
-    }
-    if (key == LogicalKeyboardKey.keyX) {
-      _confirmRemove(sel);
-      return KeyEventResult.handled;
-    }
-    return KeyEventResult.ignored;
   }
 
-  Future<void> _openPalette() async {
-    final sel = state.selected;
-    final cmds = <PaletteCmd>[
-      PaletteCmd('New connection', run: _addConnection),
-      PaletteCmd('Open existing project', run: _openExisting),
-      PaletteCmd('Change parent folder…', run: _chooseParent),
-      PaletteCmd('About rdc', run: _about),
-      if (sel != null) ...[
-        PaletteCmd('Sync ${sel.summary.name}', key: 's', run: () => state.sync(sel)),
-        PaletteCmd('Edit ${sel.summary.name}', key: 'e', run: () => _editConnection(sel)),
-        PaletteCmd('Reveal ${sel.summary.name}', key: 'r', run: () => _reveal(sel)),
-        PaletteCmd(sel.isExternal ? 'Detach ${sel.summary.name}' : 'Remove ${sel.summary.name}',
-            key: 'x', run: () => _confirmRemove(sel)),
-      ],
-      for (final c in state.connections)
-        PaletteCmd('→ ${c.summary.name}', run: () => state.select(c.summary.folder)),
-    ];
-    final chosen = await showDialog<PaletteCmd>(
-      context: context,
-      builder: (_) => CommandPalette(commands: cmds),
-    );
-    _refocus();
-    chosen?.run();
-  }
+  void _about() => showAboutDialog(
+        context: context,
+        applicationName: 'rdc',
+        applicationVersion: 'v$kAppVersion  •  rdc core embedded',
+        children: const [
+          Text('Cross-platform desktop front-end for the rdc core '
+              '(Flutter + flutter_rust_bridge).'),
+        ],
+      );
 
   @override
   Widget build(BuildContext context) {
-    final c = ConsoleColors.of(context);
     return Scaffold(
-      backgroundColor: c.bg,
       body: ListenableBuilder(
         listenable: state,
-        builder: (context, _) {
-          if (state.parentFolder == null) {
-            return _EmptyState(onChoose: _chooseParent);
-          }
-          return Focus(
-            focusNode: _focus,
-            autofocus: true,
-            onKeyEvent: _onKey,
-            child: ConsoleMain(
-              state: state,
-              onPalette: _openPalette,
-              onSync: (i) => state.sync(i),
-              onEdit: _editConnection,
-              onReveal: _reveal,
-              onRemove: _confirmRemove,
-              sidebarWidth: _listWidth,
-              onResizeSidebar: (dx) =>
-                  setState(() => _listWidth = (_listWidth + dx).clamp(160.0, 480.0)),
-            ),
-          );
-        },
+        builder: (context, _) => MdhScaffold(
+          state: state,
+          view: _rail,
+          listWidth: _listWidth,
+          activeTab: _tab,
+          onSelectRail: (v) => setState(() => _rail = v),
+          onResize: (dx) => setState(() => _listWidth = (_listWidth + dx).clamp(200.0, 460.0)),
+          onSelectTab: (t) => setState(() => _tab = t),
+          onSelectConn: (folder) => setState(() {
+            state.select(folder);
+            _rail = RailView.connections;
+          }),
+          onAdd: _addConnection,
+          onOpen: _openExisting,
+          onSync: (i) => state.sync(i),
+          onSyncAll: _syncAll,
+          onEdit: _editConnection,
+          onReveal: _reveal,
+          onRemove: _confirmRemove,
+          onChooseParent: _chooseParent,
+          onAbout: _about,
+          onCheckUpdate: () async {
+            final messenger = ScaffoldMessenger.of(context);
+            final info = await checkForUpdate();
+            if (!mounted) return;
+            messenger.showSnackBar(SnackBar(
+              content: Text(info == null
+                  ? "You're on the latest version (or the check couldn't reach GitHub)."
+                  : 'A newer version (${info.latest}) is available on GitHub Releases.'),
+            ));
+          },
+        ),
       ),
     );
   }
 }
 
-// ------------------------------------------------------------ main scaffold
+// ------------------------------------------------------------ shell
 
-/// The connected main screen: command bar + connection list + record + footer.
-/// Public and callback-driven so it renders in golden tests from seeded state,
-/// independent of the bridge or the initial reload.
-class ConsoleMain extends StatelessWidget {
-  const ConsoleMain({
+/// The MDH-style shell: a rail + the active view. Public and callback-driven so
+/// it renders in golden tests from seeded state, with no bridge dependence.
+class MdhScaffold extends StatelessWidget {
+  const MdhScaffold({
     super.key,
     required this.state,
-    this.onPalette,
+    this.view = RailView.connections,
+    this.listWidth = 250,
+    this.activeTab = 'overview',
+    this.onSelectRail,
+    this.onResize,
+    this.onSelectTab,
+    this.onSelectConn,
+    this.onAdd,
+    this.onOpen,
     this.onSync,
+    this.onSyncAll,
     this.onEdit,
     this.onReveal,
     this.onRemove,
-    this.sidebarWidth = 200,
-    this.onResizeSidebar,
+    this.onChooseParent,
+    this.onAbout,
+    this.onCheckUpdate,
   });
+
   final AppState state;
-  final VoidCallback? onPalette;
+  final RailView view;
+  final double listWidth;
+  final String activeTab;
+  final void Function(RailView)? onSelectRail;
+  final void Function(double)? onResize;
+  final void Function(String)? onSelectTab;
+  final void Function(String folder)? onSelectConn;
+  final VoidCallback? onAdd;
+  final VoidCallback? onOpen;
   final void Function(ConnItem)? onSync;
+  final VoidCallback? onSyncAll;
   final void Function(ConnItem)? onEdit;
   final void Function(ConnItem)? onReveal;
   final void Function(ConnItem)? onRemove;
-  final double sidebarWidth;
-  final ValueChanged<double>? onResizeSidebar;
+  final VoidCallback? onChooseParent;
+  final VoidCallback? onAbout;
+  final VoidCallback? onCheckUpdate;
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      children: [
-        _CommandBar(state: state, onPalette: onPalette ?? () {}),
-        Expanded(
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              SizedBox(width: sidebarWidth, child: _ConnList(state: state)),
-              _Resizer(onDelta: onResizeSidebar ?? (_) {}),
-              Expanded(
-                child: _Record(
-                  state: state,
-                  onSync: onSync ?? (_) {},
-                  onEdit: onEdit ?? (_) {},
-                  onReveal: onReveal ?? (_) {},
-                  onRemove: onRemove ?? (_) {},
-                ),
-              ),
-            ],
-          ),
-        ),
-        const _Footer(),
-      ],
-    );
-  }
-}
+    final c = MdhColors.of(context);
+    final noParent = state.parentFolder == null;
 
-// ------------------------------------------------------------ resizer
-
-/// Draggable divider between the list and the record: a 1px line inside an 8px
-/// hit area, with a horizontal-resize cursor.
-class _Resizer extends StatelessWidget {
-  const _Resizer({required this.onDelta});
-  final ValueChanged<double> onDelta;
-
-  @override
-  Widget build(BuildContext context) {
-    final c = ConsoleColors.of(context);
-    return MouseRegion(
-      cursor: SystemMouseCursors.resizeLeftRight,
-      child: GestureDetector(
-        behavior: HitTestBehavior.translucent,
-        onHorizontalDragUpdate: (d) => onDelta(d.delta.dx),
-        child: SizedBox(
-          width: 8,
-          child: Center(child: Container(width: 1, color: c.line)),
-        ),
-      ),
-    );
-  }
-}
-
-// ------------------------------------------------------------ command bar
-
-class _CommandBar extends StatelessWidget {
-  const _CommandBar({required this.state, required this.onPalette});
-  final AppState state;
-  final VoidCallback onPalette;
-
-  @override
-  Widget build(BuildContext context) {
-    final c = ConsoleColors.of(context);
-    final sel = state.selected;
-    Widget context0;
-    Widget? chip;
-    if (sel != null) {
-      context0 = RichText(
-        text: TextSpan(
-          style: TextStyle(color: c.muted, fontSize: 13),
-          children: [
-            const TextSpan(text: 'connection '),
-            TextSpan(text: sel.summary.name, style: TextStyle(color: c.ink, fontWeight: FontWeight.w600)),
-          ],
-        ),
-      );
-      chip = _StatusChip(state: state, item: sel);
+    Widget content;
+    if (noParent) {
+      content = _ChooseFolderEmpty(onChoose: onChooseParent ?? () {});
     } else {
-      final n = state.connections.length;
-      context0 = Text('${state.parentFolder}  ·  $n connection${n == 1 ? '' : 's'}',
-          style: TextStyle(color: c.muted, fontSize: 13));
-    }
-    return Container(
-      padding: const EdgeInsets.fromLTRB(16, 12, 14, 12),
-      decoration: BoxDecoration(
-        color: c.surf,
-        border: Border(bottom: BorderSide(color: c.line)),
-        gradient: LinearGradient(
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
-          colors: [c.acc.withValues(alpha: 0.08), Colors.transparent],
-        ),
-      ),
-      child: Row(
-        children: [
-          Text('rdc ▸', style: TextStyle(color: c.acc, fontWeight: FontWeight.w700, fontSize: 13)),
-          const SizedBox(width: 10),
-          // Left group takes all slack so ⌘K is always flush right.
-          Expanded(
-            child: Row(
-              children: [
-                Flexible(child: context0),
-                if (chip != null) ...[const SizedBox(width: 12), chip],
-              ],
-            ),
+      content = switch (view) {
+        RailView.connections => _ConnectionsView(
+            state: state,
+            listWidth: listWidth,
+            activeTab: activeTab,
+            onResize: onResize ?? (_) {},
+            onSelectTab: onSelectTab ?? (_) {},
+            onSelect: (f) => state.select(f),
+            onAdd: onAdd ?? () {},
+            onOpen: onOpen ?? () {},
+            onSync: onSync ?? (_) {},
+            onEdit: onEdit ?? (_) {},
+            onReveal: onReveal ?? (_) {},
+            onRemove: onRemove ?? (_) {},
           ),
-          const SizedBox(width: 12),
-          _KbdHint(onTap: onPalette, label: '⌘K'),
+        RailView.overview => _FleetView(
+            state: state,
+            onNew: onAdd ?? () {},
+            onSyncAll: onSyncAll ?? () {},
+            onOpenConn: onSelectConn ?? (_) {},
+          ),
+        RailView.settings => _SettingsView(
+            state: state,
+            onChooseParent: onChooseParent ?? () {},
+            onOpen: onOpen ?? () {},
+            onAbout: onAbout ?? () {},
+            onCheckUpdate: onCheckUpdate ?? () {},
+          ),
+      };
+    }
+
+    return Container(
+      color: c.bgBase,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _Rail(active: view, onSelect: onSelectRail ?? (_) {}),
+          Expanded(child: content),
         ],
       ),
     );
   }
 }
 
-class _StatusChip extends StatelessWidget {
-  const _StatusChip({required this.state, required this.item});
-  final AppState state;
-  final ConnItem item;
+// ------------------------------------------------------------ rail
+
+class _Rail extends StatelessWidget {
+  const _Rail({required this.active, required this.onSelect});
+  final RailView active;
+  final void Function(RailView) onSelect;
 
   @override
   Widget build(BuildContext context) {
-    final c = ConsoleColors.of(context);
-    final (String label, Color color) = switch (_statusOf(state, item)) {
-      _St.running => ('● syncing', c.acc),
-      _St.error => ('✕ sync failed', c.err),
-      _St.synced => ('● synced', c.ok),
-      _St.never => ('○ never synced', c.muted),
-    };
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(999),
-        border: Border.all(color: Color.alphaBlend(color.withValues(alpha: 0.4), c.line)),
-      ),
-      child: Text(label, style: TextStyle(color: color, fontSize: 11)),
-    );
-  }
-}
-
-class _KbdHint extends StatelessWidget {
-  const _KbdHint({required this.label, this.onTap});
-  final String label;
-  final VoidCallback? onTap;
-  @override
-  Widget build(BuildContext context) {
-    final c = ConsoleColors.of(context);
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(5),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
-        decoration: BoxDecoration(
-          border: Border.all(color: c.line),
-          borderRadius: BorderRadius.circular(5),
-        ),
-        child: Text(label, style: TextStyle(color: c.muted, fontSize: 11)),
-      ),
-    );
-  }
-}
-
-// ------------------------------------------------------------ connection list
-
-class _ConnList extends StatelessWidget {
-  const _ConnList({required this.state});
-  final AppState state;
-
-  @override
-  Widget build(BuildContext context) {
-    final c = ConsoleColors.of(context);
-    if (state.connections.isEmpty) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Text('no connections\n⌘K → new',
-              textAlign: TextAlign.center, style: TextStyle(color: c.muted, fontSize: 12)),
+    final c = MdhColors.of(context);
+    Widget item(RailView v, IconData icon, String tip) {
+      final on = v == active;
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 3),
+        child: Tooltip(
+          message: tip,
+          child: InkWell(
+            onTap: () => onSelect(v),
+            borderRadius: BorderRadius.circular(8),
+            child: Container(
+              width: 34,
+              height: 34,
+              decoration: BoxDecoration(
+                color: on ? c.accent : Colors.transparent,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Icon(icon, size: 18, color: on ? Colors.white : c.textSecondary),
+            ),
+          ),
         ),
       );
     }
-    return ListView.builder(
-      padding: const EdgeInsets.symmetric(vertical: 8),
-      itemCount: state.connections.length,
-      itemBuilder: (context, i) => _ConnRow(state: state, item: state.connections[i]),
-    );
-  }
-}
 
-class _ConnRow extends StatelessWidget {
-  const _ConnRow({required this.state, required this.item});
-  final AppState state;
-  final ConnItem item;
-
-  @override
-  Widget build(BuildContext context) {
-    final c = ConsoleColors.of(context);
-    final s = item.summary;
-    final selected = s.folder == state.selectedFolder;
-    final st = _statusOf(state, item);
-
-    Widget glyph;
-    switch (st) {
-      case _St.running:
-        glyph = SizedBox(
-            width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 1.6, color: c.acc));
-      case _St.error:
-        glyph = Text('✕', style: TextStyle(color: c.err, fontSize: 12));
-      case _St.synced:
-        glyph = Text('●', style: TextStyle(color: c.ok, fontSize: 12));
-      case _St.never:
-        glyph = Text('○', style: TextStyle(color: c.muted, fontSize: 12));
-    }
-
-    final sub = switch (st) {
-      _St.running => 'syncing…',
-      _St.error => 'failed',
-      _St.synced => _relTime(s.lastSyncUnix),
-      _St.never => 'never',
-    };
-    final ext = item.isExternal ? ' · ext' : '';
-
-    return InkWell(
-      onTap: () => state.select(s.folder),
-      child: Container(
-        decoration: BoxDecoration(
-          color: selected ? c.sel : Colors.transparent,
-          border: Border(left: BorderSide(color: selected ? c.acc : Colors.transparent, width: 2)),
-        ),
-        padding: const EdgeInsets.fromLTRB(12, 9, 12, 9),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            SizedBox(width: 15, child: Align(alignment: Alignment.centerLeft, child: glyph)),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(s.name, style: TextStyle(color: c.ink, fontSize: 13), overflow: TextOverflow.ellipsis),
-                  const SizedBox(height: 1),
-                  Text('org ${s.orgId} · $sub$ext',
-                      style: TextStyle(color: c.muted, fontSize: 11), overflow: TextOverflow.ellipsis),
-                ],
-              ),
-            ),
-          ],
-        ),
+    return Container(
+      width: 52,
+      decoration: BoxDecoration(
+        color: c.bgSidebar,
+        border: Border(right: BorderSide(color: c.border)),
+      ),
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          Container(
+            width: 32,
+            height: 32,
+            margin: const EdgeInsets.only(bottom: 8),
+            decoration: BoxDecoration(color: c.accent, borderRadius: BorderRadius.circular(8)),
+            alignment: Alignment.center,
+            child: Text('rdc', style: _mono(Colors.white, 11, FontWeight.w700)),
+          ),
+          item(RailView.connections, Icons.dns_outlined, 'Connections'),
+          item(RailView.overview, Icons.dashboard_outlined, 'Fleet overview'),
+          const Spacer(),
+          item(RailView.settings, Icons.settings_outlined, 'Settings'),
+        ],
       ),
     );
   }
 }
 
-// ------------------------------------------------------------ record (detail)
+// ------------------------------------------------------------ connections view
 
-class _Record extends StatelessWidget {
-  const _Record({
+class _ConnectionsView extends StatelessWidget {
+  const _ConnectionsView({
     required this.state,
+    required this.listWidth,
+    required this.activeTab,
+    required this.onResize,
+    required this.onSelectTab,
+    required this.onSelect,
+    required this.onAdd,
+    required this.onOpen,
     required this.onSync,
     required this.onEdit,
     required this.onReveal,
     required this.onRemove,
   });
   final AppState state;
-  final void Function(ConnItem) onSync;
-  final void Function(ConnItem) onEdit;
-  final void Function(ConnItem) onReveal;
-  final void Function(ConnItem) onRemove;
+  final double listWidth;
+  final String activeTab;
+  final void Function(double) onResize;
+  final void Function(String) onSelectTab;
+  final void Function(String) onSelect;
+  final VoidCallback onAdd, onOpen;
+  final void Function(ConnItem) onSync, onEdit, onReveal, onRemove;
 
   @override
   Widget build(BuildContext context) {
-    final c = ConsoleColors.of(context);
-    final item = state.selected;
-    if (item == null) {
-      return Center(
-        child: Text('rdc ▸ ⌘K to add a connection', style: TextStyle(color: c.muted, fontSize: 13)),
-      );
-    }
-    final s = item.summary;
-    final st = _statusOf(state, item);
-    final auth = s.authKind == AuthKind.token ? 'api_token' : 'username & password';
-
-    return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(20, 18, 20, 18),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // header
-          Row(
-            children: [
-              Text('◆ ', style: TextStyle(color: st == _St.error ? c.err : c.acc, fontSize: 18)),
-              Flexible(
-                child: Text(s.name,
-                    style: TextStyle(color: c.ink, fontSize: 19, fontWeight: FontWeight.w700)),
-              ),
-              const SizedBox(width: 9),
-              _Badge(text: item.isExternal ? 'external' : 'managed'),
-            ],
-          ),
-          const SizedBox(height: 16),
-          // kv
-          _Kv(rows: [
-            ('api_base', s.apiBase, null),
-            ('org_id', s.orgId.toString(), null),
-            ('auth', auth, null),
-            ('folder', s.folder, null),
-            ('files', s.fileCount.toString(), null),
-            ('last_sync', _lastSyncText(st, s), _lastSyncColor(context, st)),
-          ]),
-          const SizedBox(height: 14),
-          // actions
-          Wrap(spacing: 8, runSpacing: 8, children: [
-            _CBtn(keyChar: 's', label: st == _St.error ? 'retry' : 'ync',
-                primary: true, onTap: st == _St.running ? null : () => onSync(item)),
-            _CBtn(keyChar: 'e', label: 'dit', onTap: () => onEdit(item)),
-            _CBtn(keyChar: 'r', label: 'eveal', onTap: () => onReveal(item)),
-            _CBtn(keyChar: 'x', label: item.isExternal ? ' detach' : ' remove', onTap: () => onRemove(item)),
-          ]),
-          const SizedBox(height: 16),
-          _SyncLog(state: state, item: item),
-        ],
-      ),
-    );
-  }
-
-  String _lastSyncText(_St st, ConnectionSummary s) => switch (st) {
-        _St.running => 'syncing…',
-        _St.error => 'failed · ${_relTime(s.lastSyncUnix)}',
-        _St.synced => 'ok · ${_relTime(s.lastSyncUnix)}',
-        _St.never => 'never',
-      };
-
-  Color? _lastSyncColor(BuildContext ctx, _St st) {
-    final c = ConsoleColors.of(ctx);
-    return switch (st) {
-      _St.error => c.err,
-      _St.synced => c.ok,
-      _ => null,
-    };
-  }
-}
-
-class _Badge extends StatelessWidget {
-  const _Badge({required this.text});
-  final String text;
-  @override
-  Widget build(BuildContext context) {
-    final c = ConsoleColors.of(context);
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-      decoration: BoxDecoration(
-        border: Border.all(color: c.line),
-        borderRadius: BorderRadius.circular(4),
-      ),
-      child: Text(text.toUpperCase(),
-          style: TextStyle(color: c.muted, fontSize: 10, letterSpacing: 0.6)),
-    );
-  }
-}
-
-class _Kv extends StatelessWidget {
-  const _Kv({required this.rows});
-  final List<(String, String, Color?)> rows;
-  @override
-  Widget build(BuildContext context) {
-    final c = ConsoleColors.of(context);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        for (final (k, v, color) in rows)
-          Padding(
-            padding: const EdgeInsets.only(bottom: 7),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                SizedBox(
-                  width: 92,
-                  child: RichText(
-                    text: TextSpan(style: TextStyle(color: c.muted, fontSize: 13), children: [
-                      TextSpan(text: '› ', style: TextStyle(color: c.acc)),
-                      TextSpan(text: k),
-                    ]),
-                  ),
-                ),
-                const SizedBox(width: 18),
-                Expanded(
-                  child: SelectableText(v,
-                      style: TextStyle(color: color ?? c.ink, fontSize: 13)),
-                ),
-              ],
-            ),
+        SizedBox(
+          width: listWidth,
+          child: _Sidebar(state: state, onSelect: onSelect, onAdd: onAdd, onOpen: onOpen),
+        ),
+        _Resizer(onDelta: onResize),
+        Expanded(
+          child: _ConnMain(
+            state: state,
+            activeTab: activeTab,
+            onSelectTab: onSelectTab,
+            onSync: onSync,
+            onEdit: onEdit,
+            onReveal: onReveal,
+            onRemove: onRemove,
+            onAdd: onAdd,
           ),
+        ),
       ],
     );
   }
 }
 
-class _CBtn extends StatelessWidget {
-  const _CBtn({required this.keyChar, required this.label, this.primary = false, this.onTap});
-  final String keyChar;
-  final String label;
-  final bool primary;
-  final VoidCallback? onTap;
+class _Sidebar extends StatelessWidget {
+  const _Sidebar({required this.state, required this.onSelect, required this.onAdd, required this.onOpen});
+  final AppState state;
+  final void Function(String) onSelect;
+  final VoidCallback onAdd, onOpen;
 
   @override
   Widget build(BuildContext context) {
-    final c = ConsoleColors.of(context);
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(6),
-      child: Opacity(
-        opacity: onTap == null ? 0.5 : 1,
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          decoration: BoxDecoration(
-            color: primary ? c.acc.withValues(alpha: 0.08) : Colors.transparent,
-            border: Border.all(color: primary ? c.acc : c.line),
-            borderRadius: BorderRadius.circular(6),
-          ),
-          child: RichText(
-            text: TextSpan(
-              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: primary ? c.acc : c.ink),
+    final c = MdhColors.of(context);
+    return Container(
+      decoration: BoxDecoration(
+        color: c.bgSidebar,
+        border: Border(right: BorderSide(color: c.border)),
+      ),
+      child: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(14, 12, 10, 8),
+            child: Row(
               children: [
-                TextSpan(text: keyChar, style: TextStyle(color: c.acc)),
-                TextSpan(text: label),
+                Text('CONNECTIONS',
+                    style: TextStyle(color: c.textSecondary, fontSize: 11, fontWeight: FontWeight.w700, letterSpacing: 0.8)),
+                const Spacer(),
+                Tooltip(
+                  message: 'New connection',
+                  child: InkWell(
+                    onTap: onAdd,
+                    borderRadius: BorderRadius.circular(6),
+                    child: Container(
+                      width: 24,
+                      height: 24,
+                      decoration: BoxDecoration(
+                        color: c.bgCard,
+                        border: Border.all(color: c.border),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Icon(Icons.add, size: 15, color: c.textSecondary),
+                    ),
+                  ),
+                ),
               ],
             ),
+          ),
+          Expanded(
+            child: state.connections.isEmpty
+                ? Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Text('No connections yet.\nAdd one with +.',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(color: c.textSecondary, fontSize: 12)),
+                    ),
+                  )
+                : ListView(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    children: [
+                      for (final it in state.connections) _SidebarRow(state: state, item: it, onSelect: onSelect),
+                    ],
+                  ),
+          ),
+          Container(
+            decoration: BoxDecoration(border: Border(top: BorderSide(color: c.border))),
+            padding: const EdgeInsets.all(8),
+            child: _NavItem(icon: Icons.folder_open_outlined, label: 'Open existing…', onTap: onOpen),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SidebarRow extends StatelessWidget {
+  const _SidebarRow({required this.state, required this.item, required this.onSelect});
+  final AppState state;
+  final ConnItem item;
+  final void Function(String) onSelect;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    final s = item.summary;
+    final sel = s.folder == state.selectedFolder;
+    final st = _statusOf(state, item);
+    final dotColor = switch (st) {
+      _St.error => c.danger,
+      _St.never => c.textHint,
+      _ => c.successFg,
+    };
+    final sub = switch (st) {
+      _St.running => 'syncing…',
+      _St.error => 'failed',
+      _St.synced => _rel(s.lastSyncUnix),
+      _St.never => 'never',
+    };
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 1),
+      child: InkWell(
+        onTap: () => onSelect(s.folder),
+        borderRadius: BorderRadius.circular(6),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          decoration: BoxDecoration(
+            color: sel ? c.accent : Colors.transparent,
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Row(
+            children: [
+              Container(width: 7, height: 7, margin: const EdgeInsets.only(right: 10),
+                  decoration: BoxDecoration(color: sel ? Colors.white : dotColor, shape: BoxShape.circle)),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(s.name,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(color: sel ? Colors.white : c.textPrimary, fontSize: 13, fontWeight: FontWeight.w500)),
+                    const SizedBox(height: 2),
+                    Text('org ${s.orgId} · $sub${item.isExternal ? ' · ext' : ''}',
+                        overflow: TextOverflow.ellipsis,
+                        style: _mono(sel ? Colors.white70 : c.textSecondary, 11)),
+                  ],
+                ),
+              ),
+            ],
           ),
         ),
       ),
@@ -710,22 +517,179 @@ class _CBtn extends StatelessWidget {
   }
 }
 
-class _SyncLog extends StatelessWidget {
-  const _SyncLog({required this.state, required this.item});
+class _Resizer extends StatelessWidget {
+  const _Resizer({required this.onDelta});
+  final void Function(double) onDelta;
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    return MouseRegion(
+      cursor: SystemMouseCursors.resizeLeftRight,
+      child: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onHorizontalDragUpdate: (d) => onDelta(d.delta.dx),
+        child: SizedBox(width: 5, child: Center(child: Container(width: 1, color: c.border))),
+      ),
+    );
+  }
+}
+
+class _ConnMain extends StatelessWidget {
+  const _ConnMain({
+    required this.state,
+    required this.activeTab,
+    required this.onSelectTab,
+    required this.onSync,
+    required this.onEdit,
+    required this.onReveal,
+    required this.onRemove,
+    required this.onAdd,
+  });
   final AppState state;
-  final ConnItem item;
+  final String activeTab;
+  final void Function(String) onSelectTab;
+  final void Function(ConnItem) onSync, onEdit, onReveal, onRemove;
+  final VoidCallback onAdd;
 
   @override
   Widget build(BuildContext context) {
-    final c = ConsoleColors.of(context);
+    final c = MdhColors.of(context);
+    final item = state.selected;
+    if (item == null) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text('No connection selected', style: TextStyle(color: c.textSecondary)),
+            const SizedBox(height: 12),
+            _Btn(label: 'New connection', primary: true, onTap: onAdd),
+          ],
+        ),
+      );
+    }
     final st = _statusOf(state, item);
-    final msg = state.syncMessage[item.summary.folder];
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _ConnBar(state: state, item: item, onSync: onSync, onEdit: onEdit, onReveal: onReveal, onRemove: onRemove),
+        _TabBar(active: activeTab, tabs: const ['overview', 'log'], labels: const {'overview': 'Overview', 'log': 'Sync log'}, onSelect: onSelectTab),
+        Expanded(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(18),
+            child: activeTab == 'log'
+                ? _SyncLogCard(state: state, item: item, expanded: true)
+                : _OverviewPanel(state: state, item: item, st: st),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _ConnBar extends StatelessWidget {
+  const _ConnBar({required this.state, required this.item, required this.onSync, required this.onEdit, required this.onReveal, required this.onRemove});
+  final AppState state;
+  final ConnItem item;
+  final void Function(ConnItem) onSync, onEdit, onReveal, onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    final s = item.summary;
+    final st = _statusOf(state, item);
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+      decoration: BoxDecoration(
+        color: c.bgCard,
+        border: Border(bottom: BorderSide(color: c.border)),
+      ),
+      child: Row(
+        children: [
+          Flexible(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(s.name, maxLines: 1, overflow: TextOverflow.ellipsis,
+                    style: TextStyle(color: c.textPrimary, fontSize: 15, fontWeight: FontWeight.w600)),
+                const SizedBox(height: 2),
+                Text('${_host(s.apiBase)} · org ${s.orgId}', maxLines: 1, overflow: TextOverflow.ellipsis,
+                    style: _mono(c.textSecondary, 12)),
+              ],
+            ),
+          ),
+          const SizedBox(width: 12),
+          _StatusPill(st: st),
+          const Spacer(),
+          _Btn(label: st == _St.error ? 'Retry' : 'Sync', primary: true, onTap: st == _St.running ? null : () => onSync(item)),
+          const SizedBox(width: 8),
+          _Btn(label: 'Edit', onTap: () => onEdit(item)),
+          const SizedBox(width: 8),
+          _Btn(label: 'Reveal', onTap: () => onReveal(item)),
+          const SizedBox(width: 8),
+          _Btn(label: item.isExternal ? 'Detach' : 'Remove', onTap: () => onRemove(item)),
+        ],
+      ),
+    );
+  }
+}
+
+class _OverviewPanel extends StatelessWidget {
+  const _OverviewPanel({required this.state, required this.item, required this.st});
+  final AppState state;
+  final ConnItem item;
+  final _St st;
+
+  @override
+  Widget build(BuildContext context) {
+    final s = item.summary;
+    final auth = s.authKind == AuthKind.token ? 'API token' : 'Username & password';
+    final lastSync = switch (st) {
+      _St.running => 'syncing…',
+      _St.error => 'failed · ${_rel(s.lastSyncUnix)}',
+      _St.synced => 'today · ${_rel(s.lastSyncUnix)} ago',
+      _St.never => 'never',
+    };
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(children: [
+          Expanded(child: _StatCard(n: s.fileCount.toString(), l: 'Files pulled')),
+          const SizedBox(width: 12),
+          Expanded(child: _StatCard(n: st == _St.never ? '—' : _rel(s.lastSyncUnix), l: 'Last sync')),
+          const SizedBox(width: 12),
+          Expanded(child: _StatCard(n: s.authKind == AuthKind.token ? 'token' : 'login', l: 'Auth')),
+        ]),
+        _SectionTitle('Connection'),
+        Wrap(spacing: 12, runSpacing: 12, children: [
+          _SpecCard(k: 'API base', v: s.apiBase),
+          _SpecCard(k: 'Organization ID', v: s.orgId.toString()),
+          _SpecCard(k: 'Folder', v: s.folder),
+          _SpecCard(k: 'Authentication', v: auth, mono: false),
+          _SpecCard(k: 'Last sync', v: lastSync, mono: false),
+        ]),
+        _SectionTitle('Recent sync'),
+        _SyncLogCard(state: state, item: item, expanded: false),
+      ],
+    );
+  }
+}
+
+class _SyncLogCard extends StatelessWidget {
+  const _SyncLogCard({required this.state, required this.item, required this.expanded});
+  final AppState state;
+  final ConnItem item;
+  final bool expanded;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    final st = _statusOf(state, item);
     final lines = state.syncLog[item.summary.folder] ?? const <String>[];
+    final msg = state.syncMessage[item.summary.folder];
 
     Widget body;
     if (lines.isNotEmpty) {
-      // rdc's real, rendered log (ANSI-colored) — full width, scrollable,
-      // latest line in view.
       final spans = <InlineSpan>[];
       for (var k = 0; k < lines.length; k++) {
         spans.addAll(ansiSpans(lines[k], c, 12.5));
@@ -734,138 +698,421 @@ class _SyncLog extends StatelessWidget {
       body = SizedBox(
         width: double.infinity,
         child: ConstrainedBox(
-          constraints: const BoxConstraints(maxHeight: 168),
+          constraints: BoxConstraints(maxHeight: expanded ? 420 : 150),
           child: Scrollbar(
             child: SingleChildScrollView(
               reverse: true,
-              child: SelectableText.rich(
-                TextSpan(style: const TextStyle(fontSize: 12.5, height: 1.5), children: spans),
-              ),
+              child: SelectableText.rich(TextSpan(children: spans)),
             ),
           ),
         ),
       );
     } else {
-      // No live log this session: one-line summary from the current state.
-      final (String prefix, Color pc, String text, Color tc) = switch (st) {
-        _St.running => ('», ', c.acc, 'syncing…', c.ink),
-        _St.error => ('✕ ', c.err, msg ?? 'sync failed', c.err),
-        _St.synced => ('✓ ', c.ok, msg ?? 'up to date · ${_relTime(item.summary.lastSyncUnix)}', c.ok),
-        _St.never => ('— ', c.muted, 'not synced yet', c.muted),
+      final (String text, Color col) = switch (st) {
+        _St.running => ('syncing…', c.textPrimary),
+        _St.error => ('✕ ${msg ?? 'sync failed'}', c.dangerFg),
+        _St.synced => ('✓ ${msg ?? 'up to date · ${_rel(item.summary.lastSyncUnix)} ago'}', c.successFg),
+        _St.never => ('— not synced yet', c.textSecondary),
       };
-      body = SelectableText.rich(TextSpan(style: const TextStyle(fontSize: 12.5), children: [
-        TextSpan(text: prefix, style: TextStyle(color: pc)),
-        TextSpan(text: text, style: TextStyle(color: tc)),
-      ]));
+      body = SelectableText(text, style: _mono(col, 12.5));
     }
 
     return Container(
       width: double.infinity,
       decoration: BoxDecoration(
-        color: c.log,
-        border: Border.all(color: c.line),
-        borderRadius: BorderRadius.circular(8),
+        color: c.bgCode,
+        border: Border.all(color: c.borderCard),
+        borderRadius: BorderRadius.circular(6),
       ),
-      padding: const EdgeInsets.fromLTRB(13, 11, 13, 11),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text('SYNC LOG', style: TextStyle(color: c.muted, fontSize: 10.5, letterSpacing: 1)),
-              Text('pull-only', style: TextStyle(color: c.muted, fontSize: 10.5, letterSpacing: 1)),
-            ],
-          ),
-          const SizedBox(height: 8),
-          body,
-        ],
-      ),
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+      child: body,
     );
   }
 }
 
-// ------------------------------------------------------------ footer
+// ------------------------------------------------------------ fleet overview
 
-class _Footer extends StatelessWidget {
-  const _Footer();
+class _FleetView extends StatelessWidget {
+  const _FleetView({required this.state, required this.onNew, required this.onSyncAll, required this.onOpenConn});
+  final AppState state;
+  final VoidCallback onNew, onSyncAll;
+  final void Function(String) onOpenConn;
+
   @override
   Widget build(BuildContext context) {
-    final c = ConsoleColors.of(context);
-    TextSpan hint(String k, String label) => TextSpan(children: [
-          TextSpan(text: k, style: TextStyle(color: c.ink, fontWeight: FontWeight.w700)),
-          TextSpan(text: ' $label   ', style: TextStyle(color: c.muted)),
-        ]);
+    final c = MdhColors.of(context);
+    final conns = state.connections;
+    final now = DateTime.now();
+    var syncedToday = 0, files = 0, errors = 0;
+    for (final it in conns) {
+      final u = it.summary.lastSyncUnix;
+      if (u != null && now.difference(DateTime.fromMillisecondsSinceEpoch(u * 1000)).inHours < 24) {
+        syncedToday++;
+      }
+      files += it.summary.fileCount.toInt();
+      if (state.syncState[it.summary.folder] == SyncState.error) errors++;
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Container(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+          decoration: BoxDecoration(color: c.bgCard, border: Border(bottom: BorderSide(color: c.border))),
+          child: Row(children: [
+            Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+              Text('Fleet overview', style: TextStyle(color: c.textPrimary, fontSize: 15, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 2),
+              Text(state.parentFolder ?? '', style: _mono(c.textSecondary, 12)),
+            ]),
+            const Spacer(),
+            _Btn(label: 'Sync all', primary: true, onTap: conns.isEmpty ? null : onSyncAll),
+            const SizedBox(width: 8),
+            _Btn(label: 'New connection', onTap: onNew),
+          ]),
+        ),
+        Expanded(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(18),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(children: [
+                  Expanded(child: _StatCard(n: '${conns.length}', l: 'Connections')),
+                  const SizedBox(width: 12),
+                  Expanded(child: _StatCard(n: '$syncedToday', l: 'Synced today')),
+                  const SizedBox(width: 12),
+                  Expanded(child: _StatCard(n: '$errors', l: 'Needs attention', danger: errors > 0)),
+                  const SizedBox(width: 12),
+                  Expanded(child: _StatCard(n: '$files', l: 'Files pulled')),
+                ]),
+                _SectionTitle('Connections'),
+                _FleetTable(state: state, onOpenConn: onOpenConn),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _FleetTable extends StatelessWidget {
+  const _FleetTable({required this.state, required this.onOpenConn});
+  final AppState state;
+  final void Function(String) onOpenConn;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    Widget cell(Widget child, {int flex = 1}) =>
+        Expanded(flex: flex, child: Padding(padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11), child: child));
+    Widget head(String t, {int flex = 1}) => cell(
+        Text(t.toUpperCase(), style: TextStyle(color: c.textSecondary, fontSize: 10.5, fontWeight: FontWeight.w600, letterSpacing: 0.5)),
+        flex: flex);
+
+    if (state.connections.isEmpty) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(24),
+        decoration: BoxDecoration(color: c.bgCard, border: Border.all(color: c.borderCard), borderRadius: BorderRadius.circular(6)),
+        child: Center(child: Text('No connections yet.', style: TextStyle(color: c.textSecondary))),
+      );
+    }
+
     return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      decoration: BoxDecoration(
-        color: c.surf,
-        border: Border(top: BorderSide(color: c.line)),
-      ),
-      child: RichText(
-        text: TextSpan(style: const TextStyle(fontSize: 11), children: [
-          hint('j/k', 'move'),
-          hint('s', 'sync'),
-          hint('e', 'edit'),
-          hint('⌘K', 'commands'),
+      decoration: BoxDecoration(color: c.bgCard, border: Border.all(color: c.borderCard), borderRadius: BorderRadius.circular(6),
+          boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.04), blurRadius: 3, offset: const Offset(0, 1))]),
+      clipBehavior: Clip.antiAlias,
+      child: Column(children: [
+        Container(
+          decoration: BoxDecoration(color: c.bgSidebar, border: Border(bottom: BorderSide(color: c.border))),
+          child: Row(children: [head('Connection', flex: 2), head('Org'), head('Host', flex: 2), head('Files'), head('Last sync'), head('Status')]),
+        ),
+        for (var i = 0; i < state.connections.length; i++)
+          _FleetRow(state: state, item: state.connections[i], last: i == state.connections.length - 1, onOpenConn: onOpenConn, cell: cell),
+      ]),
+    );
+  }
+}
+
+class _FleetRow extends StatelessWidget {
+  const _FleetRow({required this.state, required this.item, required this.last, required this.onOpenConn, required this.cell});
+  final AppState state;
+  final ConnItem item;
+  final bool last;
+  final void Function(String) onOpenConn;
+  final Widget Function(Widget, {int flex}) cell;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    final s = item.summary;
+    final st = _statusOf(state, item);
+    final (String badge, Color bg, Color fg) = switch (st) {
+      _St.error => ('error', c.dangerBg, c.dangerFg),
+      _St.never => ('never', c.infoBg, c.infoFg),
+      _St.running => ('syncing', c.infoBg, c.infoFg),
+      _St.synced => ('synced', c.successBg, c.successFg),
+    };
+    return InkWell(
+      onTap: () => onOpenConn(s.folder),
+      child: Container(
+        decoration: BoxDecoration(border: last ? null : Border(bottom: BorderSide(color: c.border))),
+        child: Row(children: [
+          cell(Row(children: [
+            Flexible(child: Text(s.name, overflow: TextOverflow.ellipsis, style: TextStyle(color: c.textPrimary, fontSize: 12.5))),
+            if (item.isExternal) Padding(padding: const EdgeInsets.only(left: 6), child: _MiniBadge('external', c.extBg, c.extFg)),
+          ]), flex: 2),
+          cell(Text(s.orgId.toString(), style: _mono(c.textSecondary, 12)), ),
+          cell(Text(_host(s.apiBase), overflow: TextOverflow.ellipsis, style: _mono(c.textSecondary, 12)), flex: 2),
+          cell(Text(s.fileCount.toString(), style: _mono(c.textSecondary, 12))),
+          cell(Text(st == _St.never ? '—' : '${_rel(s.lastSyncUnix)} ago', style: TextStyle(color: c.textPrimary, fontSize: 12.5))),
+          cell(Align(alignment: Alignment.centerLeft, child: _MiniBadge(badge, bg, fg))),
         ]),
       ),
     );
   }
 }
 
-// ------------------------------------------------------------ empty state
+// ------------------------------------------------------------ settings
 
-class _EmptyState extends StatelessWidget {
-  const _EmptyState({required this.onChoose});
+class _SettingsView extends StatelessWidget {
+  const _SettingsView({required this.state, required this.onChooseParent, required this.onOpen, required this.onAbout, required this.onCheckUpdate});
+  final AppState state;
+  final VoidCallback onChooseParent, onOpen, onAbout, onCheckUpdate;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Container(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+          decoration: BoxDecoration(color: c.bgCard, border: Border(bottom: BorderSide(color: c.border))),
+          child: Text('Settings', style: TextStyle(color: c.textPrimary, fontSize: 15, fontWeight: FontWeight.w600)),
+        ),
+        Expanded(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(18),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              _SpecCard(k: 'Connections folder', v: state.parentFolder ?? '(not set)'),
+              const SizedBox(height: 14),
+              Wrap(spacing: 12, runSpacing: 12, children: [
+                _Btn(label: 'Change folder…', onTap: onChooseParent),
+                _Btn(label: 'Open existing project…', onTap: onOpen),
+                _Btn(label: 'Check for updates', onTap: onCheckUpdate),
+                _Btn(label: 'About rdc', onTap: onAbout),
+              ]),
+            ]),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// ------------------------------------------------------------ empty
+
+class _ChooseFolderEmpty extends StatelessWidget {
+  const _ChooseFolderEmpty({required this.onChoose});
   final VoidCallback onChoose;
   @override
   Widget build(BuildContext context) {
-    final c = ConsoleColors.of(context);
-    TextStyle mut = TextStyle(color: c.muted, fontSize: 13, height: 1.7);
+    final c = MdhColors.of(context);
     return Center(
       child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 460),
+        constraints: const BoxConstraints(maxWidth: 360),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Container(
+            width: 56, height: 56, margin: const EdgeInsets.only(bottom: 14),
+            decoration: BoxDecoration(color: c.infoBg, borderRadius: BorderRadius.circular(14)),
+            child: Icon(Icons.folder_outlined, color: c.accent, size: 26),
+          ),
+          Text('Choose a folder for your connections', style: TextStyle(color: c.textPrimary, fontSize: 16, fontWeight: FontWeight.w600)),
+          const SizedBox(height: 6),
+          Text('Each connection is a subfolder that the CLI and this app share.',
+              textAlign: TextAlign.center, style: TextStyle(color: c.textSecondary)),
+          const SizedBox(height: 18),
+          _Btn(label: 'Choose folder…', primary: true, onTap: onChoose),
+        ]),
+      ),
+    );
+  }
+}
+
+// ------------------------------------------------------------ shared bits
+
+class _Btn extends StatelessWidget {
+  const _Btn({required this.label, this.primary = false, this.onTap});
+  final String label;
+  final bool primary;
+  final VoidCallback? onTap;
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    return Opacity(
+      opacity: onTap == null ? 0.5 : 1,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(6),
         child: Container(
-          margin: const EdgeInsets.all(24),
-          padding: const EdgeInsets.all(18),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
           decoration: BoxDecoration(
-            color: c.log,
-            border: Border.all(color: c.line, style: BorderStyle.solid),
-            borderRadius: BorderRadius.circular(8),
+            color: primary ? c.accent : c.bgCard,
+            border: Border.all(color: primary ? c.accent : c.border),
+            borderRadius: BorderRadius.circular(6),
           ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              RichText(
-                text: TextSpan(style: TextStyle(fontSize: 13, height: 1.7), children: [
-                  TextSpan(text: 'rdc ▸ ', style: TextStyle(color: c.acc, fontWeight: FontWeight.w700)),
-                  TextSpan(text: 'no connections folder set', style: TextStyle(color: c.ink)),
-                ]),
-              ),
-              Text('# each connection is a subfolder the CLI shares', style: mut),
-              Text('# choose where they live:', style: mut),
-              const SizedBox(height: 12),
-              InkWell(
-                onTap: onChoose,
-                borderRadius: BorderRadius.circular(6),
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: c.acc.withValues(alpha: 0.08),
-                    border: Border.all(color: c.acc),
-                    borderRadius: BorderRadius.circular(6),
-                  ),
-                  child: Text('▸ choose folder…',
-                      style: TextStyle(color: c.acc, fontSize: 12, fontWeight: FontWeight.w600)),
-                ),
-              ),
-            ],
-          ),
+          child: Text(label, style: TextStyle(color: primary ? Colors.white : c.textPrimary, fontSize: 12.5, fontWeight: FontWeight.w600)),
         ),
       ),
+    );
+  }
+}
+
+class _StatusPill extends StatelessWidget {
+  const _StatusPill({required this.st});
+  final _St st;
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    final (String label, Color bg, Color fg, Color bd) = switch (st) {
+      _St.running => ('● syncing', c.infoBg, c.infoFg, c.infoBorder),
+      _St.error => ('✕ sync failed', c.dangerBg, c.dangerFg, c.dangerBorder),
+      _St.synced => ('● synced', c.successBg, c.successFg, c.successBorder),
+      _St.never => ('○ never synced', c.warningBg, c.warningFg, c.warningBorder),
+    };
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+      decoration: BoxDecoration(color: bg, border: Border.all(color: bd), borderRadius: BorderRadius.circular(999)),
+      child: Text(label, style: TextStyle(color: fg, fontSize: 11, fontWeight: FontWeight.w600)),
+    );
+  }
+}
+
+class _TabBar extends StatelessWidget {
+  const _TabBar({required this.active, required this.tabs, required this.labels, required this.onSelect});
+  final String active;
+  final List<String> tabs;
+  final Map<String, String> labels;
+  final void Function(String) onSelect;
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    return Container(
+      decoration: BoxDecoration(color: c.bgCard, border: Border(bottom: BorderSide(color: c.border))),
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      child: Row(children: [
+        for (final t in tabs)
+          InkWell(
+            onTap: () => onSelect(t),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+              decoration: BoxDecoration(
+                border: Border(bottom: BorderSide(color: t == active ? c.accent : Colors.transparent, width: 2)),
+              ),
+              child: Text(labels[t] ?? t,
+                  style: TextStyle(color: t == active ? c.accent : c.textSecondary, fontSize: 12.5, fontWeight: FontWeight.w600)),
+            ),
+          ),
+      ]),
+    );
+  }
+}
+
+class _StatCard extends StatelessWidget {
+  const _StatCard({required this.n, required this.l, this.danger = false});
+  final String n, l;
+  final bool danger;
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    return Container(
+      padding: const EdgeInsets.fromLTRB(15, 14, 15, 15),
+      decoration: BoxDecoration(
+        color: c.bgCard, border: Border.all(color: c.borderCard), borderRadius: BorderRadius.circular(6),
+        boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.04), blurRadius: 3, offset: const Offset(0, 1))],
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(n, style: TextStyle(color: danger ? c.danger : c.textPrimary, fontSize: 26, fontWeight: FontWeight.w700, letterSpacing: -0.5)),
+        const SizedBox(height: 7),
+        Text(l.toUpperCase(), style: TextStyle(color: c.textSecondary, fontSize: 11, fontWeight: FontWeight.w600, letterSpacing: 0.5)),
+      ]),
+    );
+  }
+}
+
+class _SpecCard extends StatelessWidget {
+  const _SpecCard({required this.k, required this.v, this.mono = true});
+  final String k, v;
+  final bool mono;
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    return Container(
+      width: 260,
+      padding: const EdgeInsets.fromLTRB(15, 13, 15, 14),
+      decoration: BoxDecoration(
+        color: c.bgCard, border: Border.all(color: c.borderCard), borderRadius: BorderRadius.circular(6),
+        boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.04), blurRadius: 3, offset: const Offset(0, 1))],
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(k.toUpperCase(), style: TextStyle(color: c.textSecondary, fontSize: 10.5, fontWeight: FontWeight.w600, letterSpacing: 0.5)),
+        const SizedBox(height: 8),
+        SelectableText(v, style: mono ? _mono(c.textPrimary, 13) : TextStyle(color: c.textPrimary, fontSize: 13)),
+      ]),
+    );
+  }
+}
+
+class _SectionTitle extends StatelessWidget {
+  const _SectionTitle(this.text);
+  final String text;
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(0, 20, 0, 10),
+      child: Text(text.toUpperCase(),
+          style: TextStyle(color: c.textSecondary, fontSize: 11, fontWeight: FontWeight.w700, letterSpacing: 0.7)),
+    );
+  }
+}
+
+class _NavItem extends StatelessWidget {
+  const _NavItem({required this.icon, required this.label, required this.onTap});
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(6),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        child: Row(children: [
+          Icon(icon, size: 16, color: c.textSecondary),
+          const SizedBox(width: 9),
+          Text(label, style: TextStyle(color: c.textSecondary, fontSize: 12.5, fontWeight: FontWeight.w500)),
+        ]),
+      ),
+    );
+  }
+}
+
+class _MiniBadge extends StatelessWidget {
+  const _MiniBadge(this.text, this.bg, this.fg);
+  final String text;
+  final Color bg, fg;
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(999)),
+      child: Text(text, style: TextStyle(color: fg, fontSize: 10.5, fontWeight: FontWeight.w600)),
     );
   }
 }

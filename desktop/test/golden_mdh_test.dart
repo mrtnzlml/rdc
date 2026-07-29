@@ -1,9 +1,9 @@
-// Renders the Console UI to PNGs for visual fidelity checks against the
-// approved design. Run: flutter test --update-goldens test/golden_console_test.dart
+// Renders the MDH-style UI to PNGs for visual fidelity checks against the
+// approved proposal. Run: flutter test --update-goldens test/golden_mdh_test.dart
 import 'package:desktop/src/app.dart';
 import 'package:desktop/src/app_state.dart';
-import 'package:desktop/src/console_theme.dart';
 import 'package:desktop/src/home_page.dart';
+import 'package:desktop/src/mdh_theme.dart';
 import 'package:desktop/src/rust/api/rdc.dart';
 import 'package:desktop/src/settings.dart';
 import 'package:flutter/material.dart';
@@ -17,7 +17,7 @@ ConnItem _conn(String name, int org,
       name: name,
       apiBase: 'https://acme.rossum.app/api/v1',
       orgId: BigInt.from(org),
-      folder: '/tmp/$name',
+      folder: '/tmp/Rossum/$name',
       authKind: AuthKind.token,
       lastSyncUnix: lastSync,
       fileCount: BigInt.from(files),
@@ -27,18 +27,17 @@ ConnItem _conn(String name, int org,
 }
 
 AppState _seeded() {
-  final s = AppState(Settings());
+  final s = AppState(Settings(parentFolder: '/tmp/Rossum'));
   s.connections = [
     _conn('acme-invoices', 123456, lastSync: 1000, files: 128),
     _conn('acme-orders', 123457),
     _conn('globex-dev', 654321, files: 210),
     _conn('widgets-eu', 778899, external: true, lastSync: 1000, files: 302),
   ];
-  s.selectedFolder = '/tmp/acme-invoices';
-  s.syncState['/tmp/globex-dev'] = SyncState.error;
-  s.syncMessage['/tmp/globex-dev'] = "couldn't sign in (401)";
-  // ANSI-colored lines, exactly as rdc emits them (ColorMode::Color).
-  s.syncLog['/tmp/acme-invoices'] = [
+  s.selectedFolder = '/tmp/Rossum/acme-invoices';
+  s.syncState['/tmp/Rossum/globex-dev'] = SyncState.error;
+  s.syncMessage['/tmp/Rossum/globex-dev'] = "couldn't sign in (401)";
+  s.syncLog['/tmp/Rossum/acme-invoices'] = [
     '\x1B[2m14:12:03\x1B[0m \x1B[38;2;120;180;90mPULL\x1B[0m   schemas … 12 ok',
     '\x1B[2m14:12:05\x1B[0m \x1B[38;2;120;180;90mPULL\x1B[0m   hooks … 8 ok',
     '\x1B[2m14:12:07\x1B[0m \x1B[1;38;2;237;142;71mWRITE\x1B[0m  queues … 3 ok',
@@ -49,13 +48,13 @@ AppState _seeded() {
 
 Widget _wrap(Brightness b, Widget child) => MaterialApp(
       debugShowCheckedModeBanner: false,
-      theme: consoleTheme(b),
+      theme: mdhTheme(b),
       home: Scaffold(body: child),
     );
 
 void main() {
   Future<void> shot(WidgetTester t, Widget w, String file,
-      {Size size = const Size(1000, 640)}) async {
+      {Size size = const Size(1080, 660)}) async {
     t.view.physicalSize = size;
     t.view.devicePixelRatio = 1.0;
     addTearDown(t.view.resetPhysicalSize);
@@ -66,16 +65,18 @@ void main() {
   }
 
   testWidgets('empty state', (t) async {
-    await shot(t, RdcApp(state: AppState(Settings())), 'goldens/empty_light.png',
-        size: const Size(900, 600));
-    expect(find.textContaining('choose folder'), findsOneWidget);
+    await shot(t, RdcApp(state: AppState(Settings())), 'goldens/mdh_empty.png', size: const Size(900, 560));
   });
 
-  testWidgets('main — light', (t) async {
-    await shot(t, _wrap(Brightness.light, ConsoleMain(state: _seeded())), 'goldens/main_light.png');
+  testWidgets('connection view — light', (t) async {
+    await shot(t, _wrap(Brightness.light, MdhScaffold(state: _seeded(), view: RailView.connections)), 'goldens/mdh_conn_light.png');
   });
 
-  testWidgets('main — dark', (t) async {
-    await shot(t, _wrap(Brightness.dark, ConsoleMain(state: _seeded())), 'goldens/main_dark.png');
+  testWidgets('connection view — dark', (t) async {
+    await shot(t, _wrap(Brightness.dark, MdhScaffold(state: _seeded(), view: RailView.connections)), 'goldens/mdh_conn_dark.png');
+  });
+
+  testWidgets('fleet overview — light', (t) async {
+    await shot(t, _wrap(Brightness.light, MdhScaffold(state: _seeded(), view: RailView.overview)), 'goldens/mdh_fleet_light.png');
   });
 }
