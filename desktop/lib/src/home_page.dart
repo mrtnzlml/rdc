@@ -551,7 +551,7 @@ class _Record extends StatelessWidget {
     final item = state.selected;
     if (item == null) {
       return Center(
-        child: Text('rdc ▸ select a connection', style: TextStyle(color: c.muted, fontSize: 13)),
+        child: Text('rdc ▸ ⌘K to add a connection', style: TextStyle(color: c.muted, fontSize: 13)),
       );
     }
     final s = item.summary;

@@ -94,6 +94,10 @@ class AppState extends ChangeNotifier {
         !connections.any((c) => c.summary.folder == selectedFolder)) {
       selectedFolder = null;
     }
+    // Always keep a connection selected when there is one.
+    if (selectedFolder == null && connections.isNotEmpty) {
+      selectedFolder = connections.first.summary.folder;
+    }
     loading = false;
     notifyListeners();
   }
