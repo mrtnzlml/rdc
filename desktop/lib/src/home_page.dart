@@ -13,7 +13,8 @@ import 'update_check.dart';
 
 // ------------------------------------------------------------ helpers
 
-enum RailView { connections, overview, settings }
+/// Which pane the main area shows. Selected from the sidebar (there is no rail).
+enum NavView { connection, overview, settings }
 
 enum _St { running, error, synced, never }
 
@@ -44,6 +45,14 @@ String _host(String apiBase) {
   return slash >= 0 ? s.substring(0, slash) : s;
 }
 
+String _fmtSize(int b) {
+  if (b < 1024) return '$b B';
+  final kb = b / 1024;
+  if (kb < 1024) return '${kb.toStringAsFixed(kb < 10 ? 1 : 0)} KB';
+  final mb = kb / 1024;
+  return '${mb.toStringAsFixed(mb < 10 ? 1 : 0)} MB';
+}
+
 TextStyle _mono(Color color, double size, [FontWeight w = FontWeight.w400]) =>
     TextStyle(color: color, fontSize: size, fontWeight: w,
         fontFamily: kMonoFamily, fontFamilyFallback: kMonoFallback);
@@ -59,7 +68,7 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   AppState get state => widget.state;
-  RailView _rail = RailView.connections;
+  NavView _view = NavView.connection;
   double _listWidth = 250;
   String _tab = 'overview';
 
@@ -138,16 +147,17 @@ class _HomePageState extends State<HomePage> {
         listenable: state,
         builder: (context, _) => MdhScaffold(
           state: state,
-          view: _rail,
+          view: _view,
           listWidth: _listWidth,
           activeTab: _tab,
-          onSelectRail: (v) => setState(() => _rail = v),
           onResize: (dx) => setState(() => _listWidth = (_listWidth + dx).clamp(200.0, 460.0)),
           onSelectTab: (t) => setState(() => _tab = t),
           onSelectConn: (folder) => setState(() {
             state.select(folder);
-            _rail = RailView.connections;
+            _view = NavView.connection;
           }),
+          onSelectFleet: () => setState(() => _view = NavView.overview),
+          onSelectSettings: () => setState(() => _view = NavView.settings),
           onAdd: _addConnection,
           onOpen: _openExisting,
           onSync: (i) => state.sync(i),
@@ -155,6 +165,7 @@ class _HomePageState extends State<HomePage> {
           onEdit: _editConnection,
           onReveal: _reveal,
           onRemove: _confirmRemove,
+          onRevealDir: (path) => _run(() => state.reveal(path)),
           onChooseParent: _chooseParent,
           onAbout: _about,
           onCheckUpdate: () async {
@@ -175,19 +186,21 @@ class _HomePageState extends State<HomePage> {
 
 // ------------------------------------------------------------ shell
 
-/// The MDH-style shell: a rail + the active view. Public and callback-driven so
-/// it renders in golden tests from seeded state, with no bridge dependence.
+/// The MDH-style shell: one persistent sidebar + the active pane. Public and
+/// callback-driven so it renders in golden tests from seeded state, with no
+/// bridge dependence.
 class MdhScaffold extends StatelessWidget {
   const MdhScaffold({
     super.key,
     required this.state,
-    this.view = RailView.connections,
+    this.view = NavView.connection,
     this.listWidth = 250,
     this.activeTab = 'overview',
-    this.onSelectRail,
     this.onResize,
     this.onSelectTab,
     this.onSelectConn,
+    this.onSelectFleet,
+    this.onSelectSettings,
     this.onAdd,
     this.onOpen,
     this.onSync,
@@ -195,19 +208,21 @@ class MdhScaffold extends StatelessWidget {
     this.onEdit,
     this.onReveal,
     this.onRemove,
+    this.onRevealDir,
     this.onChooseParent,
     this.onAbout,
     this.onCheckUpdate,
   });
 
   final AppState state;
-  final RailView view;
+  final NavView view;
   final double listWidth;
   final String activeTab;
-  final void Function(RailView)? onSelectRail;
   final void Function(double)? onResize;
   final void Function(String)? onSelectTab;
   final void Function(String folder)? onSelectConn;
+  final VoidCallback? onSelectFleet;
+  final VoidCallback? onSelectSettings;
   final VoidCallback? onAdd;
   final VoidCallback? onOpen;
   final void Function(ConnItem)? onSync;
@@ -215,6 +230,7 @@ class MdhScaffold extends StatelessWidget {
   final void Function(ConnItem)? onEdit;
   final void Function(ConnItem)? onReveal;
   final void Function(ConnItem)? onRemove;
+  final void Function(String path)? onRevealDir;
   final VoidCallback? onChooseParent;
   final VoidCallback? onAbout;
   final VoidCallback? onCheckUpdate;
@@ -222,175 +238,83 @@ class MdhScaffold extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = MdhColors.of(context);
-    final noParent = state.parentFolder == null;
 
-    Widget content;
-    if (noParent) {
-      content = _ChooseFolderEmpty(onChoose: onChooseParent ?? () {});
-    } else {
-      content = switch (view) {
-        RailView.connections => _ConnectionsView(
-            state: state,
-            listWidth: listWidth,
-            activeTab: activeTab,
-            onResize: onResize ?? (_) {},
-            onSelectTab: onSelectTab ?? (_) {},
-            onSelect: (f) => state.select(f),
-            onAdd: onAdd ?? () {},
-            onOpen: onOpen ?? () {},
-            onSync: onSync ?? (_) {},
-            onEdit: onEdit ?? (_) {},
-            onReveal: onReveal ?? (_) {},
-            onRemove: onRemove ?? (_) {},
-          ),
-        RailView.overview => _FleetView(
-            state: state,
-            onNew: onAdd ?? () {},
-            onSyncAll: onSyncAll ?? () {},
-            onOpenConn: onSelectConn ?? (_) {},
-          ),
-        RailView.settings => _SettingsView(
-            state: state,
-            onChooseParent: onChooseParent ?? () {},
-            onOpen: onOpen ?? () {},
-            onAbout: onAbout ?? () {},
-            onCheckUpdate: onCheckUpdate ?? () {},
-          ),
-      };
+    // No connections folder yet → full-screen onboarding, no sidebar.
+    if (state.parentFolder == null) {
+      return Container(
+        color: c.bgBase,
+        child: _ChooseFolderEmpty(onChoose: onChooseParent ?? () {}),
+      );
     }
+
+    final main = switch (view) {
+      NavView.connection => _ConnMain(
+          state: state,
+          activeTab: activeTab,
+          onSelectTab: onSelectTab ?? (_) {},
+          onSync: onSync ?? (_) {},
+          onEdit: onEdit ?? (_) {},
+          onReveal: onReveal ?? (_) {},
+          onRemove: onRemove ?? (_) {},
+          onRevealDir: onRevealDir ?? (_) {},
+          onAdd: onAdd ?? () {},
+        ),
+      NavView.overview => _FleetView(
+          state: state,
+          onNew: onAdd ?? () {},
+          onSyncAll: onSyncAll ?? () {},
+          onOpenConn: onSelectConn ?? (_) {},
+        ),
+      NavView.settings => _SettingsView(
+          state: state,
+          onChooseParent: onChooseParent ?? () {},
+          onOpen: onOpen ?? () {},
+          onAbout: onAbout ?? () {},
+          onCheckUpdate: onCheckUpdate ?? () {},
+        ),
+    };
 
     return Container(
       color: c.bgBase,
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          _Rail(active: view, onSelect: onSelectRail ?? (_) {}),
-          Expanded(child: content),
-        ],
-      ),
-    );
-  }
-}
-
-// ------------------------------------------------------------ rail
-
-class _Rail extends StatelessWidget {
-  const _Rail({required this.active, required this.onSelect});
-  final RailView active;
-  final void Function(RailView) onSelect;
-
-  @override
-  Widget build(BuildContext context) {
-    final c = MdhColors.of(context);
-    Widget item(RailView v, IconData icon, String tip) {
-      final on = v == active;
-      return Padding(
-        padding: const EdgeInsets.symmetric(vertical: 3),
-        child: Tooltip(
-          message: tip,
-          child: InkWell(
-            onTap: () => onSelect(v),
-            borderRadius: BorderRadius.circular(8),
-            child: Container(
-              width: 34,
-              height: 34,
-              decoration: BoxDecoration(
-                color: on ? c.accent : Colors.transparent,
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Icon(icon, size: 18, color: on ? Colors.white : c.textSecondary),
+          SizedBox(
+            width: listWidth,
+            child: _Sidebar(
+              state: state,
+              view: view,
+              onSelect: onSelectConn ?? (_) {},
+              onSelectFleet: onSelectFleet ?? () {},
+              onSelectSettings: onSelectSettings ?? () {},
+              onAdd: onAdd ?? () {},
+              onOpen: onOpen ?? () {},
             ),
           ),
-        ),
-      );
-    }
-
-    return Container(
-      width: 52,
-      decoration: BoxDecoration(
-        color: c.bgSidebar,
-        border: Border(right: BorderSide(color: c.border)),
-      ),
-      padding: const EdgeInsets.symmetric(vertical: 10),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.center,
-        children: [
-          Container(
-            width: 32,
-            height: 32,
-            margin: const EdgeInsets.only(bottom: 8),
-            decoration: BoxDecoration(color: c.accent, borderRadius: BorderRadius.circular(8)),
-            alignment: Alignment.center,
-            child: Text('rdc', style: _mono(Colors.white, 11, FontWeight.w700)),
-          ),
-          item(RailView.connections, Icons.dns_outlined, 'Connections'),
-          item(RailView.overview, Icons.dashboard_outlined, 'Fleet overview'),
-          const Spacer(),
-          item(RailView.settings, Icons.settings_outlined, 'Settings'),
+          _Resizer(onDelta: onResize ?? (_) {}),
+          Expanded(child: main),
         ],
       ),
     );
   }
 }
 
-// ------------------------------------------------------------ connections view
-
-class _ConnectionsView extends StatelessWidget {
-  const _ConnectionsView({
-    required this.state,
-    required this.listWidth,
-    required this.activeTab,
-    required this.onResize,
-    required this.onSelectTab,
-    required this.onSelect,
-    required this.onAdd,
-    required this.onOpen,
-    required this.onSync,
-    required this.onEdit,
-    required this.onReveal,
-    required this.onRemove,
-  });
-  final AppState state;
-  final double listWidth;
-  final String activeTab;
-  final void Function(double) onResize;
-  final void Function(String) onSelectTab;
-  final void Function(String) onSelect;
-  final VoidCallback onAdd, onOpen;
-  final void Function(ConnItem) onSync, onEdit, onReveal, onRemove;
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        SizedBox(
-          width: listWidth,
-          child: _Sidebar(state: state, onSelect: onSelect, onAdd: onAdd, onOpen: onOpen),
-        ),
-        _Resizer(onDelta: onResize),
-        Expanded(
-          child: _ConnMain(
-            state: state,
-            activeTab: activeTab,
-            onSelectTab: onSelectTab,
-            onSync: onSync,
-            onEdit: onEdit,
-            onReveal: onReveal,
-            onRemove: onRemove,
-            onAdd: onAdd,
-          ),
-        ),
-      ],
-    );
-  }
-}
+// ------------------------------------------------------------ sidebar
 
 class _Sidebar extends StatelessWidget {
-  const _Sidebar({required this.state, required this.onSelect, required this.onAdd, required this.onOpen});
+  const _Sidebar({
+    required this.state,
+    required this.view,
+    required this.onSelect,
+    required this.onSelectFleet,
+    required this.onSelectSettings,
+    required this.onAdd,
+    required this.onOpen,
+  });
   final AppState state;
+  final NavView view;
   final void Function(String) onSelect;
-  final VoidCallback onAdd, onOpen;
+  final VoidCallback onSelectFleet, onSelectSettings, onAdd, onOpen;
 
   @override
   Widget build(BuildContext context) {
@@ -402,8 +326,44 @@ class _Sidebar extends StatelessWidget {
       ),
       child: Column(
         children: [
+          // brand + settings
           Padding(
-            padding: const EdgeInsets.fromLTRB(14, 12, 10, 8),
+            padding: const EdgeInsets.fromLTRB(14, 12, 8, 8),
+            child: Row(
+              children: [
+                Text('rdc', style: TextStyle(color: c.accent, fontSize: 16, fontWeight: FontWeight.w800, letterSpacing: -0.3)),
+                const Spacer(),
+                Tooltip(
+                  message: 'Settings',
+                  child: InkWell(
+                    onTap: onSelectSettings,
+                    borderRadius: BorderRadius.circular(6),
+                    child: Container(
+                      width: 28,
+                      height: 28,
+                      decoration: BoxDecoration(
+                        color: view == NavView.settings ? c.accent : Colors.transparent,
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Icon(Icons.settings_outlined, size: 17,
+                          color: view == NavView.settings ? Colors.white : c.textSecondary),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: _NavItem(
+              icon: Icons.dashboard_outlined,
+              label: 'Fleet overview',
+              selected: view == NavView.overview,
+              onTap: onSelectFleet,
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(14, 14, 10, 6),
             child: Row(
               children: [
                 Text('CONNECTIONS',
@@ -442,7 +402,8 @@ class _Sidebar extends StatelessWidget {
                 : ListView(
                     padding: const EdgeInsets.symmetric(horizontal: 8),
                     children: [
-                      for (final it in state.connections) _SidebarRow(state: state, item: it, onSelect: onSelect),
+                      for (final it in state.connections)
+                        _SidebarRow(state: state, item: it, active: view == NavView.connection, onSelect: onSelect),
                     ],
                   ),
           ),
@@ -458,16 +419,17 @@ class _Sidebar extends StatelessWidget {
 }
 
 class _SidebarRow extends StatelessWidget {
-  const _SidebarRow({required this.state, required this.item, required this.onSelect});
+  const _SidebarRow({required this.state, required this.item, required this.active, required this.onSelect});
   final AppState state;
   final ConnItem item;
+  final bool active;
   final void Function(String) onSelect;
 
   @override
   Widget build(BuildContext context) {
     final c = MdhColors.of(context);
     final s = item.summary;
-    final sel = s.folder == state.selectedFolder;
+    final sel = active && s.folder == state.selectedFolder;
     final st = _statusOf(state, item);
     final dotColor = switch (st) {
       _St.error => c.danger,
@@ -534,6 +496,8 @@ class _Resizer extends StatelessWidget {
   }
 }
 
+// ------------------------------------------------------------ connection pane
+
 class _ConnMain extends StatelessWidget {
   const _ConnMain({
     required this.state,
@@ -543,12 +507,14 @@ class _ConnMain extends StatelessWidget {
     required this.onEdit,
     required this.onReveal,
     required this.onRemove,
+    required this.onRevealDir,
     required this.onAdd,
   });
   final AppState state;
   final String activeTab;
   final void Function(String) onSelectTab;
   final void Function(ConnItem) onSync, onEdit, onReveal, onRemove;
+  final void Function(String) onRevealDir;
   final VoidCallback onAdd;
 
   @override
@@ -572,14 +538,32 @@ class _ConnMain extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _ConnBar(state: state, item: item, onSync: onSync, onEdit: onEdit, onReveal: onReveal, onRemove: onRemove),
-        _TabBar(active: activeTab, tabs: const ['overview', 'log'], labels: const {'overview': 'Overview', 'log': 'Sync log'}, onSelect: onSelectTab),
+        _TabBar(
+          active: activeTab,
+          tabs: const ['overview', 'log', 'files'],
+          labels: const {'overview': 'Overview', 'log': 'Sync log', 'files': 'Files'},
+          onSelect: onSelectTab,
+        ),
         Expanded(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(18),
-            child: activeTab == 'log'
-                ? _SyncLogCard(state: state, item: item, expanded: true)
-                : _OverviewPanel(state: state, item: item, st: st),
-          ),
+          child: switch (activeTab) {
+            'files' => Padding(
+                padding: const EdgeInsets.all(18),
+                child: _FilesPanel(
+                  key: ValueKey('files:${item.summary.folder}'),
+                  rootFolder: item.summary.folder,
+                  revision: item.summary.fileCount.toInt(),
+                  onRevealDir: onRevealDir,
+                ),
+              ),
+            'log' => SingleChildScrollView(
+                padding: const EdgeInsets.all(18),
+                child: _SyncLogCard(state: state, item: item, expanded: true),
+              ),
+            _ => SingleChildScrollView(
+                padding: const EdgeInsets.all(18),
+                child: _OverviewPanel(state: state, item: item, st: st),
+              ),
+          },
         ),
       ],
     );
@@ -726,6 +710,202 @@ class _SyncLogCard extends StatelessWidget {
       ),
       padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
       child: body,
+    );
+  }
+}
+
+// ------------------------------------------------------------ files pane
+
+class _FEntry {
+  const _FEntry({required this.name, required this.isDir, required this.size, required this.count});
+  final String name;
+  final bool isDir;
+  final int size; // bytes, files only
+  final int count; // child entries, dirs only
+}
+
+/// Finder-style browser of a connection's folder on disk. Reads directly with
+/// dart:io (the folder is the CLI's own snapshot), navigating into subfolders
+/// with a Back button and a clickable breadcrumb. Dotfiles are hidden.
+class _FilesPanel extends StatefulWidget {
+  const _FilesPanel({super.key, required this.rootFolder, required this.revision, required this.onRevealDir});
+  final String rootFolder;
+  final int revision; // reload trigger (grows after a sync)
+  final void Function(String absPath) onRevealDir;
+  @override
+  State<_FilesPanel> createState() => _FilesPanelState();
+}
+
+class _FilesPanelState extends State<_FilesPanel> {
+  List<String> _crumbs = [];
+  List<_FEntry> _entries = const [];
+  String? _error;
+
+  String get _sep => Platform.pathSeparator;
+  String get _absPath => [widget.rootFolder, ..._crumbs].join(_sep);
+
+  @override
+  void initState() {
+    super.initState();
+    _readInto();
+  }
+
+  @override
+  void didUpdateWidget(covariant _FilesPanel old) {
+    super.didUpdateWidget(old);
+    if (old.rootFolder != widget.rootFolder) {
+      _crumbs = [];
+      _readInto();
+    } else if (old.revision != widget.revision) {
+      _readInto();
+    }
+  }
+
+  bool _hidden(String name) => name.startsWith('.');
+
+  void _readInto() {
+    try {
+      final list = Directory(_absPath).listSync(followLinks: false);
+      final out = <_FEntry>[];
+      for (final e in list) {
+        final name = e.path.split(_sep).last;
+        if (_hidden(name)) continue;
+        if (e is Directory) {
+          var n = 0;
+          try {
+            n = e.listSync(followLinks: false).where((x) => !_hidden(x.path.split(_sep).last)).length;
+          } catch (_) {}
+          out.add(_FEntry(name: name, isDir: true, size: 0, count: n));
+        } else if (e is File) {
+          var sz = 0;
+          try {
+            sz = e.lengthSync();
+          } catch (_) {}
+          out.add(_FEntry(name: name, isDir: false, size: sz, count: 0));
+        }
+      }
+      out.sort((a, b) =>
+          a.isDir != b.isDir ? (a.isDir ? -1 : 1) : a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+      _entries = out;
+      _error = null;
+    } catch (e) {
+      _entries = const [];
+      _error = errorText(e);
+    }
+  }
+
+  void _go(List<String> crumbs) => setState(() {
+        _crumbs = crumbs;
+        _readInto();
+      });
+
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    final rootName = widget.rootFolder.split(_sep).last;
+    final segs = [rootName, ..._crumbs];
+
+    final crumbs = <Widget>[];
+    for (var i = 0; i < segs.length; i++) {
+      final cur = i == segs.length - 1;
+      crumbs.add(InkWell(
+        onTap: cur ? null : () => _go(_crumbs.sublist(0, i)),
+        borderRadius: BorderRadius.circular(4),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+          child: Text(segs[i], style: _mono(cur ? c.textPrimary : c.textSecondary, 12.5, cur ? FontWeight.w600 : FontWeight.w400)),
+        ),
+      ));
+      if (!cur) crumbs.add(Padding(padding: const EdgeInsets.symmetric(horizontal: 3), child: Text('›', style: _mono(c.textHint, 12.5))));
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Opacity(
+              opacity: _crumbs.isEmpty ? 0.45 : 1,
+              child: InkWell(
+                onTap: _crumbs.isEmpty ? null : () => _go(_crumbs.sublist(0, _crumbs.length - 1)),
+                borderRadius: BorderRadius.circular(6),
+                child: Container(
+                  width: 28,
+                  height: 28,
+                  decoration: BoxDecoration(color: c.bgCard, border: Border.all(color: c.border), borderRadius: BorderRadius.circular(6)),
+                  child: Icon(Icons.chevron_left, size: 19, color: c.textPrimary),
+                ),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(child: Wrap(crossAxisAlignment: WrapCrossAlignment.center, children: crumbs)),
+            const SizedBox(width: 10),
+            _Btn(label: 'Reveal in Finder', onTap: () => widget.onRevealDir(_absPath)),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Expanded(
+          child: Container(
+            decoration: BoxDecoration(
+              color: c.bgCard,
+              border: Border.all(color: c.borderCard),
+              borderRadius: BorderRadius.circular(6),
+              boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.04), blurRadius: 3, offset: const Offset(0, 1))],
+            ),
+            clipBehavior: Clip.antiAlias,
+            child: Column(
+              children: [
+                Container(
+                  decoration: BoxDecoration(color: c.bgSidebar, border: Border(bottom: BorderSide(color: c.border))),
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
+                  child: Row(children: [
+                    Expanded(child: Text('NAME', style: TextStyle(color: c.textSecondary, fontSize: 10.5, fontWeight: FontWeight.w600, letterSpacing: 0.5))),
+                    Text('SIZE', style: TextStyle(color: c.textSecondary, fontSize: 10.5, fontWeight: FontWeight.w600, letterSpacing: 0.5)),
+                  ]),
+                ),
+                Expanded(child: _list(c)),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _list(MdhColors c) {
+    if (_error != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: SelectableText("Couldn't read this folder.\n$_error",
+              textAlign: TextAlign.center, style: TextStyle(color: c.textSecondary, fontSize: 12.5)),
+        ),
+      );
+    }
+    if (_entries.isEmpty) {
+      return Center(child: Text('This folder is empty.', style: TextStyle(color: c.textSecondary, fontSize: 12.5)));
+    }
+    return ListView.builder(
+      itemCount: _entries.length,
+      itemBuilder: (context, i) {
+        final e = _entries[i];
+        final last = i == _entries.length - 1;
+        return InkWell(
+          onTap: e.isDir ? () => _go([..._crumbs, e.name]) : null,
+          child: Container(
+            decoration: BoxDecoration(border: last ? null : Border(bottom: BorderSide(color: c.border))),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
+            child: Row(children: [
+              Icon(e.isDir ? Icons.folder_rounded : Icons.insert_drive_file_outlined,
+                  size: 18, color: e.isDir ? c.accent : c.textSecondary),
+              const SizedBox(width: 12),
+              Expanded(child: Text(e.name, overflow: TextOverflow.ellipsis, style: _mono(c.textPrimary, 13, FontWeight.w500))),
+              const SizedBox(width: 12),
+              Text(e.isDir ? '${e.count} item${e.count == 1 ? '' : 's'}' : _fmtSize(e.size), style: _mono(c.textHint, 12)),
+            ]),
+          ),
+        );
+      },
     );
   }
 }
@@ -1081,22 +1261,28 @@ class _SectionTitle extends StatelessWidget {
 }
 
 class _NavItem extends StatelessWidget {
-  const _NavItem({required this.icon, required this.label, required this.onTap});
+  const _NavItem({required this.icon, required this.label, required this.onTap, this.selected = false});
   final IconData icon;
   final String label;
   final VoidCallback onTap;
+  final bool selected;
   @override
   Widget build(BuildContext context) {
     final c = MdhColors.of(context);
+    final fg = selected ? Colors.white : c.textSecondary;
     return InkWell(
       onTap: onTap,
       borderRadius: BorderRadius.circular(6),
-      child: Padding(
+      child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        decoration: BoxDecoration(
+          color: selected ? c.accent : Colors.transparent,
+          borderRadius: BorderRadius.circular(6),
+        ),
         child: Row(children: [
-          Icon(icon, size: 16, color: c.textSecondary),
+          Icon(icon, size: 16, color: fg),
           const SizedBox(width: 9),
-          Text(label, style: TextStyle(color: c.textSecondary, fontSize: 12.5, fontWeight: FontWeight.w500)),
+          Text(label, style: TextStyle(color: fg, fontSize: 12.5, fontWeight: FontWeight.w500)),
         ]),
       ),
     );
