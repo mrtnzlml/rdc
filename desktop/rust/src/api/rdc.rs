@@ -1,8 +1,9 @@
 //! FRB bridge from the Flutter desktop app ("Rossum Local") into the rdc core.
 //!
-//! Mirrors the retired `rdc-ffi` (UniFFI) surface 1:1 and re-uses rdc's own
-//! file/credential/sync helpers — this crate adds no new credential or sync
-//! logic. Only the FFI glue differs (StreamSink progress + anyhow errors).
+//! Exposes projects that group multiple environments (e.g. dev/test/prod),
+//! each syncable independently, and re-uses rdc's own file/credential/sync
+//! helpers — this crate adds no new credential or sync logic. Only the FFI
+//! glue differs (StreamSink progress + anyhow errors).
 
 use crate::discover::{self, AuthKindRaw, Project};
 use anyhow::{anyhow, Result};
@@ -262,6 +263,10 @@ pub fn edit_project(
 /// Pull-only sync of one environment. Scaffolds init files, resolves the token
 /// (silent re-login in password mode), then runs `sync_no_push`. Progress is
 /// streamed as `SyncPhase`.
+///
+/// Returns `Ok(())` even when the sync itself fails — the terminal outcome
+/// (success or error) is conveyed to the caller via the `SyncPhase::Done` /
+/// `SyncPhase::Error` stream events, not via this function's `Result`.
 pub fn sync_env(
     folder: String,
     env: String,

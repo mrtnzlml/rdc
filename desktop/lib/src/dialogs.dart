@@ -225,7 +225,7 @@ class _AddConnectionDialogState extends State<AddConnectionDialog> {
   @override
   Widget build(BuildContext context) {
     return _Frame(
-      title: 'New connection',
+      title: 'New project',
       primaryLabel: 'Create',
       busy: _busy,
       onPrimary: _submit,
@@ -311,7 +311,7 @@ class _EditConnectionDialogState extends State<EditConnectionDialog> {
   Widget build(BuildContext context) {
     final c = MdhColors.of(context);
     return _Frame(
-      title: 'Edit connection',
+      title: 'Edit environment',
       primaryLabel: 'Save',
       busy: _busy,
       onPrimary: _submit,
@@ -343,7 +343,7 @@ class RemoveDialog extends StatelessWidget {
     final c = MdhColors.of(context);
     final external = item.isExternal;
     return _Frame(
-      title: external ? 'Detach connection?' : 'Remove connection?',
+      title: external ? 'Detach project?' : 'Remove project?',
       primaryLabel: external ? 'Detach' : 'Move to Trash',
       onPrimary: () => Navigator.of(context).pop(true),
       child: Text(
