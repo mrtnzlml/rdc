@@ -1,15 +1,14 @@
-//! Connection discovery via directory scan. A Connection is any folder under
-//! the caller-supplied parent that looks like an rdc project: an `rdc.toml`
-//! with an `[envs.main]` section. All state is derived from on-disk artifacts
-//! — there is no registry. Ported verbatim from the retired `rdc-ffi` crate;
-//! not part of the FRB `api` module, so FRB does not scan it.
+//! Project discovery via directory scan. A Project is any folder under the
+//! caller-supplied parent that looks like an rdc project: an `rdc.toml` with
+//! at least one `[envs.<name>]` section. Each env is surfaced independently.
+//! All state is derived from on-disk artifacts — there is no registry.
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
-pub(crate) struct Connection {
-    pub folder: PathBuf,
+pub(crate) struct EnvInfo {
+    pub name: String,
     pub api_base: String,
     pub org_id: u64,
     pub auth_kind: AuthKindRaw,
@@ -17,7 +16,13 @@ pub(crate) struct Connection {
     pub file_count: u64,
 }
 
-impl Connection {
+#[derive(Debug, Clone)]
+pub(crate) struct Project {
+    pub folder: PathBuf,
+    pub envs: Vec<EnvInfo>, // non-empty, sorted by name
+}
+
+impl Project {
     pub fn name(&self) -> &str {
         self.folder.file_name().and_then(|s| s.to_str()).unwrap_or("?")
     }
@@ -44,50 +49,64 @@ struct RdcEnvConfig {
     org_id: u64,
 }
 
-pub(crate) fn scan(parent: &Path) -> Vec<Connection> {
+pub(crate) fn scan(parent: &Path) -> Vec<Project> {
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(parent) else {
         return out;
     };
     for entry in rd.flatten() {
-        if let Some(conn) = inspect(&entry.path()) {
-            out.push(conn);
+        if let Some(p) = inspect(&entry.path()) {
+            out.push(p);
         }
     }
     out.sort_by(|a, b| a.name().cmp(b.name()));
     out
 }
 
-pub(crate) fn find(parent: &Path, name: &str) -> Option<Connection> {
+pub(crate) fn find(parent: &Path, name: &str) -> Option<Project> {
     inspect(&parent.join(name))
 }
 
-pub(crate) fn inspect(folder: &Path) -> Option<Connection> {
+pub(crate) fn inspect(folder: &Path) -> Option<Project> {
     if !folder.is_dir() {
         return None;
     }
     let content = std::fs::read_to_string(folder.join("rdc.toml")).ok()?;
     let parsed: RdcToml = toml::from_str(&content).ok()?;
-    let env = parsed.envs.get("main")?;
-    let secrets = rdc::secrets::read_secrets_file(folder, "main").unwrap_or_default();
-    let auth_kind = if secrets.username.is_some() {
-        AuthKindRaw::Password
-    } else {
-        AuthKindRaw::Token
-    };
-    let last_sync_unix = std::fs::metadata(folder.join(".rdc/state/main.lock.json"))
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .and_then(|d| i64::try_from(d.as_secs()).ok());
-    let file_count = count_files(&folder.join("envs/main"));
-    Some(Connection {
+    if parsed.envs.is_empty() {
+        return None;
+    }
+    // BTreeMap iterates in sorted key order → envs come out sorted by name.
+    let envs: Vec<EnvInfo> = parsed
+        .envs
+        .into_iter()
+        .map(|(name, cfg)| {
+            let secrets = rdc::secrets::read_secrets_file(folder, &name).unwrap_or_default();
+            let auth_kind = if secrets.username.is_some() {
+                AuthKindRaw::Password
+            } else {
+                AuthKindRaw::Token
+            };
+            let last_sync_unix =
+                std::fs::metadata(folder.join(format!(".rdc/state/{name}.lock.json")))
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .and_then(|d| i64::try_from(d.as_secs()).ok());
+            let file_count = count_files(&folder.join(format!("envs/{name}")));
+            EnvInfo {
+                name,
+                api_base: cfg.api_base,
+                org_id: cfg.org_id,
+                auth_kind,
+                last_sync_unix,
+                file_count,
+            }
+        })
+        .collect();
+    Some(Project {
         folder: folder.to_path_buf(),
-        api_base: env.api_base.clone(),
-        org_id: env.org_id,
-        auth_kind,
-        last_sync_unix,
-        file_count,
+        envs,
     })
 }
 
@@ -113,52 +132,65 @@ pub(crate) fn count_files(p: &Path) -> u64 {
 mod tests {
     use super::*;
 
-    fn seed_connection(parent: &Path, name: &str, api_base: &str, org_id: u64) {
+    fn seed_env(parent: &Path, name: &str, env: &str, api_base: &str, org_id: u64) {
         let folder = parent.join(name);
         std::fs::create_dir_all(&folder).unwrap();
-        std::fs::write(
-            folder.join("rdc.toml"),
-            format!("[envs.main]\napi_base = \"{api_base}\"\norg_id = {org_id}\n"),
-        )
-        .unwrap();
+        let existing = std::fs::read_to_string(folder.join("rdc.toml")).unwrap_or_default();
+        let block = format!("[envs.{env}]\napi_base = \"{api_base}\"\norg_id = {org_id}\n");
+        std::fs::write(folder.join("rdc.toml"), format!("{existing}{block}")).unwrap();
     }
 
     #[test]
-    fn scan_finds_rdc_projects_sorts_by_name() {
+    fn inspect_reads_every_env_sorted() {
         let tmp = tempfile::tempdir().unwrap();
-        seed_connection(tmp.path(), "zebra", "https://example.test/api/v1", 1);
-        seed_connection(tmp.path(), "alpha", "https://other.test/api/v1", 2);
+        seed_env(tmp.path(), "acme", "prod", "https://p.test/api/v1", 2);
+        seed_env(tmp.path(), "acme", "dev", "https://d.test/api/v1", 1);
+        let p = inspect(&tmp.path().join("acme")).unwrap();
+        assert_eq!(p.name(), "acme");
+        let names: Vec<&str> = p.envs.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["dev", "prod"]); // sorted
+        assert_eq!(p.envs[0].org_id, 1);
+        assert_eq!(p.envs[1].api_base, "https://p.test/api/v1");
+    }
+
+    #[test]
+    fn inspect_discovers_project_without_a_main_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_env(tmp.path(), "cli", "dev", "https://d.test/api/v1", 7);
+        let p = inspect(&tmp.path().join("cli")).unwrap();
+        assert_eq!(p.envs.len(), 1);
+        assert_eq!(p.envs[0].name, "dev");
+    }
+
+    #[test]
+    fn inspect_none_when_no_envs_or_no_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("empty")).unwrap();
+        std::fs::write(tmp.path().join("empty/rdc.toml"), "").unwrap();
+        assert!(inspect(&tmp.path().join("empty")).is_none());
+        assert!(inspect(&tmp.path().join("missing")).is_none());
+    }
+
+    #[test]
+    fn scan_sorts_projects_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_env(tmp.path(), "zebra", "main", "https://z.test/api/v1", 1);
+        seed_env(tmp.path(), "alpha", "main", "https://a.test/api/v1", 2);
         std::fs::create_dir_all(tmp.path().join("not-a-project")).unwrap();
-
-        let cs = scan(tmp.path());
-        assert_eq!(cs.len(), 2);
-        assert_eq!(cs[0].name(), "alpha");
-        assert_eq!(cs[1].name(), "zebra");
-        assert_eq!(cs[0].org_id, 2);
+        let ps = scan(tmp.path());
+        assert_eq!(ps.iter().map(|p| p.name()).collect::<Vec<_>>(), vec!["alpha", "zebra"]);
     }
 
     #[test]
-    fn find_returns_named_connection() {
+    fn auth_kind_is_per_env() {
         let tmp = tempfile::tempdir().unwrap();
-        seed_connection(tmp.path(), "acme", "https://example.test/api/v1", 7);
-        let c = find(tmp.path(), "acme").unwrap();
-        assert_eq!(c.api_base, "https://example.test/api/v1");
-        assert_eq!(c.org_id, 7);
-        assert_eq!(c.auth_kind, AuthKindRaw::Token);
-    }
-
-    #[test]
-    fn find_returns_none_for_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(find(tmp.path(), "nope").is_none());
-    }
-
-    #[test]
-    fn auth_kind_is_password_when_username_in_secrets() {
-        let tmp = tempfile::tempdir().unwrap();
-        seed_connection(tmp.path(), "p", "https://example.test/api/v1", 1);
-        rdc::secrets::save_password_credentials(&tmp.path().join("p"), "main", "u", "pw").unwrap();
-        let c = find(tmp.path(), "p").unwrap();
-        assert_eq!(c.auth_kind, AuthKindRaw::Password);
+        seed_env(tmp.path(), "acme", "dev", "https://d.test/api/v1", 1);
+        seed_env(tmp.path(), "acme", "prod", "https://p.test/api/v1", 2);
+        rdc::secrets::save_password_credentials(&tmp.path().join("acme"), "dev", "u", "pw").unwrap();
+        let p = find(tmp.path(), "acme").unwrap();
+        let dev = p.envs.iter().find(|e| e.name == "dev").unwrap();
+        let prod = p.envs.iter().find(|e| e.name == "prod").unwrap();
+        assert_eq!(dev.auth_kind, AuthKindRaw::Password);
+        assert_eq!(prod.auth_kind, AuthKindRaw::Token);
     }
 }
