@@ -258,6 +258,78 @@ pub fn edit_project(
         .ok_or_else(|| anyhow!("Project not found after edit"))
 }
 
+// ---------------------------------------------------------------- add/remove env
+
+#[derive(Debug, Clone)]
+pub struct AddEnvInput {
+    pub name: String,
+    pub api_base: String,
+    pub org_id: u64,
+    pub auth_kind: AuthKind,
+    pub token: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+/// Add a new environment to an existing project. Errors if the env already exists.
+pub fn add_env(folder: String, input: AddEnvInput) -> Result<ProjectSummary> {
+    let folder = PathBuf::from(&folder);
+    let name = input.name.trim().to_string();
+    if name.is_empty() {
+        return Err(anyhow!("Environment name is required."));
+    }
+    let toml_path = folder.join("rdc.toml");
+    let mut cfg = rdc::config::ProjectConfig::load(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
+    if cfg.envs.contains_key(&name) {
+        return Err(anyhow!("An environment named \"{name}\" already exists in this project."));
+    }
+    cfg.envs.insert(
+        name.clone(),
+        rdc::config::EnvConfig {
+            api_base: input.api_base.trim_end_matches('/').to_string(),
+            org_id: input.org_id,
+        },
+    );
+    cfg.save(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
+    write_credentials(
+        &folder, &name,
+        input.auth_kind, input.token.as_deref(), input.username.as_deref(), input.password.as_deref(),
+    )?;
+    discover::inspect(&folder)
+        .as_ref()
+        .map(ProjectSummary::from)
+        .ok_or_else(|| anyhow!("Project not found after add_env"))
+}
+
+/// Remove an environment: its `rdc.toml` section, snapshot, secrets, and state.
+/// If it was the last env, the whole project is trashed and `Ok(None)` returned.
+pub fn remove_env(folder: String, env: String) -> Result<Option<ProjectSummary>> {
+    let folder = PathBuf::from(&folder);
+    let toml_path = folder.join("rdc.toml");
+    let mut cfg = rdc::config::ProjectConfig::load(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
+    if !cfg.envs.contains_key(&env) {
+        return Err(anyhow!("This project has no \"{env}\" environment."));
+    }
+    if cfg.envs.len() == 1 {
+        // Last environment — removing it means removing the project.
+        trash_project(folder.display().to_string())?;
+        return Ok(None);
+    }
+    cfg.envs.remove(&env);
+    cfg.save(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
+    // Best-effort cleanup of the env's on-disk artifacts.
+    let _ = std::fs::remove_dir_all(folder.join(format!("envs/{env}")));
+    let _ = std::fs::remove_file(folder.join(format!("secrets/{env}.secrets.json")));
+    let _ = std::fs::remove_file(folder.join(format!(".rdc/state/{env}.lock.json")));
+    let _ = std::fs::remove_file(folder.join(format!(".rdc/state/{env}.lock")));
+    let _ = std::fs::remove_dir_all(folder.join(format!(".rdc/state/{env}.base")));
+    discover::inspect(&folder)
+        .as_ref()
+        .map(ProjectSummary::from)
+        .map(Some)
+        .ok_or_else(|| anyhow!("Project not found after remove_env"))
+}
+
 // ---------------------------------------------------------------- sync
 
 /// Pull-only sync of one environment. Scaffolds init files, resolves the token
@@ -467,5 +539,61 @@ mod tests {
         assert_eq!(summary.envs.len(), 2);
         assert_eq!(summary.envs[0].name, "dev");
         assert_eq!(summary.envs[1].org_id, 2);
+    }
+
+    fn seed_project(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let folder = dir.join(name);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("rdc.toml"),
+            "[envs.main]\napi_base = \"https://m.test/api/v1\"\norg_id = 1\n").unwrap();
+        rdc::secrets::write_secrets_file(&folder, "main", "tok", None).unwrap();
+        folder
+    }
+
+    #[test]
+    fn add_env_appends_a_second_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = seed_project(tmp.path(), "acme");
+        let p = add_env(folder.display().to_string(), AddEnvInput {
+            name: "prod".into(), api_base: "https://p.test/api/v1/".into(), org_id: 2,
+            auth_kind: AuthKind::Token, token: Some("tok2".into()), username: None, password: None,
+        }).unwrap();
+        assert_eq!(p.envs.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), vec!["main", "prod"]);
+        let prod = p.envs.iter().find(|e| e.name == "prod").unwrap();
+        assert_eq!(prod.api_base, "https://p.test/api/v1"); // trailing slash trimmed
+        assert!(folder.join("secrets/prod.secrets.json").exists());
+    }
+
+    #[test]
+    fn add_env_rejects_duplicate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = seed_project(tmp.path(), "acme");
+        let err = add_env(folder.display().to_string(), AddEnvInput {
+            name: "main".into(), api_base: "https://x.test/api/v1".into(), org_id: 9,
+            auth_kind: AuthKind::Token, token: Some("t".into()), username: None, password: None,
+        }).unwrap_err();
+        assert!(format!("{err:#}").contains("already exists"));
+    }
+
+    #[test]
+    fn remove_env_drops_one_and_keeps_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = seed_project(tmp.path(), "acme");
+        add_env(folder.display().to_string(), AddEnvInput {
+            name: "prod".into(), api_base: "https://p.test/api/v1".into(), org_id: 2,
+            auth_kind: AuthKind::Token, token: Some("t2".into()), username: None, password: None,
+        }).unwrap();
+        let p = remove_env(folder.display().to_string(), "prod".into()).unwrap().unwrap();
+        assert_eq!(p.envs.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), vec!["main"]);
+        assert!(!folder.join("secrets/prod.secrets.json").exists());
+    }
+
+    #[test]
+    fn remove_last_env_trashes_project_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = seed_project(tmp.path(), "acme");
+        let r = remove_env(folder.display().to_string(), "main".into()).unwrap();
+        assert!(r.is_none());
+        assert!(!folder.exists()); // whole project gone (moved to trash)
     }
 }

@@ -66,7 +66,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.12.0';
 
   @override
-  int get rustContentHash => -50370165;
+  int get rustContentHash => -1505621509;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -78,6 +78,11 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
 }
 
 abstract class RustLibApi extends BaseApi {
+  Future<ProjectSummary> crateApiRdcAddEnv({
+    required String folder,
+    required AddEnvInput input,
+  });
+
   Future<ProjectSummary> crateApiRdcAddProject({
     required String parent,
     required AddConnectionInput input,
@@ -96,6 +101,11 @@ abstract class RustLibApi extends BaseApi {
   });
 
   Future<String?> crateApiRdcRdcVersion();
+
+  Future<ProjectSummary?> crateApiRdcRemoveEnv({
+    required String folder,
+    required String env,
+  });
 
   Future<void> crateApiRdcRevealInFileManager({required String path});
 
@@ -122,6 +132,38 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   });
 
   @override
+  Future<ProjectSummary> crateApiRdcAddEnv({
+    required String folder,
+    required AddEnvInput input,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(folder, serializer);
+          sse_encode_box_autoadd_add_env_input(input, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 1,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_project_summary,
+          decodeErrorData: sse_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiRdcAddEnvConstMeta,
+        argValues: [folder, input],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiRdcAddEnvConstMeta =>
+      const TaskConstMeta(debugName: "add_env", argNames: ["folder", "input"]);
+
+  @override
   Future<ProjectSummary> crateApiRdcAddProject({
     required String parent,
     required AddConnectionInput input,
@@ -135,7 +177,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 1,
+            funcId: 2,
             port: port_,
           );
         },
@@ -171,7 +213,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 2,
+            funcId: 3,
             port: port_,
           );
         },
@@ -200,7 +242,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 3,
+            funcId: 4,
             port: port_,
           );
         },
@@ -230,7 +272,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 4,
+            funcId: 5,
             port: port_,
           );
         },
@@ -257,7 +299,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 5,
+            funcId: 6,
             port: port_,
           );
         },
@@ -276,6 +318,38 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "rdc_version", argNames: []);
 
   @override
+  Future<ProjectSummary?> crateApiRdcRemoveEnv({
+    required String folder,
+    required String env,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(folder, serializer);
+          sse_encode_String(env, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 7,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_opt_box_autoadd_project_summary,
+          decodeErrorData: sse_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiRdcRemoveEnvConstMeta,
+        argValues: [folder, env],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiRdcRemoveEnvConstMeta =>
+      const TaskConstMeta(debugName: "remove_env", argNames: ["folder", "env"]);
+
+  @override
   Future<void> crateApiRdcRevealInFileManager({required String path}) {
     return handler.executeNormal(
       NormalTask(
@@ -285,7 +359,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 6,
+            funcId: 8,
             port: port_,
           );
         },
@@ -327,7 +401,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             pdeCallFfi(
               generalizedFrbRustBinding,
               serializer,
-              funcId: 7,
+              funcId: 9,
               port: port_,
             );
           },
@@ -359,7 +433,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 8,
+            funcId: 10,
             port: port_,
           );
         },
@@ -389,7 +463,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 9,
+            funcId: 11,
             port: port_,
           );
         },
@@ -446,6 +520,23 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  AddEnvInput dco_decode_add_env_input(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 7)
+      throw Exception('unexpected arr length: expect 7 but see ${arr.length}');
+    return AddEnvInput(
+      name: dco_decode_String(arr[0]),
+      apiBase: dco_decode_String(arr[1]),
+      orgId: dco_decode_u_64(arr[2]),
+      authKind: dco_decode_auth_kind(arr[3]),
+      token: dco_decode_opt_String(arr[4]),
+      username: dco_decode_opt_String(arr[5]),
+      password: dco_decode_opt_String(arr[6]),
+    );
+  }
+
+  @protected
   AuthKind dco_decode_auth_kind(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return AuthKind.values[raw as int];
@@ -455,6 +546,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   AddConnectionInput dco_decode_box_autoadd_add_connection_input(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return dco_decode_add_connection_input(raw);
+  }
+
+  @protected
+  AddEnvInput dco_decode_box_autoadd_add_env_input(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_add_env_input(raw);
   }
 
   @protected
@@ -469,6 +566,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   PlatformInt64 dco_decode_box_autoadd_i_64(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return dco_decode_i_64(raw);
+  }
+
+  @protected
+  ProjectSummary dco_decode_box_autoadd_project_summary(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_project_summary(raw);
   }
 
   @protected
@@ -544,6 +647,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   PlatformInt64? dco_decode_opt_box_autoadd_i_64(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw == null ? null : dco_decode_box_autoadd_i_64(raw);
+  }
+
+  @protected
+  ProjectSummary? dco_decode_opt_box_autoadd_project_summary(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_box_autoadd_project_summary(raw);
   }
 
   @protected
@@ -641,6 +750,27 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  AddEnvInput sse_decode_add_env_input(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_name = sse_decode_String(deserializer);
+    var var_apiBase = sse_decode_String(deserializer);
+    var var_orgId = sse_decode_u_64(deserializer);
+    var var_authKind = sse_decode_auth_kind(deserializer);
+    var var_token = sse_decode_opt_String(deserializer);
+    var var_username = sse_decode_opt_String(deserializer);
+    var var_password = sse_decode_opt_String(deserializer);
+    return AddEnvInput(
+      name: var_name,
+      apiBase: var_apiBase,
+      orgId: var_orgId,
+      authKind: var_authKind,
+      token: var_token,
+      username: var_username,
+      password: var_password,
+    );
+  }
+
+  @protected
   AuthKind sse_decode_auth_kind(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var inner = sse_decode_i_32(deserializer);
@@ -656,6 +786,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  AddEnvInput sse_decode_box_autoadd_add_env_input(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_add_env_input(deserializer));
+  }
+
+  @protected
   EditConnectionInput sse_decode_box_autoadd_edit_connection_input(
     SseDeserializer deserializer,
   ) {
@@ -667,6 +805,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   PlatformInt64 sse_decode_box_autoadd_i_64(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return (sse_decode_i_64(deserializer));
+  }
+
+  @protected
+  ProjectSummary sse_decode_box_autoadd_project_summary(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_project_summary(deserializer));
   }
 
   @protected
@@ -773,6 +919,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
     if (sse_decode_bool(deserializer)) {
       return (sse_decode_box_autoadd_i_64(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
+  ProjectSummary? sse_decode_opt_box_autoadd_project_summary(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_box_autoadd_project_summary(deserializer));
     } else {
       return null;
     }
@@ -886,6 +1045,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_add_env_input(AddEnvInput self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.name, serializer);
+    sse_encode_String(self.apiBase, serializer);
+    sse_encode_u_64(self.orgId, serializer);
+    sse_encode_auth_kind(self.authKind, serializer);
+    sse_encode_opt_String(self.token, serializer);
+    sse_encode_opt_String(self.username, serializer);
+    sse_encode_opt_String(self.password, serializer);
+  }
+
+  @protected
   void sse_encode_auth_kind(AuthKind self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.index, serializer);
@@ -898,6 +1069,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_add_connection_input(self, serializer);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_add_env_input(
+    AddEnvInput self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_add_env_input(self, serializer);
   }
 
   @protected
@@ -916,6 +1096,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_64(self, serializer);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_project_summary(
+    ProjectSummary self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_project_summary(self, serializer);
   }
 
   @protected
@@ -1010,6 +1199,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_bool(self != null, serializer);
     if (self != null) {
       sse_encode_box_autoadd_i_64(self, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_opt_box_autoadd_project_summary(
+    ProjectSummary? self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_box_autoadd_project_summary(self, serializer);
     }
   }
 

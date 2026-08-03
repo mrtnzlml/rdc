@@ -10,7 +10,7 @@ part 'rdc.freezed.dart';
 
 // These functions are ignored because they are not marked as `pub`: `block_on`, `write_credentials`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `LineForwarder`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `flush`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `from`, `write`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `flush`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `from`, `write`
 
 /// rdc's package version, surfaced to the app's About box.
 Future<String?> rdcVersion() => RustLib.instance.api.crateApiRdcRdcVersion();
@@ -44,9 +44,26 @@ Future<ProjectSummary> editProject({
   input: input,
 );
 
+/// Add a new environment to an existing project. Errors if the env already exists.
+Future<ProjectSummary> addEnv({
+  required String folder,
+  required AddEnvInput input,
+}) => RustLib.instance.api.crateApiRdcAddEnv(folder: folder, input: input);
+
+/// Remove an environment: its `rdc.toml` section, snapshot, secrets, and state.
+/// If it was the last env, the whole project is trashed and `Ok(None)` returned.
+Future<ProjectSummary?> removeEnv({
+  required String folder,
+  required String env,
+}) => RustLib.instance.api.crateApiRdcRemoveEnv(folder: folder, env: env);
+
 /// Pull-only sync of one environment. Scaffolds init files, resolves the token
 /// (silent re-login in password mode), then runs `sync_no_push`. Progress is
 /// streamed as `SyncPhase`.
+///
+/// Returns `Ok(())` even when the sync itself fails — the terminal outcome
+/// (success or error) is conveyed to the caller via the `SyncPhase::Done` /
+/// `SyncPhase::Error` stream events, not via this function's `Result`.
 Stream<SyncPhase> syncEnv({
   required String folder,
   required String env,
@@ -100,6 +117,49 @@ class AddConnectionInput {
   bool operator ==(Object other) =>
       identical(this, other) ||
       other is AddConnectionInput &&
+          runtimeType == other.runtimeType &&
+          name == other.name &&
+          apiBase == other.apiBase &&
+          orgId == other.orgId &&
+          authKind == other.authKind &&
+          token == other.token &&
+          username == other.username &&
+          password == other.password;
+}
+
+class AddEnvInput {
+  final String name;
+  final String apiBase;
+  final BigInt orgId;
+  final AuthKind authKind;
+  final String? token;
+  final String? username;
+  final String? password;
+
+  const AddEnvInput({
+    required this.name,
+    required this.apiBase,
+    required this.orgId,
+    required this.authKind,
+    this.token,
+    this.username,
+    this.password,
+  });
+
+  @override
+  int get hashCode =>
+      name.hashCode ^
+      apiBase.hashCode ^
+      orgId.hashCode ^
+      authKind.hashCode ^
+      token.hashCode ^
+      username.hashCode ^
+      password.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is AddEnvInput &&
           runtimeType == other.runtimeType &&
           name == other.name &&
           apiBase == other.apiBase &&

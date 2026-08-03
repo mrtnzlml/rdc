@@ -33,16 +33,25 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   AddConnectionInput dco_decode_add_connection_input(dynamic raw);
 
   @protected
+  AddEnvInput dco_decode_add_env_input(dynamic raw);
+
+  @protected
   AuthKind dco_decode_auth_kind(dynamic raw);
 
   @protected
   AddConnectionInput dco_decode_box_autoadd_add_connection_input(dynamic raw);
 
   @protected
+  AddEnvInput dco_decode_box_autoadd_add_env_input(dynamic raw);
+
+  @protected
   EditConnectionInput dco_decode_box_autoadd_edit_connection_input(dynamic raw);
 
   @protected
   PlatformInt64 dco_decode_box_autoadd_i_64(dynamic raw);
+
+  @protected
+  ProjectSummary dco_decode_box_autoadd_project_summary(dynamic raw);
 
   @protected
   EditConnectionInput dco_decode_edit_connection_input(dynamic raw);
@@ -70,6 +79,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PlatformInt64? dco_decode_opt_box_autoadd_i_64(dynamic raw);
+
+  @protected
+  ProjectSummary? dco_decode_opt_box_autoadd_project_summary(dynamic raw);
 
   @protected
   ProjectSummary dco_decode_project_summary(dynamic raw);
@@ -103,10 +115,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  AddEnvInput sse_decode_add_env_input(SseDeserializer deserializer);
+
+  @protected
   AuthKind sse_decode_auth_kind(SseDeserializer deserializer);
 
   @protected
   AddConnectionInput sse_decode_box_autoadd_add_connection_input(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  AddEnvInput sse_decode_box_autoadd_add_env_input(
     SseDeserializer deserializer,
   );
 
@@ -117,6 +137,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PlatformInt64 sse_decode_box_autoadd_i_64(SseDeserializer deserializer);
+
+  @protected
+  ProjectSummary sse_decode_box_autoadd_project_summary(
+    SseDeserializer deserializer,
+  );
 
   @protected
   EditConnectionInput sse_decode_edit_connection_input(
@@ -148,6 +173,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PlatformInt64? sse_decode_opt_box_autoadd_i_64(SseDeserializer deserializer);
+
+  @protected
+  ProjectSummary? sse_decode_opt_box_autoadd_project_summary(
+    SseDeserializer deserializer,
+  );
 
   @protected
   ProjectSummary sse_decode_project_summary(SseDeserializer deserializer);
@@ -189,11 +219,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_add_env_input(AddEnvInput self, SseSerializer serializer);
+
+  @protected
   void sse_encode_auth_kind(AuthKind self, SseSerializer serializer);
 
   @protected
   void sse_encode_box_autoadd_add_connection_input(
     AddConnectionInput self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_add_env_input(
+    AddEnvInput self,
     SseSerializer serializer,
   );
 
@@ -206,6 +245,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_box_autoadd_i_64(
     PlatformInt64 self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_project_summary(
+    ProjectSummary self,
     SseSerializer serializer,
   );
 
@@ -248,6 +293,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_opt_box_autoadd_i_64(
     PlatformInt64? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_project_summary(
+    ProjectSummary? self,
     SseSerializer serializer,
   );
 
