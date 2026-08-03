@@ -338,6 +338,7 @@ class _Sidebar extends StatelessWidget {
                   message: 'Settings',
                   child: InkWell(
                     onTap: onSelectSettings,
+                    mouseCursor: SystemMouseCursors.click,
                     borderRadius: BorderRadius.circular(6),
                     child: Container(
                       width: 28,
@@ -374,6 +375,7 @@ class _Sidebar extends StatelessWidget {
                   message: 'New connection',
                   child: InkWell(
                     onTap: onAdd,
+                    mouseCursor: SystemMouseCursors.click,
                     borderRadius: BorderRadius.circular(6),
                     child: Container(
                       width: 24,
@@ -447,6 +449,7 @@ class _SidebarRow extends StatelessWidget {
       padding: const EdgeInsets.symmetric(vertical: 1),
       child: InkWell(
         onTap: () => onSelect(s.folder),
+        mouseCursor: SystemMouseCursors.click,
         borderRadius: BorderRadius.circular(6),
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
@@ -889,6 +892,7 @@ class _FilesPanelState extends State<_FilesPanel> {
       final current = i == dirSegs.length - 1 && !previewing;
       crumbs.add(InkWell(
         onTap: current ? null : () => _goDir(_crumbs.sublist(0, i)),
+        mouseCursor: current ? SystemMouseCursors.basic : SystemMouseCursors.click,
         borderRadius: BorderRadius.circular(4),
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
@@ -916,6 +920,7 @@ class _FilesPanelState extends State<_FilesPanel> {
               opacity: canBack ? 1 : 0.45,
               child: InkWell(
                 onTap: canBack ? _back : null,
+                mouseCursor: canBack ? SystemMouseCursors.click : SystemMouseCursors.basic,
                 borderRadius: BorderRadius.circular(6),
                 child: Container(
                   width: 28,
@@ -984,6 +989,7 @@ class _FilesPanelState extends State<_FilesPanel> {
         final last = i == _entries.length - 1;
         return InkWell(
           onTap: e.isDir ? () => _goDir([..._crumbs, e.name]) : () => _openFile(e.name),
+          mouseCursor: SystemMouseCursors.click,
           child: Container(
             decoration: BoxDecoration(border: last ? null : Border(bottom: BorderSide(color: c.border))),
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
@@ -1157,6 +1163,7 @@ class _FleetRow extends StatelessWidget {
     };
     return InkWell(
       onTap: () => onOpenConn(s.folder),
+      mouseCursor: SystemMouseCursors.click,
       child: Container(
         decoration: BoxDecoration(border: last ? null : Border(bottom: BorderSide(color: c.border))),
         child: Row(children: [
@@ -1256,6 +1263,7 @@ class _Btn extends StatelessWidget {
       opacity: onTap == null ? 0.5 : 1,
       child: InkWell(
         onTap: onTap,
+        mouseCursor: onTap == null ? SystemMouseCursors.basic : SystemMouseCursors.click,
         borderRadius: BorderRadius.circular(6),
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -1307,6 +1315,7 @@ class _TabBar extends StatelessWidget {
         for (final t in tabs)
           InkWell(
             onTap: () => onSelect(t),
+            mouseCursor: SystemMouseCursors.click,
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
               decoration: BoxDecoration(
@@ -1394,6 +1403,7 @@ class _NavItem extends StatelessWidget {
     final fg = selected ? Colors.white : c.textSecondary;
     return InkWell(
       onTap: onTap,
+      mouseCursor: SystemMouseCursors.click,
       borderRadius: BorderRadius.circular(6),
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
