@@ -66,7 +66,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.12.0';
 
   @override
-  int get rustContentHash => 2140695709;
+  int get rustContentHash => -50370165;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -78,19 +78,20 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
 }
 
 abstract class RustLibApi extends BaseApi {
-  Future<ConnectionSummary> crateApiRdcAddConnection({
+  Future<ProjectSummary> crateApiRdcAddProject({
     required String parent,
     required AddConnectionInput input,
   });
 
-  Future<ConnectionSummary> crateApiRdcEditConnection({
+  Future<ProjectSummary> crateApiRdcEditProject({
     required String folder,
+    required String env,
     required EditConnectionInput input,
   });
 
   Future<void> crateApiRdcInitApp();
 
-  Future<List<ConnectionSummary>> crateApiRdcListConnections({
+  Future<List<ProjectSummary>> crateApiRdcListProjects({
     required String parent,
   });
 
@@ -98,15 +99,16 @@ abstract class RustLibApi extends BaseApi {
 
   Future<void> crateApiRdcRevealInFileManager({required String path});
 
-  Stream<SyncPhase> crateApiRdcSyncConnection({
+  Stream<SyncPhase> crateApiRdcSyncEnv({
     required String folder,
+    required String env,
     required String apiBase,
     required BigInt orgId,
   });
 
-  Future<void> crateApiRdcTrashConnection({required String folder});
+  Future<void> crateApiRdcTrashProject({required String folder});
 
-  Future<ConnectionSummary> crateApiRdcValidateExistingProject({
+  Future<ProjectSummary> crateApiRdcValidateExistingProject({
     required String path,
   });
 }
@@ -120,7 +122,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   });
 
   @override
-  Future<ConnectionSummary> crateApiRdcAddConnection({
+  Future<ProjectSummary> crateApiRdcAddProject({
     required String parent,
     required AddConnectionInput input,
   }) {
@@ -138,24 +140,25 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           );
         },
         codec: SseCodec(
-          decodeSuccessData: sse_decode_connection_summary,
+          decodeSuccessData: sse_decode_project_summary,
           decodeErrorData: sse_decode_AnyhowException,
         ),
-        constMeta: kCrateApiRdcAddConnectionConstMeta,
+        constMeta: kCrateApiRdcAddProjectConstMeta,
         argValues: [parent, input],
         apiImpl: this,
       ),
     );
   }
 
-  TaskConstMeta get kCrateApiRdcAddConnectionConstMeta => const TaskConstMeta(
-    debugName: "add_connection",
+  TaskConstMeta get kCrateApiRdcAddProjectConstMeta => const TaskConstMeta(
+    debugName: "add_project",
     argNames: ["parent", "input"],
   );
 
   @override
-  Future<ConnectionSummary> crateApiRdcEditConnection({
+  Future<ProjectSummary> crateApiRdcEditProject({
     required String folder,
+    required String env,
     required EditConnectionInput input,
   }) {
     return handler.executeNormal(
@@ -163,6 +166,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         callFfi: (port_) {
           final serializer = SseSerializer(generalizedFrbRustBinding);
           sse_encode_String(folder, serializer);
+          sse_encode_String(env, serializer);
           sse_encode_box_autoadd_edit_connection_input(input, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
@@ -172,19 +176,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           );
         },
         codec: SseCodec(
-          decodeSuccessData: sse_decode_connection_summary,
+          decodeSuccessData: sse_decode_project_summary,
           decodeErrorData: sse_decode_AnyhowException,
         ),
-        constMeta: kCrateApiRdcEditConnectionConstMeta,
-        argValues: [folder, input],
+        constMeta: kCrateApiRdcEditProjectConstMeta,
+        argValues: [folder, env, input],
         apiImpl: this,
       ),
     );
   }
 
-  TaskConstMeta get kCrateApiRdcEditConnectionConstMeta => const TaskConstMeta(
-    debugName: "edit_connection",
-    argNames: ["folder", "input"],
+  TaskConstMeta get kCrateApiRdcEditProjectConstMeta => const TaskConstMeta(
+    debugName: "edit_project",
+    argNames: ["folder", "env", "input"],
   );
 
   @override
@@ -215,7 +219,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "init_app", argNames: []);
 
   @override
-  Future<List<ConnectionSummary>> crateApiRdcListConnections({
+  Future<List<ProjectSummary>> crateApiRdcListProjects({
     required String parent,
   }) {
     return handler.executeNormal(
@@ -231,18 +235,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           );
         },
         codec: SseCodec(
-          decodeSuccessData: sse_decode_list_connection_summary,
+          decodeSuccessData: sse_decode_list_project_summary,
           decodeErrorData: null,
         ),
-        constMeta: kCrateApiRdcListConnectionsConstMeta,
+        constMeta: kCrateApiRdcListProjectsConstMeta,
         argValues: [parent],
         apiImpl: this,
       ),
     );
   }
 
-  TaskConstMeta get kCrateApiRdcListConnectionsConstMeta =>
-      const TaskConstMeta(debugName: "list_connections", argNames: ["parent"]);
+  TaskConstMeta get kCrateApiRdcListProjectsConstMeta =>
+      const TaskConstMeta(debugName: "list_projects", argNames: ["parent"]);
 
   @override
   Future<String?> crateApiRdcRdcVersion() {
@@ -303,8 +307,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Stream<SyncPhase> crateApiRdcSyncConnection({
+  Stream<SyncPhase> crateApiRdcSyncEnv({
     required String folder,
+    required String env,
     required String apiBase,
     required BigInt orgId,
   }) {
@@ -315,6 +320,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           callFfi: (port_) {
             final serializer = SseSerializer(generalizedFrbRustBinding);
             sse_encode_String(folder, serializer);
+            sse_encode_String(env, serializer);
             sse_encode_String(apiBase, serializer);
             sse_encode_u_64(orgId, serializer);
             sse_encode_StreamSink_sync_phase_Sse(sink, serializer);
@@ -329,8 +335,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             decodeSuccessData: sse_decode_unit,
             decodeErrorData: sse_decode_AnyhowException,
           ),
-          constMeta: kCrateApiRdcSyncConnectionConstMeta,
-          argValues: [folder, apiBase, orgId, sink],
+          constMeta: kCrateApiRdcSyncEnvConstMeta,
+          argValues: [folder, env, apiBase, orgId, sink],
           apiImpl: this,
         ),
       ),
@@ -338,13 +344,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     return sink.stream;
   }
 
-  TaskConstMeta get kCrateApiRdcSyncConnectionConstMeta => const TaskConstMeta(
-    debugName: "sync_connection",
-    argNames: ["folder", "apiBase", "orgId", "sink"],
+  TaskConstMeta get kCrateApiRdcSyncEnvConstMeta => const TaskConstMeta(
+    debugName: "sync_env",
+    argNames: ["folder", "env", "apiBase", "orgId", "sink"],
   );
 
   @override
-  Future<void> crateApiRdcTrashConnection({required String folder}) {
+  Future<void> crateApiRdcTrashProject({required String folder}) {
     return handler.executeNormal(
       NormalTask(
         callFfi: (port_) {
@@ -361,18 +367,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           decodeSuccessData: sse_decode_unit,
           decodeErrorData: sse_decode_AnyhowException,
         ),
-        constMeta: kCrateApiRdcTrashConnectionConstMeta,
+        constMeta: kCrateApiRdcTrashProjectConstMeta,
         argValues: [folder],
         apiImpl: this,
       ),
     );
   }
 
-  TaskConstMeta get kCrateApiRdcTrashConnectionConstMeta =>
-      const TaskConstMeta(debugName: "trash_connection", argNames: ["folder"]);
+  TaskConstMeta get kCrateApiRdcTrashProjectConstMeta =>
+      const TaskConstMeta(debugName: "trash_project", argNames: ["folder"]);
 
   @override
-  Future<ConnectionSummary> crateApiRdcValidateExistingProject({
+  Future<ProjectSummary> crateApiRdcValidateExistingProject({
     required String path,
   }) {
     return handler.executeNormal(
@@ -388,7 +394,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           );
         },
         codec: SseCodec(
-          decodeSuccessData: sse_decode_connection_summary,
+          decodeSuccessData: sse_decode_project_summary,
           decodeErrorData: sse_decode_AnyhowException,
         ),
         constMeta: kCrateApiRdcValidateExistingProjectConstMeta,
@@ -466,24 +472,6 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  ConnectionSummary dco_decode_connection_summary(dynamic raw) {
-    // Codec=Dco (DartCObject based), see doc to use other codecs
-    final arr = raw as List<dynamic>;
-    if (arr.length != 8)
-      throw Exception('unexpected arr length: expect 8 but see ${arr.length}');
-    return ConnectionSummary(
-      id: dco_decode_String(arr[0]),
-      name: dco_decode_String(arr[1]),
-      apiBase: dco_decode_String(arr[2]),
-      orgId: dco_decode_u_64(arr[3]),
-      folder: dco_decode_String(arr[4]),
-      authKind: dco_decode_auth_kind(arr[5]),
-      lastSyncUnix: dco_decode_opt_box_autoadd_i_64(arr[6]),
-      fileCount: dco_decode_u_64(arr[7]),
-    );
-  }
-
-  @protected
   EditConnectionInput dco_decode_edit_connection_input(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
@@ -501,6 +489,22 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  EnvSummary dco_decode_env_summary(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 6)
+      throw Exception('unexpected arr length: expect 6 but see ${arr.length}');
+    return EnvSummary(
+      name: dco_decode_String(arr[0]),
+      apiBase: dco_decode_String(arr[1]),
+      orgId: dco_decode_u_64(arr[2]),
+      authKind: dco_decode_auth_kind(arr[3]),
+      lastSyncUnix: dco_decode_opt_box_autoadd_i_64(arr[4]),
+      fileCount: dco_decode_u_64(arr[5]),
+    );
+  }
+
+  @protected
   int dco_decode_i_32(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as int;
@@ -513,15 +517,21 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  List<ConnectionSummary> dco_decode_list_connection_summary(dynamic raw) {
+  List<EnvSummary> dco_decode_list_env_summary(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
-    return (raw as List<dynamic>).map(dco_decode_connection_summary).toList();
+    return (raw as List<dynamic>).map(dco_decode_env_summary).toList();
   }
 
   @protected
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as Uint8List;
+  }
+
+  @protected
+  List<ProjectSummary> dco_decode_list_project_summary(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_project_summary).toList();
   }
 
   @protected
@@ -534,6 +544,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   PlatformInt64? dco_decode_opt_box_autoadd_i_64(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw == null ? null : dco_decode_box_autoadd_i_64(raw);
+  }
+
+  @protected
+  ProjectSummary dco_decode_project_summary(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 4)
+      throw Exception('unexpected arr length: expect 4 but see ${arr.length}');
+    return ProjectSummary(
+      id: dco_decode_String(arr[0]),
+      name: dco_decode_String(arr[1]),
+      folder: dco_decode_String(arr[2]),
+      envs: dco_decode_list_env_summary(arr[3]),
+    );
   }
 
   @protected
@@ -646,31 +670,6 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  ConnectionSummary sse_decode_connection_summary(
-    SseDeserializer deserializer,
-  ) {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    var var_id = sse_decode_String(deserializer);
-    var var_name = sse_decode_String(deserializer);
-    var var_apiBase = sse_decode_String(deserializer);
-    var var_orgId = sse_decode_u_64(deserializer);
-    var var_folder = sse_decode_String(deserializer);
-    var var_authKind = sse_decode_auth_kind(deserializer);
-    var var_lastSyncUnix = sse_decode_opt_box_autoadd_i_64(deserializer);
-    var var_fileCount = sse_decode_u_64(deserializer);
-    return ConnectionSummary(
-      id: var_id,
-      name: var_name,
-      apiBase: var_apiBase,
-      orgId: var_orgId,
-      folder: var_folder,
-      authKind: var_authKind,
-      lastSyncUnix: var_lastSyncUnix,
-      fileCount: var_fileCount,
-    );
-  }
-
-  @protected
   EditConnectionInput sse_decode_edit_connection_input(
     SseDeserializer deserializer,
   ) {
@@ -694,6 +693,25 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  EnvSummary sse_decode_env_summary(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_name = sse_decode_String(deserializer);
+    var var_apiBase = sse_decode_String(deserializer);
+    var var_orgId = sse_decode_u_64(deserializer);
+    var var_authKind = sse_decode_auth_kind(deserializer);
+    var var_lastSyncUnix = sse_decode_opt_box_autoadd_i_64(deserializer);
+    var var_fileCount = sse_decode_u_64(deserializer);
+    return EnvSummary(
+      name: var_name,
+      apiBase: var_apiBase,
+      orgId: var_orgId,
+      authKind: var_authKind,
+      lastSyncUnix: var_lastSyncUnix,
+      fileCount: var_fileCount,
+    );
+  }
+
+  @protected
   int sse_decode_i_32(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return deserializer.buffer.getInt32();
@@ -706,15 +724,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  List<ConnectionSummary> sse_decode_list_connection_summary(
-    SseDeserializer deserializer,
-  ) {
+  List<EnvSummary> sse_decode_list_env_summary(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
     var len_ = sse_decode_i_32(deserializer);
-    var ans_ = <ConnectionSummary>[];
+    var ans_ = <EnvSummary>[];
     for (var idx_ = 0; idx_ < len_; ++idx_) {
-      ans_.add(sse_decode_connection_summary(deserializer));
+      ans_.add(sse_decode_env_summary(deserializer));
     }
     return ans_;
   }
@@ -724,6 +740,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var len_ = sse_decode_i_32(deserializer);
     return deserializer.buffer.getUint8List(len_);
+  }
+
+  @protected
+  List<ProjectSummary> sse_decode_list_project_summary(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <ProjectSummary>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_project_summary(deserializer));
+    }
+    return ans_;
   }
 
   @protected
@@ -746,6 +776,21 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     } else {
       return null;
     }
+  }
+
+  @protected
+  ProjectSummary sse_decode_project_summary(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_id = sse_decode_String(deserializer);
+    var var_name = sse_decode_String(deserializer);
+    var var_folder = sse_decode_String(deserializer);
+    var var_envs = sse_decode_list_env_summary(deserializer);
+    return ProjectSummary(
+      id: var_id,
+      name: var_name,
+      folder: var_folder,
+      envs: var_envs,
+    );
   }
 
   @protected
@@ -874,22 +919,6 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  void sse_encode_connection_summary(
-    ConnectionSummary self,
-    SseSerializer serializer,
-  ) {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    sse_encode_String(self.id, serializer);
-    sse_encode_String(self.name, serializer);
-    sse_encode_String(self.apiBase, serializer);
-    sse_encode_u_64(self.orgId, serializer);
-    sse_encode_String(self.folder, serializer);
-    sse_encode_auth_kind(self.authKind, serializer);
-    sse_encode_opt_box_autoadd_i_64(self.lastSyncUnix, serializer);
-    sse_encode_u_64(self.fileCount, serializer);
-  }
-
-  @protected
   void sse_encode_edit_connection_input(
     EditConnectionInput self,
     SseSerializer serializer,
@@ -905,6 +934,17 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_env_summary(EnvSummary self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.name, serializer);
+    sse_encode_String(self.apiBase, serializer);
+    sse_encode_u_64(self.orgId, serializer);
+    sse_encode_auth_kind(self.authKind, serializer);
+    sse_encode_opt_box_autoadd_i_64(self.lastSyncUnix, serializer);
+    sse_encode_u_64(self.fileCount, serializer);
+  }
+
+  @protected
   void sse_encode_i_32(int self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     serializer.buffer.putInt32(self);
@@ -917,14 +957,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  void sse_encode_list_connection_summary(
-    List<ConnectionSummary> self,
+  void sse_encode_list_env_summary(
+    List<EnvSummary> self,
     SseSerializer serializer,
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.length, serializer);
     for (final item in self) {
-      sse_encode_connection_summary(item, serializer);
+      sse_encode_env_summary(item, serializer);
     }
   }
 
@@ -936,6 +976,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.length, serializer);
     serializer.buffer.putUint8List(self);
+  }
+
+  @protected
+  void sse_encode_list_project_summary(
+    List<ProjectSummary> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_project_summary(item, serializer);
+    }
   }
 
   @protected
@@ -959,6 +1011,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     if (self != null) {
       sse_encode_box_autoadd_i_64(self, serializer);
     }
+  }
+
+  @protected
+  void sse_encode_project_summary(
+    ProjectSummary self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.id, serializer);
+    sse_encode_String(self.name, serializer);
+    sse_encode_String(self.folder, serializer);
+    sse_encode_list_env_summary(self.envs, serializer);
   }
 
   @protected

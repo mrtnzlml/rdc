@@ -4,7 +4,7 @@
 //! file/credential/sync helpers — this crate adds no new credential or sync
 //! logic. Only the FFI glue differs (StreamSink progress + anyhow errors).
 
-use crate::discover::{self, AuthKindRaw, Connection};
+use crate::discover::{self, AuthKindRaw, Project};
 use anyhow::{anyhow, Result};
 use crate::frb_generated::StreamSink;
 use std::collections::HashSet;
@@ -35,28 +35,43 @@ impl From<AuthKindRaw> for AuthKind {
 }
 
 #[derive(Debug, Clone)]
-pub struct ConnectionSummary {
-    pub id: String,
+pub struct EnvSummary {
     pub name: String,
     pub api_base: String,
     pub org_id: u64,
-    pub folder: String,
     pub auth_kind: AuthKind,
     pub last_sync_unix: Option<i64>,
     pub file_count: u64,
 }
 
-impl From<&Connection> for ConnectionSummary {
-    fn from(c: &Connection) -> Self {
+impl From<&crate::discover::EnvInfo> for EnvSummary {
+    fn from(e: &crate::discover::EnvInfo) -> Self {
         Self {
-            id: c.id().to_string(),
-            name: c.name().to_string(),
-            api_base: c.api_base.clone(),
-            org_id: c.org_id,
-            folder: c.folder.display().to_string(),
-            auth_kind: c.auth_kind.into(),
-            last_sync_unix: c.last_sync_unix,
-            file_count: c.file_count,
+            name: e.name.clone(),
+            api_base: e.api_base.clone(),
+            org_id: e.org_id,
+            auth_kind: e.auth_kind.into(),
+            last_sync_unix: e.last_sync_unix,
+            file_count: e.file_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectSummary {
+    pub id: String,
+    pub name: String,
+    pub folder: String,
+    pub envs: Vec<EnvSummary>,
+}
+
+impl From<&Project> for ProjectSummary {
+    fn from(p: &Project) -> Self {
+        Self {
+            id: p.id().to_string(),
+            name: p.name().to_string(),
+            folder: p.folder.display().to_string(),
+            envs: p.envs.iter().map(EnvSummary::from).collect(),
         }
     }
 }
@@ -104,22 +119,23 @@ pub fn rdc_version() -> Option<String> {
 
 // ---------------------------------------------------------------- list
 
-/// List every Connection under `parent`. Non-project folders are skipped.
-pub fn list_connections(parent: String) -> Vec<ConnectionSummary> {
+/// List every Project under `parent`. Non-project folders are skipped.
+pub fn list_projects(parent: String) -> Vec<ProjectSummary> {
     discover::scan(Path::new(&parent))
         .iter()
-        .map(ConnectionSummary::from)
+        .map(ProjectSummary::from)
         .collect()
 }
 
 // ---------------------------------------------------------------- add
 
-/// Create a new Connection: write `rdc.toml` + secrets under a unique slug.
-pub fn add_connection(parent: String, input: AddConnectionInput) -> Result<ConnectionSummary> {
+/// Create a new Project: write `rdc.toml` + secrets for a first env named
+/// `main` under a unique slug. (Additional envs are added in a later phase.)
+pub fn add_project(parent: String, input: AddConnectionInput) -> Result<ProjectSummary> {
     let parent = PathBuf::from(parent);
     let used: HashSet<String> = discover::scan(&parent)
         .iter()
-        .map(|c| c.name().to_string())
+        .map(|p| p.name().to_string())
         .collect();
     let slug = rdc::slug::slugify_unique(&input.name, &used);
     let folder = parent.join(&slug);
@@ -135,6 +151,7 @@ pub fn add_connection(parent: String, input: AddConnectionInput) -> Result<Conne
 
     write_credentials(
         &folder,
+        "main",
         input.auth_kind,
         input.token.as_deref(),
         input.username.as_deref(),
@@ -143,55 +160,47 @@ pub fn add_connection(parent: String, input: AddConnectionInput) -> Result<Conne
 
     discover::find(&parent, &slug)
         .as_ref()
-        .map(ConnectionSummary::from)
-        .ok_or_else(|| anyhow!("Connection not found after add"))
+        .map(ProjectSummary::from)
+        .ok_or_else(|| anyhow!("Project not found after add"))
 }
 
 // ---------------------------------------------------------------- validate
 
-/// Validate that `path` is a single-env (`main`) rdc project and return its
+/// Validate that `path` is an rdc project (≥1 env, any names) and return its
 /// summary. Does not move, copy, or symlink anything.
-pub fn validate_existing_project(path: String) -> Result<ConnectionSummary> {
+pub fn validate_existing_project(path: String) -> Result<ProjectSummary> {
     let source = PathBuf::from(&path);
     if !source.is_dir() {
         return Err(anyhow!("Not a folder: {path}"));
     }
-    let rdc_toml = source.join("rdc.toml");
-    if !rdc_toml.exists() {
+    if !source.join("rdc.toml").exists() {
         return Err(anyhow!(
             "{path} doesn't look like an rdc project (no rdc.toml). Run `rdc init` there first."
         ));
     }
-    let body = std::fs::read_to_string(&rdc_toml).map_err(|e| anyhow!("reading rdc.toml: {e}"))?;
-    if !body.contains("[envs.main]") {
-        return Err(anyhow!(
-            "{} has no [envs.main] section; only single-env projects named `main` are supported.",
-            rdc_toml.display()
-        ));
-    }
     discover::inspect(&source)
         .as_ref()
-        .map(ConnectionSummary::from)
-        .ok_or_else(|| anyhow!("Project not discoverable"))
+        .map(ProjectSummary::from)
+        .ok_or_else(|| anyhow!("{path} has no environments defined in rdc.toml."))
 }
 
 // ---------------------------------------------------------------- edit
 
-/// Update a Connection's settings, renaming its folder if the name changed.
-/// `api_base`/`org_id` are rewritten through rdc's own config writer so the
-/// file matches the CLI's format exactly. Credentials are only touched when
-/// new ones are supplied (blank = keep existing). Returns the (possibly moved)
-/// Connection so the caller can reselect it.
-pub fn edit_connection(folder: String, input: EditConnectionInput) -> Result<ConnectionSummary> {
+/// Rename the project folder (from `input.name`) if it changed, and rewrite the
+/// named `env`'s api_base/org_id through rdc's own config writer. Credentials
+/// are only replaced when supplied (blank = keep existing).
+pub fn edit_project(
+    folder: String,
+    env: String,
+    input: EditConnectionInput,
+) -> Result<ProjectSummary> {
     let mut folder = PathBuf::from(&folder);
     if !folder.join("rdc.toml").exists() {
-        return Err(anyhow!("Connection not found"));
+        return Err(anyhow!("Project not found"));
     }
-
-    // Rename the folder when the name (slug) changed.
     let parent = folder
         .parent()
-        .ok_or_else(|| anyhow!("Connection has no parent folder"))?
+        .ok_or_else(|| anyhow!("Project has no parent folder"))?
         .to_path_buf();
     let current_slug = folder
         .file_name()
@@ -200,34 +209,29 @@ pub fn edit_connection(folder: String, input: EditConnectionInput) -> Result<Con
         .to_string();
     let used: HashSet<String> = discover::scan(&parent)
         .iter()
-        .map(|c| c.name().to_string())
+        .map(|p| p.name().to_string())
         .filter(|n| n != &current_slug)
         .collect();
     let desired_slug = rdc::slug::slugify_unique(&input.name, &used);
     if desired_slug != current_slug {
         let new_folder = parent.join(&desired_slug);
         if new_folder.exists() {
-            return Err(anyhow!(
-                "A connection named \"{}\" already exists here.",
-                input.name
-            ));
+            return Err(anyhow!("A project named \"{}\" already exists here.", input.name));
         }
-        std::fs::rename(&folder, &new_folder).map_err(|e| anyhow!("renaming the connection: {e}"))?;
+        std::fs::rename(&folder, &new_folder).map_err(|e| anyhow!("renaming the project: {e}"))?;
         folder = new_folder;
     }
 
-    // Rewrite api_base/org_id through rdc's own config (canonical + lossless).
     let toml_path = folder.join("rdc.toml");
     let mut cfg = rdc::config::ProjectConfig::load(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
-    let env = cfg
+    let ec = cfg
         .envs
-        .get_mut("main")
-        .ok_or_else(|| anyhow!("This project has no `main` environment."))?;
-    env.api_base = input.api_base.trim_end_matches('/').to_string();
-    env.org_id = input.org_id;
+        .get_mut(&env)
+        .ok_or_else(|| anyhow!("This project has no `{env}` environment."))?;
+    ec.api_base = input.api_base.trim_end_matches('/').to_string();
+    ec.org_id = input.org_id;
     cfg.save(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
 
-    // Only replace credentials if new ones were supplied.
     let has_new_credentials = match input.auth_kind {
         AuthKind::Token => input.token.as_deref().is_some_and(|s| !s.is_empty()),
         AuthKind::Password => {
@@ -236,9 +240,10 @@ pub fn edit_connection(folder: String, input: EditConnectionInput) -> Result<Con
         }
     };
     if has_new_credentials {
-        let _ = std::fs::remove_file(folder.join("secrets/main.secrets.json"));
+        let _ = std::fs::remove_file(folder.join(format!("secrets/{env}.secrets.json")));
         write_credentials(
             &folder,
+            &env,
             input.auth_kind,
             input.token.as_deref(),
             input.username.as_deref(),
@@ -248,18 +253,18 @@ pub fn edit_connection(folder: String, input: EditConnectionInput) -> Result<Con
 
     discover::inspect(&folder)
         .as_ref()
-        .map(ConnectionSummary::from)
-        .ok_or_else(|| anyhow!("Connection not found after edit"))
+        .map(ProjectSummary::from)
+        .ok_or_else(|| anyhow!("Project not found after edit"))
 }
 
 // ---------------------------------------------------------------- sync
 
-/// Pull-only sync of one Connection. Scaffolds init files, resolves the token
+/// Pull-only sync of one environment. Scaffolds init files, resolves the token
 /// (silent re-login in password mode), then runs `sync_no_push`. Progress is
-/// streamed as `SyncPhase`; the stream conveys the terminal outcome (Done or
-/// Error) rather than throwing.
-pub fn sync_connection(
+/// streamed as `SyncPhase`.
+pub fn sync_env(
     folder: String,
+    env: String,
     api_base: String,
     org_id: u64,
     sink: StreamSink<SyncPhase>,
@@ -273,11 +278,11 @@ pub fn sync_connection(
         buf: Vec::new(),
     };
     let result: Result<u64> = block_on(async {
-        rdc::cli::init::write_scaffold_files(&folder, "main", &api_base, org_id)?;
-        let token = rdc::secrets::resolve_token(&folder, "main", &api_base).await?;
-        rdc::cli::sync::embed::sync_no_push_logged(&folder, "main", &token, Box::new(forwarder))
+        rdc::cli::init::write_scaffold_files(&folder, &env, &api_base, org_id)?;
+        let token = rdc::secrets::resolve_token(&folder, &env, &api_base).await?;
+        rdc::cli::sync::embed::sync_no_push_logged(&folder, &env, &token, Box::new(forwarder))
             .await?;
-        Ok(discover::count_files(&folder.join("envs/main")))
+        Ok(discover::count_files(&folder.join(format!("envs/{env}"))))
     });
 
     match result {
@@ -328,8 +333,8 @@ impl std::io::Write for LineForwarder {
 
 // ---------------------------------------------------------------- trash / reveal
 
-/// Move a managed Connection's folder to the OS trash/recycle bin.
-pub fn trash_connection(folder: String) -> Result<()> {
+/// Move a managed Project's folder to the OS trash/recycle bin.
+pub fn trash_project(folder: String) -> Result<()> {
     let path = PathBuf::from(&folder);
     #[cfg(target_os = "macos")]
     {
@@ -399,6 +404,7 @@ pub fn reveal_in_file_manager(path: String) -> Result<()> {
 /// same way the original bridge did.
 fn write_credentials(
     folder: &Path,
+    env: &str,
     auth: AuthKind,
     token: Option<&str>,
     username: Option<&str>,
@@ -409,8 +415,7 @@ fn write_credentials(
             let t = token
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| anyhow!("Token is required."))?;
-            rdc::secrets::write_secrets_file(folder, "main", t, None)
-                .map_err(|e| anyhow!("{e:#}"))?;
+            rdc::secrets::write_secrets_file(folder, env, t, None).map_err(|e| anyhow!("{e:#}"))?;
         }
         AuthKind::Password => {
             let u = username
@@ -419,7 +424,7 @@ fn write_credentials(
             let p = password
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| anyhow!("Password is required."))?;
-            rdc::secrets::save_password_credentials(folder, "main", u, p)
+            rdc::secrets::save_password_credentials(folder, env, u, p)
                 .map_err(|e| anyhow!("{e:#}"))?;
         }
     }
@@ -434,4 +439,28 @@ fn block_on<F: Future>(fut: F) -> F::Output {
         .build()
         .expect("build current-thread tokio runtime")
         .block_on(fut)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_summary_from_multi_env_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("acme");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("rdc.toml"),
+            "[envs.dev]\napi_base = \"https://d.test/api/v1\"\norg_id = 1\n\
+             [envs.prod]\napi_base = \"https://p.test/api/v1\"\norg_id = 2\n",
+        )
+        .unwrap();
+        let p = discover::inspect(&folder).unwrap();
+        let summary = ProjectSummary::from(&p);
+        assert_eq!(summary.name, "acme");
+        assert_eq!(summary.envs.len(), 2);
+        assert_eq!(summary.envs[0].name, "dev");
+        assert_eq!(summary.envs[1].org_id, 2);
+    }
 }

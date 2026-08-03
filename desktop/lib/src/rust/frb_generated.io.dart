@@ -43,10 +43,10 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   PlatformInt64 dco_decode_box_autoadd_i_64(dynamic raw);
 
   @protected
-  ConnectionSummary dco_decode_connection_summary(dynamic raw);
+  EditConnectionInput dco_decode_edit_connection_input(dynamic raw);
 
   @protected
-  EditConnectionInput dco_decode_edit_connection_input(dynamic raw);
+  EnvSummary dco_decode_env_summary(dynamic raw);
 
   @protected
   int dco_decode_i_32(dynamic raw);
@@ -55,16 +55,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   PlatformInt64 dco_decode_i_64(dynamic raw);
 
   @protected
-  List<ConnectionSummary> dco_decode_list_connection_summary(dynamic raw);
+  List<EnvSummary> dco_decode_list_env_summary(dynamic raw);
 
   @protected
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw);
+
+  @protected
+  List<ProjectSummary> dco_decode_list_project_summary(dynamic raw);
 
   @protected
   String? dco_decode_opt_String(dynamic raw);
 
   @protected
   PlatformInt64? dco_decode_opt_box_autoadd_i_64(dynamic raw);
+
+  @protected
+  ProjectSummary dco_decode_project_summary(dynamic raw);
 
   @protected
   SyncPhase dco_decode_sync_phase(dynamic raw);
@@ -111,12 +117,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   PlatformInt64 sse_decode_box_autoadd_i_64(SseDeserializer deserializer);
 
   @protected
-  ConnectionSummary sse_decode_connection_summary(SseDeserializer deserializer);
-
-  @protected
   EditConnectionInput sse_decode_edit_connection_input(
     SseDeserializer deserializer,
   );
+
+  @protected
+  EnvSummary sse_decode_env_summary(SseDeserializer deserializer);
 
   @protected
   int sse_decode_i_32(SseDeserializer deserializer);
@@ -125,18 +131,24 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   PlatformInt64 sse_decode_i_64(SseDeserializer deserializer);
 
   @protected
-  List<ConnectionSummary> sse_decode_list_connection_summary(
-    SseDeserializer deserializer,
-  );
+  List<EnvSummary> sse_decode_list_env_summary(SseDeserializer deserializer);
 
   @protected
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer);
+
+  @protected
+  List<ProjectSummary> sse_decode_list_project_summary(
+    SseDeserializer deserializer,
+  );
 
   @protected
   String? sse_decode_opt_String(SseDeserializer deserializer);
 
   @protected
   PlatformInt64? sse_decode_opt_box_autoadd_i_64(SseDeserializer deserializer);
+
+  @protected
+  ProjectSummary sse_decode_project_summary(SseDeserializer deserializer);
 
   @protected
   SyncPhase sse_decode_sync_phase(SseDeserializer deserializer);
@@ -196,16 +208,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
-  void sse_encode_connection_summary(
-    ConnectionSummary self,
-    SseSerializer serializer,
-  );
-
-  @protected
   void sse_encode_edit_connection_input(
     EditConnectionInput self,
     SseSerializer serializer,
   );
+
+  @protected
+  void sse_encode_env_summary(EnvSummary self, SseSerializer serializer);
 
   @protected
   void sse_encode_i_32(int self, SseSerializer serializer);
@@ -214,8 +223,8 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_i_64(PlatformInt64 self, SseSerializer serializer);
 
   @protected
-  void sse_encode_list_connection_summary(
-    List<ConnectionSummary> self,
+  void sse_encode_list_env_summary(
+    List<EnvSummary> self,
     SseSerializer serializer,
   );
 
@@ -226,11 +235,23 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_list_project_summary(
+    List<ProjectSummary> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer);
 
   @protected
   void sse_encode_opt_box_autoadd_i_64(
     PlatformInt64? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_project_summary(
+    ProjectSummary self,
     SseSerializer serializer,
   );
 
