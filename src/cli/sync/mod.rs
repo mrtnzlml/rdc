@@ -306,6 +306,14 @@ pub(crate) async fn run_cycle(
     // only explodes mid-push, after earlier kinds already landed.
     let parse_errors = changes.json_parse_errors();
 
+    // Changed local files with a field longer than the API's declared
+    // `max_length`. Same treatment as `parse_errors`, and for the same
+    // reason: the value is a *permanent* push failure (no retry can
+    // succeed while the bytes stay oversized), so letting it reach the
+    // wire means every later sync dies at that PATCH — and since push
+    // runs before pull, no pull ever lands again.
+    let limit_violations = changes.field_limit_violations();
+
     // Classification computed; grid renderer rebuild handled elsewhere.
 
     // Phase 4: plan + confirm. `--dry-run` exits here without writing.
@@ -482,6 +490,25 @@ pub(crate) async fn run_cycle(
             progress.block(&body);
         }
 
+        if !limit_violations.is_empty() {
+            progress.event(Action::Plan, "field limit errors");
+            let mut body = String::new();
+            use std::fmt::Write as _;
+            for v in &limit_violations {
+                let _ = writeln!(
+                    body,
+                    "- {}/{} -- {}: {} is {} characters, the API allows {}",
+                    v.kind,
+                    v.slug,
+                    v.path.display(),
+                    v.field,
+                    v.actual,
+                    v.limit,
+                );
+            }
+            progress.block(&body);
+        }
+
         if !renderer_was_supplied {
             let parse_suffix = if parse_errors.is_empty() {
                 String::new()
@@ -492,6 +519,16 @@ pub(crate) async fn run_cycle(
                     if parse_errors.len() == 1 { "" } else { "s" }
                 )
             };
+            let limit_suffix = if limit_violations.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", {} field limit error{}",
+                    limit_violations.len(),
+                    if limit_violations.len() == 1 { "" } else { "s" }
+                )
+            };
+            let parse_suffix = format!("{parse_suffix}{limit_suffix}");
             progress.event(
                 Action::Done,
                 &format!(
@@ -517,6 +554,36 @@ pub(crate) async fn run_cycle(
         for e in &parse_errors {
             use std::fmt::Write as _;
             let _ = write!(msg, "\n  - {}/{} -- {}: {}", e.kind, e.slug, e.path.display(), e.error);
+        }
+        anyhow::bail!("{msg}");
+    }
+
+    // Refuse to push a field the API will reject on length. Unlike a
+    // transient API error this can never succeed on retry, so attempting
+    // it would abort the cycle before the pull phase every single run —
+    // wedging the project until a human notices. Failing here instead
+    // keeps the remote untouched and names exactly what to shorten.
+    // `--no-push` (audit) proceeds: there is nothing to half-apply.
+    if !no_push && !limit_violations.is_empty() {
+        let mut msg = format!(
+            "{} changed local field(s) exceed the Rossum API's length limit; \
+             refusing to push before any remote write:",
+            limit_violations.len()
+        );
+        for v in &limit_violations {
+            use std::fmt::Write as _;
+            let _ = write!(
+                msg,
+                "\n  - {}/{} -- {}: {} is {} characters, the API allows {} \
+                 (shorten it by {})",
+                v.kind,
+                v.slug,
+                v.path.display(),
+                v.field,
+                v.actual,
+                v.limit,
+                v.actual.saturating_sub(v.limit),
+            );
         }
         anyhow::bail!("{msg}");
     }
