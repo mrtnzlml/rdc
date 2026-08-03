@@ -60,10 +60,19 @@ Directory _filesFixture() {
   Directory('${root.path}/envs/main/queues').createSync(recursive: true);
   File('${root.path}/envs/main/hooks/validate_invoice.json').writeAsStringSync('x' * 2000);
   File('${root.path}/envs/main/queues/invoices.json').writeAsStringSync('x' * 4200);
-  File('${root.path}/mapping.toml').writeAsStringSync('x' * 320);
-  File('${root.path}/overlay.toml').writeAsStringSync('x' * 90);
+  // multi-line content so the read-only preview shows real lines
+  File('${root.path}/mapping.toml').writeAsStringSync(
+      '[env.dev]\nqueue = "invoices"\nschema = "invoices"\nhook = "validate_invoice"\n');
+  File('${root.path}/overlay.toml').writeAsStringSync('[queues.invoices]\nname = "Invoices"\n');
   File('${root.path}/.gitignore').writeAsStringSync('x' * 40); // hidden → skipped
   return root;
+}
+
+AppState _filesState(Directory root) {
+  final s = AppState(Settings(parentFolder: Directory.systemTemp.path));
+  s.connections = [_conn('acme-invoices', 123456, lastSync: 1000, files: 128, folder: root.path)];
+  s.selectedFolder = root.path;
+  return s;
 }
 
 Widget _wrap(Brightness b, Widget child) => MaterialApp(
@@ -103,9 +112,20 @@ void main() {
   testWidgets('files tab — light', (t) async {
     final root = _filesFixture();
     addTearDown(() => root.deleteSync(recursive: true));
-    final s = AppState(Settings(parentFolder: Directory.systemTemp.path));
-    s.connections = [_conn('acme-invoices', 123456, lastSync: 1000, files: 128, folder: root.path)];
-    s.selectedFolder = root.path;
-    await shot(t, _wrap(Brightness.light, MdhScaffold(state: s, view: NavView.connection, activeTab: 'files')), 'goldens/mdh_files_light.png');
+    await shot(t, _wrap(Brightness.light, MdhScaffold(state: _filesState(root), view: NavView.connection, activeTab: 'files')), 'goldens/mdh_files_light.png');
+  });
+
+  testWidgets('files preview — light', (t) async {
+    final root = _filesFixture();
+    addTearDown(() => root.deleteSync(recursive: true));
+    t.view.physicalSize = const Size(1080, 660);
+    t.view.devicePixelRatio = 1.0;
+    addTearDown(t.view.resetPhysicalSize);
+    addTearDown(t.view.resetDevicePixelRatio);
+    await t.pumpWidget(_wrap(Brightness.light, MdhScaffold(state: _filesState(root), view: NavView.connection, activeTab: 'files')));
+    await t.pumpAndSettle();
+    await t.tap(find.text('mapping.toml')); // open the read-only preview
+    await t.pumpAndSettle();
+    await expectLater(find.byType(MaterialApp), matchesGoldenFile('goldens/mdh_files_preview_light.png'));
   });
 }
