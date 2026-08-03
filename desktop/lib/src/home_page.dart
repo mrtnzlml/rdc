@@ -8,6 +8,7 @@ import 'ansi.dart';
 import 'app_state.dart';
 import 'dialogs.dart';
 import 'error_text.dart';
+import 'highlight.dart';
 import 'mdh_theme.dart';
 import 'rust/api/rdc.dart';
 import 'update_check.dart';
@@ -1021,7 +1022,8 @@ class _FilesPanelState extends State<_FilesPanel> {
       return Center(child: Text('Empty file.', style: TextStyle(color: c.textSecondary, fontSize: 12.5)));
     }
     // Vertical scroll (with a visible scrollbar) over a horizontal scroll so
-    // long code/JSON lines don't wrap — read-only, selectable.
+    // long code/JSON lines don't wrap — read-only, selectable, basic syntax
+    // highlighting by file type.
     return Scrollbar(
       controller: _preview,
       child: SingleChildScrollView(
@@ -1029,10 +1031,19 @@ class _FilesPanelState extends State<_FilesPanel> {
         padding: const EdgeInsets.all(14),
         child: SingleChildScrollView(
           scrollDirection: Axis.horizontal,
-          child: SelectableText(text, style: _mono(c.textPrimary, 12.5)),
+          child: SelectableText.rich(
+            TextSpan(children: highlightSource(text, _ext(_previewName), c, 12.5)),
+          ),
         ),
       ),
     );
+  }
+
+  /// Lower-case extension of [name] without the dot, or null (also for dotfiles).
+  String? _ext(String? name) {
+    if (name == null) return null;
+    final i = name.lastIndexOf('.');
+    return (i <= 0 || i == name.length - 1) ? null : name.substring(i + 1).toLowerCase();
   }
 }
 
