@@ -20,14 +20,14 @@ enum NavView { connection, overview, settings }
 
 enum _St { running, error, synced, never }
 
-_St _statusOf(AppState s, ConnItem it) {
-  switch (s.syncState[it.summary.folder]) {
+_St _statusOf(AppState s, ProjectItem it, EnvSummary env) {
+  switch (s.syncState[s.envKey(it.summary.folder, env.name)]) {
     case SyncState.running:
       return _St.running;
     case SyncState.error:
       return _St.error;
     default:
-      return it.summary.lastSyncUnix != null ? _St.synced : _St.never;
+      return env.lastSyncUnix != null ? _St.synced : _St.never;
   }
 }
 
@@ -116,19 +116,22 @@ class _HomePageState extends State<HomePage> {
   Future<void> _addConnection() =>
       showDialog<bool>(context: context, builder: (_) => AddConnectionDialog(state: state));
 
-  Future<void> _editConnection(ConnItem i) =>
-      showDialog<bool>(context: context, builder: (_) => EditConnectionDialog(state: state, item: i));
+  Future<void> _editConnection(ProjectItem i) => showDialog<bool>(
+      context: context,
+      builder: (_) => EditConnectionDialog(state: state, item: i, env: state.selectedEnvSummary!));
 
-  Future<void> _reveal(ConnItem i) => _run(() => state.reveal(i.summary.folder));
+  Future<void> _reveal(ProjectItem i) => _run(() => state.reveal(i.summary.folder));
 
-  Future<void> _confirmRemove(ConnItem i) async {
+  Future<void> _confirmRemove(ProjectItem i) async {
     final ok = await showDialog<bool>(context: context, builder: (_) => RemoveDialog(item: i));
     if (ok == true) await _run(() => state.removeOrDetach(i));
   }
 
   void _syncAll() {
-    for (final c in state.connections) {
-      state.sync(c);
+    for (final p in state.projects) {
+      for (final e in p.summary.envs) {
+        state.syncEnvItem(p, e);
+      }
     }
   }
 
@@ -155,14 +158,18 @@ class _HomePageState extends State<HomePage> {
           onResize: (dx) => setState(() => _listWidth = (_listWidth + dx).clamp(200.0, 460.0)),
           onSelectTab: (t) => setState(() => _tab = t),
           onSelectConn: (folder) => setState(() {
-            state.select(folder);
+            state.selectProject(folder);
+            _view = NavView.connection;
+          }),
+          onSelectEnv: (folder, env) => setState(() {
+            state.selectEnv(folder, env);
             _view = NavView.connection;
           }),
           onSelectFleet: () => setState(() => _view = NavView.overview),
           onSelectSettings: () => setState(() => _view = NavView.settings),
           onAdd: _addConnection,
           onOpen: _openExisting,
-          onSync: (i) => state.sync(i),
+          onSync: (p, e) => state.syncEnvItem(p, e),
           onSyncAll: _syncAll,
           onEdit: _editConnection,
           onReveal: _reveal,
@@ -201,6 +208,7 @@ class MdhScaffold extends StatelessWidget {
     this.onResize,
     this.onSelectTab,
     this.onSelectConn,
+    this.onSelectEnv,
     this.onSelectFleet,
     this.onSelectSettings,
     this.onAdd,
@@ -223,15 +231,16 @@ class MdhScaffold extends StatelessWidget {
   final void Function(double)? onResize;
   final void Function(String)? onSelectTab;
   final void Function(String folder)? onSelectConn;
+  final void Function(String folder, String env)? onSelectEnv;
   final VoidCallback? onSelectFleet;
   final VoidCallback? onSelectSettings;
   final VoidCallback? onAdd;
   final VoidCallback? onOpen;
-  final void Function(ConnItem)? onSync;
+  final void Function(ProjectItem, EnvSummary)? onSync;
   final VoidCallback? onSyncAll;
-  final void Function(ConnItem)? onEdit;
-  final void Function(ConnItem)? onReveal;
-  final void Function(ConnItem)? onRemove;
+  final void Function(ProjectItem)? onEdit;
+  final void Function(ProjectItem)? onReveal;
+  final void Function(ProjectItem)? onRemove;
   final void Function(String path)? onRevealDir;
   final VoidCallback? onChooseParent;
   final VoidCallback? onAbout;
@@ -254,7 +263,7 @@ class MdhScaffold extends StatelessWidget {
           state: state,
           activeTab: activeTab,
           onSelectTab: onSelectTab ?? (_) {},
-          onSync: onSync ?? (_) {},
+          onSync: onSync ?? (_, _) {},
           onEdit: onEdit ?? (_) {},
           onReveal: onReveal ?? (_) {},
           onRemove: onRemove ?? (_) {},
@@ -265,7 +274,7 @@ class MdhScaffold extends StatelessWidget {
           state: state,
           onNew: onAdd ?? () {},
           onSyncAll: onSyncAll ?? () {},
-          onOpenConn: onSelectConn ?? (_) {},
+          onOpenConn: onSelectEnv ?? (_, _) {},
         ),
       NavView.settings => _SettingsView(
           state: state,
@@ -287,6 +296,7 @@ class MdhScaffold extends StatelessWidget {
               state: state,
               view: view,
               onSelect: onSelectConn ?? (_) {},
+              onSelectEnv: onSelectEnv ?? (_, _) {},
               onSelectFleet: onSelectFleet ?? () {},
               onSelectSettings: onSelectSettings ?? () {},
               onAdd: onAdd ?? () {},
@@ -308,6 +318,7 @@ class _Sidebar extends StatelessWidget {
     required this.state,
     required this.view,
     required this.onSelect,
+    required this.onSelectEnv,
     required this.onSelectFleet,
     required this.onSelectSettings,
     required this.onAdd,
@@ -316,6 +327,7 @@ class _Sidebar extends StatelessWidget {
   final AppState state;
   final NavView view;
   final void Function(String) onSelect;
+  final void Function(String folder, String env) onSelectEnv;
   final VoidCallback onSelectFleet, onSelectSettings, onAdd, onOpen;
 
   @override
@@ -369,11 +381,11 @@ class _Sidebar extends StatelessWidget {
             padding: const EdgeInsets.fromLTRB(14, 14, 10, 6),
             child: Row(
               children: [
-                Text('CONNECTIONS',
+                Text('PROJECTS',
                     style: TextStyle(color: c.textSecondary, fontSize: 11, fontWeight: FontWeight.w700, letterSpacing: 0.8)),
                 const Spacer(),
                 Tooltip(
-                  message: 'New connection',
+                  message: 'New project',
                   child: InkWell(
                     onTap: onAdd,
                     mouseCursor: SystemMouseCursors.click,
@@ -394,11 +406,11 @@ class _Sidebar extends StatelessWidget {
             ),
           ),
           Expanded(
-            child: state.connections.isEmpty
+            child: state.projects.isEmpty
                 ? Center(
                     child: Padding(
                       padding: const EdgeInsets.all(16),
-                      child: Text('No connections yet.\nAdd one with +.',
+                      child: Text('No projects yet.\nAdd one with +.',
                           textAlign: TextAlign.center,
                           style: TextStyle(color: c.textSecondary, fontSize: 12)),
                     ),
@@ -406,8 +418,11 @@ class _Sidebar extends StatelessWidget {
                 : ListView(
                     padding: const EdgeInsets.symmetric(horizontal: 8),
                     children: [
-                      for (final it in state.connections)
-                        _SidebarRow(state: state, item: it, active: view == NavView.connection, onSelect: onSelect),
+                      for (final p in state.projects) ...[
+                        _ProjectRow(state: state, item: p, onSelect: onSelect),
+                        for (final e in p.summary.envs)
+                          _EnvRow(state: state, item: p, env: e, onSelect: onSelectEnv),
+                      ],
                     ],
                   ),
           ),
@@ -422,62 +437,71 @@ class _Sidebar extends StatelessWidget {
   }
 }
 
-class _SidebarRow extends StatelessWidget {
-  const _SidebarRow({required this.state, required this.item, required this.active, required this.onSelect});
+class _ProjectRow extends StatelessWidget {
+  const _ProjectRow({required this.state, required this.item, required this.onSelect});
   final AppState state;
-  final ConnItem item;
-  final bool active;
+  final ProjectItem item;
   final void Function(String) onSelect;
-
   @override
   Widget build(BuildContext context) {
     final c = MdhColors.of(context);
-    final s = item.summary;
-    final sel = active && s.folder == state.selectedFolder;
-    final st = _statusOf(state, item);
-    final dotColor = switch (st) {
-      _St.error => c.danger,
-      _St.never => c.textHint,
-      _ => c.successFg,
-    };
+    final sel = item.summary.folder == state.selectedFolder;
+    return Padding(
+      padding: const EdgeInsets.only(top: 4, bottom: 1),
+      child: InkWell(
+        onTap: () => onSelect(item.summary.folder),
+        mouseCursor: SystemMouseCursors.click,
+        borderRadius: BorderRadius.circular(6),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          child: Row(children: [
+            Icon(Icons.folder_outlined, size: 15, color: sel ? c.accent : c.textSecondary),
+            const SizedBox(width: 8),
+            Expanded(child: Text(item.summary.name,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(color: c.textPrimary, fontSize: 13, fontWeight: FontWeight.w600))),
+            if (item.isExternal) Text('ext', style: _mono(c.textHint, 10)),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+class _EnvRow extends StatelessWidget {
+  const _EnvRow({required this.state, required this.item, required this.env, required this.onSelect});
+  final AppState state;
+  final ProjectItem item;
+  final EnvSummary env;
+  final void Function(String folder, String env) onSelect;
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    final sel = item.summary.folder == state.selectedFolder && env.name == state.selectedEnv;
+    final st = _statusOf(state, item, env);
+    final dotColor = switch (st) { _St.error => c.danger, _St.never => c.textHint, _ => c.successFg };
     final sub = switch (st) {
-      _St.running => 'syncing…',
-      _St.error => 'failed',
-      _St.synced => _rel(s.lastSyncUnix),
-      _St.never => 'never',
+      _St.running => 'syncing…', _St.error => 'failed',
+      _St.synced => _rel(env.lastSyncUnix), _St.never => 'never',
     };
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 1),
+      padding: const EdgeInsets.only(left: 14, top: 1, bottom: 1),
       child: InkWell(
-        onTap: () => onSelect(s.folder),
+        onTap: () => onSelect(item.summary.folder, env.name),
         mouseCursor: SystemMouseCursors.click,
         borderRadius: BorderRadius.circular(6),
         child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
           decoration: BoxDecoration(
-            color: sel ? c.accent : Colors.transparent,
-            borderRadius: BorderRadius.circular(6),
-          ),
-          child: Row(
-            children: [
-              Container(width: 7, height: 7, margin: const EdgeInsets.only(right: 10),
-                  decoration: BoxDecoration(color: sel ? Colors.white : dotColor, shape: BoxShape.circle)),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(s.name,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(color: sel ? Colors.white : c.textPrimary, fontSize: 13, fontWeight: FontWeight.w500)),
-                    const SizedBox(height: 2),
-                    Text('org ${s.orgId} · $sub${item.isExternal ? ' · ext' : ''}',
-                        overflow: TextOverflow.ellipsis,
-                        style: _mono(sel ? Colors.white70 : c.textSecondary, 11)),
-                  ],
-                ),
-              ),
-            ],
-          ),
+            color: sel ? c.accent : Colors.transparent, borderRadius: BorderRadius.circular(6)),
+          child: Row(children: [
+            Container(width: 7, height: 7, margin: const EdgeInsets.only(right: 10),
+                decoration: BoxDecoration(color: sel ? Colors.white : dotColor, shape: BoxShape.circle)),
+            Expanded(child: Text(env.name, overflow: TextOverflow.ellipsis,
+                style: TextStyle(color: sel ? Colors.white : c.textPrimary, fontSize: 12.5, fontWeight: FontWeight.w500))),
+            Text('org ${env.orgId} · $sub',
+                style: _mono(sel ? Colors.white70 : c.textSecondary, 10.5)),
+          ]),
         ),
       ),
     );
@@ -518,7 +542,8 @@ class _ConnMain extends StatelessWidget {
   final AppState state;
   final String activeTab;
   final void Function(String) onSelectTab;
-  final void Function(ConnItem) onSync, onEdit, onReveal, onRemove;
+  final void Function(ProjectItem, EnvSummary) onSync;
+  final void Function(ProjectItem) onEdit, onReveal, onRemove;
   final void Function(String) onRevealDir;
   final VoidCallback onAdd;
 
@@ -526,23 +551,24 @@ class _ConnMain extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = MdhColors.of(context);
     final item = state.selected;
-    if (item == null) {
+    final env = state.selectedEnvSummary;
+    if (item == null || env == null) {
       return Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text('No connection selected', style: TextStyle(color: c.textSecondary)),
+            Text('No environment selected', style: TextStyle(color: c.textSecondary)),
             const SizedBox(height: 12),
             _Btn(label: 'New connection', primary: true, onTap: onAdd),
           ],
         ),
       );
     }
-    final st = _statusOf(state, item);
+    final st = _statusOf(state, item, env);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _ConnBar(state: state, item: item, onSync: onSync, onEdit: onEdit, onReveal: onReveal, onRemove: onRemove),
+        _ConnBar(state: state, item: item, env: env, onSync: onSync, onEdit: onEdit, onReveal: onReveal, onRemove: onRemove),
         _TabBar(
           active: activeTab,
           tabs: const ['overview', 'log', 'files'],
@@ -556,17 +582,17 @@ class _ConnMain extends StatelessWidget {
                 child: _FilesPanel(
                   key: ValueKey('files:${item.summary.folder}'),
                   rootFolder: item.summary.folder,
-                  revision: item.summary.fileCount.toInt(),
+                  revision: env.fileCount.toInt(),
                   onRevealDir: onRevealDir,
                 ),
               ),
             'log' => Padding(
                 padding: const EdgeInsets.all(18),
-                child: _SyncLogCard(state: state, item: item),
+                child: _SyncLogCard(state: state, item: item, env: env),
               ),
             _ => Padding(
                 padding: const EdgeInsets.all(18),
-                child: _OverviewPanel(state: state, item: item, st: st),
+                child: _OverviewPanel(state: state, item: item, env: env, st: st),
               ),
           },
         ),
@@ -576,16 +602,17 @@ class _ConnMain extends StatelessWidget {
 }
 
 class _ConnBar extends StatelessWidget {
-  const _ConnBar({required this.state, required this.item, required this.onSync, required this.onEdit, required this.onReveal, required this.onRemove});
+  const _ConnBar({required this.state, required this.item, required this.env, required this.onSync, required this.onEdit, required this.onReveal, required this.onRemove});
   final AppState state;
-  final ConnItem item;
-  final void Function(ConnItem) onSync, onEdit, onReveal, onRemove;
+  final ProjectItem item;
+  final EnvSummary env;
+  final void Function(ProjectItem, EnvSummary) onSync;
+  final void Function(ProjectItem) onEdit, onReveal, onRemove;
 
   @override
   Widget build(BuildContext context) {
     final c = MdhColors.of(context);
-    final s = item.summary;
-    final st = _statusOf(state, item);
+    final st = _statusOf(state, item, env);
     return Container(
       padding: const EdgeInsets.fromLTRB(18, 12, 18, 12),
       decoration: BoxDecoration(
@@ -604,21 +631,25 @@ class _ConnBar extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Text(s.name, maxLines: 1, overflow: TextOverflow.ellipsis,
+                      Text('${item.summary.name} · ${env.name}', maxLines: 1, overflow: TextOverflow.ellipsis,
                           style: TextStyle(color: c.textPrimary, fontSize: 15, fontWeight: FontWeight.w600)),
                       const SizedBox(height: 2),
-                      Text('${_host(s.apiBase)} · org ${s.orgId}', maxLines: 1, overflow: TextOverflow.ellipsis,
+                      Text('${_host(env.apiBase)} · org ${env.orgId}', maxLines: 1, overflow: TextOverflow.ellipsis,
                           style: _mono(c.textSecondary, 12)),
                     ],
                   ),
                 ),
                 const SizedBox(width: 12),
-                _StatusPill(st: st),
+                // Flexible (not a rigid sibling) so the pill can also give up
+                // room under extreme width pressure instead of forcing a
+                // hard RenderFlex overflow; at any width with room to spare
+                // it just renders at its natural size, identical to before.
+                Flexible(child: _StatusPill(st: st)),
               ],
             ),
           ),
           const SizedBox(width: 12),
-          _Btn(label: st == _St.error ? 'Retry' : 'Sync', primary: true, onTap: st == _St.running ? null : () => onSync(item)),
+          _Btn(label: st == _St.error ? 'Retry' : 'Sync', primary: true, onTap: st == _St.running ? null : () => onSync(item, env)),
           const SizedBox(width: 8),
           _Btn(label: 'Edit', onTap: () => onEdit(item)),
           const SizedBox(width: 8),
@@ -632,14 +663,14 @@ class _ConnBar extends StatelessWidget {
 }
 
 class _OverviewPanel extends StatelessWidget {
-  const _OverviewPanel({required this.state, required this.item, required this.st});
+  const _OverviewPanel({required this.state, required this.item, required this.env, required this.st});
   final AppState state;
-  final ConnItem item;
+  final ProjectItem item;
+  final EnvSummary env;
   final _St st;
 
   @override
   Widget build(BuildContext context) {
-    final s = item.summary;
     // Connection details (host, org) already live in the header, so the panel
     // is just the at-a-glance stat cards plus a recent-sync log that fills the
     // remaining height.
@@ -647,14 +678,14 @@ class _OverviewPanel extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Row(children: [
-          Expanded(child: _StatCard(n: s.fileCount.toString(), l: 'Files pulled')),
+          Expanded(child: _StatCard(n: env.fileCount.toString(), l: 'Files pulled')),
           const SizedBox(width: 12),
-          Expanded(child: _StatCard(n: st == _St.never ? '—' : _rel(s.lastSyncUnix), l: 'Last sync')),
+          Expanded(child: _StatCard(n: st == _St.never ? '—' : _rel(env.lastSyncUnix), l: 'Last sync')),
           const SizedBox(width: 12),
-          Expanded(child: _StatCard(n: s.authKind == AuthKind.token ? 'token' : 'login', l: 'Auth')),
+          Expanded(child: _StatCard(n: env.authKind == AuthKind.token ? 'token' : 'login', l: 'Auth')),
         ]),
         _SectionTitle('Recent sync'),
-        Expanded(child: _SyncLogCard(state: state, item: item)),
+        Expanded(child: _SyncLogCard(state: state, item: item, env: env)),
       ],
     );
   }
@@ -663,9 +694,10 @@ class _OverviewPanel extends StatelessWidget {
 /// The sync-log panel. Fills the height it's given (place it in an Expanded);
 /// short logs sit at the top, long logs auto-scroll to the latest line.
 class _SyncLogCard extends StatefulWidget {
-  const _SyncLogCard({required this.state, required this.item});
+  const _SyncLogCard({required this.state, required this.item, required this.env});
   final AppState state;
-  final ConnItem item;
+  final ProjectItem item;
+  final EnvSummary env;
   @override
   State<_SyncLogCard> createState() => _SyncLogCardState();
 }
@@ -704,9 +736,10 @@ class _SyncLogCardState extends State<_SyncLogCard> {
   @override
   Widget build(BuildContext context) {
     final c = MdhColors.of(context);
-    final st = _statusOf(widget.state, widget.item);
-    final lines = widget.state.syncLog[widget.item.summary.folder] ?? const <String>[];
-    final msg = widget.state.syncMessage[widget.item.summary.folder];
+    final st = _statusOf(widget.state, widget.item, widget.env);
+    final k = widget.state.envKey(widget.item.summary.folder, widget.env.name);
+    final lines = widget.state.syncLog[k] ?? const <String>[];
+    final msg = widget.state.syncMessage[k];
 
     Widget body;
     if (lines.isNotEmpty) {
@@ -728,7 +761,7 @@ class _SyncLogCardState extends State<_SyncLogCard> {
       final (String text, Color col) = switch (st) {
         _St.running => ('syncing…', c.textPrimary),
         _St.error => ('✕ ${msg ?? 'sync failed'}', c.dangerFg),
-        _St.synced => ('✓ ${msg ?? 'up to date · ${_rel(widget.item.summary.lastSyncUnix)} ago'}', c.successFg),
+        _St.synced => ('✓ ${msg ?? 'up to date · ${_rel(widget.env.lastSyncUnix)} ago'}', c.successFg),
         _St.never => ('— not synced yet', c.textSecondary),
       };
       body = Align(alignment: Alignment.topLeft, child: SelectableText(text, style: _mono(col, 12.5)));
@@ -1071,21 +1104,21 @@ class _FleetView extends StatelessWidget {
   const _FleetView({required this.state, required this.onNew, required this.onSyncAll, required this.onOpenConn});
   final AppState state;
   final VoidCallback onNew, onSyncAll;
-  final void Function(String) onOpenConn;
+  final void Function(String folder, String env) onOpenConn;
 
   @override
   Widget build(BuildContext context) {
     final c = MdhColors.of(context);
-    final conns = state.connections;
+    final rows = [for (final p in state.projects) for (final e in p.summary.envs) (p, e)];
     final now = DateTime.now();
     var syncedToday = 0, files = 0, errors = 0;
-    for (final it in conns) {
-      final u = it.summary.lastSyncUnix;
+    for (final (p, e) in rows) {
+      final u = e.lastSyncUnix;
       if (u != null && now.difference(DateTime.fromMillisecondsSinceEpoch(u * 1000)).inHours < 24) {
         syncedToday++;
       }
-      files += it.summary.fileCount.toInt();
-      if (state.syncState[it.summary.folder] == SyncState.error) errors++;
+      files += e.fileCount.toInt();
+      if (state.syncState[state.envKey(p.summary.folder, e.name)] == SyncState.error) errors++;
     }
 
     return Column(
@@ -1101,9 +1134,9 @@ class _FleetView extends StatelessWidget {
               Text(state.parentFolder ?? '', style: _mono(c.textSecondary, 12)),
             ]),
             const Spacer(),
-            _Btn(label: 'Sync all', primary: true, onTap: conns.isEmpty ? null : onSyncAll),
+            _Btn(label: 'Sync all', primary: true, onTap: rows.isEmpty ? null : onSyncAll),
             const SizedBox(width: 8),
-            _Btn(label: 'New connection', onTap: onNew),
+            _Btn(label: 'New project', onTap: onNew),
           ]),
         ),
         Expanded(
@@ -1113,7 +1146,7 @@ class _FleetView extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Row(children: [
-                  Expanded(child: _StatCard(n: '${conns.length}', l: 'Connections')),
+                  Expanded(child: _StatCard(n: '${rows.length}', l: 'Environments')),
                   const SizedBox(width: 12),
                   Expanded(child: _StatCard(n: '$syncedToday', l: 'Synced today')),
                   const SizedBox(width: 12),
@@ -1122,7 +1155,7 @@ class _FleetView extends StatelessWidget {
                   Expanded(child: _StatCard(n: '$files', l: 'Files pulled')),
                 ]),
                 _SectionTitle('Connections'),
-                _FleetTable(state: state, onOpenConn: onOpenConn),
+                _FleetTable(state: state, rows: rows, onOpenConn: onOpenConn),
               ],
             ),
           ),
@@ -1133,9 +1166,10 @@ class _FleetView extends StatelessWidget {
 }
 
 class _FleetTable extends StatelessWidget {
-  const _FleetTable({required this.state, required this.onOpenConn});
+  const _FleetTable({required this.state, required this.rows, required this.onOpenConn});
   final AppState state;
-  final void Function(String) onOpenConn;
+  final List<(ProjectItem, EnvSummary)> rows;
+  final void Function(String folder, String env) onOpenConn;
 
   @override
   Widget build(BuildContext context) {
@@ -1146,7 +1180,7 @@ class _FleetTable extends StatelessWidget {
         Text(t.toUpperCase(), style: TextStyle(color: c.textSecondary, fontSize: 10.5, fontWeight: FontWeight.w600, letterSpacing: 0.5)),
         flex: flex);
 
-    if (state.connections.isEmpty) {
+    if (rows.isEmpty) {
       return Container(
         width: double.infinity,
         padding: const EdgeInsets.all(24),
@@ -1164,26 +1198,26 @@ class _FleetTable extends StatelessWidget {
           decoration: BoxDecoration(color: c.bgSidebar, border: Border(bottom: BorderSide(color: c.border))),
           child: Row(children: [head('Connection', flex: 2), head('Org'), head('Host', flex: 2), head('Files'), head('Last sync'), head('Status')]),
         ),
-        for (var i = 0; i < state.connections.length; i++)
-          _FleetRow(state: state, item: state.connections[i], last: i == state.connections.length - 1, onOpenConn: onOpenConn, cell: cell),
+        for (var i = 0; i < rows.length; i++)
+          _FleetRow(state: state, item: rows[i].$1, env: rows[i].$2, last: i == rows.length - 1, onOpenConn: onOpenConn, cell: cell),
       ]),
     );
   }
 }
 
 class _FleetRow extends StatelessWidget {
-  const _FleetRow({required this.state, required this.item, required this.last, required this.onOpenConn, required this.cell});
+  const _FleetRow({required this.state, required this.item, required this.env, required this.last, required this.onOpenConn, required this.cell});
   final AppState state;
-  final ConnItem item;
+  final ProjectItem item;
+  final EnvSummary env;
   final bool last;
-  final void Function(String) onOpenConn;
+  final void Function(String folder, String env) onOpenConn;
   final Widget Function(Widget, {int flex}) cell;
 
   @override
   Widget build(BuildContext context) {
     final c = MdhColors.of(context);
-    final s = item.summary;
-    final st = _statusOf(state, item);
+    final st = _statusOf(state, item, env);
     final (String badge, Color bg, Color fg) = switch (st) {
       _St.error => ('error', c.dangerBg, c.dangerFg),
       _St.never => ('never', c.infoBg, c.infoFg),
@@ -1191,19 +1225,19 @@ class _FleetRow extends StatelessWidget {
       _St.synced => ('synced', c.successBg, c.successFg),
     };
     return InkWell(
-      onTap: () => onOpenConn(s.folder),
+      onTap: () => onOpenConn(item.summary.folder, env.name),
       mouseCursor: SystemMouseCursors.click,
       child: Container(
         decoration: BoxDecoration(border: last ? null : Border(bottom: BorderSide(color: c.border))),
         child: Row(children: [
           cell(Row(children: [
-            Flexible(child: Text(s.name, overflow: TextOverflow.ellipsis, style: TextStyle(color: c.textPrimary, fontSize: 12.5))),
+            Flexible(child: Text('${item.summary.name} · ${env.name}', overflow: TextOverflow.ellipsis, style: TextStyle(color: c.textPrimary, fontSize: 12.5))),
             if (item.isExternal) Padding(padding: const EdgeInsets.only(left: 6), child: _MiniBadge('external', c.extBg, c.extFg)),
           ]), flex: 2),
-          cell(Text(s.orgId.toString(), style: _mono(c.textSecondary, 12)), ),
-          cell(Text(_host(s.apiBase), overflow: TextOverflow.ellipsis, style: _mono(c.textSecondary, 12)), flex: 2),
-          cell(Text(s.fileCount.toString(), style: _mono(c.textSecondary, 12))),
-          cell(Text(st == _St.never ? '—' : '${_rel(s.lastSyncUnix)} ago', style: TextStyle(color: c.textPrimary, fontSize: 12.5))),
+          cell(Text(env.orgId.toString(), style: _mono(c.textSecondary, 12)), ),
+          cell(Text(_host(env.apiBase), overflow: TextOverflow.ellipsis, style: _mono(c.textSecondary, 12)), flex: 2),
+          cell(Text(env.fileCount.toString(), style: _mono(c.textSecondary, 12))),
+          cell(Text(st == _St.never ? '—' : '${_rel(env.lastSyncUnix)} ago', style: TextStyle(color: c.textPrimary, fontSize: 12.5))),
           cell(Align(alignment: Alignment.centerLeft, child: _MiniBadge(badge, bg, fg))),
         ]),
       ),
