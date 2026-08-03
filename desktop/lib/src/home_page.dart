@@ -555,11 +555,11 @@ class _ConnMain extends StatelessWidget {
                   onRevealDir: onRevealDir,
                 ),
               ),
-            'log' => SingleChildScrollView(
+            'log' => Padding(
                 padding: const EdgeInsets.all(18),
-                child: _SyncLogCard(state: state, item: item, expanded: true),
+                child: _SyncLogCard(state: state, item: item),
               ),
-            _ => SingleChildScrollView(
+            _ => Padding(
                 padding: const EdgeInsets.all(18),
                 child: _OverviewPanel(state: state, item: item, st: st),
               ),
@@ -582,29 +582,37 @@ class _ConnBar extends StatelessWidget {
     final s = item.summary;
     final st = _statusOf(state, item);
     return Container(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+      padding: const EdgeInsets.fromLTRB(18, 12, 18, 12),
       decoration: BoxDecoration(
         color: c.bgCard,
         border: Border(bottom: BorderSide(color: c.border)),
       ),
       child: Row(
         children: [
-          Flexible(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
+          // The whole left group is one Expanded so all slack lives here and
+          // the action buttons stay flush against the right edge.
+          Expanded(
+            child: Row(
               children: [
-                Text(s.name, maxLines: 1, overflow: TextOverflow.ellipsis,
-                    style: TextStyle(color: c.textPrimary, fontSize: 15, fontWeight: FontWeight.w600)),
-                const SizedBox(height: 2),
-                Text('${_host(s.apiBase)} · org ${s.orgId}', maxLines: 1, overflow: TextOverflow.ellipsis,
-                    style: _mono(c.textSecondary, 12)),
+                Flexible(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(s.name, maxLines: 1, overflow: TextOverflow.ellipsis,
+                          style: TextStyle(color: c.textPrimary, fontSize: 15, fontWeight: FontWeight.w600)),
+                      const SizedBox(height: 2),
+                      Text('${_host(s.apiBase)} · org ${s.orgId}', maxLines: 1, overflow: TextOverflow.ellipsis,
+                          style: _mono(c.textSecondary, 12)),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 12),
+                _StatusPill(st: st),
               ],
             ),
           ),
           const SizedBox(width: 12),
-          _StatusPill(st: st),
-          const Spacer(),
           _Btn(label: st == _St.error ? 'Retry' : 'Sync', primary: true, onTap: st == _St.running ? null : () => onSync(item)),
           const SizedBox(width: 8),
           _Btn(label: 'Edit', onTap: () => onEdit(item)),
@@ -627,13 +635,9 @@ class _OverviewPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final s = item.summary;
-    final auth = s.authKind == AuthKind.token ? 'API token' : 'Username & password';
-    final lastSync = switch (st) {
-      _St.running => 'syncing…',
-      _St.error => 'failed · ${_rel(s.lastSyncUnix)}',
-      _St.synced => 'today · ${_rel(s.lastSyncUnix)} ago',
-      _St.never => 'never',
-    };
+    // Auth and Last sync are shown in the stat cards above, so they're omitted
+    // here to avoid duplication; the rest are compact text lines, leaving the
+    // recent-sync log to fill the remaining height.
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -645,32 +649,45 @@ class _OverviewPanel extends StatelessWidget {
           Expanded(child: _StatCard(n: s.authKind == AuthKind.token ? 'token' : 'login', l: 'Auth')),
         ]),
         _SectionTitle('Connection'),
-        _CardGrid(children: [
-          _SpecCard(k: 'API base', v: s.apiBase),
-          _SpecCard(k: 'Organization ID', v: s.orgId.toString()),
-          _SpecCard(k: 'Folder', v: s.folder),
-          _SpecCard(k: 'Authentication', v: auth, mono: false),
-          _SpecCard(k: 'Last sync', v: lastSync, mono: false),
-        ]),
+        _KvLine(k: 'API base', v: s.apiBase),
+        _KvLine(k: 'Organization ID', v: s.orgId.toString()),
+        _KvLine(k: 'Folder', v: s.folder),
         _SectionTitle('Recent sync'),
-        _SyncLogCard(state: state, item: item, expanded: false),
+        Expanded(child: _SyncLogCard(state: state, item: item)),
       ],
     );
   }
 }
 
-class _SyncLogCard extends StatelessWidget {
-  const _SyncLogCard({required this.state, required this.item, required this.expanded});
+/// The sync-log panel. Fills the height it's given (place it in an Expanded);
+/// short logs sit at the top, long logs auto-scroll to the latest line.
+class _SyncLogCard extends StatefulWidget {
+  const _SyncLogCard({required this.state, required this.item});
   final AppState state;
   final ConnItem item;
-  final bool expanded;
+  @override
+  State<_SyncLogCard> createState() => _SyncLogCardState();
+}
+
+class _SyncLogCardState extends State<_SyncLogCard> {
+  final _scroll = ScrollController();
+
+  @override
+  void dispose() {
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  void _tail() {
+    if (_scroll.hasClients) _scroll.jumpTo(_scroll.position.maxScrollExtent);
+  }
 
   @override
   Widget build(BuildContext context) {
     final c = MdhColors.of(context);
-    final st = _statusOf(state, item);
-    final lines = state.syncLog[item.summary.folder] ?? const <String>[];
-    final msg = state.syncMessage[item.summary.folder];
+    final st = _statusOf(widget.state, widget.item);
+    final lines = widget.state.syncLog[widget.item.summary.folder] ?? const <String>[];
+    final msg = widget.state.syncMessage[widget.item.summary.folder];
 
     Widget body;
     if (lines.isNotEmpty) {
@@ -679,26 +696,23 @@ class _SyncLogCard extends StatelessWidget {
         spans.addAll(ansiSpans(lines[k], c, 12.5));
         if (k < lines.length - 1) spans.add(const TextSpan(text: '\n'));
       }
-      body = SizedBox(
-        width: double.infinity,
-        child: ConstrainedBox(
-          constraints: BoxConstraints(maxHeight: expanded ? 420 : 150),
-          child: Scrollbar(
-            child: SingleChildScrollView(
-              reverse: true,
-              child: SelectableText.rich(TextSpan(children: spans)),
-            ),
-          ),
+      // Follow the tail as new lines stream in (no-op when it all fits).
+      WidgetsBinding.instance.addPostFrameCallback((_) => _tail());
+      body = Scrollbar(
+        controller: _scroll,
+        child: SingleChildScrollView(
+          controller: _scroll,
+          child: SizedBox(width: double.infinity, child: SelectableText.rich(TextSpan(children: spans))),
         ),
       );
     } else {
       final (String text, Color col) = switch (st) {
         _St.running => ('syncing…', c.textPrimary),
         _St.error => ('✕ ${msg ?? 'sync failed'}', c.dangerFg),
-        _St.synced => ('✓ ${msg ?? 'up to date · ${_rel(item.summary.lastSyncUnix)} ago'}', c.successFg),
+        _St.synced => ('✓ ${msg ?? 'up to date · ${_rel(widget.item.summary.lastSyncUnix)} ago'}', c.successFg),
         _St.never => ('— not synced yet', c.textSecondary),
       };
-      body = SelectableText(text, style: _mono(col, 12.5));
+      body = Align(alignment: Alignment.topLeft, child: SelectableText(text, style: _mono(col, 12.5)));
     }
 
     return Container(
@@ -1223,50 +1237,37 @@ class _StatCard extends StatelessWidget {
   }
 }
 
-/// Lays cards out in a responsive grid where every card in a row shares one
-/// height (the tallest in that row), like CSS `grid` with `align-items: stretch`.
-/// Column count adapts to the available width; the last row keeps grid-aligned
-/// widths by padding with empty cells rather than stretching its cards.
-class _CardGrid extends StatelessWidget {
-  const _CardGrid({required this.children});
-  final List<Widget> children;
-
+/// A compact label→value line (used for connection details in the Overview).
+/// The label column is fixed-width so the values line up; values are selectable.
+class _KvLine extends StatelessWidget {
+  const _KvLine({required this.k, required this.v});
+  final String k, v;
   @override
   Widget build(BuildContext context) {
-    const minCardWidth = 240.0, gap = 12.0;
-    return LayoutBuilder(
-      builder: (context, cons) {
-        final n = children.length;
-        if (n == 0) return const SizedBox.shrink();
-        var cols = ((cons.maxWidth + gap) / (minCardWidth + gap)).floor();
-        cols = cols.clamp(1, n);
-        final rows = <Widget>[];
-        for (var i = 0; i < n; i += cols) {
-          final end = (i + cols) < n ? i + cols : n;
-          final cells = <Widget>[];
-          for (var j = 0; j < cols; j++) {
-            if (j > 0) cells.add(SizedBox(width: gap));
-            final idx = i + j;
-            cells.add(Expanded(child: idx < end ? children[idx] : const SizedBox.shrink()));
-          }
-          if (rows.isNotEmpty) rows.add(SizedBox(height: gap));
-          rows.add(IntrinsicHeight(
-            child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: cells),
-          ));
-        }
-        return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: rows);
-      },
+    final c = MdhColors.of(context);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 150,
+            child: Text(k.toUpperCase(),
+                style: TextStyle(color: c.textSecondary, fontSize: 11, fontWeight: FontWeight.w600, letterSpacing: 0.5)),
+          ),
+          const SizedBox(width: 12),
+          Expanded(child: SelectableText(v, style: _mono(c.textPrimary, 13))),
+        ],
+      ),
     );
   }
 }
 
 class _SpecCard extends StatelessWidget {
-  const _SpecCard({required this.k, required this.v, this.mono = true, this.width});
+  const _SpecCard({required this.k, required this.v, this.width});
   final String k, v;
-  final bool mono;
 
-  /// Fixed width for standalone use. Null lets the card fill its parent (e.g.
-  /// an Expanded cell in [_CardGrid]), so a row of cards shares one width/height.
+  /// Fixed width for standalone use; null lets the card fill its parent.
   final double? width;
   @override
   Widget build(BuildContext context) {
@@ -1281,7 +1282,7 @@ class _SpecCard extends StatelessWidget {
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Text(k.toUpperCase(), style: TextStyle(color: c.textSecondary, fontSize: 10.5, fontWeight: FontWeight.w600, letterSpacing: 0.5)),
         const SizedBox(height: 8),
-        SelectableText(v, style: mono ? _mono(c.textPrimary, 13) : TextStyle(color: c.textPrimary, fontSize: 13)),
+        SelectableText(v, style: _mono(c.textPrimary, 13)),
       ]),
     );
   }
