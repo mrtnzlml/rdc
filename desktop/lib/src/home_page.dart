@@ -645,7 +645,7 @@ class _OverviewPanel extends StatelessWidget {
           Expanded(child: _StatCard(n: s.authKind == AuthKind.token ? 'token' : 'login', l: 'Auth')),
         ]),
         _SectionTitle('Connection'),
-        Wrap(spacing: 12, runSpacing: 12, children: [
+        _CardGrid(children: [
           _SpecCard(k: 'API base', v: s.apiBase),
           _SpecCard(k: 'Organization ID', v: s.orgId.toString()),
           _SpecCard(k: 'Folder', v: s.folder),
@@ -1077,7 +1077,7 @@ class _SettingsView extends StatelessWidget {
           child: SingleChildScrollView(
             padding: const EdgeInsets.all(18),
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              _SpecCard(k: 'Connections folder', v: state.parentFolder ?? '(not set)'),
+              _SpecCard(k: 'Connections folder', v: state.parentFolder ?? '(not set)', width: 260),
               const SizedBox(height: 14),
               Wrap(spacing: 12, runSpacing: 12, children: [
                 _Btn(label: 'Change folder…', onTap: onChooseParent),
@@ -1223,15 +1223,56 @@ class _StatCard extends StatelessWidget {
   }
 }
 
+/// Lays cards out in a responsive grid where every card in a row shares one
+/// height (the tallest in that row), like CSS `grid` with `align-items: stretch`.
+/// Column count adapts to the available width; the last row keeps grid-aligned
+/// widths by padding with empty cells rather than stretching its cards.
+class _CardGrid extends StatelessWidget {
+  const _CardGrid({required this.children});
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) {
+    const minCardWidth = 240.0, gap = 12.0;
+    return LayoutBuilder(
+      builder: (context, cons) {
+        final n = children.length;
+        if (n == 0) return const SizedBox.shrink();
+        var cols = ((cons.maxWidth + gap) / (minCardWidth + gap)).floor();
+        cols = cols.clamp(1, n);
+        final rows = <Widget>[];
+        for (var i = 0; i < n; i += cols) {
+          final end = (i + cols) < n ? i + cols : n;
+          final cells = <Widget>[];
+          for (var j = 0; j < cols; j++) {
+            if (j > 0) cells.add(SizedBox(width: gap));
+            final idx = i + j;
+            cells.add(Expanded(child: idx < end ? children[idx] : const SizedBox.shrink()));
+          }
+          if (rows.isNotEmpty) rows.add(SizedBox(height: gap));
+          rows.add(IntrinsicHeight(
+            child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: cells),
+          ));
+        }
+        return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: rows);
+      },
+    );
+  }
+}
+
 class _SpecCard extends StatelessWidget {
-  const _SpecCard({required this.k, required this.v, this.mono = true});
+  const _SpecCard({required this.k, required this.v, this.mono = true, this.width});
   final String k, v;
   final bool mono;
+
+  /// Fixed width for standalone use. Null lets the card fill its parent (e.g.
+  /// an Expanded cell in [_CardGrid]), so a row of cards shares one width/height.
+  final double? width;
   @override
   Widget build(BuildContext context) {
     final c = MdhColors.of(context);
     return Container(
-      width: 260,
+      width: width,
       padding: const EdgeInsets.fromLTRB(15, 13, 15, 14),
       decoration: BoxDecoration(
         color: c.bgCard, border: Border.all(color: c.borderCard), borderRadius: BorderRadius.circular(6),

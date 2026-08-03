@@ -29,17 +29,20 @@ ConnItem _conn(String name, int org,
 }
 
 AppState _seeded() {
+  // A long-ish path so the "Folder" spec card wraps to multiple lines — this
+  // is what exercises the equal-height grid alignment in the connection view.
+  const sel = '/tmp/Rossum/acme-invoices-eu-prod-primary';
   final s = AppState(Settings(parentFolder: '/tmp/Rossum'));
   s.connections = [
-    _conn('acme-invoices', 123456, lastSync: 1000, files: 128),
+    _conn('acme-invoices', 123456, lastSync: 1000, files: 128, folder: sel),
     _conn('acme-orders', 123457),
     _conn('globex-dev', 654321, files: 210),
     _conn('widgets-eu', 778899, external: true, lastSync: 1000, files: 302),
   ];
-  s.selectedFolder = '/tmp/Rossum/acme-invoices';
+  s.selectedFolder = sel;
   s.syncState['/tmp/Rossum/globex-dev'] = SyncState.error;
   s.syncMessage['/tmp/Rossum/globex-dev'] = "couldn't sign in (401)";
-  s.syncLog['/tmp/Rossum/acme-invoices'] = [
+  s.syncLog[sel] = [
     '\x1B[2m14:12:03\x1B[0m \x1B[38;2;120;180;90mPULL\x1B[0m   schemas … 12 ok',
     '\x1B[2m14:12:05\x1B[0m \x1B[38;2;120;180;90mPULL\x1B[0m   hooks … 8 ok',
     '\x1B[2m14:12:07\x1B[0m \x1B[1;38;2;237;142;71mWRITE\x1B[0m  queues … 3 ok',
