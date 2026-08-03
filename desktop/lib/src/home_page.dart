@@ -499,8 +499,13 @@ class _EnvRow extends StatelessWidget {
                 decoration: BoxDecoration(color: sel ? Colors.white : dotColor, shape: BoxShape.circle)),
             Expanded(child: Text(env.name, overflow: TextOverflow.ellipsis,
                 style: TextStyle(color: sel ? Colors.white : c.textPrimary, fontSize: 12.5, fontWeight: FontWeight.w500))),
-            Text('org ${env.orgId} · $sub',
-                style: _mono(sel ? Colors.white70 : c.textSecondary, 10.5)),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 110),
+              child: Text('org ${env.orgId} · $sub',
+                  overflow: TextOverflow.ellipsis,
+                  maxLines: 1,
+                  style: _mono(sel ? Colors.white70 : c.textSecondary, 10.5)),
+            ),
           ]),
         ),
       ),
@@ -559,7 +564,7 @@ class _ConnMain extends StatelessWidget {
           children: [
             Text('No environment selected', style: TextStyle(color: c.textSecondary)),
             const SizedBox(height: 12),
-            _Btn(label: 'New connection', primary: true, onTap: onAdd),
+            _Btn(label: 'New project', primary: true, onTap: onAdd),
           ],
         ),
       );
@@ -1154,7 +1159,7 @@ class _FleetView extends StatelessWidget {
                   const SizedBox(width: 12),
                   Expanded(child: _StatCard(n: '$files', l: 'Files pulled')),
                 ]),
-                _SectionTitle('Connections'),
+                _SectionTitle('Environments'),
                 _FleetTable(state: state, rows: rows, onOpenConn: onOpenConn),
               ],
             ),
@@ -1185,7 +1190,7 @@ class _FleetTable extends StatelessWidget {
         width: double.infinity,
         padding: const EdgeInsets.all(24),
         decoration: BoxDecoration(color: c.bgCard, border: Border.all(color: c.borderCard), borderRadius: BorderRadius.circular(6)),
-        child: Center(child: Text('No connections yet.', style: TextStyle(color: c.textSecondary))),
+        child: Center(child: Text('No environments yet.', style: TextStyle(color: c.textSecondary))),
       );
     }
 

@@ -23,7 +23,7 @@ void main() {
   test('add / list / validate round-trip on a temp folder', () async {
     final dir = Directory.systemTemp.createTempSync('rossum_local_it');
     try {
-      final added = await addConnection(
+      final added = await addProject(
         parent: dir.path,
         input: AddConnectionInput(
           name: 'Acme Prod',
@@ -34,31 +34,31 @@ void main() {
         ),
       );
       // API base trailing slash is trimmed by the bridge.
-      expect(added.apiBase, 'https://example.test/api/v1');
-      expect(added.orgId, BigInt.from(42));
+      expect(added.envs.first.apiBase, 'https://example.test/api/v1');
+      expect(added.envs.first.orgId, BigInt.from(42));
       expect(File('${dir.path}/${added.id}/rdc.toml').existsSync(), true);
       expect(
         File('${dir.path}/${added.id}/secrets/main.secrets.json').existsSync(),
         true,
       );
 
-      final list = await listConnections(parent: dir.path);
+      final list = await listProjects(parent: dir.path);
       expect(list.length, 1);
       expect(list.first.id, added.id);
 
       final validated =
           await validateExistingProject(path: '${dir.path}/${added.id}');
-      expect(validated.orgId, BigInt.from(42));
+      expect(validated.envs.first.orgId, BigInt.from(42));
     } finally {
       dir.deleteSync(recursive: true);
     }
   });
 
-  test('addConnection rejects an empty token', () async {
+  test('addProject rejects an empty token', () async {
     final dir = Directory.systemTemp.createTempSync('rossum_local_it2');
     try {
       await expectLater(
-        addConnection(
+        addProject(
           parent: dir.path,
           input: AddConnectionInput(
             name: 'x',
@@ -87,10 +87,10 @@ void main() {
     }
   });
 
-  test('trashConnection removes the folder (no Apple Events needed)', () async {
+  test('trashProject removes the folder (no Apple Events needed)', () async {
     final parent = Directory.systemTemp.createTempSync('rdc_it_trash');
     try {
-      final added = await addConnection(
+      final added = await addProject(
         parent: parent.path,
         input: AddConnectionInput(
           name: 'Trash Me',
@@ -103,18 +103,18 @@ void main() {
       final folder = '${parent.path}/${added.id}';
       expect(Directory(folder).existsSync(), true);
       // Must not throw the AppleScript/-1743 error the Finder backend did.
-      await trashConnection(folder: folder);
+      await trashProject(folder: folder);
       expect(Directory(folder).existsSync(), false);
     } finally {
       parent.deleteSync(recursive: true);
     }
   });
 
-  test('editConnection updates api_base/org_id and renames the folder',
+  test('editProject updates api_base/org_id and renames the folder',
       () async {
     final parent = Directory.systemTemp.createTempSync('rdc_it_edit');
     try {
-      final added = await addConnection(
+      final added = await addProject(
         parent: parent.path,
         input: AddConnectionInput(
           name: 'before',
@@ -124,8 +124,9 @@ void main() {
           token: 'tok',
         ),
       );
-      final updated = await editConnection(
+      final updated = await editProject(
         folder: '${parent.path}/${added.id}',
+        env: 'main',
         input: EditConnectionInput(
           name: 'after',
           apiBase: 'https://new.test/api/v1/',
@@ -137,14 +138,30 @@ void main() {
       expect(updated.id, 'after');
       expect(Directory('${parent.path}/${added.id}').existsSync(), false);
       expect(Directory('${parent.path}/after').existsSync(), true);
-      expect(updated.apiBase, 'https://new.test/api/v1'); // trailing slash trimmed
-      expect(updated.orgId, BigInt.from(99));
+      expect(updated.envs.first.apiBase, 'https://new.test/api/v1'); // trailing slash trimmed
+      expect(updated.envs.first.orgId, BigInt.from(99));
       // credentials were left blank, so token auth is preserved
-      expect(updated.authKind, AuthKind.token);
+      expect(updated.envs.first.authKind, AuthKind.token);
       expect(
         File('${parent.path}/after/secrets/main.secrets.json').existsSync(),
         true,
       );
+    } finally {
+      parent.deleteSync(recursive: true);
+    }
+  });
+
+  test('listProjects surfaces a CLI project with no main env', () async {
+    final parent = Directory.systemTemp.createTempSync('rdc_it_multienv');
+    try {
+      final dir = Directory('${parent.path}/cli')..createSync();
+      File('${dir.path}/rdc.toml').writeAsStringSync(
+          '[envs.dev]\napi_base = "https://d.test/api/v1"\norg_id = 1\n'
+          '[envs.prod]\napi_base = "https://p.test/api/v1"\norg_id = 2\n');
+      final list = await listProjects(parent: parent.path);
+      expect(list.length, 1);
+      final envs = list.first.envs.map((e) => e.name).toList();
+      expect(envs, ['dev', 'prod']);
     } finally {
       parent.deleteSync(recursive: true);
     }
