@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:file_selector/file_selector.dart';
@@ -755,8 +756,18 @@ class _FilesPanelState extends State<_FilesPanel> {
   List<_FEntry> _entries = const [];
   String? _error;
 
+  // Read-only file preview. Non-null [_previewName] → previewing that file in
+  // the current directory; [_previewText] holds its content, or [_previewNote]
+  // explains why it can't be shown (binary / too large / unreadable).
+  String? _previewName;
+  String? _previewText;
+  String? _previewNote;
+  final _preview = ScrollController();
+
+  static const _maxPreviewBytes = 2 * 1024 * 1024;
+
   String get _sep => Platform.pathSeparator;
-  String get _absPath => [widget.rootFolder, ..._crumbs].join(_sep);
+  String get _dirPath => [widget.rootFolder, ..._crumbs].join(_sep);
 
   @override
   void initState() {
@@ -769,17 +780,25 @@ class _FilesPanelState extends State<_FilesPanel> {
     super.didUpdateWidget(old);
     if (old.rootFolder != widget.rootFolder) {
       _crumbs = [];
+      _clearPreview();
       _readInto();
     } else if (old.revision != widget.revision) {
       _readInto();
+      if (_previewName != null) _loadPreview(_previewName!);
     }
+  }
+
+  @override
+  void dispose() {
+    _preview.dispose();
+    super.dispose();
   }
 
   bool _hidden(String name) => name.startsWith('.');
 
   void _readInto() {
     try {
-      final list = Directory(_absPath).listSync(followLinks: false);
+      final list = Directory(_dirPath).listSync(followLinks: false);
       final out = <_FEntry>[];
       for (final e in list) {
         final name = e.path.split(_sep).last;
@@ -808,30 +827,89 @@ class _FilesPanelState extends State<_FilesPanel> {
     }
   }
 
-  void _go(List<String> crumbs) => setState(() {
+  void _loadPreview(String name) {
+    _previewName = name;
+    _previewText = null;
+    _previewNote = null;
+    try {
+      final f = File('$_dirPath$_sep$name');
+      final len = f.lengthSync();
+      if (len > _maxPreviewBytes) {
+        _previewNote = 'File is too large to preview (${_fmtSize(len)}).';
+        return;
+      }
+      final bytes = f.readAsBytesSync();
+      if (bytes.contains(0)) {
+        _previewNote = 'Binary file — preview not available.';
+        return;
+      }
+      try {
+        _previewText = utf8.decode(bytes);
+      } on FormatException {
+        _previewNote = 'Binary file — preview not available.';
+      }
+    } catch (e) {
+      _previewNote = errorText(e);
+    }
+  }
+
+  void _clearPreview() {
+    _previewName = null;
+    _previewText = null;
+    _previewNote = null;
+  }
+
+  void _goDir(List<String> crumbs) => setState(() {
         _crumbs = crumbs;
+        _clearPreview();
         _readInto();
       });
+
+  void _openFile(String name) => setState(() {
+        _loadPreview(name);
+        if (_preview.hasClients) _preview.jumpTo(0);
+      });
+
+  void _back() {
+    if (_previewName != null) {
+      setState(_clearPreview);
+    } else if (_crumbs.isNotEmpty) {
+      _goDir(_crumbs.sublist(0, _crumbs.length - 1));
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final c = MdhColors.of(context);
+    final previewing = _previewName != null;
     final rootName = widget.rootFolder.split(_sep).last;
-    final segs = [rootName, ..._crumbs];
+    final dirSegs = [rootName, ..._crumbs]; // navigable directory segments
 
+    // Breadcrumb: navigable directory segments, then the file name when previewing.
     final crumbs = <Widget>[];
-    for (var i = 0; i < segs.length; i++) {
-      final cur = i == segs.length - 1;
+    void sep() => crumbs.add(Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 3), child: Text('›', style: _mono(c.textHint, 12.5))));
+    for (var i = 0; i < dirSegs.length; i++) {
+      final current = i == dirSegs.length - 1 && !previewing;
       crumbs.add(InkWell(
-        onTap: cur ? null : () => _go(_crumbs.sublist(0, i)),
+        onTap: current ? null : () => _goDir(_crumbs.sublist(0, i)),
         borderRadius: BorderRadius.circular(4),
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
-          child: Text(segs[i], style: _mono(cur ? c.textPrimary : c.textSecondary, 12.5, cur ? FontWeight.w600 : FontWeight.w400)),
+          child: Text(dirSegs[i], style: _mono(current ? c.textPrimary : c.textSecondary, 12.5, current ? FontWeight.w600 : FontWeight.w400)),
         ),
       ));
-      if (!cur) crumbs.add(Padding(padding: const EdgeInsets.symmetric(horizontal: 3), child: Text('›', style: _mono(c.textHint, 12.5))));
+      if (i < dirSegs.length - 1 || previewing) sep();
     }
+    if (previewing) {
+      crumbs.add(Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+        child: Text(_previewName!, style: _mono(c.textPrimary, 12.5, FontWeight.w600)),
+      ));
+    }
+
+    final canBack = previewing || _crumbs.isNotEmpty;
+    final revealTarget = previewing ? '$_dirPath$_sep$_previewName' : _dirPath;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -839,9 +917,9 @@ class _FilesPanelState extends State<_FilesPanel> {
         Row(
           children: [
             Opacity(
-              opacity: _crumbs.isEmpty ? 0.45 : 1,
+              opacity: canBack ? 1 : 0.45,
               child: InkWell(
-                onTap: _crumbs.isEmpty ? null : () => _go(_crumbs.sublist(0, _crumbs.length - 1)),
+                onTap: canBack ? _back : null,
                 borderRadius: BorderRadius.circular(6),
                 child: Container(
                   width: 28,
@@ -854,7 +932,7 @@ class _FilesPanelState extends State<_FilesPanel> {
             const SizedBox(width: 10),
             Expanded(child: Wrap(crossAxisAlignment: WrapCrossAlignment.center, children: crumbs)),
             const SizedBox(width: 10),
-            _Btn(label: 'Reveal in Finder', onTap: () => widget.onRevealDir(_absPath)),
+            _Btn(label: 'Reveal in Finder', onTap: () => widget.onRevealDir(revealTarget)),
           ],
         ),
         const SizedBox(height: 12),
@@ -867,21 +945,25 @@ class _FilesPanelState extends State<_FilesPanel> {
               boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.04), blurRadius: 3, offset: const Offset(0, 1))],
             ),
             clipBehavior: Clip.antiAlias,
-            child: Column(
-              children: [
-                Container(
-                  decoration: BoxDecoration(color: c.bgSidebar, border: Border(bottom: BorderSide(color: c.border))),
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
-                  child: Row(children: [
-                    Expanded(child: Text('NAME', style: TextStyle(color: c.textSecondary, fontSize: 10.5, fontWeight: FontWeight.w600, letterSpacing: 0.5))),
-                    Text('SIZE', style: TextStyle(color: c.textSecondary, fontSize: 10.5, fontWeight: FontWeight.w600, letterSpacing: 0.5)),
-                  ]),
-                ),
-                Expanded(child: _list(c)),
-              ],
-            ),
+            child: previewing ? _previewView(c) : _listView(c),
           ),
         ),
+      ],
+    );
+  }
+
+  Widget _listView(MdhColors c) {
+    return Column(
+      children: [
+        Container(
+          decoration: BoxDecoration(color: c.bgSidebar, border: Border(bottom: BorderSide(color: c.border))),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
+          child: Row(children: [
+            Expanded(child: Text('NAME', style: TextStyle(color: c.textSecondary, fontSize: 10.5, fontWeight: FontWeight.w600, letterSpacing: 0.5))),
+            Text('SIZE', style: TextStyle(color: c.textSecondary, fontSize: 10.5, fontWeight: FontWeight.w600, letterSpacing: 0.5)),
+          ]),
+        ),
+        Expanded(child: _list(c)),
       ],
     );
   }
@@ -905,7 +987,7 @@ class _FilesPanelState extends State<_FilesPanel> {
         final e = _entries[i];
         final last = i == _entries.length - 1;
         return InkWell(
-          onTap: e.isDir ? () => _go([..._crumbs, e.name]) : null,
+          onTap: e.isDir ? () => _goDir([..._crumbs, e.name]) : () => _openFile(e.name),
           child: Container(
             decoration: BoxDecoration(border: last ? null : Border(bottom: BorderSide(color: c.border))),
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
@@ -920,6 +1002,34 @@ class _FilesPanelState extends State<_FilesPanel> {
           ),
         );
       },
+    );
+  }
+
+  Widget _previewView(MdhColors c) {
+    if (_previewNote != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: SelectableText(_previewNote!, textAlign: TextAlign.center, style: TextStyle(color: c.textSecondary, fontSize: 12.5)),
+        ),
+      );
+    }
+    final text = _previewText ?? '';
+    if (text.isEmpty) {
+      return Center(child: Text('Empty file.', style: TextStyle(color: c.textSecondary, fontSize: 12.5)));
+    }
+    // Vertical scroll (with a visible scrollbar) over a horizontal scroll so
+    // long code/JSON lines don't wrap — read-only, selectable.
+    return Scrollbar(
+      controller: _preview,
+      child: SingleChildScrollView(
+        controller: _preview,
+        padding: const EdgeInsets.all(14),
+        child: SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: SelectableText(text, style: _mono(c.textPrimary, 12.5)),
+        ),
+      ),
     );
   }
 }
