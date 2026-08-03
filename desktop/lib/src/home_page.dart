@@ -500,6 +500,7 @@ class _EnvRow extends StatelessWidget {
             Expanded(child: Text(env.name, overflow: TextOverflow.ellipsis,
                 style: TextStyle(color: sel ? Colors.white : c.textPrimary, fontSize: 12.5, fontWeight: FontWeight.w500))),
             ConstrainedBox(
+              // cap the trailing "org N · sub" text so a 6-digit org id can't overflow the row
               constraints: const BoxConstraints(maxWidth: 110),
               child: Text('org ${env.orgId} · $sub',
                   overflow: TextOverflow.ellipsis,
@@ -1272,7 +1273,7 @@ class _SettingsView extends StatelessWidget {
           child: SingleChildScrollView(
             padding: const EdgeInsets.all(18),
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              _SpecCard(k: 'Connections folder', v: state.parentFolder ?? '(not set)', width: 260),
+              _SpecCard(k: 'Projects folder', v: state.parentFolder ?? '(not set)', width: 260),
               const SizedBox(height: 14),
               Wrap(spacing: 12, runSpacing: 12, children: [
                 _Btn(label: 'Change folder…', onTap: onChooseParent),
