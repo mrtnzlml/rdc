@@ -636,9 +636,9 @@ class _OverviewPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final s = item.summary;
-    // Auth and Last sync are shown in the stat cards above, so they're omitted
-    // here to avoid duplication; the rest are compact text lines, leaving the
-    // recent-sync log to fill the remaining height.
+    // Connection details (host, org) already live in the header, so the panel
+    // is just the at-a-glance stat cards plus a recent-sync log that fills the
+    // remaining height.
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -649,10 +649,6 @@ class _OverviewPanel extends StatelessWidget {
           const SizedBox(width: 12),
           Expanded(child: _StatCard(n: s.authKind == AuthKind.token ? 'token' : 'login', l: 'Auth')),
         ]),
-        _SectionTitle('Connection'),
-        _KvLine(k: 'API base', v: s.apiBase),
-        _KvLine(k: 'Organization ID', v: s.orgId.toString()),
-        _KvLine(k: 'Folder', v: s.folder),
         _SectionTitle('Recent sync'),
         Expanded(child: _SyncLogCard(state: state, item: item)),
       ],
@@ -1343,32 +1339,6 @@ class _StatCard extends StatelessWidget {
         const SizedBox(height: 7),
         Text(l.toUpperCase(), style: TextStyle(color: c.textSecondary, fontSize: 11, fontWeight: FontWeight.w600, letterSpacing: 0.5)),
       ]),
-    );
-  }
-}
-
-/// A compact label→value line (used for connection details in the Overview).
-/// The label column is fixed-width so the values line up; values are selectable.
-class _KvLine extends StatelessWidget {
-  const _KvLine({required this.k, required this.v});
-  final String k, v;
-  @override
-  Widget build(BuildContext context) {
-    final c = MdhColors.of(context);
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 5),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 150,
-            child: Text(k.toUpperCase(),
-                style: TextStyle(color: c.textSecondary, fontSize: 11, fontWeight: FontWeight.w600, letterSpacing: 0.5)),
-          ),
-          const SizedBox(width: 12),
-          Expanded(child: SelectableText(v, style: _mono(c.textPrimary, 13))),
-        ],
-      ),
     );
   }
 }
