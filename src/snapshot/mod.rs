@@ -8,6 +8,7 @@ pub mod inbox;
 pub mod index_set;
 pub mod key_order;
 pub mod label;
+pub mod limits;
 pub mod noise;
 pub mod organization;
 pub mod queue;

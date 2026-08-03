@@ -11243,3 +11243,219 @@ async fn sync_keeps_stale_queue_dir_when_locally_edited_after_remote_workspace_m
         "queue must still be written under the new workspace despite the stale-dir warning"
     );
 }
+
+/// Regression: a local field longer than the API's `max_length` must be
+/// caught locally, BEFORE the first remote write.
+///
+/// Previously the oversized value rode classification as a normal local
+/// edit and only exploded mid-push as an opaque `400` naming the remote
+/// hook id. That failure is permanent — no retry can succeed while the
+/// bytes stay oversized — and because the push phase precedes the pull
+/// phase and its error aborts the cycle, every later `rdc sync` died at
+/// the same PATCH and no pull ever landed again: one long string wedged
+/// the whole project.
+#[tokio::test]
+async fn sync_refuses_oversized_field_before_any_remote_write() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let hook_id = 7101u64;
+    let server_uri = server.uri();
+    let hooks_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": hook_id,
+                "url": format!("{server_uri}/api/v1/hooks/{hook_id}"),
+                "name": "example-hook",
+                "type": "webhook",
+                "queues": [],
+                "events": ["annotation_content"],
+                "config": { "url": "https://hook.example.com/run" },
+                "description": "short",
+                "status": "ready",
+                "modified_at": "2026-04-01T10:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&hooks_body))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &["/api/v1/hooks"]).await;
+
+    // No PATCH mock is mounted at all: if the pre-flight check fails to
+    // stop the push, the request 404s against the mock server and this
+    // test fails on the request-count assertion below.
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("seed sync should succeed");
+
+    // Grow `description` past the API's 2000-character cap -> LocalEdit.
+    let hook_json = project.path().join("envs/dev/hooks/example-hook.json");
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hook_json).unwrap()).unwrap();
+    v["description"] = serde_json::Value::String("x".repeat(2406));
+    std::fs::write(
+        &hook_json,
+        format!("{}\n", serde_json::to_string_pretty(&v).unwrap()),
+    )
+    .unwrap();
+
+    let err = rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect_err("sync must refuse to push an oversized field");
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    let msg = format!("{err:#}");
+    // The message has to be actionable on its own: which object, which
+    // file, which field, and by how much it overshoots.
+    assert!(msg.contains("hooks/example-hook"), "must name the object: {msg}");
+    assert!(msg.contains("example-hook.json"), "must name the local file: {msg}");
+    assert!(msg.contains("description"), "must name the field: {msg}");
+    assert!(msg.contains("2406"), "must report the actual length: {msg}");
+    assert!(msg.contains("2000"), "must report the allowed limit: {msg}");
+
+    // The whole point: nothing was MUTATED on the remote. Note the
+    // Data Storage (MDH) API reads via POST (`/collections/list`,
+    // `/indexes/list`), so method alone doesn't imply a write — those
+    // `/list` endpoints are reads and are excluded here.
+    let writes: Vec<_> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| {
+            matches!(
+                r.method,
+                http::Method::PATCH | http::Method::POST | http::Method::PUT | http::Method::DELETE
+            )
+        })
+        .filter(|r| !r.url.path().ends_with("/list"))
+        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .collect();
+    assert!(
+        writes.is_empty(),
+        "refusal must happen before any remote write; saw: {writes:?}"
+    );
+}
+
+/// `--dry-run` must predict the refusal instead of reporting the doomed
+/// push as though it would succeed. A preview that says "1 would push"
+/// for a push that cannot succeed is worse than no preview.
+#[tokio::test]
+async fn sync_dry_run_reports_oversized_field() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let hook_id = 7102u64;
+    let server_uri = server.uri();
+    let hooks_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": hook_id,
+                "url": format!("{server_uri}/api/v1/hooks/{hook_id}"),
+                "name": "example-hook",
+                "type": "webhook",
+                "queues": [],
+                "events": ["annotation_content"],
+                "config": { "url": "https://hook.example.com/run" },
+                "description": "short",
+                "status": "ready",
+                "modified_at": "2026-04-01T10:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&hooks_body))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &["/api/v1/hooks"]).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("seed sync should succeed");
+
+    let hook_json = project.path().join("envs/dev/hooks/example-hook.json");
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hook_json).unwrap()).unwrap();
+    v["description"] = serde_json::Value::String("x".repeat(2406));
+    std::fs::write(
+        &hook_json,
+        format!("{}\n", serde_json::to_string_pretty(&v).unwrap()),
+    )
+    .unwrap();
+
+    // Dry run must SUCCEED (it is a preview, not an execution) while
+    // still surfacing the violation to the user.
+    let out = assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev", "--dry-run"])
+        .output()
+        .unwrap();
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "dry run must not fail: {combined}");
+    assert!(
+        combined.contains("limit error") || combined.contains("field limit"),
+        "dry run must surface a field-limit section: {combined}"
+    );
+    assert!(
+        combined.contains("description"),
+        "dry run must name the offending field: {combined}"
+    );
+}
