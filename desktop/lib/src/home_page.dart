@@ -672,15 +672,33 @@ class _SyncLogCard extends StatefulWidget {
 
 class _SyncLogCardState extends State<_SyncLogCard> {
   final _scroll = ScrollController();
+  bool _follow = true; // tail the log unless the user has scrolled up
+
+  @override
+  void initState() {
+    super.initState();
+    _scroll.addListener(_onScroll);
+  }
 
   @override
   void dispose() {
+    _scroll.removeListener(_onScroll);
     _scroll.dispose();
     super.dispose();
   }
 
+  void _onScroll() {
+    if (!_scroll.hasClients) return;
+    final p = _scroll.position;
+    _follow = p.maxScrollExtent - p.pixels <= 40;
+  }
+
+  // Keep the latest line in view as it streams, but don't yank the view down
+  // when the user has scrolled up to read earlier output.
   void _tail() {
-    if (_scroll.hasClients) _scroll.jumpTo(_scroll.position.maxScrollExtent);
+    if (!_follow || !_scroll.hasClients) return;
+    final p = _scroll.position;
+    if (p.pixels != p.maxScrollExtent) _scroll.jumpTo(p.maxScrollExtent);
   }
 
   @override
