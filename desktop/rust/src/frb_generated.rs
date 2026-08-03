@@ -38,7 +38,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 2140695709;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -50370165;
 
 // Section: executor
 
@@ -46,7 +46,7 @@ flutter_rust_bridge::frb_generated_default_handler!();
 
 // Section: wire_funcs
 
-fn wire__crate__api__rdc__add_connection_impl(
+fn wire__crate__api__rdc__add_project_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -54,7 +54,7 @@ fn wire__crate__api__rdc__add_connection_impl(
 ) {
     FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
         flutter_rust_bridge::for_generated::TaskInfo {
-            debug_name: "add_connection",
+            debug_name: "add_project",
             port: Some(port_),
             mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
         },
@@ -74,7 +74,7 @@ fn wire__crate__api__rdc__add_connection_impl(
             move |context| {
                 transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
                     (move || {
-                        let output_ok = crate::api::rdc::add_connection(api_parent, api_input)?;
+                        let output_ok = crate::api::rdc::add_project(api_parent, api_input)?;
                         Ok(output_ok)
                     })(),
                 )
@@ -82,7 +82,7 @@ fn wire__crate__api__rdc__add_connection_impl(
         },
     )
 }
-fn wire__crate__api__rdc__edit_connection_impl(
+fn wire__crate__api__rdc__edit_project_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -90,7 +90,7 @@ fn wire__crate__api__rdc__edit_connection_impl(
 ) {
     FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
         flutter_rust_bridge::for_generated::TaskInfo {
-            debug_name: "edit_connection",
+            debug_name: "edit_project",
             port: Some(port_),
             mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
         },
@@ -105,12 +105,14 @@ fn wire__crate__api__rdc__edit_connection_impl(
             let mut deserializer =
                 flutter_rust_bridge::for_generated::SseDeserializer::new(message);
             let api_folder = <String>::sse_decode(&mut deserializer);
+            let api_env = <String>::sse_decode(&mut deserializer);
             let api_input = <crate::api::rdc::EditConnectionInput>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| {
                 transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
                     (move || {
-                        let output_ok = crate::api::rdc::edit_connection(api_folder, api_input)?;
+                        let output_ok =
+                            crate::api::rdc::edit_project(api_folder, api_env, api_input)?;
                         Ok(output_ok)
                     })(),
                 )
@@ -152,7 +154,7 @@ fn wire__crate__api__rdc__init_app_impl(
         },
     )
 }
-fn wire__crate__api__rdc__list_connections_impl(
+fn wire__crate__api__rdc__list_projects_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -160,7 +162,7 @@ fn wire__crate__api__rdc__list_connections_impl(
 ) {
     FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
         flutter_rust_bridge::for_generated::TaskInfo {
-            debug_name: "list_connections",
+            debug_name: "list_projects",
             port: Some(port_),
             mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
         },
@@ -179,7 +181,7 @@ fn wire__crate__api__rdc__list_connections_impl(
             move |context| {
                 transform_result_sse::<_, ()>((move || {
                     let output_ok =
-                        Result::<_, ()>::Ok(crate::api::rdc::list_connections(api_parent))?;
+                        Result::<_, ()>::Ok(crate::api::rdc::list_projects(api_parent))?;
                     Ok(output_ok)
                 })())
             }
@@ -253,7 +255,7 @@ fn wire__crate__api__rdc__reveal_in_file_manager_impl(
         },
     )
 }
-fn wire__crate__api__rdc__sync_connection_impl(
+fn wire__crate__api__rdc__sync_env_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -261,7 +263,7 @@ fn wire__crate__api__rdc__sync_connection_impl(
 ) {
     FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
         flutter_rust_bridge::for_generated::TaskInfo {
-            debug_name: "sync_connection",
+            debug_name: "sync_env",
             port: Some(port_),
             mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
         },
@@ -276,6 +278,7 @@ fn wire__crate__api__rdc__sync_connection_impl(
             let mut deserializer =
                 flutter_rust_bridge::for_generated::SseDeserializer::new(message);
             let api_folder = <String>::sse_decode(&mut deserializer);
+            let api_env = <String>::sse_decode(&mut deserializer);
             let api_api_base = <String>::sse_decode(&mut deserializer);
             let api_org_id = <u64>::sse_decode(&mut deserializer);
             let api_sink = <StreamSink<
@@ -286,8 +289,9 @@ fn wire__crate__api__rdc__sync_connection_impl(
             move |context| {
                 transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
                     (move || {
-                        let output_ok = crate::api::rdc::sync_connection(
+                        let output_ok = crate::api::rdc::sync_env(
                             api_folder,
+                            api_env,
                             api_api_base,
                             api_org_id,
                             api_sink,
@@ -299,7 +303,7 @@ fn wire__crate__api__rdc__sync_connection_impl(
         },
     )
 }
-fn wire__crate__api__rdc__trash_connection_impl(
+fn wire__crate__api__rdc__trash_project_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -307,7 +311,7 @@ fn wire__crate__api__rdc__trash_connection_impl(
 ) {
     FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
         flutter_rust_bridge::for_generated::TaskInfo {
-            debug_name: "trash_connection",
+            debug_name: "trash_project",
             port: Some(port_),
             mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
         },
@@ -326,7 +330,7 @@ fn wire__crate__api__rdc__trash_connection_impl(
             move |context| {
                 transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
                     (move || {
-                        let output_ok = crate::api::rdc::trash_connection(api_folder)?;
+                        let output_ok = crate::api::rdc::trash_project(api_folder)?;
                         Ok(output_ok)
                     })(),
                 )
@@ -432,30 +436,6 @@ impl SseDecode for crate::api::rdc::AuthKind {
     }
 }
 
-impl SseDecode for crate::api::rdc::ConnectionSummary {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
-        let mut var_id = <String>::sse_decode(deserializer);
-        let mut var_name = <String>::sse_decode(deserializer);
-        let mut var_apiBase = <String>::sse_decode(deserializer);
-        let mut var_orgId = <u64>::sse_decode(deserializer);
-        let mut var_folder = <String>::sse_decode(deserializer);
-        let mut var_authKind = <crate::api::rdc::AuthKind>::sse_decode(deserializer);
-        let mut var_lastSyncUnix = <Option<i64>>::sse_decode(deserializer);
-        let mut var_fileCount = <u64>::sse_decode(deserializer);
-        return crate::api::rdc::ConnectionSummary {
-            id: var_id,
-            name: var_name,
-            api_base: var_apiBase,
-            org_id: var_orgId,
-            folder: var_folder,
-            auth_kind: var_authKind,
-            last_sync_unix: var_lastSyncUnix,
-            file_count: var_fileCount,
-        };
-    }
-}
-
 impl SseDecode for crate::api::rdc::EditConnectionInput {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -478,6 +458,26 @@ impl SseDecode for crate::api::rdc::EditConnectionInput {
     }
 }
 
+impl SseDecode for crate::api::rdc::EnvSummary {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_name = <String>::sse_decode(deserializer);
+        let mut var_apiBase = <String>::sse_decode(deserializer);
+        let mut var_orgId = <u64>::sse_decode(deserializer);
+        let mut var_authKind = <crate::api::rdc::AuthKind>::sse_decode(deserializer);
+        let mut var_lastSyncUnix = <Option<i64>>::sse_decode(deserializer);
+        let mut var_fileCount = <u64>::sse_decode(deserializer);
+        return crate::api::rdc::EnvSummary {
+            name: var_name,
+            api_base: var_apiBase,
+            org_id: var_orgId,
+            auth_kind: var_authKind,
+            last_sync_unix: var_lastSyncUnix,
+            file_count: var_fileCount,
+        };
+    }
+}
+
 impl SseDecode for i32 {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -492,15 +492,13 @@ impl SseDecode for i64 {
     }
 }
 
-impl SseDecode for Vec<crate::api::rdc::ConnectionSummary> {
+impl SseDecode for Vec<crate::api::rdc::EnvSummary> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         let mut len_ = <i32>::sse_decode(deserializer);
         let mut ans_ = Vec::with_capacity(len_ as usize);
         for idx_ in 0..len_ {
-            ans_.push(<crate::api::rdc::ConnectionSummary>::sse_decode(
-                deserializer,
-            ));
+            ans_.push(<crate::api::rdc::EnvSummary>::sse_decode(deserializer));
         }
         return ans_;
     }
@@ -513,6 +511,18 @@ impl SseDecode for Vec<u8> {
         let mut ans_ = Vec::with_capacity(len_ as usize);
         for idx_ in 0..len_ {
             ans_.push(<u8>::sse_decode(deserializer));
+        }
+        return ans_;
+    }
+}
+
+impl SseDecode for Vec<crate::api::rdc::ProjectSummary> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut len_ = <i32>::sse_decode(deserializer);
+        let mut ans_ = Vec::with_capacity(len_ as usize);
+        for idx_ in 0..len_ {
+            ans_.push(<crate::api::rdc::ProjectSummary>::sse_decode(deserializer));
         }
         return ans_;
     }
@@ -537,6 +547,22 @@ impl SseDecode for Option<i64> {
         } else {
             return None;
         }
+    }
+}
+
+impl SseDecode for crate::api::rdc::ProjectSummary {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_id = <String>::sse_decode(deserializer);
+        let mut var_name = <String>::sse_decode(deserializer);
+        let mut var_folder = <String>::sse_decode(deserializer);
+        let mut var_envs = <Vec<crate::api::rdc::EnvSummary>>::sse_decode(deserializer);
+        return crate::api::rdc::ProjectSummary {
+            id: var_id,
+            name: var_name,
+            folder: var_folder,
+            envs: var_envs,
+        };
     }
 }
 
@@ -606,14 +632,14 @@ fn pde_ffi_dispatcher_primary_impl(
 ) {
     // Codec=Pde (Serialization + dispatch), see doc to use other codecs
     match func_id {
-        1 => wire__crate__api__rdc__add_connection_impl(port, ptr, rust_vec_len, data_len),
-        2 => wire__crate__api__rdc__edit_connection_impl(port, ptr, rust_vec_len, data_len),
+        1 => wire__crate__api__rdc__add_project_impl(port, ptr, rust_vec_len, data_len),
+        2 => wire__crate__api__rdc__edit_project_impl(port, ptr, rust_vec_len, data_len),
         3 => wire__crate__api__rdc__init_app_impl(port, ptr, rust_vec_len, data_len),
-        4 => wire__crate__api__rdc__list_connections_impl(port, ptr, rust_vec_len, data_len),
+        4 => wire__crate__api__rdc__list_projects_impl(port, ptr, rust_vec_len, data_len),
         5 => wire__crate__api__rdc__rdc_version_impl(port, ptr, rust_vec_len, data_len),
         6 => wire__crate__api__rdc__reveal_in_file_manager_impl(port, ptr, rust_vec_len, data_len),
-        7 => wire__crate__api__rdc__sync_connection_impl(port, ptr, rust_vec_len, data_len),
-        8 => wire__crate__api__rdc__trash_connection_impl(port, ptr, rust_vec_len, data_len),
+        7 => wire__crate__api__rdc__sync_env_impl(port, ptr, rust_vec_len, data_len),
+        8 => wire__crate__api__rdc__trash_project_impl(port, ptr, rust_vec_len, data_len),
         9 => {
             wire__crate__api__rdc__validate_existing_project_impl(port, ptr, rust_vec_len, data_len)
         }
@@ -678,33 +704,6 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::rdc::AuthKind> for crate::api
     }
 }
 // Codec=Dco (DartCObject based), see doc to use other codecs
-impl flutter_rust_bridge::IntoDart for crate::api::rdc::ConnectionSummary {
-    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
-        [
-            self.id.into_into_dart().into_dart(),
-            self.name.into_into_dart().into_dart(),
-            self.api_base.into_into_dart().into_dart(),
-            self.org_id.into_into_dart().into_dart(),
-            self.folder.into_into_dart().into_dart(),
-            self.auth_kind.into_into_dart().into_dart(),
-            self.last_sync_unix.into_into_dart().into_dart(),
-            self.file_count.into_into_dart().into_dart(),
-        ]
-        .into_dart()
-    }
-}
-impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
-    for crate::api::rdc::ConnectionSummary
-{
-}
-impl flutter_rust_bridge::IntoIntoDart<crate::api::rdc::ConnectionSummary>
-    for crate::api::rdc::ConnectionSummary
-{
-    fn into_into_dart(self) -> crate::api::rdc::ConnectionSummary {
-        self
-    }
-}
-// Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for crate::api::rdc::EditConnectionInput {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
@@ -727,6 +726,51 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::rdc::EditConnectionInput>
     for crate::api::rdc::EditConnectionInput
 {
     fn into_into_dart(self) -> crate::api::rdc::EditConnectionInput {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::rdc::EnvSummary {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.name.into_into_dart().into_dart(),
+            self.api_base.into_into_dart().into_dart(),
+            self.org_id.into_into_dart().into_dart(),
+            self.auth_kind.into_into_dart().into_dart(),
+            self.last_sync_unix.into_into_dart().into_dart(),
+            self.file_count.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::rdc::EnvSummary {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::rdc::EnvSummary>
+    for crate::api::rdc::EnvSummary
+{
+    fn into_into_dart(self) -> crate::api::rdc::EnvSummary {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::rdc::ProjectSummary {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.id.into_into_dart().into_dart(),
+            self.name.into_into_dart().into_dart(),
+            self.folder.into_into_dart().into_dart(),
+            self.envs.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::rdc::ProjectSummary
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::rdc::ProjectSummary>
+    for crate::api::rdc::ProjectSummary
+{
+    fn into_into_dart(self) -> crate::api::rdc::ProjectSummary {
         self
     }
 }
@@ -809,20 +853,6 @@ impl SseEncode for crate::api::rdc::AuthKind {
     }
 }
 
-impl SseEncode for crate::api::rdc::ConnectionSummary {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        <String>::sse_encode(self.id, serializer);
-        <String>::sse_encode(self.name, serializer);
-        <String>::sse_encode(self.api_base, serializer);
-        <u64>::sse_encode(self.org_id, serializer);
-        <String>::sse_encode(self.folder, serializer);
-        <crate::api::rdc::AuthKind>::sse_encode(self.auth_kind, serializer);
-        <Option<i64>>::sse_encode(self.last_sync_unix, serializer);
-        <u64>::sse_encode(self.file_count, serializer);
-    }
-}
-
 impl SseEncode for crate::api::rdc::EditConnectionInput {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -833,6 +863,18 @@ impl SseEncode for crate::api::rdc::EditConnectionInput {
         <Option<String>>::sse_encode(self.token, serializer);
         <Option<String>>::sse_encode(self.username, serializer);
         <Option<String>>::sse_encode(self.password, serializer);
+    }
+}
+
+impl SseEncode for crate::api::rdc::EnvSummary {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.name, serializer);
+        <String>::sse_encode(self.api_base, serializer);
+        <u64>::sse_encode(self.org_id, serializer);
+        <crate::api::rdc::AuthKind>::sse_encode(self.auth_kind, serializer);
+        <Option<i64>>::sse_encode(self.last_sync_unix, serializer);
+        <u64>::sse_encode(self.file_count, serializer);
     }
 }
 
@@ -850,12 +892,12 @@ impl SseEncode for i64 {
     }
 }
 
-impl SseEncode for Vec<crate::api::rdc::ConnectionSummary> {
+impl SseEncode for Vec<crate::api::rdc::EnvSummary> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         <i32>::sse_encode(self.len() as _, serializer);
         for item in self {
-            <crate::api::rdc::ConnectionSummary>::sse_encode(item, serializer);
+            <crate::api::rdc::EnvSummary>::sse_encode(item, serializer);
         }
     }
 }
@@ -866,6 +908,16 @@ impl SseEncode for Vec<u8> {
         <i32>::sse_encode(self.len() as _, serializer);
         for item in self {
             <u8>::sse_encode(item, serializer);
+        }
+    }
+}
+
+impl SseEncode for Vec<crate::api::rdc::ProjectSummary> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(self.len() as _, serializer);
+        for item in self {
+            <crate::api::rdc::ProjectSummary>::sse_encode(item, serializer);
         }
     }
 }
@@ -887,6 +939,16 @@ impl SseEncode for Option<i64> {
         if let Some(value) = self {
             <i64>::sse_encode(value, serializer);
         }
+    }
+}
+
+impl SseEncode for crate::api::rdc::ProjectSummary {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.id, serializer);
+        <String>::sse_encode(self.name, serializer);
+        <String>::sse_encode(self.folder, serializer);
+        <Vec<crate::api::rdc::EnvSummary>>::sse_encode(self.envs, serializer);
     }
 }
 

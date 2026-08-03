@@ -10,57 +10,58 @@ part 'rdc.freezed.dart';
 
 // These functions are ignored because they are not marked as `pub`: `block_on`, `write_credentials`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `LineForwarder`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `flush`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `write`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `flush`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `from`, `write`
 
 /// rdc's package version, surfaced to the app's About box.
 Future<String?> rdcVersion() => RustLib.instance.api.crateApiRdcRdcVersion();
 
-/// List every Connection under `parent`. Non-project folders are skipped.
-Future<List<ConnectionSummary>> listConnections({required String parent}) =>
-    RustLib.instance.api.crateApiRdcListConnections(parent: parent);
+/// List every Project under `parent`. Non-project folders are skipped.
+Future<List<ProjectSummary>> listProjects({required String parent}) =>
+    RustLib.instance.api.crateApiRdcListProjects(parent: parent);
 
-/// Create a new Connection: write `rdc.toml` + secrets under a unique slug.
-Future<ConnectionSummary> addConnection({
+/// Create a new Project: write `rdc.toml` + secrets for a first env named
+/// `main` under a unique slug. (Additional envs are added in a later phase.)
+Future<ProjectSummary> addProject({
   required String parent,
   required AddConnectionInput input,
-}) =>
-    RustLib.instance.api.crateApiRdcAddConnection(parent: parent, input: input);
+}) => RustLib.instance.api.crateApiRdcAddProject(parent: parent, input: input);
 
-/// Validate that `path` is a single-env (`main`) rdc project and return its
+/// Validate that `path` is an rdc project (≥1 env, any names) and return its
 /// summary. Does not move, copy, or symlink anything.
-Future<ConnectionSummary> validateExistingProject({required String path}) =>
+Future<ProjectSummary> validateExistingProject({required String path}) =>
     RustLib.instance.api.crateApiRdcValidateExistingProject(path: path);
 
-/// Update a Connection's settings, renaming its folder if the name changed.
-/// `api_base`/`org_id` are rewritten through rdc's own config writer so the
-/// file matches the CLI's format exactly. Credentials are only touched when
-/// new ones are supplied (blank = keep existing). Returns the (possibly moved)
-/// Connection so the caller can reselect it.
-Future<ConnectionSummary> editConnection({
+/// Rename the project folder (from `input.name`) if it changed, and rewrite the
+/// named `env`'s api_base/org_id through rdc's own config writer. Credentials
+/// are only replaced when supplied (blank = keep existing).
+Future<ProjectSummary> editProject({
   required String folder,
+  required String env,
   required EditConnectionInput input,
-}) => RustLib.instance.api.crateApiRdcEditConnection(
+}) => RustLib.instance.api.crateApiRdcEditProject(
   folder: folder,
+  env: env,
   input: input,
 );
 
-/// Pull-only sync of one Connection. Scaffolds init files, resolves the token
+/// Pull-only sync of one environment. Scaffolds init files, resolves the token
 /// (silent re-login in password mode), then runs `sync_no_push`. Progress is
-/// streamed as `SyncPhase`; the stream conveys the terminal outcome (Done or
-/// Error) rather than throwing.
-Stream<SyncPhase> syncConnection({
+/// streamed as `SyncPhase`.
+Stream<SyncPhase> syncEnv({
   required String folder,
+  required String env,
   required String apiBase,
   required BigInt orgId,
-}) => RustLib.instance.api.crateApiRdcSyncConnection(
+}) => RustLib.instance.api.crateApiRdcSyncEnv(
   folder: folder,
+  env: env,
   apiBase: apiBase,
   orgId: orgId,
 );
 
-/// Move a managed Connection's folder to the OS trash/recycle bin.
-Future<void> trashConnection({required String folder}) =>
-    RustLib.instance.api.crateApiRdcTrashConnection(folder: folder);
+/// Move a managed Project's folder to the OS trash/recycle bin.
+Future<void> trashProject({required String folder}) =>
+    RustLib.instance.api.crateApiRdcTrashProject(folder: folder);
 
 /// Reveal a path in the OS file manager (Finder / Explorer / file manager).
 Future<void> revealInFileManager({required String path}) =>
@@ -111,53 +112,6 @@ class AddConnectionInput {
 
 enum AuthKind { token, password }
 
-class ConnectionSummary {
-  final String id;
-  final String name;
-  final String apiBase;
-  final BigInt orgId;
-  final String folder;
-  final AuthKind authKind;
-  final PlatformInt64? lastSyncUnix;
-  final BigInt fileCount;
-
-  const ConnectionSummary({
-    required this.id,
-    required this.name,
-    required this.apiBase,
-    required this.orgId,
-    required this.folder,
-    required this.authKind,
-    this.lastSyncUnix,
-    required this.fileCount,
-  });
-
-  @override
-  int get hashCode =>
-      id.hashCode ^
-      name.hashCode ^
-      apiBase.hashCode ^
-      orgId.hashCode ^
-      folder.hashCode ^
-      authKind.hashCode ^
-      lastSyncUnix.hashCode ^
-      fileCount.hashCode;
-
-  @override
-  bool operator ==(Object other) =>
-      identical(this, other) ||
-      other is ConnectionSummary &&
-          runtimeType == other.runtimeType &&
-          id == other.id &&
-          name == other.name &&
-          apiBase == other.apiBase &&
-          orgId == other.orgId &&
-          folder == other.folder &&
-          authKind == other.authKind &&
-          lastSyncUnix == other.lastSyncUnix &&
-          fileCount == other.fileCount;
-}
-
 class EditConnectionInput {
   /// The connection name; if it changes, the folder is renamed.
   final String name;
@@ -203,6 +157,73 @@ class EditConnectionInput {
           token == other.token &&
           username == other.username &&
           password == other.password;
+}
+
+class EnvSummary {
+  final String name;
+  final String apiBase;
+  final BigInt orgId;
+  final AuthKind authKind;
+  final PlatformInt64? lastSyncUnix;
+  final BigInt fileCount;
+
+  const EnvSummary({
+    required this.name,
+    required this.apiBase,
+    required this.orgId,
+    required this.authKind,
+    this.lastSyncUnix,
+    required this.fileCount,
+  });
+
+  @override
+  int get hashCode =>
+      name.hashCode ^
+      apiBase.hashCode ^
+      orgId.hashCode ^
+      authKind.hashCode ^
+      lastSyncUnix.hashCode ^
+      fileCount.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is EnvSummary &&
+          runtimeType == other.runtimeType &&
+          name == other.name &&
+          apiBase == other.apiBase &&
+          orgId == other.orgId &&
+          authKind == other.authKind &&
+          lastSyncUnix == other.lastSyncUnix &&
+          fileCount == other.fileCount;
+}
+
+class ProjectSummary {
+  final String id;
+  final String name;
+  final String folder;
+  final List<EnvSummary> envs;
+
+  const ProjectSummary({
+    required this.id,
+    required this.name,
+    required this.folder,
+    required this.envs,
+  });
+
+  @override
+  int get hashCode =>
+      id.hashCode ^ name.hashCode ^ folder.hashCode ^ envs.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ProjectSummary &&
+          runtimeType == other.runtimeType &&
+          id == other.id &&
+          name == other.name &&
+          folder == other.folder &&
+          envs == other.envs;
 }
 
 @freezed
