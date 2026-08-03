@@ -204,7 +204,7 @@ class _AddConnectionDialogState extends State<AddConnectionDialog> {
       _error = null;
     });
     try {
-      await widget.state.addConnectionEntry(AddConnectionInput(
+      await widget.state.addProjectEntry(AddConnectionInput(
         name: _name.text.trim(),
         apiBase: _apiBase.text.trim(),
         orgId: org,
@@ -249,21 +249,22 @@ class _AddConnectionDialogState extends State<AddConnectionDialog> {
 // ------------------------------------------------------------ edit
 
 class EditConnectionDialog extends StatefulWidget {
-  const EditConnectionDialog({super.key, required this.state, required this.item});
+  const EditConnectionDialog({super.key, required this.state, required this.item, required this.env});
   final AppState state;
-  final ConnItem item;
+  final ProjectItem item;
+  final EnvSummary env;
   @override
   State<EditConnectionDialog> createState() => _EditConnectionDialogState();
 }
 
 class _EditConnectionDialogState extends State<EditConnectionDialog> {
   late final _name = TextEditingController(text: widget.item.summary.name);
-  late final _apiBase = TextEditingController(text: widget.item.summary.apiBase);
-  late final _orgId = TextEditingController(text: widget.item.summary.orgId.toString());
+  late final _apiBase = TextEditingController(text: widget.env.apiBase);
+  late final _orgId = TextEditingController(text: widget.env.orgId.toString());
   final _token = TextEditingController();
   final _username = TextEditingController();
   final _password = TextEditingController();
-  late AuthKind _auth = widget.item.summary.authKind;
+  late AuthKind _auth = widget.env.authKind;
   String? _error;
   bool _busy = false;
 
@@ -284,8 +285,9 @@ class _EditConnectionDialogState extends State<EditConnectionDialog> {
       _error = null;
     });
     try {
-      await widget.state.editConnectionEntry(
+      await widget.state.editEnvEntry(
         widget.item,
+        widget.env,
         EditConnectionInput(
           name: _name.text.trim(),
           apiBase: _apiBase.text.trim(),
@@ -335,7 +337,7 @@ class _EditConnectionDialogState extends State<EditConnectionDialog> {
 
 class RemoveDialog extends StatelessWidget {
   const RemoveDialog({super.key, required this.item});
-  final ConnItem item;
+  final ProjectItem item;
   @override
   Widget build(BuildContext context) {
     final c = MdhColors.of(context);

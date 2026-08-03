@@ -6,47 +6,68 @@ import 'settings.dart';
 
 enum SyncState { idle, running, done, error }
 
-/// A discovered connection plus whether it lives outside the parent folder
-/// (an "external" project attached via Open Existing). External connections
-/// are detached (forgotten) on remove; managed ones are moved to the trash.
-class ConnItem {
-  final ConnectionSummary summary;
+/// A discovered project plus whether it lives outside the parent folder (an
+/// "external" project attached via Open Existing).
+class ProjectItem {
+  final ProjectSummary summary;
   final bool isExternal;
-  const ConnItem(this.summary, this.isExternal);
+  const ProjectItem(this.summary, this.isExternal);
 }
 
 /// Single source of truth for the UI. Wraps the Rust bridge and derives the
-/// connection list from disk (parent scan ∪ attached externals), mirroring the
-/// retired SwiftUI `ConnectionStore`.
+/// project list from disk (parent scan ∪ attached externals). Transient sync
+/// state is keyed per (folder, env) via [envKey].
 class AppState extends ChangeNotifier {
   AppState(this._settings);
 
   final Settings _settings;
 
-  List<ConnItem> connections = [];
+  List<ProjectItem> projects = [];
   String? selectedFolder;
+  String? selectedEnv;
   bool loading = false;
   String? lastError;
 
   final Map<String, SyncState> syncState = {};
   final Map<String, String> syncMessage = {};
-
-  /// rdc's real, rendered sync-log lines from the current/last run, per folder.
   final Map<String, List<String>> syncLog = {};
 
   String? get parentFolder => _settings.parentFolder;
 
-  ConnItem? get selected {
+  String envKey(String folder, String env) => '$folder\u0000$env';
+
+  ProjectItem? get selected {
     final folder = selectedFolder;
     if (folder == null) return null;
-    for (final c in connections) {
-      if (c.summary.folder == folder) return c;
+    for (final p in projects) {
+      if (p.summary.folder == folder) return p;
     }
     return null;
   }
 
-  void select(String? folder) {
+  EnvSummary? get selectedEnvSummary {
+    final p = selected;
+    final env = selectedEnv;
+    if (p == null || env == null) return null;
+    for (final e in p.summary.envs) {
+      if (e.name == env) return e;
+    }
+    return null;
+  }
+
+  void selectProject(String folder) {
     selectedFolder = folder;
+    ProjectItem? p;
+    for (final it in projects) {
+      if (it.summary.folder == folder) p = it;
+    }
+    selectedEnv = (p != null && p.summary.envs.isNotEmpty) ? p.summary.envs.first.name : null;
+    notifyListeners();
+  }
+
+  void selectEnv(String folder, String env) {
+    selectedFolder = folder;
+    selectedEnv = env;
     notifyListeners();
   }
 
@@ -60,23 +81,21 @@ class AppState extends ChangeNotifier {
     loading = true;
     notifyListeners();
 
-    final byFolder = <String, ConnItem>{};
+    final byFolder = <String, ProjectItem>{};
     try {
       final parent = _settings.parentFolder;
       if (parent != null) {
-        for (final s in await listConnections(parent: parent)) {
-          byFolder[s.folder] = ConnItem(s, false);
+        for (final s in await listProjects(parent: parent)) {
+          byFolder[s.folder] = ProjectItem(s, false);
         }
       }
       final stillValid = <String>[];
       for (final path in List<String>.from(_settings.externalPaths)) {
         try {
           final s = await validateExistingProject(path: path);
-          byFolder.putIfAbsent(s.folder, () => ConnItem(s, true));
+          byFolder.putIfAbsent(s.folder, () => ProjectItem(s, true));
           stillValid.add(path);
-        } catch (_) {
-          // A moved/deleted external project is silently dropped.
-        }
+        } catch (_) {}
       }
       if (stillValid.length != _settings.externalPaths.length) {
         _settings.externalPaths = stillValid;
@@ -86,36 +105,34 @@ class AppState extends ChangeNotifier {
       lastError = errorText(e);
     }
 
-    connections = byFolder.values.toList()
-      ..sort((a, b) => a.summary.name
-          .toLowerCase()
-          .compareTo(b.summary.name.toLowerCase()));
-    if (selectedFolder != null &&
-        !connections.any((c) => c.summary.folder == selectedFolder)) {
+    projects = byFolder.values.toList()
+      ..sort((a, b) => a.summary.name.toLowerCase().compareTo(b.summary.name.toLowerCase()));
+    if (selectedFolder != null && !projects.any((p) => p.summary.folder == selectedFolder)) {
       selectedFolder = null;
+      selectedEnv = null;
     }
-    // Always keep a connection selected when there is one.
-    if (selectedFolder == null && connections.isNotEmpty) {
-      selectedFolder = connections.first.summary.folder;
+    // Re-pin the selected env if it vanished (e.g. removed on disk).
+    if (selectedFolder != null && selected != null &&
+        !selected!.summary.envs.any((e) => e.name == selectedEnv)) {
+      selectedEnv = selected!.summary.envs.isNotEmpty ? selected!.summary.envs.first.name : null;
+    }
+    if (selectedFolder == null && projects.isNotEmpty) {
+      selectProject(projects.first.summary.folder);
     }
     loading = false;
     notifyListeners();
   }
 
-  Future<void> addConnectionEntry(AddConnectionInput input) async {
+  Future<void> addProjectEntry(AddConnectionInput input) async {
     final parent = _settings.parentFolder;
     if (parent == null) throw Exception('Choose a parent folder first.');
-    final s = await addConnection(parent: parent, input: input);
+    final s = await addProject(parent: parent, input: input);
     await reload();
-    selectedFolder = s.folder;
-    notifyListeners();
+    selectProject(s.folder);
   }
 
-  Future<void> editConnectionEntry(
-      ConnItem item, EditConnectionInput input) async {
-    final updated =
-        await editConnection(folder: item.summary.folder, input: input);
-    // If an external connection's folder was renamed, follow it in settings.
+  Future<void> editEnvEntry(ProjectItem item, EnvSummary env, EditConnectionInput input) async {
+    final updated = await editProject(folder: item.summary.folder, env: env.name, input: input);
     if (item.isExternal && updated.folder != item.summary.folder) {
       final i = _settings.externalPaths.indexOf(item.summary.folder);
       if (i >= 0) {
@@ -124,12 +141,11 @@ class AppState extends ChangeNotifier {
       }
     }
     await reload();
-    selectedFolder = updated.folder;
-    notifyListeners();
+    selectEnv(updated.folder, env.name);
   }
 
   Future<void> openExisting(String path) async {
-    final s = await validateExistingProject(path: path); // throws if invalid
+    final s = await validateExistingProject(path: path);
     final parent = _settings.parentFolder;
     final underParent = parent != null && s.folder.startsWith(parent);
     if (!underParent && !_settings.externalPaths.contains(s.folder)) {
@@ -137,55 +153,53 @@ class AppState extends ChangeNotifier {
       _settings.save();
     }
     await reload();
-    selectedFolder = s.folder;
-    notifyListeners();
+    selectProject(s.folder);
   }
 
-  /// Managed → move folder to trash; external → forget it (folder untouched).
-  Future<void> removeOrDetach(ConnItem item) async {
+  Future<void> removeOrDetach(ProjectItem item) async {
     if (item.isExternal) {
       _settings.externalPaths.remove(item.summary.folder);
       _settings.save();
     } else {
-      await trashConnection(folder: item.summary.folder);
+      await trashProject(folder: item.summary.folder);
     }
-    if (selectedFolder == item.summary.folder) selectedFolder = null;
+    if (selectedFolder == item.summary.folder) {
+      selectedFolder = null;
+      selectedEnv = null;
+    }
     await reload();
   }
 
   Future<void> reveal(String folder) => revealInFileManager(path: folder);
 
-  void sync(ConnItem item) {
+  void syncEnvItem(ProjectItem item, EnvSummary env) {
     final folder = item.summary.folder;
-    syncState[folder] = SyncState.running;
-    syncMessage.remove(folder);
-    syncLog[folder] = <String>[];
+    final k = envKey(folder, env.name);
+    syncState[k] = SyncState.running;
+    syncMessage.remove(k);
+    syncLog[k] = <String>[];
     notifyListeners();
 
-    syncConnection(
-      folder: folder,
-      apiBase: item.summary.apiBase,
-      orgId: item.summary.orgId,
-    ).listen(
+    syncEnv(folder: folder, env: env.name, apiBase: env.apiBase, orgId: env.orgId).listen(
       (phase) {
         switch (phase) {
           case SyncPhase_Started():
-            syncState[folder] = SyncState.running;
+            syncState[k] = SyncState.running;
           case SyncPhase_Log(:final line):
-            (syncLog[folder] ??= <String>[]).add(line);
+            (syncLog[k] ??= <String>[]).add(line);
           case SyncPhase_Done(:final fileCount):
-            syncState[folder] = SyncState.done;
-            syncMessage[folder] = 'Pulled $fileCount files';
+            syncState[k] = SyncState.done;
+            syncMessage[k] = 'Pulled $fileCount files';
             reload();
           case SyncPhase_Error(:final message):
-            syncState[folder] = SyncState.error;
-            syncMessage[folder] = message;
+            syncState[k] = SyncState.error;
+            syncMessage[k] = message;
         }
         notifyListeners();
       },
       onError: (Object e) {
-        syncState[folder] = SyncState.error;
-        syncMessage[folder] = errorText(e);
+        syncState[k] = SyncState.error;
+        syncMessage[k] = errorText(e);
         notifyListeners();
       },
     );
