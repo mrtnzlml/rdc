@@ -235,7 +235,7 @@ class _AddConnectionDialogState extends State<AddConnectionDialog> {
       busy: _busy,
       onPrimary: _submit,
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        _Field(label: 'NAME', controller: _name, autofocus: true),
+        _Field(label: 'PROJECT NAME', controller: _name, autofocus: true),
         _Field(label: 'ENVIRONMENT NAME', controller: _envName, hint: 'e.g. prod'),
         _Field(label: 'API BASE URL', controller: _apiBase),
         _Field(label: 'ORGANIZATION ID', controller: _orgId, keyboardType: TextInputType.number),
@@ -408,7 +408,7 @@ class _EditConnectionDialogState extends State<EditConnectionDialog> {
       busy: _busy,
       onPrimary: _submit,
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        _Field(label: 'NAME', controller: _name, autofocus: true),
+        _Field(label: 'PROJECT NAME', controller: _name, autofocus: true),
         _Field(label: 'ENVIRONMENT NAME', controller: _envName, hint: 'e.g. prod'),
         _Field(label: 'API BASE URL', controller: _apiBase),
         _Field(label: 'ORGANIZATION ID', controller: _orgId, keyboardType: TextInputType.number),
