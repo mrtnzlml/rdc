@@ -57,11 +57,7 @@ class AppState extends ChangeNotifier {
 
   void selectProject(String folder) {
     selectedFolder = folder;
-    ProjectItem? p;
-    for (final it in projects) {
-      if (it.summary.folder == folder) p = it;
-    }
-    selectedEnv = (p != null && p.summary.envs.isNotEmpty) ? p.summary.envs.first.name : null;
+    selectedEnv = null; // show the Project view; env children are selected explicitly
     notifyListeners();
   }
 
@@ -111,8 +107,10 @@ class AppState extends ChangeNotifier {
       selectedFolder = null;
       selectedEnv = null;
     }
-    // Re-pin the selected env if it vanished (e.g. removed on disk).
-    if (selectedFolder != null && selected != null &&
+    // Re-pin the selected env if it vanished (e.g. removed on disk). Only
+    // applies when an env was actually selected — `selectedEnv == null` means
+    // the Project view is showing on purpose and must not be disturbed.
+    if (selectedFolder != null && selectedEnv != null && selected != null &&
         !selected!.summary.envs.any((e) => e.name == selectedEnv)) {
       selectedEnv = selected!.summary.envs.isNotEmpty ? selected!.summary.envs.first.name : null;
     }
@@ -142,6 +140,26 @@ class AppState extends ChangeNotifier {
     }
     await reload();
     selectEnv(updated.folder, env.name);
+  }
+
+  Future<void> addEnvEntry(ProjectItem item, AddEnvInput input) async {
+    await addEnv(folder: item.summary.folder, input: input);
+    await reload();
+    selectEnv(item.summary.folder, input.name.trim());
+  }
+
+  Future<void> removeEnvEntry(ProjectItem item, EnvSummary env) async {
+    final updated = await removeEnv(folder: item.summary.folder, env: env.name);
+    await reload();
+    if (updated == null) {
+      // whole project was removed (last env)
+      if (selectedFolder == item.summary.folder) {
+        selectedFolder = null;
+        selectedEnv = null;
+      }
+    } else {
+      selectProject(item.summary.folder); // back to the Project view
+    }
   }
 
   Future<void> openExisting(String path) async {
