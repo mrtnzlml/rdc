@@ -6,6 +6,11 @@ import 'settings.dart';
 
 enum SyncState { idle, running, done, error }
 
+/// Stage of the promote flow for the currently-selected project (there is
+/// only ever one promote in flight per project, so this is a single set of
+/// fields on [AppState] rather than something keyed like [syncState]).
+enum PromoteStage { idle, preparing, preview, pushing, done, error }
+
 /// A discovered project plus whether it lives outside the parent folder (an
 /// "external" project attached via Open Existing).
 class ProjectItem {
@@ -31,6 +36,17 @@ class AppState extends ChangeNotifier {
   final Map<String, SyncState> syncState = {};
   final Map<String, String> syncMessage = {};
   final Map<String, List<String>> syncLog = {};
+
+  // ---- promote (migrate src -> tgt, offline preview, then a gated push) ----
+  String? promoteSrc;
+  String? promoteTgt;
+  bool promoteMirror = false;
+  ConflictPolicy promotePolicy = ConflictPolicy.keepTarget;
+  bool promoteAllowDeletes = false;
+  PromotionPreview? promotePreview;
+  List<String> promoteLog = [];
+  PromoteStage promoteStage = PromoteStage.idle;
+  String? promoteError;
 
   String? get parentFolder => _settings.parentFolder;
 
@@ -218,6 +234,113 @@ class AppState extends ChangeNotifier {
       onError: (Object e) {
         syncState[k] = SyncState.error;
         syncMessage[k] = errorText(e);
+        notifyListeners();
+      },
+    );
+  }
+
+  /// Pick (or change) the promote direction. Setting both to `null` clears
+  /// the picker back to unselected (used when the project changes).
+  void setPromoteDir(String? src, String? tgt) {
+    promoteSrc = src;
+    promoteTgt = tgt;
+    notifyListeners();
+  }
+
+  void swapPromoteDir() {
+    final src = promoteSrc;
+    promoteSrc = promoteTgt;
+    promoteTgt = src;
+    notifyListeners();
+  }
+
+  void setPromoteMirror(bool value) {
+    promoteMirror = value;
+    notifyListeners();
+  }
+
+  void setPromotePolicy(ConflictPolicy value) {
+    promotePolicy = value;
+    notifyListeners();
+  }
+
+  void setPromoteAllowDeletes(bool value) {
+    promoteAllowDeletes = value;
+    notifyListeners();
+  }
+
+  /// Abandon the current preview/push and go back to idle. The picked
+  /// direction, mirror flag, policy, and allow-deletes are left alone so a
+  /// Cancel doesn't force the user to redo their picks before re-Preparing.
+  void resetPromote() {
+    promoteStage = PromoteStage.idle;
+    promotePreview = null;
+    promoteLog = [];
+    promoteError = null;
+    notifyListeners();
+  }
+
+  /// Offline dry-run: migrate `src` -> `tgt` locally and capture the rendered
+  /// push plan, without touching the target remote.
+  Future<void> preparePromote(ProjectItem p) async {
+    final src = promoteSrc;
+    final tgt = promoteTgt;
+    if (src == null || tgt == null || src == tgt) return;
+    promoteStage = PromoteStage.preparing;
+    promoteError = null;
+    notifyListeners();
+
+    try {
+      promotePreview = await preparePromotion(
+        folder: p.summary.folder,
+        src: src,
+        tgt: tgt,
+        mirror: promoteMirror,
+      );
+      promoteStage = PromoteStage.preview;
+    } catch (e) {
+      promoteStage = PromoteStage.error;
+      promoteError = errorText(e);
+    }
+    notifyListeners();
+  }
+
+  /// The real gated push, streaming rdc's log. Modeled on [syncEnvItem].
+  void pushPromote(ProjectItem p) {
+    final src = promoteSrc;
+    final tgt = promoteTgt;
+    if (src == null || tgt == null || src == tgt) return;
+    promoteStage = PromoteStage.pushing;
+    promoteLog = <String>[];
+    promoteError = null;
+    notifyListeners();
+
+    pushPromotion(
+      folder: p.summary.folder,
+      src: src,
+      tgt: tgt,
+      mirror: promoteMirror,
+      policy: promotePolicy,
+      allowDeletes: promoteAllowDeletes,
+    ).listen(
+      (phase) {
+        switch (phase) {
+          case SyncPhase_Started():
+            promoteStage = PromoteStage.pushing;
+          case SyncPhase_Log(:final line):
+            promoteLog.add(line);
+          case SyncPhase_Done():
+            promoteStage = PromoteStage.done;
+            reload();
+          case SyncPhase_Error(:final message):
+            promoteStage = PromoteStage.error;
+            promoteError = message;
+        }
+        notifyListeners();
+      },
+      onError: (Object e) {
+        promoteStage = PromoteStage.error;
+        promoteError = errorText(e);
         notifyListeners();
       },
     );
