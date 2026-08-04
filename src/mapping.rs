@@ -327,6 +327,25 @@ impl GenericMapping {
         m
     }
 
+    /// Rename an environment across every mapping row (each row is
+    /// `BTreeMap<env_name, slug>`). No-op for rows that don't reference `old`,
+    /// and a no-op overall when `old == new`. Local, non-behavioral: `migrate`
+    /// reads the same rows under the new env name afterward.
+    pub fn rename_env(&mut self, old: &str, new: &str) {
+        if old == new {
+            return;
+        }
+        for kind in Self::KINDS {
+            if let Some(rows) = self.kind_rows_mut(kind) {
+                for row in rows.iter_mut() {
+                    if let Some(slug) = row.remove(old) {
+                        row.insert(new.to_string(), slug);
+                    }
+                }
+            }
+        }
+    }
+
     /// Convert legacy per-pair mappings into one N-way table. Each input tuple is
     /// `(env_a, env_b, mapping)` where `mapping` is a legacy `src -> tgt` map read
     /// from `<env_a>-to-<env_b>.toml`. EVERY edge — including identity
@@ -680,6 +699,23 @@ version = 1
         ])
         .unwrap_err();
         assert!(format!("{err}").contains("inconsistent"));
+    }
+
+    #[test]
+    fn rename_env_rewrites_row_keys_across_kinds() {
+        let mut g = GenericMapping::default();
+        let mut row = std::collections::BTreeMap::new();
+        row.insert("dev".to_string(), "cost-dev".to_string());
+        row.insert("prod".to_string(), "cost-prod".to_string());
+        g.queues.push(row);
+        let mut hrow = std::collections::BTreeMap::new();
+        hrow.insert("dev".to_string(), "validator".to_string());
+        g.hooks.push(hrow);
+        g.rename_env("dev", "sandbox");
+        assert_eq!(g.queues[0].get("sandbox"), Some(&"cost-dev".to_string()));
+        assert_eq!(g.queues[0].get("dev"), None);
+        assert_eq!(g.queues[0].get("prod"), Some(&"cost-prod".to_string()));
+        assert_eq!(g.hooks[0].get("sandbox"), Some(&"validator".to_string()));
     }
 
     /// Drift guard for the parallel 10-kind lists (struct fields, `Default`,

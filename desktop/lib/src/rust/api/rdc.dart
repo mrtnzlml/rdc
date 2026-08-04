@@ -10,7 +10,7 @@ part 'rdc.freezed.dart';
 
 // These functions are ignored because they are not marked as `pub`: `block_on`, `env_api_base`, `policy_to_strategy`, `valid_env_name`, `write_credentials`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `LineCollector`, `LineForwarder`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `flush`, `flush`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `from`, `write`, `write`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `flush`, `flush`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `from`, `write`, `write`
 
 /// rdc's package version, surfaced to the app's About box.
 Future<String?> rdcVersion() => RustLib.instance.api.crateApiRdcRdcVersion();
@@ -19,12 +19,18 @@ Future<String?> rdcVersion() => RustLib.instance.api.crateApiRdcRdcVersion();
 Future<List<ProjectSummary>> listProjects({required String parent}) =>
     RustLib.instance.api.crateApiRdcListProjects(parent: parent);
 
-/// Create a new Project: write `rdc.toml` + secrets for a first env named
-/// `main` under a unique slug. (Additional envs are added in a later phase.)
+/// Create a new Project: write `rdc.toml` + secrets for a first env named by
+/// the caller (`first_env.name`) under a unique slug. (Additional envs are
+/// added later via `add_env`.)
 Future<ProjectSummary> addProject({
   required String parent,
-  required AddConnectionInput input,
-}) => RustLib.instance.api.crateApiRdcAddProject(parent: parent, input: input);
+  required String projectName,
+  required AddEnvInput firstEnv,
+}) => RustLib.instance.api.crateApiRdcAddProject(
+  parent: parent,
+  projectName: projectName,
+  firstEnv: firstEnv,
+);
 
 /// Validate that `path` is an rdc project (≥1 env, any names) and return its
 /// summary. Does not move, copy, or symlink anything.
@@ -56,6 +62,18 @@ Future<ProjectSummary?> removeEnv({
   required String folder,
   required String env,
 }) => RustLib.instance.api.crateApiRdcRemoveEnv(folder: folder, env: env);
+
+/// Rename an environment `old` → `new` entirely locally: move every per-env
+/// path, rewrite `.rdc/mapping.toml`, and rename the `[envs.<old>]` section.
+Future<ProjectSummary> renameEnv({
+  required String folder,
+  required String old,
+  required String new_,
+}) => RustLib.instance.api.crateApiRdcRenameEnv(
+  folder: folder,
+  old: old,
+  new_: new_,
+);
 
 /// Pull-only sync of one environment. Scaffolds init files, resolves the token
 /// (silent re-login in password mode), then runs `sync_no_push`. Progress is
@@ -119,49 +137,6 @@ Future<void> trashProject({required String folder}) =>
 /// Reveal a path in the OS file manager (Finder / Explorer / file manager).
 Future<void> revealInFileManager({required String path}) =>
     RustLib.instance.api.crateApiRdcRevealInFileManager(path: path);
-
-class AddConnectionInput {
-  final String name;
-  final String apiBase;
-  final BigInt orgId;
-  final AuthKind authKind;
-  final String? token;
-  final String? username;
-  final String? password;
-
-  const AddConnectionInput({
-    required this.name,
-    required this.apiBase,
-    required this.orgId,
-    required this.authKind,
-    this.token,
-    this.username,
-    this.password,
-  });
-
-  @override
-  int get hashCode =>
-      name.hashCode ^
-      apiBase.hashCode ^
-      orgId.hashCode ^
-      authKind.hashCode ^
-      token.hashCode ^
-      username.hashCode ^
-      password.hashCode;
-
-  @override
-  bool operator ==(Object other) =>
-      identical(this, other) ||
-      other is AddConnectionInput &&
-          runtimeType == other.runtimeType &&
-          name == other.name &&
-          apiBase == other.apiBase &&
-          orgId == other.orgId &&
-          authKind == other.authKind &&
-          token == other.token &&
-          username == other.username &&
-          password == other.password;
-}
 
 class AddEnvInput {
   final String name;
