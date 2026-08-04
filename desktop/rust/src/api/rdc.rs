@@ -271,6 +271,17 @@ pub struct AddEnvInput {
     pub password: Option<String>,
 }
 
+/// An env name may only contain letters, digits, `-` and `_` — the same rule
+/// `rdc init`'s own prompt validator enforces (see `cli::init::prompt_env_name`).
+/// Rejecting anything else here (path separators, `..`, etc.) before an env
+/// name is ever interpolated into a filesystem path is what keeps `remove_env`
+/// from being tricked into deleting outside the project folder.
+fn valid_env_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+const INVALID_ENV_NAME_MSG: &str = "Environment name may only contain letters, digits, - and _.";
+
 /// Add a new environment to an existing project. Errors if the env already exists.
 pub fn add_env(folder: String, input: AddEnvInput) -> Result<ProjectSummary> {
     let folder = PathBuf::from(&folder);
@@ -278,11 +289,21 @@ pub fn add_env(folder: String, input: AddEnvInput) -> Result<ProjectSummary> {
     if name.is_empty() {
         return Err(anyhow!("Environment name is required."));
     }
+    if !valid_env_name(&name) {
+        return Err(anyhow!(INVALID_ENV_NAME_MSG));
+    }
     let toml_path = folder.join("rdc.toml");
     let mut cfg = rdc::config::ProjectConfig::load(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
     if cfg.envs.contains_key(&name) {
         return Err(anyhow!("An environment named \"{name}\" already exists in this project."));
     }
+    // Validate + write credentials FIRST: if they're invalid, `rdc.toml` must
+    // stay untouched so the caller can fix the input and retry `add_env`
+    // without first having to remove a half-registered env.
+    write_credentials(
+        &folder, &name,
+        input.auth_kind, input.token.as_deref(), input.username.as_deref(), input.password.as_deref(),
+    )?;
     cfg.envs.insert(
         name.clone(),
         rdc::config::EnvConfig {
@@ -291,10 +312,6 @@ pub fn add_env(folder: String, input: AddEnvInput) -> Result<ProjectSummary> {
         },
     );
     cfg.save(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
-    write_credentials(
-        &folder, &name,
-        input.auth_kind, input.token.as_deref(), input.username.as_deref(), input.password.as_deref(),
-    )?;
     discover::inspect(&folder)
         .as_ref()
         .map(ProjectSummary::from)
@@ -304,6 +321,13 @@ pub fn add_env(folder: String, input: AddEnvInput) -> Result<ProjectSummary> {
 /// Remove an environment: its `rdc.toml` section, snapshot, secrets, and state.
 /// If it was the last env, the whole project is trashed and `Ok(None)` returned.
 pub fn remove_env(folder: String, env: String) -> Result<Option<ProjectSummary>> {
+    // Defensive: guard against a malformed `rdc.toml` env key (or any other
+    // caller mistake) before `env` is ever interpolated into a path below —
+    // an env name with `..` or a path separator must never reach
+    // `remove_dir_all`/`remove_file`.
+    if !valid_env_name(&env) {
+        return Err(anyhow!(INVALID_ENV_NAME_MSG));
+    }
     let folder = PathBuf::from(&folder);
     let toml_path = folder.join("rdc.toml");
     let mut cfg = rdc::config::ProjectConfig::load(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
@@ -317,12 +341,19 @@ pub fn remove_env(folder: String, env: String) -> Result<Option<ProjectSummary>>
     }
     cfg.envs.remove(&env);
     cfg.save(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
-    // Best-effort cleanup of the env's on-disk artifacts.
-    let _ = std::fs::remove_dir_all(folder.join(format!("envs/{env}")));
-    let _ = std::fs::remove_file(folder.join(format!("secrets/{env}.secrets.json")));
-    let _ = std::fs::remove_file(folder.join(format!(".rdc/state/{env}.lock.json")));
-    let _ = std::fs::remove_file(folder.join(format!(".rdc/state/{env}.lock")));
-    let _ = std::fs::remove_dir_all(folder.join(format!(".rdc/state/{env}.base")));
+    // Best-effort cleanup of the env's on-disk artifacts, all routed through
+    // rdc's own `Paths` so the layout stays single-sourced (src/paths.rs).
+    let paths = rdc::paths::Paths::for_env(&folder, &env);
+    let _ = std::fs::remove_dir_all(paths.env_root());
+    let _ = std::fs::remove_file(paths.secrets_file());
+    let _ = std::fs::remove_file(paths.lockfile());
+    let _ = std::fs::remove_file(paths.env_lock());
+    let _ = std::fs::remove_dir_all(paths.base_cache_root());
+    // `Paths` has no bare "conflicts dir" accessor, only the per-file
+    // `conflict_shadow_path`; passing the env root itself as `local_path`
+    // makes it strip to an empty relpath, yielding the env's whole
+    // `.rdc/conflicts/<env>/` shadow directory without hand-rolling the path.
+    let _ = std::fs::remove_dir_all(paths.conflict_shadow_path(&paths.env_root()));
     discover::inspect(&folder)
         .as_ref()
         .map(ProjectSummary::from)
@@ -576,6 +607,37 @@ mod tests {
     }
 
     #[test]
+    fn add_env_rejects_invalid_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = seed_project(tmp.path(), "acme");
+        for bad in ["../x", "a/b", "..", ""] {
+            let err = add_env(folder.display().to_string(), AddEnvInput {
+                name: bad.into(), api_base: "https://x.test/api/v1".into(), org_id: 9,
+                auth_kind: AuthKind::Token, token: Some("t".into()), username: None, password: None,
+            }).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("required") || msg.contains("letters, digits"),
+                "unexpected error for {bad:?}: {msg}"
+            );
+        }
+        // Nothing outside the project folder was touched, and rdc.toml still
+        // has only the original env.
+        let cfg = rdc::config::ProjectConfig::load(&folder.join("rdc.toml")).unwrap();
+        assert_eq!(cfg.envs.keys().collect::<Vec<_>>(), vec!["main"]);
+    }
+
+    #[test]
+    fn remove_env_rejects_invalid_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = seed_project(tmp.path(), "acme");
+        let err = remove_env(folder.display().to_string(), "../../etc".into()).unwrap_err();
+        assert!(format!("{err:#}").contains("letters, digits"));
+        // The (legitimate) project is entirely untouched.
+        assert!(folder.join("rdc.toml").exists());
+    }
+
+    #[test]
     fn remove_env_drops_one_and_keeps_project() {
         let tmp = tempfile::tempdir().unwrap();
         let folder = seed_project(tmp.path(), "acme");
@@ -583,9 +645,28 @@ mod tests {
             name: "prod".into(), api_base: "https://p.test/api/v1".into(), org_id: 2,
             auth_kind: AuthKind::Token, token: Some("t2".into()), username: None, password: None,
         }).unwrap();
+        // Seed on-disk artifacts the cleanup is supposed to remove, so the
+        // cleanup lines are actually exercised (not just the rdc.toml edit).
+        let paths = rdc::paths::Paths::for_env(&folder, "prod");
+        std::fs::create_dir_all(paths.env_root()).unwrap();
+        std::fs::write(paths.env_root().join("organization.json"), "{}").unwrap();
+        std::fs::create_dir_all(paths.lockfile().parent().unwrap()).unwrap();
+        std::fs::write(paths.lockfile(), "{}").unwrap();
+        std::fs::write(paths.env_lock(), "").unwrap();
+        std::fs::create_dir_all(paths.base_cache_root()).unwrap();
+        std::fs::write(paths.base_cache_root().join("organization.json"), "{}").unwrap();
+        let conflicts_dir = folder.join(".rdc/conflicts/prod");
+        std::fs::create_dir_all(&conflicts_dir).unwrap();
+        std::fs::write(conflicts_dir.join("stray.json"), "{}").unwrap();
+
         let p = remove_env(folder.display().to_string(), "prod".into()).unwrap().unwrap();
         assert_eq!(p.envs.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), vec!["main"]);
         assert!(!folder.join("secrets/prod.secrets.json").exists());
+        assert!(!paths.env_root().exists(), "envs/prod should be removed");
+        assert!(!paths.lockfile().exists(), "state lockfile.json should be removed");
+        assert!(!paths.env_lock().exists(), "state .lock should be removed");
+        assert!(!paths.base_cache_root().exists(), "base cache should be removed");
+        assert!(!conflicts_dir.exists(), "conflicts shadow dir should be removed");
     }
 
     #[test]
