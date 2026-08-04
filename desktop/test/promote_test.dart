@@ -98,6 +98,46 @@ void main() {
       expect(s.promoteTgt, isNull);
     });
 
+    test('a prepare result that resolves after switching projects must not clobber the new project', () {
+      final s = AppState(Settings(parentFolder: '/tmp'));
+      s.projects = [
+        _p('/tmp/acme', [_e('dev', 1), _e('prod', 2)]),
+        _p('/tmp/beta', [_e('dev', 3), _e('prod', 4)]),
+      ];
+
+      // Project A (acme) has a prepare in flight (imagine `preparePromote`
+      // mid-`await`)...
+      s.selectProject('/tmp/acme');
+      s.setPromoteDir('dev', 'prod');
+      s.promoteStage = PromoteStage.preparing;
+
+      // ...then the user switches to project B before it resolves.
+      s.selectProject('/tmp/beta');
+      expect(s.selectedFolder, '/tmp/beta');
+      expect(s.promoteStage, PromoteStage.idle); // switching already reset B's panel
+
+      // A's prepare now resolves. Applying it must be a no-op: the selected
+      // project is no longer acme, so beta's Promote panel (and its live
+      // Push button) must not end up wired to acme's plan.
+      s.applyPrepareResult('/tmp/acme', const PromotionPreview(plan: ['+ queue acme/invoices']));
+
+      expect(s.promoteStage, isNot(PromoteStage.preview));
+      expect(s.promotePreview, isNull);
+    });
+
+    test('a prepare result for the still-selected project is applied normally', () {
+      final s = AppState(Settings(parentFolder: '/tmp'));
+      s.projects = [_p('/tmp/acme', [_e('dev', 1), _e('prod', 2)])];
+      s.selectProject('/tmp/acme');
+      s.setPromoteDir('dev', 'prod');
+      s.promoteStage = PromoteStage.preparing;
+
+      s.applyPrepareResult('/tmp/acme', const PromotionPreview(plan: ['+ queue acme/invoices']));
+
+      expect(s.promoteStage, PromoteStage.preview);
+      expect(s.promotePreview?.plan, ['+ queue acme/invoices']);
+    });
+
     test('selecting an env within the same project does not reset a prepared promote', () {
       final s = AppState(Settings(parentFolder: '/tmp'));
       s.projects = [_p('/tmp/acme', [_e('dev', 1), _e('prod', 2)])];
@@ -135,13 +175,41 @@ void main() {
       expect(find.text('From'), findsOneWidget);
       expect(find.text('To'), findsOneWidget);
       expect(find.byType(DropdownButton<String>), findsNWidgets(2));
-      expect(find.textContaining('Prepare'), findsOneWidget);
+      expect(find.text('Prepare →'), findsOneWidget);
       expect(find.text('Mirror'), findsOneWidget);
 
       // Defaults to the first two envs (src = first, tgt = second) so
       // Prepare is immediately actionable without forcing a manual pick.
       expect(s.promoteSrc, 'dev');
       expect(s.promoteTgt, 'prod');
+
+      // Prepare overwrites the target's on-disk snapshot with no drift
+      // detection (spec §9.1 is deferred) — an always-visible caption is the
+      // v1 warning.
+      expect(find.textContaining('Prepare rewrites'), findsOneWidget);
+    });
+
+    testWidgets('Prepare caption names the actually-selected src/tgt', (t) async {
+      final s = AppState(Settings(parentFolder: '/tmp'));
+      s.projects = [_p('/tmp/acme', [_e('dev', 1), _e('prod', 2)])];
+      s.selectProject('/tmp/acme');
+      // Pre-select the direction (rather than relying on the Project view's
+      // first-frame auto-default) so the very first build already reflects
+      // it — the caption must name the *chosen* envs, not just render once
+      // and go stale.
+      s.setPromoteDir('dev', 'prod');
+
+      await t.pumpWidget(MaterialApp(
+        theme: mdhTheme(Brightness.light),
+        home: Scaffold(body: MdhScaffold(state: s, view: NavView.connection)),
+      ));
+      await t.pumpAndSettle();
+
+      expect(
+        find.text("Prepare rewrites prod's local files from dev and replaces any "
+            'un-synced local edits to prod. Nothing is pushed until you Push.'),
+        findsOneWidget,
+      );
     });
 
     testWidgets('absent for a single-env project', (t) async {
