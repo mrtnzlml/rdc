@@ -974,7 +974,16 @@ class _PromotePickerRow extends StatelessWidget {
     };
     final src = state.promoteSrc;
     final tgt = state.promoteTgt;
-    final canPrepare = !locked && src != null && tgt != null && src != tgt;
+    // Defense in depth: besides the basic shape checks, require that both
+    // envs actually belong to this project *today* — guards against a stale
+    // direction (e.g. restored from a since-renamed/removed env) enabling
+    // Prepare with a dead env name, from whatever source it came from.
+    final canPrepare = !locked &&
+        src != null &&
+        tgt != null &&
+        src != tgt &&
+        envs.any((e) => e.name == src) &&
+        envs.any((e) => e.name == tgt);
 
     List<DropdownMenuItem<String>> items() =>
         [for (final e in envs) DropdownMenuItem(value: e.name, child: Text(e.name))];
