@@ -30,9 +30,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String dco_decode_String(dynamic raw);
 
   @protected
-  AddConnectionInput dco_decode_add_connection_input(dynamic raw);
-
-  @protected
   AddEnvInput dco_decode_add_env_input(dynamic raw);
 
   @protected
@@ -40,9 +37,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   bool dco_decode_bool(dynamic raw);
-
-  @protected
-  AddConnectionInput dco_decode_box_autoadd_add_connection_input(dynamic raw);
 
   @protected
   AddEnvInput dco_decode_box_autoadd_add_env_input(dynamic raw);
@@ -122,11 +116,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String sse_decode_String(SseDeserializer deserializer);
 
   @protected
-  AddConnectionInput sse_decode_add_connection_input(
-    SseDeserializer deserializer,
-  );
-
-  @protected
   AddEnvInput sse_decode_add_env_input(SseDeserializer deserializer);
 
   @protected
@@ -134,11 +123,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   bool sse_decode_bool(SseDeserializer deserializer);
-
-  @protected
-  AddConnectionInput sse_decode_box_autoadd_add_connection_input(
-    SseDeserializer deserializer,
-  );
 
   @protected
   AddEnvInput sse_decode_box_autoadd_add_env_input(
@@ -234,12 +218,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_String(String self, SseSerializer serializer);
 
   @protected
-  void sse_encode_add_connection_input(
-    AddConnectionInput self,
-    SseSerializer serializer,
-  );
-
-  @protected
   void sse_encode_add_env_input(AddEnvInput self, SseSerializer serializer);
 
   @protected
@@ -247,12 +225,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_bool(bool self, SseSerializer serializer);
-
-  @protected
-  void sse_encode_box_autoadd_add_connection_input(
-    AddConnectionInput self,
-    SseSerializer serializer,
-  );
 
   @protected
   void sse_encode_box_autoadd_add_env_input(

@@ -80,17 +80,6 @@ impl From<&Project> for ProjectSummary {
 }
 
 #[derive(Debug, Clone)]
-pub struct AddConnectionInput {
-    pub name: String,
-    pub api_base: String,
-    pub org_id: u64,
-    pub auth_kind: AuthKind,
-    pub token: Option<String>,
-    pub username: Option<String>,
-    pub password: Option<String>,
-}
-
-#[derive(Debug, Clone)]
 pub struct EditConnectionInput {
     /// The connection name; if it changes, the folder is renamed.
     pub name: String,
@@ -132,38 +121,26 @@ pub fn list_projects(parent: String) -> Vec<ProjectSummary> {
 
 // ---------------------------------------------------------------- add
 
-/// Create a new Project: write `rdc.toml` + secrets for a first env named
-/// `main` under a unique slug. (Additional envs are added in a later phase.)
-pub fn add_project(parent: String, input: AddConnectionInput) -> Result<ProjectSummary> {
+/// Create a new Project: write `rdc.toml` + secrets for a first env named by
+/// the caller (`first_env.name`) under a unique slug. (Additional envs are
+/// added later via `add_env`.)
+pub fn add_project(parent: String, project_name: String, first_env: AddEnvInput) -> Result<ProjectSummary> {
     let parent = PathBuf::from(parent);
-    let used: HashSet<String> = discover::scan(&parent)
-        .iter()
-        .map(|p| p.name().to_string())
-        .collect();
-    let slug = rdc::slug::slugify_unique(&input.name, &used);
+    let env_name = first_env.name.trim().to_string();
+    if !valid_env_name(&env_name) {
+        return Err(anyhow!("Environment name may only contain letters, digits, - and _ (and can't be empty)."));
+    }
+    let used: HashSet<String> = discover::scan(&parent).iter().map(|p| p.name().to_string()).collect();
+    let slug = rdc::slug::slugify_unique(&project_name, &used);
     let folder = parent.join(&slug);
     std::fs::create_dir_all(&folder).map_err(|e| anyhow!("creating folder: {e}"))?;
-
-    let api_base = input.api_base.trim_end_matches('/').to_string();
-    let rdc_toml = format!(
-        "[envs.main]\napi_base = \"{api_base}\"\norg_id = {}\n",
-        input.org_id
-    );
-    std::fs::write(folder.join("rdc.toml"), rdc_toml)
-        .map_err(|e| anyhow!("writing rdc.toml: {e}"))?;
-
-    write_credentials(
-        &folder,
-        "main",
-        input.auth_kind,
-        input.token.as_deref(),
-        input.username.as_deref(),
-        input.password.as_deref(),
-    )?;
-
-    discover::find(&parent, &slug)
-        .as_ref()
-        .map(ProjectSummary::from)
+    // credentials first (validates + writes secrets) so a bad credential never leaves a config behind
+    write_credentials(&folder, &env_name, first_env.auth_kind,
+        first_env.token.as_deref(), first_env.username.as_deref(), first_env.password.as_deref())?;
+    let api_base = first_env.api_base.trim_end_matches('/').to_string();
+    let rdc_toml = format!("[envs.{env_name}]\napi_base = \"{api_base}\"\norg_id = {}\n", first_env.org_id);
+    std::fs::write(folder.join("rdc.toml"), rdc_toml).map_err(|e| anyhow!("writing rdc.toml: {e}"))?;
+    discover::find(&parent, &slug).as_ref().map(ProjectSummary::from)
         .ok_or_else(|| anyhow!("Project not found after add"))
 }
 
@@ -361,6 +338,62 @@ pub fn remove_env(folder: String, env: String) -> Result<Option<ProjectSummary>>
         .map(ProjectSummary::from)
         .map(Some)
         .ok_or_else(|| anyhow!("Project not found after remove_env"))
+}
+
+/// Rename an environment `old` → `new` entirely locally: move every per-env
+/// path, rewrite `.rdc/mapping.toml`, and rename the `[envs.<old>]` section.
+pub fn rename_env(folder: String, old: String, new: String) -> Result<ProjectSummary> {
+    let folder = PathBuf::from(&folder);
+    let new = new.trim().to_string();
+    if !valid_env_name(&new) {
+        return Err(anyhow!("Environment name may only contain letters, digits, - and _."));
+    }
+    let toml_path = folder.join("rdc.toml");
+    let mut cfg = rdc::config::ProjectConfig::load(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
+    if !cfg.envs.contains_key(&old) {
+        return Err(anyhow!("This project has no \"{old}\" environment."));
+    }
+    if new == old {
+        return discover::inspect(&folder).as_ref().map(ProjectSummary::from)
+            .ok_or_else(|| anyhow!("Project not found"));
+    }
+    if cfg.envs.contains_key(&new) {
+        return Err(anyhow!("An environment named \"{new}\" already exists in this project."));
+    }
+    let op = rdc::paths::Paths::for_env(&folder, &old);
+    let np = rdc::paths::Paths::for_env(&folder, &new);
+    // 1. filesystem moves — env_root + secrets are the substantive ones; state/conflicts best-effort.
+    if op.env_root().exists() {
+        std::fs::rename(op.env_root(), np.env_root())
+            .map_err(|e| anyhow!("moving envs/{old} → envs/{new}: {e}"))?;
+    }
+    if op.secrets_file().exists() {
+        if let Some(parent) = np.secrets_file().parent() { let _ = std::fs::create_dir_all(parent); }
+        std::fs::rename(op.secrets_file(), np.secrets_file())
+            .map_err(|e| anyhow!("moving secrets: {e}"))?;
+    }
+    for (o, n) in [
+        (op.lockfile(), np.lockfile()),
+        (op.env_lock(), np.env_lock()),
+        (op.base_cache_root(), np.base_cache_root()),
+    ] {
+        if o.exists() { let _ = std::fs::rename(&o, &n); }
+    }
+    let old_conflicts = folder.join(".rdc").join("conflicts").join(&old);
+    let new_conflicts = folder.join(".rdc").join("conflicts").join(&new);
+    if old_conflicts.exists() { let _ = std::fs::rename(&old_conflicts, &new_conflicts); }
+    // 2. rewrite mapping.toml
+    let mapping_path = folder.join(".rdc").join("mapping.toml");
+    if mapping_path.exists() {
+        let mut g = rdc::mapping::GenericMapping::load(&mapping_path).map_err(|e| anyhow!("{e:#}"))?;
+        g.rename_env(&old, &new);
+        g.save(&mapping_path).map_err(|e| anyhow!("{e:#}"))?;
+    }
+    // 3. rename the rdc.toml section last (authoritative record)
+    if let Some(env_cfg) = cfg.envs.remove(&old) { cfg.envs.insert(new.clone(), env_cfg); }
+    cfg.save(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
+    discover::inspect(&folder).as_ref().map(ProjectSummary::from)
+        .ok_or_else(|| anyhow!("Project not found after rename_env"))
 }
 
 // ---------------------------------------------------------------- sync
@@ -868,5 +901,69 @@ mod tests {
         let r = remove_env(folder.display().to_string(), "main".into()).unwrap();
         assert!(r.is_none());
         assert!(!folder.exists()); // whole project gone (moved to trash)
+    }
+
+    #[test]
+    fn add_project_uses_the_given_first_env_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = add_project(
+            tmp.path().display().to_string(),
+            "Acme".into(),
+            AddEnvInput { name: "prod".into(), api_base: "https://p.test/api/v1/".into(), org_id: 7,
+                auth_kind: AuthKind::Token, token: Some("t".into()), username: None, password: None },
+        ).unwrap();
+        assert_eq!(p.envs.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), vec!["prod"]);
+        assert_eq!(p.envs[0].api_base, "https://p.test/api/v1"); // trailing slash trimmed
+        let folder = tmp.path().join(&p.id);
+        assert!(folder.join("secrets/prod.secrets.json").exists());
+        assert!(!folder.join("secrets/main.secrets.json").exists());
+    }
+
+    #[test]
+    fn add_project_rejects_invalid_first_env_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = add_project(tmp.path().display().to_string(), "Acme".into(),
+            AddEnvInput { name: "../x".into(), api_base: "https://p.test/api/v1".into(), org_id: 1,
+                auth_kind: AuthKind::Token, token: Some("t".into()), username: None, password: None }).unwrap_err();
+        assert!(format!("{err:#}").to_lowercase().contains("environment name"));
+    }
+
+    #[test]
+    fn rename_env_moves_files_toml_and_mapping() {
+        let tmp = tempfile::tempdir().unwrap();
+        // seed a 2-env project with a mapping.toml referencing `dev`
+        let folder = tmp.path().join("acme");
+        std::fs::create_dir_all(folder.join("envs/dev/queues")).unwrap();
+        std::fs::write(folder.join("envs/dev/queues/x.json"), "{}").unwrap();
+        std::fs::write(folder.join("rdc.toml"),
+            "[envs.dev]\napi_base = \"https://d.test/api/v1\"\norg_id = 1\n\
+             [envs.prod]\napi_base = \"https://p.test/api/v1\"\norg_id = 2\n").unwrap();
+        rdc::secrets::write_secrets_file(&folder, "dev", "tok", None).unwrap();
+        std::fs::create_dir_all(folder.join(".rdc")).unwrap();
+        std::fs::write(folder.join(".rdc/mapping.toml"),
+            "version = 2\n[[queues]]\ndev = \"cost-dev\"\nprod = \"cost-prod\"\n").unwrap();
+
+        let p = rename_env(folder.display().to_string(), "dev".into(), "sandbox".into()).unwrap();
+        let names: Vec<String> = p.envs.iter().map(|e| e.name.clone()).collect();
+        assert!(names.contains(&"sandbox".to_string()) && names.contains(&"prod".to_string()));
+        assert!(!names.contains(&"dev".to_string()));
+        assert!(folder.join("envs/sandbox/queues/x.json").exists());
+        assert!(!folder.join("envs/dev").exists());
+        assert!(folder.join("secrets/sandbox.secrets.json").exists());
+        let mapping = std::fs::read_to_string(folder.join(".rdc/mapping.toml")).unwrap();
+        assert!(mapping.contains("sandbox = \"cost-dev\"") && !mapping.contains("dev = \"cost-dev\""));
+    }
+
+    #[test]
+    fn rename_env_rejects_collision_and_invalid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("acme");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("rdc.toml"),
+            "[envs.dev]\napi_base = \"https://d.test/api/v1\"\norg_id = 1\n\
+             [envs.prod]\napi_base = \"https://p.test/api/v1\"\norg_id = 2\n").unwrap();
+        assert!(rename_env(folder.display().to_string(), "dev".into(), "prod".into()).is_err()); // collision
+        assert!(rename_env(folder.display().to_string(), "dev".into(), "a/b".into()).is_err());  // invalid
+        assert!(rename_env(folder.display().to_string(), "nope".into(), "x".into()).is_err());   // unknown old
     }
 }
