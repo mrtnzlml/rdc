@@ -626,7 +626,8 @@ class _ConnMain extends StatelessWidget {
                 padding: const EdgeInsets.all(18),
                 child: _FilesPanel(
                   key: ValueKey('files:${item.summary.folder}:${env.name}'),
-                  rootFolder: [item.summary.folder, 'envs', env.name].join(Platform.pathSeparator),
+                  rootFolder: item.summary.folder,
+                  initialCrumbs: ['envs', env.name],
                   revision: env.fileCount.toInt(),
                   onRevealDir: onRevealDir,
                 ),
@@ -1436,8 +1437,9 @@ class _FEntry {
 /// dart:io (the folder is the CLI's own snapshot), navigating into subfolders
 /// with a Back button and a clickable breadcrumb. Dotfiles are hidden.
 class _FilesPanel extends StatefulWidget {
-  const _FilesPanel({super.key, required this.rootFolder, required this.revision, required this.onRevealDir});
+  const _FilesPanel({super.key, required this.rootFolder, required this.initialCrumbs, required this.revision, required this.onRevealDir});
   final String rootFolder;
+  final List<String> initialCrumbs; // sub-path to open at; parents above it stay navigable
   final int revision; // reload trigger (grows after a sync)
   final void Function(String absPath) onRevealDir;
   @override
@@ -1466,14 +1468,18 @@ class _FilesPanelState extends State<_FilesPanel> {
   @override
   void initState() {
     super.initState();
+    _crumbs = List.of(widget.initialCrumbs);
     _readInto();
   }
 
   @override
   void didUpdateWidget(covariant _FilesPanel old) {
     super.didUpdateWidget(old);
+    // Env switches change the ValueKey (env name) → fresh State + initState, so
+    // here we only need to handle a project (rootFolder) change; either way we
+    // re-open at initialCrumbs.
     if (old.rootFolder != widget.rootFolder) {
-      _crumbs = [];
+      _crumbs = List.of(widget.initialCrumbs);
       _clearPreview();
       _readInto();
     } else if (old.revision != widget.revision) {
