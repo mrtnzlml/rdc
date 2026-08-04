@@ -37,6 +37,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   AuthKind dco_decode_auth_kind(dynamic raw);
 
   @protected
+  bool dco_decode_bool(dynamic raw);
+
+  @protected
   AddConnectionInput dco_decode_box_autoadd_add_connection_input(dynamic raw);
 
   @protected
@@ -52,6 +55,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ProjectSummary dco_decode_box_autoadd_project_summary(dynamic raw);
 
   @protected
+  ConflictPolicy dco_decode_conflict_policy(dynamic raw);
+
+  @protected
   EditConnectionInput dco_decode_edit_connection_input(dynamic raw);
 
   @protected
@@ -62,6 +68,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PlatformInt64 dco_decode_i_64(dynamic raw);
+
+  @protected
+  List<String> dco_decode_list_String(dynamic raw);
 
   @protected
   List<EnvSummary> dco_decode_list_env_summary(dynamic raw);
@@ -83,6 +92,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   ProjectSummary dco_decode_project_summary(dynamic raw);
+
+  @protected
+  PromotionPreview dco_decode_promotion_preview(dynamic raw);
 
   @protected
   SyncPhase dco_decode_sync_phase(dynamic raw);
@@ -119,6 +131,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   AuthKind sse_decode_auth_kind(SseDeserializer deserializer);
 
   @protected
+  bool sse_decode_bool(SseDeserializer deserializer);
+
+  @protected
   AddConnectionInput sse_decode_box_autoadd_add_connection_input(
     SseDeserializer deserializer,
   );
@@ -142,6 +157,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  ConflictPolicy sse_decode_conflict_policy(SseDeserializer deserializer);
+
+  @protected
   EditConnectionInput sse_decode_edit_connection_input(
     SseDeserializer deserializer,
   );
@@ -154,6 +172,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PlatformInt64 sse_decode_i_64(SseDeserializer deserializer);
+
+  @protected
+  List<String> sse_decode_list_String(SseDeserializer deserializer);
 
   @protected
   List<EnvSummary> sse_decode_list_env_summary(SseDeserializer deserializer);
@@ -181,6 +202,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ProjectSummary sse_decode_project_summary(SseDeserializer deserializer);
 
   @protected
+  PromotionPreview sse_decode_promotion_preview(SseDeserializer deserializer);
+
+  @protected
   SyncPhase sse_decode_sync_phase(SseDeserializer deserializer);
 
   @protected
@@ -191,9 +215,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_decode_unit(SseDeserializer deserializer);
-
-  @protected
-  bool sse_decode_bool(SseDeserializer deserializer);
 
   @protected
   void sse_encode_AnyhowException(
@@ -221,6 +242,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_auth_kind(AuthKind self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_bool(bool self, SseSerializer serializer);
 
   @protected
   void sse_encode_box_autoadd_add_connection_input(
@@ -253,6 +277,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_conflict_policy(
+    ConflictPolicy self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_edit_connection_input(
     EditConnectionInput self,
     SseSerializer serializer,
@@ -266,6 +296,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_i_64(PlatformInt64 self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_String(List<String> self, SseSerializer serializer);
 
   @protected
   void sse_encode_list_env_summary(
@@ -307,6 +340,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_promotion_preview(
+    PromotionPreview self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_sync_phase(SyncPhase self, SseSerializer serializer);
 
   @protected
@@ -317,9 +356,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_unit(void self, SseSerializer serializer);
-
-  @protected
-  void sse_encode_bool(bool self, SseSerializer serializer);
 }
 
 // Section: wire_class

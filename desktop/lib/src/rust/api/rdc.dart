@@ -8,9 +8,9 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 part 'rdc.freezed.dart';
 
-// These functions are ignored because they are not marked as `pub`: `block_on`, `write_credentials`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `LineForwarder`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `flush`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `from`, `write`
+// These functions are ignored because they are not marked as `pub`: `block_on`, `env_api_base`, `policy_to_strategy`, `valid_env_name`, `write_credentials`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `LineCollector`, `LineForwarder`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `flush`, `flush`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `from`, `write`, `write`
 
 /// rdc's package version, surfaced to the app's About box.
 Future<String?> rdcVersion() => RustLib.instance.api.crateApiRdcRdcVersion();
@@ -74,6 +74,42 @@ Stream<SyncPhase> syncEnv({
   env: env,
   apiBase: apiBase,
   orgId: orgId,
+);
+
+/// Offline `migrate src -> tgt` (writes local `envs/<tgt>/`), then a dry-run
+/// `--no-pull` push whose rendered plan is captured and returned. Needs the
+/// TARGET env's token (the dry-run push lists/scans the target remote to
+/// compute the plan). Nothing is written to the remote.
+Future<PromotionPreview> preparePromotion({
+  required String folder,
+  required String src,
+  required String tgt,
+  required bool mirror,
+}) => RustLib.instance.api.crateApiRdcPreparePromotion(
+  folder: folder,
+  src: src,
+  tgt: tgt,
+  mirror: mirror,
+);
+
+/// The real gated push: re-runs the offline migrate (so the pushed snapshot
+/// reflects `src` at push time, not whatever `prepare_promotion` saw earlier)
+/// then a real `--no-pull` push with the chosen conflict policy and
+/// allow-deletes, streaming the log. Needs the TARGET token.
+Stream<SyncPhase> pushPromotion({
+  required String folder,
+  required String src,
+  required String tgt,
+  required bool mirror,
+  required ConflictPolicy policy,
+  required bool allowDeletes,
+}) => RustLib.instance.api.crateApiRdcPushPromotion(
+  folder: folder,
+  src: src,
+  tgt: tgt,
+  mirror: mirror,
+  policy: policy,
+  allowDeletes: allowDeletes,
 );
 
 /// Move a managed Project's folder to the OS trash/recycle bin.
@@ -171,6 +207,22 @@ class AddEnvInput {
 }
 
 enum AuthKind { token, password }
+
+/// How a promote push resolves a `BothDiverged` conflict (a datapoint edited
+/// on both the source snapshot being promoted and the live target since the
+/// last sync). Dart-facing name only — the mapping onto rdc's own
+/// [`rdc::cli::resolve::ConflictStrategy`] is inverted; see
+/// [`policy_to_strategy`].
+enum ConflictPolicy {
+  /// The promoted (local, just-migrated) side wins.
+  useIncoming,
+
+  /// The target (remote, already-live) side wins.
+  keepTarget,
+
+  /// Leave the conflicting item untouched (shadow-file fallback).
+  skip,
+}
 
 class EditConnectionInput {
   /// The connection name; if it changes, the folder is renamed.
@@ -284,6 +336,24 @@ class ProjectSummary {
           name == other.name &&
           folder == other.folder &&
           envs == other.envs;
+}
+
+/// The rendered, captured dry-run push plan for a pending promotion — one
+/// entry per line of rdc's normal plan output.
+class PromotionPreview {
+  final List<String> plan;
+
+  const PromotionPreview({required this.plan});
+
+  @override
+  int get hashCode => plan.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is PromotionPreview &&
+          runtimeType == other.runtimeType &&
+          plan == other.plan;
 }
 
 @freezed
