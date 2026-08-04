@@ -127,6 +127,17 @@ class _HomePageState extends State<HomePage> {
     if (ok == true) await _run(() => state.removeOrDetach(i));
   }
 
+  Future<void> _addEnv(ProjectItem i) =>
+      showDialog<bool>(context: context, builder: (_) => AddEnvDialog(state: state, item: i));
+
+  Future<void> _editEnv(ProjectItem i, EnvSummary e) => showDialog<bool>(
+      context: context, builder: (_) => EditConnectionDialog(state: state, item: i, env: e));
+
+  Future<void> _confirmRemoveEnv(ProjectItem i, EnvSummary e) async {
+    final ok = await showDialog<bool>(context: context, builder: (_) => RemoveEnvDialog(item: i, env: e));
+    if (ok == true) await _run(() => state.removeEnvEntry(i, e));
+  }
+
   void _syncAll() {
     for (final p in state.projects) {
       for (final e in p.summary.envs) {
@@ -175,6 +186,9 @@ class _HomePageState extends State<HomePage> {
           onReveal: _reveal,
           onRemove: _confirmRemove,
           onRevealDir: (path) => _run(() => state.reveal(path)),
+          onAddEnv: _addEnv,
+          onEditEnv: _editEnv,
+          onRemoveEnv: _confirmRemoveEnv,
           onChooseParent: _chooseParent,
           onAbout: _about,
           onCheckUpdate: () async {
@@ -219,6 +233,9 @@ class MdhScaffold extends StatelessWidget {
     this.onReveal,
     this.onRemove,
     this.onRevealDir,
+    this.onAddEnv,
+    this.onRemoveEnv,
+    this.onEditEnv,
     this.onChooseParent,
     this.onAbout,
     this.onCheckUpdate,
@@ -242,6 +259,9 @@ class MdhScaffold extends StatelessWidget {
   final void Function(ProjectItem)? onReveal;
   final void Function(ProjectItem)? onRemove;
   final void Function(String path)? onRevealDir;
+  final void Function(ProjectItem)? onAddEnv;
+  final void Function(ProjectItem, EnvSummary)? onRemoveEnv;
+  final void Function(ProjectItem, EnvSummary)? onEditEnv;
   final VoidCallback? onChooseParent;
   final VoidCallback? onAbout;
   final VoidCallback? onCheckUpdate;
@@ -259,17 +279,26 @@ class MdhScaffold extends StatelessWidget {
     }
 
     final main = switch (view) {
-      NavView.connection => _ConnMain(
-          state: state,
-          activeTab: activeTab,
-          onSelectTab: onSelectTab ?? (_) {},
-          onSync: onSync ?? (_, _) {},
-          onEdit: onEdit ?? (_) {},
-          onReveal: onReveal ?? (_) {},
-          onRemove: onRemove ?? (_) {},
-          onRevealDir: onRevealDir ?? (_) {},
-          onAdd: onAdd ?? () {},
-        ),
+      NavView.connection => state.selectedEnv == null
+          ? _ProjectView(
+              state: state,
+              onSync: onSync ?? (_, _) {},
+              onSelectEnv: onSelectEnv ?? (_, _) {},
+              onAddEnv: onAddEnv ?? (_) {},
+              onEditEnv: onEditEnv ?? (_, _) {},
+              onRemoveEnv: onRemoveEnv ?? (_, _) {},
+            )
+          : _ConnMain(
+              state: state,
+              activeTab: activeTab,
+              onSelectTab: onSelectTab ?? (_) {},
+              onSync: onSync ?? (_, _) {},
+              onEdit: onEdit ?? (_) {},
+              onReveal: onReveal ?? (_) {},
+              onRemove: onRemove ?? (_) {},
+              onRevealDir: onRevealDir ?? (_) {},
+              onAdd: onAdd ?? () {},
+            ),
       NavView.overview => _FleetView(
           state: state,
           onNew: onAdd ?? () {},
@@ -782,6 +811,293 @@ class _SyncLogCardState extends State<_SyncLogCard> {
       ),
       padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
       child: body,
+    );
+  }
+}
+
+// ------------------------------------------------------------ project pane
+
+/// Shown when a project node (not one of its envs) is selected
+/// (`state.selectedEnv == null`): the Environments table for that project,
+/// with per-env Sync/Edit/Remove and an "Add environment" action. No promote
+/// section yet — that lands in Phase 3.
+class _ProjectView extends StatelessWidget {
+  const _ProjectView({
+    required this.state,
+    required this.onSync,
+    required this.onSelectEnv,
+    required this.onAddEnv,
+    required this.onEditEnv,
+    required this.onRemoveEnv,
+  });
+  final AppState state;
+  final void Function(ProjectItem, EnvSummary) onSync;
+  final void Function(String folder, String env) onSelectEnv;
+  final void Function(ProjectItem) onAddEnv;
+  final void Function(ProjectItem, EnvSummary) onEditEnv;
+  final void Function(ProjectItem, EnvSummary) onRemoveEnv;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    final item = state.selected;
+    if (item == null) {
+      return Center(child: Text('No project selected', style: TextStyle(color: c.textSecondary)));
+    }
+    final envs = item.summary.envs;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _ProjectBar(
+          item: item,
+          onSyncAll: envs.isEmpty ? null : () { for (final e in envs) { onSync(item, e); } },
+          onAddEnv: () => onAddEnv(item),
+        ),
+        Expanded(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(18),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _SectionTitle('Environments'),
+                _EnvTable(
+                  state: state,
+                  item: item,
+                  envs: envs,
+                  onSync: onSync,
+                  onEdit: onEditEnv,
+                  onRemove: onRemoveEnv,
+                  onSelectEnv: onSelectEnv,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _ProjectBar extends StatelessWidget {
+  const _ProjectBar({required this.item, required this.onSyncAll, required this.onAddEnv});
+  final ProjectItem item;
+  final VoidCallback? onSyncAll;
+  final VoidCallback onAddEnv;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    return Container(
+      padding: const EdgeInsets.fromLTRB(18, 12, 18, 12),
+      decoration: BoxDecoration(
+        color: c.bgCard,
+        border: Border(bottom: BorderSide(color: c.border)),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(item.summary.name, maxLines: 1, overflow: TextOverflow.ellipsis,
+                    style: TextStyle(color: c.textPrimary, fontSize: 15, fontWeight: FontWeight.w600)),
+                const SizedBox(height: 2),
+                Text(item.summary.folder, maxLines: 1, overflow: TextOverflow.ellipsis,
+                    style: _mono(c.textSecondary, 12)),
+              ],
+            ),
+          ),
+          const SizedBox(width: 12),
+          _Btn(label: 'Sync all envs', primary: true, onTap: onSyncAll),
+          const SizedBox(width: 8),
+          _Btn(label: 'Add environment', onTap: onAddEnv),
+        ],
+      ),
+    );
+  }
+}
+
+class _EnvTable extends StatelessWidget {
+  const _EnvTable({
+    required this.state,
+    required this.item,
+    required this.envs,
+    required this.onSync,
+    required this.onEdit,
+    required this.onRemove,
+    required this.onSelectEnv,
+  });
+  final AppState state;
+  final ProjectItem item;
+  final List<EnvSummary> envs;
+  final void Function(ProjectItem, EnvSummary) onSync, onEdit, onRemove;
+  final void Function(String folder, String env) onSelectEnv;
+
+  // The info columns (everything but the trailing action cluster) share this
+  // total flex so the header row lines up with each data row, which nests
+  // those same columns inside one Expanded (see _EnvTableRow) to keep the
+  // action buttons outside the row's tap target.
+  static const _infoFlex = 8;
+  static const _actionsFlex = 3;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    Widget head(String t, {int flex = 1}) => Expanded(
+        flex: flex,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+          child: Text(t.toUpperCase(),
+              style: TextStyle(color: c.textSecondary, fontSize: 10.5, fontWeight: FontWeight.w600, letterSpacing: 0.5)),
+        ));
+
+    if (envs.isEmpty) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(24),
+        decoration: BoxDecoration(color: c.bgCard, border: Border.all(color: c.borderCard), borderRadius: BorderRadius.circular(6)),
+        child: Center(child: Text('No environments yet.', style: TextStyle(color: c.textSecondary))),
+      );
+    }
+
+    return Container(
+      decoration: BoxDecoration(color: c.bgCard, border: Border.all(color: c.borderCard), borderRadius: BorderRadius.circular(6),
+          boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.04), blurRadius: 3, offset: const Offset(0, 1))]),
+      clipBehavior: Clip.antiAlias,
+      child: Column(children: [
+        Container(
+          decoration: BoxDecoration(color: c.bgSidebar, border: Border(bottom: BorderSide(color: c.border))),
+          child: Row(children: [
+            Expanded(
+              flex: _infoFlex,
+              child: Row(children: [
+                head('Environment', flex: 2),
+                head('Org'),
+                head('Host', flex: 2),
+                head('Files'),
+                head('Last sync'),
+                head('Status'),
+              ]),
+            ),
+            head('', flex: _actionsFlex),
+          ]),
+        ),
+        for (var i = 0; i < envs.length; i++)
+          _EnvTableRow(
+            state: state, item: item, env: envs[i], last: i == envs.length - 1,
+            onSync: onSync, onEdit: onEdit, onRemove: onRemove, onSelectEnv: onSelectEnv,
+          ),
+      ]),
+    );
+  }
+}
+
+class _EnvTableRow extends StatelessWidget {
+  const _EnvTableRow({
+    required this.state,
+    required this.item,
+    required this.env,
+    required this.last,
+    required this.onSync,
+    required this.onEdit,
+    required this.onRemove,
+    required this.onSelectEnv,
+  });
+  final AppState state;
+  final ProjectItem item;
+  final EnvSummary env;
+  final bool last;
+  final void Function(ProjectItem, EnvSummary) onSync, onEdit, onRemove;
+  final void Function(String folder, String env) onSelectEnv;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    final st = _statusOf(state, item, env);
+    final (String badge, Color bg, Color fg) = switch (st) {
+      _St.error => ('error', c.dangerBg, c.dangerFg),
+      _St.never => ('never', c.infoBg, c.infoFg),
+      _St.running => ('syncing', c.infoBg, c.infoFg),
+      _St.synced => ('synced', c.successBg, c.successFg),
+    };
+    Widget cell(Widget child, {int flex = 1}) =>
+        Expanded(flex: flex, child: Padding(padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11), child: child));
+
+    return Container(
+      decoration: BoxDecoration(border: last ? null : Border(bottom: BorderSide(color: c.border))),
+      child: Row(children: [
+        // Info cells are the tap target for row selection; the action
+        // cluster below sits outside this InkWell so its buttons don't also
+        // trigger onSelectEnv.
+        Expanded(
+          flex: _EnvTable._infoFlex,
+          child: InkWell(
+            onTap: () => onSelectEnv(item.summary.folder, env.name),
+            mouseCursor: SystemMouseCursors.click,
+            child: Row(children: [
+              cell(Text('${item.summary.name} · ${env.name}', overflow: TextOverflow.ellipsis,
+                  style: TextStyle(color: c.textPrimary, fontSize: 12.5, fontWeight: FontWeight.w600)), flex: 2),
+              cell(Text(env.orgId.toString(), style: _mono(c.textSecondary, 12))),
+              cell(Text(_host(env.apiBase), overflow: TextOverflow.ellipsis, style: _mono(c.textSecondary, 12)), flex: 2),
+              cell(Text(env.fileCount.toString(), style: _mono(c.textSecondary, 12))),
+              cell(Text(st == _St.never ? '—' : '${_rel(env.lastSyncUnix)} ago', style: TextStyle(color: c.textPrimary, fontSize: 12.5))),
+              cell(Align(alignment: Alignment.centerLeft, child: _MiniBadge(badge, bg, fg))),
+            ]),
+          ),
+        ),
+        Expanded(
+          flex: _EnvTable._actionsFlex,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+            // Icon buttons (not _Btn) — a row of three labeled buttons doesn't
+            // fit this column at the app's minimum width; row actions are a
+            // narrow column by design, unlike the header bar's full buttons.
+            child: Row(mainAxisAlignment: MainAxisAlignment.end, mainAxisSize: MainAxisSize.min, children: [
+              _RowIconBtn(
+                icon: Icons.sync,
+                tooltip: st == _St.error ? 'Retry' : 'Sync',
+                onTap: st == _St.running ? null : () => onSync(item, env),
+              ),
+              const SizedBox(width: 6),
+              _RowIconBtn(icon: Icons.edit_outlined, tooltip: 'Edit', onTap: () => onEdit(item, env)),
+              const SizedBox(width: 6),
+              _RowIconBtn(icon: Icons.delete_outline, tooltip: 'Remove', danger: true, onTap: () => onRemove(item, env)),
+            ]),
+          ),
+        ),
+      ]),
+    );
+  }
+}
+
+/// Compact icon-only action button for a table row, where a full labeled
+/// `_Btn` cluster wouldn't fit. `tooltip` doubles as its accessible/test label.
+class _RowIconBtn extends StatelessWidget {
+  const _RowIconBtn({required this.icon, required this.tooltip, this.onTap, this.danger = false});
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback? onTap;
+  final bool danger;
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    return Tooltip(
+      message: tooltip,
+      child: Opacity(
+        opacity: onTap == null ? 0.4 : 1,
+        child: InkWell(
+          onTap: onTap,
+          mouseCursor: onTap == null ? SystemMouseCursors.basic : SystemMouseCursors.click,
+          borderRadius: BorderRadius.circular(6),
+          child: Container(
+            width: 26,
+            height: 26,
+            decoration: BoxDecoration(color: c.bgCard, border: Border.all(color: c.border), borderRadius: BorderRadius.circular(6)),
+            child: Icon(icon, size: 14, color: danger ? c.danger : c.textSecondary),
+          ),
+        ),
+      ),
     );
   }
 }

@@ -14,14 +14,15 @@ EnvSummary _e(String name, int org) => EnvSummary(
     );
 
 void main() {
-  test('selecting a project picks its first env; selecting an env pins it', () {
+  test('selecting a project shows the Project view (no env pinned); selecting an env pins it', () {
     final s = AppState(Settings(parentFolder: '/tmp'));
     s.projects = [_p('/tmp/acme', [_e('dev', 1), _e('prod', 2)])];
     s.selectProject('/tmp/acme');
     expect(s.selected!.summary.folder, '/tmp/acme');
-    expect(s.selectedEnv, 'dev');
-    expect(s.selectedEnvSummary!.orgId, BigInt.from(1));
+    expect(s.selectedEnv, isNull);
+    expect(s.selectedEnvSummary, isNull);
     s.selectEnv('/tmp/acme', 'prod');
+    expect(s.selectedEnv, 'prod');
     expect(s.selectedEnvSummary!.orgId, BigInt.from(2));
   });
 
