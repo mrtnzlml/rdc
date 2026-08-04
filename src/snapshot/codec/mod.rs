@@ -96,11 +96,39 @@ pub trait KindCodec: Sync {
     fn path(&self, paths: &Paths, slug: &str) -> PathBuf;
 }
 
+/// A code sidecar's bytes as they participate in a content hash, with any
+/// end-of-file newline ignored.
+///
+/// Every sidecar-bearing kind (hook `code`, rule `trigger_condition`, schema
+/// `formulas/*`) stores program text, and rdc writes it without a
+/// terminating newline — that is the form the API hands back. Editors
+/// disagree: "insert final newline" is on by default in most of them. Left
+/// in the hash, saving an otherwise untouched sidecar registers as a local
+/// edit, so `sync` PATCHes semantically identical code and the write-back
+/// then rewrites the file without the newline — a phantom remote write plus
+/// a silent edit of a file the user never changed, recurring on every save.
+/// Ignoring EOF newlines on both sides keeps the object Clean, the remote
+/// untouched, and the file exactly as the user saved it.
+///
+/// ONLY newlines at EOF are ignored. Interior trailing whitespace — and a
+/// trailing space at EOF — are hashed verbatim: the API demonstrably
+/// preserves whitespace inside code bodies, and an earlier blanket
+/// trailing-whitespace trim silently corrupted real data (see
+/// `snapshot::noise::trim_trailing_whitespace`).
+pub(crate) fn sidecar_bytes_for_hash(bytes: &[u8]) -> &[u8] {
+    let mut end = bytes.len();
+    while end > 0 && (bytes[end - 1] == b'\n' || bytes[end - 1] == b'\r') {
+        end -= 1;
+    }
+    &bytes[..end]
+}
+
 /// Compute a combined SHA-256 over canonical JSON bytes and any sidecars.
 ///
 /// Algorithm:
 /// 1. Hash `canonicalize_for_hash(json)`.
-/// 2. For each sidecar in order: feed `0x00 || path_bytes || 0x00 || content`.
+/// 2. For each sidecar in order: feed
+///    `0x00 || path_bytes || 0x00 || sidecar_bytes_for_hash(content)`.
 /// 3. Hex-encode the digest.
 ///
 /// This is the canonical hash function for all `KindCodec` implementations.
@@ -115,7 +143,7 @@ pub fn combined_hash(
         hasher.update([0x00u8]);
         hasher.update(path.as_bytes());
         hasher.update([0x00u8]);
-        hasher.update(bytes);
+        hasher.update(sidecar_bytes_for_hash(bytes));
     }
     to_hex(&hasher.finalize())
 }
