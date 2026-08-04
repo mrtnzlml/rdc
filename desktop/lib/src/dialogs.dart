@@ -178,6 +178,7 @@ class AddConnectionDialog extends StatefulWidget {
 
 class _AddConnectionDialogState extends State<AddConnectionDialog> {
   final _name = TextEditingController();
+  final _envName = TextEditingController();
   final _apiBase = TextEditingController(text: 'https://<org>.rossum.app/api/v1');
   final _orgId = TextEditingController();
   final _token = TextEditingController();
@@ -189,7 +190,7 @@ class _AddConnectionDialogState extends State<AddConnectionDialog> {
 
   @override
   void dispose() {
-    for (final c in [_name, _apiBase, _orgId, _token, _username, _password]) {
+    for (final c in [_name, _envName, _apiBase, _orgId, _token, _username, _password]) {
       c.dispose();
     }
     super.dispose();
@@ -198,21 +199,25 @@ class _AddConnectionDialogState extends State<AddConnectionDialog> {
   Future<void> _submit() async {
     final org = BigInt.tryParse(_orgId.text.trim());
     if (_name.text.trim().isEmpty) return setState(() => _error = 'Name is required.');
+    if (_envName.text.trim().isEmpty) return setState(() => _error = 'Environment name is required.');
     if (org == null) return setState(() => _error = 'Organization ID must be a number.');
     setState(() {
       _busy = true;
       _error = null;
     });
     try {
-      await widget.state.addProjectEntry(AddConnectionInput(
-        name: _name.text.trim(),
-        apiBase: _apiBase.text.trim(),
-        orgId: org,
-        authKind: _auth,
-        token: _auth == AuthKind.token ? _token.text : null,
-        username: _auth == AuthKind.password ? _username.text : null,
-        password: _auth == AuthKind.password ? _password.text : null,
-      ));
+      await widget.state.addProjectEntry(
+        _name.text.trim(),
+        AddEnvInput(
+          name: _envName.text.trim(),
+          apiBase: _apiBase.text.trim(),
+          orgId: org,
+          authKind: _auth,
+          token: _auth == AuthKind.token ? _token.text : null,
+          username: _auth == AuthKind.password ? _username.text : null,
+          password: _auth == AuthKind.password ? _password.text : null,
+        ),
+      );
       if (mounted) Navigator.of(context).pop(true);
     } catch (e) {
       setState(() {
@@ -231,6 +236,7 @@ class _AddConnectionDialogState extends State<AddConnectionDialog> {
       onPrimary: _submit,
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         _Field(label: 'NAME', controller: _name, autofocus: true),
+        _Field(label: 'ENVIRONMENT NAME', controller: _envName, hint: 'e.g. prod'),
         _Field(label: 'API BASE URL', controller: _apiBase),
         _Field(label: 'ORGANIZATION ID', controller: _orgId, keyboardType: TextInputType.number),
         _AuthToggle(value: _auth, onChanged: (a) => setState(() => _auth = a)),
@@ -342,6 +348,7 @@ class EditConnectionDialog extends StatefulWidget {
 
 class _EditConnectionDialogState extends State<EditConnectionDialog> {
   late final _name = TextEditingController(text: widget.item.summary.name);
+  late final _envName = TextEditingController(text: widget.env.name);
   late final _apiBase = TextEditingController(text: widget.env.apiBase);
   late final _orgId = TextEditingController(text: widget.env.orgId.toString());
   final _token = TextEditingController();
@@ -353,7 +360,7 @@ class _EditConnectionDialogState extends State<EditConnectionDialog> {
 
   @override
   void dispose() {
-    for (final c in [_name, _apiBase, _orgId, _token, _username, _password]) {
+    for (final c in [_name, _envName, _apiBase, _orgId, _token, _username, _password]) {
       c.dispose();
     }
     super.dispose();
@@ -362,6 +369,7 @@ class _EditConnectionDialogState extends State<EditConnectionDialog> {
   Future<void> _submit() async {
     final org = BigInt.tryParse(_orgId.text.trim());
     if (_name.text.trim().isEmpty) return setState(() => _error = 'Name is required.');
+    if (_envName.text.trim().isEmpty) return setState(() => _error = 'Environment name is required.');
     if (org == null) return setState(() => _error = 'Organization ID must be a number.');
     setState(() {
       _busy = true;
@@ -380,6 +388,7 @@ class _EditConnectionDialogState extends State<EditConnectionDialog> {
           username: _auth == AuthKind.password ? _username.text : null,
           password: _auth == AuthKind.password ? _password.text : null,
         ),
+        newEnvName: _envName.text.trim(),
       );
       if (mounted) Navigator.of(context).pop(true);
     } catch (e) {
@@ -400,6 +409,7 @@ class _EditConnectionDialogState extends State<EditConnectionDialog> {
       onPrimary: _submit,
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         _Field(label: 'NAME', controller: _name, autofocus: true),
+        _Field(label: 'ENVIRONMENT NAME', controller: _envName, hint: 'e.g. prod'),
         _Field(label: 'API BASE URL', controller: _apiBase),
         _Field(label: 'ORGANIZATION ID', controller: _orgId, keyboardType: TextInputType.number),
         _AuthToggle(value: _auth, onChanged: (a) => setState(() => _auth = a)),
