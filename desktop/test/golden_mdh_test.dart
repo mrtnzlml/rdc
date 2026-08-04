@@ -70,6 +70,22 @@ AppState _filesState(Directory root) {
   final s = AppState(Settings(parentFolder: Directory.systemTemp.path));
   s.projects = [_proj('acme-invoices', [_env('main', 123456, lastSync: 1000, files: 128)], folder: root.path)];
   s.selectProject(root.path);
+  s.selectEnv(root.path, 'main'); // pin the env so _ConnMain (Files tab) renders, not the Project view
+  return s;
+}
+
+/// A multi-env project with no env pinned — exercises the Project view
+/// (environments table) rendered when `selectedEnv == null`.
+AppState _projectViewState() {
+  const sel = '/tmp/Rossum/acme-invoices-eu-prod-primary';
+  final s = AppState(Settings(parentFolder: '/tmp/Rossum'));
+  s.projects = [
+    _proj('acme-invoices', [
+      _env('dev', 123456, files: 64),
+      _env('prod', 123456, lastSync: 1000, files: 128),
+    ], folder: sel),
+  ];
+  s.selectProject(sel);
   return s;
 }
 
@@ -117,6 +133,22 @@ void main() {
         _wrap(Brightness.light,
             MdhScaffold(state: _seeded(), view: NavView.overview, onSelectEnv: (f, e) {})),
         'goldens/mdh_fleet_light.png');
+  });
+
+  testWidgets('project view — light', (t) async {
+    await shot(
+        t,
+        _wrap(
+            Brightness.light,
+            MdhScaffold(
+                state: _projectViewState(),
+                view: NavView.connection,
+                onSelectEnv: (f, e) {},
+                onAddEnv: (_) {},
+                onEditEnv: (_, _) {},
+                onRemoveEnv: (_, _) {},
+                onAdd: () {})),
+        'goldens/mdh_project_light.png');
   });
 
   testWidgets('files tab — light', (t) async {
