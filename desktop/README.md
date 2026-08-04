@@ -37,8 +37,9 @@ for moving config from one env to another (e.g. `dev` → `prod`). It's a
 2-phase flow:
 
 - **Prepare** — runs `migrate` offline (writes the target env's local
-  snapshot only; no network) and captures a dry-run push preview, so nothing
-  is pushed to the remote yet.
+  snapshot only; no network) and then captures a dry-run push preview against
+  the target org (this step *contacts* the target — it needs the target
+  token — but never writes to it), so nothing is pushed to the remote yet.
 - **Push** — a gated `sync --no-pull` against the target, with an explicit
   conflict policy (which side wins when the same item changed on both ends)
   and an opt-in "allow deletes" toggle.
