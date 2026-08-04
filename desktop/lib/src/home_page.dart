@@ -829,8 +829,8 @@ class _SyncLogCardState extends State<_SyncLogCard> {
 
 /// Shown when a project node (not one of its envs) is selected
 /// (`state.selectedEnv == null`): the Environments table for that project,
-/// with per-env Sync/Edit/Remove and an "Add environment" action. No promote
-/// section yet — that lands in Phase 3.
+/// with per-env Sync/Edit/Remove and an "Add environment" action, plus (for
+/// ≥2-env projects) the Promote panel below it.
 class _ProjectView extends StatelessWidget {
   const _ProjectView({
     required this.state,
@@ -866,6 +866,18 @@ class _ProjectView extends StatelessWidget {
       );
     }
     final envs = item.summary.envs;
+    // First time a ≥2-env project's Promote panel appears with nothing
+    // picked yet, default to the first two envs so "Prepare" is immediately
+    // actionable. Deferred to after this frame (like _SyncLogCard's _tail())
+    // since mutating `state` — which notifies this same subtree's
+    // ListenableBuilder — is unsafe from inside build().
+    if (envs.length >= 2 && state.promoteSrc == null && state.promoteTgt == null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (state.promoteSrc == null && state.promoteTgt == null) {
+          state.setPromoteDir(envs[0].name, envs[1].name);
+        }
+      });
+    }
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -890,11 +902,241 @@ class _ProjectView extends StatelessWidget {
                   onRemove: onRemoveEnv,
                   onSelectEnv: onSelectEnv,
                 ),
+                if (envs.length >= 2) _PromotePanel(state: state, item: item, envs: envs),
               ],
             ),
           ),
         ),
       ],
+    );
+  }
+}
+
+// ------------------------------------------------------------ promote panel
+
+/// Migrate `src` -> `tgt` offline, preview the plan, then a gated push with
+/// a conflict policy. Only shown for projects with ≥2 envs (below the
+/// Environments table). The picker row stays visible across every stage;
+/// stage-specific content (progress / preview / log) appends below it.
+class _PromotePanel extends StatelessWidget {
+  const _PromotePanel({required this.state, required this.item, required this.envs});
+  final AppState state;
+  final ProjectItem item;
+  final List<EnvSummary> envs;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _SectionTitle('Promote'),
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: c.bgCard, border: Border.all(color: c.borderCard), borderRadius: BorderRadius.circular(6),
+            boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.04), blurRadius: 3, offset: const Offset(0, 1))],
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _PromotePickerRow(state: state, item: item, envs: envs),
+              switch (state.promoteStage) {
+                PromoteStage.preparing => const _PromotePreparing(),
+                PromoteStage.preview => _PromotePreviewPanel(state: state, item: item),
+                PromoteStage.pushing || PromoteStage.done || PromoteStage.error => _PromotePushPanel(state: state),
+                PromoteStage.idle => const SizedBox.shrink(),
+              },
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// `From [src ▾]  ⇄  To [tgt ▾]`, the Mirror checkbox, and Prepare. Locked
+/// (dropdowns/checkbox/button disabled) once a prepare/preview/push is in
+/// flight — Cancel/Close (in the stage panels below) return to idle first.
+class _PromotePickerRow extends StatelessWidget {
+  const _PromotePickerRow({required this.state, required this.item, required this.envs});
+  final AppState state;
+  final ProjectItem item;
+  final List<EnvSummary> envs;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    final locked = switch (state.promoteStage) {
+      PromoteStage.preparing || PromoteStage.preview || PromoteStage.pushing => true,
+      _ => false,
+    };
+    final src = state.promoteSrc;
+    final tgt = state.promoteTgt;
+    final canPrepare = !locked && src != null && tgt != null && src != tgt;
+
+    List<DropdownMenuItem<String>> items() =>
+        [for (final e in envs) DropdownMenuItem(value: e.name, child: Text(e.name))];
+
+    return Wrap(
+      crossAxisAlignment: WrapCrossAlignment.center,
+      spacing: 10,
+      runSpacing: 10,
+      children: [
+        Text('From', style: TextStyle(color: c.textSecondary, fontSize: 12.5, fontWeight: FontWeight.w600)),
+        DropdownButton<String>(
+          value: envs.any((e) => e.name == src) ? src : null,
+          items: items(),
+          onChanged: locked ? null : (v) => state.setPromoteDir(v, tgt),
+        ),
+        IconButton(
+          icon: const Icon(Icons.swap_horiz),
+          iconSize: 18,
+          tooltip: 'Swap direction',
+          onPressed: locked ? null : state.swapPromoteDir,
+        ),
+        Text('To', style: TextStyle(color: c.textSecondary, fontSize: 12.5, fontWeight: FontWeight.w600)),
+        DropdownButton<String>(
+          value: envs.any((e) => e.name == tgt) ? tgt : null,
+          items: items(),
+          onChanged: locked ? null : (v) => state.setPromoteDir(src, v),
+        ),
+        Row(mainAxisSize: MainAxisSize.min, children: [
+          Checkbox(
+            value: state.promoteMirror,
+            onChanged: locked ? null : (v) => state.setPromoteMirror(v ?? false),
+          ),
+          Text('Mirror', style: TextStyle(color: c.textPrimary, fontSize: 12.5)),
+        ]),
+        _Btn(label: 'Prepare →', primary: true, onTap: canPrepare ? () => state.preparePromote(item) : null),
+      ],
+    );
+  }
+}
+
+class _PromotePreparing extends StatelessWidget {
+  const _PromotePreparing();
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(top: 14),
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        SizedBox(width: 15, height: 15, child: CircularProgressIndicator(strokeWidth: 2, color: c.accent)),
+        const SizedBox(width: 10),
+        Text('Preparing (offline)…', style: TextStyle(color: c.textSecondary, fontSize: 12.5)),
+      ]),
+    );
+  }
+}
+
+/// The captured dry-run plan, a conflict-policy pick, Allow deletes, and
+/// Push/Cancel. Shown once `preparePromote` has resolved into a preview.
+class _PromotePreviewPanel extends StatelessWidget {
+  const _PromotePreviewPanel({required this.state, required this.item});
+  final AppState state;
+  final ProjectItem item;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    final plan = state.promotePreview?.plan ?? const <String>[];
+    final spans = <InlineSpan>[];
+    for (var i = 0; i < plan.length; i++) {
+      spans.addAll(ansiSpans(plan[i], c, 12.5));
+      if (i < plan.length - 1) spans.add(const TextSpan(text: '\n'));
+    }
+    return Padding(
+      padding: const EdgeInsets.only(top: 14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Prepared locally — nothing pushed yet.', style: TextStyle(color: c.textSecondary, fontSize: 12)),
+          const SizedBox(height: 8),
+          Container(
+            width: double.infinity,
+            constraints: const BoxConstraints(maxHeight: 220),
+            decoration: BoxDecoration(color: c.bgCode, border: Border.all(color: c.borderCard), borderRadius: BorderRadius.circular(6)),
+            padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+            child: plan.isEmpty
+                ? Text('(no changes)', style: _mono(c.textSecondary, 12.5))
+                : SingleChildScrollView(child: SelectableText.rich(TextSpan(children: spans))),
+          ),
+          const SizedBox(height: 14),
+          Text('ON CONFLICT', style: TextStyle(color: c.textSecondary, fontSize: 10.5, fontWeight: FontWeight.w600, letterSpacing: 0.5)),
+          const SizedBox(height: 6),
+          SegmentedButton<ConflictPolicy>(
+            segments: const [
+              ButtonSegment(value: ConflictPolicy.useIncoming, label: Text('Use incoming')),
+              ButtonSegment(value: ConflictPolicy.keepTarget, label: Text('Keep target')),
+              ButtonSegment(value: ConflictPolicy.skip, label: Text('Skip')),
+            ],
+            selected: {state.promotePolicy},
+            onSelectionChanged: (selection) => state.setPromotePolicy(selection.first),
+          ),
+          const SizedBox(height: 10),
+          Row(children: [
+            Checkbox(
+              value: state.promoteAllowDeletes,
+              onChanged: (v) => state.setPromoteAllowDeletes(v ?? false),
+            ),
+            Text('Allow deletes', style: TextStyle(color: c.textPrimary, fontSize: 12.5)),
+          ]),
+          const SizedBox(height: 10),
+          Row(children: [
+            _Btn(label: 'Push to ${state.promoteTgt} →', primary: true, onTap: () => state.pushPromote(item)),
+            const SizedBox(width: 8),
+            _Btn(label: 'Cancel', onTap: state.resetPromote),
+          ]),
+        ],
+      ),
+    );
+  }
+}
+
+/// The streaming push log (pushing) or its terminal state (done/error), plus
+/// a Close/Done button back to idle.
+class _PromotePushPanel extends StatelessWidget {
+  const _PromotePushPanel({required this.state});
+  final AppState state;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    final lines = state.promoteLog;
+    final spans = <InlineSpan>[];
+    for (var i = 0; i < lines.length; i++) {
+      spans.addAll(ansiSpans(lines[i], c, 12.5));
+      if (i < lines.length - 1) spans.add(const TextSpan(text: '\n'));
+    }
+    final (String statusText, Color statusColor) = switch (state.promoteStage) {
+      PromoteStage.done => ('✓ Pushed', c.successFg),
+      PromoteStage.error => ('✕ ${state.promoteError ?? 'push failed'}', c.dangerFg),
+      _ => ('pushing…', c.textPrimary),
+    };
+    return Padding(
+      padding: const EdgeInsets.only(top: 14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: double.infinity,
+            constraints: const BoxConstraints(maxHeight: 220),
+            decoration: BoxDecoration(color: c.bgCode, border: Border.all(color: c.borderCard), borderRadius: BorderRadius.circular(6)),
+            padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+            child: lines.isEmpty
+                ? Text(state.promoteStage == PromoteStage.pushing ? 'pushing…' : ' ', style: _mono(c.textSecondary, 12.5))
+                : Align(alignment: Alignment.topLeft, child: SingleChildScrollView(child: SelectableText.rich(TextSpan(children: spans)))),
+          ),
+          const SizedBox(height: 10),
+          Row(children: [
+            Expanded(child: SelectableText(statusText, style: _mono(statusColor, 12.5))),
+            if (state.promoteStage != PromoteStage.pushing)
+              _Btn(label: state.promoteStage == PromoteStage.done ? 'Done' : 'Close', onTap: state.resetPromote),
+          ]),
+        ],
+      ),
     );
   }
 }
