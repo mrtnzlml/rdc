@@ -153,16 +153,40 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> addProjectEntry(AddConnectionInput input) async {
+  Future<void> addProjectEntry(String projectName, AddEnvInput firstEnv) async {
     final parent = _settings.parentFolder;
     if (parent == null) throw Exception('Choose a parent folder first.');
-    final s = await addProject(parent: parent, input: input);
+    final s = await addProject(parent: parent, projectName: projectName, firstEnv: firstEnv);
     await reload();
     selectProject(s.folder);
   }
 
-  Future<void> editEnvEntry(ProjectItem item, EnvSummary env, EditConnectionInput input) async {
-    final updated = await editProject(folder: item.summary.folder, env: env.name, input: input);
+  /// Whether `env` under `folder` is safe to rename right now — refused while
+  /// a sync is actively running against it (a rename mid-sync would move the
+  /// very paths the in-flight sync is reading/writing out from under it).
+  bool canRenameEnv(String folder, String env) => syncState[envKey(folder, env)] != SyncState.running;
+
+  /// Edit `env`'s connection details, optionally renaming it first.
+  ///
+  /// When `newEnvName` names a different env than `env.name`, the rename is
+  /// guarded by [canRenameEnv] (refused mid-sync) and applied via `renameEnv`
+  /// before the subsequent `editProject` — which then targets the *new* name,
+  /// since `renameEnv` has already moved the env's on-disk section/paths.
+  Future<void> editEnvEntry(
+    ProjectItem item,
+    EnvSummary env,
+    EditConnectionInput input, {
+    String? newEnvName,
+  }) async {
+    var targetEnv = env.name;
+    if (newEnvName != null && newEnvName != env.name) {
+      if (!canRenameEnv(item.summary.folder, env.name)) {
+        throw Exception("Can't rename while this environment is syncing.");
+      }
+      await renameEnv(folder: item.summary.folder, old: env.name, new_: newEnvName);
+      targetEnv = newEnvName;
+    }
+    final updated = await editProject(folder: item.summary.folder, env: targetEnv, input: input);
     if (item.isExternal && updated.folder != item.summary.folder) {
       final i = _settings.externalPaths.indexOf(item.summary.folder);
       if (i >= 0) {
@@ -171,7 +195,7 @@ class AppState extends ChangeNotifier {
       }
     }
     await reload();
-    selectEnv(updated.folder, env.name);
+    selectEnv(updated.folder, targetEnv);
   }
 
   Future<void> addEnvEntry(ProjectItem item, AddEnvInput input) async {
