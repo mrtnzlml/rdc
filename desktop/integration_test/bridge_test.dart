@@ -25,8 +25,9 @@ void main() {
     try {
       final added = await addProject(
         parent: dir.path,
-        input: AddConnectionInput(
-          name: 'Acme Prod',
+        projectName: 'Acme Prod',
+        firstEnv: AddEnvInput(
+          name: 'prod',
           apiBase: 'https://example.test/api/v1/',
           orgId: BigInt.from(42),
           authKind: AuthKind.token,
@@ -36,15 +37,17 @@ void main() {
       // API base trailing slash is trimmed by the bridge.
       expect(added.envs.first.apiBase, 'https://example.test/api/v1');
       expect(added.envs.first.orgId, BigInt.from(42));
+      expect(added.envs.first.name, 'prod');
       expect(File('${dir.path}/${added.id}/rdc.toml').existsSync(), true);
       expect(
-        File('${dir.path}/${added.id}/secrets/main.secrets.json').existsSync(),
+        File('${dir.path}/${added.id}/secrets/prod.secrets.json').existsSync(),
         true,
       );
 
       final list = await listProjects(parent: dir.path);
       expect(list.length, 1);
       expect(list.first.id, added.id);
+      expect(list.first.envs.first.name, 'prod');
 
       final validated =
           await validateExistingProject(path: '${dir.path}/${added.id}');
@@ -60,8 +63,9 @@ void main() {
       await expectLater(
         addProject(
           parent: dir.path,
-          input: AddConnectionInput(
-            name: 'x',
+          projectName: 'x',
+          firstEnv: AddEnvInput(
+            name: 'main',
             apiBase: 'https://example.test/api/v1',
             orgId: BigInt.from(1),
             authKind: AuthKind.token,
@@ -92,8 +96,9 @@ void main() {
     try {
       final added = await addProject(
         parent: parent.path,
-        input: AddConnectionInput(
-          name: 'Trash Me',
+        projectName: 'Trash Me',
+        firstEnv: AddEnvInput(
+          name: 'main',
           apiBase: 'https://example.test/api/v1',
           orgId: BigInt.from(3),
           authKind: AuthKind.token,
@@ -116,8 +121,9 @@ void main() {
     try {
       final added = await addProject(
         parent: parent.path,
-        input: AddConnectionInput(
-          name: 'before',
+        projectName: 'before',
+        firstEnv: AddEnvInput(
+          name: 'main',
           apiBase: 'https://old.test/api/v1',
           orgId: BigInt.from(1),
           authKind: AuthKind.token,
@@ -156,8 +162,9 @@ void main() {
     try {
       final added = await addProject(
         parent: parent.path,
-        input: AddConnectionInput(
-          name: 'multi-env',
+        projectName: 'multi-env',
+        firstEnv: AddEnvInput(
+          name: 'main',
           apiBase: 'https://example.test/api/v1',
           orgId: BigInt.from(10),
           authKind: AuthKind.token,
@@ -198,6 +205,60 @@ void main() {
       final afterLastRemoval = await removeEnv(folder: folder, env: 'main');
       expect(afterLastRemoval, isNull);
       expect(Directory(folder).existsSync(), false);
+    } finally {
+      if (parent.existsSync()) parent.deleteSync(recursive: true);
+    }
+  });
+
+  test('renameEnv round-trip: prod → staging moves secrets + env folder',
+      () async {
+    final parent = Directory.systemTemp.createTempSync('rdc_it_rename');
+    try {
+      final added = await addProject(
+        parent: parent.path,
+        projectName: 'rename-me',
+        firstEnv: AddEnvInput(
+          name: 'main',
+          apiBase: 'https://example.test/api/v1',
+          orgId: BigInt.from(1),
+          authKind: AuthKind.token,
+          token: 'tok-main',
+        ),
+      );
+      final folder = '${parent.path}/${added.id}';
+
+      await addEnv(
+        folder: folder,
+        input: AddEnvInput(
+          name: 'prod',
+          apiBase: 'https://prod.example.test/api/v1',
+          orgId: BigInt.from(20),
+          authKind: AuthKind.token,
+          token: 'tok-prod',
+        ),
+      );
+      expect(File('$folder/secrets/prod.secrets.json').existsSync(), true);
+
+      // `add_env` alone doesn't materialize `envs/<name>/` (only a real sync
+      // does) — seed it here so the rename below has files to move, mirroring
+      // a project that has actually been synced once.
+      Directory('$folder/envs/prod').createSync(recursive: true);
+      File('$folder/envs/prod/marker.json').writeAsStringSync('{}');
+
+      final renamed =
+          await renameEnv(folder: folder, old: 'prod', new_: 'staging');
+      expect(renamed.envs.map((e) => e.name).toList(), ['main', 'staging']);
+
+      final list = await listProjects(parent: parent.path);
+      expect(list.length, 1);
+      expect(
+          list.first.envs.map((e) => e.name).toList(), ['main', 'staging']);
+
+      expect(File('$folder/secrets/staging.secrets.json').existsSync(), true);
+      expect(File('$folder/secrets/prod.secrets.json').existsSync(), false);
+      expect(Directory('$folder/envs/staging').existsSync(), true);
+      expect(Directory('$folder/envs/prod').existsSync(), false);
+      expect(File('$folder/envs/staging/marker.json').existsSync(), true);
     } finally {
       if (parent.existsSync()) parent.deleteSync(recursive: true);
     }

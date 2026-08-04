@@ -48,21 +48,22 @@ AppState _seeded() {
 }
 
 /// A real on-disk connection folder for the Files tab. Fixed basename so the
-/// breadcrumb width is deterministic across runs.
+/// breadcrumb width is deterministic across runs. The Files tab browses
+/// `envs/<env>/`, so every previewable file lives under `envs/main/`.
 Directory _filesFixture() {
   final root = Directory('${Directory.systemTemp.path}/rdc_golden_conn');
   if (root.existsSync()) root.deleteSync(recursive: true);
   Directory('${root.path}/envs/main/hooks').createSync(recursive: true);
   Directory('${root.path}/envs/main/queues').createSync(recursive: true);
+  Directory('${root.path}/envs/main/schemas').createSync(recursive: true);
   File('${root.path}/envs/main/hooks/validate_invoice.json').writeAsStringSync('x' * 2000);
   File('${root.path}/envs/main/queues/invoices.json').writeAsStringSync('x' * 4200);
   // multi-line content so the read-only preview shows real, highlightable lines
-  File('${root.path}/mapping.toml').writeAsStringSync(
+  File('${root.path}/envs/main/hooks/config.toml').writeAsStringSync(
       '# environment map\n[env.dev]\nqueue = "invoices"\nschema = "invoices"\nhook = "validate_invoice"\n');
-  File('${root.path}/overlay.toml').writeAsStringSync('[queues.invoices]\nname = "Invoices"\n');
-  File('${root.path}/sample.json').writeAsStringSync(
+  File('${root.path}/envs/main/schemas/invoices.json').writeAsStringSync(
       '{\n  "queue": "invoices",\n  "active": true,\n  "count": 42,\n  "tags": ["a", "b"]\n}\n');
-  File('${root.path}/.gitignore').writeAsStringSync('x' * 40); // hidden → skipped
+  File('${root.path}/envs/main/.gitignore').writeAsStringSync('x' * 40); // hidden → skipped
   return root;
 }
 
@@ -178,7 +179,9 @@ void main() {
         MdhScaffold(
             state: _filesState(root), view: NavView.connection, activeTab: 'files', onSelectEnv: (f, e) {})));
     await t.pumpAndSettle();
-    await t.tap(find.text('mapping.toml')); // open the read-only preview (TOML highlighting)
+    await t.tap(find.text('hooks')); // descend into envs/main/hooks/
+    await t.pumpAndSettle();
+    await t.tap(find.text('config.toml')); // open the read-only preview (TOML highlighting)
     await t.pumpAndSettle();
     await expectLater(find.byType(MaterialApp), matchesGoldenFile('goldens/mdh_files_preview_light.png'));
   });
@@ -195,7 +198,9 @@ void main() {
         MdhScaffold(
             state: _filesState(root), view: NavView.connection, activeTab: 'files', onSelectEnv: (f, e) {})));
     await t.pumpAndSettle();
-    await t.tap(find.text('sample.json')); // JSON syntax highlighting
+    await t.tap(find.text('schemas')); // descend into envs/main/schemas/
+    await t.pumpAndSettle();
+    await t.tap(find.text('invoices.json')); // JSON syntax highlighting
     await t.pumpAndSettle();
     await expectLater(find.byType(MaterialApp), matchesGoldenFile('goldens/mdh_files_preview_json_light.png'));
   });
