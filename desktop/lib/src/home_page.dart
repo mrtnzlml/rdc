@@ -31,6 +31,15 @@ _St _statusOf(AppState s, ProjectItem it, EnvSummary env) {
   }
 }
 
+/// Badge (label, background, foreground) for a sync status, shared by
+/// `_EnvTableRow` and `_FleetRow` so their status pills stay in lockstep.
+(String, Color, Color) _badgeFor(MdhColors c, _St st) => switch (st) {
+      _St.error => ('error', c.dangerBg, c.dangerFg),
+      _St.never => ('never', c.infoBg, c.infoFg),
+      _St.running => ('syncing', c.infoBg, c.infoFg),
+      _St.synced => ('synced', c.successBg, c.successFg),
+    };
+
 String _rel(int? unix) {
   if (unix == null) return 'never';
   final d = DateTime.now()
@@ -287,6 +296,7 @@ class MdhScaffold extends StatelessWidget {
               onAddEnv: onAddEnv ?? (_) {},
               onEditEnv: onEditEnv ?? (_, _) {},
               onRemoveEnv: onRemoveEnv ?? (_, _) {},
+              onAdd: onAdd ?? () {},
             )
           : _ConnMain(
               state: state,
@@ -829,6 +839,7 @@ class _ProjectView extends StatelessWidget {
     required this.onAddEnv,
     required this.onEditEnv,
     required this.onRemoveEnv,
+    required this.onAdd,
   });
   final AppState state;
   final void Function(ProjectItem, EnvSummary) onSync;
@@ -836,13 +847,23 @@ class _ProjectView extends StatelessWidget {
   final void Function(ProjectItem) onAddEnv;
   final void Function(ProjectItem, EnvSummary) onEditEnv;
   final void Function(ProjectItem, EnvSummary) onRemoveEnv;
+  final VoidCallback onAdd;
 
   @override
   Widget build(BuildContext context) {
     final c = MdhColors.of(context);
     final item = state.selected;
     if (item == null) {
-      return Center(child: Text('No project selected', style: TextStyle(color: c.textSecondary)));
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text('No projects yet', style: TextStyle(color: c.textSecondary)),
+            const SizedBox(height: 12),
+            _Btn(label: 'New project', primary: true, onTap: onAdd),
+          ],
+        ),
+      );
     }
     final envs = item.summary.envs;
     return Column(
@@ -980,7 +1001,7 @@ class _EnvTable extends StatelessWidget {
                 head('Status'),
               ]),
             ),
-            head('', flex: _actionsFlex),
+            head('Actions', flex: _actionsFlex),
           ]),
         ),
         for (var i = 0; i < envs.length; i++)
@@ -1015,12 +1036,7 @@ class _EnvTableRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = MdhColors.of(context);
     final st = _statusOf(state, item, env);
-    final (String badge, Color bg, Color fg) = switch (st) {
-      _St.error => ('error', c.dangerBg, c.dangerFg),
-      _St.never => ('never', c.infoBg, c.infoFg),
-      _St.running => ('syncing', c.infoBg, c.infoFg),
-      _St.synced => ('synced', c.successBg, c.successFg),
-    };
+    final (String badge, Color bg, Color fg) = _badgeFor(c, st);
     Widget cell(Widget child, {int flex = 1}) =>
         Expanded(flex: flex, child: Padding(padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11), child: child));
 
@@ -1540,12 +1556,7 @@ class _FleetRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = MdhColors.of(context);
     final st = _statusOf(state, item, env);
-    final (String badge, Color bg, Color fg) = switch (st) {
-      _St.error => ('error', c.dangerBg, c.dangerFg),
-      _St.never => ('never', c.infoBg, c.infoFg),
-      _St.running => ('syncing', c.infoBg, c.infoFg),
-      _St.synced => ('synced', c.successBg, c.successFg),
-    };
+    final (String badge, Color bg, Color fg) = _badgeFor(c, st);
     return InkWell(
       onTap: () => onOpenConn(item.summary.folder, env.name),
       mouseCursor: SystemMouseCursors.click,
