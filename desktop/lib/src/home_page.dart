@@ -625,8 +625,8 @@ class _ConnMain extends StatelessWidget {
             'files' => Padding(
                 padding: const EdgeInsets.all(18),
                 child: _FilesPanel(
-                  key: ValueKey('files:${item.summary.folder}'),
-                  rootFolder: item.summary.folder,
+                  key: ValueKey('files:${item.summary.folder}:${env.name}'),
+                  rootFolder: [item.summary.folder, 'envs', env.name].join(Platform.pathSeparator),
                   revision: env.fileCount.toInt(),
                   onRevealDir: onRevealDir,
                 ),
@@ -1448,6 +1448,7 @@ class _FilesPanelState extends State<_FilesPanel> {
   List<String> _crumbs = [];
   List<_FEntry> _entries = const [];
   String? _error;
+  bool _notSynced = false; // envs/<env>/ doesn't exist yet (never synced)
 
   // Read-only file preview. Non-null [_previewName] → previewing that file in
   // the current directory; [_previewText] holds its content, or [_previewNote]
@@ -1490,6 +1491,13 @@ class _FilesPanelState extends State<_FilesPanel> {
   bool _hidden(String name) => name.startsWith('.');
 
   void _readInto() {
+    if (!Directory(_dirPath).existsSync()) {
+      _entries = const [];
+      _error = null;
+      _notSynced = true;
+      return;
+    }
+    _notSynced = false;
     try {
       final list = Directory(_dirPath).listSync(followLinks: false);
       final out = <_FEntry>[];
@@ -1664,6 +1672,11 @@ class _FilesPanelState extends State<_FilesPanel> {
   }
 
   Widget _list(MdhColors c) {
+    if (_notSynced) {
+      return Center(
+        child: Text("This environment hasn't been synced yet.", style: TextStyle(color: c.textSecondary, fontSize: 12.5)),
+      );
+    }
     if (_error != null) {
       return Center(
         child: Padding(
