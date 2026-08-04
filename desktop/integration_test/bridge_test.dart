@@ -151,6 +151,58 @@ void main() {
     }
   });
 
+  test('addEnv / removeEnv round-trip on a managed project', () async {
+    final parent = Directory.systemTemp.createTempSync('rdc_it_envs');
+    try {
+      final added = await addProject(
+        parent: parent.path,
+        input: AddConnectionInput(
+          name: 'multi-env',
+          apiBase: 'https://example.test/api/v1',
+          orgId: BigInt.from(10),
+          authKind: AuthKind.token,
+          token: 'tok-main',
+        ),
+      );
+      final folder = '${parent.path}/${added.id}';
+
+      final withProd = await addEnv(
+        folder: folder,
+        input: AddEnvInput(
+          name: 'prod',
+          apiBase: 'https://prod.example.test/api/v1',
+          orgId: BigInt.from(20),
+          authKind: AuthKind.token,
+          token: 'tok-prod',
+        ),
+      );
+      expect(withProd.envs.map((e) => e.name).toList(), ['main', 'prod']);
+
+      var list = await listProjects(parent: parent.path);
+      expect(list.length, 1);
+      expect(list.first.envs.map((e) => e.name).toList(), ['main', 'prod']);
+      expect(
+        File('$folder/secrets/prod.secrets.json').existsSync(),
+        true,
+      );
+
+      final backToMain = await removeEnv(folder: folder, env: 'prod');
+      expect(backToMain, isNotNull);
+      expect(backToMain!.envs.map((e) => e.name).toList(), ['main']);
+
+      list = await listProjects(parent: parent.path);
+      expect(list.length, 1);
+      expect(list.first.envs.map((e) => e.name).toList(), ['main']);
+
+      // Removing the last env trashes the whole project.
+      final afterLastRemoval = await removeEnv(folder: folder, env: 'main');
+      expect(afterLastRemoval, isNull);
+      expect(Directory(folder).existsSync(), false);
+    } finally {
+      if (parent.existsSync()) parent.deleteSync(recursive: true);
+    }
+  });
+
   test('listProjects surfaces a CLI project with no main env', () async {
     final parent = Directory.systemTemp.createTempSync('rdc_it_multienv');
     try {
