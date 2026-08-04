@@ -342,8 +342,24 @@ pub fn remove_env(folder: String, env: String) -> Result<Option<ProjectSummary>>
 
 /// Rename an environment `old` → `new` entirely locally: move every per-env
 /// path, rewrite `.rdc/mapping.toml`, and rename the `[envs.<old>]` section.
+///
+/// Not fully transactional: the state/conflicts moves below stay best-effort
+/// (as before), but once the substantive moves (`env_root`, `secrets`) have
+/// happened, a later failure (mapping.toml rewrite, final `rdc.toml` save)
+/// triggers a best-effort rollback of exactly those substantive moves before
+/// the error is returned, so the registry and filesystem don't end up
+/// disagreeing (`rdc.toml` still naming `old` while the files live under
+/// `new`, or vice versa).
 pub fn rename_env(folder: String, old: String, new: String) -> Result<ProjectSummary> {
     let folder = PathBuf::from(&folder);
+    // Defensive, mirroring `remove_env`: `old` comes from a hand-editable
+    // `rdc.toml` (via `validate_existing_project`, which adopts any env
+    // name), so it must be checked before it's ever interpolated into a
+    // filesystem path below — an env name with `..` or a path separator
+    // must never reach `std::fs::rename`.
+    if !valid_env_name(&old) {
+        return Err(anyhow!(INVALID_ENV_NAME_MSG));
+    }
     let new = new.trim().to_string();
     if !valid_env_name(&new) {
         return Err(anyhow!("Environment name may only contain letters, digits, - and _."));
@@ -363,14 +379,30 @@ pub fn rename_env(folder: String, old: String, new: String) -> Result<ProjectSum
     let op = rdc::paths::Paths::for_env(&folder, &old);
     let np = rdc::paths::Paths::for_env(&folder, &new);
     // 1. filesystem moves — env_root + secrets are the substantive ones; state/conflicts best-effort.
+    let mut moved_env_root = false;
+    let mut moved_secrets = false;
+    // Best-effort undo of whichever substantive moves already happened —
+    // used by every fallible step below that runs AFTER the moves.
+    let rollback = |moved_env_root: bool, moved_secrets: bool| {
+        if moved_secrets && np.secrets_file().exists() {
+            let _ = std::fs::rename(np.secrets_file(), op.secrets_file());
+        }
+        if moved_env_root && np.env_root().exists() {
+            let _ = std::fs::rename(np.env_root(), op.env_root());
+        }
+    };
     if op.env_root().exists() {
         std::fs::rename(op.env_root(), np.env_root())
             .map_err(|e| anyhow!("moving envs/{old} → envs/{new}: {e}"))?;
+        moved_env_root = true;
     }
     if op.secrets_file().exists() {
         if let Some(parent) = np.secrets_file().parent() { let _ = std::fs::create_dir_all(parent); }
-        std::fs::rename(op.secrets_file(), np.secrets_file())
-            .map_err(|e| anyhow!("moving secrets: {e}"))?;
+        if let Err(e) = std::fs::rename(op.secrets_file(), np.secrets_file()) {
+            rollback(moved_env_root, moved_secrets);
+            return Err(anyhow!("moving secrets: {e}"));
+        }
+        moved_secrets = true;
     }
     for (o, n) in [
         (op.lockfile(), np.lockfile()),
@@ -379,19 +411,31 @@ pub fn rename_env(folder: String, old: String, new: String) -> Result<ProjectSum
     ] {
         if o.exists() { let _ = std::fs::rename(&o, &n); }
     }
-    let old_conflicts = folder.join(".rdc").join("conflicts").join(&old);
-    let new_conflicts = folder.join(".rdc").join("conflicts").join(&new);
+    let old_conflicts = op.conflict_shadow_path(&op.env_root());
+    let new_conflicts = np.conflict_shadow_path(&np.env_root());
     if old_conflicts.exists() { let _ = std::fs::rename(&old_conflicts, &new_conflicts); }
     // 2. rewrite mapping.toml
-    let mapping_path = folder.join(".rdc").join("mapping.toml");
+    let mapping_path = op.mapping_file();
     if mapping_path.exists() {
-        let mut g = rdc::mapping::GenericMapping::load(&mapping_path).map_err(|e| anyhow!("{e:#}"))?;
+        let mut g = match rdc::mapping::GenericMapping::load(&mapping_path) {
+            Ok(g) => g,
+            Err(e) => {
+                rollback(moved_env_root, moved_secrets);
+                return Err(anyhow!("{e:#}"));
+            }
+        };
         g.rename_env(&old, &new);
-        g.save(&mapping_path).map_err(|e| anyhow!("{e:#}"))?;
+        if let Err(e) = g.save(&mapping_path) {
+            rollback(moved_env_root, moved_secrets);
+            return Err(anyhow!("{e:#}"));
+        }
     }
     // 3. rename the rdc.toml section last (authoritative record)
     if let Some(env_cfg) = cfg.envs.remove(&old) { cfg.envs.insert(new.clone(), env_cfg); }
-    cfg.save(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
+    if let Err(e) = cfg.save(&toml_path) {
+        rollback(moved_env_root, moved_secrets);
+        return Err(anyhow!("{e:#}"));
+    }
     discover::inspect(&folder).as_ref().map(ProjectSummary::from)
         .ok_or_else(|| anyhow!("Project not found after rename_env"))
 }
@@ -965,5 +1009,27 @@ mod tests {
         assert!(rename_env(folder.display().to_string(), "dev".into(), "prod".into()).is_err()); // collision
         assert!(rename_env(folder.display().to_string(), "dev".into(), "a/b".into()).is_err());  // invalid
         assert!(rename_env(folder.display().to_string(), "nope".into(), "x".into()).is_err());   // unknown old
+    }
+
+    #[test]
+    fn rename_env_rejects_invalid_old_name() {
+        // `old` is never user-typed in the normal UI flow (it comes from the
+        // existing project's own env list), but `validate_existing_project`
+        // adopts a hand-edited `rdc.toml` with *any* env key, so a malicious
+        // or corrupted `old` must be rejected before it's interpolated into
+        // any filesystem path — mirrors `remove_env_rejects_invalid_name`.
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = seed_project(tmp.path(), "acme");
+        for bad in ["../x", "a/b", ".."] {
+            let err = rename_env(folder.display().to_string(), bad.into(), "sandbox".into()).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("letters, digits"),
+                "unexpected error for old={bad:?}: {err:#}"
+            );
+        }
+        // Nothing was touched: the (legitimate) project still has only its
+        // original env, untouched on disk.
+        let cfg = rdc::config::ProjectConfig::load(&folder.join("rdc.toml")).unwrap();
+        assert_eq!(cfg.envs.keys().collect::<Vec<_>>(), vec!["main"]);
     }
 }
