@@ -93,4 +93,52 @@ void main() {
     await t.pump();
     expect(syncedEnvs, containsAll(['main', 'prod']));
   });
+
+  testWidgets('Per-row Sync button triggers a per-env sync', (t) async {
+    final s = _seeded();
+
+    await t.pumpWidget(MaterialApp(
+      theme: mdhTheme(Brightness.light),
+      home: Scaffold(body: MdhScaffold(
+        state: s,
+        view: NavView.connection,
+        // Stand in for AppState.syncEnvItem's synchronous "running" flip
+        // (the real bridge call isn't available under test) so the
+        // assertion below observes the same state transition the UI relies on.
+        onSync: (p, e) => s.syncState[s.envKey(p.summary.folder, e.name)] = SyncState.running,
+      )),
+    ));
+    await t.pumpAndSettle();
+
+    // Both rows start unsynced, so their per-row action is 'Sync' (not 'Retry').
+    expect(find.byTooltip('Sync'), findsNWidgets(2));
+    expect(s.syncState[s.envKey('/tmp/acme', 'main')], isNot(SyncState.running));
+
+    await t.tap(find.byTooltip('Sync').first);
+    await t.pump();
+
+    expect(s.syncState[s.envKey('/tmp/acme', 'main')], SyncState.running);
+  });
+
+  testWidgets('Project view empty state (no projects) shows a New project button', (t) async {
+    final s = AppState(Settings(parentFolder: '/tmp'));
+    var added = false;
+
+    await t.pumpWidget(MaterialApp(
+      theme: mdhTheme(Brightness.light),
+      home: Scaffold(body: MdhScaffold(
+        state: s,
+        view: NavView.connection,
+        onAdd: () => added = true,
+      )),
+    ));
+    await t.pumpAndSettle();
+
+    expect(find.text('No projects yet'), findsOneWidget);
+    expect(find.text('New project'), findsOneWidget);
+
+    await t.tap(find.text('New project'));
+    await t.pump();
+    expect(added, isTrue);
+  });
 }
