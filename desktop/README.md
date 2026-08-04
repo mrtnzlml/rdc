@@ -49,6 +49,12 @@ than the one you're looking at: the per-env **Sync** action elsewhere in the
 app stays pull-only, so cross-environment writes always go through this
 explicit, previewed flow.
 
+**Known limitation:** Prepare unconditionally overwrites the target's local
+snapshot (`envs/<tgt>/`) with `<src>`'s — any un-synced local edits to the
+target are replaced, with no diff or drift check first (the panel shows a
+caption warning about this before every Prepare). Full drift-detection
+(warn only when the target actually has un-synced changes) is deferred.
+
 ## Prerequisites
 
 - [Flutter](https://docs.flutter.dev/get-started/install) 3.44+ (stable), with

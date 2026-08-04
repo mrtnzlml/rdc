@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -49,6 +50,12 @@ class AppState extends ChangeNotifier {
   List<String> promoteLog = [];
   PromoteStage promoteStage = PromoteStage.idle;
   String? promoteError;
+
+  /// The live subscription behind an in-flight [pushPromote], if any. Kept
+  /// so [resetPromote] (and a project switch, which calls it) can cancel a
+  /// still-running push instead of leaving it silently writing into fields
+  /// that may since belong to a different project's Promote panel.
+  StreamSubscription<SyncPhase>? _pushSub;
 
   String? get parentFolder => _settings.parentFolder;
 
@@ -369,6 +376,8 @@ class AppState extends ChangeNotifier {
   /// envs also re-arms the Project view's default-direction effect for the
   /// new project's env list.
   void resetPromote({bool clearDirection = false}) {
+    _pushSub?.cancel();
+    _pushSub = null;
     promoteStage = PromoteStage.idle;
     promotePreview = null;
     promoteLog = [];
@@ -382,42 +391,70 @@ class AppState extends ChangeNotifier {
 
   /// Offline dry-run: migrate `src` -> `tgt` locally and capture the rendered
   /// push plan, without touching the target remote.
+  ///
+  /// This awaits the bridge, so the user is free to switch to a different
+  /// project while it's in flight. If they do, `p`'s eventual result must
+  /// not land in the *new* project's Promote panel (which would render a
+  /// stranger's reviewed plan under this project's live "Push" button) — see
+  /// [applyPrepareResult] and the matching guard in the catch branch below.
   Future<void> preparePromote(ProjectItem p) async {
     final src = promoteSrc;
     final tgt = promoteTgt;
     if (src == null || tgt == null || src == tgt) return;
-    savePromoteDefaults(p.summary.folder); // remember the direction actually prepared
+    final folder = p.summary.folder;
+    savePromoteDefaults(folder); // remember the direction actually prepared
     promoteStage = PromoteStage.preparing;
     promoteError = null;
     notifyListeners();
 
     try {
-      promotePreview = await preparePromotion(
-        folder: p.summary.folder,
+      final preview = await preparePromotion(
+        folder: folder,
         src: src,
         tgt: tgt,
         mirror: promoteMirror,
       );
-      promoteStage = PromoteStage.preview;
+      applyPrepareResult(folder, preview);
     } catch (e) {
+      if (selectedFolder != folder) return; // navigated away; B's panel must not show A's error
       promoteStage = PromoteStage.error;
       promoteError = errorText(e);
+      notifyListeners();
     }
+  }
+
+  /// Applies a resolved [preparePromote] result for `folder` — a no-op if
+  /// `folder` is no longer the selected project (the user switched away
+  /// while the prepare was in flight). Split out from [preparePromote] so
+  /// the guard is unit-testable without an actual bridge round-trip.
+  @visibleForTesting
+  void applyPrepareResult(String folder, PromotionPreview preview) {
+    if (selectedFolder != folder) return;
+    promotePreview = preview;
+    promoteStage = PromoteStage.preview;
     notifyListeners();
   }
 
   /// The real gated push, streaming rdc's log. Modeled on [syncEnvItem].
+  ///
+  /// Like [preparePromote], this keeps running across a project switch (it's
+  /// a stream, not a single await), so every phase callback re-checks that
+  /// `folder` is still selected before touching `promoteStage`/`promoteLog` —
+  /// otherwise a switch mid-push would leave this project's log streaming
+  /// into whatever project the user switched to, under its live Push button.
   void pushPromote(ProjectItem p) {
     final src = promoteSrc;
     final tgt = promoteTgt;
     if (src == null || tgt == null || src == tgt) return;
+    final folder = p.summary.folder;
     promoteStage = PromoteStage.pushing;
     promoteLog = <String>[];
     promoteError = null;
     notifyListeners();
 
-    pushPromotion(
-      folder: p.summary.folder,
+    _pushSub?.cancel();
+    _pushSub = pushPromotion(
+      folder: folder,
       src: src,
       tgt: tgt,
       mirror: promoteMirror,
@@ -425,6 +462,11 @@ class AppState extends ChangeNotifier {
       allowDeletes: promoteAllowDeletes,
     ).listen(
       (phase) {
+        if (selectedFolder != folder) {
+          _pushSub?.cancel();
+          _pushSub = null;
+          return; // navigated away; don't clobber the newly-selected project
+        }
         switch (phase) {
           case SyncPhase_Started():
             promoteStage = PromoteStage.pushing;
@@ -440,6 +482,11 @@ class AppState extends ChangeNotifier {
         notifyListeners();
       },
       onError: (Object e) {
+        if (selectedFolder != folder) {
+          _pushSub?.cancel();
+          _pushSub = null;
+          return;
+        }
         promoteStage = PromoteStage.error;
         promoteError = errorText(e);
         notifyListeners();
@@ -450,5 +497,11 @@ class AppState extends ChangeNotifier {
   void clearError() {
     lastError = null;
     notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    _pushSub?.cancel();
+    super.dispose();
   }
 }

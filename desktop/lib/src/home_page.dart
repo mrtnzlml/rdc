@@ -988,38 +988,57 @@ class _PromotePickerRow extends StatelessWidget {
     List<DropdownMenuItem<String>> items() =>
         [for (final e in envs) DropdownMenuItem(value: e.name, child: Text(e.name))];
 
-    return Wrap(
-      crossAxisAlignment: WrapCrossAlignment.center,
-      spacing: 10,
-      runSpacing: 10,
+    // Prepare's migrate step overwrites `envs/<tgt>/` unconditionally — any
+    // un-synced local edits to the target are silently replaced. Full
+    // drift-detection (only warn when the target actually has local changes)
+    // is deferred (spec §9.1); until then this caption is the warning, so it
+    // stays visible regardless of stage rather than gated behind a dialog.
+    final captionSrc = src ?? 'the source';
+    final captionTgt = tgt ?? 'the target';
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text('From', style: TextStyle(color: c.textSecondary, fontSize: 12.5, fontWeight: FontWeight.w600)),
-        DropdownButton<String>(
-          value: envs.any((e) => e.name == src) ? src : null,
-          items: items(),
-          onChanged: locked ? null : (v) => state.setPromoteDir(v, tgt),
+        Wrap(
+          crossAxisAlignment: WrapCrossAlignment.center,
+          spacing: 10,
+          runSpacing: 10,
+          children: [
+            Text('From', style: TextStyle(color: c.textSecondary, fontSize: 12.5, fontWeight: FontWeight.w600)),
+            DropdownButton<String>(
+              value: envs.any((e) => e.name == src) ? src : null,
+              items: items(),
+              onChanged: locked ? null : (v) => state.setPromoteDir(v, tgt),
+            ),
+            IconButton(
+              icon: const Icon(Icons.swap_horiz),
+              iconSize: 18,
+              tooltip: 'Swap direction',
+              onPressed: locked ? null : state.swapPromoteDir,
+            ),
+            Text('To', style: TextStyle(color: c.textSecondary, fontSize: 12.5, fontWeight: FontWeight.w600)),
+            DropdownButton<String>(
+              value: envs.any((e) => e.name == tgt) ? tgt : null,
+              items: items(),
+              onChanged: locked ? null : (v) => state.setPromoteDir(src, v),
+            ),
+            Row(mainAxisSize: MainAxisSize.min, children: [
+              Checkbox(
+                value: state.promoteMirror,
+                onChanged: locked ? null : (v) => state.setPromoteMirror(v ?? false),
+              ),
+              Text('Mirror', style: TextStyle(color: c.textPrimary, fontSize: 12.5)),
+            ]),
+            _ConfigureMenu(state: state, item: item, tgt: tgt),
+            _Btn(label: 'Prepare →', primary: true, onTap: canPrepare ? () => state.preparePromote(item) : null),
+          ],
         ),
-        IconButton(
-          icon: const Icon(Icons.swap_horiz),
-          iconSize: 18,
-          tooltip: 'Swap direction',
-          onPressed: locked ? null : state.swapPromoteDir,
+        const SizedBox(height: 8),
+        Text(
+          'Prepare rewrites $captionTgt\'s local files from $captionSrc and replaces any '
+          'un-synced local edits to $captionTgt. Nothing is pushed until you Push.',
+          style: TextStyle(color: c.textSecondary, fontSize: 11, fontStyle: FontStyle.italic),
         ),
-        Text('To', style: TextStyle(color: c.textSecondary, fontSize: 12.5, fontWeight: FontWeight.w600)),
-        DropdownButton<String>(
-          value: envs.any((e) => e.name == tgt) ? tgt : null,
-          items: items(),
-          onChanged: locked ? null : (v) => state.setPromoteDir(src, v),
-        ),
-        Row(mainAxisSize: MainAxisSize.min, children: [
-          Checkbox(
-            value: state.promoteMirror,
-            onChanged: locked ? null : (v) => state.setPromoteMirror(v ?? false),
-          ),
-          Text('Mirror', style: TextStyle(color: c.textPrimary, fontSize: 12.5)),
-        ]),
-        _ConfigureMenu(state: state, item: item, tgt: tgt),
-        _Btn(label: 'Prepare →', primary: true, onTap: canPrepare ? () => state.preparePromote(item) : null),
       ],
     );
   }
