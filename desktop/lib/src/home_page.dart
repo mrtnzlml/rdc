@@ -1009,7 +1009,41 @@ class _PromotePickerRow extends StatelessWidget {
           ),
           Text('Mirror', style: TextStyle(color: c.textPrimary, fontSize: 12.5)),
         ]),
+        _ConfigureMenu(state: state, item: item, tgt: tgt),
         _Btn(label: 'Prepare →', primary: true, onTap: canPrepare ? () => state.preparePromote(item) : null),
+      ],
+    );
+  }
+}
+
+/// A small ⚙ icon button offering two escape hatches into the on-disk files
+/// that drive a promote — the N-way mapping and the target's overlay — for
+/// when the picker/preview above isn't enough and the user needs to edit
+/// those files directly. Deliberately minor (icon-only, no label) so it
+/// doesn't compete with the picker row's primary controls.
+class _ConfigureMenu extends StatelessWidget {
+  const _ConfigureMenu({required this.state, required this.item, required this.tgt});
+  final AppState state;
+  final ProjectItem item;
+  final String? tgt;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    return PopupMenuButton<void Function()>(
+      tooltip: 'Configure',
+      icon: Icon(Icons.settings_outlined, size: 18, color: c.textSecondary),
+      onSelected: (action) => action(),
+      itemBuilder: (context) => [
+        PopupMenuItem<void Function()>(
+          value: () => state.revealMapping(item),
+          child: const Text('Reveal mapping (.rdc/mapping.toml)'),
+        ),
+        PopupMenuItem<void Function()>(
+          enabled: tgt != null,
+          value: tgt == null ? () {} : () => state.revealOverlay(item, tgt!),
+          child: const Text('Reveal target overlay (envs/<tgt>/overlay)'),
+        ),
       ],
     );
   }

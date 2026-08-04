@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/foundation.dart';
 
 import 'error_text.dart';
@@ -73,7 +75,10 @@ class AppState extends ChangeNotifier {
 
   void selectProject(String folder) {
     final folderChanged = folder != selectedFolder;
-    if (folderChanged) resetPromote(clearDirection: true);
+    if (folderChanged) {
+      resetPromote(clearDirection: true);
+      restorePromoteDefaults(folder);
+    }
     selectedFolder = folder;
     selectedEnv = null; // show the Project view; env children are selected explicitly
     notifyListeners();
@@ -210,6 +215,26 @@ class AppState extends ChangeNotifier {
 
   Future<void> reveal(String folder) => revealInFileManager(path: folder);
 
+  /// Reveal the N-way mapping file (`.rdc/mapping.toml`) that records this
+  /// project's per-env slug divergences, or the project folder itself if it
+  /// doesn't exist yet (e.g. nothing has diverged, so rdc hasn't written it).
+  Future<void> revealMapping(ProjectItem p) async {
+    final folder = p.summary.folder;
+    final sep = Platform.pathSeparator;
+    final mapping = File('$folder$sep.rdc${sep}mapping.toml');
+    await reveal(mapping.existsSync() ? mapping.path : folder);
+  }
+
+  /// Reveal `<folder>/envs/<tgt>/overlay/`, creating it first if it doesn't
+  /// exist yet — this is where target-only attribute overrides for a promote
+  /// live, and a fresh env may not have the directory on disk at all.
+  Future<void> revealOverlay(ProjectItem p, String tgt) async {
+    final sep = Platform.pathSeparator;
+    final dir = Directory('${p.summary.folder}${sep}envs$sep$tgt${sep}overlay');
+    dir.createSync(recursive: true);
+    await reveal(dir.path);
+  }
+
   void syncEnvItem(ProjectItem item, EnvSummary env) {
     final folder = item.summary.folder;
     final k = envKey(folder, env.name);
@@ -273,6 +298,39 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Re-arm `promoteSrc`/`promoteTgt`/`promoteMirror`/`promotePolicy` from
+  /// the last direction saved for `folder` (see [savePromoteDefaults]).
+  /// No-op if this project has never had a promote prepared — the
+  /// first-two-envs default in `_ProjectView` then takes over.
+  void restorePromoteDefaults(String folder) {
+    final d = _settings.promoteDefaults[folder];
+    if (d == null) return;
+    promoteSrc = d['src'] as String?;
+    promoteTgt = d['tgt'] as String?;
+    promoteMirror = d['mirror'] as bool? ?? false;
+    final policyName = d['policy'] as String?;
+    for (final p in ConflictPolicy.values) {
+      if (p.name == policyName) {
+        promotePolicy = p;
+        break;
+      }
+    }
+    notifyListeners();
+  }
+
+  /// Persist the current promote direction/mirror/policy for `folder` so
+  /// re-selecting this project later re-arms the same picks (see
+  /// [restorePromoteDefaults]).
+  void savePromoteDefaults(String folder) {
+    _settings.promoteDefaults[folder] = {
+      'src': promoteSrc,
+      'tgt': promoteTgt,
+      'mirror': promoteMirror,
+      'policy': promotePolicy.name,
+    };
+    _settings.save();
+  }
+
   /// Abandon the current preview/push and go back to idle. By default the
   /// picked direction, mirror flag, policy, and allow-deletes are left alone
   /// so a Cancel doesn't force the user to redo their picks before
@@ -304,6 +362,7 @@ class AppState extends ChangeNotifier {
     final src = promoteSrc;
     final tgt = promoteTgt;
     if (src == null || tgt == null || src == tgt) return;
+    savePromoteDefaults(p.summary.folder); // remember the direction actually prepared
     promoteStage = PromoteStage.preparing;
     promoteError = null;
     notifyListeners();

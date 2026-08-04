@@ -11,8 +11,19 @@ class Settings {
   String? parentFolder;
   List<String> externalPaths;
 
-  Settings({this.parentFolder, List<String>? externalPaths})
-      : externalPaths = externalPaths ?? [];
+  /// Per-project promote defaults, keyed by project folder. Each value is
+  /// `{src, tgt, mirror, policy}` (`policy` is a [ConflictPolicy] name
+  /// string) — the last direction/options the user prepared for that
+  /// project, so re-selecting it re-arms the same picks instead of falling
+  /// back to the first-two-envs default.
+  Map<String, Map<String, dynamic>> promoteDefaults;
+
+  Settings({
+    this.parentFolder,
+    List<String>? externalPaths,
+    Map<String, Map<String, dynamic>>? promoteDefaults,
+  })  : externalPaths = externalPaths ?? [],
+        promoteDefaults = promoteDefaults ?? {};
 
   static File _file() {
     final home = Platform.environment['HOME'] ??
@@ -34,17 +45,33 @@ class Settings {
     return file;
   }
 
+  /// Pure (no disk I/O) deserialization, so it's unit-testable and `load`
+  /// can delegate to it. Tolerates a missing/legacy file: any absent key
+  /// falls back to its default (in particular `promoteDefaults` → `{}`).
+  static Settings fromJson(Map<String, dynamic> m) => Settings(
+        parentFolder: m['parentFolder'] as String?,
+        externalPaths:
+            (m['externalPaths'] as List?)?.map((e) => e as String).toList() ??
+                [],
+        promoteDefaults: (m['promoteDefaults'] as Map?)?.map(
+              (k, v) => MapEntry(k as String, Map<String, dynamic>.from(v as Map)),
+            ) ??
+            {},
+      );
+
+  /// Pure (no disk I/O) serialization; `save` delegates to it.
+  Map<String, dynamic> toJson() => {
+        'parentFolder': parentFolder,
+        'externalPaths': externalPaths,
+        'promoteDefaults': promoteDefaults,
+      };
+
   static Settings load() {
     try {
       final f = _file();
       if (!f.existsSync()) return Settings();
       final m = jsonDecode(f.readAsStringSync()) as Map<String, dynamic>;
-      return Settings(
-        parentFolder: m['parentFolder'] as String?,
-        externalPaths:
-            (m['externalPaths'] as List?)?.map((e) => e as String).toList() ??
-                [],
-      );
+      return Settings.fromJson(m);
     } catch (_) {
       return Settings();
     }
@@ -53,10 +80,7 @@ class Settings {
   void save() {
     try {
       _file().writeAsStringSync(
-        const JsonEncoder.withIndent('  ').convert({
-          'parentFolder': parentFolder,
-          'externalPaths': externalPaths,
-        }),
+        const JsonEncoder.withIndent('  ').convert(toJson()),
       );
     } catch (_) {
       // Settings are best-effort; a write failure must not crash the app.
