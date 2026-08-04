@@ -1434,15 +1434,31 @@ pub fn run(
     only: Vec<String>,
     migrate_score_thresholds: bool,
 ) -> Result<()> {
+    let cwd = std::env::current_dir().context("getting current directory")?;
+    run_at(&cwd, src, tgt, mirror, dry_run, only, migrate_score_thresholds)
+}
+
+/// Like [`run`], but takes the project root explicitly instead of reading
+/// the process's current directory — the embedding seam non-CLI consumers
+/// (e.g. the desktop app's promote flow) use to drive migrate without a
+/// `std::env::set_current_dir` dance.
+pub fn run_at(
+    cwd: &Path,
+    src: &str,
+    tgt: &str,
+    mirror: bool,
+    dry_run: bool,
+    only: Vec<String>,
+    migrate_score_thresholds: bool,
+) -> Result<()> {
     if src == tgt {
         anyhow::bail!(
             "src and tgt envs are the same ('{src}'). Use two different envs for `rdc migrate`."
         );
     }
 
-    let cwd = std::env::current_dir().context("getting current directory")?;
-    let src_paths = crate::paths::Paths::for_env(&cwd, src);
-    let tgt_paths = crate::paths::Paths::for_env(&cwd, tgt);
+    let src_paths = crate::paths::Paths::for_env(cwd, src);
+    let tgt_paths = crate::paths::Paths::for_env(cwd, tgt);
     let src_root = src_paths.env_root();
     let tgt_root = tgt_paths.env_root();
 
@@ -1821,6 +1837,51 @@ fn split_ext(leaf: &str) -> Option<(&str, &str)> {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// Proves `run_at` takes its project root from the `cwd` PARAMETER, not
+    /// `std::env::current_dir()` — the embedding seam the desktop app relies
+    /// on to drive migrate without a `std::env::set_current_dir` dance (which
+    /// would be unsound to do concurrently from a GUI app). Builds a tiny
+    /// two-env project in a tempdir unrelated to the process cwd, and asserts
+    /// both that the dry-run succeeds and that the process cwd never moved.
+    #[test]
+    fn run_at_uses_explicit_cwd_not_process_current_dir() {
+        let before = std::env::current_dir().unwrap();
+
+        let project = tempfile::TempDir::new().unwrap();
+        let root = project.path();
+        let mut envs = BTreeMap::new();
+        envs.insert(
+            "dev".to_string(),
+            crate::config::EnvConfig {
+                api_base: "https://dev.example/api/v1".to_string(),
+                org_id: 1,
+            },
+        );
+        envs.insert(
+            "prod".to_string(),
+            crate::config::EnvConfig {
+                api_base: "https://prod.example/api/v1".to_string(),
+                org_id: 2,
+            },
+        );
+        crate::config::ProjectConfig { envs }
+            .save(&root.join("rdc.toml"))
+            .unwrap();
+        // Minimal pulled source snapshot: an empty managed dir is enough for
+        // `run_at` to consider 'dev' present (no writes happen under dry_run
+        // regardless).
+        std::fs::create_dir_all(root.join("envs/dev/workspaces")).unwrap();
+
+        let result = run_at(root, "dev", "prod", false, true /* dry_run */, vec![], false);
+
+        assert!(result.is_ok(), "run_at should succeed: {result:?}");
+        assert_eq!(
+            std::env::current_dir().unwrap(),
+            before,
+            "run_at must not change the process cwd"
+        );
+    }
 
     #[test]
     fn parse_legacy_env_pair_handles_hyphenated_envs() {

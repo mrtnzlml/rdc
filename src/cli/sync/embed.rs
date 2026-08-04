@@ -9,6 +9,7 @@
 //! decode, atomic write, lockfile, `_index.md`) reuses the existing
 //! sync pipeline in no-push, non-interactive mode.
 
+use crate::cli::resolve::ConflictStrategy;
 use crate::cli::sync::CycleOutcome;
 use crate::log::Log;
 use anyhow::Result;
@@ -71,6 +72,41 @@ pub async fn sync_no_push_logged(
         true,  // no_push
         false, // no_pull
         None,  // conflict_strategy
+        Some(renderer),
+        Some(cwd),
+        Some(token.to_string()),
+    )
+    .await
+}
+
+/// Run one `--no-pull` (deploy) reconciliation cycle, streaming rdc's rendered
+/// log into `log_sink`. `dry_run` renders the plan and stops before executing.
+/// `conflict` selects the non-interactive BothDiverged strategy; `allow_deletes`
+/// permits local-tombstone → remote DELETE. Pull is never performed (local files
+/// are never overwritten). Used by the desktop app's promote Push.
+pub async fn sync_push_logged(
+    cwd: &Path,
+    env: &str,
+    token: &str,
+    conflict: Option<ConflictStrategy>,
+    allow_deletes: bool,
+    dry_run: bool,
+    log_sink: Box<dyn std::io::Write + Send>,
+) -> Result<CycleOutcome> {
+    let paths = crate::paths::Paths::for_env(cwd, env);
+    let _lock = crate::cli::sync::lock::EnvLock::acquire(
+        &paths.env_lock(),
+        std::time::Duration::from_secs(30),
+    )?;
+    let renderer = Log::for_sink(crate::cli::resolve::ColorMode::Color, log_sink);
+    crate::cli::sync::run_cycle(
+        env,
+        false, // interactive
+        dry_run,
+        allow_deletes,
+        false, // no_push
+        true,  // no_pull  <-- deploy: push local, never overwrite local
+        conflict,
         Some(renderer),
         Some(cwd),
         Some(token.to_string()),
