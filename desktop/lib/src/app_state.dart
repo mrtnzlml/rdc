@@ -72,12 +72,16 @@ class AppState extends ChangeNotifier {
   }
 
   void selectProject(String folder) {
+    final folderChanged = folder != selectedFolder;
+    if (folderChanged) resetPromote(clearDirection: true);
     selectedFolder = folder;
     selectedEnv = null; // show the Project view; env children are selected explicitly
     notifyListeners();
   }
 
   void selectEnv(String folder, String env) {
+    final folderChanged = folder != selectedFolder;
+    if (folderChanged) resetPromote(clearDirection: true);
     selectedFolder = folder;
     selectedEnv = env;
     notifyListeners();
@@ -269,14 +273,28 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Abandon the current preview/push and go back to idle. The picked
-  /// direction, mirror flag, policy, and allow-deletes are left alone so a
-  /// Cancel doesn't force the user to redo their picks before re-Preparing.
-  void resetPromote() {
+  /// Abandon the current preview/push and go back to idle. By default the
+  /// picked direction, mirror flag, policy, and allow-deletes are left alone
+  /// so a Cancel doesn't force the user to redo their picks before
+  /// re-Preparing.
+  ///
+  /// Pass `clearDirection: true` when the *project* itself is changing (see
+  /// [selectProject]/[selectEnv]) — a promote in flight belongs to one
+  /// project, and leaving `promoteSrc`/`promoteTgt` (or a stale
+  /// `promotePreview`) set after switching projects would let the Promote
+  /// panel render another project's plan against the newly-selected one —
+  /// including a live "Push" button wired to push it. Clearing the picked
+  /// envs also re-arms the Project view's default-direction effect for the
+  /// new project's env list.
+  void resetPromote({bool clearDirection = false}) {
     promoteStage = PromoteStage.idle;
     promotePreview = null;
     promoteLog = [];
     promoteError = null;
+    if (clearDirection) {
+      promoteSrc = null;
+      promoteTgt = null;
+    }
     notifyListeners();
   }
 
