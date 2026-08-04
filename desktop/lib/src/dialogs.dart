@@ -246,6 +246,89 @@ class _AddConnectionDialogState extends State<AddConnectionDialog> {
   }
 }
 
+// ------------------------------------------------------------ add env
+
+class AddEnvDialog extends StatefulWidget {
+  const AddEnvDialog({super.key, required this.state, required this.item});
+  final AppState state;
+  final ProjectItem item;
+  @override
+  State<AddEnvDialog> createState() => _AddEnvDialogState();
+}
+
+class _AddEnvDialogState extends State<AddEnvDialog> {
+  final _envName = TextEditingController();
+  final _apiBase = TextEditingController(text: 'https://<org>.rossum.app/api/v1');
+  final _orgId = TextEditingController();
+  final _token = TextEditingController();
+  final _username = TextEditingController();
+  final _password = TextEditingController();
+  AuthKind _auth = AuthKind.token;
+  String? _error;
+  bool _busy = false;
+
+  @override
+  void dispose() {
+    for (final c in [_envName, _apiBase, _orgId, _token, _username, _password]) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    final org = BigInt.tryParse(_orgId.text.trim());
+    if (_envName.text.trim().isEmpty) return setState(() => _error = 'Environment name is required.');
+    if (org == null) return setState(() => _error = 'Organization ID must be a number.');
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await widget.state.addEnvEntry(
+        widget.item,
+        AddEnvInput(
+          name: _envName.text.trim(),
+          apiBase: _apiBase.text.trim(),
+          orgId: org,
+          authKind: _auth,
+          token: _auth == AuthKind.token ? _token.text : null,
+          username: _auth == AuthKind.password ? _username.text : null,
+          password: _auth == AuthKind.password ? _password.text : null,
+        ),
+      );
+      if (mounted) Navigator.of(context).pop(true);
+    } catch (e) {
+      setState(() {
+        _busy = false;
+        _error = errorText(e);
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _Frame(
+      title: 'Add environment',
+      primaryLabel: 'Add',
+      busy: _busy,
+      onPrimary: _submit,
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        _Field(label: 'ENVIRONMENT NAME', controller: _envName, autofocus: true, hint: 'e.g. prod'),
+        _Field(label: 'API BASE URL', controller: _apiBase),
+        _Field(label: 'ORGANIZATION ID', controller: _orgId, keyboardType: TextInputType.number),
+        _AuthToggle(value: _auth, onChanged: (a) => setState(() => _auth = a)),
+        if (_auth == AuthKind.token)
+          _Field(label: 'API TOKEN', controller: _token, obscure: true)
+        else ...[
+          _Field(label: 'USERNAME', controller: _username),
+          _Field(label: 'PASSWORD', controller: _password, obscure: true),
+        ],
+        if (_error != null) _ErrLine(_error!),
+      ]),
+    );
+  }
+}
+
 // ------------------------------------------------------------ edit
 
 class EditConnectionDialog extends StatefulWidget {
@@ -350,6 +433,26 @@ class RemoveDialog extends StatelessWidget {
         external
             ? 'Forgets "${item.summary.name}" from the app. The folder on disk is left untouched.'
             : 'Moves "${item.summary.name}" and its files to the Trash.',
+        style: TextStyle(color: c.textPrimary, fontSize: 13, height: 1.5),
+      ),
+    );
+  }
+}
+
+class RemoveEnvDialog extends StatelessWidget {
+  const RemoveEnvDialog({super.key, required this.item, required this.env});
+  final ProjectItem item;
+  final EnvSummary env;
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    return _Frame(
+      title: 'Remove environment?',
+      primaryLabel: 'Remove',
+      onPrimary: () => Navigator.of(context).pop(true),
+      child: Text(
+        'Removes the "${env.name}" environment and its local files from "${item.summary.name}". '
+        'If it is the last environment, the whole project is moved to the Trash.',
         style: TextStyle(color: c.textPrimary, fontSize: 13, height: 1.5),
       ),
     );
