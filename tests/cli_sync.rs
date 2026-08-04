@@ -4516,6 +4516,122 @@ async fn sync_hook_code_only_divergence_does_not_silently_push() {
     assert_eq!(shadow_body, b"def remote_edit():\n    return 3\n");
 }
 
+/// An editor's "insert final newline" must not register as a local edit.
+///
+/// rdc writes code sidecars without a terminating newline (the form the API
+/// returns), so opening one in an editor that adds it back makes the object
+/// look locally edited. Before the hash ignored EOF newlines, that produced
+/// a real PATCH of semantically identical code, and the write-back then
+/// rewrote the user's file without the newline — a phantom remote write plus
+/// a silent edit of a file the user never changed, repeating on every save.
+#[tokio::test]
+async fn sync_ignores_an_editor_added_final_newline_in_a_hook_sidecar() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let hook_id = 713u64;
+    let server_uri = server.uri();
+    // The remote never changes: code is stored WITHOUT a trailing newline,
+    // exactly as the API hands it back.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(move |_req: &Request| {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+                "results": [{
+                    "id": hook_id,
+                    "url": format!("{server_uri}/api/v1/hooks/{hook_id}"),
+                    "name": "ap-normalize-currency",
+                    "type": "function",
+                    "queues": [],
+                    "events": ["annotation_content"],
+                    "config": { "runtime": "python3.12", "code": "def x():\n    return 1" },
+                    "modified_at": "2026-05-14T08:00:00Z"
+                }]
+            }))
+        })
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &["/api/v1/hooks"]).await;
+    Mock::given(method("PATCH"))
+        .and(path(format!("/api/v1/hooks/{hook_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("seed sync should succeed");
+
+    let py_path = project.path().join("envs/dev/hooks/ap-normalize-currency.py");
+    assert_eq!(
+        std::fs::read(&py_path).unwrap(),
+        b"def x():\n    return 1",
+        "precondition: rdc writes sidecars without a terminating newline"
+    );
+    // Simulate the editor save: identical code, one newline appended.
+    std::fs::write(&py_path, b"def x():\n    return 1\n").unwrap();
+
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("second sync should succeed");
+    // …and again, to prove it does not oscillate.
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("third sync should succeed");
+
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    let mutations = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| {
+            (r.method == http::Method::PATCH || r.method == http::Method::POST)
+                && r.url.path() == format!("/api/v1/hooks/{hook_id}")
+        })
+        .count();
+    assert_eq!(
+        mutations, 0,
+        "a trailing-newline-only difference must not reach the remote; saw {mutations}"
+    );
+    assert_eq!(
+        std::fs::read(&py_path).unwrap(),
+        b"def x():\n    return 1\n",
+        "the user's file must be left exactly as saved — not rewritten without the newline"
+    );
+    assert!(
+        !project
+            .path()
+            .join(".rdc/conflicts/dev/hooks/ap-normalize-currency.py")
+            .exists(),
+        "no conflict shadow: there is no conflict here"
+    );
+}
+
 /// Regression for the reported bug: with both local and remote changed
 /// since the lockfile-recorded base, sync must NOT silently PATCH local
 /// over remote — the conflict resolver should kick in (or, in non-TTY
