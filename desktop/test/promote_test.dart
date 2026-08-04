@@ -72,6 +72,50 @@ void main() {
       expect(s.promoteSrc, 'dev');
       expect(s.promoteTgt, 'prod');
     });
+
+    test('switching to a different project resets a prepared promote (no stale preview/push)', () {
+      final s = AppState(Settings(parentFolder: '/tmp'));
+      s.projects = [
+        _p('/tmp/acme', [_e('dev', 1), _e('prod', 2)]),
+        _p('/tmp/beta', [_e('dev', 3), _e('prod', 4)]),
+      ];
+
+      // Prepare project A (acme) up to the preview stage.
+      s.selectProject('/tmp/acme');
+      s.setPromoteDir('dev', 'prod');
+      s.promoteStage = PromoteStage.preview;
+      s.promotePreview = const PromotionPreview(plan: ['+ queue acme/invoices']);
+
+      // Switching to a different project (beta, which happens to have envs
+      // of the same names) must not leave acme's stale preview/direction
+      // behind — otherwise the Promote panel would render beta's Push
+      // button wired to acme's reviewed plan.
+      s.selectProject('/tmp/beta');
+
+      expect(s.promoteStage, PromoteStage.idle);
+      expect(s.promotePreview, isNull);
+      expect(s.promoteSrc, isNull);
+      expect(s.promoteTgt, isNull);
+    });
+
+    test('selecting an env within the same project does not reset a prepared promote', () {
+      final s = AppState(Settings(parentFolder: '/tmp'));
+      s.projects = [_p('/tmp/acme', [_e('dev', 1), _e('prod', 2)])];
+
+      s.selectProject('/tmp/acme');
+      s.setPromoteDir('dev', 'prod');
+      s.promoteStage = PromoteStage.preview;
+      s.promotePreview = const PromotionPreview(plan: ['+ queue acme/invoices']);
+
+      // Navigating to an env child of the SAME project (project <-> env
+      // navigation) must preserve an in-progress promote.
+      s.selectEnv('/tmp/acme', 'prod');
+
+      expect(s.promoteStage, PromoteStage.preview);
+      expect(s.promotePreview, isNotNull);
+      expect(s.promoteSrc, 'dev');
+      expect(s.promoteTgt, 'prod');
+    });
   });
 
   group('Promote panel (Project view)', () {
