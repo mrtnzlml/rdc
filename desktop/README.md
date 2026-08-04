@@ -29,6 +29,25 @@ parent rdc workspace) because the parent sets `panic = "abort"`, and FRB needs
 unwinding to turn Rust panics into Dart exceptions. It depends on `rdc` via a
 path dependency (`../..`).
 
+## Promote
+
+For projects with 2+ environments, the Project view (select the project row,
+not one of its envs) shows a **Promote** panel below the Environments table
+for moving config from one env to another (e.g. `dev` → `prod`). It's a
+2-phase flow:
+
+- **Prepare** — runs `migrate` offline (writes the target env's local
+  snapshot only; no network) and captures a dry-run push preview, so nothing
+  is pushed to the remote yet.
+- **Push** — a gated `sync --no-pull` against the target, with an explicit
+  conflict policy (which side wins when the same item changed on both ends)
+  and an opt-in "allow deletes" toggle.
+
+This is deliberately the only place the app writes to an environment other
+than the one you're looking at: the per-env **Sync** action elsewhere in the
+app stays pull-only, so cross-environment writes always go through this
+explicit, previewed flow.
+
 ## Prerequisites
 
 - [Flutter](https://docs.flutter.dev/get-started/install) 3.44+ (stable), with
