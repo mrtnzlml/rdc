@@ -302,18 +302,42 @@ class AppState extends ChangeNotifier {
   /// the last direction saved for `folder` (see [savePromoteDefaults]).
   /// No-op if this project has never had a promote prepared — the
   /// first-two-envs default in `_ProjectView` then takes over.
+  ///
+  /// A saved `src`/`tgt` is only restored if it still names an env that
+  /// exists on this project *today* — otherwise a since-renamed/removed env
+  /// would come back as a stale selection (blank dropdown, but a `Prepare`
+  /// button that could still fire against the bridge with the dead name).
+  /// Guarded end-to-end in a try/catch: a hand-edited/corrupted settings
+  /// value (wrong types, etc.) must not throw inside `selectProject`.
   void restorePromoteDefaults(String folder) {
-    final d = _settings.promoteDefaults[folder];
-    if (d == null) return;
-    promoteSrc = d['src'] as String?;
-    promoteTgt = d['tgt'] as String?;
-    promoteMirror = d['mirror'] as bool? ?? false;
-    final policyName = d['policy'] as String?;
-    for (final p in ConflictPolicy.values) {
-      if (p.name == policyName) {
-        promotePolicy = p;
-        break;
+    try {
+      final d = _settings.promoteDefaults[folder];
+      if (d == null) return;
+      ProjectItem? project;
+      for (final p in projects) {
+        if (p.summary.folder == folder) {
+          project = p;
+          break;
+        }
       }
+      final envNames = project?.summary.envs.map((e) => e.name).toSet() ?? <String>{};
+      final savedSrc = d['src'] as String?;
+      final savedTgt = d['tgt'] as String?;
+      promoteSrc = (savedSrc != null && envNames.contains(savedSrc)) ? savedSrc : null;
+      promoteTgt = (savedTgt != null && envNames.contains(savedTgt)) ? savedTgt : null;
+      promoteMirror = d['mirror'] as bool? ?? false;
+      final policyName = d['policy'] as String?;
+      for (final p in ConflictPolicy.values) {
+        if (p.name == policyName) {
+          promotePolicy = p;
+          break;
+        }
+      }
+    } catch (_) {
+      // Corrupted/hand-edited settings must not crash selectProject — fall
+      // back to no restored direction (the picker's own default kicks in).
+      promoteSrc = null;
+      promoteTgt = null;
     }
     notifyListeners();
   }

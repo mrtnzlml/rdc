@@ -18,12 +18,20 @@ class Settings {
   /// back to the first-two-envs default.
   Map<String, Map<String, dynamic>> promoteDefaults;
 
+  /// Overrides the on-disk file used by the instance methods [save]/[load]
+  /// below. `null` (the production default) means "use the real per-user
+  /// file" (see [_file]). Tests pass a temp file here so `flutter test` can
+  /// never read or write the developer's real `~/.rdc-desktop/settings.json`.
+  final File? _overrideFile;
+
   Settings({
     this.parentFolder,
     List<String>? externalPaths,
     Map<String, Map<String, dynamic>>? promoteDefaults,
+    File? file,
   })  : externalPaths = externalPaths ?? [],
-        promoteDefaults = promoteDefaults ?? {};
+        promoteDefaults = promoteDefaults ?? {},
+        _overrideFile = file;
 
   static File _file() {
     final home = Platform.environment['HOME'] ??
@@ -79,7 +87,7 @@ class Settings {
 
   void save() {
     try {
-      _file().writeAsStringSync(
+      (_overrideFile ?? _file()).writeAsStringSync(
         const JsonEncoder.withIndent('  ').convert(toJson()),
       );
     } catch (_) {
