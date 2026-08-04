@@ -8,9 +8,11 @@
 use crate::discover::{self, AuthKindRaw, Project};
 use anyhow::{anyhow, Result};
 use crate::frb_generated::StreamSink;
+use rdc::cli::sync::CycleOutcome;
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// Runs once when the Dart side calls `RustLib.init()`.
 #[flutter_rust_bridge::frb(init)]
@@ -439,6 +441,187 @@ impl std::io::Write for LineForwarder {
     }
 }
 
+// ---------------------------------------------------------------- promote
+
+/// How a promote push resolves a `BothDiverged` conflict (a datapoint edited
+/// on both the source snapshot being promoted and the live target since the
+/// last sync). Dart-facing name only — the mapping onto rdc's own
+/// [`rdc::cli::resolve::ConflictStrategy`] is inverted; see
+/// [`policy_to_strategy`].
+#[derive(Debug, Clone, Copy)]
+pub enum ConflictPolicy {
+    /// The promoted (local, just-migrated) side wins.
+    UseIncoming,
+    /// The target (remote, already-live) side wins.
+    KeepTarget,
+    /// Leave the conflicting item untouched (shadow-file fallback).
+    Skip,
+}
+
+/// Map a promote push's [`ConflictPolicy`] onto rdc's own
+/// [`rdc::cli::resolve::ConflictStrategy`].
+///
+/// The polarity is INVERTED relative to a naive reading of the variant names:
+/// a promote push runs with `no_pull = true`, so "local" in
+/// `ConflictStrategy`'s own vocabulary means the just-migrated `tgt` snapshot
+/// (i.e. the promoted content), while "remote" means the live target
+/// environment. `ConflictPolicy::UseIncoming` — the user choosing to let the
+/// promoted change win — therefore maps to `KeepLocal`, and
+/// `ConflictPolicy::KeepTarget` — the user choosing to preserve what's already
+/// live on the target — maps to `UseRemote`. Do not "fix" this without
+/// re-reading the no-pull push direction; a unit test pins this mapping.
+pub(crate) fn policy_to_strategy(p: ConflictPolicy) -> Option<rdc::cli::resolve::ConflictStrategy> {
+    use rdc::cli::resolve::ConflictStrategy as S;
+    Some(match p {
+        ConflictPolicy::UseIncoming => S::KeepLocal, // promoted (local) wins
+        ConflictPolicy::KeepTarget => S::UseRemote,  // target (remote) wins
+        ConflictPolicy::Skip => S::Skip,
+    })
+}
+
+/// The rendered, captured dry-run push plan for a pending promotion — one
+/// entry per line of rdc's normal plan output.
+#[derive(Debug, Clone)]
+pub struct PromotionPreview {
+    pub plan: Vec<String>,
+}
+
+/// Offline `migrate src -> tgt` (writes local `envs/<tgt>/`), then a dry-run
+/// `--no-pull` push whose rendered plan is captured and returned. Needs the
+/// TARGET env's token (the dry-run push lists/scans the target remote to
+/// compute the plan). Nothing is written to the remote.
+pub fn prepare_promotion(folder: String, src: String, tgt: String, mirror: bool) -> Result<PromotionPreview> {
+    let folder = PathBuf::from(folder);
+    // 1) offline migrate (no token, no network): stage tgt's local snapshot
+    // to match src.
+    rdc::cli::migrate::run_at(&folder, &src, &tgt, mirror, false /* dry_run */, vec![], false)
+        .map_err(|e| anyhow!("{e:#}"))?;
+    // 2) dry-run push preview against the target remote.
+    let api_base = env_api_base(&folder, &tgt)?;
+    // Constructed via a plain struct literal (not `LineCollector::default()`)
+    // so codegen's static analysis has no associated-function call site to
+    // latch onto and doesn't bridge this internal helper as a public opaque
+    // Dart type — same reasoning that already keeps `LineForwarder` ignored.
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let collector = LineCollector {
+        lines: lines.clone(),
+        buf: Vec::new(),
+    };
+    block_on(async {
+        let token = rdc::secrets::resolve_token(&folder, &tgt, &api_base).await?;
+        rdc::cli::sync::embed::sync_push_logged(
+            &folder,
+            &tgt,
+            &token,
+            None, // conflict: a dry-run preview never needs to resolve one
+            false, // allow_deletes
+            true,  // dry_run
+            Box::new(collector),
+        )
+        .await
+    })
+    .map_err(|e| anyhow!("{e:#}"))?;
+    let plan = lines.lock().unwrap().clone();
+    Ok(PromotionPreview { plan })
+}
+
+/// The real gated push: re-runs the offline migrate (so the pushed snapshot
+/// reflects `src` at push time, not whatever `prepare_promotion` saw earlier)
+/// then a real `--no-pull` push with the chosen conflict policy and
+/// allow-deletes, streaming the log. Needs the TARGET token.
+pub fn push_promotion(
+    folder: String,
+    src: String,
+    tgt: String,
+    mirror: bool,
+    policy: ConflictPolicy,
+    allow_deletes: bool,
+    sink: StreamSink<SyncPhase>,
+) -> Result<()> {
+    let folder = PathBuf::from(folder);
+    let _ = sink.add(SyncPhase::Started);
+    let forwarder = LineForwarder {
+        sink: sink.clone(),
+        buf: Vec::new(),
+    };
+    let result: Result<CycleOutcome> = block_on(async {
+        let api_base = env_api_base(&folder, &tgt)?;
+        let token = rdc::secrets::resolve_token(&folder, &tgt, &api_base).await?;
+        // Re-run migrate so the target snapshot reflects src at push time
+        // (Prepare may have been a while ago / src re-synced since).
+        rdc::cli::migrate::run_at(&folder, &src, &tgt, mirror, false /* dry_run */, vec![], false)
+            .map_err(|e| anyhow!("{e:#}"))?;
+        rdc::cli::sync::embed::sync_push_logged(
+            &folder,
+            &tgt,
+            &token,
+            policy_to_strategy(policy),
+            allow_deletes,
+            false, // dry_run
+            Box::new(forwarder),
+        )
+        .await
+    });
+    match result {
+        Ok(o) => {
+            let _ = sink.add(SyncPhase::Log {
+                line: format!(
+                    "✓ promote done · {} pushed · {} conflicts",
+                    o.items_pushed, o.conflicts
+                ),
+            });
+            let _ = sink.add(SyncPhase::Done {
+                file_count: o.items_pushed as u64,
+            });
+        }
+        Err(e) => {
+            let _ = sink.add(SyncPhase::Error {
+                message: format!("{e:#}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Look up `env`'s `api_base` from `folder`'s `rdc.toml`.
+fn env_api_base(folder: &Path, env: &str) -> Result<String> {
+    let toml_path = folder.join("rdc.toml");
+    let cfg = rdc::config::ProjectConfig::load(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
+    cfg.envs
+        .get(env)
+        .map(|e| e.api_base.clone())
+        .ok_or_else(|| anyhow!("This project has no `{env}` environment."))
+}
+
+/// A `std::io::Write` that splits rdc's rendered log output into whole lines
+/// and accumulates each into a shared `Vec<String>`, mirroring
+/// [`LineForwarder`]'s line-splitting but collecting rather than streaming —
+/// used to capture a dry-run push's rendered plan for [`prepare_promotion`].
+struct LineCollector {
+    lines: Arc<Mutex<Vec<String>>>,
+    buf: Vec<u8>,
+}
+
+impl std::io::Write for LineCollector {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=nl).collect();
+            let text = String::from_utf8_lossy(&line)
+                .trim_end_matches(['\n', '\r'])
+                .to_string();
+            if !text.is_empty() {
+                self.lines.lock().unwrap().push(text);
+            }
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------- trash / reveal
 
 /// Move a managed Project's folder to the OS trash/recycle bin.
@@ -552,6 +735,15 @@ fn block_on<F: Future>(fut: F) -> F::Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conflict_policy_maps_inverted_for_promote_push() {
+        use crate::api::rdc::{policy_to_strategy, ConflictPolicy};
+        use rdc::cli::resolve::ConflictStrategy;
+        assert!(matches!(policy_to_strategy(ConflictPolicy::UseIncoming), Some(ConflictStrategy::KeepLocal)));
+        assert!(matches!(policy_to_strategy(ConflictPolicy::KeepTarget), Some(ConflictStrategy::UseRemote)));
+        assert!(matches!(policy_to_strategy(ConflictPolicy::Skip), Some(ConflictStrategy::Skip)));
+    }
 
     #[test]
     fn project_summary_from_multi_env_project() {
