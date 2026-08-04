@@ -172,6 +172,14 @@ class AppState extends ChangeNotifier {
   /// guarded by [canRenameEnv] (refused mid-sync) and applied via `renameEnv`
   /// before the subsequent `editProject` — which then targets the *new* name,
   /// since `renameEnv` has already moved the env's on-disk section/paths.
+  ///
+  /// `renameEnv` commits to disk immediately, so if the following
+  /// `editProject`/reselect then throws, [projects] must still be refreshed
+  /// to reflect the completed rename — otherwise it keeps showing the OLD
+  /// name and a retry from the still-open dialog would re-send it, hitting
+  /// "This project has no `<old>` environment" and masking that the rename
+  /// took. Not needed on the non-rename path: nothing moved on disk there,
+  /// so the pre-existing state is still accurate on failure.
   Future<void> editEnvEntry(
     ProjectItem item,
     EnvSummary env,
@@ -179,23 +187,29 @@ class AppState extends ChangeNotifier {
     String? newEnvName,
   }) async {
     var targetEnv = env.name;
-    if (newEnvName != null && newEnvName != env.name) {
+    final renamed = newEnvName != null && newEnvName != env.name;
+    if (renamed) {
       if (!canRenameEnv(item.summary.folder, env.name)) {
         throw Exception("Can't rename while this environment is syncing.");
       }
       await renameEnv(folder: item.summary.folder, old: env.name, new_: newEnvName);
       targetEnv = newEnvName;
     }
-    final updated = await editProject(folder: item.summary.folder, env: targetEnv, input: input);
-    if (item.isExternal && updated.folder != item.summary.folder) {
-      final i = _settings.externalPaths.indexOf(item.summary.folder);
-      if (i >= 0) {
-        _settings.externalPaths[i] = updated.folder;
-        _settings.save();
+    try {
+      final updated = await editProject(folder: item.summary.folder, env: targetEnv, input: input);
+      if (item.isExternal && updated.folder != item.summary.folder) {
+        final i = _settings.externalPaths.indexOf(item.summary.folder);
+        if (i >= 0) {
+          _settings.externalPaths[i] = updated.folder;
+          _settings.save();
+        }
       }
+      await reload();
+      selectEnv(updated.folder, targetEnv);
+    } catch (e) {
+      if (renamed) await reload();
+      rethrow;
     }
-    await reload();
-    selectEnv(updated.folder, targetEnv);
   }
 
   Future<void> addEnvEntry(ProjectItem item, AddEnvInput input) async {

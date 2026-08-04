@@ -381,9 +381,30 @@ pub fn rename_env(folder: String, old: String, new: String) -> Result<ProjectSum
     // 1. filesystem moves — env_root + secrets are the substantive ones; state/conflicts best-effort.
     let mut moved_env_root = false;
     let mut moved_secrets = false;
-    // Best-effort undo of whichever substantive moves already happened —
-    // used by every fallible step below that runs AFTER the moves.
+    // Best-effort undo of every per-env path this function may have moved —
+    // used by every fallible step below that runs AFTER the moves. Covers
+    // both the two substantive moves (env_root/secrets, gated on the tracked
+    // flags since a hard failure partway through the forward move may leave
+    // them untouched) AND the four best-effort cache/derived paths
+    // (lockfile, env_lock, base_cache_root, conflicts dir) that are moved
+    // unconditionally further down, before this closure is ever invoked —
+    // reversing those is unconditional too; each `np...exists()` check
+    // makes a given rename a no-op if that particular cache never existed.
     let rollback = |moved_env_root: bool, moved_secrets: bool| {
+        for (n, o) in [
+            (np.lockfile(), op.lockfile()),
+            (np.env_lock(), op.env_lock()),
+            (np.base_cache_root(), op.base_cache_root()),
+        ] {
+            if n.exists() {
+                let _ = std::fs::rename(&n, &o);
+            }
+        }
+        let new_conflicts = np.conflict_shadow_path(&np.env_root());
+        let old_conflicts = op.conflict_shadow_path(&op.env_root());
+        if new_conflicts.exists() {
+            let _ = std::fs::rename(&new_conflicts, &old_conflicts);
+        }
         if moved_secrets && np.secrets_file().exists() {
             let _ = std::fs::rename(np.secrets_file(), op.secrets_file());
         }
@@ -996,6 +1017,62 @@ mod tests {
         assert!(folder.join("secrets/sandbox.secrets.json").exists());
         let mapping = std::fs::read_to_string(folder.join(".rdc/mapping.toml")).unwrap();
         assert!(mapping.contains("sandbox = \"cost-dev\"") && !mapping.contains("dev = \"cost-dev\""));
+    }
+
+    #[test]
+    fn rename_env_rollback_is_symmetric_on_mapping_load_failure() {
+        // A corrupt `.rdc/mapping.toml` fails to parse, so `rename_env` errors
+        // out at the mapping-rewrite step — AFTER the env_root/secrets moves
+        // and the four best-effort cache moves (lockfile, env_lock,
+        // base_cache_root, conflicts dir) have already happened. The rollback
+        // must reverse ALL of them, not just env_root/secrets, or the tree is
+        // left half-renamed (derived caches under `sandbox` while `rdc.toml`
+        // still names `dev`).
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("acme");
+        std::fs::create_dir_all(folder.join("envs/dev")).unwrap();
+        std::fs::write(folder.join("envs/dev/organization.json"), "{}").unwrap();
+        std::fs::write(folder.join("rdc.toml"),
+            "[envs.dev]\napi_base = \"https://d.test/api/v1\"\norg_id = 1\n\
+             [envs.prod]\napi_base = \"https://p.test/api/v1\"\norg_id = 2\n").unwrap();
+        rdc::secrets::write_secrets_file(&folder, "dev", "tok", None).unwrap();
+
+        let paths = rdc::paths::Paths::for_env(&folder, "dev");
+        std::fs::create_dir_all(paths.lockfile().parent().unwrap()).unwrap();
+        std::fs::write(paths.lockfile(), "{}").unwrap();
+        std::fs::write(paths.env_lock(), "").unwrap();
+        std::fs::create_dir_all(paths.base_cache_root()).unwrap();
+        std::fs::write(paths.base_cache_root().join("organization.json"), "{}").unwrap();
+        let conflicts_dir = folder.join(".rdc/conflicts/dev");
+        std::fs::create_dir_all(&conflicts_dir).unwrap();
+        std::fs::write(conflicts_dir.join("stray.json"), "{}").unwrap();
+
+        // Garbage (unparsable) mapping.toml forces `GenericMapping::load` to
+        // error inside `rename_env`, after the moves above already ran.
+        std::fs::write(folder.join(".rdc/mapping.toml"), "not [ valid toml").unwrap();
+
+        let err = rename_env(folder.display().to_string(), "dev".into(), "sandbox".into())
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("parsing"), "unexpected error: {err:#}");
+
+        // Everything must be back under `dev` — no `sandbox` remnants.
+        assert!(folder.join("envs/dev/organization.json").exists());
+        assert!(!folder.join("envs/sandbox").exists());
+        assert!(folder.join("secrets/dev.secrets.json").exists());
+        assert!(!folder.join("secrets/sandbox.secrets.json").exists());
+        assert!(paths.lockfile().exists(), "lockfile should be rolled back to dev");
+        assert!(paths.env_lock().exists(), "env_lock should be rolled back to dev");
+        assert!(paths.base_cache_root().join("organization.json").exists(),
+            "base cache should be rolled back to dev");
+        assert!(conflicts_dir.join("stray.json").exists(), "conflicts dir should be rolled back to dev");
+        let sandbox_paths = rdc::paths::Paths::for_env(&folder, "sandbox");
+        assert!(!sandbox_paths.lockfile().exists());
+        assert!(!sandbox_paths.env_lock().exists());
+        assert!(!sandbox_paths.base_cache_root().exists());
+        assert!(!folder.join(".rdc/conflicts/sandbox").exists());
+        // rdc.toml untouched (rename never got past the mapping step).
+        let cfg = rdc::config::ProjectConfig::load(&folder.join("rdc.toml")).unwrap();
+        assert!(cfg.envs.contains_key("dev") && !cfg.envs.contains_key("sandbox"));
     }
 
     #[test]
