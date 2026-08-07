@@ -82,6 +82,72 @@ impl ChangeList {
         check("engine_fields", &self.engine_fields);
         out
     }
+
+    /// Validate every changed local file against the Rossum API's
+    /// declared `max_length` limits (see [`crate::snapshot::limits`]).
+    ///
+    /// An oversized field is a *permanent* push failure: the server
+    /// answers `400` and no retry can ever succeed while the local bytes
+    /// stay too long. Since the push phase precedes the pull phase and
+    /// its error aborts the cycle, one oversized field otherwise wedges
+    /// the entire project — every later `rdc sync` dies at the same
+    /// PATCH and no pull lands again. Callers surface these in the
+    /// dry-run plan and refuse a real push before the first remote
+    /// write, exactly like [`ChangeList::json_parse_errors`].
+    ///
+    /// Each file is stripped with `strip_for_create` before checking, so
+    /// a long value in a server-managed field (which never reaches the
+    /// wire) can't produce a false positive.
+    pub fn field_limit_violations(&self) -> Vec<FieldLimitViolation> {
+        let mut out = Vec::new();
+        let mut check = |kind: &'static str, map: &BTreeMap<String, std::path::PathBuf>| {
+            for (slug, path) in map {
+                let Ok(bytes) = std::fs::read(path) else {
+                    continue; // unreadable — push surfaces I/O errors
+                };
+                let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                    continue; // unparseable — reported by json_parse_errors
+                };
+                crate::snapshot::create::strip_for_create(&mut body, kind);
+                for v in crate::snapshot::limits::check_field_limits(kind, &body) {
+                    out.push(FieldLimitViolation {
+                        kind,
+                        slug: slug.clone(),
+                        path: path.clone(),
+                        field: v.field,
+                        limit: v.limit,
+                        actual: v.actual,
+                    });
+                }
+            }
+        };
+        check("workspaces", &self.workspaces);
+        check("hooks", &self.hooks);
+        check("rules", &self.rules);
+        check("labels", &self.labels);
+        check("queues", &self.queues);
+        check("schemas", &self.schemas);
+        check("inboxes", &self.inboxes);
+        check("email_templates", &self.email_templates);
+        check("engines", &self.engines);
+        check("engine_fields", &self.engine_fields);
+        out
+    }
+}
+
+/// One changed local file whose field exceeds the API's `max_length`, as
+/// reported by [`ChangeList::field_limit_violations`].
+#[derive(Debug)]
+pub struct FieldLimitViolation {
+    pub kind: &'static str,
+    pub slug: String,
+    pub path: std::path::PathBuf,
+    /// Top-level JSON key that is too long.
+    pub field: &'static str,
+    /// The API's declared limit for this field.
+    pub limit: usize,
+    /// The local value's length, in characters.
+    pub actual: usize,
 }
 
 /// One unparseable changed local file, as reported by
@@ -977,6 +1043,78 @@ pub fn detect_slug_collisions(paths: &Paths) -> BTreeMap<String, Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An oversized field in a changed local file must be reported with
+    /// enough context to fix it: kind, slug, path, field, actual, limit.
+    #[test]
+    fn field_limit_violations_reports_oversized_hook_description() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("example-hook.json");
+        std::fs::write(
+            &p,
+            serde_json::to_vec(&serde_json::json!({ "description": "x".repeat(2406) })).unwrap(),
+        )
+        .unwrap();
+        let mut cl = ChangeList::default();
+        cl.hooks.insert("example-hook".to_string(), p.clone());
+
+        let v = cl.field_limit_violations();
+        assert_eq!(v.len(), 1, "expected exactly one violation: {v:?}");
+        assert_eq!(v[0].kind, "hooks");
+        assert_eq!(v[0].slug, "example-hook");
+        assert_eq!(v[0].path, p);
+        assert_eq!(v[0].field, "description");
+        assert_eq!(v[0].actual, 2406);
+        assert_eq!(v[0].limit, 2000);
+    }
+
+    /// A within-limit file must produce nothing — this check must never
+    /// block a legitimate push.
+    #[test]
+    fn field_limit_violations_ignores_within_limit_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("example-hook.json");
+        std::fs::write(
+            &p,
+            serde_json::to_vec(&serde_json::json!({ "description": "x".repeat(2000) })).unwrap(),
+        )
+        .unwrap();
+        let mut cl = ChangeList::default();
+        cl.hooks.insert("example-hook".to_string(), p);
+        assert_eq!(cl.field_limit_violations().len(), 0);
+    }
+
+    /// Unparseable JSON is already reported by `json_parse_errors`; the
+    /// limit check must skip it rather than double-reporting or panicking.
+    #[test]
+    fn field_limit_violations_skips_unparseable_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("broken.json");
+        std::fs::write(&p, b"{not json").unwrap();
+        let mut cl = ChangeList::default();
+        cl.hooks.insert("broken".to_string(), p);
+        assert_eq!(cl.field_limit_violations().len(), 0);
+    }
+
+    /// Server-managed fields are stripped from the outgoing body, so an
+    /// oversized value there is never sent and must not block the push.
+    #[test]
+    fn field_limit_violations_ignores_fields_stripped_before_push() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("example-hook.json");
+        std::fs::write(
+            &p,
+            serde_json::to_vec(&serde_json::json!({
+                "url": "https://example.test/".to_string() + &"u".repeat(4000),
+                "description": "fine",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cl = ChangeList::default();
+        cl.hooks.insert("example-hook".to_string(), p);
+        assert_eq!(cl.field_limit_violations().len(), 0);
+    }
 
     #[test]
     fn detect_slug_collisions_finds_cross_workspace_dupes() {

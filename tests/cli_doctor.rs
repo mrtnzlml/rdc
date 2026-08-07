@@ -124,3 +124,56 @@ async fn doctor_warns_about_unpushed_local_changes() {
         .stderr(predicate::str::contains("1 local change"))
         .stderr(predicate::str::contains("not yet pushed"));
 }
+
+/// `rdc doctor` is the offline pre-flight, so it must catch a field that
+/// exceeds the API's `max_length` with no network calls at all — before
+/// the user ever starts a sync and waits out the remote listing.
+#[tokio::test]
+async fn doctor_reports_field_exceeding_api_length_limit() {
+    let server = MockServer::start().await;
+    mount_minimal_pull(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "next": null },
+            "results": [{
+                "id": 9, "url": format!("{}/api/v1/hooks/9", server.uri()),
+                "name": "example-hook", "type": "webhook", "queues": [],
+                "events": ["annotation_content"],
+                "config": { "url": "https://hook.example.com/run" },
+                "description": "short"
+            }]
+        })))
+        .with_priority(1)
+        .mount(&server).await;
+
+    let project = TempDir::new().unwrap();
+    Command::cargo_bin("rdc").unwrap().current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())]).assert().success();
+    std::fs::write(project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#).unwrap();
+    Command::cargo_bin("rdc").unwrap().current_dir(project.path())
+        .args(["sync", "dev", "--no-push"]).assert().success();
+
+    // Grow `description` past the API's 2000-character cap.
+    let hook_path = project.path().join("envs/dev/hooks/example-hook.json");
+    let mut hook: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hook_path).unwrap()).unwrap();
+    hook["description"] = serde_json::json!("x".repeat(2406));
+    std::fs::write(&hook_path, format!("{}\n", serde_json::to_string_pretty(&hook).unwrap())).unwrap();
+
+    // Point the env at a dead port: proves the check is genuinely offline.
+    let rdc_toml = project.path().join("rdc.toml");
+    let cfg = std::fs::read_to_string(&rdc_toml).unwrap()
+        .replace(&server.uri(), "http://127.0.0.1:1");
+    std::fs::write(&rdc_toml, cfg).unwrap();
+
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(project.path())
+        .args(["doctor", "dev"])
+        .assert().success()
+        .stderr(predicate::str::contains("hooks/example-hook"))
+        .stderr(predicate::str::contains("description"))
+        .stderr(predicate::str::contains("2406"))
+        .stderr(predicate::str::contains("2000"));
+}
