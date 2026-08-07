@@ -572,6 +572,7 @@ fn transform_file(
     migrate_score_thresholds: bool,
     src_lockfile: &crate::state::Lockfile,
     dry_run: bool,
+    migrate_email_prefixes: bool,
 ) -> Result<FileOutcome> {
     let src_path = src_root.join(rel);
     let dst_rel = remap_relative(rel, mapping);
@@ -677,11 +678,55 @@ fn transform_file(
         strip_source_host_env_refs(&mut value, codec, &src_host);
     }
 
+    // ---- env-tuned field reconciles ----
+    //
+    // These restore the TARGET's own value for fields that are per-env by
+    // nature, so promoting a source env does not overwrite them. They all run
+    // BEFORE the overlay is applied: `overlay.toml` is the user declaring the
+    // target's value on purpose and must win, per the precedence the overlay
+    // block below documents. (Running them after silently made an overlay entry
+    // for any of these keys permanently inert — the reconcile just wrote the
+    // target's pulled value back on every run.)
+
+    // Per-org confidence thresholds, unless the user opted to carry them.
+    // `score_threshold` (per schema datapoint) and `default_score_threshold`
+    // (per queue) are tuned per queue/organization and expected to differ across
+    // envs, so by default a matched target keeps its own values and a brand-new
+    // object drops them (falling back to the queue/server default).
+    if !migrate_score_thresholds
+        && let Some((kind, _)) = classify(rel)
+    {
+        reconcile_score_thresholds(&mut value, kind, &dst_path);
+    }
+
+    // The per-queue `training_enabled` flag. Engine auto-training is a per-env
+    // policy (train in dev, not in a test clone) and Rossum resets the flag to
+    // `false` on queue creation, so carrying the source's value would make every
+    // migrate+sync conflict (source `true` vs deployed `false`). Like the score
+    // thresholds, a matched target keeps its own value and a brand-new queue
+    // drops the field. Unconditional (no flag): there is no case for blindly
+    // propagating a training toggle across orgs.
+    if let Some((kind, _)) = classify(rel) {
+        reconcile_training_enabled(&mut value, kind, &dst_path);
+    }
+
+    // An inbox's `email_prefix`, unless the user opted to carry it. The prefix
+    // is the left-hand side of the inbox's PUBLIC address, so promoting the
+    // source env's value re-addresses the target's mailbox. Like the score
+    // thresholds, a matched target keeps its own and a brand-new inbox drops the
+    // field.
+    if !migrate_email_prefixes
+        && let Some((kind, _)) = classify(rel)
+    {
+        reconcile_email_prefix(&mut value, kind, &dst_path);
+    }
+
     // Apply the tgt overlay for this object. A kind-wide default lives under the
     // reserved `"*"` slug (e.g. `[hooks."*"]`) and is applied FIRST; the
     // per-object entry (`[hooks.<slug>]`) is applied SECOND so it wins on any
-    // shared key. Both run AFTER `reconcile_target_identity`, so an overlay value
-    // overrides the object's reconciled/source content. Precedence:
+    // shared key. Both run AFTER `reconcile_target_identity` and after the
+    // env-tuned reconciles above, so an overlay value overrides the object's
+    // reconciled/source content. Precedence:
     // per-object override > kind-wide `"*"` default > reconciled value.
     if let Some((kind, src_slug)) = classify(rel)
         && let Some(ov) = overlay
@@ -692,30 +737,6 @@ fn transform_file(
         if let Some(overrides) = overlay_for(ov, mapping, kind, &src_slug) {
             apply_overrides(&mut value, overrides);
         }
-    }
-
-    // Reconcile per-org confidence thresholds unless the user opted to carry
-    // them. `score_threshold` (per schema datapoint) and `default_score_threshold`
-    // (per queue) are tuned per queue/organization and expected to differ across
-    // envs, so by default a matched target keeps its own values and a brand-new
-    // object drops them (falling back to the queue/server default). Runs after
-    // overlay so an explicit overlay override still wins, and before the sort +
-    // serialize below.
-    if !migrate_score_thresholds
-        && let Some((kind, _)) = classify(rel)
-    {
-        reconcile_score_thresholds(&mut value, kind, &dst_path);
-    }
-
-    // Reconcile the per-queue `training_enabled` flag. Engine auto-training is a
-    // per-env policy (train in dev, not in a test clone) and Rossum resets the
-    // flag to `false` on queue creation, so carrying the source's value would
-    // make every migrate+sync conflict (source `true` vs deployed `false`). Like
-    // the score thresholds, a matched target keeps its own value and a brand-new
-    // queue drops the field. Unconditional (no flag): there is no case for
-    // blindly propagating a training toggle across orgs.
-    if let Some((kind, _)) = classify(rel) {
-        reconcile_training_enabled(&mut value, kind, &dst_path);
     }
 
     // Trailing-whitespace normalization: Rossum strips trailing whitespace from
@@ -1058,6 +1079,55 @@ fn reconcile_score_thresholds(value: &mut serde_json::Value, kind: &str, tgt_pat
 fn reconcile_training_enabled(value: &mut serde_json::Value, kind: &str, tgt_path: &Path) {
     const KEY: &str = "training_enabled";
     if kind != "queues" {
+        return;
+    }
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    if !obj.contains_key(KEY) {
+        return;
+    }
+    let target: Option<serde_json::Value> = std::fs::read(tgt_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok());
+    match target.as_ref().and_then(|t| t.get(KEY)).cloned() {
+        Some(v) => {
+            obj.insert(KEY.to_string(), v);
+        }
+        None => {
+            obj.shift_remove(KEY);
+        }
+    }
+}
+
+/// Reconcile an inbox's `email_prefix` so migrate never re-addresses the
+/// target's mailbox (see the module-level flag `--migrate-email-prefixes`).
+///
+/// `email_prefix` is the left-hand side of an inbox's PUBLIC address: Rossum
+/// derives `email` as `<email_prefix>-<hash>@<host>`. rdc already treats the
+/// derived `email` as env-specific — [`crate::snapshot::create::strip_for_create`]
+/// drops it for inboxes, and [`strip_source_host_env_refs`] removes a
+/// source-host one — but the field that DETERMINES it was carried verbatim, so
+/// promoting a source env whose prefix differs silently rewrote the target's
+/// address and broke mail to the old one. That is the outward-facing half of
+/// the same problem, so it follows the same rule as
+/// [`reconcile_score_thresholds`]:
+///
+/// - **Matched target** (`tgt_path` exists + carries a prefix): adopt the
+///   TARGET's, so each env keeps the address its senders already use.
+/// - **New target** (or the target has no prefix): drop the field, so the
+///   server derives the target env's own address rather than inheriting the
+///   source's.
+///
+/// A source inbox that carries no prefix is left alone — this only ever
+/// protects a value the target already owns. Set one deliberately per env with
+/// an `[inboxes.<queue-slug>]` entry in the target's `overlay.toml`, which is
+/// applied before this runs and therefore still wins.
+///
+/// A no-op for any kind other than `inboxes`.
+fn reconcile_email_prefix(value: &mut serde_json::Value, kind: &str, tgt_path: &Path) {
+    const KEY: &str = "email_prefix";
+    if kind != "inboxes" {
         return;
     }
     let Some(obj) = value.as_object_mut() else {
@@ -1544,9 +1614,19 @@ pub fn run(
     dry_run: bool,
     only: Vec<String>,
     migrate_score_thresholds: bool,
+    migrate_email_prefixes: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
-    run_at(&cwd, src, tgt, mirror, dry_run, only, migrate_score_thresholds)
+    run_at(
+        &cwd,
+        src,
+        tgt,
+        mirror,
+        dry_run,
+        only,
+        migrate_score_thresholds,
+        migrate_email_prefixes,
+    )
 }
 
 /// Like [`run`], but takes the project root explicitly instead of reading
@@ -1561,6 +1641,7 @@ pub fn run_at(
     dry_run: bool,
     only: Vec<String>,
     migrate_score_thresholds: bool,
+    migrate_email_prefixes: bool,
 ) -> Result<()> {
     if src == tgt {
         anyhow::bail!(
@@ -1763,6 +1844,7 @@ pub fn run_at(
             migrate_score_thresholds,
             &src_lockfile,
             dry_run,
+            migrate_email_prefixes,
         )
         .with_context(|| format!("migrating {}", rel.display()))?;
         if outcome != FileOutcome::Unchanged {
@@ -2027,7 +2109,7 @@ mod tests {
         // regardless).
         std::fs::create_dir_all(root.join("envs/dev/workspaces")).unwrap();
 
-        let result = run_at(root, "dev", "prod", false, true /* dry_run */, vec![], false);
+        let result = run_at(root, "dev", "prod", false, true /* dry_run */, vec![], false, false);
 
         assert!(result.is_ok(), "run_at should succeed: {result:?}");
         assert_eq!(
@@ -2457,7 +2539,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false).unwrap();
 
         // File landed at the remapped path.
         let dst = tgt
@@ -2527,6 +2609,7 @@ mod tests {
             true,
             &src_lock,
             false,
+            false,
         )
         .unwrap();
 
@@ -2570,7 +2653,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false).unwrap();
 
         let dst = tgt.path().join("hooks/extractor-prod.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -2612,7 +2695,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false).unwrap();
 
         let dst = tgt.path().join("hooks/any-hook.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -2660,7 +2743,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false).unwrap();
 
         let dst = tgt.path().join("hooks/special-hook.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -2701,7 +2784,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false).unwrap();
 
         let dst = tgt.path().join("rules/some-rule.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -2777,6 +2860,7 @@ mod tests {
             true,
             &crate::state::Lockfile::default(),
             false,
+            false,
         )
         .unwrap();
 
@@ -2825,7 +2909,7 @@ mod tests {
         fs::write(&src_file, code).unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false).unwrap();
 
         let dst = tgt.path().join("hooks/extractor-prod.py");
         assert_eq!(
@@ -3144,6 +3228,61 @@ mod tests {
         assert_eq!(source["training_enabled"], serde_json::json!(true));
     }
 
+    // ---- email_prefix reconciliation (migrate default: ignore) ----
+
+    #[test]
+    fn reconcile_email_prefix_matched_adopts_target_value() {
+        // An inbox's `email_prefix` is the left-hand side of its PUBLIC address
+        // (`<email_prefix>-<hash>@<host>`), so carrying the source env's value
+        // would re-address the target's inbox and break mail to the old
+        // address. A matched target keeps its own.
+        let mut source = serde_json::json!({ "name": "In", "email_prefix": "acme-dev--mtr" });
+        let (_d, tgt) = tgt_file(&serde_json::json!({ "name": "In", "email_prefix": "acme" }));
+        reconcile_email_prefix(&mut source, "inboxes", &tgt);
+        assert_eq!(source["email_prefix"], serde_json::json!("acme"));
+    }
+
+    #[test]
+    fn reconcile_email_prefix_new_target_drops_it() {
+        // No target => brand-new inbox => drop the field so the server derives
+        // the target env's own address instead of inheriting the source's.
+        let mut source = serde_json::json!({ "name": "In", "email_prefix": "acme-dev--mtr" });
+        let missing = std::path::Path::new("/nonexistent/does-not-exist/inbox.json");
+        reconcile_email_prefix(&mut source, "inboxes", missing);
+        assert!(source.get("email_prefix").is_none());
+    }
+
+    #[test]
+    fn reconcile_email_prefix_matched_target_without_prefix_drops_it() {
+        // The target inbox exists but carries no prefix of its own: the source's
+        // must not fill the gap, or the first migrate silently assigns the
+        // target an address derived from the source env.
+        let mut source = serde_json::json!({ "name": "In", "email_prefix": "acme-dev--mtr" });
+        let (_d, tgt) = tgt_file(&serde_json::json!({ "name": "In" }));
+        reconcile_email_prefix(&mut source, "inboxes", &tgt);
+        assert!(source.get("email_prefix").is_none());
+    }
+
+    #[test]
+    fn reconcile_email_prefix_no_op_for_non_inbox() {
+        // Only inboxes carry `email_prefix`; a same-named key on another kind
+        // is not ours to touch.
+        let mut source = serde_json::json!({ "name": "H", "email_prefix": "acme-dev--mtr" });
+        let (_d, tgt) = tgt_file(&serde_json::json!({ "name": "H", "email_prefix": "acme" }));
+        reconcile_email_prefix(&mut source, "hooks", &tgt);
+        assert_eq!(source["email_prefix"], serde_json::json!("acme-dev--mtr"));
+    }
+
+    #[test]
+    fn reconcile_email_prefix_absent_in_source_stays_absent() {
+        // A source inbox with no prefix must not gain the target's — the
+        // reconcile only ever protects a value the target already owns.
+        let mut source = serde_json::json!({ "name": "In" });
+        let (_d, tgt) = tgt_file(&serde_json::json!({ "name": "In", "email_prefix": "acme" }));
+        reconcile_email_prefix(&mut source, "inboxes", &tgt);
+        assert!(source.get("email_prefix").is_none());
+    }
+
     #[test]
     fn transform_file_carries_thresholds_when_opted_in() {
         // With --migrate-score-thresholds (the `true` arg), the source's
@@ -3187,6 +3326,7 @@ mod tests {
             /* migrate_score_thresholds = */ true,
             &crate::state::Lockfile::default(),
             false,
+            /* migrate_email_prefixes = */ false,
         )
         .unwrap();
 
@@ -3239,6 +3379,7 @@ mod tests {
             /* migrate_score_thresholds = */ false,
             &crate::state::Lockfile::default(),
             false,
+            /* migrate_email_prefixes = */ false,
         )
         .unwrap();
 

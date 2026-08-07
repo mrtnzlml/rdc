@@ -592,7 +592,16 @@ pub fn prepare_promotion(folder: String, src: String, tgt: String, mirror: bool)
     let folder = PathBuf::from(folder);
     // 1) offline migrate (no token, no network): stage tgt's local snapshot
     // to match src.
-    rdc::cli::migrate::run_at(&folder, &src, &tgt, mirror, false /* dry_run */, vec![], false)
+    rdc::cli::migrate::run_at(
+        &folder,
+        &src,
+        &tgt,
+        mirror,
+        false, /* dry_run */
+        vec![],
+        false, /* migrate_score_thresholds */
+        false, /* migrate_email_prefixes */
+    )
         .map_err(|e| anyhow!("{e:#}"))?;
     // 2) dry-run push preview against the target remote.
     let api_base = env_api_base(&folder, &tgt)?;
@@ -647,7 +656,16 @@ pub fn push_promotion(
         let token = rdc::secrets::resolve_token(&folder, &tgt, &api_base).await?;
         // Re-run migrate so the target snapshot reflects src at push time
         // (Prepare may have been a while ago / src re-synced since).
-        rdc::cli::migrate::run_at(&folder, &src, &tgt, mirror, false /* dry_run */, vec![], false)
+        rdc::cli::migrate::run_at(
+        &folder,
+        &src,
+        &tgt,
+        mirror,
+        false, /* dry_run */
+        vec![],
+        false, /* migrate_score_thresholds */
+        false, /* migrate_email_prefixes */
+    )
             .map_err(|e| anyhow!("{e:#}"))?;
         rdc::cli::sync::embed::sync_push_logged(
             &folder,

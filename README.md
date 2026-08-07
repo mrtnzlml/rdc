@@ -223,6 +223,24 @@ rdc migrate test prod                            # thresholds stay the target's
 rdc migrate test prod --migrate-score-thresholds # promote thresholds too
 ```
 
+### Inbox email prefixes
+
+An inbox's `email_prefix` is the left-hand side of its **public address** — Rossum derives `email` as `<email_prefix>-<hash>@<host>` — so promoting the source env's value re-addresses the target's mailbox and mail sent to the old address stops arriving. migrate therefore **ignores it by default**: a matched target keeps its own prefix, and a brand-new inbox drops the field so the server derives the target env's own address. Pass `--migrate-email-prefixes` to carry the source env's value instead.
+
+```sh
+rdc migrate test prod                           # prod keeps its own inbox address
+rdc migrate test prod --migrate-email-prefixes  # promote the prefix too
+```
+
+To set a target env's prefix deliberately, declare it in that env's `overlay.toml`:
+
+```toml
+[inboxes.cost-invoices]
+email_prefix = "acme-prod"
+```
+
+An overlay value always wins over these reconciles — that is the documented precedence (per-object override > kind-wide `"*"` default > reconciled value), and it applies to `score_threshold` / `default_score_threshold` / `training_enabled` too.
+
 ### Hook secrets
 
 Hook secret values are never copied between envs — they live in each env's gitignored `secrets/<env>.hook-secrets.json`. On push, `rdc sync` injects only filled values; keys still holding the placeholder sentinel are skipped, so a half-edited template never leaks a literal to the API.
