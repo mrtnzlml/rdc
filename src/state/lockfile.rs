@@ -300,6 +300,11 @@ fn to_hex(digest: &[u8]) -> String {
 ///     || ...   (continued for every formula, in field_id order)
 /// )
 /// ```
+/// EOF newlines in a code sidecar are not drift — see
+/// [`crate::snapshot::codec::sidecar_bytes_for_hash`], the single definition
+/// shared with `KindCodec::base_hash` so both hashing paths agree.
+use crate::snapshot::codec::sidecar_bytes_for_hash as code_bytes_for_hash;
+
 pub fn schema_combined_hash(
     json_bytes: &[u8],
     formulas: &[(String, Vec<u8>)],
@@ -313,7 +318,7 @@ pub fn schema_combined_hash(
         let path = format!("formulas/{field_id}.py");
         hasher.update(path.as_bytes());
         hasher.update([0u8]);
-        hasher.update(bytes);
+        hasher.update(code_bytes_for_hash(bytes));
     }
     to_hex(&hasher.finalize())
 }
@@ -345,7 +350,7 @@ pub fn hook_combined_hash(json_bytes: &[u8], code: &Option<String>, lockfile: &L
         hasher.update([0u8]);
         hasher.update(b"code");
         hasher.update([0u8]);
-        hasher.update(code.as_bytes());
+        hasher.update(code_bytes_for_hash(code.as_bytes()));
     }
     to_hex(&hasher.finalize())
 }
@@ -372,7 +377,7 @@ pub fn rule_combined_hash(json_bytes: &[u8], code: &Option<String>, lockfile: &L
         hasher.update([0u8]);
         hasher.update(b"trigger_condition");
         hasher.update([0u8]);
-        hasher.update(code.as_bytes());
+        hasher.update(code_bytes_for_hash(code.as_bytes()));
     }
     to_hex(&hasher.finalize())
 }
@@ -679,6 +684,58 @@ mod tests {
         let h2 = hook_combined_hash(b"{}", &None, &Lockfile::default());
         assert_eq!(h1, h2);
         assert_eq!(h1, content_hash(b"{}", &Lockfile::default()));
+    }
+
+    #[test]
+    fn code_hash_ignores_an_editor_added_final_newline() {
+        let bare = Some("def x():\n    return 1".to_string());
+        let with_nl = Some("def x():\n    return 1\n".to_string());
+        let with_crlf = Some("def x():\n    return 1\r\n".to_string());
+        let lf = Lockfile::default();
+        assert_eq!(
+            hook_combined_hash(b"{}", &bare, &lf),
+            hook_combined_hash(b"{}", &with_nl, &lf),
+            "a trailing newline is an editor artifact — the API never stores one, so \
+             hashing it makes an untouched save look like a local edit"
+        );
+        assert_eq!(
+            hook_combined_hash(b"{}", &bare, &lf),
+            hook_combined_hash(b"{}", &with_crlf, &lf),
+            "same for CRLF line endings"
+        );
+        assert_eq!(
+            rule_combined_hash(b"{}", &bare, &lf),
+            rule_combined_hash(b"{}", &with_nl, &lf),
+            "rules extract trigger_condition to a sidecar with the same convention"
+        );
+        let f_bare = vec![("total".to_string(), b"a + b".to_vec())];
+        let f_nl = vec![("total".to_string(), b"a + b\n".to_vec())];
+        assert_eq!(
+            schema_combined_hash(b"{}", &f_bare, &lf),
+            schema_combined_hash(b"{}", &f_nl, &lf),
+            "formula sidecars follow the same convention"
+        );
+    }
+
+    #[test]
+    fn code_hash_still_sees_interior_and_non_newline_whitespace() {
+        let lf = Lockfile::default();
+        // A trailing SPACE inside the body is real: the API preserves it,
+        // so it must stay visible as drift (a blanket trim once corrupted data).
+        assert_ne!(
+            hook_combined_hash(b"{}", &Some("x = 1\ny = 2".to_string()), &lf),
+            hook_combined_hash(b"{}", &Some("x = 1 \ny = 2".to_string()), &lf),
+        );
+        // Trailing space at EOF (not a newline) is likewise not ignored.
+        assert_ne!(
+            hook_combined_hash(b"{}", &Some("x = 1".to_string()), &lf),
+            hook_combined_hash(b"{}", &Some("x = 1 ".to_string()), &lf),
+        );
+        // A blank line ADDED before EOF text is a real change.
+        assert_ne!(
+            hook_combined_hash(b"{}", &Some("x = 1\ny = 2".to_string()), &lf),
+            hook_combined_hash(b"{}", &Some("x = 1\n\ny = 2".to_string()), &lf),
+        );
     }
 
     #[test]

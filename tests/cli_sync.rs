@@ -4516,6 +4516,122 @@ async fn sync_hook_code_only_divergence_does_not_silently_push() {
     assert_eq!(shadow_body, b"def remote_edit():\n    return 3\n");
 }
 
+/// An editor's "insert final newline" must not register as a local edit.
+///
+/// rdc writes code sidecars without a terminating newline (the form the API
+/// returns), so opening one in an editor that adds it back makes the object
+/// look locally edited. Before the hash ignored EOF newlines, that produced
+/// a real PATCH of semantically identical code, and the write-back then
+/// rewrote the user's file without the newline — a phantom remote write plus
+/// a silent edit of a file the user never changed, repeating on every save.
+#[tokio::test]
+async fn sync_ignores_an_editor_added_final_newline_in_a_hook_sidecar() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let hook_id = 713u64;
+    let server_uri = server.uri();
+    // The remote never changes: code is stored WITHOUT a trailing newline,
+    // exactly as the API hands it back.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(move |_req: &Request| {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+                "results": [{
+                    "id": hook_id,
+                    "url": format!("{server_uri}/api/v1/hooks/{hook_id}"),
+                    "name": "ap-normalize-currency",
+                    "type": "function",
+                    "queues": [],
+                    "events": ["annotation_content"],
+                    "config": { "runtime": "python3.12", "code": "def x():\n    return 1" },
+                    "modified_at": "2026-05-14T08:00:00Z"
+                }]
+            }))
+        })
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &["/api/v1/hooks"]).await;
+    Mock::given(method("PATCH"))
+        .and(path(format!("/api/v1/hooks/{hook_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("seed sync should succeed");
+
+    let py_path = project.path().join("envs/dev/hooks/ap-normalize-currency.py");
+    assert_eq!(
+        std::fs::read(&py_path).unwrap(),
+        b"def x():\n    return 1",
+        "precondition: rdc writes sidecars without a terminating newline"
+    );
+    // Simulate the editor save: identical code, one newline appended.
+    std::fs::write(&py_path, b"def x():\n    return 1\n").unwrap();
+
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("second sync should succeed");
+    // …and again, to prove it does not oscillate.
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("third sync should succeed");
+
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    let mutations = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| {
+            (r.method == http::Method::PATCH || r.method == http::Method::POST)
+                && r.url.path() == format!("/api/v1/hooks/{hook_id}")
+        })
+        .count();
+    assert_eq!(
+        mutations, 0,
+        "a trailing-newline-only difference must not reach the remote; saw {mutations}"
+    );
+    assert_eq!(
+        std::fs::read(&py_path).unwrap(),
+        b"def x():\n    return 1\n",
+        "the user's file must be left exactly as saved — not rewritten without the newline"
+    );
+    assert!(
+        !project
+            .path()
+            .join(".rdc/conflicts/dev/hooks/ap-normalize-currency.py")
+            .exists(),
+        "no conflict shadow: there is no conflict here"
+    );
+}
+
 /// Regression for the reported bug: with both local and remote changed
 /// since the lockfile-recorded base, sync must NOT silently PATCH local
 /// over remote — the conflict resolver should kick in (or, in non-TTY
@@ -4747,6 +4863,13 @@ enum HookConflictVariant {
     /// must NOT prompt — the combined hashes are equal so the kind is
     /// `Clean`, even though both sides "edited."
     BothEditedToSameCode,
+    /// BOTH halves diverge at once: each side edited the JSON *and* the
+    /// `.py`. The sidecar overlap defeats the auto-merge, so this is a
+    /// real conflict — and the user must be shown BOTH divergences, not
+    /// just the JSON one. (A JSON diff can be pure server churn like
+    /// `modified_by`, which makes a code-only-visible-in-the-sidecar
+    /// conflict look like "nothing really changed".)
+    JsonAndCodeBothEdited,
 }
 
 /// Drive one hook-conflict scenario through `rdc sync` and assert that
@@ -4858,6 +4981,11 @@ async fn run_hook_conflict_scenario(variant: HookConflictVariant) {
                     HookConflictVariant::BothEditedToSameCode => (
                         events_base.clone(),
                         Some(same_code_both.to_string()),
+                        "2026-05-14T10:00:00Z".to_string(),
+                    ),
+                    HookConflictVariant::JsonAndCodeBothEdited => (
+                        events_remote.clone(),
+                        Some(remote_code_edit.to_string()),
                         "2026-05-14T10:00:00Z".to_string(),
                     ),
                 }
@@ -5007,6 +5135,14 @@ async fn run_hook_conflict_scenario(variant: HookConflictVariant) {
         }
         HookConflictVariant::BothEditedToSameCode => {
             std::fs::write(&py_path, same_code_both.as_bytes()).unwrap();
+        }
+        HookConflictVariant::JsonAndCodeBothEdited => {
+            let mut v: serde_json::Value = serde_json::from_slice(&json_before).unwrap();
+            v["events"] = serde_json::json!(events_local);
+            let mut new_json = serde_json::to_vec_pretty(&v).unwrap();
+            new_json.push(b'\n');
+            std::fs::write(&json_path, &new_json).unwrap();
+            std::fs::write(&py_path, local_code_edit.as_bytes()).unwrap();
         }
     }
 
@@ -5215,6 +5351,47 @@ async fn run_hook_conflict_scenario(variant: HookConflictVariant) {
             "variant {variant:?}: local JSON edit must survive in {}",
             json_path.display()
         );
+    } else if matches!(variant, HookConflictVariant::JsonAndCodeBothEdited) {
+        // Both local edits survive…
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&json_path).unwrap()).unwrap();
+        let evs = v["events"].as_array().unwrap();
+        assert!(
+            evs.iter().any(|x| x.as_str() == Some("annotation_status")),
+            "variant {variant:?}: local JSON edit must survive in {}",
+            json_path.display()
+        );
+        assert_eq!(
+            std::fs::read(&py_path).unwrap(),
+            local_code_edit.as_bytes(),
+            "variant {variant:?}: local .py edit must survive"
+        );
+        // …and BOTH remote divergences must be parked as shadows. A
+        // JSON-only shadow leaves the user with no copy of the remote
+        // code they are being asked to reconcile against, and the
+        // warning points at the wrong file.
+        let json_shadow = project
+            .path()
+            .join(format!(".rdc/conflicts/dev/hooks/{slug}.json"));
+        let py_shadow = project
+            .path()
+            .join(format!(".rdc/conflicts/dev/hooks/{slug}.py"));
+        assert!(
+            json_shadow.exists(),
+            "variant {variant:?}: remote JSON must be parked at {}",
+            json_shadow.display()
+        );
+        assert!(
+            py_shadow.exists(),
+            "variant {variant:?}: remote code must be parked at {} — without it the user \
+             cannot see (or merge) the env's code change",
+            py_shadow.display()
+        );
+        assert_eq!(
+            std::fs::read(&py_shadow).unwrap(),
+            remote_code_edit.as_bytes(),
+            "variant {variant:?}: the .py shadow must hold the REMOTE code"
+        );
     }
 }
 
@@ -5228,6 +5405,15 @@ async fn run_hook_conflict_scenario(variant: HookConflictVariant) {
 #[tokio::test]
 async fn sync_hook_auto_merges_disjoint_events_pushes() {
     run_hook_conflict_scenario(HookConflictVariant::JsonBothEdited).await;
+}
+
+/// Both halves diverge at once (JSON *and* `.py` edited on both sides).
+/// The conflict must surface BOTH remote sides as shadows — anchoring
+/// only on the JSON hides the code divergence, and a JSON diff that is
+/// pure server churn (`modified_by`) then reads as "nothing changed".
+#[tokio::test]
+async fn sync_hook_conflict_json_and_code_both_edited_shadows_both_halves() {
+    run_hook_conflict_scenario(HookConflictVariant::JsonAndCodeBothEdited).await;
 }
 
 #[tokio::test]
@@ -5284,6 +5470,9 @@ enum RuleConflictVariant {
     LocalRemovedCodeRemoteEdited,
     /// Both converge on the same code.
     BothEditedToSameCode,
+    /// Both halves diverge at once (JSON *and* trigger_condition edited on
+    /// both sides). Every divergent half must be parked as a shadow.
+    JsonAndCodeBothEdited,
 }
 
 async fn run_rule_conflict_scenario(variant: RuleConflictVariant) {
@@ -5363,6 +5552,11 @@ async fn run_rule_conflict_scenario(variant: RuleConflictVariant) {
                     RuleConflictVariant::BothEditedToSameCode => (
                         name_base.clone(),
                         Some(same_cond_both.to_string()),
+                        "2026-05-14T10:00:00Z".to_string(),
+                    ),
+                    RuleConflictVariant::JsonAndCodeBothEdited => (
+                        name_remote.clone(),
+                        Some(remote_cond_edit.to_string()),
                         "2026-05-14T10:00:00Z".to_string(),
                     ),
                 }
@@ -5483,6 +5677,14 @@ async fn run_rule_conflict_scenario(variant: RuleConflictVariant) {
         }
         RuleConflictVariant::BothEditedToSameCode => {
             std::fs::write(&py_path, same_cond_both.as_bytes()).unwrap();
+        }
+        RuleConflictVariant::JsonAndCodeBothEdited => {
+            let mut v: serde_json::Value = serde_json::from_slice(&json_before).unwrap();
+            v["name"] = serde_json::json!(name_local);
+            let mut nj = serde_json::to_vec_pretty(&v).unwrap();
+            nj.push(b'\n');
+            std::fs::write(&json_path, &nj).unwrap();
+            std::fs::write(&py_path, local_cond_edit.as_bytes()).unwrap();
         }
     }
 
@@ -5610,11 +5812,48 @@ async fn run_rule_conflict_scenario(variant: RuleConflictVariant) {
             "variant {variant:?}: local .py edit must survive",
         );
     }
+
+    if matches!(variant, RuleConflictVariant::JsonAndCodeBothEdited) {
+        assert_eq!(
+            std::fs::read(&py_path).unwrap(),
+            local_cond_edit.as_bytes(),
+            "variant {variant:?}: local .py edit must survive",
+        );
+        let json_shadow = project
+            .path()
+            .join(format!(".rdc/conflicts/dev/rules/{slug}.json"));
+        let py_shadow = project
+            .path()
+            .join(format!(".rdc/conflicts/dev/rules/{slug}.py"));
+        assert!(
+            json_shadow.exists(),
+            "variant {variant:?}: remote JSON must be parked at {}",
+            json_shadow.display()
+        );
+        assert!(
+            py_shadow.exists(),
+            "variant {variant:?}: remote trigger_condition must be parked at {}",
+            py_shadow.display()
+        );
+        assert_eq!(
+            std::fs::read(&py_shadow).unwrap(),
+            remote_cond_edit.as_bytes(),
+            "variant {variant:?}: the .py shadow must hold the REMOTE condition"
+        );
+    }
 }
 
 #[tokio::test]
 async fn sync_rule_conflict_json_both_edited_never_silently_pushes() {
     run_rule_conflict_scenario(RuleConflictVariant::JsonBothEdited).await;
+}
+
+/// Rule counterpart of the hook both-halves case: JSON *and*
+/// `trigger_condition` diverge on both sides, so both remote halves must
+/// be parked for the user to reconcile against.
+#[tokio::test]
+async fn sync_rule_conflict_json_and_code_both_edited_shadows_both_halves() {
+    run_rule_conflict_scenario(RuleConflictVariant::JsonAndCodeBothEdited).await;
 }
 
 #[tokio::test]
@@ -5944,6 +6183,34 @@ async fn run_schema_conflict_scenario(variant: SchemaConflictVariant) {
             formula_after,
             local_formula_edit.as_bytes(),
             "variant {variant:?}: local formula edit must survive",
+        );
+    }
+
+    // Both halves diverged: the schema JSON *and* a formula sidecar. Each
+    // must be parked so the user can diff against the env's version — a
+    // schema.json-only shadow hides the formula change entirely.
+    if matches!(variant, SchemaConflictVariant::JsonAndFormulaBothEdited) {
+        let json_shadow = project
+            .path()
+            .join(".rdc/conflicts/dev/workspaces/ap-invoices/queues/cost-invoices/schema.json");
+        let formula_shadow = project.path().join(
+            ".rdc/conflicts/dev/workspaces/ap-invoices/queues/cost-invoices/formulas/amount_total.py",
+        );
+        assert!(
+            json_shadow.exists(),
+            "variant {variant:?}: remote schema JSON must be parked at {}",
+            json_shadow.display()
+        );
+        assert!(
+            formula_shadow.exists(),
+            "variant {variant:?}: remote formula must be parked at {} — otherwise the \
+             formula divergence is invisible",
+            formula_shadow.display()
+        );
+        assert_eq!(
+            std::fs::read(&formula_shadow).unwrap(),
+            remote_formula_edit.as_bytes(),
+            "variant {variant:?}: the formula shadow must hold the REMOTE formula"
         );
     }
 }

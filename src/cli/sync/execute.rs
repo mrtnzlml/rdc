@@ -1344,62 +1344,30 @@ fn resolve_one_conflict<R: BufRead>(
         // local hash here would make the next sync see a one-sided
         // `RemoteEdit` and silently overwrite the local edit.
         //
-        // For combined-hash kinds where the JSON portions are byte-
-        // identical (post-canonicalize) but the sidecar diverges,
-        // anchor the shadow on the sidecar so the user sees the actual
-        // divergence — a `schema.json`/`hook.json` shadow with byte-
-        // identical-to-local content would be misleading. (The shadow
-        // lands under `.rdc/conflicts/<env>/`, mirroring the anchor's
-        // env-tree relpath.)
-        let (shadow_anchor, shadow_bytes): (PathBuf, Vec<u8>) = if json_canonicalize_equal
-            && sidecar_diverges
-        {
-            match hash_strategy {
-                HashStrategy::Hook | HashStrategy::Rule => {
-                    let remote_code_bytes = remote_code.clone().unwrap_or_default().into_bytes();
-                    (code_path.clone(), remote_code_bytes)
-                }
-                HashStrategy::Schema => {
-                    // Pick the first divergent formula as the
-                    // representative shadow anchor; the lockfile
-                    // base is preserved so the next sync re-prompts
-                    // with proper UX. Schemas with multiple
-                    // divergent formulas land the shadow on the
-                    // first one for visibility.
-                    let queue_dir = local_path.parent().unwrap_or(&local_path);
-                    let formulas_dir = queue_dir.join("formulas");
-
-                    remote_formulas
-                        .iter()
-                        .find(|(id, bytes)| {
-                            local_formulas
-                                .iter()
-                                .find(|(lid, _)| lid == id)
-                                .map(|(_, lb)| lb)
-                                != Some(bytes)
-                        })
-                        .or_else(|| {
-                            // Local formula present, remote absent:
-                            // pick the first that's only in local.
-                            local_formulas
-                                .iter()
-                                .find(|(id, _)| !remote_formulas.iter().any(|(rid, _)| rid == id))
-                        })
-                        .map(|(fid, bytes)| (formulas_dir.join(format!("{fid}.py")), bytes.clone()))
-                        .unwrap_or_else(|| (local_path.clone(), remote_bytes.clone()))
-                }
-                HashStrategy::Flat => (local_path.clone(), remote_bytes.clone()),
-            }
-        } else {
-            (local_path.clone(), remote_bytes.clone())
-        };
-        let conflict_path = ctx.paths.conflict_shadow_path(&shadow_anchor);
-        write_atomic(&conflict_path, &shadow_bytes)?;
-        progress.event(Action::Warn, &format!(
-            "{} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
-            shadow_anchor.display(),
-            conflict_path.display(),
-        ));
+        // Park EVERY divergent half under `.rdc/conflicts/<env>/`
+        // (mirroring each anchor's env-tree relpath). A JSON-only shadow
+        // hides a simultaneous code/formula divergence — and when the JSON
+        // moved only by server churn (`modified_by`), that hidden half is
+        // the whole conflict. See `divergent_shadow_parts`.
+        for (shadow_anchor, shadow_bytes) in divergent_shadow_parts(
+            hash_strategy,
+            json_canonicalize_equal,
+            sidecar_diverges,
+            &local_path,
+            &code_path,
+            &remote_bytes,
+            &remote_code,
+            &local_formulas,
+            &remote_formulas,
+        ) {
+            let conflict_path = ctx.paths.conflict_shadow_path(&shadow_anchor);
+            write_atomic(&conflict_path, &shadow_bytes)?;
+            progress.event(Action::Warn, &format!(
+                "{} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
+                shadow_anchor.display(),
+                conflict_path.display(),
+            ));
+        }
         let preserved_hash: Option<String> = it.base_hash.clone();
         crate::cli::pull::common::record_object(
             ctx.lockfile,
@@ -1436,6 +1404,42 @@ fn resolve_one_conflict<R: BufRead>(
         Some(ConflictStrategy::KeepLocal) => Some(BulkChoice::AllLocal),
         Some(ConflictStrategy::Skip) | None => *bulk_sticky,
     };
+    // A conflict can straddle the JSON and its sidecar(s) at once, while the
+    // prompt below can only focus on one of them. Name every divergent half
+    // up front so the choice is informed: the resolution applies to the whole
+    // object ([k] force-pushes all local halves, [r] adopts all remote ones).
+    // Without this line a JSON diff consisting solely of server-stamped
+    // `modified_by` churn reads as "nothing really changed" — while the code
+    // sidecar the user is about to discard never appears on screen.
+    let divergent_parts = divergent_shadow_parts(
+        hash_strategy,
+        json_canonicalize_equal,
+        sidecar_diverges,
+        &local_path,
+        &code_path,
+        &remote_bytes,
+        &remote_code,
+        &local_formulas,
+        &remote_formulas,
+    );
+    if divergent_parts.len() > 1 {
+        let list = divergent_parts
+            .iter()
+            .map(|(p, _)| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        progress.event(
+            Action::Warn,
+            &format!(
+                "{}/{} conflict spans {} files: {list} — one choice covers all of them \
+                 ([k] pushes your copies, [r] adopts {env}'s)",
+                it.kind,
+                it.slug,
+                divergent_parts.len(),
+            ),
+        );
+    }
+
     let prompt_out: std::cell::RefCell<Option<PromptOutcome>> = std::cell::RefCell::new(None);
     progress.with_prompt(|| -> anyhow::Result<_> {
         let computed: PromptOutcome = if json_canonicalize_equal && sidecar_diverges {
@@ -1552,7 +1556,11 @@ fn resolve_one_conflict<R: BufRead>(
         *prompt_out.borrow_mut() = Some(computed);
         Ok(())
     })?;
-    let (resolution, code_conflict_only, prompt_local_bytes, prompt_remote_bytes, prompt_path) =
+    // The prompt's own byte pair / anchor path are informational only: the
+    // resolution below applies to the whole object, and the shadow flow
+    // parks every divergent half via `divergent_shadow_parts` rather than
+    // just the half the prompt happened to focus on.
+    let (resolution, code_conflict_only, _prompt_local_bytes, _prompt_remote_bytes, _prompt_path) =
         prompt_out
             .into_inner()
             .expect("with_prompt must populate the resolution");
@@ -1571,10 +1579,6 @@ fn resolve_one_conflict<R: BufRead>(
         }
         other => other,
     };
-
-    // Suppress unused-warning for prompt_local_bytes when no Skip arm
-    // reads it (the variable carries diagnostic value for future hooks).
-    let _ = prompt_local_bytes;
 
     match resolution {
         Resolution::KeepLocal => {
@@ -1598,6 +1602,13 @@ fn resolve_one_conflict<R: BufRead>(
             );
             sweep_conflict_artifacts(ctx.paths, &local_path);
             sweep_conflict_artifacts(ctx.paths, &code_path);
+            // Also clear the shadows parked for the OTHER divergent halves
+            // (schema formulas live under `formulas/<id>.py`, which the
+            // `local_path`/`code_path` sweep above never reached — a
+            // leftover shadow there reads as an open conflict forever).
+            for (anchor, _) in &divergent_parts {
+                sweep_conflict_artifacts(ctx.paths, anchor);
+            }
             outcome
                 .promoted_to_push
                 .push((it.kind.clone(), it.slug.clone(), local_path));
@@ -1665,6 +1676,9 @@ fn resolve_one_conflict<R: BufRead>(
             );
             sweep_conflict_artifacts(ctx.paths, &local_path);
             sweep_conflict_artifacts(ctx.paths, &code_path);
+            for (anchor, _) in &divergent_parts {
+                sweep_conflict_artifacts(ctx.paths, anchor);
+            }
         }
         Resolution::Edit(edited) => {
             // Fully-resolved edit — write bytes to disk and align base to
@@ -1692,6 +1706,9 @@ fn resolve_one_conflict<R: BufRead>(
             );
             sweep_conflict_artifacts(ctx.paths, &local_path);
             sweep_conflict_artifacts(ctx.paths, &code_path);
+            for (anchor, _) in &divergent_parts {
+                sweep_conflict_artifacts(ctx.paths, anchor);
+            }
             outcome
                 .promoted_to_push
                 .push((it.kind.clone(), it.slug.clone(), local_path));
@@ -1733,21 +1750,32 @@ fn resolve_one_conflict<R: BufRead>(
             );
         }
         Resolution::Skip => {
-            // Shadow-file fallback. Write the remote bytes (the same
-            // content the prompt would have shown) to the shadow parked
-            // under `.rdc/conflicts/<env>/` (mirroring `prompt_path`'s
-            // env-tree relpath), keep local on disk, pin the lockfile to
-            // the prior base so subsequent runs re-prompt. When the
-            // prompt was redirected to the sidecar, the shadow anchors on
-            // the sidecar; this way the user gets the remote code, not a
-            // redundant copy of an identical-to-local `.json`.
-            let conflict_path = ctx.paths.conflict_shadow_path(&prompt_path);
-            write_atomic(&conflict_path, &prompt_remote_bytes)?;
-            progress.event(Action::Warn, &format!(
-                "{} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
-                prompt_path.display(),
-                conflict_path.display(),
-            ));
+            // Shadow-file fallback. Park the remote side of every
+            // divergent half under `.rdc/conflicts/<env>/` (mirroring
+            // each anchor's env-tree relpath), keep local on disk, pin
+            // the lockfile to the prior base so subsequent runs
+            // re-prompt. Parking only the prompted half would leave the
+            // other one (a code sidecar the prompt didn't focus on)
+            // with no remote copy to reconcile against.
+            for (shadow_anchor, shadow_bytes) in divergent_shadow_parts(
+                hash_strategy,
+                json_canonicalize_equal,
+                sidecar_diverges,
+                &local_path,
+                &code_path,
+                &remote_bytes,
+                &remote_code,
+                &local_formulas,
+                &remote_formulas,
+            ) {
+                let conflict_path = ctx.paths.conflict_shadow_path(&shadow_anchor);
+                write_atomic(&conflict_path, &shadow_bytes)?;
+                progress.event(Action::Warn, &format!(
+                    "{} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
+                    shadow_anchor.display(),
+                    conflict_path.display(),
+                ));
+            }
             // When base is absent (empty lockfile, or any first-encounter
             // conflict), record `None` for the content_hash
             // so the next sync re-classifies as `BothDiverged` and re-prompts
@@ -1922,6 +1950,82 @@ fn delete_local_object(
 fn sweep_conflict_artifacts(paths: &crate::paths::Paths, local_path: &Path) {
     let _ = std::fs::remove_file(paths.conflict_shadow_path(local_path));
     let _ = std::fs::remove_file(deleted_marker_path(paths, local_path));
+}
+
+/// Every half of a split-file object whose remote side diverges from the
+/// local one, as `(anchor_path, remote_bytes)` pairs ready to be parked
+/// under `.rdc/conflicts/<env>/` (and swept from there on resolution).
+///
+/// A `BothDiverged` conflict can straddle both halves at once — the JSON
+/// *and* the code sidecar (hooks/rules) or formula sidecars (schemas).
+/// Parking only one of them (historically: the JSON whenever it moved at
+/// all) leaves the user with no copy of the other side's change, and the
+/// warning names the wrong file. That is especially misleading because a
+/// JSON divergence is frequently nothing but server-stamped `modified_by`
+/// churn: the shadow the user gets reads as "nothing really changed" while
+/// the code conflict that actually blocks the sync stays invisible.
+///
+/// Ordering is JSON-then-sidecars so the warnings read top-down like the
+/// on-disk layout. The list is never empty: a conflict whose halves all
+/// look equal (only reachable if the combined hash and the canonical
+/// projections disagree) still parks the JSON, so a conflict can never
+/// pass without leaving the user something to reconcile against.
+fn divergent_shadow_parts(
+    hash_strategy: HashStrategy,
+    json_canonicalize_equal: bool,
+    sidecar_diverges: bool,
+    local_path: &Path,
+    code_path: &Path,
+    remote_bytes: &[u8],
+    remote_code: &Option<String>,
+    local_formulas: &[(String, Vec<u8>)],
+    remote_formulas: &[(String, Vec<u8>)],
+) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut parts: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+    if !json_canonicalize_equal {
+        parts.push((local_path.to_path_buf(), remote_bytes.to_vec()));
+    }
+    if sidecar_diverges {
+        match hash_strategy {
+            HashStrategy::Hook | HashStrategy::Rule => {
+                parts.push((
+                    code_path.to_path_buf(),
+                    remote_code.clone().unwrap_or_default().into_bytes(),
+                ));
+            }
+            HashStrategy::Schema => {
+                // `code_path` is a directory sentinel for schemas — the real
+                // sidecars are `formulas/<id>.py`. Park EVERY divergent
+                // formula, not just the first: a schema edit typically moves
+                // several formulas together, and a single representative
+                // shadow silently hides the rest.
+                let queue_dir = local_path.parent().unwrap_or(local_path);
+                let formulas_dir = queue_dir.join("formulas");
+                for (rid, rbytes) in remote_formulas {
+                    let local = local_formulas
+                        .iter()
+                        .find(|(lid, _)| lid == rid)
+                        .map(|(_, b)| b);
+                    if local.map(Vec::as_slice) != Some(rbytes.as_slice()) {
+                        parts.push((formulas_dir.join(format!("{rid}.py")), rbytes.clone()));
+                    }
+                }
+                // Local-only formulas (the remote dropped them): park the
+                // local bytes so the file the user must decide about is
+                // visible in the conflicts tree next to the others.
+                for (lid, lbytes) in local_formulas {
+                    if !remote_formulas.iter().any(|(rid, _)| rid == lid) {
+                        parts.push((formulas_dir.join(format!("{lid}.py")), lbytes.clone()));
+                    }
+                }
+            }
+            HashStrategy::Flat => {}
+        }
+    }
+    if parts.is_empty() {
+        parts.push((local_path.to_path_buf(), remote_bytes.to_vec()));
+    }
+    parts
 }
 
 /// Drop a `(kind, slug)` entry from the lockfile. Used by the
@@ -3841,6 +3945,122 @@ pub async fn run(
     }
 
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod divergent_parts_tests {
+    use super::*;
+
+    fn hook_paths() -> (PathBuf, PathBuf) {
+        (
+            PathBuf::from("/p/envs/dev/hooks/validate.json"),
+            PathBuf::from("/p/envs/dev/hooks/validate.py"),
+        )
+    }
+
+    fn parts(
+        strategy: HashStrategy,
+        json_equal: bool,
+        sidecar_diverges: bool,
+        remote_code: Option<&str>,
+        local_formulas: &[(String, Vec<u8>)],
+        remote_formulas: &[(String, Vec<u8>)],
+    ) -> Vec<(PathBuf, Vec<u8>)> {
+        let (json, code) = match strategy {
+            HashStrategy::Schema => (
+                PathBuf::from("/p/envs/dev/workspaces/ws/queues/q/schema.json"),
+                PathBuf::from("/p/envs/dev/workspaces/ws/queues/q/formulas"),
+            ),
+            _ => hook_paths(),
+        };
+        divergent_shadow_parts(
+            strategy,
+            json_equal,
+            sidecar_diverges,
+            &json,
+            &code,
+            b"{\"remote\":true}",
+            &remote_code.map(str::to_string),
+            local_formulas,
+            remote_formulas,
+        )
+    }
+
+    #[test]
+    fn json_only_divergence_parks_the_json() {
+        let p = parts(HashStrategy::Hook, false, false, Some("code"), &[], &[]);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].0, hook_paths().0);
+        assert_eq!(p[0].1, b"{\"remote\":true}");
+    }
+
+    #[test]
+    fn sidecar_only_divergence_parks_the_sidecar() {
+        let p = parts(HashStrategy::Hook, true, true, Some("remote code"), &[], &[]);
+        assert_eq!(p.len(), 1, "an identical JSON must not be parked: {p:?}");
+        assert_eq!(p[0].0, hook_paths().1);
+        assert_eq!(p[0].1, b"remote code");
+    }
+
+    #[test]
+    fn both_halves_diverging_parks_both_json_first() {
+        let p = parts(HashStrategy::Hook, false, true, Some("remote code"), &[], &[]);
+        assert_eq!(
+            p.iter().map(|(a, _)| a.clone()).collect::<Vec<_>>(),
+            vec![hook_paths().0, hook_paths().1],
+            "both halves must be parked, JSON first"
+        );
+        assert_eq!(p[1].1, b"remote code");
+    }
+
+    #[test]
+    fn hook_whose_remote_dropped_its_code_parks_an_empty_sidecar() {
+        let p = parts(HashStrategy::Hook, true, true, None, &[], &[]);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].0, hook_paths().1);
+        assert!(
+            p[0].1.is_empty(),
+            "an empty shadow is how 'the env has no code here' is shown"
+        );
+    }
+
+    #[test]
+    fn schema_parks_every_divergent_formula_not_just_the_first() {
+        let f = |id: &str, body: &str| (id.to_string(), body.as_bytes().to_vec());
+        let local = vec![f("total", "a"), f("tax", "b"), f("net", "same")];
+        let remote = vec![f("total", "A"), f("tax", "B"), f("net", "same")];
+        let p = parts(HashStrategy::Schema, false, true, None, &local, &remote);
+        let names: Vec<String> = p
+            .iter()
+            .map(|(a, _)| a.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["schema.json", "total.py", "tax.py"],
+            "every divergent formula must be parked; an unchanged one must not"
+        );
+        assert_eq!(p[1].1, b"A", "formula shadows hold the REMOTE body");
+    }
+
+    #[test]
+    fn schema_parks_formulas_the_remote_dropped() {
+        let f = |id: &str, body: &str| (id.to_string(), body.as_bytes().to_vec());
+        let local = vec![f("gone", "local body")];
+        let p = parts(HashStrategy::Schema, true, true, None, &local, &[]);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].0.file_name().unwrap(), "gone.py");
+        assert_eq!(p[0].1, b"local body");
+    }
+
+    #[test]
+    fn a_conflict_with_no_visible_divergence_still_parks_something() {
+        // Defensive: combined hash says "conflict" but both projections
+        // look equal. Parking nothing would leave the user with a warning
+        // and no artifact to reconcile against.
+        let p = parts(HashStrategy::Hook, true, false, Some("code"), &[], &[]);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].0, hook_paths().0);
+    }
 }
 
 #[cfg(test)]
