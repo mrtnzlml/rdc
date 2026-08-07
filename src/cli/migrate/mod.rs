@@ -186,50 +186,6 @@ fn display_paths(paths: &[PathBuf]) -> String {
         .join(", ")
 }
 
-/// Count how many primary objects this migration will CREATE vs UPDATE in the
-/// target, by whether the remapped target JSON already exists. Mirrors the
-/// selection gate AND the un-creatable-unique-template skip of the write
-/// loop (`skip`), so the summary never overcounts files the write loop will
-/// actually skip. Used only for the migrate summary.
-fn count_create_update(
-    files: &[PathBuf],
-    tgt_root: &Path,
-    mapping: &Mapping,
-    selection: &Option<crate::cli::deploy::selection::Selection>,
-    skip: &BTreeSet<PathBuf>,
-) -> (usize, usize) {
-    let mut create = 0usize;
-    let mut update = 0usize;
-    for rel in files {
-        if skip.contains(rel) {
-            continue;
-        }
-        // `classify` covers the `rdc://`-target kinds; `classify_managed_primary`
-        // adds the workflow / MDH primary leaves it intentionally ignores but the
-        // write loop still copies — without them a migrate that writes only
-        // workflow/mdh objects reported "0 create" (an undercount).
-        let Some((kind, slug)) = classify(rel).or_else(|| classify_managed_primary(rel)) else {
-            continue;
-        };
-        if let Some(sel) = selection {
-            // workflows/mdh carry no classifiable object identity, so the write
-            // loop skips them whenever `--only` is active (see its
-            // `classify_for_selection` gate); mirror that here so the count
-            // matches what is actually written.
-            if matches!(kind, "workflows" | "mdh") || !sel.contains(kind, &slug) {
-                continue;
-            }
-        }
-        let dst = remap_relative(rel, mapping);
-        if tgt_root.join(&dst).exists() {
-            update += 1;
-        } else {
-            create += 1;
-        }
-    }
-    (create, update)
-}
-
 /// Every portable kind that can appear as a `rdc://` reference target, paired
 /// with its `Mapping` accessor. `engine_fields`/`email_templates` are never
 /// reference targets (nothing points at them), so they are omitted from the
@@ -615,7 +571,8 @@ fn transform_file(
     tgt_org_url: &str,
     migrate_score_thresholds: bool,
     src_lockfile: &crate::state::Lockfile,
-) -> Result<()> {
+    dry_run: bool,
+) -> Result<FileOutcome> {
     let src_path = src_root.join(rel);
     let dst_rel = remap_relative(rel, mapping);
     let dst_path = tgt_root.join(&dst_rel);
@@ -637,8 +594,7 @@ fn transform_file(
         } else {
             std::fs::read(&src_path).with_context(|| format!("reading {}", src_path.display()))?
         };
-        crate::snapshot::writer::write_atomic(&dst_path, &bytes)?;
-        return Ok(());
+        return settle(&dst_path, &bytes, dry_run);
     }
 
     let raw =
@@ -783,8 +739,163 @@ fn transform_file(
 
     let mut json = serde_json::to_vec_pretty(&value)?;
     json.push(b'\n');
-    crate::snapshot::writer::write_atomic(&dst_path, &json)?;
-    Ok(())
+    settle(&dst_path, &json, dry_run)
+}
+
+/// What migrating one file did (or, under `--dry-run`, would do) to the target
+/// tree. The distinction is what makes the migrate summary describe the RUN
+/// rather than the size of the snapshot: a target already holding these exact
+/// bytes is [`FileOutcome::Unchanged`] and nothing is written.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FileOutcome {
+    /// No file at the target path.
+    Created,
+    /// A file at the target path held different bytes.
+    Updated,
+    /// The target path already held exactly these bytes.
+    Unchanged,
+}
+
+/// Classify `bytes` against whatever is already at `dst_path`, then write when
+/// they differ (never under `dry_run`). A target that cannot be read for any
+/// reason other than "missing" counts as [`FileOutcome::Updated`]: we cannot
+/// prove it matches, so we write it and report a write — matching
+/// [`crate::snapshot::writer::write_atomic`], which also treats an unreadable
+/// target as "not known equal".
+fn settle(dst_path: &Path, bytes: &[u8], dry_run: bool) -> Result<FileOutcome> {
+    let outcome = match std::fs::read(dst_path) {
+        Ok(existing) if existing == bytes => FileOutcome::Unchanged,
+        Ok(_) => FileOutcome::Updated,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => FileOutcome::Created,
+        Err(_) => FileOutcome::Updated,
+    };
+    if !dry_run && outcome != FileOutcome::Unchanged {
+        crate::snapshot::writer::write_atomic(dst_path, bytes)?;
+    }
+    Ok(outcome)
+}
+
+/// What migrating an object's files did to it as a whole. Aggregated from the
+/// per-file [`FileOutcome`]s by [`record_object_status`] so the summary counts
+/// OBJECTS (what the follow-up `rdc sync <tgt>` will POST / PATCH / leave
+/// alone), not files.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ObjStatus {
+    /// The object's primary leaf was absent — `sync` will POST it.
+    Created,
+    /// The object existed and at least one of its files changed — `sync` will
+    /// PATCH it.
+    Updated,
+    /// Every one of the object's files was already byte-identical — `sync` has
+    /// nothing to do for it.
+    Unchanged,
+}
+
+/// The object a snapshot file belongs to. Extends [`classify_for_selection`]
+/// (which already maps a `.py`/`.js` sidecar and a queue formula to its owning
+/// object) with the multi-file managed kinds that have no `classify` identity of
+/// their own: every leaf under `mdh/<slug>/` or `workflows/<slug>/` belongs to
+/// that slug's object. Used only to aggregate per-file outcomes — an object must
+/// be reachable from ANY of its files, which is why this is deliberately wider
+/// than [`classify_managed_primary`].
+fn owning_object(rel: &Path) -> Option<(&'static str, String)> {
+    if let Some(hit) = classify_for_selection(rel) {
+        return Some(hit);
+    }
+    let comps: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if comps.len() < 3 {
+        return None;
+    }
+    match comps[0].as_str() {
+        "mdh" => Some(("mdh", comps[1].clone())),
+        "workflows" => Some(("workflows", comps[1].clone())),
+        _ => None,
+    }
+}
+
+/// Fold one file's outcome into its object's status. `dst_rel` is the file's
+/// path in the TARGET tree (post-remap), so the tallies describe the target env.
+///
+/// `Created` is reserved for a missing PRIMARY leaf, because that is what
+/// decides POST-vs-PATCH on the next sync: a fresh sidecar beside an existing
+/// primary is an update to an object the env already has. `Created` is never
+/// downgraded once set.
+fn record_object_status(
+    acc: &mut BTreeMap<(&'static str, String), ObjStatus>,
+    dst_rel: &Path,
+    outcome: FileOutcome,
+) {
+    let Some(key) = owning_object(dst_rel) else {
+        return;
+    };
+    let is_primary = classify(dst_rel).is_some() || classify_managed_primary(dst_rel).is_some();
+    let slot = acc.entry(key).or_insert(ObjStatus::Unchanged);
+    if *slot == ObjStatus::Created {
+        return;
+    }
+    *slot = match (is_primary, outcome) {
+        (true, FileOutcome::Created) => ObjStatus::Created,
+        (_, FileOutcome::Unchanged) => *slot,
+        _ => ObjStatus::Updated,
+    };
+}
+
+/// Directories inside the target's [`MANAGED_DIRS`] subtrees that hold no file
+/// at any depth once `pruned` is gone. Returned deepest-first (post-order), the
+/// order `remove_dir` needs.
+///
+/// A directory survives if ANY file beneath it is not being pruned — including
+/// files rdc does not manage (an old sync shadow, an editor leftover, a
+/// `.DS_Store`). Those are the user's, so their directory stays. Symlinks count
+/// as files here (`DirEntry::file_type` does not follow them), which keeps a
+/// symlinked directory from being followed or removed. An unreadable directory
+/// is assumed to be in use and left alone.
+fn emptied_dirs(tgt_root: &Path, pruned: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
+    /// Returns whether `dir` still holds a surviving file, pushing every
+    /// fully-emptied directory (children before parents) onto `out`.
+    fn walk(base: &Path, dir: &Path, pruned: &BTreeSet<PathBuf>, out: &mut Vec<PathBuf>) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return true;
+        };
+        let mut survives = false;
+        let mut children = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => children.push(path),
+                Ok(_) => {
+                    let rel = path.strip_prefix(base).unwrap_or(&path).to_path_buf();
+                    if !pruned.contains(&rel) {
+                        survives = true;
+                    }
+                }
+                // Unknown kind — assume it is a file that must be kept.
+                Err(_) => survives = true,
+            }
+        }
+        children.sort();
+        for child in children {
+            if walk(base, &child, pruned, out) {
+                survives = true;
+            }
+        }
+        if !survives {
+            out.push(dir.strip_prefix(base).unwrap_or(dir).to_path_buf());
+        }
+        survives
+    }
+
+    let mut out = Vec::new();
+    for dir in MANAGED_DIRS {
+        let managed = tgt_root.join(dir);
+        if managed.exists() {
+            walk(tgt_root, &managed, pruned, &mut out);
+        }
+    }
+    out
 }
 
 /// The bare `host[:port]` of an API base URL, e.g.
@@ -1553,10 +1664,6 @@ pub fn run_at(
     // (and let `--mirror` prune stale copies of them from the target tree).
     let tgt_lockfile = crate::state::Lockfile::load(&tgt_paths.lockfile()).unwrap_or_default();
     let unique_tpl_skips = unique_template_skips(&files, &src_root, &mapping, &tgt_lockfile);
-    // Computed AFTER unique_tpl_skips so the summary counts never include
-    // files the write loop below will skip as un-creatable duplicates.
-    let (creates, updates) =
-        count_create_update(&files, &tgt_root, &mapping, &selection, &unique_tpl_skips);
     if !unique_tpl_skips.is_empty() {
         let listing: Vec<String> = unique_tpl_skips
             .iter()
@@ -1607,8 +1714,13 @@ pub fn run_at(
         }
     }
 
-    let mut copied = 0usize;
+    // `considered` is every file the migration looked at; `written` is the
+    // subset whose bytes actually changed on disk. `obj_status` aggregates the
+    // per-file outcomes into per-object create / update / unchanged tallies.
+    let mut considered = 0usize;
+    let mut written = 0usize;
     let mut renamed = 0usize;
+    let mut obj_status: BTreeMap<(&'static str, String), ObjStatus> = BTreeMap::new();
 
     for rel in &files {
         // Un-creatable duplicate unique-typed email templates (see above).
@@ -1629,28 +1741,47 @@ pub fn run_at(
         if &dst_rel != rel {
             renamed += 1;
         }
-        copied += 1;
+        considered += 1;
 
         if dry_run {
             log.event(
                 crate::log::Action::Plan,
                 &format!("{} -> {}", rel.display(), dst_rel.display()),
             );
-        } else {
-            transform_file(
-                rel,
-                &src_root,
-                &tgt_root,
-                &mapping,
-                &subst,
-                tgt_overlay.as_ref(),
-                &tgt_org_url,
-                migrate_score_thresholds,
-                &src_lockfile,
-            )
-            .with_context(|| format!("migrating {}", rel.display()))?;
         }
+        // Runs in BOTH modes: the transform is what reveals whether the target
+        // would actually change, so `--dry-run` can only forecast the same
+        // counts the real run reports by performing it (minus the write).
+        let outcome = transform_file(
+            rel,
+            &src_root,
+            &tgt_root,
+            &mapping,
+            &subst,
+            tgt_overlay.as_ref(),
+            &tgt_org_url,
+            migrate_score_thresholds,
+            &src_lockfile,
+            dry_run,
+        )
+        .with_context(|| format!("migrating {}", rel.display()))?;
+        if outcome != FileOutcome::Unchanged {
+            written += 1;
+        }
+        record_object_status(&mut obj_status, &dst_rel, outcome);
     }
+    let creates = obj_status
+        .values()
+        .filter(|s| **s == ObjStatus::Created)
+        .count();
+    let updates = obj_status
+        .values()
+        .filter(|s| **s == ObjStatus::Updated)
+        .count();
+    let unchanged = obj_status
+        .values()
+        .filter(|s| **s == ObjStatus::Unchanged)
+        .count();
 
     // `--mirror`: prune target-only objects.
     let mut pruned = 0usize;
@@ -1669,19 +1800,42 @@ pub fn run_at(
                 std::fs::remove_file(&abs).with_context(|| format!("pruning {}", abs.display()))?;
             }
         }
+        // A pruned object's directory must go too, or the target keeps a phantom
+        // queue / dataset / engine folder forever. git cannot represent an empty
+        // directory, so this is the one part of the migration the `git diff`
+        // review below can never show — hence a log line per directory, in both
+        // modes. A failure here is reported but never aborts: the migration's
+        // real work is already on disk and correct.
+        let prune_set: BTreeSet<PathBuf> = prune.iter().cloned().collect();
+        for rel in emptied_dirs(&tgt_root, &prune_set) {
+            let abs = tgt_root.join(&rel);
+            if !dry_run
+                && let Err(e) = std::fs::remove_dir(&abs)
+            {
+                log.event(
+                    crate::log::Action::Warn,
+                    &format!("could not remove empty dir {}: {e}", rel.display()),
+                );
+                continue;
+            }
+            log.event(
+                crate::log::Action::Delete,
+                &format!("prune dir {}", rel.display()),
+            );
+        }
     }
 
     let verb = if dry_run { "would migrate" } else { "migrated" };
     log.event(
         crate::log::Action::Done,
         &format!(
-            "{verb} {copied} file(s) ({renamed} renamed, {pruned} pruned) \
-             envs/{src} -> envs/{tgt}"
+            "{verb} envs/{src} -> envs/{tgt}: {written} of {considered} file(s) changed \
+             ({renamed} renamed, {pruned} pruned)"
         ),
     );
     log.event(
         crate::log::Action::Info,
-        &format!("-> {tgt}: {updates} update, {creates} create"),
+        &format!("-> {tgt}: {creates} create, {updates} update, {unchanged} unchanged"),
     );
     if tgt_was_empty {
         log.event(
@@ -1933,26 +2087,140 @@ mod tests {
     }
 
     #[test]
-    fn count_create_update_counts_by_target_file_presence() {
-        use crate::mapping::Mapping;
-        let dir = tempfile::TempDir::new().unwrap();
-        let tgt_root = dir.path().join("prod");
-        // An existing target hook => update; a missing one => create.
-        std::fs::create_dir_all(tgt_root.join("hooks")).unwrap();
-        std::fs::write(tgt_root.join("hooks").join("existing.json"), b"{}").unwrap();
-
-        let files = vec![
-            PathBuf::from("hooks/existing.json"),
-            PathBuf::from("hooks/brand-new.json"),
-        ];
-        let (create, update) = count_create_update(
-            &files,
-            &tgt_root,
-            &Mapping::default(),
-            &None,
-            &BTreeSet::new(),
+    fn owning_object_maps_sidecars_and_multifile_kinds_to_their_object() {
+        // Primary leaves resolve to themselves.
+        assert_eq!(
+            owning_object(Path::new("hooks/extractor.json")),
+            Some(("hooks", "extractor".to_string()))
         );
-        assert_eq!((create, update), (1, 1));
+        // A code sidecar resolves to the hook that owns it, not to nothing —
+        // this is what lets a sidecar-only edit count as one object update.
+        assert_eq!(
+            owning_object(Path::new("hooks/extractor.py")),
+            Some(("hooks", "extractor".to_string()))
+        );
+        // Both leaves of a multi-file MDH dataset resolve to the same object,
+        // so a `collection.json`-only change is still attributed.
+        assert_eq!(
+            owning_object(Path::new("mdh/vendors/indexes.json")),
+            Some(("mdh", "vendors".to_string()))
+        );
+        assert_eq!(
+            owning_object(Path::new("mdh/vendors/collection.json")),
+            Some(("mdh", "vendors".to_string()))
+        );
+        // Env-level files belong to no object.
+        assert_eq!(owning_object(Path::new("organization.json")), None);
+    }
+
+    #[test]
+    fn object_status_is_created_only_when_the_primary_leaf_is_new() {
+        let mut acc = BTreeMap::new();
+        // A brand-new hook: primary missing => the object is a create, and the
+        // sidecar that follows must not downgrade it to an update.
+        record_object_status(&mut acc, Path::new("hooks/new.json"), FileOutcome::Created);
+        record_object_status(&mut acc, Path::new("hooks/new.py"), FileOutcome::Created);
+        assert_eq!(acc[&("hooks", "new".to_string())], ObjStatus::Created);
+
+        // An existing hook whose JSON is untouched but whose sidecar changed is
+        // an UPDATE — sync will PATCH it, not POST it.
+        let mut acc = BTreeMap::new();
+        record_object_status(
+            &mut acc,
+            Path::new("hooks/old.json"),
+            FileOutcome::Unchanged,
+        );
+        record_object_status(&mut acc, Path::new("hooks/old.py"), FileOutcome::Updated);
+        assert_eq!(acc[&("hooks", "old".to_string())], ObjStatus::Updated);
+
+        // A brand-new sidecar beside an existing primary is still an update:
+        // the env already has the object.
+        let mut acc = BTreeMap::new();
+        record_object_status(
+            &mut acc,
+            Path::new("hooks/old.json"),
+            FileOutcome::Unchanged,
+        );
+        record_object_status(&mut acc, Path::new("hooks/old.py"), FileOutcome::Created);
+        assert_eq!(acc[&("hooks", "old".to_string())], ObjStatus::Updated);
+
+        // Every file byte-identical => unchanged.
+        let mut acc = BTreeMap::new();
+        record_object_status(
+            &mut acc,
+            Path::new("hooks/same.json"),
+            FileOutcome::Unchanged,
+        );
+        record_object_status(&mut acc, Path::new("hooks/same.py"), FileOutcome::Unchanged);
+        assert_eq!(acc[&("hooks", "same".to_string())], ObjStatus::Unchanged);
+    }
+
+    #[test]
+    fn emptied_dirs_reports_deepest_first_and_spares_surviving_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tgt = dir.path();
+        // `mdh/gone/` loses both its files => it and nothing above it is empty.
+        std::fs::create_dir_all(tgt.join("mdh/gone")).unwrap();
+        std::fs::write(tgt.join("mdh/gone/indexes.json"), b"[]").unwrap();
+        std::fs::write(tgt.join("mdh/gone/collection.json"), b"{}").unwrap();
+        // `mdh/stays/` keeps a file, so `mdh/` itself must survive.
+        std::fs::create_dir_all(tgt.join("mdh/stays")).unwrap();
+        std::fs::write(tgt.join("mdh/stays/indexes.json"), b"[]").unwrap();
+
+        let pruned: BTreeSet<PathBuf> = [
+            PathBuf::from("mdh/gone/indexes.json"),
+            PathBuf::from("mdh/gone/collection.json"),
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(
+            emptied_dirs(tgt, &pruned),
+            vec![PathBuf::from("mdh/gone")],
+            "only the fully-emptied dataset dir is reported"
+        );
+    }
+
+    #[test]
+    fn emptied_dirs_walks_up_to_the_managed_root_when_all_of_it_goes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tgt = dir.path();
+        std::fs::create_dir_all(tgt.join("workspaces/ws/queues/q")).unwrap();
+        std::fs::write(tgt.join("workspaces/ws/queues/q/queue.json"), b"{}").unwrap();
+        // An env-level file outside MANAGED_DIRS must not keep the tree alive.
+        std::fs::write(tgt.join("organization.json"), b"{}").unwrap();
+
+        let pruned: BTreeSet<PathBuf> =
+            [PathBuf::from("workspaces/ws/queues/q/queue.json")].into_iter().collect();
+
+        assert_eq!(
+            emptied_dirs(tgt, &pruned),
+            vec![
+                PathBuf::from("workspaces/ws/queues/q"),
+                PathBuf::from("workspaces/ws/queues"),
+                PathBuf::from("workspaces/ws"),
+                PathBuf::from("workspaces"),
+            ],
+            "deepest-first, so remove_dir always sees an empty dir"
+        );
+    }
+
+    #[test]
+    fn emptied_dirs_keeps_a_dir_holding_an_unmanaged_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tgt = dir.path();
+        std::fs::create_dir_all(tgt.join("mdh/gone")).unwrap();
+        std::fs::write(tgt.join("mdh/gone/indexes.json"), b"[]").unwrap();
+        // A foreign leaf rdc never manages — the dir is not ours to remove.
+        std::fs::write(tgt.join("mdh/gone/notes.txt"), b"keep").unwrap();
+
+        let pruned: BTreeSet<PathBuf> =
+            [PathBuf::from("mdh/gone/indexes.json")].into_iter().collect();
+
+        assert!(
+            emptied_dirs(tgt, &pruned).is_empty(),
+            "a directory still holding any file must never be reported"
+        );
     }
 
     #[test]
@@ -2189,7 +2457,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false).unwrap();
 
         // File landed at the remapped path.
         let dst = tgt
@@ -2258,6 +2526,7 @@ mod tests {
             "https://tgt.example/api/v1/organizations/2",
             true,
             &src_lock,
+            false,
         )
         .unwrap();
 
@@ -2301,7 +2570,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false).unwrap();
 
         let dst = tgt.path().join("hooks/extractor-prod.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -2343,7 +2612,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false).unwrap();
 
         let dst = tgt.path().join("hooks/any-hook.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -2391,7 +2660,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false).unwrap();
 
         let dst = tgt.path().join("hooks/special-hook.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -2432,7 +2701,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false).unwrap();
 
         let dst = tgt.path().join("rules/some-rule.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -2507,6 +2776,7 @@ mod tests {
             "https://acme-test.rossum.app/api/v1/organizations/2",
             true,
             &crate::state::Lockfile::default(),
+            false,
         )
         .unwrap();
 
@@ -2555,7 +2825,7 @@ mod tests {
         fs::write(&src_file, code).unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false).unwrap();
 
         let dst = tgt.path().join("hooks/extractor-prod.py");
         assert_eq!(
@@ -2916,6 +3186,7 @@ mod tests {
             "https://tgt.example/api/v1/organizations/2",
             /* migrate_score_thresholds = */ true,
             &crate::state::Lockfile::default(),
+            false,
         )
         .unwrap();
 
@@ -2967,6 +3238,7 @@ mod tests {
             "https://tgt.example/api/v1/organizations/2",
             /* migrate_score_thresholds = */ false,
             &crate::state::Lockfile::default(),
+            false,
         )
         .unwrap();
 
