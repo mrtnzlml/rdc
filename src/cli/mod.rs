@@ -228,6 +228,16 @@ pub enum Command {
         /// default). Pass this flag to migrate the thresholds too.
         #[arg(long = "migrate-score-thresholds")]
         migrate_score_thresholds: bool,
+        /// Carry an inbox's `email_prefix` from the source env. By default it
+        /// is IGNORED: the prefix is the left-hand side of the inbox's public
+        /// address (`<email_prefix>-<hash>@<host>`), so promoting the source's
+        /// value re-addresses the target's mailbox and breaks mail sent to the
+        /// old address. A matched target keeps its own prefix and a brand-new
+        /// inbox drops the field (the server derives the target's address).
+        /// Set one deliberately per env with `[inboxes.<queue-slug>]` in the
+        /// target's `overlay.toml`. Pass this flag to migrate the prefix too.
+        #[arg(long = "migrate-email-prefixes")]
+        migrate_email_prefixes: bool,
     },
     /// Set or refresh an env's API token. Validates the token before
     /// writing to `secrets/<env>.secrets.json` (mode 0600 on Unix).
@@ -349,7 +359,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                  the target snapshot locally, review the diff, then `rdc sync <tgt>` to push it."
             )
         }
-        Some(Command::Migrate { src, tgt, mirror, dry_run, only, migrate_score_thresholds }) => {
+        Some(Command::Migrate {
+            src,
+            tgt,
+            mirror,
+            dry_run,
+            only,
+            migrate_score_thresholds,
+            migrate_email_prefixes,
+        }) => {
             let src = crate::cli::env_picker::pick_env("Migrate from which env (source)?", src)?;
             let tgt = crate::cli::env_picker::pick_env_excluding(
                 "Migrate to which env (target)?",
@@ -357,7 +375,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 &[&src],
             )?;
             // Pure-local: no remote calls, so no 401-retry wrapper needed.
-            crate::cli::migrate::run(&src, &tgt, mirror, dry_run, only, migrate_score_thresholds)
+            crate::cli::migrate::run(
+                &src,
+                &tgt,
+                mirror,
+                dry_run,
+                only,
+                migrate_score_thresholds,
+                migrate_email_prefixes,
+            )
         }
         Some(Command::Auth { env, token, username }) => {
             let env = crate::cli::env_picker::pick_env("Set token for which env?", env)?;
