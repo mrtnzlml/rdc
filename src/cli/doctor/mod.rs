@@ -5,7 +5,9 @@
 //!
 //! 1. **Pre-flight** (report-only): scan for local changes not yet pushed to
 //!    the remote and surface them, so the user knows what's on disk but not
-//!    yet on the server.
+//!    yet on the server. Also report any field longer than the API's
+//!    declared `max_length` — `rdc sync` refuses to push those, and this is
+//!    the cheapest place to find out (no network, no waiting on a listing).
 //! 2. **Slug renames** (automatic): rename local files whose slug no longer
 //!    matches their JSON `name`. Cascade-aware; no decision to make.
 //! 3. **Base-cache GC** (automatic): drop `.rdc/state/<env>.base/` files whose
@@ -35,7 +37,31 @@ pub async fn run(env: &str, dry_run: bool) -> Result<()> {
     let log = Log::new(crate::cli::resolve::detect_color_mode());
 
     // 1. Pre-flight: local changes not yet pushed to the remote (offline).
-    let unpushed = count_unpushed(&paths, &api_base)?;
+    let (unpushed, limit_violations) = scan_unpushed(&paths, &api_base)?;
+
+    // Fields the API will reject on length. Reported here — the offline
+    // pre-flight — because it is the cheapest place to learn: `rdc sync`
+    // only refuses after the remote listing, and before that check
+    // existed the value surfaced as a mid-push 400 naming just the
+    // remote id. Not auto-fixable (truncating prose would destroy
+    // meaning), so doctor reports and leaves the edit to a human.
+    for v in &limit_violations {
+        log.event(
+            Action::Warn,
+            &format!(
+                "{}/{} -- {}: {} is {} characters, the API allows {} \
+                 (shorten it by {}); `rdc sync {env}` will refuse to push until fixed",
+                v.kind,
+                v.slug,
+                v.path.display(),
+                v.field,
+                v.actual,
+                v.limit,
+                v.actual.saturating_sub(v.limit),
+            ),
+        );
+    }
+
     if unpushed > 0 {
         log.event(
             Action::Warn,
@@ -93,17 +119,24 @@ pub async fn run(env: &str, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-/// Offline count of everything a push would send: local objects whose
+/// Offline scan of everything a push would send: local objects whose
 /// content differs from the lockfile base (edits/creates) plus tombstones
-/// (local deletes). Returns 0 when there's no lockfile yet — nothing is
-/// tracked, so nothing is "unpushed".
-fn count_unpushed(paths: &Paths, api_base: &str) -> Result<usize> {
+/// (local deletes), together with any field that exceeds the API's
+/// declared `max_length`. Returns `(0, [])` when there's no lockfile yet —
+/// nothing is tracked, so nothing is "unpushed".
+fn scan_unpushed(
+    paths: &Paths,
+    api_base: &str,
+) -> Result<(usize, Vec<crate::cli::push::scan::FieldLimitViolation>)> {
     let lockfile_path = paths.lockfile();
     if !lockfile_path.exists() {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     }
     let mut lockfile = Lockfile::load(&lockfile_path)?;
     lockfile.api_base = api_base.to_string();
     let (_scanned, changes, tombstones) = crate::cli::push::scan::scan(paths, &lockfile)?;
-    Ok(changes.total() + tombstones.total())
+    Ok((
+        changes.total() + tombstones.total(),
+        changes.field_limit_violations(),
+    ))
 }
