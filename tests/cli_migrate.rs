@@ -1472,3 +1472,209 @@ fn migrate_aborts_with_file_attribution_on_inconsistent_legacy_files() {
         "no .rdc/mapping.toml may be written when conversion aborts"
     );
 }
+
+/// Write a two-file hook (JSON + `.py` sidecar) into `env`'s snapshot.
+fn write_hook(root: &std::path::Path, env: &str, slug: &str, code: &str) {
+    write(
+        &root.join(format!("envs/{env}/hooks/{slug}.json")),
+        &serde_json::json!({
+            "name": "Extractor",
+            "type": "function",
+            "events": ["annotation_content.initialize"],
+            "config": { "runtime": "python3.12" },
+        }),
+    );
+    std::fs::write(root.join(format!("envs/{env}/hooks/{slug}.py")), code).unwrap();
+}
+
+/// The summary must describe what the run DID, not how big the snapshot is. A
+/// repeat migrate over an already-mirrored target writes nothing, so it must
+/// report zero changed files and zero updates — the pre-fix output counted every
+/// file it *considered* ("2 file(s)") and every target file that merely *existed*
+/// ("1 update"), which is indistinguishable from a run that rewrote everything.
+#[test]
+fn migrate_summary_reports_nothing_changed_on_a_repeat_run() {
+    let project = init_two_env_project();
+    let root = project.path();
+    write_hook(root, "test", "extractor", "def f(): pass\n");
+
+    let first = migrate_stderr(root, &["test", "prod"]);
+    assert!(
+        first.contains("2 of 2 file(s) changed"),
+        "the first migrate writes both files: {first}"
+    );
+    assert!(
+        first.contains("1 create"),
+        "the first migrate creates the hook object: {first}"
+    );
+
+    let second = migrate_stderr(root, &["test", "prod"]);
+    assert!(
+        second.contains("0 of 2 file(s) changed"),
+        "a repeat migrate writes nothing and must say so: {second}"
+    );
+    assert!(
+        second.contains("0 update") && second.contains("1 unchanged"),
+        "an object whose files are byte-identical is unchanged, not updated: {second}"
+    );
+}
+
+/// An object counts as `update` only when its produced content actually differs.
+/// A change confined to a `.py` sidecar still updates the owning hook object —
+/// per-object status aggregates over the object's JSON *and* its sidecars.
+#[test]
+fn migrate_summary_counts_a_sidecar_only_change_as_one_update() {
+    let project = init_two_env_project();
+    let root = project.path();
+    write_hook(root, "test", "extractor", "def f(): pass\n");
+    migrate_stderr(root, &["test", "prod"]);
+
+    // Touch only the source sidecar; the hook JSON stays byte-identical.
+    std::fs::write(
+        root.join("envs/test/hooks/extractor.py"),
+        "def f(): return 1\n",
+    )
+    .unwrap();
+
+    let stderr = migrate_stderr(root, &["test", "prod"]);
+
+    assert!(
+        stderr.contains("1 of 2 file(s) changed"),
+        "only the sidecar is rewritten: {stderr}"
+    );
+    assert!(
+        stderr.contains("1 update") && stderr.contains("0 unchanged"),
+        "the owning hook object must count as exactly one update: {stderr}"
+    );
+}
+
+/// `--dry-run` must forecast the same counts the real run reports, otherwise the
+/// plan cannot be used to decide whether to run it for real.
+#[test]
+fn migrate_dry_run_forecasts_the_same_counts_as_the_real_run() {
+    let project = init_two_env_project();
+    let root = project.path();
+    write_hook(root, "test", "extractor", "def f(): pass\n");
+    migrate_stderr(root, &["test", "prod"]);
+
+    let dry = migrate_stderr(root, &["test", "prod", "--dry-run"]);
+
+    assert!(
+        dry.contains("0 of 2 file(s) changed"),
+        "dry-run over a mirrored target must forecast no writes: {dry}"
+    );
+    assert!(
+        dry.contains("0 update") && dry.contains("1 unchanged"),
+        "dry-run must forecast the same per-object status: {dry}"
+    );
+}
+
+/// `--mirror` prunes target-only object FILES; the directories they occupied
+/// must go too. git cannot represent an empty directory, so a leftover
+/// `mdh/<slug>/` is invisible in the `git diff` review the command tells the
+/// user to perform — yet it stays on disk, where every filesystem-level view of
+/// the snapshot still shows a dataset that no longer exists.
+#[test]
+fn migrate_mirror_prune_removes_the_directory_it_emptied() {
+    let project = init_two_env_project();
+    let root = project.path();
+    write(
+        &root.join("envs/test/mdh/vendors/indexes.json"),
+        &serde_json::json!([{ "name": "by_id", "key": { "id": 1 } }]),
+    );
+    // Target-only dataset: `--mirror` must prune both of its files.
+    write(
+        &root.join("envs/prod/mdh/orphan/collection.json"),
+        &serde_json::json!({ "name": "ORPHAN" }),
+    );
+    write(
+        &root.join("envs/prod/mdh/orphan/indexes.json"),
+        &serde_json::json!([]),
+    );
+
+    let stderr = migrate_stderr(root, &["test", "prod", "--mirror"]);
+
+    assert!(
+        !root.join("envs/prod/mdh/orphan/indexes.json").exists(),
+        "the target-only dataset's files must be pruned: {stderr}"
+    );
+    assert!(
+        !root.join("envs/prod/mdh/orphan").exists(),
+        "the emptied dataset directory must be removed too, not left behind: {stderr}"
+    );
+    assert!(
+        stderr.contains("prune dir mdh/orphan"),
+        "the removal must be LOGGED — `git diff` can never show it: {stderr}"
+    );
+    assert!(
+        root.join("envs/prod/mdh/vendors/indexes.json").exists(),
+        "the mirrored dataset must survive: {stderr}"
+    );
+}
+
+/// Empty-directory cleanup must never reach a directory that still holds a file
+/// rdc does not manage. A foreign file (an old sync shadow artifact, an editor
+/// leftover) is the user's, so its directory stays — pruning the managed objects
+/// around it must not delete it as collateral.
+#[test]
+fn migrate_mirror_keeps_a_pruned_directory_that_still_holds_a_foreign_file() {
+    let project = init_two_env_project();
+    let root = project.path();
+    write(
+        &root.join("envs/test/mdh/vendors/indexes.json"),
+        &serde_json::json!([]),
+    );
+    write(
+        &root.join("envs/prod/mdh/orphan/indexes.json"),
+        &serde_json::json!([]),
+    );
+    // Foreign, unmanaged leaf living beside the pruned object.
+    std::fs::write(root.join("envs/prod/mdh/orphan/notes.txt"), b"keep me").unwrap();
+
+    let stderr = migrate_stderr(root, &["test", "prod", "--mirror"]);
+
+    assert!(
+        !root.join("envs/prod/mdh/orphan/indexes.json").exists(),
+        "the managed object must still be pruned: {stderr}"
+    );
+    assert!(
+        root.join("envs/prod/mdh/orphan/notes.txt").exists(),
+        "an unmanaged file must never be deleted: {stderr}"
+    );
+    assert!(
+        root.join("envs/prod/mdh/orphan").exists(),
+        "a directory that still holds a file must be kept: {stderr}"
+    );
+}
+
+/// `--mirror --dry-run` must name the directories it would remove. They are the
+/// one part of the plan `git diff` can never show afterwards.
+#[test]
+fn migrate_mirror_dry_run_plans_the_directory_removal() {
+    let project = init_two_env_project();
+    let root = project.path();
+    write(
+        &root.join("envs/test/mdh/vendors/indexes.json"),
+        &serde_json::json!([]),
+    );
+    write(
+        &root.join("envs/prod/mdh/orphan/indexes.json"),
+        &serde_json::json!([]),
+    );
+
+    let stderr = migrate_stderr(root, &["test", "prod", "--mirror", "--dry-run"]);
+
+    assert!(
+        stderr.contains("prune dir mdh/orphan"),
+        "the plan must name the directory it would remove, distinctly from the \
+         files inside it: {stderr}"
+    );
+    assert!(
+        root.join("envs/prod/mdh/orphan/indexes.json").exists(),
+        "--dry-run must not delete anything: {stderr}"
+    );
+    assert!(
+        root.join("envs/prod/mdh/orphan").exists(),
+        "--dry-run must not remove the directory either: {stderr}"
+    );
+}
