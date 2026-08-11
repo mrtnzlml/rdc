@@ -214,6 +214,37 @@ Selector forms:
 
 Code sidecars travel with their object: selecting `hooks/<slug>` carries `hooks/<slug>.py`, selecting `schemas/<q>` carries the queue's `formulas/*.py`.
 
+### Object ids inside settings
+
+Portable `rdc://<kind>/<slug>` refs cover every *link* field, because those hold a URL. But some extensions take a bare object **id** instead — a duplicate-detection `scope.ids` / `excluded_queues` / `target_queue`, a file-storage-import `queue_id`. Those are plain integers, so the portable-ref machinery never sees them (it walks string leaves) and they would promote verbatim into the target env, pointing at objects in the wrong organization.
+
+migrate therefore remaps them: an id is paired through the same slug mapping its `rdc://` counterpart uses, and rewritten to the target env's id. Both JSON numbers and digit-strings are handled, preserving the original type. Every rewrite is logged:
+
+```
+plan   hooks/duplicates.json remapped 3 object id(s):
+  settings.configurations[0].logic[0].scope.ids[0]: 1001 -> 2001
+  settings.configurations[0].excluded_queues[0]: 1002 -> 2002
+  settings.notifications[0].queue_id: 1001 -> 2001
+```
+
+This matters because the failure it prevents is invisible: once a wrong id is in the target snapshot both sides agree, so every later migrate reports *no diff* and a diff review can never catch it.
+
+**Kind safety.** A Rossum id is unique only *within* a kind — `/queues/1010` and `/labels/1010` are different objects — and a bare integer in a settings blob carries no kind. So only ids that exactly one kind claims in the source env are remapped. An id claimed by two kinds is reported and left alone rather than guessed at:
+
+```
+warn   1 object id(s) are claimed by more than one kind in 'test' and are NOT
+       remapped — a bare id in a settings blob carries no kind, so remapping
+       could point a field at the wrong object. Pin these explicitly in
+       envs/prod/overlay.toml if any object references them:
+  1010: labels/urgent, rules/needs-review
+```
+
+One kind claiming an id under several slugs is *not* ambiguous by itself — a schema or inbox shared by several queues is snapshotted once per consuming queue and every entry carries the same remote id. That only becomes ambiguous if those slugs disagree about the target id.
+
+Scoped to deployable content: env/identity fields (`id`, `url`, `organization`, reverse-ref arrays) are owned by the identity reconcile and never touched. An object absent from the target env is left alone — `rdc sync` creates it, and the next migrate maps it.
+
+An overlay pin beats the remap, which is the escape hatch both for a large integer that is not a reference and for a deliberate per-env divergence (a target env routing a feed to a *different* queue than the source does).
+
 ### Score thresholds
 
 Confidence thresholds are tuned per queue/organization and expected to differ across envs, so migrate **ignores them by default**: a datapoint's `score_threshold` (in a schema) and a queue's `default_score_threshold` are taken from the *target* when the object already exists there, and dropped (falling back to the queue/server default) for brand-new objects. Pass `--migrate-score-thresholds` to carry the source env's values instead.

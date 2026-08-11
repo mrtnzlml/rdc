@@ -573,6 +573,8 @@ fn transform_file(
     src_lockfile: &crate::state::Lockfile,
     dry_run: bool,
     migrate_email_prefixes: bool,
+    id_remap: &IdRemap,
+    id_hits: &mut Vec<(String, u64, u64)>,
 ) -> Result<FileOutcome> {
     let src_path = src_root.join(rel);
     let dst_rel = remap_relative(rel, mapping);
@@ -719,6 +721,22 @@ fn transform_file(
         && let Some((kind, _)) = classify(rel)
     {
         reconcile_email_prefix(&mut value, kind, &dst_path);
+    }
+
+    // Remap raw numeric object ids embedded in deployable content (the stock
+    // Duplicate Handling extension's `scope.ids` / `excluded_queues` /
+    // `target_queue`, a file-storage-import `queue_id`, …). These are plain
+    // integers, so the portable-ref machinery above never sees them — it walks
+    // string leaves and resolves to URLs. Without this they promote verbatim and
+    // point at the SOURCE org's objects forever, invisibly: once the wrong id is
+    // in the target snapshot, both sides agree and every later migrate shows no
+    // diff. Kind-safe by construction (see `IdRemap`), and runs BEFORE the
+    // overlay so an explicit overlay pin still wins — which is also the escape
+    // hatch for a large integer that is NOT a reference.
+    if let Some((kind, _)) = classify(rel)
+        && let Some(codec) = crate::snapshot::codec::codec(kind)
+    {
+        remap_object_ids(&mut value, codec, id_remap, id_hits);
     }
 
     // Apply the tgt overlay for this object. A kind-wide default lives under the
@@ -988,6 +1006,205 @@ fn strip_source_host_env_refs(
             // between the create and update paths (non-deterministic bytes).
             obj.shift_remove(&field);
         }
+    }
+}
+
+/// Cross-env object-id remap: source id -> target id, for RAW NUMERIC ids
+/// embedded in deployable content.
+///
+/// Portable `rdc://<kind>/<slug>` refs cover every *link* field, because those
+/// hold a URL. But some extensions take a bare object **id** instead — e.g. the
+/// Duplicate Handling extension's `settings…scope.ids` / `excluded_queues` /
+/// `target_queue`, or a file-storage-import `queue_id`. Those are plain
+/// integers, so [`crate::snapshot::refs`] never sees them (it walks string
+/// leaves only) and they promote verbatim into the target env, where they point
+/// at objects in the wrong organization. Worse, once a wrong id is in the target
+/// snapshot both sides agree and every later migrate reports NO diff, so a diff
+/// review cannot catch it.
+///
+/// # Kind safety
+///
+/// A Rossum id is unique only **within a kind** — `/queues/1010` and
+/// `/labels/1010` are different objects — and a bare integer inside a `settings`
+/// blob carries no kind. So the map is built from ids that exactly ONE kind
+/// claims in the source env. An id claimed by two kinds is AMBIGUOUS and is
+/// deliberately excluded rather than guessed at, because remapping it could
+/// silently turn a label id into a queue id. Ambiguous ids are reported so the
+/// user can pin the field explicitly in `overlay.toml` instead.
+///
+/// One kind claiming an id under several slugs is NOT ambiguous by itself: a
+/// schema or inbox shared by many queues is snapshotted once per consuming queue
+/// and every entry carries the same remote id. That only becomes ambiguous if
+/// those slugs disagree about the target id.
+///
+/// Non-portable kinds (`organization`, `mdh_indexes`) are skipped, mirroring
+/// [`crate::snapshot::refs::is_portable_kind`]: the organization is a per-env
+/// singleton reconciled separately, and `mdh_indexes` carry the sentinel
+/// `id: 0`.
+#[derive(Debug, Default)]
+struct IdRemap {
+    /// Source id -> target id. Kind-safe: only ids uniquely owned by one kind.
+    map: BTreeMap<u64, u64>,
+    /// Source ids claimed by more than one kind (or whose slugs disagree about
+    /// the target), with the claimants, for a warning. Never remapped.
+    ambiguous: Vec<(u64, Vec<String>)>,
+}
+
+impl IdRemap {
+    fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
+
+/// Build the [`IdRemap`] by pairing the two lockfiles through the slug
+/// `subst` map, so an id follows exactly the same slug remapping its
+/// `rdc://` counterpart would.
+fn build_id_remap(
+    src_lockfile: &crate::state::Lockfile,
+    tgt_lockfile: &crate::state::Lockfile,
+    subst: &BTreeMap<String, String>,
+) -> IdRemap {
+    use crate::snapshot::refs::{RDC_SCHEME, is_portable_kind, parse_rdc_ref};
+
+    // Which (kind, slug) pairs claim each source id.
+    let mut claims: BTreeMap<u64, Vec<(&str, &str)>> = BTreeMap::new();
+    for (kind, entries) in &src_lockfile.objects {
+        if !is_portable_kind(kind) {
+            continue;
+        }
+        for (slug, entry) in entries {
+            if entry.id != 0 {
+                claims.entry(entry.id).or_default().push((kind, slug));
+            }
+        }
+    }
+
+    let mut out = IdRemap::default();
+    for (src_id, owners) in claims {
+        let kinds: std::collections::BTreeSet<&str> = owners.iter().map(|(k, _)| *k).collect();
+        if kinds.len() > 1 {
+            out.ambiguous.push((
+                src_id,
+                owners.iter().map(|(k, s)| format!("{k}/{s}")).collect(),
+            ));
+            continue;
+        }
+        // Resolve every claiming slug to a target id; they must agree.
+        let targets: std::collections::BTreeSet<u64> = owners
+            .iter()
+            .filter_map(|(kind, slug)| {
+                let tgt_slug = subst
+                    .get(&format!("{RDC_SCHEME}{kind}/{slug}"))
+                    .and_then(|r| parse_rdc_ref(r))
+                    .map(|(_, s)| s)
+                    .unwrap_or(slug);
+                tgt_lockfile
+                    .objects
+                    .get(*kind)
+                    .and_then(|m| m.get(tgt_slug))
+                    .map(|e| e.id)
+                    .filter(|id| *id != 0)
+            })
+            .collect();
+        match targets.len() {
+            // Not in the target env yet (a brand-new object): leave the id
+            // alone. `rdc sync` creates the object, and the next migrate maps it.
+            0 => {}
+            1 => {
+                let tgt_id = *targets.iter().next().expect("len checked");
+                if tgt_id != src_id {
+                    out.map.insert(src_id, tgt_id);
+                }
+            }
+            _ => out.ambiguous.push((
+                src_id,
+                owners.iter().map(|(k, s)| format!("{k}/{s}")).collect(),
+            )),
+        }
+    }
+    out
+}
+
+/// Rewrite every raw source id in `value`'s DEPLOYABLE content to its target
+/// counterpart, appending `(path, from, to)` for each rewrite.
+///
+/// Scoped to the fields `cross_env_body` KEEPS — the inverse of
+/// [`strip_source_host_env_refs`]. Env/identity fields (`id`, `url`,
+/// `organization`, reverse-ref arrays, …) are owned by
+/// [`reconcile_target_identity`] and must not be touched here: after that
+/// reconcile they already hold the TARGET's values, and a target id can
+/// coincide with some unrelated source id.
+///
+/// Both JSON numbers and digit-strings are rewritten, preserving the original
+/// type — `file-storage-import` stores `queue_id` as a string (`"1001"`) while
+/// duplicate detection stores ints. A digit-string is only considered when it
+/// round-trips exactly, so `"007"` is never treated as id `7`.
+fn remap_object_ids(
+    value: &mut serde_json::Value,
+    codec: &'static dyn crate::snapshot::codec::KindCodec,
+    remap: &IdRemap,
+    hits: &mut Vec<(String, u64, u64)>,
+) {
+    if remap.is_empty() || !value.is_object() {
+        return;
+    }
+    // Env fields = top-level keys present in the full body but removed by
+    // `cross_env_body` (probe on a clone so `value` is untouched). Same
+    // derivation `reconcile_target_identity` / `strip_source_host_env_refs` use.
+    let mut probe = value.clone();
+    codec.cross_env_body(&mut probe);
+    let deployable: std::collections::BTreeSet<String> = probe
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    for (key, field) in obj.iter_mut() {
+        if deployable.contains(key.as_str()) {
+            walk_remap_ids(field, key, &remap.map, hits);
+        }
+    }
+}
+
+/// Recursive worker for [`remap_object_ids`]. `path` is a dotted/indexed trail
+/// used only for the log line.
+fn walk_remap_ids(
+    value: &mut serde_json::Value,
+    path: &str,
+    map: &BTreeMap<u64, u64>,
+    hits: &mut Vec<(String, u64, u64)>,
+) {
+    match value {
+        serde_json::Value::Number(n) => {
+            if let Some(src) = n.as_u64()
+                && let Some(&tgt) = map.get(&src)
+            {
+                *value = serde_json::Value::from(tgt);
+                hits.push((path.to_string(), src, tgt));
+            }
+        }
+        serde_json::Value::String(s) => {
+            if let Ok(src) = s.parse::<u64>()
+                // Only an exact round-trip is an id ("007" is not id 7).
+                && src.to_string() == *s
+                && let Some(&tgt) = map.get(&src)
+            {
+                *s = tgt.to_string();
+                hits.push((path.to_string(), src, tgt));
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (i, item) in items.iter_mut().enumerate() {
+                walk_remap_ids(item, &format!("{path}[{i}]"), map, hits);
+            }
+        }
+        serde_json::Value::Object(m) => {
+            for (k, v) in m.iter_mut() {
+                walk_remap_ids(v, &format!("{path}.{k}"), map, hits);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1795,6 +2012,29 @@ pub fn run_at(
         }
     }
 
+    // Raw numeric object ids embedded in deployable content follow the same slug
+    // mapping their `rdc://` counterparts do. Built once for the whole run; an
+    // id no single kind owns is left out and warned about rather than guessed.
+    let id_remap = build_id_remap(&src_lockfile, &tgt_lockfile, &subst);
+    if !id_remap.ambiguous.is_empty() {
+        let listing: Vec<String> = id_remap
+            .ambiguous
+            .iter()
+            .map(|(id, owners)| format!("  {id}: {}", owners.join(", ")))
+            .collect();
+        log.event(
+            crate::log::Action::Warn,
+            &format!(
+                "{} object id(s) are claimed by more than one kind in '{src}' and are NOT \
+                 remapped — a bare id in a settings blob carries no kind, so remapping \
+                 could point a field at the wrong object. Pin these explicitly in \
+                 envs/{tgt}/overlay.toml if any object references them:\n{}",
+                id_remap.ambiguous.len(),
+                listing.join("\n"),
+            ),
+        );
+    }
+
     // `considered` is every file the migration looked at; `written` is the
     // subset whose bytes actually changed on disk. `obj_status` aggregates the
     // per-file outcomes into per-object create / update / unchanged tallies.
@@ -1802,6 +2042,7 @@ pub fn run_at(
     let mut written = 0usize;
     let mut renamed = 0usize;
     let mut obj_status: BTreeMap<(&'static str, String), ObjStatus> = BTreeMap::new();
+    let mut id_hits: Vec<(String, u64, u64)> = Vec::new();
 
     for rel in &files {
         // Un-creatable duplicate unique-typed email templates (see above).
@@ -1833,6 +2074,7 @@ pub fn run_at(
         // Runs in BOTH modes: the transform is what reveals whether the target
         // would actually change, so `--dry-run` can only forecast the same
         // counts the real run reports by performing it (minus the write).
+        let hits_before = id_hits.len();
         let outcome = transform_file(
             rel,
             &src_root,
@@ -1845,10 +2087,29 @@ pub fn run_at(
             &src_lockfile,
             dry_run,
             migrate_email_prefixes,
+            &id_remap,
+            &mut id_hits,
         )
         .with_context(|| format!("migrating {}", rel.display()))?;
         if outcome != FileOutcome::Unchanged {
             written += 1;
+        }
+        // Report the id rewrites this file needed. Silent remapping would be the
+        // very thing that made the original bug invisible, so each one is named.
+        if id_hits.len() > hits_before {
+            let listing: Vec<String> = id_hits[hits_before..]
+                .iter()
+                .map(|(path, from, to)| format!("  {path}: {from} -> {to}"))
+                .collect();
+            log.event(
+                crate::log::Action::Plan,
+                &format!(
+                    "{} remapped {} object id(s):\n{}",
+                    dst_rel.display(),
+                    listing.len(),
+                    listing.join("\n"),
+                ),
+            );
         }
         record_object_status(&mut obj_status, &dst_rel, outcome);
     }
@@ -2371,6 +2632,241 @@ mod tests {
         assert_eq!(v2["email"], "inbox-abc@org-test.rossum.app", "target-host email must be kept");
     }
 
+    // ---- object-id remap ------------------------------------------------
+
+    fn entry(id: u64) -> crate::state::ObjectEntry {
+        crate::state::ObjectEntry { id, modified_at: None, content_hash: None, secrets_hash: None }
+    }
+
+    #[test]
+    fn id_remap_follows_the_slug_rename() {
+        use crate::state::Lockfile;
+        let mut src = Lockfile::default();
+        src.upsert("queues", "invoices", entry(100));
+        let mut tgt = Lockfile::default();
+        tgt.upsert("queues", "invoices-prod", entry(200));
+
+        let mut m = Mapping::default();
+        m.queues.insert("invoices".into(), "invoices-prod".into());
+
+        let remap = build_id_remap(&src, &tgt, &build_subst(&m));
+        assert_eq!(remap.map.get(&100), Some(&200), "id must follow its slug rename");
+        assert!(remap.ambiguous.is_empty());
+    }
+
+    #[test]
+    fn id_remap_refuses_cross_kind_ambiguous_id() {
+        use crate::state::Lockfile;
+        // Rossum ids are unique only WITHIN a kind, and a bare integer in a
+        // settings blob carries no kind. Remapping 1010 here could turn a label
+        // reference into a rule reference, so it must be refused, not guessed.
+        let mut src = Lockfile::default();
+        src.upsert("rules", "needs-review", entry(1010));
+        src.upsert("labels", "urgent", entry(1010));
+        src.upsert("queues", "invoices", entry(100));
+        let mut tgt = Lockfile::default();
+        tgt.upsert("rules", "needs-review", entry(2010));
+        tgt.upsert("labels", "urgent", entry(3010));
+        tgt.upsert("queues", "invoices", entry(200));
+
+        let remap = build_id_remap(&src, &tgt, &build_subst(&Mapping::default()));
+        assert!(!remap.map.contains_key(&1010), "kind-ambiguous id must NOT be remapped");
+        assert_eq!(remap.map.get(&100), Some(&200), "unambiguous ids still map");
+        let owners = &remap.ambiguous.iter().find(|(id, _)| *id == 1010).expect("reported").1;
+        assert_eq!(owners, &vec!["labels/urgent".to_string(), "rules/needs-review".to_string()]);
+    }
+
+    #[test]
+    fn id_remap_allows_one_id_shared_by_several_slugs_of_one_kind() {
+        use crate::state::Lockfile;
+        // A schema shared by several queues is snapshotted once per consuming
+        // queue, so one remote id legitimately appears under several slugs.
+        // That is not ambiguous while the slugs agree on the target.
+        let mut src = Lockfile::default();
+        src.upsert("schemas", "invoices", entry(500));
+        src.upsert("schemas", "credit-notes", entry(500));
+        let mut tgt = Lockfile::default();
+        tgt.upsert("schemas", "invoices", entry(600));
+        tgt.upsert("schemas", "credit-notes", entry(600));
+
+        let remap = build_id_remap(&src, &tgt, &build_subst(&Mapping::default()));
+        assert_eq!(remap.map.get(&500), Some(&600));
+        assert!(remap.ambiguous.is_empty());
+    }
+
+    #[test]
+    fn id_remap_refuses_when_shared_slugs_disagree_on_target() {
+        use crate::state::Lockfile;
+        let mut src = Lockfile::default();
+        src.upsert("schemas", "invoices", entry(500));
+        src.upsert("schemas", "credit-notes", entry(500));
+        let mut tgt = Lockfile::default();
+        tgt.upsert("schemas", "invoices", entry(600));
+        tgt.upsert("schemas", "credit-notes", entry(601)); // diverged in target
+
+        let remap = build_id_remap(&src, &tgt, &build_subst(&Mapping::default()));
+        assert!(!remap.map.contains_key(&500), "conflicting targets must not be guessed");
+        assert_eq!(remap.ambiguous.len(), 1);
+    }
+
+    #[test]
+    fn id_remap_skips_objects_absent_from_the_target() {
+        use crate::state::Lockfile;
+        // Two-phase: the object does not exist in the target env yet. Leave the
+        // id alone; `rdc sync` creates the object and the next migrate maps it.
+        let mut src = Lockfile::default();
+        src.upsert("email_templates", "q/notify", entry(700));
+        let remap = build_id_remap(&src, &Lockfile::default(), &build_subst(&Mapping::default()));
+        assert!(remap.map.is_empty());
+        assert!(remap.ambiguous.is_empty(), "absent is not ambiguous");
+    }
+
+    #[test]
+    fn id_remap_skips_non_portable_kinds() {
+        use crate::state::Lockfile;
+        // `organization` is a per-env singleton reconciled separately and
+        // `mdh_indexes` carry the sentinel id 0.
+        let mut src = Lockfile::default();
+        src.upsert("organization", "organization", entry(11));
+        src.upsert("mdh_indexes", "vendors", entry(0));
+        let mut tgt = Lockfile::default();
+        tgt.upsert("organization", "organization", entry(22));
+        tgt.upsert("mdh_indexes", "vendors", entry(0));
+
+        let remap = build_id_remap(&src, &tgt, &build_subst(&Mapping::default()));
+        assert!(remap.map.is_empty(), "non-portable kinds must not take part");
+    }
+
+    #[test]
+    fn remap_rewrites_numbers_and_digit_strings_preserving_type() {
+        let codec = crate::snapshot::codec::codec("hooks").unwrap();
+        let remap = IdRemap { map: BTreeMap::from([(100, 200)]), ambiguous: vec![] };
+        let mut v = serde_json::json!({
+            "name": "Duplicates",
+            "settings": {
+                // Duplicate Handling stores ints; file-storage-import stores strings.
+                "scope": { "ids": [100] },
+                "target_queue": 100,
+                "notifications": [{ "queue_id": "100" }],
+                "grace_hours": 2
+            }
+        });
+        let mut hits = Vec::new();
+        remap_object_ids(&mut v, codec, &remap, &mut hits);
+
+        assert_eq!(v["settings"]["scope"]["ids"][0], serde_json::json!(200));
+        assert_eq!(v["settings"]["target_queue"], serde_json::json!(200));
+        assert_eq!(
+            v["settings"]["notifications"][0]["queue_id"],
+            serde_json::json!("200"),
+            "a digit-string id must stay a string"
+        );
+        assert_eq!(v["settings"]["grace_hours"], serde_json::json!(2), "non-ids untouched");
+        assert_eq!(hits.len(), 3, "every rewrite is reported: {hits:?}");
+    }
+
+    #[test]
+    fn remap_leaves_env_identity_fields_alone() {
+        let codec = crate::snapshot::codec::codec("hooks").unwrap();
+        // After `reconcile_target_identity` these already hold the TARGET's
+        // values, and a target id can coincide with an unrelated source id.
+        let remap = IdRemap { map: BTreeMap::from([(100, 200)]), ambiguous: vec![] };
+        let mut v = serde_json::json!({
+            "id": 100,
+            "url": "https://acme-test.rossum.app/api/v1/hooks/100",
+            "organization": 100,
+            "token_owner": "https://acme-test.rossum.app/api/v1/users/100",
+            "settings": { "queue_id": 100 }
+        });
+        let mut hits = Vec::new();
+        remap_object_ids(&mut v, codec, &remap, &mut hits);
+
+        assert_eq!(v["id"], serde_json::json!(100), "identity id must not be remapped");
+        assert_eq!(v["organization"], serde_json::json!(100), "env field untouched");
+        assert_eq!(v["settings"]["queue_id"], serde_json::json!(200), "deployable content mapped");
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn remap_ignores_digit_strings_that_do_not_round_trip() {
+        let codec = crate::snapshot::codec::codec("hooks").unwrap();
+        let remap = IdRemap { map: BTreeMap::from([(7, 9)]), ambiguous: vec![] };
+        let mut v = serde_json::json!({ "settings": { "code": "007", "real": "7" } });
+        let mut hits = Vec::new();
+        remap_object_ids(&mut v, codec, &remap, &mut hits);
+        assert_eq!(v["settings"]["code"], serde_json::json!("007"), "\"007\" is not id 7");
+        assert_eq!(v["settings"]["real"], serde_json::json!("9"));
+    }
+
+    #[test]
+    fn transform_remaps_settings_ids_but_an_overlay_pin_still_wins() {
+        use crate::state::Lockfile;
+        use std::fs;
+        let src = tempfile::TempDir::new().unwrap();
+        let tgt = tempfile::TempDir::new().unwrap();
+
+        let rel = Path::new("hooks/duplicates.json");
+        let src_file = src.path().join(rel);
+        fs::create_dir_all(src_file.parent().unwrap()).unwrap();
+        fs::write(
+            &src_file,
+            serde_json::to_vec(&serde_json::json!({
+                "name": "Duplicates",
+                "settings": { "scope": { "ids": [100] }, "pinned_queue": 100 }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut src_lock = Lockfile::default();
+        src_lock.upsert("queues", "invoices", entry(100));
+        let mut tgt_lock = Lockfile::default();
+        tgt_lock.upsert("queues", "invoices", entry(200));
+
+        let m = Mapping::default();
+        let subst = build_subst(&m);
+        let remap = build_id_remap(&src_lock, &tgt_lock, &subst);
+
+        // The overlay pins one field to a deliberate value; it must beat the
+        // automatic remap, which is the documented escape hatch for an integer
+        // that only looks like a reference.
+        let overlay: Overlay = toml::from_str(
+            "version = 1\n[hooks.duplicates]\nsettings.pinned_queue = 999\n",
+        )
+        .unwrap();
+
+        let mut hits = Vec::new();
+        transform_file(
+            rel,
+            src.path(),
+            tgt.path(),
+            &m,
+            &subst,
+            Some(&overlay),
+            "https://tgt.example/api/v1/organizations/2",
+            true,
+            &src_lock,
+            false,
+            false,
+            &remap,
+            &mut hits,
+        )
+        .unwrap();
+
+        let out: serde_json::Value =
+            serde_json::from_slice(&fs::read(tgt.path().join(rel)).unwrap()).unwrap();
+        assert_eq!(
+            out["settings"]["scope"]["ids"][0],
+            serde_json::json!(200),
+            "un-pinned id must be remapped to the target env"
+        );
+        assert_eq!(
+            out["settings"]["pinned_queue"],
+            serde_json::json!(999),
+            "an explicit overlay pin must override the remap"
+        );
+    }
+
     fn mapping_with_renames() -> Mapping {
         let mut m = Mapping::default();
         // hook renamed, label identity (not present => identity fallback)
@@ -2539,7 +3035,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new()).unwrap();
 
         // File landed at the remapped path.
         let dst = tgt
@@ -2610,6 +3106,8 @@ mod tests {
             &src_lock,
             false,
             false,
+            &IdRemap::default(),
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -2653,7 +3151,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("hooks/extractor-prod.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -2695,7 +3193,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("hooks/any-hook.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -2743,7 +3241,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("hooks/special-hook.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -2784,7 +3282,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("rules/some-rule.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -2861,6 +3359,8 @@ mod tests {
             &crate::state::Lockfile::default(),
             false,
             false,
+            &IdRemap::default(),
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -2909,7 +3409,7 @@ mod tests {
         fs::write(&src_file, code).unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("hooks/extractor-prod.py");
         assert_eq!(
@@ -3327,6 +3827,8 @@ mod tests {
             &crate::state::Lockfile::default(),
             false,
             /* migrate_email_prefixes = */ false,
+            &IdRemap::default(),
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -3380,6 +3882,8 @@ mod tests {
             &crate::state::Lockfile::default(),
             false,
             /* migrate_email_prefixes = */ false,
+            &IdRemap::default(),
+            &mut Vec::new(),
         )
         .unwrap();
 
