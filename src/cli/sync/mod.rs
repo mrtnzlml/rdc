@@ -227,13 +227,6 @@ pub(crate) async fn run_cycle(
         .get(env)
         .ok_or_else(|| anyhow!("env '{env}' is not defined in rdc.toml"))?;
 
-    let token = match token_override {
-        Some(t) => t,
-        None => resolve_token(&cwd, env, &env_cfg.api_base).await?,
-    };
-    let client = RossumClient::new(env_cfg.api_base.clone(), token.clone())
-        .context("constructing Rossum API client")?;
-
     let mut lockfile = Lockfile::load(&paths.lockfile())?;
     // Set the env's api_base so the lockfile can DERIVE object URLs from
     // ids (push ref resolution, deploy cross-ref rewriting). Without this an
@@ -258,6 +251,34 @@ pub(crate) async fn run_cycle(
         renderer.unwrap_or_else(|| Log::new(crate::cli::resolve::detect_color_mode()));
     let started = std::time::Instant::now();
 
+    // Phase 0: offline pre-flight. Scanning the local tree needs nothing
+    // but the lockfile, and both validations below are decidable from
+    // local bytes — so they run before the token is resolved and before a
+    // single remote call. `resolve_token` can perform a network login and
+    // rewrite `secrets/<env>.secrets.json`; there is no reason to pay for
+    // that on a cycle that cannot proceed.
+    //
+    // The scan result is reused by the classify phase below, so the tree
+    // is still walked and hashed exactly once.
+    let (_scanned, changes, tombstones) = crate::cli::push::scan::scan(&paths, &lockfile)?;
+    let parse_errors = changes.json_parse_errors();
+    let limit_violations = changes.field_limit_violations();
+
+    // `--no-push` is an audit mode: there is nothing to half-apply, so it
+    // proceeds and merely reports. `--dry-run` proceeds too — its job is
+    // to print the COMPLETE plan, and it already surfaces both classes in
+    // dedicated sections further down.
+    if !no_push && !dry_run {
+        refuse_on_offline_defects(&parse_errors, &limit_violations)?;
+    }
+
+    let token = match token_override {
+        Some(t) => t,
+        None => resolve_token(&cwd, env, &env_cfg.api_base).await?,
+    };
+    let client = RossumClient::new(env_cfg.api_base.clone(), token.clone())
+        .context("constructing Rossum API client")?;
+
     // Phase 1: list remote. Mirrors `pull::run`'s `PullCtx` construction
     // verbatim so the listing semantics are identical.
     let catalog = {
@@ -270,10 +291,6 @@ pub(crate) async fn run_cycle(
         };
         crate::cli::pull::common::list_remote(&mut ctx, env_cfg, env, &token, &progress).await?
     };
-
-    // Phase 2: scan local. Reuses the push scanner unchanged so behavior
-    // matches `push --dry-run` byte for byte.
-    let (_scanned, changes, tombstones) = crate::cli::push::scan::scan(&paths, &lockfile)?;
 
     // Surface queue-slug collisions: two queue dirs sharing a slug across
     // workspaces collapse onto one lockfile entry, so one is re-pushed every
@@ -299,20 +316,6 @@ pub(crate) async fn run_cycle(
     // lockfile recorded on last pull.
     let classified =
         from_catalog_scan_lockfile(&catalog, &changes, &tombstones, &lockfile)?;
-
-    // Changed local files that don't parse as JSON. Surfaced as a
-    // dedicated dry-run section, and a hard refusal before any push —
-    // otherwise the file rides classification on its raw-byte hash and
-    // only explodes mid-push, after earlier kinds already landed.
-    let parse_errors = changes.json_parse_errors();
-
-    // Changed local files with a field longer than the API's declared
-    // `max_length`. Same treatment as `parse_errors`, and for the same
-    // reason: the value is a *permanent* push failure (no retry can
-    // succeed while the bytes stay oversized), so letting it reach the
-    // wire means every later sync dies at that PATCH — and since push
-    // runs before pull, no pull ever lands again.
-    let limit_violations = changes.field_limit_violations();
 
     // Classification computed; grid renderer rebuild handled elsewhere.
 
@@ -541,51 +544,6 @@ pub(crate) async fn run_cycle(
             );
         }
         return Ok(CycleOutcome::default());
-    }
-
-    // Refuse to push with unparseable local files — fail BEFORE the first
-    // remote write so a malformed file can never cause a partial push.
-    // `--no-push` (audit) proceeds: there is nothing to half-apply.
-    if !no_push && !parse_errors.is_empty() {
-        let mut msg = format!(
-            "{} changed local file(s) are not valid JSON; refusing to push before any remote write:",
-            parse_errors.len()
-        );
-        for e in &parse_errors {
-            use std::fmt::Write as _;
-            let _ = write!(msg, "\n  - {}/{} -- {}: {}", e.kind, e.slug, e.path.display(), e.error);
-        }
-        anyhow::bail!("{msg}");
-    }
-
-    // Refuse to push a field the API will reject on length. Unlike a
-    // transient API error this can never succeed on retry, so attempting
-    // it would abort the cycle before the pull phase every single run —
-    // wedging the project until a human notices. Failing here instead
-    // keeps the remote untouched and names exactly what to shorten.
-    // `--no-push` (audit) proceeds: there is nothing to half-apply.
-    if !no_push && !limit_violations.is_empty() {
-        let mut msg = format!(
-            "{} changed local field(s) exceed the Rossum API's length limit; \
-             refusing to push before any remote write:",
-            limit_violations.len()
-        );
-        for v in &limit_violations {
-            use std::fmt::Write as _;
-            let _ = write!(
-                msg,
-                "\n  - {}/{} -- {}: {} is {} characters, the API allows {} \
-                 (shorten it by {})",
-                v.kind,
-                v.slug,
-                v.path.display(),
-                v.field,
-                v.actual,
-                v.limit,
-                v.actual.saturating_sub(v.limit),
-            );
-        }
-        anyhow::bail!("{msg}");
     }
 
     // Phase 5: execute. The destructive-delete gate (`--allow-deletes`)
@@ -1496,6 +1454,63 @@ pub fn from_catalog_scan_lockfile(
         &scan_tombstones,
         &locked,
     ))
+}
+
+/// Refuse a push over defects that are knowable from local bytes alone.
+///
+/// Both classes are *permanent*: an unparseable file and an over-length
+/// field can never be accepted by the server, so attempting the push
+/// aborts the cycle before the pull phase on every single run — wedging
+/// the project until a human notices. Raising them here keeps the remote
+/// untouched and names exactly what to fix.
+fn refuse_on_offline_defects(
+    parse_errors: &[crate::cli::push::scan::JsonParseError],
+    limit_violations: &[crate::cli::push::scan::FieldLimitViolation],
+) -> Result<()> {
+    use std::fmt::Write as _;
+
+    if !parse_errors.is_empty() {
+        let mut msg = format!(
+            "{} changed local file(s) are not valid JSON; refusing to push before any remote write:",
+            parse_errors.len()
+        );
+        for e in parse_errors {
+            let _ = write!(
+                msg,
+                "\n  - {}/{} -- {}: {}",
+                e.kind,
+                e.slug,
+                e.path.display(),
+                e.error
+            );
+        }
+        anyhow::bail!("{msg}");
+    }
+
+    if !limit_violations.is_empty() {
+        let mut msg = format!(
+            "{} changed local field(s) exceed the Rossum API's length limit; \
+             refusing to push before any remote write:",
+            limit_violations.len()
+        );
+        for v in limit_violations {
+            let _ = write!(
+                msg,
+                "\n  - {}/{} -- {}: {} is {} characters, the API allows {} \
+                 (shorten it by {})",
+                v.kind,
+                v.slug,
+                v.path.display(),
+                v.field,
+                v.actual,
+                v.limit,
+                v.actual.saturating_sub(v.limit),
+            );
+        }
+        anyhow::bail!("{msg}");
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

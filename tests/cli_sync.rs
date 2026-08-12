@@ -11726,3 +11726,85 @@ async fn sync_dry_run_reports_oversized_field() {
         "dry run must name the offending field: {combined}"
     );
 }
+
+/// An over-length field is knowable from local bytes alone. `sync` must
+/// refuse without issuing a single request — no token resolution, no
+/// remote listing. Before the pre-flight was hoisted this scenario cost
+/// 13 list calls before failing.
+#[tokio::test]
+async fn sync_refuses_oversized_field_before_any_network_call() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let rules_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [{
+            "id": 2597,
+            "url": format!("{}/api/v1/rules/2597", server.uri()),
+            "name": "Example Rule",
+            "description": "short",
+            "queues": [],
+            "modified_at": "2026-04-20T08:00:00Z"
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/rules"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(rules_body))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &["/api/v1/rules"]).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // Pull once so the lockfile has a base for the rule.
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev", "--no-push", "--yes"])
+        .assert()
+        .success();
+
+    // Lengthen `description` past the 255-char cap.
+    let json_path = project.path().join("envs/dev/rules/example-rule.json");
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+    v.as_object_mut().unwrap().insert(
+        "description".to_string(),
+        serde_json::Value::String("x".repeat(300)),
+    );
+    std::fs::write(&json_path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+
+    let before = server.received_requests().await.unwrap_or_default().len();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("the API allows 255"));
+
+    let after = server.received_requests().await.unwrap_or_default().len();
+    assert_eq!(
+        before, after,
+        "sync must refuse an over-length field without issuing ANY request; \
+         it made {} call(s) before failing",
+        after - before
+    );
+}
