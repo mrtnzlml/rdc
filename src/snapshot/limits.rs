@@ -56,6 +56,14 @@ pub struct LimitViolation {
     pub actual: usize,
 }
 
+/// `rules.trigger_condition` is capped at 4000 characters, but it is never
+/// present in the rule JSON: the codec extracts it into a `<slug>.py`
+/// sidecar (see `snapshot::codec::rules`). It therefore cannot live in
+/// [`field_limits`], which only inspects top-level JSON keys — an entry
+/// there is silently dead. `ChangeList::field_limit_violations` reads the
+/// sidecar and checks it against this constant instead.
+pub const RULE_TRIGGER_CONDITION_LIMIT: usize = 4000;
+
 /// Declared `max_length` for each kind's top-level string fields.
 ///
 /// Kinds absent from this match (and fields absent from a kind's slice)
@@ -73,7 +81,9 @@ pub fn field_limits(kind: &str) -> &'static [(&'static str, usize)] {
         "queues" => &[("name", 255), ("rir_params", 255)],
         "schemas" => &[("name", 255)],
         // A rule's `description` cap is 255 — far tighter than a hook's 2000.
-        "rules" => &[("name", 255), ("description", 255), ("trigger_condition", 4000)],
+        // `trigger_condition` is NOT here on purpose: see
+        // `RULE_TRIGGER_CONDITION_LIMIT`.
+        "rules" => &[("name", 255), ("description", 255)],
         "email_templates" => &[("name", 255), ("subject", 255)],
         "engines" => &[("name", 255)],
         "workspaces" => &[("name", 255)],

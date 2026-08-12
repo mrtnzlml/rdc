@@ -131,6 +131,31 @@ impl ChangeList {
         check("email_templates", &self.email_templates);
         check("engines", &self.engines);
         check("engine_fields", &self.engine_fields);
+
+        // `rules.trigger_condition` lives in `<slug>.py`, never in the JSON,
+        // so the JSON walk above can never see it. Point the violation at
+        // the sidecar — that is the file the user opens to fix it.
+        for (slug, json_path) in &self.rules {
+            let py_path = json_path.with_extension("py");
+            let Ok(text) = std::fs::read_to_string(&py_path) else {
+                continue; // no trigger_condition, or unreadable — push surfaces I/O errors
+            };
+            if let Some(v) = crate::snapshot::limits::check_text(
+                "trigger_condition",
+                crate::snapshot::limits::RULE_TRIGGER_CONDITION_LIMIT,
+                &text,
+            ) {
+                out.push(FieldLimitViolation {
+                    kind: "rules",
+                    slug: slug.clone(),
+                    path: py_path,
+                    field: v.field,
+                    limit: v.limit,
+                    actual: v.actual,
+                });
+            }
+        }
+
         out
     }
 }
@@ -142,7 +167,10 @@ pub struct FieldLimitViolation {
     pub kind: &'static str,
     pub slug: String,
     pub path: std::path::PathBuf,
-    /// Top-level JSON key that is too long.
+    /// Where the offending value lives: usually a top-level JSON key
+    /// (`description`), but for a sidecar-extracted field like a rule's
+    /// `trigger_condition` this names the field even though it is never a
+    /// JSON key at all — see `ChangeList::field_limit_violations`.
     pub field: String,
     /// The API's declared limit for this field.
     pub limit: usize,
@@ -1194,5 +1222,84 @@ mod tests {
         assert_eq!(cl.labels.len(), 1);
         assert!(cl.labels.contains_key("l1"));
         assert!(cl.queues.is_empty());
+    }
+
+    /// `trigger_condition` lives in `<slug>.py`, never in the rule JSON
+    /// (see `snapshot::codec::rules`), so a JSON-only check can never see
+    /// it. The server enforces 4000 characters and rejects anything longer
+    /// with a permanent 400.
+    #[test]
+    fn field_limit_violations_reports_oversized_rule_trigger_condition() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules_dir = dir.path().join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        std::fs::write(
+            rules_dir.join("my-rule.json"),
+            br#"{"name":"My Rule","queues":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(rules_dir.join("my-rule.py"), "x".repeat(4001).as_bytes()).unwrap();
+
+        let mut cl = ChangeList::default();
+        cl.rules
+            .insert("my-rule".to_string(), rules_dir.join("my-rule.json"));
+
+        let v = cl.field_limit_violations();
+        assert_eq!(v.len(), 1, "expected exactly one violation, got {v:?}");
+        assert_eq!(v[0].kind, "rules");
+        assert_eq!(v[0].field, "trigger_condition");
+        assert_eq!(v[0].limit, 4000);
+        assert_eq!(v[0].actual, 4001);
+        assert_eq!(
+            v[0].path,
+            rules_dir.join("my-rule.py"),
+            "the violation must point at the .py sidecar the user edits, not the JSON"
+        );
+    }
+
+    /// Boundary: exactly at the limit passes, and so does the limit plus a
+    /// trailing newline — rdc writes sidecars without one but editors add
+    /// it, and the server trims before validating.
+    #[test]
+    fn rule_trigger_condition_at_limit_and_with_trailing_newline_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules_dir = dir.path().join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        std::fs::write(
+            rules_dir.join("my-rule.json"),
+            br#"{"name":"My Rule","queues":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            rules_dir.join("my-rule.py"),
+            format!("{}\n", "x".repeat(4000)).as_bytes(),
+        )
+        .unwrap();
+
+        let mut cl = ChangeList::default();
+        cl.rules
+            .insert("my-rule".to_string(), rules_dir.join("my-rule.json"));
+
+        assert_eq!(cl.field_limit_violations().len(), 0);
+    }
+
+    /// A rule with no `trigger_condition` has no sidecar at all; the check
+    /// must not treat a missing file as an error.
+    #[test]
+    fn rule_without_trigger_condition_sidecar_is_not_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules_dir = dir.path().join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        std::fs::write(
+            rules_dir.join("my-rule.json"),
+            br#"{"name":"My Rule","queues":[]}"#,
+        )
+        .unwrap();
+
+        let mut cl = ChangeList::default();
+        cl.rules
+            .insert("my-rule".to_string(), rules_dir.join("my-rule.json"));
+
+        assert_eq!(cl.field_limit_violations().len(), 0);
     }
 }
