@@ -64,6 +64,13 @@ pub struct LimitViolation {
 /// sidecar and checks it against this constant instead.
 pub const RULE_TRIGGER_CONDITION_LIMIT: usize = 4000;
 
+/// A schema datapoint's `formula` is capped at 2000 characters. Like
+/// `trigger_condition` it is extracted to a sidecar (`formulas/<id>.py`)
+/// and so cannot live in [`field_limits`]. The server's rejection for this
+/// field is positional and carries no datapoint id, which is why naming the
+/// sidecar locally is worth more here than for a top-level field.
+pub const SCHEMA_FORMULA_LIMIT: usize = 2000;
+
 /// Declared `max_length` for each kind's top-level string fields.
 ///
 /// Kinds absent from this match (and fields absent from a kind's slice)

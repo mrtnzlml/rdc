@@ -156,6 +156,36 @@ impl ChangeList {
             }
         }
 
+        // Schema formulas live in `<queue_dir>/formulas/<id>.py` and are
+        // spliced back into the body on push. `ChangeList.schemas` stores the
+        // path to `schema.json`, so the queue dir is its parent.
+        for (slug, schema_path) in &self.schemas {
+            let Some(queue_dir) = schema_path.parent() else {
+                continue;
+            };
+            let formulas =
+                crate::snapshot::schema::read_local_formulas(queue_dir).unwrap_or_default();
+            for (id, bytes) in formulas {
+                let Ok(text) = String::from_utf8(bytes) else {
+                    continue; // not UTF-8 — the push path surfaces that
+                };
+                if let Some(v) = crate::snapshot::limits::check_text(
+                    format!("formula on datapoint '{id}'"),
+                    crate::snapshot::limits::SCHEMA_FORMULA_LIMIT,
+                    &text,
+                ) {
+                    out.push(FieldLimitViolation {
+                        kind: "schemas",
+                        slug: slug.clone(),
+                        path: queue_dir.join("formulas").join(format!("{id}.py")),
+                        field: v.field,
+                        limit: v.limit,
+                        actual: v.actual,
+                    });
+                }
+            }
+        }
+
         out
     }
 }
@@ -1299,6 +1329,63 @@ mod tests {
         let mut cl = ChangeList::default();
         cl.rules
             .insert("my-rule".to_string(), rules_dir.join("my-rule.json"));
+
+        assert_eq!(cl.field_limit_violations().len(), 0);
+    }
+
+    /// Schema formulas live in `formulas/<id>.py` and are spliced back into
+    /// the schema body on push. The server caps them at 2000 characters and
+    /// answers an over-length one with a POSITIONAL error carrying no
+    /// datapoint id at all, so naming the file is the whole point.
+    #[test]
+    fn field_limit_violations_reports_oversized_schema_formula() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue_dir = dir.path().join("workspaces/main/queues/invoices");
+        std::fs::create_dir_all(queue_dir.join("formulas")).unwrap();
+        std::fs::write(
+            queue_dir.join("schema.json"),
+            br#"{"name":"Invoices","content":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            queue_dir.join("formulas/total_amount.py"),
+            "x".repeat(2001).as_bytes(),
+        )
+        .unwrap();
+        std::fs::write(
+            queue_dir.join("formulas/vendor_name.py"),
+            "y".repeat(2000).as_bytes(),
+        )
+        .unwrap();
+
+        let mut cl = ChangeList::default();
+        cl.schemas
+            .insert("invoices".to_string(), queue_dir.join("schema.json"));
+
+        let v = cl.field_limit_violations();
+        assert_eq!(v.len(), 1, "only the over-length formula should flag: {v:?}");
+        assert_eq!(v[0].kind, "schemas");
+        assert_eq!(v[0].field, "formula on datapoint 'total_amount'");
+        assert_eq!(v[0].limit, 2000);
+        assert_eq!(v[0].actual, 2001);
+        assert_eq!(v[0].path, queue_dir.join("formulas/total_amount.py"));
+    }
+
+    /// A queue with no `formulas/` directory must not error.
+    #[test]
+    fn schema_without_formulas_dir_is_not_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue_dir = dir.path().join("workspaces/main/queues/invoices");
+        std::fs::create_dir_all(&queue_dir).unwrap();
+        std::fs::write(
+            queue_dir.join("schema.json"),
+            br#"{"name":"Invoices","content":[]}"#,
+        )
+        .unwrap();
+
+        let mut cl = ChangeList::default();
+        cl.schemas
+            .insert("invoices".to_string(), queue_dir.join("schema.json"));
 
         assert_eq!(cl.field_limit_violations().len(), 0);
     }
