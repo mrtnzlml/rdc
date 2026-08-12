@@ -43,8 +43,13 @@ use serde_json::Value;
 /// One field whose local value is longer than the API accepts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LimitViolation {
-    /// Top-level JSON key that is too long.
-    pub field: &'static str,
+    /// Where the offending value lives, in terms a human can act on: a
+    /// top-level JSON key (`description`), or a built-up location for a
+    /// nested or sidecar value (`formula on datapoint 'total_amount'`).
+    /// Dynamic because the server's own error for nested fields is
+    /// positional and carries no id — naming the object is the whole
+    /// value this check adds over the raw 400.
+    pub field: String,
     /// The API's declared `max_length` for this field.
     pub limit: usize,
     /// The local value's length, in the same unit the server counts.
@@ -108,16 +113,19 @@ pub fn check_field_limits(kind: &str, body: &Value) -> Vec<LimitViolation> {
         let Some(Value::String(s)) = obj.get(*field) else {
             continue;
         };
-        // The server trims surrounding whitespace before validating, so
-        // count what it will actually measure. Counting raw would reject a
-        // value the server accepts — for the very common case of an editor
-        // adding a final newline.
-        let actual = s.trim().chars().count();
-        if actual > *limit {
-            out.push(LimitViolation { field, limit: *limit, actual });
+        if let Some(v) = check_text(*field, *limit, s) {
+            out.push(v);
         }
     }
     out
+}
+
+/// Check one string against one limit, returning a violation if it is too
+/// long. The single place length is measured — every check in this module
+/// funnels through it, so the trimming rule cannot drift between them.
+pub fn check_text(field: impl Into<String>, limit: usize, text: &str) -> Option<LimitViolation> {
+    let actual = text.trim().chars().count();
+    (actual > limit).then(|| LimitViolation { field: field.into(), limit, actual })
 }
 
 #[cfg(test)]
@@ -132,7 +140,7 @@ mod tests {
         let body = json!({ "name": "example-hook", "description": "x".repeat(2406) });
         assert_eq!(
             check_field_limits("hooks", &body),
-            vec![LimitViolation { field: "description", limit: 2000, actual: 2406 }],
+            vec![LimitViolation { field: "description".to_string(), limit: 2000, actual: 2406 }],
         );
     }
 
@@ -149,7 +157,7 @@ mod tests {
         let body = json!({ "description": "x".repeat(2001) });
         assert_eq!(
             check_field_limits("hooks", &body),
-            vec![LimitViolation { field: "description", limit: 2000, actual: 2001 }],
+            vec![LimitViolation { field: "description".to_string(), limit: 2000, actual: 2001 }],
         );
     }
 
@@ -172,7 +180,7 @@ mod tests {
         let body = json!({ "description": "x".repeat(300) });
         assert_eq!(
             check_field_limits("rules", &body),
-            vec![LimitViolation { field: "description", limit: 255, actual: 300 }],
+            vec![LimitViolation { field: "description".to_string(), limit: 255, actual: 300 }],
         );
         assert_eq!(check_field_limits("hooks", &body), vec![]);
     }
@@ -186,8 +194,8 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                LimitViolation { field: "name", limit: 255, actual: 256 },
-                LimitViolation { field: "description", limit: 2000, actual: 2500 },
+                LimitViolation { field: "name".to_string(), limit: 255, actual: 256 },
+                LimitViolation { field: "description".to_string(), limit: 2000, actual: 2500 },
             ],
         );
     }
@@ -301,7 +309,7 @@ mod tests {
         let body = json!({ "description": format!("\n{}\n", "x".repeat(2500)) });
         assert_eq!(
             check_field_limits("hooks", &body),
-            vec![LimitViolation { field: "description", limit: 2000, actual: 2500 }],
+            vec![LimitViolation { field: "description".to_string(), limit: 2000, actual: 2500 }],
         );
     }
 }

@@ -143,7 +143,7 @@ pub struct FieldLimitViolation {
     pub slug: String,
     pub path: std::path::PathBuf,
     /// Top-level JSON key that is too long.
-    pub field: &'static str,
+    pub field: String,
     /// The API's declared limit for this field.
     pub limit: usize,
     /// The local value's length, in characters.
