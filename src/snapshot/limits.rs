@@ -134,6 +134,42 @@ fn walk_schema_node(node: &Value, out: &mut Vec<LimitViolation>) {
     }
 }
 
+/// A rule action's `payload.content` — the message text shown to the
+/// operator — is capped at 4096 characters.
+pub const RULE_ACTION_CONTENT_LIMIT: usize = 4096;
+
+/// Check the length-capped fields inside a rule's `actions` array.
+///
+/// The `OPTIONS` metadata nests these under a polymorphic wrapper
+/// (`actions.child.show_message.payload.content`), but that is a metadata
+/// artifact — the same one hooks exhibit. On the wire each action is flat
+/// with a `type` discriminator, so one uniform path covers every action
+/// kind. Only `payload.content` is validated: the sibling `id` is a
+/// server-generated UUID and `payload.schema_id` is bounded by the schema
+/// field id rules, so neither is free text a human can overgrow.
+pub fn check_rule_actions(body: &Value) -> Vec<LimitViolation> {
+    let mut out = Vec::new();
+    let Some(actions) = body.get("actions").and_then(|a| a.as_array()) else {
+        return out;
+    };
+    for (i, action) in actions.iter().enumerate() {
+        let Some(Value::String(content)) = action.get("payload").and_then(|p| p.get("content"))
+        else {
+            continue;
+        };
+        let ty = action
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("action");
+        out.extend(check_text(
+            format!("actions[{i}] ({ty}) payload.content"),
+            RULE_ACTION_CONTENT_LIMIT,
+            content,
+        ));
+    }
+    out
+}
+
 /// Declared `max_length` for each kind's top-level string fields.
 ///
 /// Kinds absent from this match (and fields absent from a kind's slice)
@@ -494,5 +530,83 @@ mod tests {
             }]
         });
         assert_eq!(check_schema_content(&body), vec![]);
+    }
+
+    /// Real rules serialize each action FLAT with a `type` discriminator —
+    /// `{"id","enabled","type","event","payload"}` — not under the
+    /// polymorphic wrapper the OPTIONS metadata implies. A walker written
+    /// from the metadata alone would match nothing.
+    #[test]
+    fn rule_action_payload_content_is_checked() {
+        let body = json!({
+            "name": "Example Rule",
+            "actions": [
+                {
+                    "id": "b7d5856b-7990-4c8f-8048-ca3b8e68239a",
+                    "enabled": true,
+                    "type": "show_message",
+                    "event": "validation",
+                    "payload": { "type": "warning", "content": "ok", "schema_id": "total" }
+                },
+                {
+                    "id": "cf3e8c84-552c-482c-b1cf-333ace397a8c",
+                    "enabled": true,
+                    "type": "add_automation_blocker",
+                    "event": "validation",
+                    "payload": { "content": "c".repeat(4097), "schema_id": "total" }
+                }
+            ]
+        });
+        assert_eq!(
+            check_rule_actions(&body),
+            vec![LimitViolation {
+                field: "actions[1] (add_automation_blocker) payload.content".to_string(),
+                limit: 4096,
+                actual: 4097,
+            }],
+        );
+    }
+
+    #[test]
+    fn rule_action_content_at_limit_is_accepted() {
+        let body = json!({
+            "actions": [{
+                "type": "show_message",
+                "payload": { "content": "c".repeat(4096) }
+            }]
+        });
+        assert_eq!(check_rule_actions(&body), vec![]);
+    }
+
+    /// Rules with no actions, actions with no payload, and non-string
+    /// content must all be tolerated without panicking.
+    #[test]
+    fn rule_actions_walk_tolerates_missing_and_malformed() {
+        assert_eq!(check_rule_actions(&json!({})), vec![]);
+        assert_eq!(check_rule_actions(&json!({ "actions": [] })), vec![]);
+        assert_eq!(
+            check_rule_actions(&json!({ "actions": [{ "type": "custom" }] })),
+            vec![]
+        );
+        assert_eq!(
+            check_rule_actions(&json!({ "actions": [{ "payload": { "content": 7 } }] })),
+            vec![]
+        );
+    }
+
+    /// Same invariant as `no_validated_field_is_stripped_before_push`, for
+    /// the containers the nested walks descend into. If either were ever
+    /// stripped before push, the walk would reject a value that never
+    /// reaches the wire — a false positive strictly worse than the 400.
+    #[test]
+    fn nested_walk_containers_are_not_stripped_before_push() {
+        for (kind, container) in [("schemas", "content"), ("rules", "actions")] {
+            let mut body = json!({ container: [] });
+            crate::snapshot::create::strip_for_create(&mut body, kind);
+            assert!(
+                body.get(container).is_some(),
+                "{kind}.{container} is walked for nested limits but stripped before push",
+            );
+        }
     }
 }

@@ -111,6 +111,7 @@ impl ChangeList {
                 crate::snapshot::create::strip_for_create(&mut body, kind);
                 let nested = match kind {
                     "schemas" => crate::snapshot::limits::check_schema_content(&body),
+                    "rules" => crate::snapshot::limits::check_rule_actions(&body),
                     _ => Vec::new(),
                 };
                 for v in crate::snapshot::limits::check_field_limits(kind, &body)
@@ -1441,5 +1442,57 @@ mod tests {
             .insert("invoices".to_string(), queue_dir.join("schema.json"));
 
         assert_eq!(cl.field_limit_violations().len(), 0);
+    }
+
+    /// A rule's `actions[].payload.content` stays inline in the rule JSON
+    /// (unlike `trigger_condition`, which lives in a `.py` sidecar). This
+    /// exercises the `"rules"` match arm in `field_limit_violations` itself
+    /// -- the `snapshot::limits` unit tests call `check_rule_actions`
+    /// directly and never touch that dispatch, so a typo in the match arm
+    /// or a dropped `.chain(nested)` would pass every one of them while
+    /// fully disabling this feature on the real push path.
+    #[test]
+    fn field_limit_violations_reports_oversized_rule_action_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules_dir = dir.path().join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        std::fs::write(
+            rules_dir.join("my-rule.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "Example Rule",
+                "actions": [
+                    {
+                        "id": "b7d5856b-7990-4c8f-8048-ca3b8e68239a",
+                        "enabled": true,
+                        "type": "show_message",
+                        "event": "validation",
+                        "payload": { "type": "warning", "content": "ok", "schema_id": "total" }
+                    },
+                    {
+                        "id": "cf3e8c84-552c-482c-b1cf-333ace397a8c",
+                        "enabled": true,
+                        "type": "add_automation_blocker",
+                        "event": "validation",
+                        "payload": { "content": "c".repeat(4097), "schema_id": "total" }
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut cl = ChangeList::default();
+        cl.rules
+            .insert("my-rule".to_string(), rules_dir.join("my-rule.json"));
+
+        let v = cl.field_limit_violations();
+        assert_eq!(v.len(), 1, "only the over-length action payload should flag: {v:?}");
+        assert_eq!(v[0].kind, "rules");
+        assert_eq!(v[0].field, "actions[1] (add_automation_blocker) payload.content");
+        assert_eq!(v[0].limit, 4096);
+        assert_eq!(v[0].actual, 4097);
+        // Nested values live directly in the JSON, so the reported path is
+        // the rule's .json file itself, not a sidecar.
+        assert_eq!(v[0].path, rules_dir.join("my-rule.json"));
     }
 }
