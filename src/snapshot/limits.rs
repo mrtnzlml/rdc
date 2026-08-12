@@ -91,6 +91,10 @@ pub fn field_limits(kind: &str) -> &'static [(&'static str, usize)] {
 /// Counting bytes would spuriously reject a value that fits, and only
 /// for users whose text happens to be non-ASCII.
 ///
+/// Values are counted **after trimming surrounding whitespace**, which is
+/// what the server does before validating (verified live: a value at
+/// exactly the limit plus a trailing newline is accepted).
+///
 /// Non-string values (`null`, numbers, objects) are skipped rather than
 /// coerced — a length limit is meaningless for them, and the server
 /// reports a type error that says so far more clearly than this check
@@ -104,7 +108,11 @@ pub fn check_field_limits(kind: &str, body: &Value) -> Vec<LimitViolation> {
         let Some(Value::String(s)) = obj.get(*field) else {
             continue;
         };
-        let actual = s.chars().count();
+        // The server trims surrounding whitespace before validating, so
+        // count what it will actually measure. Counting raw would reject a
+        // value the server accepts — for the very common case of an editor
+        // adding a final newline.
+        let actual = s.trim().chars().count();
         if actual > *limit {
             out.push(LimitViolation { field, limit: *limit, actual });
         }
@@ -263,5 +271,37 @@ mod tests {
                 "pushable kind '{kind}' has no field limits recorded",
             );
         }
+    }
+
+    /// The server trims surrounding whitespace before validating: a value
+    /// at exactly the limit plus a trailing newline is ACCEPTED. Verified
+    /// live with a single request carrying a 2001-char formula and a
+    /// 2000-char-plus-newline formula — only the first errored. Counting
+    /// raw would reject every sidecar an editor added a final newline to.
+    #[test]
+    fn trailing_newline_does_not_count_toward_the_limit() {
+        let body = json!({ "description": format!("{}\n", "x".repeat(2000)) });
+        assert_eq!(check_field_limits("hooks", &body), vec![]);
+    }
+
+    /// Trimming applies to both ends and to whitespace generally, not just
+    /// a newline. Trimming at least as much as the server is the safe side:
+    /// under-report and the server still rejects; over-report and a valid
+    /// push is blocked.
+    #[test]
+    fn surrounding_whitespace_does_not_count_toward_the_limit() {
+        let body = json!({ "description": format!("  {}\t\n", "x".repeat(2000)) });
+        assert_eq!(check_field_limits("hooks", &body), vec![]);
+    }
+
+    /// The reported length is what the server sees, so an over-limit value
+    /// reports its TRIMMED length — otherwise "shorten it by N" is wrong.
+    #[test]
+    fn reported_length_is_the_trimmed_length() {
+        let body = json!({ "description": format!("\n{}\n", "x".repeat(2500)) });
+        assert_eq!(
+            check_field_limits("hooks", &body),
+            vec![LimitViolation { field: "description", limit: 2000, actual: 2500 }],
+        );
     }
 }
