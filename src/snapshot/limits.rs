@@ -32,11 +32,20 @@
 //! server-side exactly as it does today, so an incomplete table degrades
 //! to current behavior rather than letting bad data through.
 //!
-//! Only **top-level string** fields are listed. Nested config limits
-//! (e.g. `webhook.config.url`) are deliberately left to the server:
-//! validating them would mean re-deriving each hook variant's shape
-//! here, and a mistake would wrongly block a legitimate push — strictly
-//! worse than the 400 it would replace.
+//! [`field_limits`] itself lists only **top-level string** fields. Coverage
+//! is extended past that table in two ways: [`check_schema_content`] and
+//! [`check_rule_actions`] walk nested JSON (a schema's content tree, a
+//! rule's `actions[]`), and `ChangeList::field_limit_violations` (in
+//! `cli::push::scan`) separately reads two sidecar files that never appear
+//! in the JSON at all — a rule's `trigger_condition` and a schema
+//! datapoint's `formula`. All five locations were individually confirmed
+//! against a live deployment.
+//!
+//! Everything else nested is still deliberately left to the server: hook
+//! `webhook.config.url`, `config.secret`, `config.app.url`,
+//! `job.config.actor_name`, `sideload[]`. Validating those would mean
+//! re-deriving each hook variant's shape here, and a mistake would wrongly
+//! block a legitimate push — strictly worse than the 400 it would replace.
 
 use serde_json::Value;
 
@@ -56,12 +65,20 @@ pub struct LimitViolation {
     pub actual: usize,
 }
 
-/// `rules.trigger_condition` is capped at 4000 characters, but it is never
-/// present in the rule JSON: the codec extracts it into a `<slug>.py`
-/// sidecar (see `snapshot::codec::rules`). It therefore cannot live in
-/// [`field_limits`], which only inspects top-level JSON keys — an entry
-/// there is silently dead. `ChangeList::field_limit_violations` reads the
-/// sidecar and checks it against this constant instead.
+/// `rules.trigger_condition` is capped at 4000 characters. For every
+/// snapshot `rdc pull` produces, the codec always extracts it into a
+/// `<slug>.py` sidecar (see `snapshot::rule::read_rule_value`), so a
+/// `trigger_condition` entry in [`field_limits`] — which only inspects
+/// top-level JSON keys — would be dead for every pulled project. It lives
+/// here instead, and `ChangeList::field_limit_violations` reads the
+/// sidecar directly and checks it against this constant.
+///
+/// That "dead" claim isn't universal, though: `read_rule_value` splices
+/// the sidecar back only `if py_path.exists()`, so a rule JSON hand-edited
+/// to carry an inline string `trigger_condition` with no sibling `.py` is
+/// pushed verbatim and is checked by neither this constant nor
+/// [`field_limits`]. That's an accepted under-report — the safe side of
+/// "never over-report" — for a shape `rdc` itself never produces.
 pub const RULE_TRIGGER_CONDITION_LIMIT: usize = 4000;
 
 /// A schema datapoint's `formula` is capped at 2000 characters. Like
@@ -147,6 +164,13 @@ pub const RULE_ACTION_CONTENT_LIMIT: usize = 4096;
 /// kind. Only `payload.content` is validated: the sibling `id` is a
 /// server-generated UUID and `payload.schema_id` is bounded by the schema
 /// field id rules, so neither is free text a human can overgrow.
+///
+/// The 4096 cap is applied to every action `type` uniformly. That harvest
+/// was verified, not assumed: `OPTIONS /v1/rules` declares `payload.content`
+/// at exactly 4096 for exactly two action types — `show_message` and
+/// `add_automation_blocker` — and **no other action type declares a
+/// `payload.content` field at all** (the rest declare only `id` at 50).
+/// There is no action type this uniform limit could be wrong for.
 pub fn check_rule_actions(body: &Value) -> Vec<LimitViolation> {
     let mut out = Vec::new();
     let Some(actions) = body.get("actions").and_then(|a| a.as_array()) else {
@@ -188,7 +212,9 @@ pub fn field_limits(kind: &str) -> &'static [(&'static str, usize)] {
         "schemas" => &[("name", 255)],
         // A rule's `description` cap is 255 — far tighter than a hook's 2000.
         // `trigger_condition` is NOT here on purpose: see
-        // `RULE_TRIGGER_CONDITION_LIMIT`.
+        // `RULE_TRIGGER_CONDITION_LIMIT` for why (dead for pulled snapshots,
+        // but not universally — a hand-written inline value with no `.py`
+        // sidecar is an accepted under-report, not a covered case).
         "rules" => &[("name", 255), ("description", 255)],
         "email_templates" => &[("name", 255), ("subject", 255)],
         "engines" => &[("name", 255)],
@@ -239,6 +265,14 @@ pub fn check_field_limits(kind: &str, body: &Value) -> Vec<LimitViolation> {
 /// Check one string against one limit, returning a violation if it is too
 /// long. The single place length is measured — every check in this module
 /// funnels through it, so the trimming rule cannot drift between them.
+///
+/// `str::trim` strips Unicode `White_Space`; the server's DRF
+/// `CharField(trim_whitespace=True)` calls Python `str.strip()`, which
+/// additionally strips the four C0 control characters `\x1c`–`\x1f` (the
+/// file/group/record/unit separators). A value surrounded by exactly those
+/// bytes would be trimmed further server-side than here — a theoretical
+/// over-report, vanishingly unlikely given those characters essentially
+/// never occur in authored text.
 pub fn check_text(field: impl Into<String>, limit: usize, text: &str) -> Option<LimitViolation> {
     let actual = text.trim().chars().count();
     (actual > limit).then(|| LimitViolation { field: field.into(), limit, actual })

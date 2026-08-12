@@ -241,6 +241,52 @@ fn merge_formulas(node: &mut Value, formulas_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Collect the datapoint ids that [`merge_formulas`] would actually splice
+/// a sidecar into: every datapoint with **no** inline `formula` key
+/// already present. Walks the identical recursion shape — array
+/// `children` for sections and tuples, a single object `children` for a
+/// multivalue.
+///
+/// Used by the field-limit pre-flight to know which `formulas/<id>.py`
+/// files the push path will actually send. Two classes of sidecar are
+/// walked past but never spliced, and must not be validated: an
+/// *orphaned* sidecar (its datapoint was renamed or deleted from
+/// `schema.json`) and a *shadowed* one (its datapoint already carries an
+/// inline `formula`, which `merge_formulas` leaves untouched). Flagging
+/// either would refuse a push the server would accept — the one failure
+/// mode this checker exists to avoid.
+pub fn formula_sidecar_ids(body: &Value) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    if let Some(content) = body.get("content").and_then(|c| c.as_array()) {
+        for node in content {
+            collect_formula_sidecar_ids(node, &mut out);
+        }
+    }
+    out
+}
+
+fn collect_formula_sidecar_ids(node: &Value, out: &mut std::collections::BTreeSet<String>) {
+    let Some(obj) = node.as_object() else { return };
+
+    let is_datapoint = obj.get("category").and_then(|c| c.as_str()) == Some("datapoint");
+    if is_datapoint
+        && !obj.contains_key("formula")
+        && let Some(id) = obj.get("id").and_then(|i| i.as_str())
+    {
+        out.insert(id.to_string());
+    }
+
+    match obj.get("children") {
+        Some(Value::Array(children)) => {
+            for child in children {
+                collect_formula_sidecar_ids(child, out);
+            }
+        }
+        Some(child @ Value::Object(_)) => collect_formula_sidecar_ids(child, out),
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

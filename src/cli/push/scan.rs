@@ -100,6 +100,16 @@ impl ChangeList {
     /// wire) can't produce a false positive.
     pub fn field_limit_violations(&self) -> Vec<FieldLimitViolation> {
         let mut out = Vec::new();
+
+        // Populated for the `"schemas"` arm below with the ids
+        // `merge_formulas` would actually splice a sidecar into — the
+        // gate the formula-sidecar loop further down consults. Keyed by
+        // slug so that loop (which walks `self.schemas` a second time,
+        // for the `formulas/` directory rather than `schema.json` itself)
+        // doesn't have to re-read and re-parse `schema.json`.
+        let mut schema_formula_ids: BTreeMap<String, std::collections::BTreeSet<String>> =
+            BTreeMap::new();
+
         let mut check = |kind: &'static str, map: &BTreeMap<String, std::path::PathBuf>| {
             for (slug, path) in map {
                 let Ok(bytes) = std::fs::read(path) else {
@@ -110,7 +120,13 @@ impl ChangeList {
                 };
                 crate::snapshot::create::strip_for_create(&mut body, kind);
                 let nested = match kind {
-                    "schemas" => crate::snapshot::limits::check_schema_content(&body),
+                    "schemas" => {
+                        schema_formula_ids.insert(
+                            slug.clone(),
+                            crate::snapshot::schema::formula_sidecar_ids(&body),
+                        );
+                        crate::snapshot::limits::check_schema_content(&body)
+                    }
                     "rules" => crate::snapshot::limits::check_rule_actions(&body),
                     _ => Vec::new(),
                 };
@@ -118,14 +134,7 @@ impl ChangeList {
                     .into_iter()
                     .chain(nested)
                 {
-                    out.push(FieldLimitViolation {
-                        kind,
-                        slug: slug.clone(),
-                        path: path.clone(),
-                        field: v.field,
-                        limit: v.limit,
-                        actual: v.actual,
-                    });
+                    out.push(violation(kind, slug, path.clone(), v));
                 }
             }
         };
@@ -153,27 +162,38 @@ impl ChangeList {
                 crate::snapshot::limits::RULE_TRIGGER_CONDITION_LIMIT,
                 &text,
             ) {
-                out.push(FieldLimitViolation {
-                    kind: "rules",
-                    slug: slug.clone(),
-                    path: py_path,
-                    field: v.field,
-                    limit: v.limit,
-                    actual: v.actual,
-                });
+                out.push(violation("rules", slug, py_path, v));
             }
         }
 
         // Schema formulas live in `<queue_dir>/formulas/<id>.py` and are
-        // spliced back into the body on push. `ChangeList.schemas` stores the
-        // path to `schema.json`, so the queue dir is its parent.
+        // spliced back into the body on push — but only for the ids
+        // `merge_formulas` would actually splice: a datapoint that both
+        // still exists in `schema.json` AND carries no inline `formula`
+        // key of its own. `read_local_formulas` returns every `.py` file
+        // in the directory with no such filter, so an *orphaned* sidecar
+        // (its datapoint renamed or deleted) or a *shadowed* one (its
+        // datapoint already has an inline `formula`) would otherwise be
+        // validated despite never reaching the wire — a false positive
+        // that would wedge the project on a value the server never sees.
+        // `ChangeList.schemas` stores the path to `schema.json`, so the
+        // queue dir is its parent.
         for (slug, schema_path) in &self.schemas {
             let Some(queue_dir) = schema_path.parent() else {
+                continue;
+            };
+            // No entry (schema.json unreadable/unparseable) means we don't
+            // know which ids are live — skip rather than guess, the same
+            // under-report-when-uncertain rule as everywhere else here.
+            let Some(sidecar_ids) = schema_formula_ids.get(slug) else {
                 continue;
             };
             let formulas =
                 crate::snapshot::schema::read_local_formulas(queue_dir).unwrap_or_default();
             for (id, bytes) in formulas {
+                if !sidecar_ids.contains(&id) {
+                    continue; // orphaned or shadowed — merge_formulas would never splice this
+                }
                 let Ok(text) = String::from_utf8(bytes) else {
                     continue; // not UTF-8 — the push path surfaces that
                 };
@@ -182,19 +202,39 @@ impl ChangeList {
                     crate::snapshot::limits::SCHEMA_FORMULA_LIMIT,
                     &text,
                 ) {
-                    out.push(FieldLimitViolation {
-                        kind: "schemas",
-                        slug: slug.clone(),
-                        path: queue_dir.join("formulas").join(format!("{id}.py")),
-                        field: v.field,
-                        limit: v.limit,
-                        actual: v.actual,
-                    });
+                    out.push(violation(
+                        "schemas",
+                        slug,
+                        queue_dir.join("formulas").join(format!("{id}.py")),
+                        v,
+                    ));
                 }
             }
         }
 
         out
+    }
+}
+
+/// Build a [`FieldLimitViolation`] from a [`crate::snapshot::limits::LimitViolation`],
+/// filling in the object-identifying fields the limits module doesn't
+/// know about (`kind`, `slug`, `path`). The one place this mapping is
+/// written, so the several call sites in `field_limit_violations` — the
+/// top-level + nested JSON walk, the rule `trigger_condition` sidecar, the
+/// schema formula sidecar — cannot drift from each other.
+fn violation(
+    kind: &'static str,
+    slug: &str,
+    path: std::path::PathBuf,
+    v: crate::snapshot::limits::LimitViolation,
+) -> FieldLimitViolation {
+    FieldLimitViolation {
+        kind,
+        slug: slug.to_string(),
+        path,
+        field: v.field,
+        limit: v.limit,
+        actual: v.actual,
     }
 }
 
@@ -1342,9 +1382,14 @@ mod tests {
     }
 
     /// Schema formulas live in `formulas/<id>.py` and are spliced back into
-    /// the schema body on push. The server caps them at 2000 characters and
-    /// answers an over-length one with a POSITIONAL error carrying no
-    /// datapoint id at all, so naming the file is the whole point.
+    /// the schema body on push -- but only for a datapoint that both still
+    /// exists in `schema.json` and carries no inline `formula` of its own
+    /// (see `snapshot::schema::merge_formulas`). This is the true happy
+    /// path: both sidecar ids are live datapoints with no inline formula,
+    /// so `merge_formulas` would actually splice them. The server caps
+    /// them at 2000 characters and answers an over-length one with a
+    /// POSITIONAL error carrying no datapoint id at all, so naming the
+    /// file is the whole point.
     #[test]
     fn field_limit_violations_reports_oversized_schema_formula() {
         let dir = tempfile::tempdir().unwrap();
@@ -1352,7 +1397,18 @@ mod tests {
         std::fs::create_dir_all(queue_dir.join("formulas")).unwrap();
         std::fs::write(
             queue_dir.join("schema.json"),
-            br#"{"name":"Invoices","content":[]}"#,
+            serde_json::to_vec(&serde_json::json!({
+                "name": "Invoices",
+                "content": [{
+                    "category": "section",
+                    "id": "s",
+                    "children": [
+                        { "category": "datapoint", "id": "total_amount" },
+                        { "category": "datapoint", "id": "vendor_name" }
+                    ]
+                }]
+            }))
+            .unwrap(),
         )
         .unwrap();
         std::fs::write(
@@ -1377,6 +1433,92 @@ mod tests {
         assert_eq!(v[0].limit, 2000);
         assert_eq!(v[0].actual, 2001);
         assert_eq!(v[0].path, queue_dir.join("formulas/total_amount.py"));
+    }
+
+    /// An ORPHANED sidecar: `formulas/<id>.py` whose id is absent from the
+    /// content tree entirely (the datapoint was renamed or deleted
+    /// locally). `merge_formulas` would never splice it -- the push never
+    /// sends it -- so it must not block the push. Before this gate, a user
+    /// who dropped an over-length field by deleting the datapoint (leaving
+    /// the stale `.py` behind) would find the project permanently wedged
+    /// on a value the server would have accepted, with an error naming a
+    /// datapoint that no longer exists.
+    #[test]
+    fn field_limit_violations_ignores_orphaned_schema_formula_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue_dir = dir.path().join("workspaces/main/queues/invoices");
+        std::fs::create_dir_all(queue_dir.join("formulas")).unwrap();
+        std::fs::write(
+            queue_dir.join("schema.json"),
+            br#"{"name":"Invoices","content":[]}"#,
+        )
+        .unwrap();
+        // No datapoint anywhere in content claims this id.
+        std::fs::write(
+            queue_dir.join("formulas/total_amount.py"),
+            "x".repeat(2001).as_bytes(),
+        )
+        .unwrap();
+
+        let mut cl = ChangeList::default();
+        cl.schemas
+            .insert("invoices".to_string(), queue_dir.join("schema.json"));
+
+        assert_eq!(
+            cl.field_limit_violations().len(),
+            0,
+            "an orphaned sidecar the push will never send must not be flagged"
+        );
+    }
+
+    /// A SHADOWED sidecar: the datapoint exists, but it carries an inline
+    /// `formula` key of its own, so `merge_formulas` splices nothing (it
+    /// only fills in a MISSING `formula`). The stale `.py` file must not
+    /// be flagged. The inline value here is itself over-length, so it
+    /// must still be reported -- exactly once, by the nested schema walk
+    /// -- not twice.
+    #[test]
+    fn field_limit_violations_ignores_shadowed_schema_formula_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue_dir = dir.path().join("workspaces/main/queues/invoices");
+        std::fs::create_dir_all(queue_dir.join("formulas")).unwrap();
+        std::fs::write(
+            queue_dir.join("schema.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "Invoices",
+                "content": [{
+                    "category": "datapoint",
+                    "id": "total_amount",
+                    "formula": "f".repeat(2001)
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // Stale sidecar left over from before the datapoint grew an
+        // inline formula. merge_formulas ignores it (the key is present).
+        std::fs::write(
+            queue_dir.join("formulas/total_amount.py"),
+            "x".repeat(2500).as_bytes(),
+        )
+        .unwrap();
+
+        let mut cl = ChangeList::default();
+        cl.schemas
+            .insert("invoices".to_string(), queue_dir.join("schema.json"));
+
+        let v = cl.field_limit_violations();
+        assert_eq!(
+            v.len(),
+            1,
+            "the inline formula must be reported once, by the nested walk -- \
+             the shadowed sidecar must not ALSO report it: {v:?}"
+        );
+        assert_eq!(v[0].field, "formula on datapoint 'total_amount'");
+        assert_eq!(v[0].actual, 2001);
+        // Reported from the nested walk, so the path is schema.json, not
+        // the stale .py sidecar.
+        assert_eq!(v[0].path, queue_dir.join("schema.json"));
     }
 
     /// Unlike the sidecar-extracted formula above, `prompt` stays inline in

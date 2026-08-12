@@ -258,8 +258,10 @@ pub(crate) async fn run_cycle(
     // rewrite `secrets/<env>.secrets.json`; there is no reason to pay for
     // that on a cycle that cannot proceed.
     //
-    // The scan result is reused by the classify phase below, so the tree
-    // is still walked and hashed exactly once.
+    // Reuses the push scanner unchanged, so behavior matches
+    // `push --dry-run` byte for byte. The scan result is also reused by
+    // the classify phase below, so the tree is still walked and hashed
+    // exactly once.
     let (_scanned, changes, tombstones) = crate::cli::push::scan::scan(&paths, &lockfile)?;
     let parse_errors = changes.json_parse_errors();
     let limit_violations = changes.field_limit_violations();
