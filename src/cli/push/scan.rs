@@ -109,7 +109,14 @@ impl ChangeList {
                     continue; // unparseable — reported by json_parse_errors
                 };
                 crate::snapshot::create::strip_for_create(&mut body, kind);
-                for v in crate::snapshot::limits::check_field_limits(kind, &body) {
+                let nested = match kind {
+                    "schemas" => crate::snapshot::limits::check_schema_content(&body),
+                    _ => Vec::new(),
+                };
+                for v in crate::snapshot::limits::check_field_limits(kind, &body)
+                    .into_iter()
+                    .chain(nested)
+                {
                     out.push(FieldLimitViolation {
                         kind,
                         slug: slug.clone(),

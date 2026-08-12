@@ -71,6 +71,69 @@ pub const RULE_TRIGGER_CONDITION_LIMIT: usize = 4000;
 /// sidecar locally is worth more here than for a top-level field.
 pub const SCHEMA_FORMULA_LIMIT: usize = 2000;
 
+/// A schema datapoint's `prompt` is capped at 5000 characters, and
+/// `memory.index_formula` at 2000. Both stay inline in `schema.json`
+/// (unlike `formula`, which is extracted to a sidecar).
+pub const SCHEMA_PROMPT_LIMIT: usize = 5000;
+pub const SCHEMA_INDEX_FORMULA_LIMIT: usize = 2000;
+
+/// Check the length-capped fields nested inside a schema's content tree.
+///
+/// Walks the same shape `snapshot::schema::extract_formulas` walks:
+/// `children` is an array for sections and tuples but a single object for
+/// a multivalue (its element schema). Descending into both is what covers
+/// line-item column fields rather than only top-level datapoints.
+///
+/// `formula` is checked here too even though it normally lives in a
+/// sidecar: `merge_formulas` splices a sidecar only when the datapoint has
+/// no `formula` key, so one written directly into `schema.json` is pushed
+/// verbatim and must be validated.
+pub fn check_schema_content(body: &Value) -> Vec<LimitViolation> {
+    let mut out = Vec::new();
+    if let Some(content) = body.get("content").and_then(|c| c.as_array()) {
+        for node in content {
+            walk_schema_node(node, &mut out);
+        }
+    }
+    out
+}
+
+fn walk_schema_node(node: &Value, out: &mut Vec<LimitViolation>) {
+    let Some(obj) = node.as_object() else { return };
+
+    if obj.get("category").and_then(|c| c.as_str()) == Some("datapoint") {
+        let id = obj.get("id").and_then(|i| i.as_str()).unwrap_or("<unnamed>");
+
+        if let Some(Value::String(s)) = obj.get("prompt") {
+            out.extend(check_text(format!("prompt on datapoint '{id}'"), SCHEMA_PROMPT_LIMIT, s));
+        }
+        if let Some(Value::String(s)) = obj.get("formula") {
+            out.extend(check_text(
+                format!("formula on datapoint '{id}'"),
+                SCHEMA_FORMULA_LIMIT,
+                s,
+            ));
+        }
+        if let Some(Value::String(s)) = obj.get("memory").and_then(|m| m.get("index_formula")) {
+            out.extend(check_text(
+                format!("memory.index_formula on datapoint '{id}'"),
+                SCHEMA_INDEX_FORMULA_LIMIT,
+                s,
+            ));
+        }
+    }
+
+    match obj.get("children") {
+        Some(Value::Array(children)) => {
+            for child in children {
+                walk_schema_node(child, out);
+            }
+        }
+        Some(child @ Value::Object(_)) => walk_schema_node(child, out),
+        _ => {}
+    }
+}
+
 /// Declared `max_length` for each kind's top-level string fields.
 ///
 /// Kinds absent from this match (and fields absent from a kind's slice)
@@ -328,5 +391,108 @@ mod tests {
             check_field_limits("hooks", &body),
             vec![LimitViolation { field: "description".to_string(), limit: 2000, actual: 2500 }],
         );
+    }
+
+    /// `prompt` and `memory.index_formula` stay inline in `schema.json`.
+    #[test]
+    fn schema_nested_prompt_and_index_formula_are_checked() {
+        let body = json!({
+            "content": [{
+                "category": "section",
+                "id": "invoice_details",
+                "children": [{
+                    "category": "datapoint",
+                    "id": "invoice_id",
+                    "prompt": "p".repeat(5001),
+                    "memory": { "index_formula": "m".repeat(2001) }
+                }]
+            }]
+        });
+        let got = check_schema_content(&body);
+        assert_eq!(
+            got,
+            vec![
+                LimitViolation {
+                    field: "prompt on datapoint 'invoice_id'".to_string(),
+                    limit: 5000,
+                    actual: 5001,
+                },
+                LimitViolation {
+                    field: "memory.index_formula on datapoint 'invoice_id'".to_string(),
+                    limit: 2000,
+                    actual: 2001,
+                },
+            ],
+        );
+    }
+
+    /// A multivalue's `children` is a single OBJECT, not an array. Missing
+    /// that descent silently skips every line-item column — the most likely
+    /// way to write this walk wrong.
+    #[test]
+    fn schema_walk_descends_into_line_item_columns() {
+        let body = json!({
+            "content": [{
+                "category": "section",
+                "id": "line_items_section",
+                "children": [{
+                    "category": "multivalue",
+                    "id": "line_items",
+                    "children": {
+                        "category": "tuple",
+                        "id": "line_item",
+                        "children": [{
+                            "category": "datapoint",
+                            "id": "item_total",
+                            "formula": "f".repeat(2001)
+                        }]
+                    }
+                }]
+            }]
+        });
+        assert_eq!(
+            check_schema_content(&body),
+            vec![LimitViolation {
+                field: "formula on datapoint 'item_total'".to_string(),
+                limit: 2000,
+                actual: 2001,
+            }],
+        );
+    }
+
+    /// Boundaries, and the trailing-newline case the server trims.
+    #[test]
+    fn schema_nested_values_at_limit_are_accepted() {
+        let body = json!({
+            "content": [{
+                "category": "section",
+                "id": "s",
+                "children": [{
+                    "category": "datapoint",
+                    "id": "d",
+                    "prompt": "p".repeat(5000),
+                    "formula": format!("{}\n", "f".repeat(2000)),
+                    "memory": { "index_formula": "m".repeat(2000) }
+                }]
+            }]
+        });
+        assert_eq!(check_schema_content(&body), vec![]);
+    }
+
+    /// A schema with no content, or datapoints carrying none of these keys,
+    /// must produce nothing and never panic.
+    #[test]
+    fn schema_walk_tolerates_missing_and_non_string_values() {
+        assert_eq!(check_schema_content(&json!({})), vec![]);
+        assert_eq!(check_schema_content(&json!({ "content": [] })), vec![]);
+        let body = json!({
+            "content": [{
+                "category": "datapoint",
+                "id": "d",
+                "prompt": 42,
+                "memory": "not-an-object"
+            }]
+        });
+        assert_eq!(check_schema_content(&body), vec![]);
     }
 }
