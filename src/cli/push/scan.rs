@@ -1378,6 +1378,52 @@ mod tests {
         assert_eq!(v[0].path, queue_dir.join("formulas/total_amount.py"));
     }
 
+    /// Unlike the sidecar-extracted formula above, `prompt` stays inline in
+    /// `schema.json`'s content tree. This exercises the `"schemas"` match
+    /// arm in `field_limit_violations` itself (`check_schema_content` is
+    /// only wired in for that one kind) -- the `snapshot::limits` unit
+    /// tests call `check_schema_content` directly and never touch that
+    /// dispatch, so a typo in the match arm or a dropped `.chain(nested)`
+    /// would pass every one of them while fully disabling this feature on
+    /// the real push path.
+    #[test]
+    fn field_limit_violations_reports_oversized_nested_schema_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue_dir = dir.path().join("workspaces/main/queues/invoices");
+        std::fs::create_dir_all(&queue_dir).unwrap();
+        std::fs::write(
+            queue_dir.join("schema.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "Invoices",
+                "content": [{
+                    "category": "section",
+                    "id": "invoice_details",
+                    "children": [{
+                        "category": "datapoint",
+                        "id": "invoice_id",
+                        "prompt": "p".repeat(5001)
+                    }]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut cl = ChangeList::default();
+        cl.schemas
+            .insert("invoices".to_string(), queue_dir.join("schema.json"));
+
+        let v = cl.field_limit_violations();
+        assert_eq!(v.len(), 1, "only the over-length prompt should flag: {v:?}");
+        assert_eq!(v[0].kind, "schemas");
+        assert_eq!(v[0].field, "prompt on datapoint 'invoice_id'");
+        assert_eq!(v[0].limit, 5000);
+        assert_eq!(v[0].actual, 5001);
+        // Nested values live directly in the JSON, so unlike the sidecar
+        // cases above, the reported path is schema.json itself.
+        assert_eq!(v[0].path, queue_dir.join("schema.json"));
+    }
+
     /// A queue with no `formulas/` directory must not error.
     #[test]
     fn schema_without_formulas_dir_is_not_flagged() {
