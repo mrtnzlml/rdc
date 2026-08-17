@@ -105,10 +105,19 @@ pub struct Cli {
 pub enum Command {
     /// Bootstrap an rdc project in the current directory, or add a new
     /// environment to an existing one. `--env` may be repeated; when
-    /// omitted, prompts interactively (if stdin is a TTY).
+    /// omitted, prompts interactively (if stdin is a TTY). `--force` on
+    /// its own regenerates an existing project's scaffold files.
     Init {
         #[arg(long = "env", value_name = "ENV_SPEC")]
         envs: Vec<String>,
+        /// Refresh the scaffold files from this binary's templates:
+        /// `CLAUDE.md`, `README.md` and `.gitlab-ci.yml` are overwritten
+        /// (hand edits are lost — commit first), while `.gitignore` and
+        /// `.gitattributes` only gain their missing rdc lines. Without any
+        /// `--env` this is all init does: no wizard, no auth, no sync, and
+        /// `rdc.toml` is left untouched.
+        #[arg(long)]
+        force: bool,
     },
     /// Reconcile the local snapshot and the env's remote state in one pass.
     /// Without `<env>`, picks interactively from envs defined in `rdc.toml`
@@ -302,7 +311,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     match cli.command {
-        Some(Command::Init { envs }) => crate::cli::init::run(envs).await,
+        Some(Command::Init { envs, force }) => crate::cli::init::run(envs, force).await,
         Some(Command::Sync {
             env,
             dry_run,

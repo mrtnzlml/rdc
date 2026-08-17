@@ -15,7 +15,30 @@ enum InitMode {
     Extend,
 }
 
-pub async fn run(env_specs: Vec<String>) -> Result<()> {
+/// What a scaffold writer did to its file, for the `--force` summary.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Scaffolded {
+    Created,
+    /// Existing file replaced with the current template (`--force` only).
+    Rewritten,
+    /// Missing canonical lines appended, user lines kept
+    /// (`.gitignore` / `.gitattributes`).
+    Merged,
+    Unchanged,
+}
+
+impl Scaffolded {
+    fn label(self) -> &'static str {
+        match self {
+            Scaffolded::Created => "created",
+            Scaffolded::Rewritten => "rewritten",
+            Scaffolded::Merged => "updated",
+            Scaffolded::Unchanged => "unchanged",
+        }
+    }
+}
+
+pub async fn run(env_specs: Vec<String>, force: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let cfg_path = cwd.join("rdc.toml");
 
@@ -28,8 +51,26 @@ pub async fn run(env_specs: Vec<String>) -> Result<()> {
         (ProjectConfig::default(), InitMode::New)
     };
 
+    // `--force` with no `--env` is regenerate-only: refresh the scaffold files
+    // from this binary's templates and stop — no env wizard, no auth, no sync,
+    // and `rdc.toml` is left exactly as it is. There is nothing to regenerate
+    // without a project, so that combination is a usage error rather than a
+    // silent fall-through into the bootstrap wizard.
+    let regenerate_only = force && env_specs.is_empty();
+    if regenerate_only && matches!(mode, InitMode::New) {
+        return Err(anyhow!(
+            "rdc init --force: no rdc.toml in {} — nothing to regenerate. \
+             Bootstrap the project first: rdc init --env <env>=<api_base>:<org_id>",
+            cwd.display()
+        ));
+    }
+
     // Get env specs (interactive when none provided + TTY available).
-    let env_specs = resolve_env_specs(env_specs, &cfg, &mode)?;
+    let env_specs = if regenerate_only {
+        Vec::new()
+    } else {
+        resolve_env_specs(env_specs, &cfg, &mode)?
+    };
 
     let mut new_env_names: Vec<String> = Vec::new();
     for spec in &env_specs {
@@ -62,12 +103,20 @@ pub async fn run(env_specs: Vec<String>) -> Result<()> {
         new_env_names.push(env_name);
     }
 
-    cfg.save(&cfg_path)?;
+    // Nothing was added in regenerate-only mode, so don't rewrite `rdc.toml`:
+    // a save round-trips it through `ProjectConfig` and would drop any key this
+    // version doesn't model.
+    if !regenerate_only {
+        cfg.save(&cfg_path)?;
+    }
 
-    write_gitignore(&cwd)?;
-    write_gitattributes(&cwd)?;
-    write_claude_md(&cwd)?;
-    write_readme(&cwd, &cfg)?;
+    let scaffold: Vec<(&str, Scaffolded)> = vec![
+        (".gitignore", write_gitignore(&cwd)?),
+        (".gitattributes", write_gitattributes(&cwd)?),
+        ("CLAUDE.md", write_claude_md(&cwd, force)?),
+        ("README.md", write_readme(&cwd, &cfg, force)?),
+        (".gitlab-ci.yml", write_gitlab_ci(&cwd, force)?),
+    ];
     std::fs::create_dir_all(cwd.join("secrets"))
         .with_context(|| format!("creating {}", cwd.join("secrets").display()))?;
     for env in &new_env_names {
@@ -78,14 +127,25 @@ pub async fn run(env_specs: Vec<String>) -> Result<()> {
             .with_context(|| format!("creating {}", paths.hooks_dir().display()))?;
     }
 
+    // The per-file summary is the whole output of a regenerate-only run, and
+    // the receipt a `--force` user needs elsewhere ("did it touch my README?").
+    // Silent otherwise, so a plain init keeps its one-line output.
+    if force {
+        println!("Scaffold files:");
+        for (name, outcome) in &scaffold {
+            println!("  {name:<16} {}", outcome.label());
+        }
+    }
+
     let env_list = new_env_names.join(", ");
     match mode {
         InitMode::New => {
             println!("Initialized rdc project with envs: {env_list}");
         }
-        InitMode::Extend => {
+        InitMode::Extend if !regenerate_only => {
             println!("Added env(s): {env_list}");
         }
+        InitMode::Extend => {}
     }
 
     // Auth-on-init: for each new env, try to authenticate up front so the
@@ -441,7 +501,10 @@ fn parse_env_spec(spec: &str) -> Result<(String, EnvConfig)> {
     ))
 }
 
-fn write_gitignore(root: &Path) -> Result<()> {
+/// Ensure the canonical ignore patterns are present. Additive by design —
+/// including under `--force`, which is why it takes no `force` flag: the merge
+/// already restores every rdc-owned line without discarding the user's own.
+fn write_gitignore(root: &Path) -> Result<Scaffolded> {
     let path = root.join(".gitignore");
     // Canonical patterns this template ensures. Each line is checked
     // independently so re-running `rdc init` on a project that already
@@ -480,7 +543,7 @@ fn write_gitignore(root: &Path) -> Result<()> {
     if !path.exists() {
         let body: String = PATTERNS.iter().map(|p| format!("{p}\n")).collect();
         write_atomic(&path, body.as_bytes())?;
-        return Ok(());
+        return Ok(Scaffolded::Created);
     }
 
     let existing = std::fs::read_to_string(&path)
@@ -494,7 +557,7 @@ fn write_gitignore(root: &Path) -> Result<()> {
         .filter(|p| !existing_lines.contains(p))
         .collect();
     if missing.is_empty() {
-        return Ok(());
+        return Ok(Scaffolded::Unchanged);
     }
 
     let mut combined = existing;
@@ -506,7 +569,7 @@ fn write_gitignore(root: &Path) -> Result<()> {
         combined.push('\n');
     }
     write_atomic(&path, combined.as_bytes())?;
-    Ok(())
+    Ok(Scaffolded::Merged)
 }
 
 /// Mark rdc-owned files under `.rdc/` as generated so GitHub collapses
@@ -514,14 +577,15 @@ fn write_gitignore(root: &Path) -> Result<()> {
 /// state lockfile (`state/<env>.lock.json`) and cross-env mappings
 /// (`map/<src>-to-<tgt>.toml`) are produced by the tool; reviewers
 /// shouldn't have to scroll past them.
-fn write_gitattributes(root: &Path) -> Result<()> {
+/// Additive like [`write_gitignore`], and for the same reason.
+fn write_gitattributes(root: &Path) -> Result<Scaffolded> {
     let path = root.join(".gitattributes");
     let body = ".rdc/** linguist-generated=true\n";
     if path.exists() {
         let existing = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         if existing.contains(".rdc/** linguist-generated") {
-            return Ok(());
+            return Ok(Scaffolded::Unchanged);
         }
         let mut combined = existing;
         if !combined.ends_with('\n') {
@@ -529,24 +593,56 @@ fn write_gitattributes(root: &Path) -> Result<()> {
         }
         combined.push_str(body);
         write_atomic(&path, combined.as_bytes())?;
+        Ok(Scaffolded::Merged)
     } else {
         write_atomic(&path, body.as_bytes())?;
+        Ok(Scaffolded::Created)
     }
-    Ok(())
+}
+
+/// Write `body` at `path` with the scaffold contract: a missing file is
+/// created, an existing one is left alone unless `force`. Under `--force` the
+/// bytes are compared first, so re-running on an untouched project reports
+/// `Unchanged` instead of churning mtimes (and the comparison is byte-wise, so
+/// a hand-edited file that isn't valid UTF-8 doesn't fail the run).
+fn write_template_file(path: &Path, body: &str, force: bool) -> Result<Scaffolded> {
+    if path.exists() {
+        if !force {
+            return Ok(Scaffolded::Unchanged);
+        }
+        let existing =
+            std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        if existing == body.as_bytes() {
+            return Ok(Scaffolded::Unchanged);
+        }
+        write_atomic(path, body.as_bytes())?;
+        return Ok(Scaffolded::Rewritten);
+    }
+    write_atomic(path, body.as_bytes())?;
+    Ok(Scaffolded::Created)
+}
+
+/// Write the GitLab CI pipeline at `<root>/.gitlab-ci.yml`. Same scaffold
+/// contract as [`write_claude_md`]: created when absent, replaced only under
+/// `--force`, so a hand-tuned pipeline is never clobbered by an ordinary init.
+///
+/// The body is the repo's `templates/gitlab-ci.yml`, embedded at compile time
+/// so the copy users read on GitHub and the copy this binary writes cannot
+/// drift. It ships with placeholder env names (`dev` -> `test` -> `prod`) and
+/// TODO markers rather than the project's real envs: `rdc.toml` stores envs in a
+/// `BTreeMap`, so their order is alphabetical and a promotion chain cannot be
+/// derived from it (`dev`, `prod`, `test` would chain dev -> prod -> test).
+fn write_gitlab_ci(root: &Path, force: bool) -> Result<Scaffolded> {
+    write_template_file(&root.join(".gitlab-ci.yml"), GITLAB_CI_TEMPLATE, force)
 }
 
 /// Write an agent guide at `<root>/CLAUDE.md`. Unlike `_index.md`, this
 /// is a once-only file — `rdc init` creates it, but sync never
 /// overwrites it. Existing files (e.g. when re-running init on an
 /// already-bootstrapped repo, or when the user has hand-edited the
-/// guide) are left untouched.
-fn write_claude_md(root: &Path) -> Result<()> {
-    let path = root.join("CLAUDE.md");
-    if path.exists() {
-        return Ok(());
-    }
-    write_atomic(&path, CLAUDE_MD_TEMPLATE.as_bytes())?;
-    Ok(())
+/// guide) are left untouched unless `force` is set.
+fn write_claude_md(root: &Path, force: bool) -> Result<Scaffolded> {
+    write_template_file(&root.join("CLAUDE.md"), CLAUDE_MD_TEMPLATE, force)
 }
 
 /// Write a human-facing `README.md` at the project root listing the
@@ -554,15 +650,17 @@ fn write_claude_md(root: &Path) -> Result<()> {
 /// `cfg`, and — when there are at least two envs — a promote example
 /// (`rdc migrate` + `rdc sync`) using the first two envs alphabetically. Same
 /// once-only contract as [`write_claude_md`]: skipped when README.md
-/// already exists, so the user's content is never clobbered.
+/// already exists (unless `force`), so the user's content is never
+/// clobbered by an ordinary init.
 ///
 /// Title is the project root's basename (matches the user's mental
 /// model of "what is this repo called"); falls back to a generic title
 /// when the basename isn't valid UTF-8 or is empty.
-fn write_readme(root: &Path, cfg: &ProjectConfig) -> Result<()> {
+fn write_readme(root: &Path, cfg: &ProjectConfig, force: bool) -> Result<Scaffolded> {
     let path = root.join("README.md");
-    if path.exists() {
-        return Ok(());
+    // Cheap exit before building the body, which the non-force path throws away.
+    if path.exists() && !force {
+        return Ok(Scaffolded::Unchanged);
     }
     let title = root
         .file_name()
@@ -626,16 +724,18 @@ fn write_readme(root: &Path, cfg: &ProjectConfig) -> Result<()> {
         "- `CLAUDE.md` — editing recipes, repo layout, common commands, \
          conflict + promote workflows.\n\
          - `envs/<env>/_index.md` — auto-generated map of every object in \
-         `<env>` with paths and cross-references.\n",
+         `<env>` with paths and cross-references.\n\
+         - `.gitlab-ci.yml` — scheduled archive + one manual deploy button per \
+         env; its header lists the CI variables to set.\n",
     );
 
-    write_atomic(&path, md.as_bytes())?;
-    Ok(())
+    write_template_file(&path, &md, force)
 }
 
-/// Write the four init-time scaffold files (`.gitignore`, `.gitattributes`,
-/// `CLAUDE.md`, `README.md`) at `cwd`, given a single-env project shape.
-/// Idempotent: each underlying writer skips when the file already exists.
+/// Write the five init-time scaffold files (`.gitignore`, `.gitattributes`,
+/// `CLAUDE.md`, `README.md`, `.gitlab-ci.yml`) at `cwd`, given a single-env
+/// project shape. Idempotent: each underlying writer skips when the file
+/// already exists.
 ///
 /// Exposed for embedders (e.g. the Rossum Local desktop app) that need
 /// a Connection folder to look identical to one produced by `rdc init`
@@ -648,7 +748,7 @@ pub fn write_scaffold_files(
 ) -> Result<()> {
     write_gitignore(cwd)?;
     write_gitattributes(cwd)?;
-    write_claude_md(cwd)?;
+    write_claude_md(cwd, false)?;
     let mut cfg = ProjectConfig::default();
     cfg.envs.insert(
         env_name.to_string(),
@@ -657,9 +757,14 @@ pub fn write_scaffold_files(
             org_id,
         },
     );
-    write_readme(cwd, &cfg)?;
+    write_readme(cwd, &cfg, false)?;
+    write_gitlab_ci(cwd, false)?;
     Ok(())
 }
+
+/// The GitLab CI pipeline `rdc init` drops into a project, embedded from the
+/// repo's `templates/gitlab-ci.yml` (see [`write_gitlab_ci`]).
+const GITLAB_CI_TEMPLATE: &str = include_str!("../../templates/gitlab-ci.yml");
 
 const CLAUDE_MD_TEMPLATE: &str = r#"# Agent guide
 
@@ -681,6 +786,7 @@ code.
 
 ```
 rdc.toml                                  project + env definitions
+.gitlab-ci.yml                            scheduled archive + deploy buttons; fill in its TODOs
 secrets/<env>.secrets.json                API tokens (gitignored)
 envs/<env>/
   _index.md                               auto-regenerated; do not edit
@@ -839,3 +945,106 @@ prompt is `[k]` (force-push), `[r]` (adopt remote), `[s]` (skip),
   to that shared resource works (id is the truth), but cross-env
   promotion via `rdc migrate` may surface confusing diffs.
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The embedder entry point (desktop Connection folders) must produce the
+    /// same scaffold `rdc init` does — a Connection folder is meant to be
+    /// indistinguishable from a hand-initialised project.
+    #[test]
+    fn write_scaffold_files_writes_every_scaffold_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_scaffold_files(dir.path(), "main", "https://example.rossum.app/api/v1", 1).unwrap();
+        for name in [
+            ".gitignore",
+            ".gitattributes",
+            "CLAUDE.md",
+            "README.md",
+            ".gitlab-ci.yml",
+        ] {
+            assert!(dir.path().join(name).exists(), "{name} should be written");
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".gitlab-ci.yml")).unwrap(),
+            GITLAB_CI_TEMPLATE
+        );
+    }
+
+    /// Embedders call this on every sync, so it must stay non-destructive.
+    #[test]
+    fn write_scaffold_files_never_clobbers_existing_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".gitlab-ci.yml"), "mine\n").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "mine\n").unwrap();
+
+        write_scaffold_files(dir.path(), "main", "https://example.rossum.app/api/v1", 1).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".gitlab-ci.yml")).unwrap(),
+            "mine\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap(),
+            "mine\n"
+        );
+    }
+
+    /// Create → skip → (force) rewrite only when the bytes actually differ, so
+    /// `rdc init --force` on an untouched project churns no mtimes.
+    #[test]
+    fn write_template_file_force_semantics() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("scaffold.txt");
+
+        assert_eq!(
+            write_template_file(&p, "body\n", false).unwrap(),
+            Scaffolded::Created
+        );
+        assert_eq!(
+            write_template_file(&p, "body\n", false).unwrap(),
+            Scaffolded::Unchanged
+        );
+        assert_eq!(
+            write_template_file(&p, "body\n", true).unwrap(),
+            Scaffolded::Unchanged
+        );
+
+        std::fs::write(&p, "drifted\n").unwrap();
+        assert_eq!(
+            write_template_file(&p, "body\n", false).unwrap(),
+            Scaffolded::Unchanged,
+            "without --force a drifted file is left alone"
+        );
+        assert_eq!(
+            write_template_file(&p, "body\n", true).unwrap(),
+            Scaffolded::Rewritten
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "body\n");
+    }
+
+    /// A hand-edited file that isn't valid UTF-8 must not fail the run: the
+    /// force comparison reads bytes, not a `String`.
+    #[test]
+    fn write_template_file_force_handles_non_utf8() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("scaffold.txt");
+        std::fs::write(&p, [0xff, 0xfe, 0x00]).unwrap();
+
+        assert_eq!(
+            write_template_file(&p, "body\n", true).unwrap(),
+            Scaffolded::Rewritten
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "body\n");
+    }
+
+    /// Smoke-check the `include_str!` target: the constant is the real pipeline,
+    /// not an empty or hand-copied stand-in.
+    #[test]
+    fn embedded_gitlab_ci_template_is_the_repo_pipeline() {
+        assert!(GITLAB_CI_TEMPLATE.starts_with("# GitLab CI for a Rossum project managed with rdc"));
+        assert!(GITLAB_CI_TEMPLATE.contains("rdc sync \"$RDC_ENV\" --no-push --yes --conflict use-remote"));
+        assert!(GITLAB_CI_TEMPLATE.contains("rdc migrate \"$RDC_SRC\" \"$RDC_ENV\" --mirror --yes"));
+    }
+}

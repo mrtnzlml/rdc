@@ -660,3 +660,166 @@ fn init_refuses_env_name_that_collides_with_existing_env_var() {
         .stderr(predicate::str::contains("dev-us"))
         .stderr(predicate::str::contains("dev_us"));
 }
+
+/// The pipeline init writes is the repo's `templates/gitlab-ci.yml`, embedded
+/// with `include_str!`. Compare bytes so a future hand-copied duplicate that
+/// drifts from the template fails here instead of shipping two versions.
+#[test]
+fn init_writes_gitlab_ci_from_the_repo_template() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "dev=https://example.rossum.app/api/v1:285704"])
+        .assert()
+        .success();
+
+    let written = std::fs::read_to_string(dir.path().join(".gitlab-ci.yml")).unwrap();
+    let template = std::fs::read_to_string("templates/gitlab-ci.yml").unwrap();
+    assert_eq!(written, template, ".gitlab-ci.yml must match templates/gitlab-ci.yml");
+    // Placeholder envs + TODOs, never the project's real env names: rdc.toml
+    // stores envs alphabetically, so a promotion chain can't be derived.
+    assert!(written.contains("RDC_ENV: [dev]  # TODO"));
+    assert!(written.contains("RDC_SRC: dev"));
+}
+
+#[test]
+fn init_does_not_clobber_existing_gitlab_ci() {
+    let dir = TempDir::new().unwrap();
+    let user_pipeline = "stages: [build]\nbuild:\n  script: [make]\n";
+    std::fs::write(dir.path().join(".gitlab-ci.yml"), user_pipeline).unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "dev=https://example.rossum.app/api/v1:285704"])
+        .assert()
+        .success();
+
+    let after = std::fs::read_to_string(dir.path().join(".gitlab-ci.yml")).unwrap();
+    assert_eq!(after, user_pipeline, "init must not overwrite an existing pipeline");
+}
+
+/// `rdc init --force` with no `--env` is regenerate-only: the three template
+/// files are restored, `.gitignore` keeps the user's own patterns, `rdc.toml`
+/// is untouched, and no env is added.
+#[test]
+fn init_force_without_env_regenerates_scaffold_files() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "dev=https://example.rossum.app/api/v1:285704"])
+        .assert()
+        .success();
+
+    // Drift: mangle the generated files and add a user ignore pattern.
+    for f in ["CLAUDE.md", "README.md", ".gitlab-ci.yml"] {
+        std::fs::write(dir.path().join(f), "stale\n").unwrap();
+    }
+    let ignore_before = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+    std::fs::write(
+        dir.path().join(".gitignore"),
+        format!("{ignore_before}/my-own-scratch\n"),
+    )
+    .unwrap();
+    let cfg_before = std::fs::read_to_string(dir.path().join("rdc.toml")).unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Scaffold files:"))
+        .stdout(predicate::str::contains("CLAUDE.md        rewritten"))
+        .stdout(predicate::str::contains("README.md        rewritten"))
+        .stdout(predicate::str::contains(".gitlab-ci.yml   rewritten"))
+        .stdout(predicate::str::contains(".gitignore       unchanged"))
+        // Regenerate-only: no env was added, so no env line and no next steps.
+        .stdout(predicate::str::contains("Added env(s)").not())
+        .stdout(predicate::str::contains("Next steps").not());
+
+    assert!(std::fs::read_to_string(dir.path().join("CLAUDE.md"))
+        .unwrap()
+        .contains("# Agent guide"));
+    assert!(std::fs::read_to_string(dir.path().join("README.md"))
+        .unwrap()
+        .contains("rdc sync dev"));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(".gitlab-ci.yml")).unwrap(),
+        std::fs::read_to_string("templates/gitlab-ci.yml").unwrap()
+    );
+    // Additive files keep the user's lines while still carrying rdc's.
+    let ignore_after = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+    assert!(ignore_after.contains("/my-own-scratch"), "--force must not drop user ignore patterns");
+    assert!(ignore_after.contains("/.rdc/conflicts"));
+    // rdc.toml is not round-tripped when nothing was added.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("rdc.toml")).unwrap(),
+        cfg_before
+    );
+}
+
+/// Nothing drifted → `--force` reports every file unchanged instead of
+/// rewriting it (the writer compares bytes first).
+#[test]
+fn init_force_reports_unchanged_when_scaffold_matches() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "dev=https://example.rossum.app/api/v1:285704"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CLAUDE.md        unchanged"))
+        .stdout(predicate::str::contains("README.md        unchanged"))
+        .stdout(predicate::str::contains(".gitlab-ci.yml   unchanged"))
+        .stdout(predicate::str::contains("rewritten").not());
+}
+
+/// `--force` with an `--env` still does a normal add, plus the summary.
+#[test]
+fn init_force_with_env_adds_env_and_prints_summary() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--force",
+            "--env", "dev=https://example.rossum.app/api/v1:285704",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(".gitlab-ci.yml   created"))
+        .stdout(predicate::str::contains("Initialized rdc project with envs: dev"));
+
+    assert!(dir.path().join(".gitlab-ci.yml").exists());
+    assert!(dir.path().join("envs/dev").is_dir());
+}
+
+/// There is nothing to regenerate without a project; say so rather than
+/// dropping into the bootstrap wizard (or its non-TTY usage error).
+#[test]
+fn init_force_without_project_errors() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--force"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("nothing to regenerate"))
+        .stderr(predicate::str::contains("rdc init --env"));
+
+    assert!(!dir.path().join("rdc.toml").exists());
+    assert!(!dir.path().join(".gitlab-ci.yml").exists());
+}

@@ -75,6 +75,8 @@ rdc init
 
 `rdc init` walks you through setting up one or more envs — env name, API base URL, org ID, API token — then syncs each into a local snapshot.
 
+Alongside the snapshot it scaffolds `CLAUDE.md`, `README.md`, `.gitignore`, `.gitattributes`, and a `.gitlab-ci.yml` pipeline (scheduled archive + one manual deploy button per env; fill in its `TODO`s before enabling it). Existing files are never touched — `rdc init --force` re-generates them from the current binary, and on its own (no `--env`) that is all it does.
+
 For an env named `test`, you now have:
 
 ```
@@ -301,11 +303,11 @@ rather than duplicating them.
 
 | Command | What it does |
 |---|---|
-| `rdc init` | Create a new project, or add an env to an existing one. Prompts interactively. |
+| `rdc init` | Create a new project, or add an env to an existing one. Prompts interactively; `--force` re-generates the scaffold files (`CLAUDE.md`, `README.md`, `.gitlab-ci.yml`). |
 | `rdc auth <env>` | Set or refresh the API token for `<env>`. |
 | `rdc sync <env>` | Reconcile snapshot ↔ remote in one pass. |
 | `rdc migrate <src> <tgt>` | Copy one env's snapshot into another's, locally (slug remap, ref rewrite, overlay) — then push with `rdc sync <tgt>`. |
-| `rdc doctor <env>` | Diagnose and fix the local snapshot — realign stale slugs, repair store-extension hooks, optionally rebuild the lockfile (`--rebuild-lock`). |
+| `rdc doctor <env>` | Offline check of the local snapshot — report unpushed local changes, realign stale slugs (cascade-aware), prune orphan base-cache entries. |
 | `rdc upgrade` | Self-update the binary. |
 
 Every command that writes to the remote takes `--dry-run`. Use `rdc <command> --help` for the full flag list.
