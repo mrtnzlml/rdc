@@ -1,56 +1,21 @@
-# One GitLab CI pipeline for a Rossum project managed with rdc:
+# GitLab CI for a Rossum project managed with rdc: a scheduled, read-only
+# archive per tenant, plus one manual deploy button per promoted env. Copy to
+# .gitlab-ci.yml, fill in the TODOs, add a Schedule for the archive (Settings ->
+# CI/CD -> Schedules), and set these masked + protected CI variables:
+#   RDC_USER_<ENV> + RDC_PASS_<ENV>  one pair per env below; rdc exchanges them
+#     for a token itself, so CI needs no `rdc auth`. RDC_TOKEN_<ENV> also works.
+#     <ENV> is the env name uppercased, non-alphanumerics as '_' (dev-eu -> DEV_EU).
+#   RDC_GITHUB_TOKEN                 read access to the rdc repo (release asset).
+#   RDC_GIT_PUSH_TOKEN               write access to THIS repo's default branch
+#     for the commit-back, or RDC_GIT_PUSH_URL with a full authenticated URL.
 #
-#   * archive — scheduled, read-only against Rossum (`sync --no-push`). Records
-#     what is live in the tenant and commits the snapshot back to the default
-#     branch. One job per archived env.
-#   * deploy — one manual "button" per promoted env. Mirrors its SOURCE env's
-#     committed snapshot onto the TARGET env with `rdc migrate --mirror`
-#     (pure-local, zero remote calls), pushes the result to the target tenant
-#     with `rdc sync`, then commits back what rdc wrote: server-assigned
-#     ids/urls and the regenerated _index.md land in envs/<env>/, refreshed
-#     base hashes in that env's lockfile, slug divergences in .rdc/mapping.toml.
+# Rehearse every new deploy target before its first press:
+#   rdc migrate <src> <tgt> --mirror --dry-run && rdc sync <tgt> --dry-run
 #
-# Copy this file to .gitlab-ci.yml at the root of your Rossum project repo (the
-# one that holds rdc.toml + envs/), or `include:` it. Then:
-#
-#   1. Set CI variables (Settings -> CI/CD -> Variables; masked, protected):
-#
-#        RDC_USER_<ENV> + RDC_PASS_<ENV>
-#            Credentials for every env this pipeline touches -- archived or
-#            deployed to. rdc reads these itself and exchanges them for a token
-#            headlessly, so CI needs NO `rdc auth` step. The suffix is the env
-#            name uppercased with non-alphanumerics turned into '_':
-#              env 'prod'    -> RDC_USER_PROD    / RDC_PASS_PROD
-#              env 'prod-eu' -> RDC_USER_PROD_EU / RDC_PASS_PROD_EU
-#            `RDC_TOKEN_<ENV>` also works and takes precedence over user+pass.
-#
-#        RDC_GITHUB_TOKEN
-#            Read access to the rdc repo, to download the release asset.
-#
-#        RDC_GIT_PUSH_TOKEN
-#            Write access to THIS repo, for the commit-back push. Both stages
-#            commit to the default branch, so the token must be allowed to push
-#            to it (add it to the protected branch's allowed-to-push list).
-#            Alternatively set RDC_GIT_PUSH_URL to a complete authenticated
-#            remote URL.
-#
-#   2. Adjust RDC_VERSION, RDC_GIT_EMAIL, the archive env matrix, and the
-#      concrete deploy jobs at the bottom of this file.
-#
-#   3. Add a Schedule for the archive in Settings -> CI/CD -> Schedules
-#      (e.g. '0 2 * * *' UTC), or trigger a run by hand with "Run pipeline".
-#
-#   4. Rehearse every new deploy target locally BEFORE its first press:
-#        rdc migrate <src> <tgt> --mirror --dry-run
-#        rdc sync <tgt> --dry-run
-#
-# CAUTION: the deploy jobs write to Rossum and CAN DELETE. `migrate --mirror`
-# removes target snapshot objects the source no longer has, and
-# `sync --allow-deletes` turns those local removals into remote DELETEs. Keep
-# the chain's SOURCE envs (e.g. dev) out of the deploy jobs: they are authored
-# by hand from a workstation and are the head of the chain, never a target of it.
-# Archive those instead -- archiving an env that is also a deploy target only
-# rewrites a snapshot the next deploy re-derives from its source anyway.
+# CAUTION: deploy writes to Rossum and CAN DELETE -- `migrate --mirror` prunes
+# target objects the source no longer has, and `sync --allow-deletes` turns
+# those into remote DELETEs. Keep hand-authored source envs (dev) out of the
+# deploy jobs; archive those instead.
 
 stages:
   - test
@@ -61,22 +26,15 @@ default:
   interruptible: true
 
 variables:
-  # Pin to a concrete released tag; never a floating alias. See
-  # https://github.com/mrtnzlml/rdc/releases
-  RDC_VERSION: "v0.5.0"
+  RDC_VERSION: "v0.5.0"  # TODO: a released tag, never a floating alias
   RDC_REPO: "mrtnzlml/rdc"
   RDC_ASSET: "rdc-x86_64-unknown-linux-gnu.tar.gz"
-  # Author + committer address for the commit-back. GitLab push rules can
-  # require these to match a pattern ("Check whether the commit author is a
-  # GitLab user", "Commit author's email"); if yours does, use an address that
-  # satisfies it or the push is rejected after rdc has already run.
-  RDC_GIT_EMAIL: "rdc-ci@example.com"
+  # Commit-back author and committer. GitLab push rules can require these to
+  # match a pattern; if yours does, use an address that satisfies it.
+  RDC_GIT_EMAIL: "rdc-ci@example.com"  # TODO
 
-# Install rdc. The GitHub repo is private, so the browser download URL
-# (releases/download/<tag>/<asset>) 404s even with a token -- github.com serves
-# release downloads to a browser session only. api.github.com plus the numeric
-# asset id is the only way in, which is why the release is looked up by tag
-# first to resolve that id.
+# github.com serves release downloads to a browser session only: that URL 404s
+# even with a token. api.github.com + the numeric asset id is the only way in.
 .rdc-install-script: &rdc-install-script |
   set -eu
   : "${RDC_GITHUB_TOKEN:?set RDC_GITHUB_TOKEN (read access to $RDC_REPO)}"
@@ -91,15 +49,13 @@ variables:
     | tar -xz -C "$install_dir"
   "$install_dir/rdc" --version
 
-# Commit what rdc wrote to the default branch. before_script and script share
-# one shell, so defining the function in before_script makes it callable from
-# script; both the archive and the deploy jobs do exactly that.
+# Commits what rdc wrote to the default branch. before_script and script share
+# one shell, so both jobs call this.
 .rdc-writeback: &rdc-writeback |
   writeback() {
     msg=$1
     remote=${RDC_GIT_PUSH_URL:-https://oauth2:$RDC_GIT_PUSH_TOKEN@$CI_SERVER_HOST/$CI_PROJECT_PATH.git}
-    # Paths are scoped on purpose: it keeps the login token rdc caches in
-    # secrets/ out of the commit even if that directory is not gitignored.
+    # Scoped paths keep the token rdc caches in secrets/ out of the commit.
     set -- "envs/$RDC_ENV"
     for p in ".rdc/state/$RDC_ENV.lock.json" ".rdc/mapping.toml" ".rdc/map"; do
       if [ -e "$p" ]; then set -- "$@" "$p"; fi
@@ -117,10 +73,9 @@ variables:
     git push -q -o ci.skip "$remote" "HEAD:refs/heads/$CI_DEFAULT_BRANCH"
   }
 
-# EXAMPLE placeholder for your repo's own checks (hook unit tests, linters).
-# The deploy buttons depend on it so a deploy cannot run against a snapshot that
-# failed validation. If your repo has no tests, delete this job AND the
-# `needs:` in .rdc-deploy below.
+# EXAMPLE placeholder for your repo's own checks. The deploy buttons depend on
+# it, so a deploy cannot run against a snapshot that failed validation. No tests
+# in this repo? Delete this job AND the `needs:` in .rdc-deploy.
 pytest:
   stage: test
   image: python:3.12-slim
@@ -134,46 +89,25 @@ pytest:
 
 archive:
   stage: archive
-  # python:3.12, not alpine: the released Linux binary targets
-  # x86_64-unknown-linux-gnu and is dynamically linked against glibc, so it
-  # cannot run on Alpine's musl. Not -slim either: the full image already ships
-  # git, curl and python3, so the job needs no apt-get and therefore no Debian
-  # mirror egress.
-  image: python:3.12
+  image: python:3.12  # glibc binary: not alpine (musl); not -slim (needs git, curl, python3)
   needs: []  # an archive records what is live; never gate it on the tests
-  # Both matrix legs push to the default branch, and every archive pipeline
-  # does. One resource group serializes them all, so no two commit-backs race.
-  resource_group: archive
+  resource_group: archive  # serialize the commit-backs, including across pipelines
   interruptible: false  # a newer pipeline must not cancel the queued sibling
   rules:
-    # Scheduled run (Settings -> CI/CD -> Schedules)...
     - if: $CI_PIPELINE_SOURCE == "schedule"
-    # ...or a manual "Run pipeline" from the GitLab UI.
     - if: $CI_PIPELINE_SOURCE == "web"
   variables:
-    # Full clone: the commit-back rebases onto the default branch, and pushing
-    # from GitLab's default shallow clone is unreliable.
-    GIT_DEPTH: "0"
-  # One archival job per environment. A single env still uses the matrix form,
-  # so adding more envs is just extending the list (each needs its own
-  # RDC_USER_<ENV> / RDC_PASS_<ENV> CI variables).
+    GIT_DEPTH: "0"  # the commit-back rebases onto the default branch
   parallel:
     matrix:
-      - RDC_ENV: [dev]
+      - RDC_ENV: [dev]  # TODO: the envs to archive
   before_script:
     - *rdc-install-script
     - *rdc-writeback
     - git config user.name "rdc-archive[bot]"
     - git config user.email "$RDC_GIT_EMAIL"
   script:
-    # Snapshot the env's live config into the working tree (never writes Rossum).
-    #
-    # --conflict use-remote is what makes the snapshot trustworthy. When the
-    # committed snapshot and the tenant have both moved since the last sync, the
-    # default non-TTY behavior parks the remote side under .rdc/conflicts/<env>/
-    # and leaves the local file untouched -- so the archive would quietly NOT
-    # record the live state of that object. An archive exists to record what is
-    # live, so the tenant always wins here.
+    # use-remote: the tenant wins, or the archive silently omits diverged objects.
     - rdc sync "$RDC_ENV" --no-push --yes --conflict use-remote
     - |
       set -eu
@@ -184,36 +118,24 @@ archive:
         exit 1
       fi
 
-# Shared setup for every deploy button.
 .rdc-deploy:
   stage: deploy
-  image: python:3.12  # glibc binary: not alpine, not -slim (see `archive`)
+  image: python:3.12  # glibc binary (see `archive`)
   needs: ["pytest"]
-  # A deploy that writes to a tenant must never be auto-cancelled mid-run by a
-  # newer pipeline.
-  interruptible: false
+  interruptible: false  # never cancel a job mid tenant write
   rules:
-    # `when: manual` lives INSIDE `rules`: a matching rule without its own
-    # `when` falls back to on_success, which would deploy on every push.
-    #
-    # allow_failure: true keeps the pipeline green while a button is unpressed.
-    # The trade-off is that a broken deploy does not turn the pipeline red; set
-    # it to false if you would rather see that, and accept that an unpressed
-    # button leaves the pipeline in the "blocked" state.
-    #
-    # A scheduled archive pipeline also runs on the default branch, so these
-    # buttons show up there too (unpressed, harmless). Add
-    # `$CI_PIPELINE_SOURCE != "schedule"` to the condition to hide them.
+    # `when: manual` belongs INSIDE `rules`: a matching rule without it falls
+    # back to on_success and would deploy on every push. allow_failure keeps the
+    # pipeline green while a button is unpressed; set it to false to have a
+    # broken deploy turn the pipeline red (unpressed buttons then block it).
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: manual
       allow_failure: true
   variables:
-    # Full clone: the commit-back rebases onto the default branch.
     GIT_DEPTH: "0"
-    # How sync resolves an object that moved BOTH locally and in the tenant.
-    # keep-local: the committed snapshot wins and overwrites the tenant edit,
-    # unattended. Empty: halt on divergence instead (the check at the end of
-    # the script turns the parked conflict shadows into a job failure).
+    # How sync resolves an object edited BOTH locally and in the tenant.
+    # keep-local: the committed snapshot overwrites the tenant edit, unattended.
+    # Empty: halt on divergence (the shadow check below fails the job).
     RDC_CONFLICT: keep-local
   before_script:
     - *rdc-install-script
@@ -224,25 +146,21 @@ archive:
     - |
       set -eu
       shadow_dir=".rdc/conflicts/$RDC_ENV"
-
-      # Drop any conflict shadow left behind by an earlier run. The tree is
-      # gitignored, so it never arrives via the clone, but a reused or cached
-      # workspace can still carry one -- and a stale shadow makes rdc skip that
-      # object indefinitely, besides tripping the divergence check below.
+      # The tree is gitignored, so it never arrives via the clone -- but a reused
+      # workspace can carry one, and a stale shadow makes rdc skip that object
+      # indefinitely, besides tripping the divergence check below.
       rm -rf "$shadow_dir"
 
-      # Promote the source snapshot onto the target, locally.
       rdc migrate "$RDC_SRC" "$RDC_ENV" --mirror --yes
 
-      # Push it to the tenant. Capture the status instead of letting `set -e`
-      # abort: sync may have written part of the tenant before failing, and
-      # those writes must be committed back before the job exits, or the repo
-      # silently falls behind the tenant.
+      # Keep the status instead of letting `set -e` abort: sync may have written
+      # part of the tenant before failing, and that must be committed back
+      # before the job exits, or the repo silently falls behind the tenant.
       rc=0
       rdc sync "$RDC_ENV" --allow-deletes --yes ${RDC_CONFLICT:+--conflict "$RDC_CONFLICT"} || rc=$?
 
-      # A rebase or push failure here happens AFTER the tenant was written, so
-      # say so plainly: the fix is to reconcile the repo, not to re-deploy.
+      # A failure here happens AFTER the tenant was written: the fix is to
+      # reconcile the repo, not to re-deploy.
       if ! writeback "ci: deploy $RDC_ENV (pipeline ${CI_PIPELINE_ID:-n/a})"; then
         echo "ERROR: $RDC_ENV WAS deployed, but committing the result back failed." >&2
         echo "The tenant is ahead of this repo. Run 'rdc sync $RDC_ENV' locally and commit." >&2
@@ -254,11 +172,9 @@ archive:
         exit "$rc"
       fi
 
-      # Fail on remote divergence. With --yes (or any non-TTY) and no
-      # --conflict, a BothDiverged conflict does NOT abort sync: it parks the
-      # remote side under .rdc/conflicts/<env>/, leaves that object unpushed,
-      # and exits 0. Left unchecked the job would go green having silently
-      # skipped objects, so treat any shadow as a deploy failure.
+      # Without --conflict, a diverged object does NOT abort sync: its remote
+      # side is parked under .rdc/conflicts/<env>/, it stays unpushed, and sync
+      # still exits 0. Treat any shadow as a deploy failure.
       if [ -n "$(find "$shadow_dir" -type f -print -quit 2>/dev/null)" ]; then
         echo "ERROR: $RDC_ENV diverged remotely; these objects were NOT deployed:" >&2
         find "$shadow_dir" -type f | sed "s|^$shadow_dir/|  |" | sort >&2
@@ -270,18 +186,10 @@ archive:
         exit 1
       fi
 
-# ---------------------------------------------------------------------------
-# The promotion chain: dev (authored by hand, archived above) -> test -> prod.
-#
-# `resource_group` serializes every pipeline that deploys the same env, so two
-# runs can never interleave writes into one tenant. `environment` records the
-# deployment under Operate -> Environments.
-#
-# Add more targets by repeating the pattern, one job per env, each with its own
-# resource_group and RDC_USER_<ENV> / RDC_PASS_<ENV> variables.
-# ---------------------------------------------------------------------------
-
-deploy:test:
+# The promotion chain. `resource_group` serializes every pipeline that deploys
+# the same env, so two runs can never interleave writes into one tenant;
+# `environment` records the deployment under Operate -> Environments.
+deploy:test:  # TODO: one job per target env, source -> target
   extends: .rdc-deploy
   resource_group: test
   environment:
