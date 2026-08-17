@@ -4,11 +4,14 @@ Project-specific instructions for working in this repo.
 
 ## CI templates
 
-- The CI templates under `templates/` (e.g. `gitlab-ci-archival.yml`) must
-  **pin to the latest released rdc version** — keep `RDC_VERSION` set to the
-  newest release tag (concrete `releases/download/<tag>/<asset>` URL), and bump
-  it whenever a new release ships. Do not use GitHub's floating
-  `releases/latest/download/<asset>` alias.
+- The CI template under `templates/` (`gitlab-ci.yml`) must **pin to the latest
+  released rdc version** — keep `RDC_VERSION` set to the newest release tag, and
+  bump it whenever a new release ships. Never a floating alias (no
+  `releases/latest/...`, no unpinned tag).
+- The repo is private, so the template installs rdc through
+  `api.github.com/repos/<repo>/releases/assets/<id>` (resolved from the tag).
+  The `releases/download/<tag>/<asset>` browser URL 404s even with a token —
+  don't "simplify" the install back to it.
 
 ## Customer confidentiality
 
