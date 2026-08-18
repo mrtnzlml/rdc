@@ -77,16 +77,35 @@ pub fn from_jsonl(bytes: &[u8], display_path: &str) -> Result<Vec<Value>> {
     let text = std::str::from_utf8(bytes)
         .with_context(|| format!("{display_path} is not valid UTF-8"))?;
     let mut out = Vec::new();
+    // Explicit (user-authored) `_id` -> the line it first appeared on. A repeat
+    // is rejected rather than deduplicated: `_id` is unique within a MongoDB
+    // collection, so a file with two of them could never be a faithful snapshot
+    // of one — and silently keeping whichever row parsed last would drop the
+    // other from the push diff, breaking "the local file is authoritative".
+    let mut seen_ids: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for (i, line) in text.lines().enumerate() {
+        let lineno = i + 1;
         if line.trim().is_empty() {
             continue;
         }
         let value: Value = serde_json::from_str(line)
-            .with_context(|| format!("{display_path}:{} is not valid JSON", i + 1))?;
+            .with_context(|| format!("{display_path}:{lineno} is not valid JSON"))?;
         if !value.is_object() {
-            bail!("{display_path}:{} is not a JSON object", i + 1);
+            bail!("{display_path}:{lineno} is not a JSON object");
         }
-        out.push(canonicalize_row(&value));
+        let canonical = canonicalize_row(&value);
+        if let Some(id) = canonical.get("_id") {
+            let key = serde_json::to_string(id).unwrap_or_default();
+            if let Some(first) = seen_ids.insert(key.clone(), lineno) {
+                bail!(
+                    "{display_path}:{lineno}: duplicate _id {id} (first seen on line {first}). \
+                     An _id is unique within a collection, so rdc will not guess which row wins. \
+                     Give the rows distinct _id values, or drop the _id field to let them be \
+                     ordinary unkeyed rows."
+                );
+            }
+        }
+        out.push(canonical);
     }
     Ok(out)
 }
@@ -208,5 +227,35 @@ mod tests {
         let err = format!("{:#}", from_jsonl(scalar, "data.jsonl").unwrap_err());
         assert!(err.contains("data.jsonl:1"), "must name the line: {err}");
         assert!(err.contains("object"), "must say what was wrong: {err}");
+    }
+
+    /// Two rows sharing an explicit `_id` is invalid data, and worse, the push
+    /// diff would silently keep only one of them. The file must be rejected,
+    /// naming the id and both line numbers. `_id: null` collides the same way.
+    #[test]
+    fn from_jsonl_rejects_duplicate_business_keys() {
+        let dup = b"{\"_id\":\"gl-1000\",\"label\":\"first\"}\n{\"_id\":\"gl-1000\",\"label\":\"second\"}\n";
+        let err = format!(
+            "{:#}",
+            from_jsonl(dup, "envs/dev/mdh/gl-codes/data.jsonl").unwrap_err()
+        );
+        assert!(err.contains("gl-1000"), "must name the duplicated id: {err}");
+        assert!(err.contains(":2"), "must name the offending line: {err}");
+        assert!(err.contains("line 1"), "must name where it was first seen: {err}");
+
+        let dup_null = b"{\"_id\":null,\"a\":1}\n{\"_id\":null,\"a\":2}\n";
+        assert!(
+            from_jsonl(dup_null, "data.jsonl").is_err(),
+            "a repeated null _id is a duplicate key too"
+        );
+    }
+
+    /// Rows WITHOUT a business key are a legitimate multiset — identical rows
+    /// are two rows, and the diff moves them by count. Only explicit ids must
+    /// be unique, so this must NOT be rejected.
+    #[test]
+    fn from_jsonl_allows_duplicate_unkeyed_rows() {
+        let bytes = b"{\"code\":\"1000\"}\n{\"code\":\"1000\"}\n";
+        assert_eq!(from_jsonl(bytes, "data.jsonl").unwrap().len(), 2);
     }
 }

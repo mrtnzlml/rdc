@@ -54,7 +54,7 @@ fn without_id(canonical: &Value) -> Value {
 /// Diff local rows (from `data.jsonl`) against raw remote rows (from
 /// `find_all`, `_id`s intact). Output order is derived from sorted maps, so it
 /// is deterministic and independent of input order.
-#[allow(dead_code)] // Called from tests; production caller added in a later task.
+#[allow(dead_code)] // Called from tests only until Task 6 adds the push driver that consumes it; Task 6 removes this attribute.
 pub(crate) fn diff_rows(local: &[Value], remote: &[Value]) -> RowDiff {
     // key → canonical row
     let mut local_keyed: BTreeMap<String, Value> = BTreeMap::new();
@@ -100,9 +100,8 @@ pub(crate) fn diff_rows(local: &[Value], remote: &[Value]) -> RowDiff {
         match remote_keyed.get(key) {
             None => diff.insert.push(local_row.clone()),
             Some((_, remote_row)) if remote_row != local_row => {
-                if let Some(id) = explicit_id(local_row) {
-                    diff.replace.push((id, without_id(local_row)));
-                }
+                let id = explicit_id(local_row).expect("a keyed row always carries its _id");
+                diff.replace.push((id, without_id(local_row)));
             }
             Some(_) => {}
         }
