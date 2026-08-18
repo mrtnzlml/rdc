@@ -522,6 +522,59 @@ fn migrate_carries_manual_mdh_dataset_rows() {
     );
 }
 
+/// `--only mdh/<slug>` must select the whole dataset — manifest, indexes, and
+/// rows — and nothing else. Before S1 this selector matched zero objects and
+/// errored out.
+#[test]
+fn migrate_only_selects_a_whole_mdh_dataset() {
+    let project = init_two_env_project();
+    let root = project.path();
+    let test_root = root.join("envs/test");
+
+    for slug in ["gl-codes", "synonyms"] {
+        write(
+            &test_root.join(format!("mdh/{slug}/collection.json")),
+            &serde_json::json!({ "name": slug, "data": "manual" }),
+        );
+        write(
+            &test_root.join(format!("mdh/{slug}/indexes.json")),
+            &serde_json::json!({ "regular": [], "search": [] }),
+        );
+        std::fs::write(
+            test_root.join(format!("mdh/{slug}/data.jsonl")),
+            b"{\"code\":\"1000\"}\n",
+        )
+        .unwrap();
+    }
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run(
+        "test",
+        "prod",
+        false,
+        false,
+        vec!["mdh/gl-codes".into()],
+        true,
+        false,
+    );
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("--only mdh/<slug> should succeed");
+
+    let prod = root.join("envs/prod/mdh");
+    for leaf in ["collection.json", "indexes.json", "data.jsonl"] {
+        assert!(
+            prod.join("gl-codes").join(leaf).exists(),
+            "{leaf} of the selected dataset must be migrated"
+        );
+    }
+    assert!(
+        !prod.join("synonyms").exists(),
+        "an unselected dataset must NOT be migrated"
+    );
+}
+
 /// A4 — the `rdc migrate <src> <tgt>` binary subcommand transforms the
 /// snapshot and exits 0, with no network server in sight.
 #[test]

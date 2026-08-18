@@ -14,8 +14,9 @@ use anyhow::{Result, anyhow, bail};
 use std::collections::BTreeSet;
 
 /// Kinds we deploy/migrate, in dependency order (POST order). Workflows are
-/// pull-only at the Rossum API (PATCH returns 405) and so are not
-/// deployable; MDH is not yet writable.
+/// pull-only at the Rossum API (PATCH returns 405) and so are not deployable;
+/// `mdh` (index sets and manual row data) IS writable and is last — nothing
+/// references a dataset, so it has no ordering constraint.
 pub(crate) const DEPLOYABLE_KINDS: &[&str] = &[
     "workspaces",
     "schemas",
@@ -27,6 +28,7 @@ pub(crate) const DEPLOYABLE_KINDS: &[&str] = &[
     "labels",
     "engines",
     "engine_fields",
+    "mdh",
 ];
 
 #[derive(Debug, Default, Clone)]
@@ -214,8 +216,31 @@ pub(crate) fn list_slugs(paths: &Paths, kind: &str) -> Result<Vec<String>> {
         "hooks" | "rules" | "labels" => list_flat_kind(paths, kind),
         "engines" => list_engine_slugs(paths),
         "engine_fields" => list_engine_field_slugs(paths),
+        "mdh" => list_mdh_slugs(paths),
         _ => Ok(Vec::new()),
     }
+}
+
+/// MDH dataset slugs: directories under `mdh/` holding an `indexes.json`. Same
+/// definition `cli::pull::mdh::local_only_dataset_slugs` uses, so selection and
+/// the sync executor never disagree about what a dataset is.
+fn list_mdh_slugs(paths: &Paths) -> Result<Vec<String>> {
+    let dir = paths.mdh_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if entry.path().join("indexes.json").exists() {
+            out.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 fn list_workspace_slugs(paths: &Paths) -> Result<Vec<String>> {
@@ -641,6 +666,30 @@ mod selection_tests {
         let err = resolve(&["hooks".to_string()], &p, &p).unwrap_err();
         let s = format!("{err:#}");
         assert!(s.contains("expected '<kind>/<slug>'"), "got: {s}");
+    }
+
+    #[test]
+    fn list_slugs_lists_mdh_datasets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        // A dataset is a dir holding indexes.json — the same definition
+        // `local_only_dataset_slugs` uses, so the two never disagree.
+        for slug in ["gl-codes", "synonyms"] {
+            let dir = paths.dataset_dir(slug);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("indexes.json"), b"{}").unwrap();
+        }
+        std::fs::create_dir_all(paths.dataset_dir("not-a-dataset")).unwrap();
+
+        assert_eq!(
+            list_slugs(&paths, "mdh").unwrap(),
+            vec!["gl-codes".to_string(), "synonyms".to_string()]
+        );
+    }
+
+    #[test]
+    fn mdh_is_an_accepted_only_kind() {
+        assert!(DEPLOYABLE_KINDS.contains(&"mdh"));
     }
 }
 

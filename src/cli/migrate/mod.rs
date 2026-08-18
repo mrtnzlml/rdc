@@ -305,6 +305,10 @@ fn classify_for_selection(rel: &Path) -> Option<(&'static str, String)> {
             leaf.strip_suffix(".py")
                 .map(|_| ("schemas", comps[3].clone()))
         }
+        // Any leaf of a dataset dir selects with its dataset, so `--only
+        // mdh/<slug>` carries collection.json + indexes.json + data.jsonl
+        // together. `classify` deliberately keeps returning None for mdh.
+        Some("mdh") if comps.len() >= 3 => Some(("mdh", comps[1].clone())),
         _ => None,
     }
 }
@@ -3613,6 +3617,31 @@ mod tests {
         )));
         // Non-sidecar code → false.
         assert!(!is_sidecar(Path::new("workspaces/main/workspace.py")));
+    }
+
+    /// Every leaf of a dataset dir must select as one `("mdh", slug)` object, so
+    /// `--only mdh/<slug>` carries the manifest, indexes, and rows together.
+    #[test]
+    fn classify_for_selection_maps_every_mdh_leaf_to_its_dataset() {
+        for leaf in ["collection.json", "indexes.json", "data.jsonl"] {
+            assert_eq!(
+                classify_for_selection(Path::new(&format!("mdh/gl-codes/{leaf}"))),
+                Some(("mdh", "gl-codes".to_string())),
+                "{leaf} must select with its dataset"
+            );
+        }
+        // `classify` itself must KEEP returning None for mdh — overlay-key
+        // validation and the substitution map depend on that contract.
+        assert_eq!(classify(Path::new("mdh/gl-codes/indexes.json")), None);
+    }
+
+    /// A per-env row-data shadow must validate as a sidecar, or
+    /// `validate_overlay_dir` aborts the whole migration.
+    #[test]
+    fn is_sidecar_accepts_mdh_row_data() {
+        assert!(is_sidecar(Path::new("mdh/gl-codes/data.jsonl")));
+        // JSON leaves are still not sidecars (they are overlay.toml territory).
+        assert!(!is_sidecar(Path::new("mdh/gl-codes/indexes.json")));
     }
 
     // ---- score_threshold reconciliation (migrate default: ignore) ----
