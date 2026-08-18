@@ -62,11 +62,14 @@ collection (`rdc_probe_*`) on a sandbox org; code facts cite the tree.
 | C4 | `pull::mdh::process` rewrites `collection.json` from server truth whenever the bytes differ. | `cli/pull/mdh.rs:500-509` | **Latent blocker:** a hand-added manifest field would be erased on the next pull. The writer must merge, not clobber. |
 | C5 | `migrate::is_managed_leaf` accepts only `json`, `py`, `js`. | `cli/migrate/mod.rs:1643-1648` | `data.jsonl` would be silently *not* migrated. Must be extended. |
 | C6 | `migrate::owning_object` maps every leaf under `mdh/<slug>/` to `("mdh", slug)`. | `cli/migrate/mod.rs:852` | `--mirror` prune and per-object status accounting already treat a new dataset leaf correctly. |
-| C7 | Non-JSON files take migrate's verbatim-copy path, which honours an overlay shadow at `envs/<tgt>/overlay/<relpath>`. | `cli/migrate/mod.rs:589-601` | Per-env row-data override comes for free. |
+| C7 | Non-JSON files take migrate's verbatim-copy path, which honours an overlay shadow at `envs/<tgt>/overlay/<relpath>`. | `cli/migrate/mod.rs:589-601` | The override is *applied* correctly. |
+| C7b | But `validate_overlay_dir` **hard-aborts** on any shadow absent from `produced_sidecars`, and that set is built from `is_sidecar` = `!is_json && classify_for_selection(rel).is_some()` — which returns `None` for MDH. | `cli/migrate/mod.rs:365-387,316-323,1985-1990` | A per-env `overlay/mdh/<slug>/data.jsonl` would abort the whole migration today. Fixed by the same classifier change as `--only` (S1). |
 | C8 | Migrate writes JSON as `to_vec_pretty(value) + "\n"`, the same shape as `collection_manifest_bytes`. | `cli/migrate/mod.rs:779-781`, `cli/pull/mdh.rs:24-29` | A manifest carrying the new flag migrates byte-stably. |
 | C9 | MDH bypasses the sync classifier; `classify.rs` contains no MDH logic, and no code sweeps `lockfile.objects` generically. | `cli/sync/classify.rs`, grep | A new lockfile kind is contained — it cannot leak into unrelated classification. |
 | C10 | `remove_mdh_dataset` deletes the dataset dir, forgets the `indexes.json` base mirror, and drops the `mdh_indexes` lockfile entry. | `cli/sync/execute.rs:2046-2060` | Must also forget the `data.jsonl` mirror and drop the new lockfile entry. |
-| C11 | Under an active `--only`, migrate skips MDH files entirely (`classify_for_selection` returns `None` for mdh). | `cli/migrate/mod.rs:2053-2060` | Pre-existing gap, documented as a known limitation; not widened here. |
+| C11 | Under an active `--only`, migrate skips MDH files entirely (`classify_for_selection` returns `None` for mdh). | `cli/migrate/mod.rs:2053-2060` | Pre-existing gap, **now in scope** (S1). |
+| C13 | `DEPLOYABLE_KINDS` is referenced only inside `selection.rs` (candidate set, matcher validation, error text) — no push/deploy ordering depends on it. | grep: `selection.rs:19,89,149,155` | Adding `"mdh"` to it is contained; it cannot perturb push order. |
+| C14 | `list_slugs` returns an empty vec for any kind it does not know, including `"mdh"`. | `cli/deploy/selection.rs:209-219` | Needs an `mdh` arm, else `--only mdh/*` would still match 0 objects and error. |
 | C12 | `serde_json` is built with `preserve_order` and **without** `arbitrary_precision`. | `Cargo.toml:33` | Key order is whatever we impose; numbers round-trip through `i64`/`u64`/`f64` (A4 confirms this is lossless for realistic data). |
 
 ## Decisions
@@ -228,16 +231,41 @@ for indexes.
 
 ## Migrate integration
 
-- `is_managed_leaf` gains `jsonl` (C5). This is the only change needed for
-  replication: the file is copied verbatim, `owning_object` already attributes it
-  to `("mdh", slug)` (C6), so `--mirror` prunes it with its dataset and the summary
-  counts the dataset once.
-- Verbatim copy means an overlay shadow at
-  `envs/<tgt>/overlay/mdh/<slug>/data.jsonl` overrides the migrated rows for that
-  env (C7) — a per-env data override, documented as supported.
+- `is_managed_leaf` gains `jsonl` (C5). That alone is enough for plain
+  replication: the file is copied verbatim, and `owning_object` already attributes
+  it to `("mdh", slug)` (C6), so `--mirror` prunes it with its dataset and the
+  summary counts the dataset once.
+- A per-env overlay shadow at `envs/<tgt>/overlay/mdh/<slug>/data.jsonl` overrides
+  the migrated rows for that env. The *application* already works (C7), but the
+  pre-write validation would abort on it (C7b) — so this capability depends on S1,
+  not on the copy path.
 - Promotion flow, end to end: `rdc migrate dev test` copies `collection.json`
   (with the flag) plus `data.jsonl`; `rdc sync test` creates the collection if
   absent, applies the indexes, then applies the row diff.
+
+## S1 — MDH becomes selectable in `migrate` (in scope)
+
+Three contained changes, all in the selection layer:
+
+1. `classify_for_selection` gains an MDH arm: any leaf under `mdh/<slug>/` maps to
+   `("mdh", slug)`. `classify` itself is left alone, preserving its
+   None-for-MDH contract that overlay-key validation and the substitution map
+   rely on (`cli/migrate/mod.rs:493-517`).
+2. `DEPLOYABLE_KINDS` gains `"mdh"` (C13) so `--only mdh/<slug>` parses and the
+   "unknown kind" error text lists it.
+3. `list_slugs` gains an `mdh` arm listing dataset dirs that contain an
+   `indexes.json` — the same definition `local_only_dataset_slugs` already uses
+   (`cli/pull/mdh.rs:45-69`), so the two agree on what a dataset is.
+
+Two deliberate consequences:
+
+- `--only mdh/<slug>` now selects the dataset's whole directory (`collection.json`,
+  `indexes.json`, `data.jsonl`), because `owning_object` already attributes every
+  leaf under `mdh/<slug>/` to that object (C6). Previously `--only mdh/...` matched
+  nothing and errored; index sets become selectable too. That widening is intended.
+- `is_sidecar` starts returning `true` for MDH non-JSON leaves, which is precisely
+  what makes a per-env `overlay/mdh/<slug>/data.jsonl` shadow validate instead of
+  aborting the migration (C7b). Its unit test (`migrate/mod.rs:3588`) gains cases.
 
 ## New API surface
 
@@ -303,8 +331,6 @@ collection and assert equality → gated delete path.
 
 ## Known limitations
 
-- `rdc migrate --only mdh/<slug>` selects nothing, because `classify_for_selection`
-  returns `None` for MDH (C11). Pre-existing; unchanged here.
 - No line-level three-way merge for `data.jsonl` in v1 (strict sidecar semantics).
 - Datasets fed by an import hook are out of scope by design; flagging one is
   warned about, not prevented.
