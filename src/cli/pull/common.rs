@@ -573,6 +573,17 @@ pub enum HashMode {
     Raw,
 }
 
+/// Hash `bytes` per `mode` — the single implementation [`decide_pull_action_with`]
+/// and the conflict-apply paths ([`apply_pull_action_with`], `shadow_file_conflict`,
+/// `resolve_conflict_interactive`) all call, so every hash site in the pull
+/// decision/apply pipeline agrees on the same mode-selected algorithm.
+fn hash_for_mode(bytes: &[u8], mode: HashMode) -> String {
+    match mode {
+        HashMode::Canonical => content_hash(bytes, &Lockfile::default()),
+        HashMode::Raw => crate::state::raw_content_hash(bytes),
+    }
+}
+
 /// Decide what to do on pull for a single object.
 ///
 /// `local_path` — the on-disk JSON file path (may not exist).
@@ -601,12 +612,7 @@ pub fn decide_pull_action_with(
     remote_bytes: &[u8],
     mode: HashMode,
 ) -> Result<(PullAction, String)> {
-    let hash = |bytes: &[u8]| -> String {
-        match mode {
-            HashMode::Canonical => content_hash(bytes, &Lockfile::default()),
-            HashMode::Raw => crate::state::raw_content_hash(bytes),
-        }
-    };
+    let hash = |bytes: &[u8]| -> String { hash_for_mode(bytes, mode) };
     let remote_hash = hash(remote_bytes);
 
     let Some(base) = base_hash else {
@@ -736,6 +742,41 @@ pub fn apply_pull_action(
     base_hash: Option<&str>,
     paths: Option<&crate::paths::Paths>,
 ) -> Result<String> {
+    apply_pull_action_with(
+        action,
+        local_path,
+        remote_bytes,
+        remote_hash,
+        interactive,
+        progress,
+        env,
+        base_hash,
+        paths,
+        HashMode::Canonical,
+    )
+}
+
+/// Same as [`apply_pull_action`], parameterized by [`HashMode`] so a conflict
+/// resolution that must compute a FRESH hash (`KeepLocal`, an interactive
+/// `Edit`, or the shadow-file fallback with no prior base) hashes MDH row data
+/// (`data.jsonl`) verbatim instead of through the Rossum-object canonicalizer.
+/// Every existing caller goes through [`apply_pull_action`], which always
+/// passes `HashMode::Canonical` — so this change is behavior-preserving for
+/// them. See [`HashMode`] for why the two modes must differ for JSONL row
+/// data, and [`decide_pull_action_with`] for the analogous split on the
+/// decision half.
+pub fn apply_pull_action_with(
+    action: PullAction,
+    local_path: &Path,
+    remote_bytes: &[u8],
+    remote_hash: String,
+    interactive: bool,
+    progress: &Arc<Log>,
+    env: &str,
+    base_hash: Option<&str>,
+    paths: Option<&crate::paths::Paths>,
+    mode: HashMode,
+) -> Result<String> {
     use crate::snapshot::writer::write_atomic;
     match action {
         PullAction::Write => {
@@ -754,7 +795,7 @@ pub fn apply_pull_action(
             if let Some(p) = paths {
                 crate::state::base_cache::write(p, local_path, &local_bytes)?;
             }
-            Ok(content_hash(&local_bytes, &Lockfile::default()))
+            Ok(hash_for_mode(&local_bytes, mode))
         }
         PullAction::NoChange => {
             // Local and remote canonicalize equal — preserve disk bytes.
@@ -778,9 +819,10 @@ pub fn apply_pull_action(
                     env,
                     paths,
                     base_hash,
+                    mode,
                 )?
             } else {
-                shadow_file_conflict(local_path, remote_bytes, progress, paths, base_hash)?
+                shadow_file_conflict(local_path, remote_bytes, progress, paths, base_hash, mode)?
             };
             // Only update the cache when the lockfile entry actually
             // advanced. Shadow-skip preserves `base_hash`, leaving the
@@ -806,15 +848,16 @@ pub fn apply_pull_action(
 /// Returns the *prior* base hash (`base_hash`) so the caller's
 /// `record_object` is a no-op — the lockfile entry must not advance on a
 /// shadow-skip, otherwise the next pull misclassifies the slug as clean
-/// and the conflict is silently swallowed. Falls back to the local hash
-/// only when `base_hash` is `None` (defensive — conflicts presuppose a
-/// prior base).
+/// and the conflict is silently swallowed. Falls back to the `mode`-selected
+/// hash of local bytes only when `base_hash` is `None` (defensive —
+/// conflicts presuppose a prior base).
 fn shadow_file_conflict(
     local_path: &Path,
     remote_bytes: &[u8],
     progress: &Arc<Log>,
     paths: Option<&crate::paths::Paths>,
     base_hash: Option<&str>,
+    mode: HashMode,
 ) -> Result<String> {
     use crate::snapshot::writer::write_atomic;
     // Park the remote side under the gitignored `.rdc/conflicts/<env>/`
@@ -834,10 +877,12 @@ fn shadow_file_conflict(
     }
     // Defensive fallback: no prior base recorded (shouldn't happen for a
     // real conflict; conflicts presuppose `(local != base, remote != base)`).
-    // Use local hash so the lockfile still gets a sensible entry.
+    // Use the mode-selected hash of local bytes so the lockfile still gets a
+    // sensible entry — `mode == Raw` for MDH row data, never the canonical
+    // hash that a one-row `data.jsonl` would misclassify.
     let local_bytes =
         std::fs::read(local_path).with_context(|| format!("reading {}", local_path.display()))?;
-    Ok(content_hash(&local_bytes, &Lockfile::default()))
+    Ok(hash_for_mode(&local_bytes, mode))
 }
 
 /// Drive the spec §8.3 resolver TUI on stdin/stderr. On
@@ -852,6 +897,7 @@ fn resolve_conflict_interactive(
     env: &str,
     paths: Option<&crate::paths::Paths>,
     base_hash: Option<&str>,
+    mode: HashMode,
 ) -> Result<String> {
     use crate::cli::resolve::{PullAborted, Resolution, prompt_resolve};
     use crate::snapshot::writer::write_atomic;
@@ -877,7 +923,7 @@ fn resolve_conflict_interactive(
         Resolution::KeepLocal => {
             let local_bytes = std::fs::read(local_path)
                 .with_context(|| format!("reading {}", local_path.display()))?;
-            Ok(content_hash(&local_bytes, &Lockfile::default()))
+            Ok(hash_for_mode(&local_bytes, mode))
         }
         Resolution::KeepRemote => {
             write_atomic(local_path, remote_bytes)?;
@@ -885,7 +931,7 @@ fn resolve_conflict_interactive(
         }
         Resolution::Edit(edited) => {
             write_atomic(local_path, &edited)?;
-            Ok(content_hash(&edited, &Lockfile::default()))
+            Ok(hash_for_mode(&edited, mode))
         }
         Resolution::EditWithMarkers(edited) => {
             // Hunk-by-hunk walker with at least one skipped hunk — bytes
@@ -894,7 +940,8 @@ fn resolve_conflict_interactive(
             // base MUST NOT advance: the next pull/sync needs to see the
             // marker-bearing state as still-conflicting so the user keeps
             // getting nudged. Return the prior base (same rule as
-            // shadow-skip); fall back to local hash when no prior base.
+            // shadow-skip); fall back to the mode-selected hash of the
+            // edited bytes when no prior base.
             write_atomic(local_path, &edited)?;
             if let Some(prior) = base_hash {
                 progress.event(Action::Warn, &format!(
@@ -903,11 +950,11 @@ fn resolve_conflict_interactive(
                 ));
                 Ok(prior.to_string())
             } else {
-                Ok(content_hash(&edited, &Lockfile::default()))
+                Ok(hash_for_mode(&edited, mode))
             }
         }
         Resolution::Skip => {
-            shadow_file_conflict(local_path, remote_bytes, progress, paths, base_hash)
+            shadow_file_conflict(local_path, remote_bytes, progress, paths, base_hash, mode)
         }
         Resolution::Abort => Err(anyhow::Error::new(PullAborted)),
         Resolution::KeepLocalAll | Resolution::KeepRemoteAll => {
@@ -1304,6 +1351,73 @@ mod tests {
         )
         .unwrap();
         assert_eq!(recorded, content_hash(local, &Lockfile::default()));
+    }
+
+    /// The blocker this module exists to close: a row-data conflict
+    /// resolution must record `raw_content_hash`, never `content_hash`, or a
+    /// canonical hash lands in the `mdh_data` lockfile entry and — because a
+    /// one-row `data.jsonl` ALWAYS canonicalizes differently from its raw
+    /// bytes (the trailing newline alone guarantees it) — every subsequent
+    /// `sync --no-push` re-fires the same conflict forever.
+    ///
+    /// Exercises the shadow-file fallback (`apply_pull_action_with` with
+    /// `interactive == false` and no prior `base_hash`), not the interactive
+    /// resolver: that path reads from stdin via `prompt_resolve`'s TUI, which
+    /// has no seam for feeding canned input in a unit test here, whereas the
+    /// shadow fallback hits the exact same `hash_for_mode` call
+    /// (`shadow_file_conflict`'s no-prior-base branch, `:840` before this fix)
+    /// with a plain function call. Both call sites were converted together,
+    /// so this test covers the underlying defect even though it drives the
+    /// non-interactive leg.
+    #[test]
+    fn raw_mode_conflict_resolution_records_raw_hash_not_canonical() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = Paths::for_env(dir.path(), "test");
+        std::fs::create_dir_all(paths.env_root()).unwrap();
+        let path = paths.env_root().join("mdh/gl-codes/data.jsonl");
+        // A one-row JSONL file: parses as a single JSON value, so the
+        // canonical hash and the raw hash are GUARANTEED to differ (the
+        // canonicalizer alone drops the trailing newline). If they landed on
+        // the same hash here, the test would be vacuous.
+        let local: &[u8] = b"{\"code\":\"1000\",\"modified_at\":\"t1\"}\n";
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, local).unwrap();
+        let remote: &[u8] = b"{\"code\":\"2000\",\"modified_at\":\"t2\"}\n";
+        let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+
+        let raw = crate::state::raw_content_hash(local);
+        let canonical = content_hash(local, &Lockfile::default());
+        assert_ne!(
+            raw, canonical,
+            "a one-row JSONL file must hash differently raw vs canonical, \
+             or this test would not distinguish the two modes"
+        );
+
+        // No prior base (`None`) drives shadow_file_conflict's fallback
+        // branch — the site the blocker's fix converts.
+        let recorded = apply_pull_action_with(
+            PullAction::Conflict,
+            &path,
+            remote,
+            content_hash(remote, &Lockfile::default()),
+            false, // non-interactive → shadow_file_conflict
+            &p,
+            "test",
+            None, // no prior base → fallback hashes local bytes
+            Some(&paths),
+            HashMode::Raw,
+        )
+        .unwrap();
+
+        assert_eq!(
+            recorded, raw,
+            "HashMode::Raw must record raw_content_hash(local_bytes)"
+        );
+        assert_ne!(
+            recorded, canonical,
+            "must NOT record content_hash(local_bytes, &Lockfile::default()) — \
+             that is the blocker this test guards against"
+        );
     }
 
     /// Re-running the same conflict pull twice with shadow-skip must keep

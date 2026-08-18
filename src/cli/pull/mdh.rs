@@ -1,6 +1,6 @@
 use super::common::{
-    HashMode, PullAction, PullCtx, apply_pull_action, decide_pull_action, decide_pull_action_with,
-    record_object,
+    HashMode, PullAction, PullCtx, apply_pull_action, apply_pull_action_with, decide_pull_action,
+    decide_pull_action_with, record_object,
 };
 use crate::api::{DataStorageClient, anyhow_has_status};
 use crate::config::EnvConfig;
@@ -277,11 +277,15 @@ pub(crate) fn plan_mdh(
     }
 
     // Stage 3b: a manual dataset with no local row data yet → a pull would
-    // create `data.jsonl`. Deliberately NOT gated on `remote_slugs`-only —
-    // this also covers the brand-new-dataset case from stage 3 above,
-    // whose dataset dir (and therefore `data.jsonl`) doesn't exist either.
-    // Same `unwrap_or(DataMode::None)` swallow as stage 1b, for the same
-    // reason (infallible-by-design; the fallible companion surfaces errors).
+    // create `data.jsonl`. This CANNOT also cover the brand-new-dataset case
+    // from stage 3 above: such a dataset has no local dataset dir yet, so
+    // `read_data_mode` finds no manifest and returns `DataMode::None`, which
+    // fails this loop's `== DataMode::Manual` check regardless of what the
+    // remote collection's manifest would say. A brand-new manual dataset's
+    // row-data forecast only appears once a real pull has materialized its
+    // local manifest — one dry-run later. Same `unwrap_or(DataMode::None)`
+    // swallow as stage 1b, for the same reason (infallible-by-design; the
+    // fallible companion surfaces errors).
     for slug in &remote_slugs {
         if read_data_mode(&paths.dataset_dir(slug)).unwrap_or(DataMode::None) == DataMode::Manual
             && !paths.dataset_data(slug).is_file()
@@ -636,7 +640,11 @@ pub(crate) async fn pull_dataset_data(
     let recorded = if action == PullAction::KeepLocal {
         base.clone().unwrap_or(remote_hash)
     } else {
-        apply_pull_action(
+        // `HashMode::Raw`: a conflict resolution here (shadow fallback,
+        // interactive keep-local/edit) must hash `data.jsonl` verbatim, same
+        // as the decision above — see `HashMode` for why the canonical hash
+        // misfires on JSONL row data.
+        apply_pull_action_with(
             action,
             &data_path,
             &proposed,
@@ -646,6 +654,7 @@ pub(crate) async fn pull_dataset_data(
             ctx.paths.env(),
             base.as_deref(),
             Some(ctx.paths),
+            HashMode::Raw,
         )?
     };
     record_object(ctx.lockfile, "mdh_data", slug, 0, None, Some(recorded));
@@ -761,8 +770,11 @@ pub async fn process(
         // `slugify` is lossy, so the slug cannot recover the name; a deploy
         // to an env that lacks the collection needs it to (re)create the
         // collection. Written deterministically (server-authoritative
-        // identity) — idempotent, and it also overwrites any legacy
-        // full-metadata `collection.json` a pre-manifest project carried.
+        // identity) — idempotent. `manifest_bytes_merged` MERGES rather than
+        // overwrites, so a legacy full-metadata `collection.json` a
+        // pre-manifest project carried (`type` / `options` / `info` /
+        // `idIndex`) is NOT cleaned up here: those keys survive every pull
+        // indefinitely and travel through `migrate` into other envs.
         let manifest_path = dataset_dir.join(COLLECTION_MANIFEST);
         let existing = std::fs::read(&manifest_path).ok();
         let manifest_bytes = manifest_bytes_merged(existing.as_deref(), &c.name)?;
