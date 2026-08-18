@@ -19,13 +19,73 @@ const KIND: &str = "mdh";
 /// collection on an env that does not have it yet.
 pub(crate) const COLLECTION_MANIFEST: &str = "collection.json";
 
-/// Canonical on-disk bytes for a collection manifest: pretty JSON with a
-/// trailing newline, matching every other snapshot file.
-pub(crate) fn collection_manifest_bytes(name: &str) -> Vec<u8> {
-    let mut bytes = serde_json::to_vec_pretty(&serde_json::json!({ "name": name }))
-        .expect("serializing collection manifest (a single-key object never fails)");
+/// The only accepted value of the manifest's optional `data` key. Its presence
+/// is what opts a dataset into row-data versioning.
+// Not yet called from non-test code: no production caller exists until a
+// later task in this plan wires row pulling/pushing to this opt-in.
+#[allow(dead_code)]
+pub(crate) const MANUAL_DATA_VALUE: &str = "manual";
+
+/// Whether a dataset's ROW DATA is versioned in the snapshot.
+// Same as MANUAL_DATA_VALUE above: consumed by a later task, not this one.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DataMode {
+    /// Metadata only — the historical (and default) behavior: rdc never reads
+    /// or writes this collection's rows.
+    None,
+    /// Rows are pulled to `data.jsonl`, versioned, and pushed authoritatively.
+    Manual,
+}
+
+/// Read a dataset's row-data mode from its manifest. Absent manifest or absent
+/// `data` key ⇒ [`DataMode::None`] (backward compatible). An unrecognised value
+/// is a hard error: silently ignoring it would look exactly like rdc dropping
+/// the user's opt-in.
+// Same as MANUAL_DATA_VALUE above: consumed by a later task, not this one.
+#[allow(dead_code)]
+pub(crate) fn read_data_mode(dataset_dir: &std::path::Path) -> Result<DataMode> {
+    let path = dataset_dir.join(COLLECTION_MANIFEST);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Ok(DataMode::None);
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return Ok(DataMode::None);
+    };
+    match value.get("data") {
+        None | Some(Value::Null) => Ok(DataMode::None),
+        Some(Value::String(s)) if s == MANUAL_DATA_VALUE => Ok(DataMode::Manual),
+        Some(other) => anyhow::bail!(
+            "{}: unrecognised \"data\" value {other} in {COLLECTION_MANIFEST}. \
+             The only accepted value is \"{MANUAL_DATA_VALUE}\" (row data versioned \
+             in {}); remove the key for metadata-only.",
+            dataset_dir.display(),
+            crate::snapshot::mdh_data::DATA_FILE,
+        ),
+    }
+}
+
+/// Canonical on-disk bytes for a collection manifest, MERGING into whatever the
+/// file already holds: `name` is refreshed from server truth while every other
+/// key (notably the `data` opt-in) and the file's own key order are preserved.
+///
+/// Clobbering instead of merging is what would erase a hand-added flag on the
+/// next pull. Unparseable existing bytes fall back to a fresh manifest.
+/// Serialized as `to_vec_pretty` + newline, matching migrate's JSON writer so
+/// a migrated manifest and a pulled one are byte-comparable.
+pub(crate) fn manifest_bytes_merged(existing: Option<&[u8]>, name: &str) -> Result<Vec<u8>> {
+    let mut obj = existing
+        .and_then(|b| serde_json::from_slice::<Value>(b).ok())
+        .and_then(|v| match v {
+            Value::Object(o) => Some(o),
+            _ => None,
+        })
+        .unwrap_or_default();
+    obj.insert("name".to_string(), Value::String(name.to_string()));
+    let mut bytes = serde_json::to_vec_pretty(&Value::Object(obj))
+        .context("serializing collection manifest")?;
     bytes.push(b'\n');
-    bytes
+    Ok(bytes)
 }
 
 /// Read a dataset's collection name from its manifest. Returns `None` when
@@ -498,10 +558,9 @@ pub async fn process(
         // identity) — idempotent, and it also overwrites any legacy
         // full-metadata `collection.json` a pre-manifest project carried.
         let manifest_path = dataset_dir.join(COLLECTION_MANIFEST);
-        let manifest_bytes = collection_manifest_bytes(&c.name);
-        let needs_write = std::fs::read(&manifest_path)
-            .map(|existing| existing != manifest_bytes)
-            .unwrap_or(true);
+        let existing = std::fs::read(&manifest_path).ok();
+        let manifest_bytes = manifest_bytes_merged(existing.as_deref(), &c.name)?;
+        let needs_write = existing.as_deref() != Some(manifest_bytes.as_slice());
         if needs_write {
             std::fs::write(&manifest_path, &manifest_bytes)
                 .with_context(|| format!("writing {}", manifest_path.display()))?;
@@ -643,25 +702,88 @@ mod tests {
     use super::*;
 
     #[test]
-    fn collection_manifest_round_trips_name() {
-        // The manifest persists the one identity field the on-disk slug
-        // cannot recover (slugify is lossy). Bytes must be the canonical
-        // pretty-JSON-plus-newline shared by every other snapshot file, and
-        // reading them back must yield the exact name.
-        let bytes = collection_manifest_bytes("PO_CANCELS");
-        assert_eq!(bytes, b"{\n  \"name\": \"PO_CANCELS\"\n}\n");
-
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(COLLECTION_MANIFEST), &bytes).unwrap();
-        assert_eq!(read_collection_name(dir.path()).as_deref(), Some("PO_CANCELS"));
+    fn manifest_bytes_for_a_fresh_dataset_are_unchanged_from_the_legacy_form() {
+        // Byte-identity with the pre-merge writer: an existing project must not
+        // see churn in its collection.json files.
+        assert_eq!(
+            manifest_bytes_merged(None, "GL_CODES").unwrap(),
+            b"{\n  \"name\": \"GL_CODES\"\n}\n"
+        );
     }
 
     #[test]
-    fn read_collection_name_tolerates_absent_and_malformed() {
+    fn manifest_merge_preserves_the_manual_flag_while_refreshing_name() {
+        // The pull rewrites `name` from server truth; every OTHER key the user
+        // added must survive, or the opt-in flag would be erased on next pull.
+        let existing = b"{\n  \"name\": \"OLD_NAME\",\n  \"data\": \"manual\"\n}\n";
+        let merged = manifest_bytes_merged(Some(existing), "GL_CODES").unwrap();
+        let v: Value = serde_json::from_slice(&merged).unwrap();
+        assert_eq!(v["name"], serde_json::json!("GL_CODES"));
+        assert_eq!(v["data"], serde_json::json!("manual"));
+        assert_eq!(merged.last(), Some(&b'\n'), "trailing newline required");
+    }
+
+    #[test]
+    fn manifest_merge_is_idempotent() {
+        let once = manifest_bytes_merged(
+            Some(b"{\n  \"name\": \"GL_CODES\",\n  \"data\": \"manual\"\n}\n"),
+            "GL_CODES",
+        )
+        .unwrap();
+        let twice = manifest_bytes_merged(Some(&once), "GL_CODES").unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn manifest_merge_tolerates_unparseable_existing_bytes() {
+        // A corrupt manifest must not wedge the pull: fall back to a fresh one.
+        assert_eq!(
+            manifest_bytes_merged(Some(b"not json"), "GL_CODES").unwrap(),
+            b"{\n  \"name\": \"GL_CODES\"\n}\n"
+        );
+    }
+
+    #[test]
+    fn read_data_mode_defaults_to_none_and_reads_manual() {
         let dir = tempfile::tempdir().unwrap();
-        // No manifest → None (a legacy dataset predating the manifest).
+        // No manifest at all → not manual (today's behavior).
+        assert_eq!(read_data_mode(dir.path()).unwrap(), DataMode::None);
+
+        std::fs::write(
+            dir.path().join(COLLECTION_MANIFEST),
+            b"{\n  \"name\": \"GL_CODES\"\n}\n",
+        )
+        .unwrap();
+        assert_eq!(read_data_mode(dir.path()).unwrap(), DataMode::None);
+
+        std::fs::write(
+            dir.path().join(COLLECTION_MANIFEST),
+            b"{\n  \"name\": \"GL_CODES\",\n  \"data\": \"manual\"\n}\n",
+        )
+        .unwrap();
+        assert_eq!(read_data_mode(dir.path()).unwrap(), DataMode::Manual);
+    }
+
+    #[test]
+    fn read_data_mode_rejects_an_unknown_value_loudly() {
+        // A typo must fail loudly rather than silently reverting the dataset to
+        // metadata-only (which would look like rdc ignoring the user).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(COLLECTION_MANIFEST),
+            b"{\n  \"name\": \"GL_CODES\",\n  \"data\": \"Manual \"\n}\n",
+        )
+        .unwrap();
+        let err = format!("{:#}", read_data_mode(dir.path()).unwrap_err());
+        assert!(err.contains("Manual "), "must echo the bad value: {err}");
+        assert!(err.contains("manual"), "must name the accepted value: {err}");
+        assert!(err.contains(COLLECTION_MANIFEST), "must name the file: {err}");
+    }
+
+    #[test]
+    fn read_collection_name_still_tolerates_absent_and_malformed() {
+        let dir = tempfile::tempdir().unwrap();
         assert_eq!(read_collection_name(dir.path()), None);
-        // Malformed JSON → None (never panics; caller warns + skips).
         std::fs::write(dir.path().join(COLLECTION_MANIFEST), b"not json").unwrap();
         assert_eq!(read_collection_name(dir.path()), None);
     }
