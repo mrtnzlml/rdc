@@ -1445,4 +1445,96 @@ mod tests {
         assert!(msg.contains("10001"), "must state the count: {msg}");
         assert!(!paths.dataset_data("gl-codes").exists(), "must write nothing");
     }
+
+    /// `KeepLocal` is the ONLY thing stopping a locally-edited `data.jsonl`
+    /// from being silently reverted two cycles later: if base advanced to the
+    /// LOCAL content here, the next cycle's push gate (`local_hash == base`)
+    /// would see nothing to push, and the cycle after that would then see
+    /// local == base / remote != base and overwrite the file with remote —
+    /// reverting the user's edit. This proves base is left at its PRIOR
+    /// value (not advanced to local) when remote matches base but local has
+    /// diverged from it.
+    #[tokio::test]
+    async fn pull_dataset_data_keep_local_preserves_prior_base_hash() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/aggregate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "code": "ok", "result": [{ "n": 2 }] }),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/find"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "ok",
+                "result": [
+                    { "_id": { "$oid": "a2" }, "label": "Travel", "code": "2000" },
+                    { "_id": { "$oid": "a1" }, "label": "Office supplies", "code": "1000" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        let dir = paths.dataset_dir("gl-codes");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // What the remote proposes, canonical form — byte-identical to the
+        // fixture in `pull_dataset_data_writes_canonical_rows_and_records_state`.
+        let remote_proposed: &[u8] = b"{\"code\":\"1000\",\"label\":\"Office supplies\"}\n{\"code\":\"2000\",\"label\":\"Travel\"}\n";
+        let base_hash = crate::state::raw_content_hash(remote_proposed);
+
+        // Local has diverged from base (a real edit); remote still matches base.
+        let local_edited: &[u8] = b"{\"code\":\"1000\",\"label\":\"Office supplies EDITED\"}\n{\"code\":\"2000\",\"label\":\"Travel\"}\n";
+        std::fs::write(paths.dataset_data("gl-codes"), local_edited).unwrap();
+
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        let rossum = crate::api::RossumClient::new(
+            "https://unused.invalid/api/v1".to_string(),
+            "t".to_string(),
+        )
+        .unwrap();
+        let client = DataStorageClient::new(server.uri(), "t".to_string()).unwrap();
+        let mut lockfile = crate::state::Lockfile::default();
+        record_object(&mut lockfile, "mdh_data", "gl-codes", 0, None, Some(base_hash.clone()));
+        let mut ctx = PullCtx {
+            paths: &paths,
+            client: &rossum,
+            lockfile: &mut lockfile,
+            queue_locations: std::collections::BTreeMap::new(),
+            interactive: false,
+        };
+
+        let (changed, conflicts) =
+            pull_dataset_data(&mut ctx, &client, "GL_CODES", "gl-codes", &progress)
+                .await
+                .unwrap();
+        assert!(!changed, "KeepLocal is not a change");
+        assert_eq!(conflicts, 0);
+        assert_eq!(
+            std::fs::read(paths.dataset_data("gl-codes")).unwrap(),
+            local_edited,
+            "the pull must not overwrite the locally-edited file"
+        );
+        // The crux of this test: base must stay at its PRIOR value, never
+        // advance to local. Asserting only "the file didn't change" would
+        // still pass even if base HAD wrongly advanced — this is the
+        // assertion that actually guards against period-2 churn.
+        let recorded = ctx.lockfile.objects["mdh_data"]["gl-codes"].content_hash.clone();
+        assert_eq!(
+            recorded,
+            Some(base_hash),
+            "base must be preserved at its prior value, not advanced"
+        );
+        assert_ne!(
+            recorded,
+            Some(crate::state::raw_content_hash(local_edited)),
+            "base must NOT advance to the local content"
+        );
+    }
 }
