@@ -479,6 +479,49 @@ fn migrate_only_unknown_selector_errors() {
     );
 }
 
+/// A manual dataset must promote whole: the flag in `collection.json` and the
+/// rows in `data.jsonl` both land in the target env, byte-identical. Without
+/// `jsonl` as a managed leaf the rows are silently dropped and replication is a
+/// no-op that looks like success.
+#[test]
+fn migrate_carries_manual_mdh_dataset_rows() {
+    let project = init_two_env_project();
+    let root = project.path();
+    let test_root = root.join("envs/test");
+
+    write(
+        &test_root.join("mdh/gl-codes/collection.json"),
+        &serde_json::json!({ "name": "GL_CODES", "data": "manual" }),
+    );
+    write(
+        &test_root.join("mdh/gl-codes/indexes.json"),
+        &serde_json::json!({ "regular": [], "search": [] }),
+    );
+    let rows = "{\"code\":\"1000\",\"label\":\"Office supplies\"}\n\
+                {\"code\":\"2000\",\"label\":\"Travel\"}\n";
+    std::fs::create_dir_all(test_root.join("mdh/gl-codes")).unwrap();
+    std::fs::write(test_root.join("mdh/gl-codes/data.jsonl"), rows).unwrap();
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true, false);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("migrate should succeed");
+
+    let prod = root.join("envs/prod/mdh/gl-codes");
+    assert_eq!(
+        std::fs::read_to_string(prod.join("data.jsonl")).unwrap(),
+        rows,
+        "row data must migrate byte-identically"
+    );
+    assert_eq!(
+        read_json(&prod.join("collection.json"))["data"],
+        serde_json::json!("manual"),
+        "the opt-in flag must survive the migration"
+    );
+}
+
 /// A4 — the `rdc migrate <src> <tgt>` binary subcommand transforms the
 /// snapshot and exits 0, with no network server in sight.
 #[test]

@@ -1636,14 +1636,16 @@ fn env_tree_has_managed_file(env_root: &Path, env: &str) -> bool {
 }
 
 /// File extensions rdc actually writes inside a managed dir: `.json` (objects),
-/// `.py` (hook / rule / schema-formula code), `.js` (Node.js hook code).
-/// Anything else sitting next to them — `.pyc` bytecode, `.DS_Store`, editor
-/// temp files, sync shadow artifacts (`<file>.<env>`) — is foreign to rdc and
-/// must not be migrated.
+/// `.py` (hook / rule / schema-formula code), `.js` (Node.js hook code),
+/// `.jsonl` (MDH row data for a dataset flagged `"data": "manual"`, copied
+/// verbatim — it is not `.json`, so it does not go through the
+/// parse/substitute path). Anything else sitting next to them — `.pyc`
+/// bytecode, `.DS_Store`, editor temp files, sync shadow artifacts
+/// (`<file>.<env>`) — is foreign to rdc and must not be migrated.
 fn is_managed_leaf(name: &str) -> bool {
     matches!(
         name.rsplit_once('.').map(|(_, ext)| ext),
-        Some("json") | Some("py") | Some("js")
+        Some("json") | Some("py") | Some("js") | Some("jsonl")
     )
 }
 
@@ -2980,6 +2982,17 @@ mod tests {
                 "non-rdc-managed entry {rel} must NOT be enumerated; got {got:?}"
             );
         }
+    }
+
+    /// `data.jsonl` is how manual MDH rows travel between envs. Without `jsonl`
+    /// as a managed leaf, migrate silently drops it and replication is a no-op.
+    #[test]
+    fn is_managed_leaf_accepts_jsonl_row_data() {
+        assert!(is_managed_leaf("data.jsonl"));
+        assert!(is_managed_leaf("collection.json"));
+        assert!(is_managed_leaf("extractor.py"));
+        assert!(!is_managed_leaf("notes.txt"));
+        assert!(!is_managed_leaf("data.jsonl.bak"));
     }
 
     // ---- A2: ref substitution + overlay + write ----
