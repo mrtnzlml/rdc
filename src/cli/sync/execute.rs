@@ -2039,16 +2039,60 @@ fn drop_lockfile_entry(ctx: &mut PullCtx<'_>, kind: &str, slug: &str) {
     }
 }
 
-/// Remove an orphaned MDH dataset's on-disk dir + base-cache mirror +
-/// lockfile entry. Best-effort on the filesystem (idempotent: missing
-/// paths are a no-op); the lockfile drop is the load-bearing part so the
-/// dataset stops being re-flagged on the next sync.
+/// Push a freshly-created MDH dataset's row data, if it opted in
+/// (`"data": "manual"` in its `collection.json`). Shared verbatim by the two
+/// stage-2 create paths (bare collection / create-via-indexes) so a dataset
+/// replicated from another env lands its rows in the same cycle its collection
+/// is created. Returns the number of API write ops — `0` both for a
+/// metadata-only dataset and for a manual one with no `data.jsonl` yet.
+///
+/// Deliberately UNGATED on the `mdh_data` baseline (unlike the stage-1 drift
+/// push): the collection was just created empty on this env, so the rows must
+/// go out even if a stale lockfile hash happens to match the local file.
+async fn push_new_mdh_rows(
+    ctx: &mut PullCtx<'_>,
+    client: &crate::api::DataStorageClient,
+    collection_name: &str,
+    slug: &str,
+    allow_deletes: bool,
+    progress: &Arc<Log>,
+) -> Result<usize> {
+    if crate::cli::pull::mdh::read_data_mode(&ctx.paths.dataset_dir(slug))?
+        != crate::cli::pull::mdh::DataMode::Manual
+    {
+        return Ok(0);
+    }
+    crate::cli::push::mdh_data::push_dataset_data(
+        client,
+        ctx.lockfile,
+        collection_name,
+        slug,
+        ctx.paths,
+        allow_deletes,
+        ctx.interactive,
+        progress,
+    )
+    .await
+    .with_context(|| format!("loading row data for new mdh/{slug}"))
+}
+
+/// Remove an orphaned MDH dataset's on-disk dir + base-cache mirrors +
+/// lockfile entries (`mdh_indexes` and, for a manual dataset, `mdh_data`).
+/// Best-effort on the filesystem (idempotent: missing paths are a no-op);
+/// the lockfile drops are the load-bearing part so the dataset stops being
+/// re-flagged on the next sync.
 fn remove_mdh_dataset(ctx: &mut PullCtx<'_>, slug: &str, indexes_path: &Path) {
     let dataset_dir = ctx.paths.dataset_dir(slug);
     if dataset_dir.exists() {
         std::fs::remove_dir_all(&dataset_dir).ok();
     }
     crate::state::base_cache::forget(ctx.paths, indexes_path).ok();
+    // Row data (manual datasets): the file itself went with the dir removal
+    // above; its base mirror and lockfile entry must go too. The mirror MUST
+    // be forgotten before the dir removal below — that call only succeeds on
+    // an empty dir, so an orphaned data.jsonl mirror would block it forever.
+    let data_path = ctx.paths.dataset_data(slug);
+    crate::state::base_cache::forget(ctx.paths, &data_path).ok();
     // Drop the now-empty base-cache dataset dir too (cosmetic; only
     // succeeds if empty).
     if let Some(mirror) = crate::state::base_cache::cache_mirror(ctx.paths, indexes_path)
@@ -2057,6 +2101,7 @@ fn remove_mdh_dataset(ctx: &mut PullCtx<'_>, slug: &str, indexes_path: &Path) {
         std::fs::remove_dir(mirror_dir).ok();
     }
     drop_lockfile_entry(ctx, "mdh_indexes", slug);
+    drop_lockfile_entry(ctx, "mdh_data", slug);
 }
 
 /// Reconcile MDH datasets the remote no longer lists.
@@ -3704,45 +3749,91 @@ pub async fn run(
             let mut created_local_only: Vec<String> = Vec::new();
 
             if !no_push {
-                // Stage 1: existing collections — index drift push.
+                // Stage 1: existing collections — index drift push, then row
+                // drift push. The two legs are INDEPENDENT: a dataset may own
+                // row data with no indexes.json at all (nothing to manage on
+                // the metadata side), so the index leg bails with
+                // `break 'index` rather than `continue` — a `continue` here
+                // would silently skip that dataset's rows forever.
                 for (slug, collection) in &slug_to_collection {
-                    let indexes_path = ctx.paths.dataset_dir(slug).join("indexes.json");
-                    if !indexes_path.exists() {
-                        continue;
+                    'index: {
+                        let indexes_path = ctx.paths.dataset_dir(slug).join("indexes.json");
+                        if !indexes_path.exists() {
+                            break 'index;
+                        }
+                        let local_bytes = match std::fs::read(&indexes_path) {
+                            Ok(b) => b,
+                            Err(_) => break 'index,
+                        };
+                        let local_hash = crate::state::content_hash(
+                            &local_bytes,
+                            &crate::state::Lockfile::default(),
+                        );
+                        let base = ctx
+                            .lockfile
+                            .objects
+                            .get("mdh_indexes")
+                            .and_then(|m| m.get(slug.as_str()))
+                            .and_then(|e| e.content_hash.as_deref());
+                        if Some(local_hash.as_str()) == base {
+                            break 'index;
+                        }
+                        // MDH bypasses the classifier, so its writes are invisible
+                        // to the plan-time tally — count the actually-performed
+                        // ops here so the cycle summary reflects them.
+                        outcome.items_pushed += crate::cli::push::mdh::push_dataset(
+                            &catalog.mdh.client,
+                            ctx.lockfile,
+                            &collection.name,
+                            slug,
+                            &indexes_path,
+                            ctx.paths,
+                            allow_deletes,
+                            ctx.interactive,
+                            progress,
+                        )
+                        .await
+                        .with_context(|| format!("pushing local index edits for mdh/{slug}"))?;
                     }
-                    let local_bytes = match std::fs::read(&indexes_path) {
-                        Ok(b) => b,
-                        Err(_) => continue,
-                    };
-                    let local_hash = crate::state::content_hash(
-                        &local_bytes,
-                        &crate::state::Lockfile::default(),
-                    );
-                    let base = ctx
-                        .lockfile
-                        .objects
-                        .get("mdh_indexes")
-                        .and_then(|m| m.get(slug.as_str()))
-                        .and_then(|e| e.content_hash.as_deref());
-                    if Some(local_hash.as_str()) == base {
-                        continue;
+
+                    // Row data for manual datasets, gated on its own baseline
+                    // so an unchanged data.jsonl costs nothing. The gate hashes
+                    // VERBATIM (`raw_content_hash`), matching what the push and
+                    // pull drivers record: `content_hash` canonicalizes a
+                    // whole-stream JSON value (which a one-row data.jsonl is)
+                    // and strips `modified_at` / `modifier` /
+                    // `training_enabled` at any depth — all ordinary master-data
+                    // column names, so an edit confined to one of them would
+                    // hash Clean here and never be pushed.
+                    if crate::cli::pull::mdh::read_data_mode(&ctx.paths.dataset_dir(slug))?
+                        == crate::cli::pull::mdh::DataMode::Manual
+                    {
+                        let data_path = ctx.paths.dataset_data(slug);
+                        let local = std::fs::read(&data_path).ok();
+                        let base = ctx
+                            .lockfile
+                            .objects
+                            .get("mdh_data")
+                            .and_then(|m| m.get(slug.as_str()))
+                            .and_then(|e| e.content_hash.as_deref());
+                        let local_hash = local.as_deref().map(crate::state::raw_content_hash);
+                        // No local file ⇒ never authoritative (not pulled yet).
+                        if local_hash.is_some() && local_hash.as_deref() != base {
+                            outcome.items_pushed +=
+                                crate::cli::push::mdh_data::push_dataset_data(
+                                    &catalog.mdh.client,
+                                    ctx.lockfile,
+                                    &collection.name,
+                                    slug,
+                                    ctx.paths,
+                                    allow_deletes,
+                                    ctx.interactive,
+                                    progress,
+                                )
+                                .await
+                                .with_context(|| format!("pushing row data for mdh/{slug}"))?;
+                        }
                     }
-                    // MDH bypasses the classifier, so its writes are invisible
-                    // to the plan-time tally — count the actually-performed
-                    // ops here so the cycle summary reflects them.
-                    outcome.items_pushed += crate::cli::push::mdh::push_dataset(
-                        &catalog.mdh.client,
-                        ctx.lockfile,
-                        &collection.name,
-                        slug,
-                        &indexes_path,
-                        ctx.paths,
-                        allow_deletes,
-                        ctx.interactive,
-                        progress,
-                    )
-                    .await
-                    .with_context(|| format!("pushing local index edits for mdh/{slug}"))?;
                 }
 
                 // Stage 2: create collections absent on this env yet.
@@ -3791,7 +3882,9 @@ pub async fn run(
                     // would never appear on the target. Create the bare collection
                     // explicitly (`POST /v1/collections/create`) so a full mirror
                     // includes it, then record its (empty) index set as the base so
-                    // the next sync sees it Clean. rdc still never touches row data.
+                    // the next sync sees it Clean. Row data follows only for a
+                    // dataset that opted in (`"data": "manual"`); rdc never
+                    // touches the rows of a metadata-only collection.
                     if let Ok(s) = serde_json::from_slice::<crate::model::IndexSet>(&local_bytes)
                         && s.regular.is_empty()
                         && s.search.is_empty()
@@ -3828,6 +3921,15 @@ pub async fn run(
                             &format!("mdh/{slug} created empty collection '{name}'"),
                         );
                         outcome.items_pushed += 1;
+                        outcome.items_pushed += push_new_mdh_rows(
+                            ctx,
+                            &catalog.mdh.client,
+                            &name,
+                            &slug,
+                            allow_deletes,
+                            progress,
+                        )
+                        .await?;
                         created_local_only.push(slug);
                         continue;
                     }
@@ -3846,6 +3948,15 @@ pub async fn run(
                     .with_context(|| {
                         format!("creating mdh collection + indexes for mdh/{slug}")
                     })?;
+                    outcome.items_pushed += push_new_mdh_rows(
+                        ctx,
+                        &catalog.mdh.client,
+                        &name,
+                        &slug,
+                        allow_deletes,
+                        progress,
+                    )
+                    .await?;
                     created_local_only.push(slug);
                 }
             }
@@ -5500,6 +5611,70 @@ mod tests {
                 .and_then(|m| m.get("vendors"))
                 .is_some(),
             "live lockfile entry must survive"
+        );
+    }
+
+    /// Pruning an orphaned dataset must take its ROW data with it: the file
+    /// (via the dir removal), the base-cache mirror, and the `mdh_data`
+    /// lockfile entry. A surviving mirror also blocks the cosmetic
+    /// base-cache dir removal (only succeeds when empty).
+    #[tokio::test]
+    async fn prune_mdh_orphans_also_removes_row_data_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        let mut lockfile = Lockfile::default();
+        // Seeds indexes.json byte-clean vs the lockfile hash, so the orphan
+        // auto-prunes without a prompt (same path as
+        // `prune_mdh_orphans_unchanged_auto_prunes_without_prompt`).
+        let mirror = seed_mdh_dataset(&paths, &mut lockfile, "gl-codes-2");
+        let data = paths.dataset_data("gl-codes-2");
+        let rows: &[u8] = b"{\"code\":\"1000\"}\n";
+        std::fs::write(&data, rows).unwrap();
+        crate::state::base_cache::write(&paths, &data, rows).unwrap();
+        lockfile.upsert(
+            "mdh_data",
+            "gl-codes-2",
+            ObjectEntry {
+                id: 0,
+                modified_at: None,
+                // Row data hashes VERBATIM everywhere (push, pull, drift gate).
+                content_hash: Some(crate::state::raw_content_hash(rows)),
+                secrets_hash: None,
+            },
+        );
+
+        let client =
+            RossumClient::new("https://unused.invalid/api/v1".to_string(), "TEST".to_string())
+                .unwrap();
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+        let pruned = {
+            let mut ctx = PullCtx {
+                paths: &paths,
+                client: &client,
+                lockfile: &mut lockfile,
+                queue_locations: BTreeMap::new(),
+                interactive: true,
+            };
+            prune_mdh_orphans(&mut ctx, &BTreeSet::new(), Cursor::new(b""), true, &progress)
+                .await
+                .expect("unchanged orphan must auto-prune")
+        };
+
+        assert_eq!(pruned, 1);
+        assert!(!mirror.exists(), "indexes base mirror must be removed");
+        assert!(!data.exists(), "row data file must go with the dataset dir");
+        assert_eq!(
+            crate::state::base_cache::read(&paths, &data).unwrap(),
+            None,
+            "row-data base mirror must be forgotten"
+        );
+        assert!(
+            lockfile
+                .objects
+                .get("mdh_data")
+                .and_then(|m| m.get("gl-codes-2"))
+                .is_none(),
+            "mdh_data lockfile entry must be dropped"
         );
     }
 

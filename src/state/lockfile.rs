@@ -532,7 +532,8 @@ mod tests {
     /// for all 297 url-bearing entries across 11 kinds —
     /// `{api_base}/{endpoint(kind)}/{id}`, where `endpoint == kind` for every
     /// kind except `organization` → `organizations`, and `id == 0`
-    /// (`mdh_indexes`) yields no URL. An empty `api_base` fails loud.
+    /// (the `mdh_indexes` / `mdh_data` sentinel kinds) yields no URL. An empty
+    /// `api_base` fails loud.
     #[test]
     fn url_for_slug_derivation_matches_empirical_rule() {
         let mut lf = Lockfile {
@@ -569,6 +570,16 @@ mod tests {
                 secrets_hash: None,
             },
         );
+        lf.upsert(
+            "mdh_data",
+            "ds",
+            ObjectEntry {
+                id: 0,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
 
         // queues: endpoint == kind.
         assert_eq!(
@@ -582,6 +593,8 @@ mod tests {
         );
         // mdh_indexes: id == 0 → no URL.
         assert_eq!(lf.url_for_slug("mdh_indexes", "ds"), None);
+        // mdh_data: the second id-0 sentinel kind (row data has no API URL).
+        assert_eq!(lf.url_for_slug("mdh_data", "ds"), None);
         // Unknown kind/slug → None.
         assert_eq!(lf.url_for_slug("queues", "nope"), None);
 

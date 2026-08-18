@@ -1037,10 +1037,10 @@ fn strip_source_host_env_refs(
 /// and every entry carries the same remote id. That only becomes ambiguous if
 /// those slugs disagree about the target id.
 ///
-/// Non-portable kinds (`organization`, `mdh_indexes`) are skipped, mirroring
-/// [`crate::snapshot::refs::is_portable_kind`]: the organization is a per-env
-/// singleton reconciled separately, and `mdh_indexes` carry the sentinel
-/// `id: 0`.
+/// Non-portable kinds (`organization`, `mdh_indexes`, `mdh_data`) are skipped,
+/// mirroring [`crate::snapshot::refs::is_portable_kind`]: the organization is a
+/// per-env singleton reconciled separately, and the two MDH kinds carry the
+/// sentinel `id: 0`.
 #[derive(Debug, Default)]
 struct IdRemap {
     /// Source id -> target id. Kind-safe: only ids uniquely owned by one kind.

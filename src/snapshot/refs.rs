@@ -13,12 +13,14 @@ use serde_json::Value;
 pub const RDC_SCHEME: &str = "rdc://";
 
 /// Returns `true` for every kind whose URLs are rewritten to portable `rdc://`
-/// refs on pull. The two excluded kinds are `organization` (per-env singleton)
-/// and `mdh_indexes` (no `/api/v1/` URL); their URLs stay verbatim. All other
-/// kinds are portable. Non-snapshotted targets (users, hook_templates) never
-/// resolve via the lockfile, so they are left alone regardless.
+/// refs on pull. The excluded kinds are `organization` (per-env singleton) and
+/// the two Data Storage sentinel kinds `mdh_indexes` / `mdh_data` (no
+/// `/api/v1/` URL — MDH is addressed by collection name, and row data is
+/// customer data rather than a Rossum object); their URLs stay verbatim. All
+/// other kinds are portable. Non-snapshotted targets (users, hook_templates)
+/// never resolve via the lockfile, so they are left alone regardless.
 pub fn is_portable_kind(kind: &str) -> bool {
-    !matches!(kind, "organization" | "mdh_indexes")
+    !matches!(kind, "organization" | "mdh_indexes" | "mdh_data")
 }
 
 /// Parse `rdc://<kind>/<slug>` into `(kind, slug)`. `kind` is the first path
@@ -218,6 +220,7 @@ mod tests {
         assert!(is_portable_kind("hooks"));
         assert!(!is_portable_kind("organization"));
         assert!(!is_portable_kind("mdh_indexes"));
+        assert!(!is_portable_kind("mdh_data"));
     }
 
     #[test]
