@@ -19,7 +19,7 @@
 //! sides could never compare equal.
 
 use anyhow::{Context, Result, bail};
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 /// On-disk filename for a manual dataset's rows.
 pub const DATA_FILE: &str = "data.jsonl";
@@ -37,34 +37,18 @@ pub fn is_oid(v: &Value) -> bool {
         .is_some_and(|o| o.len() == 1 && o.contains_key("$oid"))
 }
 
-/// Reduce a row to its canonical form: keys sorted recursively, a
-/// server-generated `_id` dropped.
+/// Reduce a row to its canonical form: keys sorted recursively (via
+/// [`crate::snapshot::noise::sort_keys_recursive`], which preserves array
+/// element order as data), a server-generated `_id` dropped.
 pub fn canonicalize_row(row: &Value) -> Value {
-    let mut out = sort_keys(row);
+    let mut out = row.clone();
+    crate::snapshot::noise::sort_keys_recursive(&mut out);
     if let Value::Object(obj) = &mut out
         && obj.get("_id").is_some_and(is_oid)
     {
         obj.shift_remove("_id");
     }
     out
-}
-
-/// Recursively sort object keys. Array ORDER is data and is left alone; only
-/// the objects inside are rewritten.
-fn sort_keys(v: &Value) -> Value {
-    match v {
-        Value::Object(o) => {
-            let mut keys: Vec<&String> = o.keys().collect();
-            keys.sort();
-            let mut m = Map::new();
-            for k in keys {
-                m.insert(k.clone(), sort_keys(&o[k]));
-            }
-            Value::Object(m)
-        }
-        Value::Array(a) => Value::Array(a.iter().map(sort_keys).collect()),
-        other => other.clone(),
-    }
 }
 
 /// Serialize rows to the canonical `data.jsonl` bytes.
