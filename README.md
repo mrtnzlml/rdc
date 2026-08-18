@@ -400,6 +400,14 @@ Deleting rows is gated like every other destructive change (prompt, or
 `--allow-deletes`). `rdc migrate` carries the file to the next env, so a change
 reviewed in `dev` promotes to `test` and `prod` without retyping.
 
+Unlike an out-of-band index addition (never dropped, see above), row *edits*
+are not delete-gated: `data.jsonl` is authoritative, so an admin's UI edit to
+a row carrying an explicit `_id` is reverted in place the next time the file
+pushes — no prompt, no warning, because only row *deletions* ride the
+`--allow-deletes` gate. The shipped `templates/gitlab-ci.yml` runs
+`rdc sync --allow-deletes --yes`, so in that pipeline such UI-side row edits
+are erased unattended; only flag a dataset's rows if that is acceptable.
+
 Notes:
 
 - A row's `_id` is dropped from the file when the server generated it. Give a row

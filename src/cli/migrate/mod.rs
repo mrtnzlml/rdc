@@ -2059,8 +2059,12 @@ pub fn run_at(
             continue;
         }
         // `--only`: keep a file only when its classified (kind, slug) is in the
-        // selection. Files with no classifiable object (workflows, mdh) are
-        // skipped under an active selection — the user narrowed scope.
+        // selection. Files with no classifiable object (workflows) are
+        // skipped under an active selection — the user narrowed scope. `mdh`
+        // IS classifiable (see `classify_for_selection`'s `Some("mdh") if
+        // comps.len() >= 3` arm) — a dataset became selectable once MDH row
+        // data shipped, so `--only mdh/<slug>` carries collection.json /
+        // indexes.json / data.jsonl together.
         if let Some(sel) = &selection {
             match classify_for_selection(rel) {
                 Some((kind, slug)) if sel.contains(kind, &slug) => {}

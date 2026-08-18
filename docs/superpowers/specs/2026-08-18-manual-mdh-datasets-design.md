@@ -188,8 +188,15 @@ important, since `plan_mdh_index_edits` already costs one fetch pair per dataset
 5. Feed the existing three-way machinery (C2) — `decide_pull_action` /
    `apply_pull_action` — keyed under a new lockfile kind **`mdh_data`** (dataset
    slug → content hash), with a base-cache mirror (C3). Conflicts, shadow files,
-   `--conflict use-remote|keep-local|skip`, and the `KeepLocal` base-preservation
-   rule the index path already implements all come along unchanged.
+   and the `KeepLocal` base-preservation rule the index path already implements
+   all come along unchanged. **Not included**: `--conflict
+   use-remote|keep-local|skip`. That strategy is consumed only inside
+   `resolve_conflicts`, which runs against the classifier's `BothDiverged`
+   items — and MDH bypasses the classifier entirely (see "Sync integration"
+   below), so a row conflict always takes the interactive resolver or the
+   non-interactive shadow path, never `--conflict`. This is pre-existing for
+   the index leg too — `--conflict` never reached `mdh_indexes` conflicts
+   either — row data simply inherits the same gap rather than introducing it.
 
 ## Manifest merge (fixes C4)
 
@@ -225,9 +232,13 @@ Extends the existing four MDH stages in `sync/execute.rs:3688-3882`:
   per manual dataset — reusing the same `index_edit_item` decision shape so the
   preview cannot disagree with the real run.
 
-`--no-push` suppresses the data push and keeps the data pull; `--no-pull` pushes
-the rows but never rewrites `data.jsonl` — exactly as both flags already behave
-for indexes.
+`--no-push` suppresses the data push and keeps the data pull, exactly as it
+already behaves for indexes. `--no-pull` is NOT the row-data analogue of that:
+the entire MDH block (both the push and the pull legs, for indexes and rows
+alike) sits inside a single `if !no_pull` in `sync/execute.rs`, so `--no-pull`
+suppresses MDH wholesale — it also skips the push. This is a pre-existing
+limitation of the index-set MDH support that row data simply inherits
+unchanged, not new behavior introduced here and not intended design.
 
 ## Migrate integration
 

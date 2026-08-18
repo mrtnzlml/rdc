@@ -31,7 +31,11 @@
 //! `content_hash(canonicalize(cache_bytes)) ==
 //! lockfile.objects[kind][slug].content_hash` for the entry that
 //! recorded it. Drift between the two is a bug; sync re-records
-//! after every authoritative write.
+//! after every authoritative write. Exception: `mdh_data` mirrors (MDH row
+//! data, `data.jsonl`) satisfy the analogous invariant under
+//! `raw_content_hash(cache_bytes)` instead — the bytes are customer row
+//! data, not Rossum object JSON, so they are hashed verbatim everywhere
+//! (see `HashMode` in `cli::pull::common`).
 
 use crate::paths::Paths;
 use anyhow::{Context, Result};
