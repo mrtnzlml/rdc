@@ -51,6 +51,28 @@ struct Envelope<T> {
     result: Option<T>,
 }
 
+/// `result` shape of `data/aggregate` with a `$count` stage. An EMPTY result
+/// array is the documented answer for an empty collection, so the absence of a
+/// row means zero — but a present row missing `n` is a contract break.
+#[derive(Debug, Deserialize)]
+struct CountRow {
+    n: usize,
+}
+
+/// `result` shape of `data/delete_many`.
+#[derive(Debug, Deserialize)]
+struct DeleteResult {
+    deleted_count: usize,
+}
+
+/// `result` shape of `data/replace_one`. A missing field here must be a decode
+/// error, never a silent 0 — callers read `matched_count == 0` as "the row
+/// vanished between our read and our write".
+#[derive(Debug, Deserialize)]
+struct ReplaceResult {
+    matched_count: usize,
+}
+
 impl DataStorageClient {
     pub fn new(base_url: String, token: String) -> Result<Self> {
         let http = crate::api::build_http_client()?;
@@ -134,18 +156,14 @@ impl DataStorageClient {
         collection: &str,
         progress: ProgressHandle,
     ) -> Result<usize> {
-        let rows: Vec<Value> = self
+        let rows: Vec<CountRow> = self
             .post_envelope(
                 "/v1/data/aggregate",
                 json!({ "collectionName": collection, "pipeline": [{ "$count": "n" }] }),
                 progress,
             )
             .await?;
-        Ok(rows
-            .first()
-            .and_then(|r| r.get("n"))
-            .and_then(|n| n.as_u64())
-            .unwrap_or(0) as usize)
+        Ok(rows.first().map_or(0, |r| r.n))
     }
 
     /// `POST /v1/data/insert_many`. `ordered: false` so one bad document does
@@ -185,7 +203,7 @@ impl DataStorageClient {
         ids: &[Value],
         progress: ProgressHandle,
     ) -> Result<usize> {
-        let result: Value = self
+        let result: DeleteResult = self
             .post_envelope(
                 "/v1/data/delete_many",
                 json!({
@@ -196,10 +214,7 @@ impl DataStorageClient {
                 progress,
             )
             .await?;
-        Ok(result
-            .get("deleted_count")
-            .and_then(|n| n.as_u64())
-            .unwrap_or(0) as usize)
+        Ok(result.deleted_count)
     }
 
     /// `POST /v1/data/replace_one`, matching on `_id`. `replacement` MUST NOT
@@ -216,7 +231,7 @@ impl DataStorageClient {
         replacement: &Value,
         progress: ProgressHandle,
     ) -> Result<usize> {
-        let result: Value = self
+        let result: ReplaceResult = self
             .post_envelope(
                 "/v1/data/replace_one",
                 json!({
@@ -228,10 +243,7 @@ impl DataStorageClient {
                 progress,
             )
             .await?;
-        Ok(result
-            .get("matched_count")
-            .and_then(|n| n.as_u64())
-            .unwrap_or(0) as usize)
+        Ok(result.matched_count)
     }
 
     /// `POST /v1/indexes/list` with `{collectionName, nameOnly: false}` —
@@ -557,16 +569,21 @@ mod tests {
     /// empty case must read as 0, not as an error.
     #[tokio::test]
     async fn count_documents_handles_the_empty_collection_result() {
-        use wiremock::matchers::{method, path};
+        use wiremock::matchers::{body_json, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/data/aggregate"))
+            .and(body_json(json!({
+                "collectionName": "GL_CODES",
+                "pipeline": [{ "$count": "n" }]
+            })))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(json!({ "code": "ok", "message": "", "result": [] })),
             )
+            .expect(1)
             .mount(&server)
             .await;
         let client = DataStorageClient::new(server.uri(), "TOKEN".into()).unwrap();
@@ -575,9 +592,14 @@ mod tests {
         let server2 = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/data/aggregate"))
+            .and(body_json(json!({
+                "collectionName": "GL_CODES",
+                "pipeline": [{ "$count": "n" }]
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 json!({ "code": "ok", "message": "", "result": [{ "n": 129 }] }),
             ))
+            .expect(1)
             .mount(&server2)
             .await;
         let client2 = DataStorageClient::new(server2.uri(), "TOKEN".into()).unwrap();
