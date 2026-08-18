@@ -105,7 +105,8 @@ envs/test/
 └── mdh/                         ← only on clusters with MDH
     └── customers/
         ├── collection.json
-        └── indexes.json
+        ├── indexes.json
+        └── data.jsonl           ← only when "data": "manual"
 ```
 
 Edit a file, then sync to send the change back:
@@ -375,6 +376,40 @@ create/modify, the gated delete, and admin-added survival.
 > absent from the last-synced base. Index *modifications* (and search-index
 > definition changes) are drop-and-recreate regardless, since Data Storage has
 > no in-place update.
+
+### Manual MDH datasets
+
+By default rdc versions a dataset's *structure* only — its name and indexes.
+Row data belongs to whatever import pipeline feeds it.
+
+A dataset maintained by hand (a synonym list, a GL-code map) is different: its
+rows *are* configuration. Opt one in by adding `"data": "manual"` to its
+manifest:
+
+```json
+{
+  "name": "GL_CODES",
+  "data": "manual"
+}
+```
+
+`rdc sync` then pulls the rows to `mdh/<slug>/data.jsonl` — one JSON object per
+line, keys and lines sorted so diffs stay readable — and treats that file as
+authoritative: after a sync the env holds exactly the rows the file lists.
+Deleting rows is gated like every other destructive change (prompt, or
+`--allow-deletes`). `rdc migrate` carries the file to the next env, so a change
+reviewed in `dev` promotes to `test` and `prod` without retyping.
+
+Notes:
+
+- A row's `_id` is dropped from the file when the server generated it. Give a row
+  an explicit `_id` (any string) to pin its identity across environments — edits
+  then replace it in place instead of removing and re-adding it.
+- rdc warns above 1 000 rows and refuses above 10 000. Import-fed datasets are
+  out of scope; rdc warns if a flagged dataset's rows carry the import
+  extension's `__digest_md5` marker.
+- An absent `data.jsonl` means "not pulled yet", never "delete every row".
+- Per-env row overrides work like code sidecars: `envs/<env>/overlay/mdh/<slug>/data.jsonl`.
 
 Edge cases whose exact on-disk form is intentionally captured rather than
 predicted use golden files in `testdata/live/expected/`. To (re)capture after a

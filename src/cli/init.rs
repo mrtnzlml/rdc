@@ -810,6 +810,8 @@ envs/<env>/
     workflow.json
     steps/<step_slug>.json                  each step nests under its workflow
   mdh/<dataset>/                          Master Data Hub (if enabled)
+                                          collection.json + indexes.json,
+                                          plus data.jsonl when "data": "manual"
 .rdc/
   state/<env>.lock.json                   slug↔id + base hashes; never edit
   map/<src>-to-<tgt>.toml                 cross-env slug mappings

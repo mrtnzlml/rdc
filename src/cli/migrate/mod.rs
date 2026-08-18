@@ -314,9 +314,10 @@ fn classify_for_selection(rel: &Path) -> Option<(&'static str, String)> {
 }
 
 /// True for a non-JSON code/formula sidecar leaf (`.py`/`.js`) that belongs to
-/// a hook, rule, or schema — the files `migrate` copies verbatim and that an
-/// `overlay/` shadow may replace. JSON objects are excluded (they are
-/// overlay-able through `overlay.toml`); non-sidecar code returns false.
+/// a hook, rule, or schema, or for an MDH dataset's row data (`data.jsonl`) —
+/// the files `migrate` copies verbatim and that an `overlay/` shadow may replace.
+/// JSON objects are excluded (they are overlay-able through `overlay.toml`);
+/// non-sidecar code and non-data files return false.
 fn is_sidecar(rel: &Path) -> bool {
     let is_json = rel
         .extension()
@@ -360,12 +361,13 @@ fn list_overlay_files(overlay_dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Validate the target env's `overlay/` shadow directory. Every file under it
-/// must mirror a code/formula sidecar that migrating the source produces in the
-/// target — i.e. its relpath must be in `produced` (the full source enumeration
-/// remapped to target paths, filtered to sidecars, independent of `--only`). A
-/// shadow that overwrites nothing — a typo, a stale path, a `.json`, or a
-/// sidecar absent from the source — is a hard error naming the offending files.
-/// Run BEFORE any target file is written so the migration aborts cleanly.
+/// must mirror a code/formula sidecar or MDH row data that migrating the source
+/// produces in the target — i.e. its relpath must be in `produced` (the full
+/// source enumeration remapped to target paths, filtered to sidecars and data,
+/// independent of `--only`). A shadow that overwrites nothing — a typo, a stale
+/// path, a `.json`, or a sidecar/data absent from the source — is a hard error
+/// naming the offending files. Run BEFORE any target file is written so the
+/// migration aborts cleanly.
 fn validate_overlay_dir(
     overlay_dir: &Path,
     produced: &std::collections::BTreeSet<PathBuf>,
@@ -384,7 +386,8 @@ fn validate_overlay_dir(
             "overlay/ contains shadow file(s) that overwrite no source code/formula sidecar:\n\
              {list}\n\
              Each file under envs/<env>/overlay/ must mirror a sidecar produced by migrating the \
-             source (a hook/rule .py/.js, or a queue's formulas/<field>.py). Fix the path or remove it."
+             source (a hook/rule .py/.js, a queue's formulas/<field>.py, or an MDH dataset's \
+             data.jsonl). Fix the path or remove it."
         );
     }
     Ok(())

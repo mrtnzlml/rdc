@@ -523,8 +523,8 @@ fn migrate_carries_manual_mdh_dataset_rows() {
 }
 
 /// `--only mdh/<slug>` must select the whole dataset — manifest, indexes, and
-/// rows — and nothing else. Before S1 this selector matched zero objects and
-/// errored out.
+/// rows — and nothing else. Before S1 this selector bailed with "unknown kind"
+/// because mdh was absent from DEPLOYABLE_KINDS.
 #[test]
 fn migrate_only_selects_a_whole_mdh_dataset() {
     let project = init_two_env_project();
