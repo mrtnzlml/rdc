@@ -557,6 +557,22 @@ pub(crate) fn portabilize_proposed(bytes: &[u8], lockfile: &Lockfile) -> Vec<u8>
     out
 }
 
+/// How to hash bytes when comparing local / remote / base for a pull decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashMode {
+    /// Rossum object JSON: hash the CANONICAL form, so a server-managed field
+    /// rdc never authors cannot register as drift.
+    Canonical,
+    /// The bytes ARE the artifact — MDH row data (`data.jsonl`), where a line is
+    /// customer data, not a Rossum object. Hashed verbatim, and the
+    /// format-migration nudge is skipped: both of those behaviors exist for
+    /// Rossum object JSON and MISFIRE on JSONL, because a one-line JSONL file
+    /// parses as a single JSON object. `content_hash` would strip a
+    /// `modified_at` COLUMN (hiding a real edit) and `contains_hidden_fields`
+    /// would force a rewrite every cycle (permanent churn).
+    Raw,
+}
+
 /// Decide what to do on pull for a single object.
 ///
 /// `local_path` — the on-disk JSON file path (may not exist).
@@ -570,7 +586,28 @@ pub fn decide_pull_action(
     base_hash: Option<&str>,
     remote_bytes: &[u8],
 ) -> Result<(PullAction, String)> {
-    let remote_hash = content_hash(remote_bytes, &Lockfile::default());
+    decide_pull_action_with(local_path, base_hash, remote_bytes, HashMode::Canonical)
+}
+
+/// Same three-way decision as [`decide_pull_action`], parameterized by
+/// [`HashMode`] so MDH row data (`data.jsonl`) can be hashed verbatim instead
+/// of through the Rossum-object canonicalizer. See [`HashMode`] for why the two
+/// modes must differ. Every existing caller goes through [`decide_pull_action`],
+/// which always passes `HashMode::Canonical` — so this change is behavior-preserving
+/// for them.
+pub fn decide_pull_action_with(
+    local_path: &Path,
+    base_hash: Option<&str>,
+    remote_bytes: &[u8],
+    mode: HashMode,
+) -> Result<(PullAction, String)> {
+    let hash = |bytes: &[u8]| -> String {
+        match mode {
+            HashMode::Canonical => content_hash(bytes, &Lockfile::default()),
+            HashMode::Raw => crate::state::raw_content_hash(bytes),
+        }
+    };
+    let remote_hash = hash(remote_bytes);
 
     let Some(base) = base_hash else {
         return Ok((PullAction::Write, remote_hash));
@@ -582,15 +619,21 @@ pub fn decide_pull_action(
 
     let local_bytes =
         std::fs::read(local_path).with_context(|| format!("reading {}", local_path.display()))?;
-    let local_hash = content_hash(&local_bytes, &Lockfile::default());
+    let local_hash = hash(&local_bytes);
 
     // Short-circuit: canonicalized local == canonicalized remote means
     // any difference is noise (modifier etc.). Don't rewrite the file —
     // unless the on-disk format is stale (still carries a field that
     // the current serializer strips, e.g. `modified_at`). In that case
     // force a one-time rewrite so the on-disk layout catches up.
+    //
+    // `Raw` mode skips the hidden-fields nudge entirely: it exists to
+    // detect a Rossum-object JSON file still carrying a field the codec now
+    // strips, which does not apply to JSONL row data, and — for a one-row
+    // `data.jsonl` — `contains_hidden_fields` would misfire on an ordinary
+    // `modified_at` COLUMN and force a rewrite every cycle.
     if local_hash == remote_hash {
-        if crate::snapshot::key_order::contains_hidden_fields(&local_bytes) {
+        if mode == HashMode::Canonical && crate::snapshot::key_order::contains_hidden_fields(&local_bytes) {
             return Ok((PullAction::Write, remote_hash));
         }
         return Ok((PullAction::NoChange, remote_hash));
@@ -1136,6 +1179,36 @@ mod tests {
         let base = content_hash(remote, &Lockfile::default());
         let (action, _hash) = decide_pull_action(&path, Some(&base), remote).unwrap();
         assert_eq!(action, PullAction::NoChange);
+    }
+
+    /// `HashMode::Raw` exists because a one-row `data.jsonl` happens to parse
+    /// as a single JSON object, which makes `HashMode::Canonical` misfire on
+    /// ordinary MDH column data named the same as a Rossum noise field. Here
+    /// the REMOTE row has a real edit in a `modified_at` COLUMN — customer
+    /// data, not a server-stamped field — while local is unedited (matches
+    /// base). Under `Raw` this is correctly a pull-worthy change (`Write`).
+    ///
+    /// The SAME payload under `HashMode::Canonical` is deliberately blind to
+    /// this: `content_hash`'s canonicalizer strips any key named `modified_at`
+    /// recursively (it exists to ignore the server's OWN stamped field on
+    /// Rossum object JSON), so local and remote would hash identically and the
+    /// edit would be silently forgotten — the bug override 2 fixes for row data.
+    #[test]
+    fn raw_mode_sees_a_modified_at_column_edit_that_canonical_mode_is_blind_to() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("data.jsonl");
+        let base_row = b"{\"code\":\"1000\",\"modified_at\":\"t1\"}\n";
+        let edited_row = b"{\"code\":\"1000\",\"modified_at\":\"t2\"}\n";
+        std::fs::write(&path, base_row).unwrap(); // local unedited
+        let base = crate::state::raw_content_hash(base_row);
+
+        let (action, _hash) =
+            decide_pull_action_with(&path, Some(&base), edited_row, HashMode::Raw).unwrap();
+        assert_eq!(
+            action,
+            PullAction::Write,
+            "Raw mode must see the remote's modified_at-column edit as real drift"
+        );
     }
 
     #[test]
