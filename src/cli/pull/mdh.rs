@@ -153,15 +153,20 @@ pub(crate) struct MdhPlanItem {
 ///
 /// - would push (only when `!no_push`): local `indexes.json` drift on an
 ///   existing collection (executor stage 1) and a brand-new local-only
-///   dataset that was never synced (stage 2);
+///   dataset that was never synced (stage 2); plus, for a `"data": "manual"`
+///   dataset, local `data.jsonl` drift against the lockfile baseline
+///   (stage 1b);
 /// - would pull: an env collection with no local dataset dir (stage 3,
 ///   "new") and a previously-synced dataset whose collection is gone on the
-///   env (stage 4 orphan prune), gated on a non-empty listing.
+///   env (stage 4 orphan prune), gated on a non-empty listing; plus, for a
+///   manual dataset with no local `data.jsonl` yet, a row-data pull
+///   (stage 3b).
 ///
-/// NOT predicted: remote-side index BODY edits to a collection that already
-/// exists locally — detecting those needs a per-collection index fetch. The
-/// executor's pull still applies them; this is a bounded, documented gap, not
-/// a silent one.
+/// NOT predicted: remote-side index BODY edits, or remote-side ROW edits, to
+/// a collection that already exists locally — detecting either needs a
+/// per-collection fetch. See [`plan_mdh_index_edits`], the network-backed
+/// companion that closes both gaps. The executor's pull still applies them
+/// either way; this is a bounded, documented gap, not a silent one.
 pub(crate) fn plan_mdh(
     listed: &MdhListed,
     lockfile: &crate::state::Lockfile,
@@ -208,6 +213,44 @@ pub(crate) fn plan_mdh(
             }
         }
 
+        // Stage 1b: row-data drift for manual datasets — local `data.jsonl`
+        // hash differs from the lockfile baseline → PATCH. Hashed RAW (never
+        // through `content_hash`'s canonicalizer): a one-line JSONL file
+        // parses as a single JSON value, so the canonical path would strip a
+        // `modified_at` / `modifier` / `training_enabled` COLUMN at any
+        // depth — those are ordinary export columns here, not Rossum
+        // metadata. `push_dataset_data` and `pull_dataset_data` both hash
+        // raw; this forecast must match or it disagrees with the real run.
+        //
+        // `unwrap_or(DataMode::None)`: this function is infallible by design
+        // (`Vec`, not `Result`) and its callers depend on that shape, so a
+        // malformed "data" flag is deliberately swallowed into "not manual"
+        // here. The fallible companion `plan_mdh_index_edits` is what
+        // surfaces the error to the user in the same dry-run pass — don't
+        // "fix" this `unwrap_or` into a silent divergence from the real run.
+        for slug in &remote_slugs {
+            if read_data_mode(&paths.dataset_dir(slug)).unwrap_or(DataMode::None)
+                != DataMode::Manual
+            {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(paths.dataset_data(slug)) else {
+                continue;
+            };
+            let local_hash = crate::state::raw_content_hash(&bytes);
+            let base = lockfile
+                .objects
+                .get("mdh_data")
+                .and_then(|m| m.get(slug))
+                .and_then(|e| e.content_hash.clone());
+            if base.as_deref() != Some(local_hash.as_str()) {
+                items.push(MdhPlanItem {
+                    dir: MdhPlanDir::Push,
+                    line: format!("mdh/{slug} data PATCH"),
+                });
+            }
+        }
+
         // Stage 2: a local-only dataset absent on the env and never synced
         // (no lockfile entry) → POST (create the collection). A local-only
         // dataset that WAS synced is an orphan, left to stage 4's prune.
@@ -229,6 +272,23 @@ pub(crate) fn plan_mdh(
             items.push(MdhPlanItem {
                 dir: MdhPlanDir::Pull,
                 line: format!("mdh/{slug} (new)"),
+            });
+        }
+    }
+
+    // Stage 3b: a manual dataset with no local row data yet → a pull would
+    // create `data.jsonl`. Deliberately NOT gated on `remote_slugs`-only —
+    // this also covers the brand-new-dataset case from stage 3 above,
+    // whose dataset dir (and therefore `data.jsonl`) doesn't exist either.
+    // Same `unwrap_or(DataMode::None)` swallow as stage 1b, for the same
+    // reason (infallible-by-design; the fallible companion surfaces errors).
+    for slug in &remote_slugs {
+        if read_data_mode(&paths.dataset_dir(slug)).unwrap_or(DataMode::None) == DataMode::Manual
+            && !paths.dataset_data(slug).is_file()
+        {
+            items.push(MdhPlanItem {
+                dir: MdhPlanDir::Pull,
+                line: format!("mdh/{slug} data (new)"),
             });
         }
     }
@@ -290,6 +350,19 @@ fn index_edit_item(
 /// the cost of one index-list pair per local collection — the same fetches the
 /// real sync's pull performs. Collections with no local dir are left to
 /// `plan_mdh` stage 3 ("(new)").
+///
+/// Also closes the row-data analogue of that same gap: for a `"data": "manual"`
+/// dataset whose `data.jsonl` already exists locally, fetches the collection's
+/// current rows and forecasts a pull when they would overwrite the file — a
+/// remote-side row edit `plan_mdh`'s no-network scan cannot see. Costs one
+/// `find_all` per manual dataset with a local `data.jsonl`; an unflagged
+/// dataset, or a manual one with no local rows yet (`plan_mdh` stage 3b's
+/// "(new)" case), makes no row-data network call at all.
+///
+/// Unlike `plan_mdh`, this function is fallible and propagates
+/// `read_data_mode`'s error on a malformed `"data"` flag — it runs in the same
+/// dry-run pass as a real sync would, so the preview must fail exactly like
+/// the real run does, not go silent about a problem that stops the real thing.
 pub(crate) async fn plan_mdh_index_edits(
     listed: &MdhListed,
     lockfile: &crate::state::Lockfile,
@@ -323,6 +396,40 @@ pub(crate) async fn plan_mdh_index_edits(
             .and_then(|e| e.content_hash.clone());
         if let Some(item) = index_edit_item(&slug, &ix_path, base.as_deref(), &proposed)? {
             items.push(item);
+        }
+
+        // Row-data forecast for manual datasets — the row-level analogue of
+        // the index-edit forecast above. `?`, not `unwrap_or`: this function
+        // is fallible and runs in the same dry-run pass as a real sync, so a
+        // malformed "data" flag must fail the preview exactly like it fails
+        // the real run (see the doc comment on this function).
+        if read_data_mode(&paths.dataset_dir(&slug))? == DataMode::Manual {
+            let data_path = paths.dataset_data(&slug);
+            // No local `data.jsonl` yet → `plan_mdh` stage 3b already
+            // forecasts "(new)"; don't fetch (nothing to compare against)
+            // or double-report. This is also what keeps an unflagged
+            // dataset's cost unchanged: no manual opt-in, no fetch, ever.
+            if data_path.is_file() {
+                let rows = listed.client.find_all(&c.name, Some(progress.clone())).await?;
+                let proposed = crate::snapshot::mdh_data::to_jsonl(&rows)?;
+                let base = lockfile
+                    .objects
+                    .get("mdh_data")
+                    .and_then(|m| m.get(&slug))
+                    .and_then(|e| e.content_hash.clone());
+                // `HashMode::Raw`: same reasoning as the pull driver at
+                // `pull_dataset_data` — the bytes ARE the artifact, so
+                // hashing must be verbatim, never through the canonical
+                // JSON path that strips ordinary export columns.
+                let (action, _) =
+                    decide_pull_action_with(&data_path, base.as_deref(), &proposed, HashMode::Raw)?;
+                if action == PullAction::Write {
+                    items.push(MdhPlanItem {
+                        dir: MdhPlanDir::Pull,
+                        line: format!("mdh/{slug} data (update)"),
+                    });
+                }
+            }
         }
     }
     Ok(items)
@@ -1018,6 +1125,85 @@ mod tests {
             !np.iter().any(|l| l.contains("PATCH") || l.contains("POST")),
             "no-push must suppress MDH pushes: {np:?}"
         );
+    }
+
+    /// MDH bypasses the classifier, so `--dry-run` is blind unless the planner
+    /// mirrors the executor. Row data must be forecast too: a drifted
+    /// data.jsonl is a would-push; a manual dataset with no local rows yet is
+    /// a would-pull.
+    #[test]
+    fn plan_mdh_forecasts_row_data_deltas() {
+        use crate::state::{Lockfile, ObjectEntry, content_hash};
+
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(root.path(), "dev");
+        std::fs::create_dir_all(paths.mdh_dir()).unwrap();
+
+        let ix = b"{\n  \"regular\": [],\n  \"search\": []\n}\n".to_vec();
+        // `drifted`: manual, local rows differ from the baseline  -> data push.
+        // `fresh`:   manual, no local rows at all                 -> data pull.
+        // `plain`:   NOT manual                                   -> no data item.
+        for slug in ["drifted", "fresh", "plain"] {
+            let dir = paths.dataset_dir(slug);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("indexes.json"), &ix).unwrap();
+            let manifest = if slug == "plain" {
+                b"{\n  \"name\": \"P\"\n}\n".to_vec()
+            } else {
+                b"{\n  \"name\": \"M\",\n  \"data\": \"manual\"\n}\n".to_vec()
+            };
+            std::fs::write(dir.join(COLLECTION_MANIFEST), manifest).unwrap();
+        }
+        std::fs::write(paths.dataset_data("drifted"), b"{\"code\":\"1000\"}\n").unwrap();
+
+        let entry = |h: &str| ObjectEntry {
+            id: 0,
+            modified_at: None,
+            content_hash: Some(h.to_string()),
+            secrets_hash: None,
+        };
+        let mut lf = Lockfile::default();
+        let ix_hash = content_hash(&ix, &Lockfile::default());
+        let mut ixs = std::collections::BTreeMap::new();
+        for slug in ["drifted", "fresh", "plain"] {
+            ixs.insert(slug.to_string(), entry(&ix_hash));
+        }
+        lf.objects.insert("mdh_indexes".to_string(), ixs);
+        let mut data = std::collections::BTreeMap::new();
+        data.insert("drifted".to_string(), entry("0000stalehash0000"));
+        lf.objects.insert("mdh_data".to_string(), data);
+
+        let collections = ["drifted", "fresh", "plain"]
+            .iter()
+            .map(|n| Collection { name: n.to_string(), extra: Default::default() })
+            .collect();
+        let listed = MdhListed {
+            client: DataStorageClient::new("http://unused.invalid".to_string(), "t".to_string())
+                .unwrap(),
+            collections,
+            available: true,
+        };
+
+        let lines: Vec<String> =
+            plan_mdh(&listed, &lf, &paths, false).into_iter().map(|i| i.line).collect();
+        assert!(
+            lines.contains(&"mdh/drifted data PATCH".to_string()),
+            "drifted rows must be forecast as a push: {lines:?}"
+        );
+        assert!(
+            lines.contains(&"mdh/fresh data (new)".to_string()),
+            "a manual dataset with no local rows must be forecast as a pull: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.starts_with("mdh/plain data")),
+            "a non-manual dataset must produce no data forecast: {lines:?}"
+        );
+
+        // --no-push keeps the pull-side forecast, drops the push-side one.
+        let np: Vec<String> =
+            plan_mdh(&listed, &lf, &paths, true).into_iter().map(|i| i.line).collect();
+        assert!(np.contains(&"mdh/fresh data (new)".to_string()));
+        assert!(!np.iter().any(|l| l.contains("data PATCH")));
     }
 
     /// MDH not provisioned on the env (`available == false`) → an empty plan.
