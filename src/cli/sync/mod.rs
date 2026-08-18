@@ -336,10 +336,11 @@ pub(crate) async fn run_cycle(
         let mut mdh_plan =
             crate::cli::pull::mdh::plan_mdh(&catalog.mdh, &lockfile, &paths, no_push);
         // Structural scan can't see a remote index-BODY edit (e.g. an index
-        // rename) on a collection that already exists locally — detecting that
-        // needs the env's index defs. Fetch them per local collection (the same
-        // fetches a real sync's pull performs) so the preview matches what the
-        // run would actually write, rather than silently under-reporting it.
+        // rename) or a remote ROW edit on a manual dataset — both need the
+        // env's index defs / rows fetched. Fetch them per local collection
+        // (the same fetches a real sync's pull performs) so the preview
+        // matches what the run would actually write, rather than silently
+        // under-reporting it.
         mdh_plan.extend(
             crate::cli::pull::mdh::plan_mdh_index_edits(&catalog.mdh, &lockfile, &paths, &progress)
                 .await?,

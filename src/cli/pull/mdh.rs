@@ -1444,6 +1444,195 @@ mod tests {
         );
     }
 
+    /// Row-level analogue of `plan_mdh_index_edits_forecasts_remote_index_change`:
+    /// a manual dataset whose local `data.jsonl` is unedited (its hash IS the
+    /// lockfile base) but whose env rows have changed must be forecast as a
+    /// would-pull, via the exact `HashMode::Raw` three-way decision the real
+    /// pull applies. The index side is set up to fire NO item (fetched set ==
+    /// local file, base recorded to match) so the row item is unambiguous.
+    #[tokio::test]
+    async fn plan_mdh_index_edits_forecasts_remote_row_data_update() {
+        use crate::state::{Lockfile, content_hash, raw_content_hash};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Index side: env advertises the same (empty) index set the local
+        // file already has — NoChange, no index item.
+        Mock::given(method("POST"))
+            .and(path("/v1/indexes/list"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "code": "ok", "result": [] })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search_indexes/list"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "code": "ok", "result": [] })),
+            )
+            .mount(&server)
+            .await;
+        // Row side: the env's row content changed.
+        Mock::given(method("POST"))
+            .and(path("/v1/data/find"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "ok",
+                "result": [ { "_id": { "$oid": "a1" }, "code": "9999", "label": "Changed" } ]
+            })))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        let dir = paths.dataset_dir("gl-codes");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(COLLECTION_MANIFEST),
+            b"{\n  \"name\": \"gl-codes\",\n  \"data\": \"manual\"\n}\n",
+        )
+        .unwrap();
+
+        // Index fixture: the ACTUAL bytes `proposed_index_bytes` would produce
+        // for an empty fetched set, so a fetch that also returns empty matches
+        // it byte-for-byte and reads NoChange regardless of what base records.
+        let empty_ix =
+            proposed_index_bytes(&IndexSet { regular: vec![], search: vec![] }).unwrap();
+        std::fs::write(dir.join("indexes.json"), &empty_ix).unwrap();
+
+        // Row fixture: local rows differ from the env's rows. The lockfile
+        // base is the LOCAL bytes' raw hash, so the file reads as unedited —
+        // the only thing that changed is the remote.
+        let local_rows: &[u8] = b"{\"code\":\"1000\",\"label\":\"Old\"}\n";
+        std::fs::write(paths.dataset_data("gl-codes"), local_rows).unwrap();
+
+        let mut lockfile = Lockfile::default();
+        let mut ixs = std::collections::BTreeMap::new();
+        ixs.insert(
+            "gl-codes".to_string(),
+            crate::state::ObjectEntry {
+                id: 0,
+                modified_at: None,
+                content_hash: Some(content_hash(&empty_ix, &Lockfile::default())),
+                secrets_hash: None,
+            },
+        );
+        lockfile.objects.insert("mdh_indexes".to_string(), ixs);
+        let mut data = std::collections::BTreeMap::new();
+        data.insert(
+            "gl-codes".to_string(),
+            crate::state::ObjectEntry {
+                id: 0,
+                modified_at: None,
+                content_hash: Some(raw_content_hash(local_rows)),
+                secrets_hash: None,
+            },
+        );
+        lockfile.objects.insert("mdh_data".to_string(), data);
+
+        let listed = MdhListed {
+            client: DataStorageClient::new(server.uri(), "t".to_string()).unwrap(),
+            collections: vec![Collection {
+                name: "gl-codes".to_string(),
+                extra: Default::default(),
+            }],
+            available: true,
+        };
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+
+        let items = plan_mdh_index_edits(&listed, &lockfile, &paths, &progress)
+            .await
+            .unwrap();
+        let lines: Vec<(MdhPlanDir, String)> =
+            items.into_iter().map(|i| (i.dir, i.line)).collect();
+        assert_eq!(
+            lines,
+            vec![(MdhPlanDir::Pull, "mdh/gl-codes data (update)".to_string())],
+            "a remote row edit on an unedited local file must be forecast as a \
+             would-pull, and nothing else"
+        );
+    }
+
+    /// A manual dataset with NO local `data.jsonl` must trigger no row fetch at
+    /// all: that case belongs to `plan_mdh` stage 3b's "(new)", and fetching
+    /// (or forecasting) it here too would double-report it. `/v1/data/find` is
+    /// deliberately NOT mounted — any row fetch would 404 and fail this test,
+    /// which is what proves the gate prevents the request rather than merely
+    /// producing output that happens to look right.
+    #[tokio::test]
+    async fn plan_mdh_index_edits_skips_row_fetch_when_no_local_data_file() {
+        use crate::state::{Lockfile, content_hash};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/indexes/list"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "code": "ok", "result": [] })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search_indexes/list"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "code": "ok", "result": [] })),
+            )
+            .mount(&server)
+            .await;
+        // /v1/data/find is deliberately NOT mounted: any row fetch would 404.
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        let dir = paths.dataset_dir("gl-codes");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(COLLECTION_MANIFEST),
+            b"{\n  \"name\": \"gl-codes\",\n  \"data\": \"manual\"\n}\n",
+        )
+        .unwrap();
+
+        let empty_ix =
+            proposed_index_bytes(&IndexSet { regular: vec![], search: vec![] }).unwrap();
+        std::fs::write(dir.join("indexes.json"), &empty_ix).unwrap();
+        // No data.jsonl written at all — the gate this test is proving.
+
+        let mut lockfile = Lockfile::default();
+        let mut ixs = std::collections::BTreeMap::new();
+        ixs.insert(
+            "gl-codes".to_string(),
+            crate::state::ObjectEntry {
+                id: 0,
+                modified_at: None,
+                content_hash: Some(content_hash(&empty_ix, &Lockfile::default())),
+                secrets_hash: None,
+            },
+        );
+        lockfile.objects.insert("mdh_indexes".to_string(), ixs);
+
+        let listed = MdhListed {
+            client: DataStorageClient::new(server.uri(), "t".to_string()).unwrap(),
+            collections: vec![Collection {
+                name: "gl-codes".to_string(),
+                extra: Default::default(),
+            }],
+            available: true,
+        };
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+
+        let items = plan_mdh_index_edits(&listed, &lockfile, &paths, &progress)
+            .await
+            .unwrap();
+        assert!(
+            items.is_empty(),
+            "no local data.jsonl must forecast no row item, and cost no row fetch: {items:?}"
+        );
+    }
+
     /// A dataset with no `"data": "manual"` flag must cost ZERO row calls — the
     /// backward-compatibility guarantee for every existing project.
     #[tokio::test]
