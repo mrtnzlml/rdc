@@ -14,9 +14,15 @@
 //! Deletes are applied BEFORE inserts so a unique index survives a row edit:
 //! the outgoing row releases its key before the incoming row claims it.
 
-use crate::snapshot::mdh_data::canonicalize_row;
+use crate::api::DataStorageClient;
+use crate::log::{Action, Log};
+use crate::paths::Paths;
+use crate::snapshot::mdh_data::{ROW_HARD_LIMIT, ROW_WARN_THRESHOLD, canonicalize_row, from_jsonl};
+use crate::state::{Lockfile, ObjectEntry, content_hash};
+use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// The operations that make a collection match `data.jsonl`.
 #[derive(Debug, Default, PartialEq)]
@@ -54,7 +60,6 @@ fn without_id(canonical: &Value) -> Value {
 /// Diff local rows (from `data.jsonl`) against raw remote rows (from
 /// `find_all`, `_id`s intact). Output order is derived from sorted maps, so it
 /// is deterministic and independent of input order.
-#[allow(dead_code)] // Called from tests only until Task 6 adds the push driver that consumes it; Task 6 removes this attribute.
 pub(crate) fn diff_rows(local: &[Value], remote: &[Value]) -> RowDiff {
     // key → canonical row
     let mut local_keyed: BTreeMap<String, Value> = BTreeMap::new();
@@ -128,6 +133,204 @@ pub(crate) fn diff_rows(local: &[Value], remote: &[Value]) -> RowDiff {
     diff
 }
 
+/// Documents per `insert_many` / ids per `delete_many`. 1 000 documents ×
+/// 20 fields (≈440 KB) was measured at ~1.1 s against the live API, so 500
+/// leaves comfortable headroom.
+const WRITE_CHUNK: usize = 500;
+
+/// Make `collection_name` hold exactly the rows in `data.jsonl`.
+///
+/// An ABSENT `data.jsonl` is never authoritative: it means the dataset was
+/// flagged manual but has not been pulled yet, NOT that the env should be
+/// emptied. Such a dataset is skipped entirely (0 ops, no reads, no writes).
+/// Only a present file — including a deliberately 0-byte one — expresses
+/// "these are all the rows".
+///
+/// The lockfile hash and the base cache are advanced only when the push FULLY
+/// reconciled the env (no gated skip, no error). A partial push leaves the
+/// dataset looking locally-diverged, so the next sync re-reads and re-diffs —
+/// which is the correct recovery given that a failed `insert_many` is
+/// partially applied.
+#[allow(clippy::too_many_arguments)]
+pub async fn push_dataset_data(
+    client: &DataStorageClient,
+    lockfile: &mut Lockfile,
+    collection_name: &str,
+    slug: &str,
+    paths: &Paths,
+    allow_deletes: bool,
+    interactive: bool,
+    progress: &Arc<Log>,
+) -> Result<usize> {
+    let data_path = paths.dataset_data(slug);
+    let Ok(local_raw) = std::fs::read(&data_path) else {
+        return Ok(0); // not pulled yet — never authoritative
+    };
+
+    let local_rows = from_jsonl(&local_raw, &data_path.display().to_string())?;
+    if local_rows.len() > ROW_HARD_LIMIT {
+        anyhow::bail!(
+            "mdh/{slug}: {} rows in {} exceeds rdc's {ROW_HARD_LIMIT}-row ceiling for \
+             versioned MDH data. Remove the \"data\" key from {} to stop versioning this \
+             dataset's rows (its indexes and name stay managed).",
+            local_rows.len(),
+            data_path.display(),
+            crate::cli::pull::mdh::COLLECTION_MANIFEST,
+        );
+    }
+    if local_rows.len() > ROW_WARN_THRESHOLD {
+        progress.event(
+            Action::Warn,
+            &format!(
+                "mdh/{slug}: {} rows is large for a git-versioned dataset (warns above \
+                 {ROW_WARN_THRESHOLD})",
+                local_rows.len()
+            ),
+        );
+    }
+
+    // `from_jsonl` already hard-errors on two rows sharing an explicit `_id`
+    // (MongoDB enforces `_id` uniqueness), so any duplicate that survives to
+    // here is a byte-identical UNKEYED row — a legitimate multiset entry, not
+    // a data-integrity problem. Still worth flagging: in a lookup table like
+    // this, a repeated row is usually a copy-paste mistake rather than intent.
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let duplicates = local_rows.iter().filter(|r| !seen.insert(key_of(r))).count();
+    if duplicates > 0 {
+        progress.event(
+            Action::Warn,
+            &format!(
+                "mdh/{slug}: {duplicates} duplicate row(s) in {} — kept as-is (rows are a \
+                 multiset), but duplicates in a lookup table are usually unintended",
+                data_path.display()
+            ),
+        );
+    }
+
+    let remote_rows = client
+        .find_all(collection_name, Some(progress.clone()))
+        .await
+        .with_context(|| format!("reading rows of '{collection_name}'"))?;
+
+    let diff = diff_rows(&local_rows, &remote_rows);
+
+    // Deletions ride the same gate as index drops.
+    let pending = diff.delete.len();
+    let mut deletes: &[Value] = &diff.delete;
+    let mut skipped = false;
+    match crate::cli::push::mdh::classify_delete_gate(pending, allow_deletes, interactive) {
+        crate::cli::push::mdh::DeleteGate::Proceed => {}
+        crate::cli::push::mdh::DeleteGate::Bail => {
+            anyhow::bail!(
+                "mdh/{slug}: {pending} row(s) present on the env are absent from {} and \
+                 would be DELETED, but --allow-deletes was not passed. Re-run with \
+                 --allow-deletes to authorise it, or restore the rows in that file to cancel.",
+                data_path.display()
+            );
+        }
+        crate::cli::push::mdh::DeleteGate::Prompt => {
+            if prompt_confirm_row_deletes(progress, collection_name, pending)? {
+                // proceed
+            } else {
+                deletes = &[];
+                skipped = true;
+                progress.event(
+                    Action::Skip,
+                    &format!("mdh/{slug} {pending} row deletion(s) skipped"),
+                );
+            }
+        }
+    }
+
+    let mut ops = 0usize;
+
+    // Deletes FIRST: a row edit on a uniquely-indexed field needs the outgoing
+    // row gone before the incoming row claims the key.
+    for chunk in deletes.chunks(WRITE_CHUNK) {
+        client
+            .delete_many_by_ids(collection_name, chunk, Some(progress.clone()))
+            .await
+            .with_context(|| format!("deleting rows from '{collection_name}'"))?;
+        progress.event(
+            Action::Delete,
+            &format!("mdh/{slug} {} row(s)", chunk.len()),
+        );
+        ops += 1;
+    }
+
+    for (id, replacement) in &diff.replace {
+        let matched = client
+            .replace_one(collection_name, id, replacement, Some(progress.clone()))
+            .await
+            .with_context(|| format!("replacing row {id} in '{collection_name}'"))?;
+        if matched == 0 {
+            progress.event(
+                Action::Warn,
+                &format!(
+                    "mdh/{slug} row {id} vanished between read and write; will retry next sync"
+                ),
+            );
+            skipped = true;
+        } else {
+            progress.event(Action::Patch, &format!("mdh/{slug} row {id}"));
+            ops += 1;
+        }
+    }
+
+    for chunk in diff.insert.chunks(WRITE_CHUNK) {
+        client
+            .insert_many(collection_name, chunk, Some(progress.clone()))
+            .await
+            .with_context(|| format!("inserting rows into '{collection_name}'"))?;
+        progress.event(Action::Post, &format!("mdh/{slug} {} row(s)", chunk.len()));
+        ops += 1;
+    }
+
+    if !skipped {
+        lockfile.upsert(
+            "mdh_data",
+            slug,
+            ObjectEntry {
+                id: 0,
+                modified_at: None,
+                content_hash: Some(content_hash(&local_raw, &Lockfile::default())),
+                secrets_hash: None,
+            },
+        );
+        crate::state::base_cache::write(paths, &data_path, &local_raw)
+            .with_context(|| format!("writing base cache for mdh/{slug} rows"))?;
+    }
+
+    Ok(ops)
+}
+
+/// Interactive [y/N] confirmation for deleting remote rows absent from
+/// `data.jsonl`. Byte-for-byte the shape of `prompt_confirm_index_drops`
+/// (`push/mdh.rs:668`): `with_prompt` clears any active status line, and
+/// `read_line_coordinated()` (no arguments, `io::Result<Option<String>>`) is the
+/// single chokepoint that also rings the watch attention bell.
+fn prompt_confirm_row_deletes(
+    progress: &Arc<Log>,
+    collection_name: &str,
+    pending: usize,
+) -> Result<bool> {
+    progress.with_prompt(|| -> Result<bool> {
+        use std::io::Write;
+        eprintln!();
+        eprintln!(
+            "{pending} row(s) on '{collection_name}' are absent from data.jsonl and would \
+             be DELETED."
+        );
+        eprint!("Proceed with the deletion(s)? [y/N] ");
+        std::io::stderr().flush().ok();
+        let ans = crate::cli::stdin_coord::read_line_coordinated()?
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        Ok(ans == "y" || ans == "yes")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +339,273 @@ mod tests {
 
     fn oid(hex: &str) -> Value {
         json!({ "$oid": hex })
+    }
+
+    use crate::api::DataStorageClient;
+    use crate::state::{Lockfile, content_hash};
+    use std::sync::Arc;
+
+    fn log() -> Arc<crate::log::Log> {
+        crate::log::Log::new(crate::cli::resolve::ColorMode::Plain)
+    }
+
+    /// Seed a manual dataset on disk: manifest with the flag + the given rows.
+    fn seed(paths: &crate::paths::Paths, slug: &str, jsonl: &[u8]) {
+        let dir = paths.dataset_dir(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::cli::pull::mdh::COLLECTION_MANIFEST),
+            b"{\n  \"name\": \"GL_CODES\",\n  \"data\": \"manual\"\n}\n",
+        )
+        .unwrap();
+        std::fs::write(paths.dataset_data(slug), jsonl).unwrap();
+    }
+
+    /// An ABSENT data.jsonl means "not pulled yet", never "the env should have
+    /// zero rows". Push must make no calls at all — the safety rule that keeps
+    /// a hand-added flag from wiping a collection.
+    #[tokio::test]
+    async fn absent_data_file_is_never_authoritative() {
+        let server = wiremock::MockServer::start().await;
+        // No mocks mounted: any request would 404 and fail the call.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        std::fs::create_dir_all(paths.dataset_dir("gl-codes")).unwrap();
+        let client = DataStorageClient::new(server.uri(), "t".into()).unwrap();
+        let mut lf = Lockfile::default();
+
+        let ops = push_dataset_data(
+            &client, &mut lf, "GL_CODES", "gl-codes", &paths, false, false, &log(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ops, 0, "an absent file must produce no writes");
+        assert!(lf.objects.get("mdh_data").is_none(), "nothing to record");
+    }
+
+    /// Local rows the env lacks are inserted, and a fully-applied push advances
+    /// both the lockfile hash and the base cache — the invariant that makes the
+    /// next sync see the dataset as clean.
+    #[tokio::test]
+    async fn inserts_missing_rows_then_records_lockfile_and_base() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/find"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "code": "ok", "result": [] })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/insert_many"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "code": "ok", "result": { "inserted_ids": ["a"] } }),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        let jsonl = b"{\"code\":\"1000\"}\n".to_vec();
+        seed(&paths, "gl-codes", &jsonl);
+        let client = DataStorageClient::new(server.uri(), "t".into()).unwrap();
+        let mut lf = Lockfile::default();
+
+        let ops = push_dataset_data(
+            &client, &mut lf, "GL_CODES", "gl-codes", &paths, false, false, &log(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ops, 1);
+        assert_eq!(
+            lf.objects["mdh_data"]["gl-codes"].content_hash.as_deref(),
+            Some(content_hash(&jsonl, &Lockfile::default()).as_str())
+        );
+        assert_eq!(
+            crate::state::base_cache::read(&paths, &paths.dataset_data("gl-codes")).unwrap(),
+            Some(jsonl),
+            "base cache must move in lockstep with the lockfile"
+        );
+    }
+
+    /// Deleting rows is destructive, so it rides the same gate index drops do:
+    /// non-interactive without --allow-deletes must BAIL, having written nothing.
+    #[tokio::test]
+    async fn pending_deletes_bail_without_allow_deletes() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/find"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "ok",
+                "result": [{ "_id": { "$oid": "a1" }, "code": "9999" }]
+            })))
+            .mount(&server)
+            .await;
+        // No delete mock: if a delete were attempted the test would fail.
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        seed(&paths, "gl-codes", b"");
+        let client = DataStorageClient::new(server.uri(), "t".into()).unwrap();
+        let mut lf = Lockfile::default();
+
+        let err = push_dataset_data(
+            &client, &mut lf, "GL_CODES", "gl-codes", &paths, false, false, &log(),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--allow-deletes"), "must name the flag: {msg}");
+        assert!(msg.contains("gl-codes"), "must name the dataset: {msg}");
+        assert!(lf.objects.get("mdh_data").is_none(), "must not record a bailed push");
+    }
+
+    #[tokio::test]
+    async fn allow_deletes_applies_deletes_before_inserts() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/find"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "ok",
+                "result": [{ "_id": { "$oid": "a1" }, "code": "old" }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/delete_many"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "code": "ok", "result": { "deleted_count": 1 } }),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/insert_many"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "code": "ok", "result": { "inserted_ids": ["b"] } }),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        seed(&paths, "gl-codes", b"{\"code\":\"new\"}\n");
+        let client = DataStorageClient::new(server.uri(), "t".into()).unwrap();
+        let mut lf = Lockfile::default();
+
+        let ops = push_dataset_data(
+            &client, &mut lf, "GL_CODES", "gl-codes", &paths, true, false, &log(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ops, 2, "one delete + one insert");
+    }
+
+    /// A keyed row edit is one in-place replace — no delete, no insert.
+    #[tokio::test]
+    async fn keyed_edit_issues_a_single_replace() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/find"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "ok",
+                "result": [{ "_id": "gl-1000", "label": "old" }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/replace_one"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "code": "ok", "result": { "matched_count": 1 } }),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        seed(&paths, "gl-codes", b"{\"_id\":\"gl-1000\",\"label\":\"new\"}\n");
+        let client = DataStorageClient::new(server.uri(), "t".into()).unwrap();
+        let mut lf = Lockfile::default();
+
+        let ops = push_dataset_data(
+            &client, &mut lf, "GL_CODES", "gl-codes", &paths, false, false, &log(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ops, 1);
+    }
+
+    /// Nothing to do → no writes, but the lockfile/base still get recorded so a
+    /// first sync of an already-matching dataset converges instead of retrying.
+    #[tokio::test]
+    async fn no_op_push_records_state_without_writing() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/find"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "ok",
+                "result": [{ "_id": { "$oid": "a1" }, "code": "1000" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        seed(&paths, "gl-codes", b"{\"code\":\"1000\"}\n");
+        let client = DataStorageClient::new(server.uri(), "t".into()).unwrap();
+        let mut lf = Lockfile::default();
+
+        let ops = push_dataset_data(
+            &client, &mut lf, "GL_CODES", "gl-codes", &paths, false, false, &log(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ops, 0);
+        assert!(lf.objects["mdh_data"].contains_key("gl-codes"));
+    }
+
+    /// The hard ceiling protects git from an import-fed table: refuse before any
+    /// write, naming the count and the way out.
+    #[tokio::test]
+    async fn local_rows_over_the_hard_limit_are_refused() {
+        let server = wiremock::MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        let mut jsonl = Vec::new();
+        for i in 0..(crate::snapshot::mdh_data::ROW_HARD_LIMIT + 1) {
+            jsonl.extend_from_slice(format!("{{\"code\":\"{i:06}\"}}\n").as_bytes());
+        }
+        seed(&paths, "gl-codes", &jsonl);
+        let client = DataStorageClient::new(server.uri(), "t".into()).unwrap();
+        let mut lf = Lockfile::default();
+
+        let err = push_dataset_data(
+            &client, &mut lf, "GL_CODES", "gl-codes", &paths, false, false, &log(),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("10001"), "must state the count: {msg}");
+        assert!(msg.contains("data"), "must point at the opt-out: {msg}");
     }
 
     #[test]
