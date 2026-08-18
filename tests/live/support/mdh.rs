@@ -88,6 +88,23 @@ impl MdhRaw {
         Ok(())
     }
 
+    /// Every row in a collection, via the raw find endpoint.
+    pub async fn find_all(&self, name: &str) -> Result<Vec<Value>> {
+        let (status, body) = self
+            .post("/v1/data/find", json!({ "collectionName": name, "query": {} }))
+            .await?;
+        if !status.is_success() {
+            return Err(anyhow!("find_all {name}: {status} {body}"));
+        }
+        let env: Value = serde_json::from_str(&body)
+            .with_context(|| format!("decoding find_all response for {name}"))?;
+        Ok(env
+            .get("result")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
+
     /// Drop a collection. Async (202); best-effort — a missing collection is
     /// not an error (idempotent teardown).
     pub async fn drop_collection(&self, name: &str) -> Result<()> {

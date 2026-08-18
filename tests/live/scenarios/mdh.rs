@@ -197,6 +197,154 @@ async fn live_mdh_index_lifecycle() {
     drop(teardown);
 }
 
+/// Read the run's dataset slug and its row data.
+fn read_rows(project: &ProjectFixture, run_id: &RunId) -> (String, Vec<String>) {
+    let lf = load_lockfile(project.path(), "test").expect("lockfile");
+    let slug = lockfile_keys(&lf, "mdh_indexes")
+        .into_iter()
+        .find(|s| s.contains(run_id.as_str()))
+        .expect("an mdh_indexes slug for this run");
+    let rel = format!("envs/test/mdh/{slug}/data.jsonl");
+    let body = project.read_to_string(&rel).unwrap_or_default();
+    let lines = body.lines().map(str::to_string).collect();
+    (slug, lines)
+}
+
+/// Flag a dataset manual by adding `"data": "manual"` to its manifest.
+fn flag_manual(project: &ProjectFixture, slug: &str) {
+    let rel = format!("envs/test/mdh/{slug}/collection.json");
+    let mut v = project.read_json(&rel);
+    v["data"] = json!("manual");
+    let mut bytes = serde_json::to_vec_pretty(&v).unwrap();
+    bytes.push(b'\n');
+    std::fs::write(project.path().join(&rel), bytes).unwrap();
+}
+
+/// Full row-data lifecycle for a MANUAL dataset on a per-run throwaway
+/// collection: opt in, pull rows, push an addition, push a deletion, prove
+/// idempotence. Never touches a real collection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live: needs RDC_LIVE_* env"]
+async fn live_mdh_manual_data_lifecycle() {
+    let Some(cfg) = LiveConfig::from_env() else {
+        eprintln!("{}", LiveConfig::skip_reason());
+        return;
+    };
+    let run_id = RunId::new();
+    let coll = mdh_collection_name(&run_id);
+    let raw = MdhRaw::connect(&cfg).expect("connect mdh");
+
+    // Teardown FIRST (drops the collection on any panic).
+    let teardown = Teardown::with_mdh(
+        LiveClient::connect(&cfg).expect("connect (teardown)"),
+        run_id.clone(),
+        cfg.clone(),
+    );
+
+    // --- seed remote out-of-band: a collection with two rows ---
+    raw.create_collection(&coll).await.expect("create collection");
+    raw.insert_one(&coll, json!({ "code": "1000", "label": "Office supplies" }))
+        .await
+        .expect("seed row 1");
+    raw.insert_one(&coll, json!({ "code": "2000", "label": "Travel" }))
+        .await
+        .expect("seed row 2");
+
+    // --- Phase 1: a NON-flagged dataset must get no data.jsonl at all ---
+    let project = ProjectFixture::init(&cfg, &["test", "prod"]).expect("init project");
+    let out = project.run_rdc(&["sync", "test", "--no-push"]);
+    assert!(out.status.success(), "pull failed: {}", String::from_utf8_lossy(&out.stderr));
+    let (slug, rows) = read_rows(&project, &run_id);
+    assert!(rows.is_empty(), "an unflagged dataset must have no row data: {rows:?}");
+    assert!(
+        !project.exists(&format!("envs/test/mdh/{slug}/data.jsonl")),
+        "an unflagged dataset must not even get a data.jsonl file"
+    );
+
+    // --- Phase 2: opt in, pull the rows ---
+    flag_manual(&project, &slug);
+    let out = project.run_rdc(&["sync", "test"]);
+    assert!(out.status.success(), "pull after opt-in failed: {}", String::from_utf8_lossy(&out.stderr));
+    let (_s, rows) = read_rows(&project, &run_id);
+    assert_eq!(
+        rows,
+        vec![
+            r#"{"code":"1000","label":"Office supplies"}"#.to_string(),
+            r#"{"code":"2000","label":"Travel"}"#.to_string(),
+        ],
+        "rows must land canonical: server ids stripped, keys and lines sorted"
+    );
+    // The opt-in flag must survive the pull that rewrites `name` from the
+    // server (regression guard for the collection.json-clobber bug: the pull
+    // rewrites the manifest from server truth and must MERGE, not overwrite).
+    assert_eq!(
+        project.read_json(&format!("envs/test/mdh/{slug}/collection.json"))["data"],
+        json!("manual"),
+        "the pull must merge collection.json, not clobber it"
+    );
+
+    // --- Phase 3: local addition is pushed ---
+    let rel = format!("envs/test/mdh/{slug}/data.jsonl");
+    let mut body = project.read_to_string(&rel).expect("data.jsonl");
+    body.push_str("{\"code\":\"3000\",\"label\":\"Software\"}\n");
+    std::fs::write(project.path().join(&rel), &body).unwrap();
+    let out = project.run_rdc(&["sync", "test"]);
+    assert!(out.status.success(), "push-add failed: {}", String::from_utf8_lossy(&out.stderr));
+    let remote = raw.find_all(&coll).await.expect("find_all after add");
+    assert_eq!(remote.len(), 3, "the added row must reach the env: {remote:?}");
+
+    // --- Phase 4: local deletion is pushed (gated, so pass --allow-deletes) ---
+    let kept: String = project
+        .read_to_string(&rel)
+        .expect("data.jsonl")
+        .lines()
+        .filter(|l| !l.contains("3000"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(project.path().join(&rel), &kept).unwrap();
+    // Without --allow-deletes a non-TTY run must REFUSE, having deleted nothing.
+    let out = project.run_rdc(&["sync", "test"]);
+    assert!(
+        !out.status.success(),
+        "a row deletion must be gated without --allow-deletes"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(combined.contains("--allow-deletes"), "expected allow-deletes refusal: {combined}");
+    assert_eq!(
+        raw.find_all(&coll).await.expect("find_all after refusal").len(),
+        3,
+        "the refused push must not have deleted anything"
+    );
+    let out = project.run_rdc(&["sync", "test", "--allow-deletes"]);
+    assert!(out.status.success(), "gated delete failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        raw.find_all(&coll).await.expect("find_all after delete").len(),
+        2,
+        "the removed row must be deleted on the env"
+    );
+
+    // --- Phase 5: idempotence — a re-sync changes nothing, byte for byte ---
+    let before = project.read_to_string(&rel).expect("data.jsonl");
+    let out = project.run_rdc(&["sync", "test"]);
+    assert!(out.status.success(), "re-sync failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        project.read_to_string(&rel).expect("data.jsonl"),
+        before,
+        "an idempotent re-sync must leave data.jsonl byte-identical"
+    );
+    assert_eq!(
+        raw.find_all(&coll).await.expect("find_all after re-sync").len(),
+        2,
+        "an idempotent re-sync must not touch the rows"
+    );
+
+    drop(teardown);
+}
+
 /// Regression: a local dataset whose collection does NOT exist on the env yet
 /// must have its collection + indexes CREATED on sync. Before the fix the
 /// deploy iterated only server-listed collections, so a brand-new local
