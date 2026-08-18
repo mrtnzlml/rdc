@@ -3,16 +3,15 @@
 //! The MDH API is RPC-style — every call is a `POST` to
 //! `<base>/v1/<resource>/<verb>` with a JSON body, and every response is
 //! wrapped in `{code, message, result}`. Collection CRUD
-//! (`collections/create`, `collections/drop`, `collections/rename`) and
-//! row-data WRITE verbs (`data/insert_*`, `data/update_*`, …) are
-//! intentionally not implemented here — the snapshot scope is collection
-//! metadata + indexes, not the row data itself, and dataset
-//! creation/removal is a UI-side concern. Index CRUD (`indexes/create`,
-//! `indexes/drop`, and the corresponding `search_indexes/*`) IS
-//! implemented to support user edits to
-//! `envs/<env>/mdh/<slug>/indexes.json` being pushed, and the read-only
-//! `data/aggregate` is implemented for the unique-index duplicate-key
-//! preflight (rdc still never mutates row data).
+//! (`collections/create`, `collections/drop`, `collections/rename`) is
+//! partially implemented: only `create` is needed. Row-data verbs ARE
+//! implemented, but only the SYNCHRONOUS ones — `data/find`,
+//! `data/insert_many`, `data/delete_many`, `data/replace_one`,
+//! `data/aggregate` — and only for datasets the snapshot flags
+//! `"data": "manual"`. `data/bulk_write` is deliberately absent: it answers
+//! 202 with an EMPTY `message`, so it carries no operation id and its
+//! completion cannot be observed. rdc never touches the rows of a dataset that
+//! is not flagged manual.
 //!
 //! Base URL convention: `<host>/svc/data-storage/api`. For example,
 //! `https://elis.rossum.ai/svc/data-storage/api`. We append `/v1/...` per
@@ -103,6 +102,136 @@ impl DataStorageClient {
             progress,
         )
         .await
+    }
+
+    /// `POST /v1/data/find` with an empty query — every document in the
+    /// collection, in one call. Verified live: a single response carried 1206
+    /// documents (1002 documents ≈ 442 KB in 0.35 s), so no paging is needed at
+    /// the scale rdc versions. Row ORDER is not stable across calls; callers
+    /// impose their own (see `snapshot::mdh_data::to_jsonl`).
+    ///
+    /// A missing collection returns `{"code":"ok","result":[]}` — NOT a 404 — so
+    /// an empty result never implies the collection is gone. Existence comes
+    /// from [`list_collections`].
+    pub async fn find_all(
+        &self,
+        collection: &str,
+        progress: ProgressHandle,
+    ) -> Result<Vec<Value>> {
+        self.post_envelope(
+            "/v1/data/find",
+            json!({ "collectionName": collection, "query": {} }),
+            progress,
+        )
+        .await
+    }
+
+    /// Row count via `POST /v1/data/aggregate [{"$count": "n"}]` — one cheap
+    /// call for the size guardrail (`collections/list` carries no count). An
+    /// empty collection yields `result: []`, which reads as 0.
+    pub async fn count_documents(
+        &self,
+        collection: &str,
+        progress: ProgressHandle,
+    ) -> Result<usize> {
+        let rows: Vec<Value> = self
+            .post_envelope(
+                "/v1/data/aggregate",
+                json!({ "collectionName": collection, "pipeline": [{ "$count": "n" }] }),
+                progress,
+            )
+            .await?;
+        Ok(rows
+            .first()
+            .and_then(|r| r.get("n"))
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0) as usize)
+    }
+
+    /// `POST /v1/data/insert_many`. `ordered: false` so one bad document does
+    /// not mask the rest, `waitForFullWrite: true` so the same-cycle pull-back
+    /// reads what we just wrote.
+    ///
+    /// A duplicate `_id` fails the call with HTTP 400 "batch op errors
+    /// occurred" — and the NON-conflicting documents in the same batch are
+    /// still inserted. Callers must therefore treat an error as PARTIALLY
+    /// applied and re-read rather than assume a no-op.
+    pub async fn insert_many(
+        &self,
+        collection: &str,
+        documents: &[Value],
+        progress: ProgressHandle,
+    ) -> Result<()> {
+        self.post_envelope_void(
+            "/v1/data/insert_many",
+            json!({
+                "collectionName": collection,
+                "documents": documents,
+                "ordered": false,
+                "waitForFullWrite": true,
+            }),
+            progress,
+        )
+        .await
+    }
+
+    /// `POST /v1/data/delete_many` filtered by raw `_id` values. The id list is
+    /// intentionally mixed-type: one collection can hold both server-generated
+    /// ObjectId wrappers and user-authored scalar ids, and `$in` accepts both in
+    /// a single array. Returns `deleted_count`.
+    pub async fn delete_many_by_ids(
+        &self,
+        collection: &str,
+        ids: &[Value],
+        progress: ProgressHandle,
+    ) -> Result<usize> {
+        let result: Value = self
+            .post_envelope(
+                "/v1/data/delete_many",
+                json!({
+                    "collectionName": collection,
+                    "filter": { "_id": { "$in": ids } },
+                    "waitForFullWrite": true,
+                }),
+                progress,
+            )
+            .await?;
+        Ok(result
+            .get("deleted_count")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0) as usize)
+    }
+
+    /// `POST /v1/data/replace_one`, matching on `_id`. `replacement` MUST NOT
+    /// contain `_id`: the API rejects a replacement that alters the immutable
+    /// field ("the (immutable) field '_id' was found to have been altered"),
+    /// and omitting it makes that error unreachable — the filter carries
+    /// identity. No upsert: a no-match leaves the collection untouched and
+    /// returns `matched_count: 0`, which the caller reads as "the row vanished
+    /// between our read and our write".
+    pub async fn replace_one(
+        &self,
+        collection: &str,
+        id: &Value,
+        replacement: &Value,
+        progress: ProgressHandle,
+    ) -> Result<usize> {
+        let result: Value = self
+            .post_envelope(
+                "/v1/data/replace_one",
+                json!({
+                    "collectionName": collection,
+                    "filter": { "_id": id },
+                    "replacement": replacement,
+                    "waitForFullWrite": true,
+                }),
+                progress,
+            )
+            .await?;
+        Ok(result
+            .get("matched_count")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0) as usize)
     }
 
     /// `POST /v1/indexes/list` with `{collectionName, nameOnly: false}` —
@@ -392,5 +521,169 @@ mod tests {
             format!("{err:#}").contains("permission denied"),
             "error should carry the API message: {err:#}"
         );
+    }
+
+    /// `find_all` must POST `data/find` with an empty query and hand back every
+    /// document — one call returns the whole collection (live-verified: 1206
+    /// documents in a single response).
+    #[tokio::test]
+    async fn find_all_posts_empty_query_and_returns_every_document() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/find"))
+            .and(body_json(json!({ "collectionName": "GL_CODES", "query": {} })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": "ok",
+                "message": "",
+                "result": [
+                    { "_id": { "$oid": "6a8403a6070b60eaa348d173" }, "code": "1000" },
+                    { "_id": "gl-2000", "code": "2000" }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = DataStorageClient::new(server.uri(), "TOKEN".into()).unwrap();
+        let rows = client.find_all("GL_CODES", None).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1]["_id"], json!("gl-2000"));
+    }
+
+    /// `$count` returns `[{"n": N}]`, and `[]` for an empty collection — the
+    /// empty case must read as 0, not as an error.
+    #[tokio::test]
+    async fn count_documents_handles_the_empty_collection_result() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/aggregate"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "code": "ok", "message": "", "result": [] })),
+            )
+            .mount(&server)
+            .await;
+        let client = DataStorageClient::new(server.uri(), "TOKEN".into()).unwrap();
+        assert_eq!(client.count_documents("GL_CODES", None).await.unwrap(), 0);
+
+        let server2 = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/aggregate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({ "code": "ok", "message": "", "result": [{ "n": 129 }] }),
+            ))
+            .mount(&server2)
+            .await;
+        let client2 = DataStorageClient::new(server2.uri(), "TOKEN".into()).unwrap();
+        assert_eq!(client2.count_documents("GL_CODES", None).await.unwrap(), 129);
+    }
+
+    /// The insert body's exact shape is load-bearing: `ordered:false` +
+    /// `waitForFullWrite:true` is the combination verified against the live API.
+    #[tokio::test]
+    async fn insert_many_posts_the_verified_body_shape() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/insert_many"))
+            .and(body_json(json!({
+                "collectionName": "GL_CODES",
+                "documents": [{ "code": "1000" }],
+                "ordered": false,
+                "waitForFullWrite": true
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": "ok", "message": "", "result": { "inserted_ids": ["x"] }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = DataStorageClient::new(server.uri(), "TOKEN".into()).unwrap();
+        client
+            .insert_many("GL_CODES", &[json!({ "code": "1000" })], None)
+            .await
+            .unwrap();
+    }
+
+    /// Deletes target raw `_id` values via `$in`, and the id list is
+    /// deliberately mixed-type (ObjectId wrappers and plain scalars coexist in
+    /// one collection).
+    #[tokio::test]
+    async fn delete_many_by_ids_posts_mixed_type_in_filter_and_returns_count() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/delete_many"))
+            .and(body_json(json!({
+                "collectionName": "GL_CODES",
+                "filter": { "_id": { "$in": [{ "$oid": "6a8403a6070b60eaa348d173" }, "gl-2000"] } },
+                "waitForFullWrite": true
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": "ok", "message": "", "result": { "deleted_count": 2 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = DataStorageClient::new(server.uri(), "TOKEN".into()).unwrap();
+        let n = client
+            .delete_many_by_ids(
+                "GL_CODES",
+                &[json!({ "$oid": "6a8403a6070b60eaa348d173" }), json!("gl-2000")],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    /// The replacement must NOT carry `_id`: the live API rejects a replacement
+    /// that alters the immutable field, and omitting it makes that unreachable.
+    /// `matched_count` comes back so the caller can detect a vanished row.
+    #[tokio::test]
+    async fn replace_one_omits_id_from_the_replacement_and_returns_matched_count() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/replace_one"))
+            .and(body_json(json!({
+                "collectionName": "GL_CODES",
+                "filter": { "_id": "gl-1000" },
+                "replacement": { "code": "1000", "label": "new" },
+                "waitForFullWrite": true
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": "ok", "message": "",
+                "result": { "matched_count": 1, "modified_count": 1, "upserted_id": null }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = DataStorageClient::new(server.uri(), "TOKEN".into()).unwrap();
+        let matched = client
+            .replace_one(
+                "GL_CODES",
+                &json!("gl-1000"),
+                &json!({ "code": "1000", "label": "new" }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(matched, 1);
     }
 }
