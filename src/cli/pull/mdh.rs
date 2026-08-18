@@ -1,4 +1,7 @@
-use super::common::{PullAction, PullCtx, apply_pull_action, decide_pull_action, record_object};
+use super::common::{
+    HashMode, PullAction, PullCtx, apply_pull_action, decide_pull_action, decide_pull_action_with,
+    record_object,
+};
 use crate::api::{DataStorageClient, anyhow_has_status};
 use crate::config::EnvConfig;
 use crate::log::{Action, Log};
@@ -21,14 +24,9 @@ pub(crate) const COLLECTION_MANIFEST: &str = "collection.json";
 
 /// The only accepted value of the manifest's optional `data` key. Its presence
 /// is what opts a dataset into row-data versioning.
-// Not yet called from non-test code: no production caller exists until a
-// later task in this plan wires row pulling/pushing to this opt-in.
-#[allow(dead_code)]
 pub(crate) const MANUAL_DATA_VALUE: &str = "manual";
 
 /// Whether a dataset's ROW DATA is versioned in the snapshot.
-// Same as MANUAL_DATA_VALUE above: consumed by a later task, not this one.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DataMode {
     /// Metadata only — the historical (and default) behavior: rdc never reads
@@ -42,8 +40,6 @@ pub(crate) enum DataMode {
 /// `data` key ⇒ [`DataMode::None`] (backward compatible). An unrecognised value
 /// is a hard error: silently ignoring it would look exactly like rdc dropping
 /// the user's opt-in.
-// Same as MANUAL_DATA_VALUE above: consumed by a later task, not this one.
-#[allow(dead_code)]
 pub(crate) fn read_data_mode(dataset_dir: &std::path::Path) -> Result<DataMode> {
     let path = dataset_dir.join(COLLECTION_MANIFEST);
     let Ok(bytes) = std::fs::read(&path) else {
@@ -450,6 +446,109 @@ async fn fetch_index_set(
     Ok(IndexSet { regular, search })
 }
 
+/// Pull one manual dataset's rows into `data.jsonl`.
+///
+/// Returns `(changed, conflicts)`. Costs two calls (`$count` for the guardrail,
+/// then one `find`) and is invoked ONLY for datasets flagged `"data": "manual"`,
+/// so a metadata-only dataset stays exactly as cheap as it is today.
+pub(crate) async fn pull_dataset_data(
+    ctx: &mut PullCtx<'_>,
+    client: &DataStorageClient,
+    collection_name: &str,
+    slug: &str,
+    progress: &Arc<Log>,
+) -> Result<(bool, usize)> {
+    use crate::snapshot::mdh_data::{ROW_HARD_LIMIT, ROW_WARN_THRESHOLD, to_jsonl};
+
+    // Guardrail first: refuse an oversized collection BEFORE reading it, so a
+    // mis-flagged import-fed dataset can never be dragged into the snapshot.
+    let count = client
+        .count_documents(collection_name, Some(progress.clone()))
+        .await
+        .with_context(|| format!("counting rows of '{collection_name}'"))?;
+    if count > ROW_HARD_LIMIT {
+        anyhow::bail!(
+            "mdh/{slug}: '{collection_name}' holds {count} rows, over rdc's \
+             {ROW_HARD_LIMIT}-row ceiling for versioned MDH data. Remove the \"data\" key \
+             from {}/{COLLECTION_MANIFEST} to stop versioning this dataset's rows \
+             (its name and indexes stay managed).",
+            ctx.paths.dataset_dir(slug).display(),
+        );
+    }
+    if count > ROW_WARN_THRESHOLD {
+        progress.event(
+            Action::Warn,
+            &format!(
+                "mdh/{slug}: {count} rows is large for a git-versioned dataset \
+                 (warns above {ROW_WARN_THRESHOLD})"
+            ),
+        );
+    }
+
+    let rows = client
+        .find_all(collection_name, Some(progress.clone()))
+        .await
+        .with_context(|| format!("reading rows of '{collection_name}'"))?;
+
+    // An import-fed dataset carries the import extension's per-row digest.
+    // Versioning it means rdc's authoritative pushes fight that hook for
+    // ownership of the rows — warn, but do what the user asked.
+    if rows.iter().any(|r| r.get("__digest_md5").is_some()) {
+        progress.event(
+            Action::Warn,
+            &format!(
+                "mdh/{slug}: rows carry __digest_md5, so this dataset looks maintained by \
+                 an MDH import hook. rdc will treat data.jsonl as authoritative and may \
+                 undo the hook's writes."
+            ),
+        );
+    }
+
+    let proposed = to_jsonl(&rows)?;
+    let data_path = ctx.paths.dataset_data(slug);
+    let base = ctx
+        .lockfile
+        .objects
+        .get("mdh_data")
+        .and_then(|m| m.get(slug))
+        .and_then(|e| e.content_hash.clone());
+    // `HashMode::Raw`: the bytes ARE the artifact (customer row data, not a
+    // Rossum object) — see `HashMode` for why the canonical hash and the
+    // format-migration nudge both misfire on JSONL.
+    let (action, remote_hash) =
+        decide_pull_action_with(&data_path, base.as_deref(), &proposed, HashMode::Raw)?;
+    let conflicts = usize::from(action == PullAction::Conflict);
+
+    // KeepLocal: the local file diverged while the remote matched base. MDH
+    // bypasses the classifier, so this pull runs right AFTER the push every
+    // cycle — landing here means the push did NOT reconcile (a gated delete
+    // skip, `--no-push`, a vanished row). Advancing base to the LOCAL content
+    // would starve the next cycle's push gate and make the cycle after revert
+    // the file. Preserve the prior base so the push retries until it lands.
+    // Mirrors the identical rule on the indexes leg.
+    let recorded = if action == PullAction::KeepLocal {
+        base.clone().unwrap_or(remote_hash)
+    } else {
+        apply_pull_action(
+            action,
+            &data_path,
+            &proposed,
+            remote_hash,
+            ctx.interactive,
+            progress,
+            ctx.paths.env(),
+            base.as_deref(),
+            Some(ctx.paths),
+        )?
+    };
+    record_object(ctx.lockfile, "mdh_data", slug, 0, None, Some(recorded));
+
+    Ok((
+        matches!(action, PullAction::Write | PullAction::Conflict),
+        conflicts,
+    ))
+}
+
 /// Opaque listed state for MDH — the client handle plus the collection list.
 /// We carry the client here because it's constructed from env_cfg + token,
 /// which live in `run_drivers` scope.
@@ -624,7 +723,7 @@ pub async fn process(
     //            user can actually edit. Hash via KindCodec (byte-identical
     //            to the legacy content_hash path since codec.disk_bytes for
     //            mdh produces the same bytes as the legacy strip+serialize).
-    for (slug, dataset_dir, _c) in &dataset_dirs {
+    for (slug, dataset_dir, c) in &dataset_dirs {
         let Some(index_set) = by_slug.get(slug) else {
             continue;
         };
@@ -679,6 +778,21 @@ pub async fn process(
         // bytes / a shadow. `NoChange` and `KeepLocal` left the file alone.
         if matches!(ix_action, PullAction::Write | PullAction::Conflict) {
             changed.insert(slug.clone());
+        }
+
+        // Row data — only for datasets that opted in. `read_data_mode` errors
+        // on a malformed flag, which surfaces here rather than being ignored.
+        // The collection name comes from `c` (this loop's bound `Collection`,
+        // server truth) rather than re-reading the manifest with a
+        // directory-name fallback: `slugify` is lossy, so a fallback could
+        // silently target a DIFFERENT collection than this dataset represents.
+        if read_data_mode(dataset_dir)? == DataMode::Manual {
+            let (data_changed, data_conflicts) =
+                pull_dataset_data(ctx, &client, &c.name, slug, progress).await?;
+            conflicts += data_conflicts;
+            if data_changed {
+                changed.insert(slug.clone());
+            }
         }
     }
 
@@ -1142,5 +1256,193 @@ mod tests {
             vec![(MdhPlanDir::Pull, "mdh/gl-codes (index update)".to_string())],
             "a remote index-body edit must be forecast as a would-pull"
         );
+    }
+
+    /// A dataset with no `"data": "manual"` flag must cost ZERO row calls — the
+    /// backward-compatibility guarantee for every existing project.
+    #[tokio::test]
+    async fn process_makes_no_row_calls_for_a_non_manual_dataset() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/indexes/list"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "code": "ok", "result": [] })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search_indexes/list"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "code": "ok", "result": [] })),
+            )
+            .mount(&server)
+            .await;
+        // /v1/data/find and /v1/data/aggregate are deliberately NOT mounted:
+        // any row call would 404 and fail the pull.
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        std::fs::create_dir_all(paths.mdh_dir()).unwrap();
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        let rossum = crate::api::RossumClient::new(
+            "https://unused.invalid/api/v1".to_string(),
+            "t".to_string(),
+        )
+        .unwrap();
+        let mut lockfile = crate::state::Lockfile::default();
+        let subset: BTreeSet<(String, String)> =
+            [("mdh".to_string(), "gl-codes".to_string())].into_iter().collect();
+        let listed = MdhListed {
+            client: DataStorageClient::new(server.uri(), "t".to_string()).unwrap(),
+            collections: vec![Collection {
+                name: "gl-codes".to_string(),
+                extra: Default::default(),
+            }],
+            available: true,
+        };
+        let mut ctx = PullCtx {
+            paths: &paths,
+            client: &rossum,
+            lockfile: &mut lockfile,
+            queue_locations: std::collections::BTreeMap::new(),
+            interactive: false,
+        };
+        process(&mut ctx, listed, &subset, &progress).await.unwrap();
+        assert!(
+            !paths.dataset_data("gl-codes").exists(),
+            "a non-manual dataset must get no data.jsonl"
+        );
+        assert!(lockfile.objects.get("mdh_data").is_none());
+    }
+
+    /// A manual dataset's rows land in canonical form, and the lockfile +
+    /// base cache record them so the next cycle is a no-op.
+    #[tokio::test]
+    async fn pull_dataset_data_writes_canonical_rows_and_records_state() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/aggregate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "code": "ok", "result": [{ "n": 2 }] }),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/find"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "ok",
+                "result": [
+                    { "_id": { "$oid": "a2" }, "label": "Travel", "code": "2000" },
+                    { "_id": { "$oid": "a1" }, "label": "Office supplies", "code": "1000" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        let dir = paths.dataset_dir("gl-codes");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(COLLECTION_MANIFEST),
+            b"{\n  \"name\": \"GL_CODES\",\n  \"data\": \"manual\"\n}\n",
+        )
+        .unwrap();
+
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        let rossum = crate::api::RossumClient::new(
+            "https://unused.invalid/api/v1".to_string(),
+            "t".to_string(),
+        )
+        .unwrap();
+        let client = DataStorageClient::new(server.uri(), "t".to_string()).unwrap();
+        let mut lockfile = crate::state::Lockfile::default();
+        let mut ctx = PullCtx {
+            paths: &paths,
+            client: &rossum,
+            lockfile: &mut lockfile,
+            queue_locations: std::collections::BTreeMap::new(),
+            interactive: false,
+        };
+
+        let (changed, conflicts) =
+            pull_dataset_data(&mut ctx, &client, "GL_CODES", "gl-codes", &progress)
+                .await
+                .unwrap();
+        assert!(changed);
+        assert_eq!(conflicts, 0);
+        // Server ids stripped, keys sorted, lines sorted.
+        assert_eq!(
+            std::fs::read_to_string(paths.dataset_data("gl-codes")).unwrap(),
+            "{\"code\":\"1000\",\"label\":\"Office supplies\"}\n\
+             {\"code\":\"2000\",\"label\":\"Travel\"}\n"
+        );
+        // Via `ctx.lockfile`, not the outer `lockfile` binding: `ctx` still
+        // holds lockfile's mutable borrow for the second call below, so a
+        // fresh immutable borrow of `lockfile` here would conflict with it.
+        assert!(ctx.lockfile.objects["mdh_data"].contains_key("gl-codes"));
+
+        // Second pull over identical remote state changes nothing.
+        let (changed2, _) =
+            pull_dataset_data(&mut ctx, &client, "GL_CODES", "gl-codes", &progress)
+                .await
+                .unwrap();
+        assert!(!changed2, "an unchanged re-pull must report no change");
+    }
+
+    #[tokio::test]
+    async fn pull_dataset_data_refuses_a_collection_over_the_hard_limit() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/aggregate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "ok",
+                "result": [{ "n": crate::snapshot::mdh_data::ROW_HARD_LIMIT + 1 }]
+            })))
+            .mount(&server)
+            .await;
+        // /v1/data/find not mounted: the guardrail must refuse BEFORE reading.
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        let dir = paths.dataset_dir("gl-codes");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(COLLECTION_MANIFEST),
+            b"{\n  \"name\": \"GL_CODES\",\n  \"data\": \"manual\"\n}\n",
+        )
+        .unwrap();
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        let rossum = crate::api::RossumClient::new(
+            "https://unused.invalid/api/v1".to_string(),
+            "t".to_string(),
+        )
+        .unwrap();
+        let client = DataStorageClient::new(server.uri(), "t".to_string()).unwrap();
+        let mut lockfile = crate::state::Lockfile::default();
+        let mut ctx = PullCtx {
+            paths: &paths,
+            client: &rossum,
+            lockfile: &mut lockfile,
+            queue_locations: std::collections::BTreeMap::new(),
+            interactive: false,
+        };
+        let err = pull_dataset_data(&mut ctx, &client, "GL_CODES", "gl-codes", &progress)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("10001"), "must state the count: {msg}");
+        assert!(!paths.dataset_data("gl-codes").exists(), "must write nothing");
     }
 }
