@@ -261,6 +261,21 @@ pub fn content_hash(bytes: &[u8], lockfile: &Lockfile) -> String {
     to_hex(&hasher.finalize())
 }
 
+/// SHA-256 over `bytes` VERBATIM — no JSON canonicalization, no noise-field
+/// stripping. For content whose bytes ARE the artifact: MDH row data
+/// (`data.jsonl`), where a line is customer data rather than a Rossum object.
+///
+/// [`content_hash`] must not be used there. It canonicalizes whenever the whole
+/// stream parses as one JSON value, which a single-line JSONL file does, and its
+/// noise-strip then deletes `modified_at` / `modifier` / `training_enabled` at
+/// any depth — so a one-row dataset's edit to such a column would hash
+/// identically and the change would be silently dropped. Verified empirically.
+pub fn raw_content_hash(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    to_hex(&hasher.finalize())
+}
+
 /// SHA-256 over a single hook's local secrets map, encoded as the
 /// canonical JSON object `{ "key1": "val1", "key2": "val2", ... }` with
 /// `BTreeMap`-sorted keys (`serde_json::to_vec` over a `BTreeMap` is
@@ -633,6 +648,26 @@ mod tests {
         assert_ne!(
             content_hash(b"foo", &Lockfile::default()),
             content_hash(b"bar", &Lockfile::default())
+        );
+    }
+
+    /// `content_hash` canonicalizes a byte stream that parses as ONE JSON value,
+    /// which a single-line JSONL file does — and its noise-strip then removes
+    /// `modified_at`. `raw_content_hash` must see that edit, or a one-row MDH
+    /// dataset's change would be silently dropped by the sync gate.
+    #[test]
+    fn raw_content_hash_sees_edits_content_hash_canonicalizes_away() {
+        let before = b"{\"code\":\"1000\",\"modified_at\":\"2026-01-01\"}\n";
+        let after = b"{\"code\":\"1000\",\"modified_at\":\"2026-02-01\"}\n";
+        assert_eq!(
+            content_hash(before, &Lockfile::default()),
+            content_hash(after, &Lockfile::default()),
+            "precondition: content_hash is blind here (this is why raw_content_hash exists)"
+        );
+        assert_ne!(
+            raw_content_hash(before),
+            raw_content_hash(after),
+            "raw_content_hash must see a real edit to a noise-named column"
         );
     }
 

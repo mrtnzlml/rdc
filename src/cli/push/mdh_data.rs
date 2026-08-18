@@ -18,7 +18,7 @@ use crate::api::DataStorageClient;
 use crate::log::{Action, Log};
 use crate::paths::Paths;
 use crate::snapshot::mdh_data::{ROW_HARD_LIMIT, ROW_WARN_THRESHOLD, canonicalize_row, from_jsonl};
-use crate::state::{Lockfile, ObjectEntry, content_hash};
+use crate::state::{Lockfile, ObjectEntry, raw_content_hash};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -229,14 +229,16 @@ pub async fn push_dataset_data(
             );
         }
         crate::cli::push::mdh::DeleteGate::Prompt => {
-            if prompt_confirm_row_deletes(progress, collection_name, pending)? {
-                // proceed
-            } else {
+            if !prompt_confirm_row_deletes(progress, collection_name, pending)? {
                 deletes = &[];
                 skipped = true;
                 progress.event(
                     Action::Skip,
-                    &format!("mdh/{slug} {pending} row deletion(s) skipped"),
+                    &format!(
+                        "mdh/{slug} {pending} row deletion(s) skipped — the remaining \
+                         replaces/inserts still run and may now conflict with a row that \
+                         would otherwise have been deleted first"
+                    ),
                 );
             }
         }
@@ -293,7 +295,7 @@ pub async fn push_dataset_data(
             ObjectEntry {
                 id: 0,
                 modified_at: None,
-                content_hash: Some(content_hash(&local_raw, &Lockfile::default())),
+                content_hash: Some(raw_content_hash(&local_raw)),
                 secrets_hash: None,
             },
         );
@@ -342,22 +344,19 @@ mod tests {
     }
 
     use crate::api::DataStorageClient;
-    use crate::state::{Lockfile, content_hash};
+    use crate::state::Lockfile;
     use std::sync::Arc;
 
     fn log() -> Arc<crate::log::Log> {
         crate::log::Log::new(crate::cli::resolve::ColorMode::Plain)
     }
 
-    /// Seed a manual dataset on disk: manifest with the flag + the given rows.
+    /// Seed a manual dataset on disk: just the row data. `push_dataset_data`
+    /// never reads `collection.json` itself — the manual-flag gate is the
+    /// caller's job — so the fixture doesn't write one; doing so would imply
+    /// a coupling that doesn't exist.
     fn seed(paths: &crate::paths::Paths, slug: &str, jsonl: &[u8]) {
-        let dir = paths.dataset_dir(slug);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join(crate::cli::pull::mdh::COLLECTION_MANIFEST),
-            b"{\n  \"name\": \"GL_CODES\",\n  \"data\": \"manual\"\n}\n",
-        )
-        .unwrap();
+        std::fs::create_dir_all(paths.dataset_dir(slug)).unwrap();
         std::fs::write(paths.dataset_data(slug), jsonl).unwrap();
     }
 
@@ -424,7 +423,7 @@ mod tests {
         assert_eq!(ops, 1);
         assert_eq!(
             lf.objects["mdh_data"]["gl-codes"].content_hash.as_deref(),
-            Some(content_hash(&jsonl, &Lockfile::default()).as_str())
+            Some(raw_content_hash(&jsonl).as_str())
         );
         assert_eq!(
             crate::state::base_cache::read(&paths, &paths.dataset_data("gl-codes")).unwrap(),
@@ -551,6 +550,55 @@ mod tests {
         assert_eq!(ops, 1);
     }
 
+    /// A replace that matched nothing means the row vanished between our read
+    /// and our write. That must NOT count as an applied op and must NOT advance
+    /// the lockfile or base cache, so the next sync re-reads and re-diffs.
+    #[tokio::test]
+    async fn replace_with_zero_matched_count_is_not_recorded() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/find"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "ok",
+                "result": [{ "_id": "gl-1000", "label": "old" }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/replace_one"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "code": "ok", "result": { "matched_count": 0 } }),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        seed(&paths, "gl-codes", b"{\"_id\":\"gl-1000\",\"label\":\"new\"}\n");
+        let client = DataStorageClient::new(server.uri(), "t".into()).unwrap();
+        let mut lf = Lockfile::default();
+
+        let ops = push_dataset_data(
+            &client, &mut lf, "GL_CODES", "gl-codes", &paths, false, false, &log(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ops, 0, "a vanished-row replace must not count as an applied op");
+        assert!(
+            lf.objects.get("mdh_data").is_none(),
+            "must not record a partially-applied push"
+        );
+        assert_eq!(
+            crate::state::base_cache::read(&paths, &paths.dataset_data("gl-codes")).unwrap(),
+            None,
+            "base cache must not advance either"
+        );
+    }
+
     /// Nothing to do → no writes, but the lockfile/base still get recorded so a
     /// first sync of an already-matching dataset converges instead of retrying.
     #[tokio::test]
@@ -605,7 +653,10 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("10001"), "must state the count: {msg}");
-        assert!(msg.contains("data"), "must point at the opt-out: {msg}");
+        assert!(
+            msg.contains("collection.json"),
+            "must point at the opt-out: {msg}"
+        );
     }
 
     #[test]
