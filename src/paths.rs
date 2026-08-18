@@ -264,6 +264,13 @@ impl Paths {
     pub fn dataset_dir(&self, dataset_slug: &str) -> PathBuf {
         self.mdh_dir().join(dataset_slug)
     }
+
+    /// `<root>/envs/<env>/mdh/<dataset_slug>/data.jsonl` — the row data of a
+    /// dataset flagged `"data": "manual"`. Absent for every other dataset.
+    pub fn dataset_data(&self, dataset_slug: &str) -> PathBuf {
+        self.dataset_dir(dataset_slug)
+            .join(crate::snapshot::mdh_data::DATA_FILE)
+    }
 }
 
 /// Returns true if this filename is a LEGACY sibling shadow artifact for
@@ -469,6 +476,14 @@ mod tests {
     #[test]
     fn dataset_dir_path() {
         assert_eq!(p().dataset_dir("vendors"), Path::new("/proj/envs/dev/mdh/vendors"));
+    }
+
+    #[test]
+    fn dataset_data_path() {
+        assert_eq!(
+            p().dataset_data("gl-codes"),
+            Path::new("/proj/envs/dev/mdh/gl-codes/data.jsonl")
+        );
     }
 
     #[test]
