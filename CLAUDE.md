@@ -7,9 +7,15 @@ Project-specific instructions for working in this repo.
 - `templates/gitlab-ci.yml` is **embedded in the binary** with `include_str!`
   (`src/cli/init.rs`) and written to `.gitlab-ci.yml` by `rdc init`. Edit the
   template, never a copy — `tests/cli_init.rs` compares the two byte-for-byte.
-- It must **pin to the latest released rdc version** — keep `RDC_VERSION` set to
-  the newest release tag, and bump it whenever a new release ships. Never a
-  floating alias (no `releases/latest/...`, no unpinned tag).
+- The **committed default must stay a pinned tag** — keep `RDC_VERSION` set to
+  the newest release tag, and bump it whenever a new release ships. The deploy
+  job runs `rdc sync --allow-deletes --yes` unattended, so a floating default
+  would let a new rdc change what a destructive sync does with nobody watching.
+- The install script *also* accepts `latest` (newest release) and a series
+  prefix like `v0.6` (newest patch in that line), resolved through
+  `api.github.com`. Those are **deliberate opt-ins for our own CI** — don't
+  make either the default, and don't delete the branches thinking they're a
+  mistake.
 - The repo is private, so the template installs rdc through
   `api.github.com/repos/<repo>/releases/assets/<id>` (resolved from the tag).
   The `releases/download/<tag>/<asset>` browser URL 404s even with a token —

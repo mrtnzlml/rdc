@@ -26,7 +26,12 @@ default:
   interruptible: true
 
 variables:
-  RDC_VERSION: "v0.5.0"  # TODO: a released tag, never a floating alias
+  # Exact tag (v0.6.0) is reproducible and is what this file ships with.
+  # "v0.6" tracks the newest patch in that line; "latest" tracks the newest
+  # release. Think before floating: the deploy job below runs
+  # `rdc sync --allow-deletes --yes`, so a version bump changes what an
+  # unattended, destructive sync does.
+  RDC_VERSION: "v0.6.0"
   RDC_REPO: "mrtnzlml/rdc"
   RDC_ASSET: "rdc-x86_64-unknown-linux-gnu.tar.gz"
   # Commit-back author and committer. GitLab push rules can require these to
@@ -40,10 +45,28 @@ variables:
   : "${RDC_GITHUB_TOKEN:?set RDC_GITHUB_TOKEN (read access to $RDC_REPO)}"
   install_dir=${RDC_INSTALL_DIR:-/usr/local/bin}
   auth="Authorization: Bearer $RDC_GITHUB_TOKEN"
-  case "$RDC_VERSION" in v*) tag=$RDC_VERSION ;; *) tag=v$RDC_VERSION ;; esac
-  release=$(curl -sSfL -H "$auth" "https://api.github.com/repos/$RDC_REPO/releases/tags/$tag")
+  api="https://api.github.com/repos/$RDC_REPO"
+  # Three accepted forms, resolved to one release object:
+  #   v0.6.0  exact tag           reproducible; what this file ships with
+  #   v0.6    newest patch in 0.6 picks up fixes, never a new feature
+  #   latest  newest release      always current, never reproducible
+  case "$RDC_VERSION" in
+    latest)
+      release=$(curl -sSfL -H "$auth" "$api/releases/latest")
+      ;;
+    v*.*.* | [0-9]*.*.*)
+      case "$RDC_VERSION" in v*) tag=$RDC_VERSION ;; *) tag=v$RDC_VERSION ;; esac
+      release=$(curl -sSfL -H "$auth" "$api/releases/tags/$tag")
+      ;;
+    *)
+      # A series prefix. The list endpoint is newest-first, so the first
+      # non-draft, non-prerelease tag under "<prefix>." is the newest patch.
+      case "$RDC_VERSION" in v*) pfx=$RDC_VERSION ;; *) pfx=v$RDC_VERSION ;; esac
+      release=$(curl -sSfL -H "$auth" "$api/releases?per_page=100" | PREFIX="$pfx" python3 -c 'import json,os,sys; p=os.environ["PREFIX"]+"."; r=[x for x in json.load(sys.stdin) if not x["draft"] and not x["prerelease"] and x["tag_name"].startswith(p)]; sys.exit("no release matching "+p+"*") if not r else json.dump(r[0], sys.stdout)')
+      ;;
+  esac
   asset_id=$(printf '%s' "$release" | ASSET=$RDC_ASSET python3 -c 'import json,os,sys; print(*[a["id"] for a in json.load(sys.stdin)["assets"] if a["name"]==os.environ["ASSET"]])')
-  : "${asset_id:?no asset named $RDC_ASSET in release $tag}"
+  : "${asset_id:?no asset named $RDC_ASSET for RDC_VERSION=$RDC_VERSION}"
   curl -sSfL -H "$auth" -H "Accept: application/octet-stream" \
     "https://api.github.com/repos/$RDC_REPO/releases/assets/$asset_id" \
     | tar -xz -C "$install_dir"
