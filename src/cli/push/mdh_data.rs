@@ -379,7 +379,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(ops, 0, "an absent file must produce no writes");
-        assert!(lf.objects.get("mdh_data").is_none(), "nothing to record");
+        assert!(!lf.objects.contains_key("mdh_data"), "nothing to record");
     }
 
     /// Local rows the env lacks are inserted, and a fully-applied push advances
@@ -464,7 +464,7 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("--allow-deletes"), "must name the flag: {msg}");
         assert!(msg.contains("gl-codes"), "must name the dataset: {msg}");
-        assert!(lf.objects.get("mdh_data").is_none(), "must not record a bailed push");
+        assert!(!lf.objects.contains_key("mdh_data"), "must not record a bailed push");
     }
 
     #[tokio::test]
@@ -589,7 +589,7 @@ mod tests {
         .unwrap();
         assert_eq!(ops, 0, "a vanished-row replace must not count as an applied op");
         assert!(
-            lf.objects.get("mdh_data").is_none(),
+            !lf.objects.contains_key("mdh_data"),
             "must not record a partially-applied push"
         );
         assert_eq!(
@@ -734,7 +734,7 @@ mod tests {
 
         // local wants 1, remote has 3 → delete 2 (the surplus, deterministically).
         let d = diff_rows(
-            &[row.clone()],
+            std::slice::from_ref(&row),
             &[
                 json!({ "_id": oid("a1"), "code": "1000" }),
                 json!({ "_id": oid("a2"), "code": "1000" }),

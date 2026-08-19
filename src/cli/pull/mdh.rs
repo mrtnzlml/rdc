@@ -1704,7 +1704,7 @@ mod tests {
             !paths.dataset_data("gl-codes").exists(),
             "a non-manual dataset must get no data.jsonl"
         );
-        assert!(lockfile.objects.get("mdh_data").is_none());
+        assert!(!lockfile.objects.contains_key("mdh_data"));
     }
 
     /// A manual dataset's rows land in canonical form, and the lockfile +

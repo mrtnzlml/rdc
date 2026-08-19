@@ -184,7 +184,9 @@ mod tests {
             "_id": "natural-key-1",
             "int": 42,
             "long": 9007199254740993i64,
-            "float": 3.14,
+            // 0.1 has no exact binary representation, so it is a stricter
+            // round-trip fixture than a tidy decimal.
+            "float": 0.1,
             "bool": true,
             "nil": null,
             "uni": "Přílöhá — ünïcode",
