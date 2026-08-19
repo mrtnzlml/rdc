@@ -1,25 +1,46 @@
-# Build and release the cross-platform "rdc" desktop app (Flutter +
-# flutter_rust_bridge) for macOS, Windows, and Linux on `desktop-v*` tags.
+# Build the cross-platform "rdc" desktop app (Flutter + flutter_rust_bridge)
+# for macOS, Windows, and Linux.
+#
+# MANUAL ONLY (workflow_dispatch), and it deliberately does NOT publish a GitHub
+# release. `/releases/latest` resolves to "the most recent non-prerelease,
+# non-draft release, sorted by created_at" regardless of tag name, so a separate
+# desktop release would shadow the CLI release and break both
+# `RDC_VERSION: latest` in templates/gitlab-ci.yml and the README's Windows
+# install URL. Desktop artifacts are meant to ride along in the CLI's own `v*`
+# release; until that is wired into release.yaml, this workflow only produces
+# downloadable workflow artifacts.
 #
 # The Rust bridge (desktop/rust, crate `rdc_bridge`) is compiled automatically
 # by Cargokit during `flutter build`, so each job needs a Rust toolchain + the
 # Flutter SDK. The FRB-generated Dart/Rust glue is committed, so no codegen
 # toolchain is required in CI.
 #
-# macOS signing/notarization reuses the existing Developer ID secrets:
-#   APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
-#   APPLE_ID, APPLE_TEAM_ID, APPLE_APP_SPECIFIC_PASSWORD
+# macOS signing/notarization is OPT-IN and currently OFF -- the repo holds none
+# of the six Developer ID secrets. The build itself needs no keychain identity
+# (desktop/macos Runner sets CODE_SIGN_IDENTITY = "-", i.e. ad-hoc), so the DMG
+# is produced either way; it is simply ad-hoc-signed and not notarized, and
+# Gatekeeper will quarantine it on download. Set all six secrets together --
+# APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
+# APPLE_ID, APPLE_TEAM_ID, APPLE_APP_SPECIFIC_PASSWORD -- and the sign +
+# notarize steps re-engage with no edit here. APPLE_SIGNING_IDENTITY is the
+# sentinel gating them: the `secrets` context is unavailable in `if` conditions,
+# so it is mapped to a job-level env var and tested as `env.*`.
+#
 # Windows/Linux code signing is deferred.
 
 name: Desktop release
 
 on:
-  push:
-    tags:
-      - "desktop-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string used in the artifact filenames"
+        required: false
+        default: "probe"
 
+# No release is created, so read access is enough.
 permissions:
-  contents: write
+  contents: read
 
 env:
   FLUTTER_VERSION: "3.44.8"
@@ -42,11 +63,28 @@ jobs:
     defaults:
       run:
         working-directory: desktop
+    env:
+      # Passed through env rather than interpolated into `run:` scripts.
+      VERSION: ${{ inputs.version }}
+      # Sentinel for the opt-in signing steps below. Only the identity *name* is
+      # exposed job-wide; the certificate and passwords stay step-scoped.
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      # Cargokit redirects cargo's --target-dir to CARGOKIT_TARGET_TEMP_DIR
+      # (inside the Flutter/Xcode build tree), NOT desktop/rust/target, so only
+      # the crate downloads are cacheable here -- not compiled artifacts.
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: desktop-cargo-${{ matrix.target }}-${{ hashFiles('desktop/rust/Cargo.lock') }}
 
       - name: Install Flutter
         uses: subosito/flutter-action@v2
@@ -64,41 +102,58 @@ jobs:
       - name: Flutter pub get
         run: flutter pub get
 
-      # ---------------- macOS: build, sign, notarize, DMG ----------------
-      - name: Import Apple Developer ID certificate
+      # ---------------- macOS: build, optionally sign, DMG, optionally notarize ----------------
+      # Resolves the built bundle once and hands it to the sign/package steps
+      # below, which run with the same `desktop` working directory.
+      - name: Build macOS app
         if: matrix.target == 'macos'
+        run: |
+          flutter build macos --release
+          shopt -s nullglob
+          apps=(build/macos/Build/Products/Release/*.app)
+          if [ ${#apps[@]} -eq 0 ]; then
+            echo "::error::flutter build macos produced no .app bundle"
+            exit 1
+          fi
+          echo "APP=${apps[0]}" >> "$GITHUB_ENV"
+
+      - name: Import Apple Developer ID certificate
+        if: matrix.target == 'macos' && env.APPLE_SIGNING_IDENTITY != ''
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
-          echo "$APPLE_CERTIFICATE" | base64 --decode > $RUNNER_TEMP/cert.p12
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security create-keychain -p actions build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p actions build.keychain
-          security import $RUNNER_TEMP/cert.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security import "$RUNNER_TEMP/cert.p12" -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
 
-      - name: Build macOS app
-        if: matrix.target == 'macos'
-        run: flutter build macos --release
+      # Signs the .app before it goes into the DMG; the DMG itself is notarized.
+      - name: Sign macOS app
+        if: matrix.target == 'macos' && env.APPLE_SIGNING_IDENTITY != ''
+        run: |
+          codesign --deep --force --options runtime --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" "$APP"
 
-      - name: Sign, notarize, and package DMG
+      - name: Package DMG
         if: matrix.target == 'macos'
+        run: |
+          mkdir -p dist
+          hdiutil create -volname "rdc" -srcfolder "$APP" -ov -format UDZO \
+            "dist/rdc-$VERSION.dmg"
+
+      - name: Notarize and staple DMG
+        if: matrix.target == 'macos' && env.APPLE_SIGNING_IDENTITY != ''
         env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: |
-          APP=$(ls -d build/macos/Build/Products/Release/*.app | head -1)
-          codesign --deep --force --options runtime --timestamp \
-            --sign "$APPLE_SIGNING_IDENTITY" "$APP"
-          DMG="rdc-${GITHUB_REF_NAME#desktop-v}.dmg"
-          hdiutil create -volname "rdc" -srcfolder "$APP" -ov -format UDZO "$DMG"
-          xcrun notarytool submit "$DMG" --apple-id "$APPLE_ID" \
+          xcrun notarytool submit "dist/rdc-$VERSION.dmg" --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" --password "$APPLE_PASSWORD" --wait
-          xcrun stapler staple "$DMG"
-          mkdir -p dist && mv "$DMG" dist/
+          xcrun stapler staple "dist/rdc-$VERSION.dmg"
 
       # ---------------- Windows: build + zip ----------------
       - name: Build Windows app
@@ -110,7 +165,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $ver = "${env:GITHUB_REF_NAME}" -replace '^desktop-v',''
+          $ver = $env:VERSION
           Compress-Archive -Path build/windows/x64/runner/Release/* `
             -DestinationPath "dist/rdc-$ver-windows-x64.zip"
         # TODO: build a proper installer (MSIX or Inno Setup) as a follow-up.
@@ -124,32 +179,14 @@ jobs:
         if: matrix.target == 'linux'
         run: |
           mkdir -p dist
-          ver="${GITHUB_REF_NAME#desktop-v}"
-          tar czf "dist/rdc-$ver-linux-x64.tar.gz" \
+          tar czf "dist/rdc-$VERSION-linux-x64.tar.gz" \
             -C build/linux/x64/release/bundle .
         # TODO: build an AppImage and/or .deb as a follow-up.
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: rossum-local-${{ matrix.target }}
+          name: rdc-desktop-${{ matrix.target }}
           path: desktop/dist/*
-          retention-days: 1
-
-  release:
-    name: Publish release
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-      - name: Create release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: artifacts/*
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Long enough to actually download and launch the build.
+          retention-days: 7
