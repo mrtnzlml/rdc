@@ -1,0 +1,13 @@
+pytest>=8,<9
+
+# The real Rossum formula runtime. Pinned: 1.2.0 dereferences payload["document"]
+# and returns an EvalResult where 1.1.0 returned the value raw, so an unpinned
+# bump can change what a formula test asserts. testkit/txscript_eval.py handles
+# both 1.1.0 and 1.2.0; 1.2.0 is the default because it exposes annotation.id
+# natively, as the live runtime does.
+txscript==1.2.0
+
+# Runtime libraries your hooks import. Tests load hook .py files as modules, so a
+# missing one is a collection ERROR, not a skip. Add what your hooks need, e.g.:
+# requests>=2,<3
+# pydantic>=2,<3
