@@ -614,6 +614,15 @@ fn transform_file(
     let mut value: serde_json::Value = serde_json::from_slice(&raw)
         .with_context(|| format!("parsing JSON {}", src_path.display()))?;
 
+    // The SOURCE's `hook_template`, read before the env-field passes below drop
+    // it (its host is the source org's, so `strip_source_host_env_refs` removes
+    // it outright). Unlike every other env field it is MANDATORY to create the
+    // hook — see `reconcile_hook_template`, which puts it back, retargeted.
+    let src_hook_template = value
+        .get("hook_template")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
     // Re-portabilize the source body against the SOURCE lockfile before slug
     // substitution. A source snapshot pulled before the portabilization fixes
     // (e.g. the webhooks→hooks endpoint mapping) can still carry raw
@@ -746,6 +755,27 @@ fn transform_file(
             .is_none();
         if let Some(prefix) = reconcile_email_prefix(&mut value, kind, &dst_path, will_create) {
             provisional_carry = Some((slug, prefix));
+        }
+    }
+
+    // A store extension's `hook_template`. Same shape as the inbox prefix above:
+    // a per-env value that is nonetheless MANDATORY on create, so the target
+    // lockfile — not the file on disk — decides whether to restore it.
+    if let Some((kind, src_slug)) = classify(rel)
+        && kind == "hooks"
+    {
+        let slug = tgt_slug(mapping, kind, &src_slug);
+        let will_create = tgt_lockfile
+            .objects
+            .get(kind)
+            .and_then(|m| m.get(&slug))
+            .is_none();
+        if will_create {
+            reconcile_hook_template(
+                &mut value,
+                src_hook_template.as_deref(),
+                api_base_of(tgt_org_url),
+            );
         }
     }
 
@@ -1449,6 +1479,68 @@ fn reconcile_email_prefix(
         return final_prefix;
     }
     None
+}
+
+/// The target env's API base, recovered from the organization URL `run` already
+/// builds for [`reconcile_target_identity`] (`{api_base}/organizations/{id}`).
+/// `None` for any other shape.
+fn api_base_of(tgt_org_url: &str) -> Option<&str> {
+    tgt_org_url
+        .rsplit_once("/organizations/")
+        .map(|(base, _)| base)
+}
+
+/// Restore a store extension's `hook_template` for a hook the target env has
+/// not created yet, retargeted to the target org.
+///
+/// `hook_template` is a per-env URL — the host is the org's — so the env-field
+/// passes drop the source's before it can leak into the target snapshot, and a
+/// matched object inherits the target's own. But it is also **mandatory to
+/// create the hook**: `POST /hooks/create` refuses a body without it, and
+/// [`crate::cli::deploy::store_extensions::check_store_extension_anomaly`]
+/// refuses even earlier, so every store extension promoted into a fresh env was
+/// unpushable (observed live: a first sync into an empty env died on the first
+/// of 16 store hooks, after the queues and custom hooks were already written).
+///
+/// Restoring the source's value is sound because the template id is the stable
+/// cross-environment identity — store templates are Rossum-global, only the
+/// host differs per org, which is exactly what
+/// [`crate::cli::deploy::store_extensions::retarget_hook_template`] rewrites
+/// (verified against a live org: every template id referenced by a source env's
+/// snapshot resolved in the target org to a template of the same name). Writing
+/// the retargeted URL rather than the source's also keeps the source host out
+/// of the target snapshot, so the value matches what a pull of the created hook
+/// writes back.
+///
+/// Only ever fills a GAP: a value already present (a matched target's own, or
+/// an overlay's — the overlay runs after this) is left alone, and a hook that
+/// is not a store extension never gains the field.
+fn reconcile_hook_template(
+    value: &mut serde_json::Value,
+    src_hook_template: Option<&str>,
+    tgt_api_base: Option<&str>,
+) {
+    const KEY: &str = "hook_template";
+    let (Some(src), Some(api_base)) = (src_hook_template, tgt_api_base) else {
+        return;
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    if obj.get(KEY).and_then(|v| v.as_str()).is_some() {
+        return;
+    }
+    // `POST /hooks/create` is only used for store extensions; a custom hook
+    // must not acquire a template link it never had.
+    if obj.get("extension_source").and_then(|v| v.as_str()) != Some("rossum_store") {
+        return;
+    }
+    let Some(retargeted) =
+        crate::cli::deploy::store_extensions::retarget_hook_template(src, api_base)
+    else {
+        return;
+    };
+    obj.insert(KEY.to_string(), serde_json::Value::String(retargeted));
 }
 
 /// The `warn` migrate emits for every brand-new inbox that kept the SOURCE
@@ -4094,6 +4186,76 @@ mod tests {
             carries.is_empty(),
             "an overlay-chosen prefix is not a carry: {carries:?}"
         );
+    }
+
+    // ---- store-extension hook_template ---------------------------------
+
+    #[test]
+    fn api_base_of_recovers_the_target_api_base() {
+        assert_eq!(
+            api_base_of("https://acme.rossum.app/api/v1/organizations/555972"),
+            Some("https://acme.rossum.app/api/v1")
+        );
+        assert_eq!(api_base_of("not-an-org-url"), None);
+    }
+
+    #[test]
+    fn reconcile_hook_template_restores_it_retargeted_to_the_target_org() {
+        // The field is mandatory on create and there is no target value to
+        // inherit; the template id is cross-env stable, so only the host moves.
+        let mut v = serde_json::json!({
+            "name": "Duplicate Handling",
+            "extension_source": "rossum_store",
+        });
+        reconcile_hook_template(
+            &mut v,
+            Some("https://acme-test.rossum.app/api/v1/hook_templates/28"),
+            Some("https://acme.rossum.app/api/v1"),
+        );
+        assert_eq!(
+            v["hook_template"],
+            serde_json::json!("https://acme.rossum.app/api/v1/hook_templates/28"),
+            "the id survives, the host becomes the target's: {v}"
+        );
+    }
+
+    #[test]
+    fn reconcile_hook_template_never_overwrites_an_existing_value() {
+        // A matched target's own template link (or one an overlay pinned) wins.
+        let mut v = serde_json::json!({
+            "name": "Duplicate Handling",
+            "extension_source": "rossum_store",
+            "hook_template": "https://acme.rossum.app/api/v1/hook_templates/99",
+        });
+        reconcile_hook_template(
+            &mut v,
+            Some("https://acme-test.rossum.app/api/v1/hook_templates/28"),
+            Some("https://acme.rossum.app/api/v1"),
+        );
+        assert_eq!(
+            v["hook_template"],
+            serde_json::json!("https://acme.rossum.app/api/v1/hook_templates/99")
+        );
+    }
+
+    #[test]
+    fn reconcile_hook_template_leaves_a_custom_hook_alone() {
+        // Only store extensions install through `POST /hooks/create`; a custom
+        // hook must not acquire a template link it never had.
+        let mut v = serde_json::json!({ "name": "Validator", "extension_source": "custom" });
+        reconcile_hook_template(
+            &mut v,
+            Some("https://acme-test.rossum.app/api/v1/hook_templates/28"),
+            Some("https://acme.rossum.app/api/v1"),
+        );
+        assert!(v.get("hook_template").is_none(), "{v}");
+    }
+
+    #[test]
+    fn reconcile_hook_template_is_a_no_op_without_a_source_value() {
+        let mut v = serde_json::json!({ "name": "H", "extension_source": "rossum_store" });
+        reconcile_hook_template(&mut v, None, Some("https://acme.rossum.app/api/v1"));
+        assert!(v.get("hook_template").is_none(), "{v}");
     }
 
     #[test]
