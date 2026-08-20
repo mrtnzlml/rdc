@@ -12,11 +12,13 @@ Project-specific instructions for working in this repo.
   markers must match the template byte-for-byte, and the committed region bodies
   must equal what `render_regions` produces for the canonical `dev`/`test`/`prod`
   example. Keep the committed example in step with the renderer, or
-  `template_carries_both_regions` / the init test will say so.
+  `committed_template_regions_match_the_renderer` will say so.
 - `rdc init` splices those regions on **every** run, including `--env`, and never
-  touches a pipeline that has no markers. A markered file is spliced even under
-  `--force`, so the static half of a project's pipeline is theirs once written;
-  taking a newer binary's static half means deleting the file and re-initing.
+  touches a pipeline that has no markers — unless `--force` is passed, which
+  replaces such a file wholesale (markers included). A markered file is spliced
+  even under `--force`, so the static half of a project's pipeline is theirs
+  once written; taking a newer binary's static half means deleting the file and
+  re-initing.
 - The Python testkit under `templates/testkit/` is embedded the same way and
   scaffolded alongside `conftest.py` / `pytest.ini` / `requirements-dev.txt`. It
   supports txscript **1.1.0 and 1.2.0** from one code path; `_unwrap` must test
