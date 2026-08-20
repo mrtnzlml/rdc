@@ -55,6 +55,41 @@ fn marker_name(line: &str, kind: &str, style: MarkerStyle) -> Option<String> {
     Some(format!("rdc:{name}"))
 }
 
+/// The current body of one rdc region in `existing`, with the marker's own
+/// indentation stripped from each line (so it round-trips through
+/// [`splice`], which re-applies that indentation).
+///
+/// `None` when the region is absent, or opened and never closed -- both cases
+/// [`splice`] either ignores or diagnoses, so there is nothing to report here.
+/// Used by callers that build a region body *from* what the file already says
+/// rather than purely from `rdc.toml`: the deploy-jobs region is only half
+/// derived (rdc knows the job name, the user supplies `RDC_SRC`), so its
+/// existing content has to survive verbatim.
+pub fn region_body(existing: &str, name: &str, style: MarkerStyle) -> Option<String> {
+    let mut indent = String::new();
+    let mut body: Vec<&str> = Vec::new();
+    let mut open = false;
+    for line in existing.lines() {
+        if !open {
+            if marker_name(line, ">>>", style).as_deref() == Some(name) {
+                indent = line.chars().take_while(|c| c.is_whitespace()).collect();
+                open = true;
+            }
+            continue;
+        }
+        if marker_name(line, "<<<", style).as_deref() == Some(name) {
+            return Some(
+                body.iter()
+                    .map(|l| l.strip_prefix(indent.as_str()).unwrap_or(l))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+        body.push(line);
+    }
+    None
+}
+
 /// Replace the body of every rdc region in `existing` with the rendered one,
 /// leaving every other byte alone.
 ///
@@ -156,25 +191,8 @@ pub fn splice(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::gitlab_ci::render_regions;
-    use crate::config::EnvConfig;
+    use crate::cli::gitlab_ci::{render_regions, test_envs as envs};
     use std::collections::BTreeMap;
-
-    fn envs(names: &[&str]) -> BTreeMap<String, EnvConfig> {
-        names
-            .iter()
-            .enumerate()
-            .map(|(i, n)| {
-                (
-                    (*n).to_string(),
-                    EnvConfig {
-                        api_base: "https://example.rossum.app/api/v1".to_string(),
-                        org_id: 100 + i as u64,
-                    },
-                )
-            })
-            .collect()
-    }
 
     /// A single region with fixed, recognizable content -- used by the tests
     /// below that exercise style-specific marker syntax directly, where the
@@ -283,6 +301,30 @@ after
         let once = splice(FILE, &regions, YAML).unwrap().unwrap();
         let twice = splice(&once, &regions, YAML).unwrap().unwrap();
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn region_body_returns_the_current_body_de_indented() {
+        assert_eq!(
+            region_body(FILE, "rdc:archive-envs", YAML).unwrap(),
+            "- RDC_ENV: \"stale\""
+        );
+        assert_eq!(region_body(FILE, "rdc:deploy-jobs", YAML).unwrap(), "stale");
+        // absent, and opened-but-never-closed, both read as "nothing to keep"
+        assert!(region_body(FILE, "rdc:envs", YAML).is_none());
+        assert!(region_body("# >>> rdc:deploy-jobs\nbody\n", "rdc:deploy-jobs", YAML).is_none());
+    }
+
+    /// What [`region_body`] returns must survive a splice unchanged, or the
+    /// additive deploy region would churn the file on every run.
+    #[test]
+    fn region_body_round_trips_through_splice() {
+        let body = region_body(FILE, "rdc:deploy-jobs", YAML).unwrap();
+        let regions = BTreeMap::from([
+            ("rdc:archive-envs", region_body(FILE, "rdc:archive-envs", YAML).unwrap()),
+            ("rdc:deploy-jobs", body),
+        ]);
+        assert_eq!(splice(FILE, &regions, YAML).unwrap().unwrap(), FILE);
     }
 
     #[test]

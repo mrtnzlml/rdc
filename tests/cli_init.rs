@@ -822,8 +822,103 @@ fn init_adding_an_env_updates_the_regions_and_keeps_hand_edits() {
     assert!(after.contains("my-own-job:"), "hand-added job must survive");
     assert!(after.contains("- RDC_ENV: \"test\""), "new env must reach the matrix");
     assert!(after.contains("\"deploy:test\":"), "new env must get a draft");
-    // one env before, two now: the drafts region stops being a bare comment
+    // The one-env project's deploy region was rdc's own "nothing to promote
+    // yet" note, so this is the single case where that region is replaced
+    // rather than appended to: it has never carried a draft, and now both envs
+    // get one. (An env whose draft was deleted is covered by the next test.)
+    assert!(!after.contains("# No deploy buttons"), "the note is obsolete: {after}");
     assert!(after.contains("\"deploy:dev\":"));
+    assert_eq!(after.matches("extends: .rdc-deploy").count(), 2);
+}
+
+/// The deploy region is ADDITIVE. Adding an env must not revert a button whose
+/// `RDC_SRC` was filled in, and must not resurrect a draft that was deleted on
+/// purpose — a re-rendered region would do both, and `rdc sync --allow-deletes`
+/// is what the resurrected button would run.
+#[test]
+fn init_keeps_a_finished_deploy_button_and_a_deleted_draft() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--env", "dev=https://example.rossum.app/api/v1:1",
+            "--env", "test=https://example.rossum.app/api/v1:2",
+        ])
+        .assert()
+        .success();
+
+    let path = dir.path().join(".gitlab-ci.yml");
+    let pipeline = std::fs::read_to_string(&path).unwrap();
+    // finish the `test` button, and add a key of our own to it
+    let edited = pipeline.replace(
+        "    RDC_ENV: \"test\"\n    RDC_SRC: \"\"   # TODO: env to promote from",
+        "    RDC_ENV: \"test\"\n    RDC_SRC: \"dev\"\n  needs: [\"pytest\"]",
+    );
+    assert_ne!(edited, pipeline, "the draft to finish must have been there");
+    // delete the draft for `dev`, the env we author by hand
+    let dev_draft = "\"deploy:dev\":\n  extends: .rdc-deploy\n  resource_group: \"dev\"\n  \
+                     environment:\n    name: \"dev\"\n  variables:\n    RDC_ENV: \"dev\"\n    \
+                     RDC_SRC: \"\"   # TODO: env to promote from\n\n";
+    assert!(edited.contains(dev_draft), "expected the generated dev draft: {edited}");
+    let edited = edited.replace(dev_draft, "");
+    std::fs::write(&path, &edited).unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "prod=https://example.rossum.app/api/v1:3"])
+        .assert()
+        .success();
+
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(after.contains("RDC_SRC: \"dev\""), "a filled-in source must survive: {after}");
+    assert!(after.contains("  needs: [\"pytest\"]"), "an added key must survive: {after}");
+    assert!(!after.contains("\"deploy:dev\":"), "a deleted draft must stay deleted: {after}");
+    assert!(after.contains("\"deploy:prod\":"), "the new env must get a draft: {after}");
+    assert_eq!(after.matches("extends: .rdc-deploy").count(), 2);
+    // the archive matrix IS fully derived, so it lists all three envs
+    for env in ["dev", "prod", "test"] {
+        assert!(after.contains(&format!("- RDC_ENV: \"{env}\"")), "{after}");
+    }
+}
+
+/// `rdc init --force` on a project whose buttons are finished must not touch
+/// them: the deploy region is reported and written back byte-for-byte.
+#[test]
+fn init_force_never_reverts_a_finished_deploy_button() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--env", "dev=https://example.rossum.app/api/v1:1",
+            "--env", "prod=https://example.rossum.app/api/v1:2",
+        ])
+        .assert()
+        .success();
+
+    let path = dir.path().join(".gitlab-ci.yml");
+    let finished = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("RDC_SRC: \"\"   # TODO: env to promote from", "RDC_SRC: \"dev\"");
+    std::fs::write(&path, &finished).unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(".gitlab-ci.yml                 unchanged"));
+
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        finished,
+        "--force must not rewrite the deploy region"
+    );
 }
 
 #[test]

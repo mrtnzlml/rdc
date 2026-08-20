@@ -640,6 +640,12 @@ fn write_template_file(path: &Path, body: &str, force: bool) -> Result<Scaffolde
 /// refreshed, user lines kept" for `.gitignore`. To take a newer binary's
 /// static half, delete the file and re-run `rdc init`.
 ///
+/// The splice is not symmetric across the two regions, and that asymmetry is
+/// the point: the archive matrix is re-rendered from `rdc.toml`, while the
+/// deploy jobs are only appended to, so a filled-in `RDC_SRC` survives and a
+/// deleted draft stays deleted (see
+/// [`crate::cli::gitlab_ci::render_regions_for_existing`]).
+///
 /// With no envs defined (a hand-emptied `rdc.toml`), the template is written
 /// verbatim: an empty `parallel:matrix` is not valid YAML, and its committed
 /// example is.
@@ -664,7 +670,8 @@ fn write_gitlab_ci(root: &Path, cfg: &ProjectConfig, force: bool) -> Result<Scaf
         return write_template_file_bytes(&path, generated()?.as_bytes(), &existing, force);
     };
 
-    let regions = crate::cli::gitlab_ci::render_regions(&cfg.envs);
+    // Additive for the deploy jobs, re-rendered for the archive matrix.
+    let regions = crate::cli::gitlab_ci::render_regions_for_existing(&text, &cfg.envs);
     match crate::cli::regions::splice(&text, &regions, crate::cli::regions::YAML)
         .with_context(|| format!("updating the rdc regions in {}", path.display()))?
     {

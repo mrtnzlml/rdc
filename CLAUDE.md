@@ -19,6 +19,26 @@ Project-specific instructions for working in this repo.
   even under `--force`, so the static half of a project's pipeline is theirs
   once written; taking a newer binary's static half means deleting the file and
   re-initing.
+- The two regions are **not** spliced the same way, and the difference is
+  load-bearing. `rdc:archive-envs` is fully derived from `rdc.toml`, so it is
+  re-rendered every run. `rdc:deploy-jobs` is only *half* derived — rdc knows
+  the job name, the user supplies `RDC_SRC` — so on an existing file it is
+  **additive** (`render_regions_for_existing` → `merge_deploy_jobs`): its
+  content survives verbatim and a draft is appended only for an env the file
+  has never been offered one for. Re-rendering it would revert finished deploy
+  buttons to drafts and resurrect the drafts a reader deliberately deleted.
+  "Has been offered one" is read off the **archive region still on disk**,
+  which the previous run wrote from `rdc.toml` and therefore names the env set
+  as of that run — no ledger, no new syntax, nothing outside the file. So
+  `render_regions` (create / wholesale rewrite) and `render_regions_for_existing`
+  (splice) are both needed; don't collapse them.
+- Markdown docs work the same way, with `regions::MARKDOWN` markers. Every
+  env-derived line in `CLAUDE.md` / `README.md` must live **inside** a region
+  (`rdc:envs`, `rdc:promote`, `rdc:sync`): on an existing file only the regions
+  are spliced, so an env-derived line outside one freezes at whatever
+  `rdc.toml` said the day the file was created. `write_doc_with_regions`
+  hard-errors on a template carrying no markers, so a README must emit every
+  region it declares unconditionally — including for a hand-emptied `rdc.toml`.
 - The Python testkit under `templates/testkit/` is embedded the same way and
   scaffolded alongside `conftest.py` / `pytest.ini` / `requirements-dev.txt`. It
   supports txscript **1.1.0 and 1.2.0** from one code path; `_unwrap` must test
