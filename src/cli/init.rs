@@ -115,7 +115,7 @@ pub async fn run(env_specs: Vec<String>, force: bool) -> Result<()> {
         (".gitattributes", write_gitattributes(&cwd)?),
         ("CLAUDE.md", write_claude_md(&cwd, force)?),
         ("README.md", write_readme(&cwd, &cfg, force)?),
-        (".gitlab-ci.yml", write_gitlab_ci(&cwd, force)?),
+        (".gitlab-ci.yml", write_gitlab_ci(&cwd, &cfg, force)?),
     ];
     std::fs::create_dir_all(cwd.join("secrets"))
         .with_context(|| format!("creating {}", cwd.join("secrets").display()))?;
@@ -622,18 +622,80 @@ fn write_template_file(path: &Path, body: &str, force: bool) -> Result<Scaffolde
     Ok(Scaffolded::Created)
 }
 
-/// Write the GitLab CI pipeline at `<root>/.gitlab-ci.yml`. Same scaffold
-/// contract as [`write_claude_md`]: created when absent, replaced only under
-/// `--force`, so a hand-tuned pipeline is never clobbered by an ordinary init.
+/// Write the GitLab CI pipeline at `<root>/.gitlab-ci.yml`.
 ///
 /// The body is the repo's `templates/gitlab-ci.yml`, embedded at compile time
 /// so the copy users read on GitHub and the copy this binary writes cannot
-/// drift. It ships with placeholder env names (`dev` -> `test` -> `prod`) and
-/// TODO markers rather than the project's real envs: `rdc.toml` stores envs in a
-/// `BTreeMap`, so their order is alphabetical and a promotion chain cannot be
-/// derived from it (`dev`, `prod`, `test` would chain dev -> prod -> test).
-fn write_gitlab_ci(root: &Path, force: bool) -> Result<Scaffolded> {
-    write_template_file(&root.join(".gitlab-ci.yml"), GITLAB_CI_TEMPLATE, force)
+/// drift — with the two `# >>> rdc:…` regions filled in from `cfg` (the archive
+/// matrix and one drafted deploy button per env).
+///
+/// | file state                  | action                        | outcome     |
+/// |-----------------------------|-------------------------------|-------------|
+/// | absent                      | write the generated template  | `Created`   |
+/// | has markers                 | splice; bytes equal           | `Unchanged` |
+/// | has markers                 | splice; bytes differ          | `Merged`    |
+/// | no markers, no `--force`    | leave alone                   | `Unchanged` |
+/// | no markers, `--force`       | regenerate the whole file     | `Rewritten` |
+///
+/// A markered file is spliced even under `--force`: the lines outside the
+/// markers are the user's, and `Merged` already means "rdc-owned lines
+/// refreshed, user lines kept" for `.gitignore`. To take a newer binary's
+/// static half, delete the file and re-run `rdc init`.
+///
+/// With no envs defined (a hand-emptied `rdc.toml`), the template is written
+/// verbatim: an empty `parallel:matrix` is not valid YAML, and its committed
+/// example is.
+fn write_gitlab_ci(root: &Path, cfg: &ProjectConfig, force: bool) -> Result<Scaffolded> {
+    let path = root.join(".gitlab-ci.yml");
+    if cfg.envs.is_empty() {
+        return write_template_file(&path, GITLAB_CI_TEMPLATE, force);
+    }
+
+    let generated = || crate::cli::gitlab_ci::generate(GITLAB_CI_TEMPLATE, &cfg.envs);
+
+    if !path.exists() {
+        write_atomic(&path, generated()?.as_bytes())?;
+        return Ok(Scaffolded::Created);
+    }
+
+    let existing =
+        std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    // A hand-edited pipeline that isn't valid UTF-8 can't be spliced; treat it
+    // like write_template_file does — byte comparison, never a parse.
+    let Ok(text) = String::from_utf8(existing.clone()) else {
+        return write_template_file_bytes(&path, generated()?.as_bytes(), &existing, force);
+    };
+
+    match crate::cli::gitlab_ci::splice(&text, &crate::cli::gitlab_ci::render_regions(&cfg.envs))
+        .with_context(|| format!("updating the rdc regions in {}", path.display()))?
+    {
+        Some(spliced) => {
+            if spliced.as_bytes() == existing.as_slice() {
+                Ok(Scaffolded::Unchanged)
+            } else {
+                write_atomic(&path, spliced.as_bytes())?;
+                Ok(Scaffolded::Merged)
+            }
+        }
+        None => write_template_file_bytes(&path, generated()?.as_bytes(), &existing, force),
+    }
+}
+
+/// `write_template_file`'s force semantics against bytes already in hand.
+fn write_template_file_bytes(
+    path: &Path,
+    body: &[u8],
+    existing: &[u8],
+    force: bool,
+) -> Result<Scaffolded> {
+    if !force {
+        return Ok(Scaffolded::Unchanged);
+    }
+    if existing == body {
+        return Ok(Scaffolded::Unchanged);
+    }
+    write_atomic(path, body)?;
+    Ok(Scaffolded::Rewritten)
 }
 
 /// Write an agent guide at `<root>/CLAUDE.md`. Unlike `_index.md`, this
@@ -758,7 +820,7 @@ pub fn write_scaffold_files(
         },
     );
     write_readme(cwd, &cfg, false)?;
-    write_gitlab_ci(cwd, false)?;
+    write_gitlab_ci(cwd, &cfg, false)?;
     Ok(())
 }
 
@@ -968,9 +1030,17 @@ mod tests {
         ] {
             assert!(dir.path().join(name).exists(), "{name} should be written");
         }
+        let mut cfg = ProjectConfig::default();
+        cfg.envs.insert(
+            "main".to_string(),
+            EnvConfig {
+                api_base: "https://example.rossum.app/api/v1".to_string(),
+                org_id: 1,
+            },
+        );
         assert_eq!(
             std::fs::read_to_string(dir.path().join(".gitlab-ci.yml")).unwrap(),
-            GITLAB_CI_TEMPLATE
+            crate::cli::gitlab_ci::generate(GITLAB_CI_TEMPLATE, &cfg.envs).unwrap()
         );
     }
 

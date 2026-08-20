@@ -661,26 +661,134 @@ fn init_refuses_env_name_that_collides_with_existing_env_var() {
         .stderr(predicate::str::contains("dev_us"));
 }
 
-/// The pipeline init writes is the repo's `templates/gitlab-ci.yml`, embedded
-/// with `include_str!`. Compare bytes so a future hand-copied duplicate that
-/// drifts from the template fails here instead of shipping two versions.
+/// The static half of the pipeline init writes is the repo's
+/// `templates/gitlab-ci.yml` byte-for-byte; the generated regions are
+/// `render_regions`' output for this project's envs. Together these keep the
+/// copy users read on GitHub and the copy the binary writes from drifting —
+/// which is what the old byte-for-byte assertion existed to enforce.
 #[test]
-fn init_writes_gitlab_ci_from_the_repo_template() {
+fn init_writes_gitlab_ci_from_the_repo_template_outside_the_regions() {
     let dir = TempDir::new().unwrap();
     Command::cargo_bin("rdc")
         .unwrap()
         .current_dir(dir.path())
-        .args(["init", "--env", "dev=https://example.rossum.app/api/v1:285704"])
+        .args(["init", "--env", "dev=https://example.rossum.app/api/v1:1"])
         .assert()
         .success();
 
     let written = std::fs::read_to_string(dir.path().join(".gitlab-ci.yml")).unwrap();
     let template = std::fs::read_to_string("templates/gitlab-ci.yml").unwrap();
-    assert_eq!(written, template, ".gitlab-ci.yml must match templates/gitlab-ci.yml");
-    // Placeholder envs + TODOs, never the project's real env names: rdc.toml
-    // stores envs alphabetically, so a promotion chain can't be derived.
-    assert!(written.contains("RDC_ENV: [dev]  # TODO"));
-    assert!(written.contains("RDC_SRC: dev"));
+    assert_eq!(
+        outside_regions(&written),
+        outside_regions(&template),
+        "everything outside the rdc regions must match templates/gitlab-ci.yml"
+    );
+    // and the generated half describes THIS project, not the template's example
+    assert!(written.contains("- RDC_ENV: \"dev\""));
+    assert!(!written.contains("- RDC_ENV: \"test\""));
+}
+
+/// Every line that is not inside an `# >>> rdc:…` / `# <<< rdc:…` pair.
+fn outside_regions(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.starts_with("# >>> rdc:") {
+            inside = true;
+            out.push(line);
+            continue;
+        }
+        if t.starts_with("# <<< rdc:") {
+            inside = false;
+            out.push(line);
+            continue;
+        }
+        if !inside {
+            out.push(line);
+        }
+    }
+    out
+}
+
+#[test]
+fn init_adding_an_env_updates_the_regions_and_keeps_hand_edits() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "dev=https://example.rossum.app/api/v1:1"])
+        .assert()
+        .success();
+
+    // a job of the user's own, outside the regions
+    let path = dir.path().join(".gitlab-ci.yml");
+    let mut pipeline = std::fs::read_to_string(&path).unwrap();
+    pipeline.push_str("\nmy-own-job:\n  script:\n    - echo mine\n");
+    std::fs::write(&path, &pipeline).unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "test=https://example.rossum.app/api/v1:2"])
+        .assert()
+        .success();
+
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(after.contains("my-own-job:"), "hand-added job must survive");
+    assert!(after.contains("- RDC_ENV: \"test\""), "new env must reach the matrix");
+    assert!(after.contains("\"deploy:test\":"), "new env must get a draft");
+    // one env before, two now: the drafts region stops being a bare comment
+    assert!(after.contains("\"deploy:dev\":"));
+}
+
+#[test]
+fn init_never_touches_a_pipeline_without_rdc_markers() {
+    let dir = TempDir::new().unwrap();
+    let hand = "stages:\n  - test\nmine:\n  script:\n    - echo hi\n";
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "dev=https://example.rossum.app/api/v1:1"])
+        .assert()
+        .success();
+    std::fs::write(dir.path().join(".gitlab-ci.yml"), hand).unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "test=https://example.rossum.app/api/v1:2"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(".gitlab-ci.yml")).unwrap(),
+        hand,
+        "a hand-written pipeline has no rdc regions and must be left alone"
+    );
+}
+
+#[test]
+fn init_force_regenerates_a_markerless_pipeline() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "dev=https://example.rossum.app/api/v1:1"])
+        .assert()
+        .success();
+    std::fs::write(dir.path().join(".gitlab-ci.yml"), "mine\n").unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(".gitlab-ci.yml   rewritten"));
+
+    let after = std::fs::read_to_string(dir.path().join(".gitlab-ci.yml")).unwrap();
+    assert!(after.contains("- RDC_ENV: \"dev\""));
 }
 
 #[test]
@@ -746,9 +854,14 @@ fn init_force_without_env_regenerates_scaffold_files() {
     assert!(std::fs::read_to_string(dir.path().join("README.md"))
         .unwrap()
         .contains("rdc sync dev"));
+    let cfg = rdc::config::ProjectConfig::load(&dir.path().join("rdc.toml")).unwrap();
     assert_eq!(
         std::fs::read_to_string(dir.path().join(".gitlab-ci.yml")).unwrap(),
-        std::fs::read_to_string("templates/gitlab-ci.yml").unwrap()
+        rdc::cli::gitlab_ci::generate(
+            &std::fs::read_to_string("templates/gitlab-ci.yml").unwrap(),
+            &cfg.envs
+        )
+        .unwrap()
     );
     // Additive files keep the user's lines while still carrying rdc's.
     let ignore_after = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
