@@ -764,7 +764,7 @@ pub fn write_scaffold_files(
 
 /// The GitLab CI pipeline `rdc init` drops into a project, embedded from the
 /// repo's `templates/gitlab-ci.yml` (see [`write_gitlab_ci`]).
-const GITLAB_CI_TEMPLATE: &str = include_str!("../../templates/gitlab-ci.yml");
+pub(crate) const GITLAB_CI_TEMPLATE: &str = include_str!("../../templates/gitlab-ci.yml");
 
 const CLAUDE_MD_TEMPLATE: &str = r#"# Agent guide
 
