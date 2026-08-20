@@ -2048,3 +2048,735 @@ git commit -m "test(init): run the scaffolded testkit under pytest; document the
 ## Known consequence to confirm before Task 4
 
 `write_gitlab_ci` splices a markered file **even under `--force`** (spec table, Section C). That keeps a project's hand-written jobs safe forever, but it also means a newer rdc's improvements to the *static* half of the template never reach an already-initialised project — the only route is deleting `.gitlab-ci.yml` and re-running `rdc init`. The alternative (markered + `--force` → wholesale regenerate, matching today's "`--force` means hand edits are lost") makes `--force` useful for picking up template improvements at the cost of discarding the user's own jobs. The spec chose the former; flag this to the user before implementing Task 4 if the trade-off should go the other way.
+
+---
+
+### Task 8: Make the splicer serve Markdown as well as YAML
+
+**Files:**
+- Create: `src/cli/regions.rs` (move `splice`, `regions_present`, `marker_name` here from `gitlab_ci.rs`, add `MarkerStyle`)
+- Modify: `src/cli/gitlab_ci.rs` (keep only the YAML renderers + `generate`; call the moved splicer)
+- Modify: `src/cli/mod.rs` (add `pub mod regions;`)
+- Test: `src/cli/regions.rs` (inline tests, moved + extended)
+
+**Interfaces:**
+- Consumes: nothing new. `gitlab_ci::render_regions` stays exactly as Task 1 built it.
+- Produces:
+  - `pub struct MarkerStyle { pub prefix: &'static str, pub suffix: &'static str }`
+  - `pub const YAML: MarkerStyle` and `pub const MARKDOWN: MarkerStyle`
+  - `pub fn splice(existing: &str, regions: &BTreeMap<&str, String>, style: MarkerStyle) -> Result<Option<String>>`
+  - `pub fn regions_present(existing: &str, style: MarkerStyle) -> BTreeSet<String>`
+
+**Why this task exists:** the splicer is format-agnostic — it rewrites named spans between comment markers — while the renderers are format-specific. Task 9 adds a second consumer (Markdown docs), which is the moment that boundary stops being theoretical. A Markdown marker must be a real HTML comment: `# >>> rdc:envs` renders as a heading.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `src/cli/regions.rs` with the test module first:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn regions() -> BTreeMap<&'static str, String> {
+        BTreeMap::from([("rdc:envs", "fresh line one\nfresh line two".to_string())])
+    }
+
+    #[test]
+    fn markdown_markers_are_html_comments_not_headings() {
+        // `# >>> rdc:envs` would render as an H1 in Markdown.
+        let doc = "# Title\n\n<!-- >>> rdc:envs (generated) -->\nstale\n<!-- <<< rdc:envs -->\n\nkeep me\n";
+        let out = splice(doc, &regions(), MARKDOWN).unwrap().unwrap();
+        assert!(out.contains("fresh line one\nfresh line two\n"));
+        assert!(!out.contains("stale"));
+        assert!(out.starts_with("# Title\n"));
+        assert!(out.ends_with("keep me\n"));
+        assert!(out.contains("<!-- >>> rdc:envs (generated) -->"));
+    }
+
+    #[test]
+    fn a_markdown_marker_with_no_space_before_the_close_still_parses() {
+        let doc = "<!-- >>> rdc:envs-->\nstale\n<!-- <<< rdc:envs-->\n";
+        let out = splice(doc, &regions(), MARKDOWN).unwrap().unwrap();
+        assert!(out.contains("fresh line one"));
+        assert!(!out.contains("stale"));
+    }
+
+    #[test]
+    fn yaml_style_is_unaffected_by_the_move() {
+        let yaml = "before\n  # >>> rdc:envs  (generated)\n  stale\n  # <<< rdc:envs\nafter\n";
+        let out = splice(yaml, &regions(), YAML).unwrap().unwrap();
+        assert_eq!(
+            out,
+            "before\n  # >>> rdc:envs  (generated)\n  fresh line one\n  fresh line two\n  # <<< rdc:envs\nafter\n"
+        );
+    }
+
+    #[test]
+    fn a_style_does_not_see_the_other_styles_markers() {
+        // A YAML pipeline scanned as Markdown has no regions, and vice versa.
+        let yaml = "# >>> rdc:envs\nstale\n# <<< rdc:envs\n";
+        assert!(splice(yaml, &regions(), MARKDOWN).unwrap().is_none());
+        let md = "<!-- >>> rdc:envs -->\nstale\n<!-- <<< rdc:envs -->\n";
+        assert!(splice(md, &regions(), YAML).unwrap().is_none());
+    }
+
+    #[test]
+    fn regions_present_reports_by_style() {
+        let md = "<!-- >>> rdc:envs -->\n<!-- <<< rdc:envs -->\n";
+        assert!(regions_present(md, MARKDOWN).contains("rdc:envs"));
+        assert!(regions_present(md, YAML).is_empty());
+    }
+
+    #[test]
+    fn an_unknown_region_names_the_known_ones() {
+        let md = "<!-- >>> rdc:nope -->\n<!-- <<< rdc:nope -->\n";
+        let err = format!("{:#}", splice(md, &regions(), MARKDOWN).unwrap_err());
+        assert!(err.contains("unknown rdc region"), "{err}");
+        assert!(err.contains("rdc:envs"), "the error must list what IS known: {err}");
+    }
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test --lib regions`
+Expected: FAIL — `cannot find function splice` / `cannot find value MARKDOWN`. Add `pub mod regions;` to `src/cli/mod.rs` in this step, otherwise the file is not compiled and you see nothing.
+
+- [ ] **Step 3: Move the splicer and add the style**
+
+Prepend to `src/cli/regions.rs`, above the tests:
+
+```rust
+//! Splices rdc-owned regions into files the user also edits.
+//!
+//! A region is a named span delimited by comment markers — `# >>> rdc:<name>`
+//! in YAML, `<!-- >>> rdc:<name> -->` in Markdown. rdc rewrites the body
+//! between the markers and never touches a byte outside them. A file carrying
+//! no markers is left completely alone, which is how a hand-written pipeline —
+//! or a README written before this existed — survives untouched.
+//!
+//! This module is format-agnostic on purpose: the renderers that produce region
+//! bodies are format-specific and live next to their file type.
+
+use anyhow::{anyhow, Result};
+use std::collections::{BTreeMap, BTreeSet};
+
+/// How one file type writes a comment. A Markdown marker has to be a real HTML
+/// comment: `# >>> rdc:envs` renders as a heading.
+#[derive(Clone, Copy)]
+pub struct MarkerStyle {
+    pub prefix: &'static str,
+    pub suffix: &'static str,
+}
+
+pub const YAML: MarkerStyle = MarkerStyle { prefix: "# ", suffix: "" };
+pub const MARKDOWN: MarkerStyle = MarkerStyle { prefix: "<!-- ", suffix: " -->" };
+
+/// Names of the rdc regions whose opening marker appears in `existing`.
+pub fn regions_present(existing: &str, style: MarkerStyle) -> BTreeSet<String> {
+    existing
+        .lines()
+        .filter_map(|l| marker_name(l, ">>>", style))
+        .collect()
+}
+
+/// If `line` is an rdc region marker of `kind` (`">>>"` or `"<<<"`), its region
+/// name. The marker may be indented and may carry a trailing note.
+fn marker_name(line: &str, kind: &str, style: MarkerStyle) -> Option<String> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix(&format!("{}{kind} rdc:", style.prefix))?;
+    // Strip the closing comment delimiter first, so `rdc:envs-->` yields `envs`.
+    let rest = match style.suffix.is_empty() {
+        true => rest,
+        false => rest.strip_suffix(style.suffix.trim()).unwrap_or(rest),
+    };
+    let name: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
+    if name.is_empty() {
+        return None;
+    }
+    Some(format!("rdc:{name}"))
+}
+
+/// Replace the body of every rdc region in `existing` with the rendered one,
+/// leaving every other byte alone.
+///
+/// `Ok(None)` means the file carries no rdc markers in this style. Every error
+/// case (a region never closed, closed without opening, duplicated, nested, or
+/// naming a region not in `regions`) returns `Err` before producing any output,
+/// so the caller has nothing to write: a half-spliced file is worse than a
+/// diagnosed one.
+pub fn splice(
+    existing: &str,
+    regions: &BTreeMap<&str, String>,
+    style: MarkerStyle,
+) -> Result<Option<String>> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    // (region name, line it opened on, its indentation)
+    let mut open: Option<(String, usize, String)> = None;
+    let mut any = false;
+
+    for (idx, line) in existing.lines().enumerate() {
+        let lineno = idx + 1;
+
+        if let Some(name) = marker_name(line, ">>>", style) {
+            let Some(body) = regions.get(name.as_str()) else {
+                let known: Vec<&str> = regions.keys().copied().collect();
+                return Err(anyhow!(
+                    "line {lineno}: unknown rdc region '{name}' (known: {})",
+                    known.join(", ")
+                ));
+            };
+            if let Some((open_name, open_line, _)) = &open {
+                return Err(anyhow!(
+                    "line {lineno}: region '{name}' opens while '{open_name}' from \
+                     line {open_line} is still open"
+                ));
+            }
+            if !seen.insert(name.clone()) {
+                return Err(anyhow!(
+                    "line {lineno}: region '{name}' appears more than once"
+                ));
+            }
+            any = true;
+            let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+            out.push(line.to_string());
+            for body_line in body.lines() {
+                if body_line.is_empty() {
+                    out.push(String::new());
+                } else {
+                    out.push(format!("{indent}{body_line}"));
+                }
+            }
+            open = Some((name, lineno, indent));
+            continue;
+        }
+
+        if let Some(name) = marker_name(line, "<<<", style) {
+            match &open {
+                Some((open_name, _, _)) if *open_name == name => {
+                    out.push(line.to_string());
+                    open = None;
+                }
+                Some((open_name, open_line, _)) => {
+                    return Err(anyhow!(
+                        "line {lineno}: region '{name}' closes while '{open_name}' \
+                         from line {open_line} is open"
+                    ));
+                }
+                None => {
+                    return Err(anyhow!(
+                        "line {lineno}: region '{name}' closes without opening"
+                    ));
+                }
+            }
+            continue;
+        }
+
+        // Lines inside an open region are the previously generated body: dropped.
+        if open.is_none() {
+            out.push(line.to_string());
+        }
+    }
+
+    if let Some((name, lineno, _)) = open {
+        return Err(anyhow!(
+            "region '{name}' opened at line {lineno} is never closed"
+        ));
+    }
+    if !any {
+        return Ok(None);
+    }
+    let mut joined = out.join("\n");
+    // `lines()` drops the final newline; put it back only if it was there.
+    if existing.ends_with('\n') {
+        joined.push('\n');
+    }
+    Ok(Some(joined))
+}
+```
+
+- [ ] **Step 4: Strip the moved code out of `gitlab_ci.rs`**
+
+Delete `splice`, `regions_present`, `marker_name` and the `REGIONS` constant from
+`src/cli/gitlab_ci.rs`, along with the splice-specific tests that moved (keep the
+render tests, `template_carries_both_regions`, `generate_fills_the_embedded_template`
+and `committed_template_regions_match_the_renderer`). Change `generate` to:
+
+```rust
+/// Splice the embedded template for a brand-new (or `--force`d) project.
+/// Unlike a plain splice, every region must be present: the template ships with
+/// us, so a missing marker is a bug here rather than a user's edit.
+pub fn generate(template: &str, envs: &BTreeMap<String, EnvConfig>) -> Result<String> {
+    let regions = render_regions(envs);
+    let present = crate::cli::regions::regions_present(template, crate::cli::regions::YAML);
+    let missing: Vec<&str> = regions
+        .keys()
+        .copied()
+        .filter(|r| !present.contains(*r))
+        .collect();
+    if !missing.is_empty() {
+        return Err(anyhow!(
+            "the embedded templates/gitlab-ci.yml is missing region marker(s): {}",
+            missing.join(", ")
+        ));
+    }
+    crate::cli::regions::splice(template, &regions, crate::cli::regions::YAML)?
+        .ok_or_else(|| anyhow!("the embedded templates/gitlab-ci.yml has no rdc region markers"))
+}
+```
+
+Update the three retained tests and `write_gitlab_ci` (`src/cli/init.rs`) to call
+`crate::cli::regions::splice(&text, &regions, crate::cli::regions::YAML)` and
+`crate::cli::regions::regions_present(...)` instead of the `gitlab_ci` versions.
+`REGIONS` was only used for the unknown-region error message and the
+`template_carries_both_regions` loop; in the test, iterate
+`render_regions(&envs(&["dev"])).keys()` instead.
+
+- [ ] **Step 5: Run the tests**
+
+Run: `cargo test --lib regions && cargo test --lib gitlab_ci && cargo test --test cli_init`
+Expected: PASS. This is a pure move plus the style parameter — no behaviour changes, so every
+test from Tasks 1-4 must still pass unmodified except for the call-site renames above.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/cli/regions.rs src/cli/gitlab_ci.rs src/cli/mod.rs src/cli/init.rs
+git commit -m "refactor(ci): split the region splicer out of the YAML renderer"
+```
+
+---
+
+### Task 9: Prefill CLAUDE.md and README.md from rdc.toml
+
+**Files:**
+- Create: `src/cli/scaffold_docs.rs`
+- Modify: `src/cli/mod.rs` (add `pub mod scaffold_docs;`)
+- Modify: `src/cli/init.rs` (`CLAUDE_MD_TEMPLATE` gains two regions and two factual fixes; `write_claude_md` takes `&ProjectConfig` and splices; `write_readme` emits the env region)
+- Test: `src/cli/scaffold_docs.rs` (inline) and `tests/cli_init.rs`
+
+**Interfaces:**
+- Consumes: `regions::{splice, regions_present, MARKDOWN}` (Task 8); `secrets::env_var_suffix` (Task 1).
+- Produces:
+  - `pub const REGION_ENVS: &str = "rdc:envs"`
+  - `pub const REGION_PROMOTE: &str = "rdc:promote"`
+  - `pub fn render_doc_regions(envs: &BTreeMap<String, EnvConfig>) -> BTreeMap<&'static str, String>`
+
+**Careful — two different CLAUDE.md/README.md files exist in this repo.** This task edits
+`CLAUDE_MD_TEMPLATE` (a `const` in `src/cli/init.rs`) and `write_readme`'s generated body —
+the docs rdc writes *into a user's project*. Task 7 edits the repo's *own* root `CLAUDE.md`
+and `README.md`, which document rdc to its maintainers. Do not touch those here. The repo's
+root `README.md` also carries uncommitted changes belonging to another person working in this
+checkout; leave it alone entirely.
+
+**Why:** `CLAUDE.md` is 181 static lines with 22 `<env>` placeholders and no awareness of the
+project it describes, while `README.md` is already partly generated — so the two files
+disagree about the same project (README names real envs in its promote example, CLAUDE.md
+hardcodes `dev → prod`). Prefilling inside marker regions means the facts refresh on every
+`rdc init` instead of freezing at bootstrap, which is what makes prefill safe here.
+
+Deliberately NOT prefilled: workspace/queue/hook inventories. `envs/<env>/_index.md` already
+carries those and is regenerated on every sync; a once-per-init copy would be a second,
+staler answer to the same question. The layout block keeps its `<env>` placeholders too —
+there it is a pattern, not a fact.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `src/cli/scaffold_docs.rs` with the test module first:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::EnvConfig;
+
+    fn envs(names: &[&str]) -> BTreeMap<String, EnvConfig> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                (
+                    (*n).to_string(),
+                    EnvConfig {
+                        api_base: "https://example.rossum.app/api/v1".to_string(),
+                        org_id: 100 + i as u64,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn env_table_carries_api_base_org_and_credential_suffix() {
+        let r = render_doc_regions(&envs(&["dev", "dev-us"]));
+        let table = &r[REGION_ENVS];
+        assert!(table.contains("| Env | API base | Org id | Credential suffix |"));
+        assert!(table.contains("| `dev` | `https://example.rossum.app/api/v1` | 100 | `DEV` |"));
+        // the suffix is the thing people derive wrong by hand
+        assert!(table.contains("| `dev-us` | `https://example.rossum.app/api/v1` | 101 | `DEV_US` |"));
+        assert!(table.contains("RDC_TOKEN_<suffix>"));
+    }
+
+    #[test]
+    fn env_table_escapes_a_pipe_so_it_cannot_break_the_table() {
+        let mut e = envs(&["dev"]);
+        e.get_mut("dev").unwrap().api_base = "https://example.rossum.app/a|b".to_string();
+        let table = &render_doc_regions(&e)[REGION_ENVS];
+        assert!(table.contains(r"a\|b"), "{table}");
+    }
+
+    #[test]
+    fn promote_recipe_names_the_first_two_envs() {
+        let r = render_doc_regions(&envs(&["dev", "prod", "test"]));
+        let promote = &r[REGION_PROMOTE];
+        assert!(promote.contains("rdc migrate dev prod --dry-run"));
+        assert!(promote.contains("rdc sync prod"));
+        assert!(!promote.contains("<src>"), "placeholders must be resolved: {promote}");
+    }
+
+    #[test]
+    fn a_single_env_says_promotion_needs_a_second() {
+        let r = render_doc_regions(&envs(&["dev"]));
+        assert!(r[REGION_PROMOTE].contains("second env"));
+        assert!(!r[REGION_PROMOTE].contains("rdc migrate dev"));
+    }
+
+    #[test]
+    fn no_envs_still_renders_both_regions() {
+        // A hand-emptied rdc.toml must not produce a broken table.
+        let r = render_doc_regions(&BTreeMap::new());
+        assert!(r[REGION_ENVS].contains("No environments"));
+        assert!(r[REGION_PROMOTE].contains("second env"));
+    }
+
+    #[test]
+    fn region_bodies_never_start_or_end_with_a_blank_line() {
+        for body in render_doc_regions(&envs(&["dev", "test"])).values() {
+            assert!(!body.starts_with('\n') && !body.ends_with('\n'), "{body:?}");
+        }
+    }
+}
+```
+
+And add to `tests/cli_init.rs`:
+
+```rust
+#[test]
+fn init_prefills_the_docs_from_rdc_toml() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--env", "dev=https://example.rossum.app/api/v1:11",
+            "--env", "prod-eu=https://example.rossum.app/api/v1:22",
+        ])
+        .assert()
+        .success();
+
+    let claude = std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
+    assert!(claude.contains("| `dev` | `https://example.rossum.app/api/v1` | 11 | `DEV` |"));
+    assert!(claude.contains("| `prod-eu` | `https://example.rossum.app/api/v1` | 22 | `PROD_EU` |"));
+    assert!(claude.contains("rdc migrate dev prod-eu --dry-run"));
+    // the two factual fixes
+    assert!(!claude.contains("project name"), "rdc.toml has no project name");
+    assert!(!claude.contains("fill in its TODOs"));
+
+    let readme = std::fs::read_to_string(dir.path().join("README.md")).unwrap();
+    assert!(readme.contains("| `dev` | `https://example.rossum.app/api/v1` | 11 | `DEV` |"));
+}
+
+#[test]
+fn init_refreshes_the_doc_regions_when_an_env_is_added() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "dev=https://example.rossum.app/api/v1:11"])
+        .assert()
+        .success();
+
+    // the user's own prose, outside the regions
+    let claude_path = dir.path().join("CLAUDE.md");
+    let mut claude = std::fs::read_to_string(&claude_path).unwrap();
+    claude.push_str("\n## House rules\n\nAlways run the linter.\n");
+    std::fs::write(&claude_path, &claude).unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "test=https://example.rossum.app/api/v1:22"])
+        .assert()
+        .success();
+
+    let after = std::fs::read_to_string(&claude_path).unwrap();
+    assert!(after.contains("## House rules"), "hand-added prose must survive");
+    assert!(after.contains("| `test` |"), "the new env must reach the table");
+    assert!(after.contains("rdc migrate dev test --dry-run"), "promote pair must refresh");
+}
+
+#[test]
+fn init_never_touches_docs_without_rdc_markers() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "dev=https://example.rossum.app/api/v1:11"])
+        .assert()
+        .success();
+    let hand = "# My own guide\n\nNothing generated here.\n";
+    std::fs::write(dir.path().join("CLAUDE.md"), hand).unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "test=https://example.rossum.app/api/v1:22"])
+        .assert()
+        .success();
+
+    assert_eq!(std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap(), hand);
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test --lib scaffold_docs`
+Expected: FAIL — `cannot find function render_doc_regions`. Add `pub mod scaffold_docs;` to
+`src/cli/mod.rs` in this step so the file compiles.
+
+- [ ] **Step 3: Write the doc renderers**
+
+Prepend to `src/cli/scaffold_docs.rs`:
+
+```rust
+//! Renders the generated regions of the two scaffolded Markdown docs.
+//!
+//! Only facts that come from `rdc.toml` go in here, because `rdc init` — the
+//! command that refreshes these regions — is also the command that changes
+//! `rdc.toml`. Remote structure (workspaces, queues, hooks) deliberately stays
+//! out: `envs/<env>/_index.md` already carries it and is regenerated on every
+//! sync, so a copy here would be a second, staler answer to one question.
+
+use crate::config::EnvConfig;
+use std::collections::BTreeMap;
+
+/// Table of every env with its API base, org id, and credential suffix.
+pub const REGION_ENVS: &str = "rdc:envs";
+/// The promote walkthrough, naming this project's own envs.
+pub const REGION_PROMOTE: &str = "rdc:promote";
+
+pub fn render_doc_regions(envs: &BTreeMap<String, EnvConfig>) -> BTreeMap<&'static str, String> {
+    BTreeMap::from([
+        (REGION_ENVS, render_envs(envs)),
+        (REGION_PROMOTE, render_promote(envs)),
+    ])
+}
+
+fn render_envs(envs: &BTreeMap<String, EnvConfig>) -> String {
+    if envs.is_empty() {
+        return "_No environments defined yet. Add one with \
+                `rdc init --env <env>=<api_base>:<org_id>`._"
+            .to_string();
+    }
+    let mut out = String::from("| Env | API base | Org id | Credential suffix |\n|---|---|---|---|\n");
+    for (name, cfg) in envs {
+        out.push_str(&format!(
+            "| `{}` | `{}` | {} | `{}` |\n",
+            md_cell(name),
+            md_cell(&cfg.api_base),
+            cfg.org_id,
+            md_cell(&crate::secrets::env_var_suffix(name)),
+        ));
+    }
+    // The suffix rule is the thing people derive wrong by hand (dev-us -> DEV_US).
+    out.push_str(
+        "\nCredentials for an env are read from `RDC_TOKEN_<suffix>`, or from \
+         `RDC_USER_<suffix>` + `RDC_PASS_<suffix>` when rdc should exchange a login \
+         for a token itself. A validated token is cached in \
+         `secrets/<env>.secrets.json`, and hook secret values live in \
+         `secrets/<env>.hook-secrets.json` — both gitignored.",
+    );
+    out.trim_end().to_string()
+}
+
+fn render_promote(envs: &BTreeMap<String, EnvConfig>) -> String {
+    let mut names = envs.keys();
+    let (Some(src), Some(tgt)) = (names.next(), names.next()) else {
+        return "Promoting needs a second env. Add one with \
+                `rdc init --env <env>=<api_base>:<org_id>`, and this section fills in \
+                with the real commands."
+            .to_string();
+    };
+    format!(
+        "1. `rdc sync {src}` and `rdc sync {tgt}` so both lockfiles are populated.\n\
+         2. `rdc migrate {src} {tgt} --dry-run` — preview the local file transform.\n\
+         3. `rdc migrate {src} {tgt}` — copy {src}'s snapshot into `envs/{tgt}/`, renaming\n   \
+            slugs per `.rdc/mapping.toml` (one hand-editable file where each env names its\n   \
+            own slug for an object; identical slugs need no entry), rewriting portable\n   \
+            `rdc://` refs, and applying {tgt}'s `overlay.toml`.\n\
+         4. Review the result with `git diff`, then `rdc sync {tgt}` to push — sync creates\n   \
+            missing objects in dependency order."
+    )
+}
+
+/// Escape a value so it cannot break out of a Markdown table cell. An env name
+/// or `api_base` reaches us from `--env` or a hand-written `rdc.toml`, neither
+/// of which validates them.
+fn md_cell(s: &str) -> String {
+    s.replace('|', r"\|")
+}
+```
+
+- [ ] **Step 4: Put the regions into `CLAUDE_MD_TEMPLATE` and fix the two errors**
+
+In `src/cli/init.rs`, in `CLAUDE_MD_TEMPLATE`:
+
+Replace the "Where to look first" bullet that currently reads
+`- **\`rdc.toml\`** — project name and per-env API base URL + org id.` with:
+
+```
+- **`rdc.toml`** — the per-env API base URL and org id. There is no project
+  name; the config is just envs.
+
+## Environments
+
+<!-- >>> rdc:envs (generated from rdc.toml — `rdc init` refreshes it) -->
+<!-- <<< rdc:envs -->
+```
+
+Replace the layout block's `.gitlab-ci.yml` line
+(`.gitlab-ci.yml                            scheduled archive + deploy buttons; fill in its TODOs`)
+with:
+
+```
+.gitlab-ci.yml                            archive per env + one deploy draft per env;
+                                          the `# >>> rdc:` regions are generated
+testkit/                                  formula/hook test harness (real txscript); `pytest -q`
+requirements-dev.txt                      pinned pytest + txscript for the CI test job
+```
+
+(If Task 6 already added the last two lines, keep them and change only the
+`.gitlab-ci.yml` line.)
+
+Replace the body of the `## Promoting changes between environments (e.g. dev → prod)`
+section — its four numbered steps — with the region, and retitle it:
+
+```
+## Promoting changes between environments
+
+<!-- >>> rdc:promote (generated from rdc.toml — `rdc init` refreshes it) -->
+<!-- <<< rdc:promote -->
+```
+
+- [ ] **Step 5: Splice both docs on write**
+
+Replace `write_claude_md` (`src/cli/init.rs:644`) with:
+
+```rust
+/// Write an agent guide at `<root>/CLAUDE.md`.
+///
+/// Mostly a static template, with two generated regions (the env table and the
+/// promote walkthrough) filled from `cfg`. Like the pipeline, an existing file
+/// carrying the markers has only its regions refreshed — so a project's own
+/// notes survive every `rdc init` — and a file with no markers is left alone
+/// unless `--force`.
+fn write_claude_md(root: &Path, cfg: &ProjectConfig, force: bool) -> Result<Scaffolded> {
+    write_doc_with_regions(&root.join("CLAUDE.md"), CLAUDE_MD_TEMPLATE, cfg, force)
+}
+
+/// Shared body for the two Markdown scaffolds: generate from `template` when
+/// absent, splice the rdc regions when present, honour `--force` for a file
+/// that has no markers at all.
+fn write_doc_with_regions(
+    path: &Path,
+    template: &str,
+    cfg: &ProjectConfig,
+    force: bool,
+) -> Result<Scaffolded> {
+    let regions = crate::cli::scaffold_docs::render_doc_regions(&cfg.envs);
+    let style = crate::cli::regions::MARKDOWN;
+    let generated = || -> Result<String> {
+        crate::cli::regions::splice(template, &regions, style)?.ok_or_else(|| {
+            anyhow!(
+                "the embedded template for {} has no rdc region markers",
+                path.display()
+            )
+        })
+    };
+
+    if !path.exists() {
+        let body = generated()?;
+        write_atomic(path, body.as_bytes())?;
+        return Ok(Scaffolded::Created);
+    }
+
+    let existing = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let Ok(text) = String::from_utf8(existing.clone()) else {
+        return write_template_file_bytes(path, generated()?.as_bytes(), &existing, force);
+    };
+    match crate::cli::regions::splice(&text, &regions, style)
+        .with_context(|| format!("updating the rdc regions in {}", path.display()))?
+    {
+        Some(spliced) => {
+            if spliced.as_bytes() == existing.as_slice() {
+                Ok(Scaffolded::Unchanged)
+            } else {
+                write_atomic(path, spliced.as_bytes())?;
+                Ok(Scaffolded::Merged)
+            }
+        }
+        None => write_template_file_bytes(path, generated()?.as_bytes(), &existing, force),
+    }
+}
+```
+
+In `write_readme`, emit the env region **unconditionally** — outside the
+`if !cfg.envs.is_empty()` block that wraps the sync-commands section — right after that
+block. It must not be conditional: `write_doc_with_regions` errors when the template
+carries no markers, so a hand-emptied `rdc.toml` would otherwise fail the write. The
+renderer already handles the empty case with a "No environments defined yet" line.
+
+```rust
+    md.push_str("## Environments\n\n");
+    md.push_str("<!-- >>> rdc:envs (generated from rdc.toml — `rdc init` refreshes it) -->\n");
+    md.push_str("<!-- <<< rdc:envs -->\n\n");
+```
+
+Then **delete the early exit** at the top of `write_readme`:
+
+```rust
+    // Cheap exit before building the body, which the non-force path throws away.
+    if path.exists() && !force {
+        return Ok(Scaffolded::Unchanged);
+    }
+```
+
+It has to go. It returns before the body is built, so an existing README would never have
+its region refreshed — the whole point of the task. `write_doc_with_regions` makes the
+same decision correctly, and the cost is building a String that a no-op splice discards.
+
+Finally change the write from `write_template_file(&path, &md, force)` to
+`write_doc_with_regions(&path, &md, cfg, force)` — `md` is the template here, and the
+splice fills the region it just declared.
+
+Update the two call sites in `src/cli/init.rs` to pass `&cfg`:
+`("CLAUDE.md", write_claude_md(&cwd, &cfg, force)?)`, and in `write_scaffold_files`,
+move `write_claude_md(cwd, &cfg, false)?` below the `cfg` it needs.
+
+- [ ] **Step 6: Run the tests**
+
+Run: `cargo test --lib scaffold_docs && cargo test --test cli_init && cargo test`
+Expected: PASS. `init_does_not_clobber_existing_claude_md` and
+`init_claude_md_documents_only_real_commands` are existing tests over this file — if either
+fails, the region markup broke an assertion they make; fix the markup, not the test, unless
+the test asserts the wording you deliberately changed (the "project name" line).
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/cli/scaffold_docs.rs src/cli/mod.rs src/cli/init.rs tests/cli_init.rs
+git commit -m "feat(init): prefill the env table and promote recipe in CLAUDE.md and README.md"
+```
