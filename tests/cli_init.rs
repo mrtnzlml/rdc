@@ -1018,3 +1018,51 @@ fn init_force_reports_every_testkit_file() {
         .stdout(predicate::str::contains("testkit/txscript_eval.py"))
         .stdout(predicate::str::contains("requirements-dev.txt"));
 }
+
+/// The scaffolded harness must actually run. rdc's CI builds on tags and runs
+/// no tests (`.github/workflows/`), so this guards `cargo test` on a developer
+/// machine; it SKIPS rather than fails when the Python side isn't available,
+/// which keeps `cargo test` green on a machine with no txscript installed.
+#[test]
+fn scaffolded_testkit_passes_its_own_pytest_suite() {
+    let probe = std::process::Command::new("python3")
+        .args(["-c", "import pytest, txscript"])
+        .output();
+    match probe {
+        Ok(out) if out.status.success() => {}
+        _ => {
+            eprintln!(
+                "SKIP scaffolded_testkit_passes_its_own_pytest_suite: \
+                 python3 with pytest + txscript not available \
+                 (pip install 'pytest>=8,<9' 'txscript==1.2.0')"
+            );
+            return;
+        }
+    }
+
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "dev=https://example.rossum.app/api/v1:1"])
+        .assert()
+        .success();
+
+    let out = std::process::Command::new("python3")
+        .args(["-m", "pytest", "-q"])
+        .current_dir(dir.path())
+        .output()
+        .expect("running pytest");
+    assert!(
+        out.status.success(),
+        "the scaffolded testkit failed its own suite:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    // Exit 0 rather than 5 is the whole point: a fresh project's test job is green.
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("passed"),
+        "expected collected tests, got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}

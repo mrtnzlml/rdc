@@ -105,7 +105,26 @@ rdc init
 
 `rdc init` walks you through setting up one or more envs — env name, API base URL, org ID, API token — then syncs each into a local snapshot.
 
-Alongside the snapshot it scaffolds `CLAUDE.md`, `README.md`, `.gitignore`, `.gitattributes`, and a `.gitlab-ci.yml` pipeline (scheduled archive + one manual deploy button per env; fill in its `TODO`s before enabling it). Existing files are never touched — `rdc init --force` re-generates them from the current binary, and on its own (no `--env`) that is all it does.
+Alongside the snapshot it scaffolds `CLAUDE.md`, `README.md`, `.gitignore`, `.gitattributes`, a `.gitlab-ci.yml` pipeline, and a Python test harness (`testkit/`, `conftest.py`, `pytest.ini`, `requirements-dev.txt`). The pipeline's archive matrix and its deploy buttons are generated from the envs in `rdc.toml` — one archive job per env, one drafted deploy button per env — inside two `# >>> rdc:…` marked regions that `rdc init` refreshes on every run, including when you add an env. Everything outside those markers is yours and is never touched; a pipeline with no markers at all is left completely alone. Fill in each draft's `RDC_SRC` before pressing it (it refuses to run until you do) and delete the drafts for envs you author by hand.
+
+The harness evaluates a queue's formulas against the **real** txscript runtime, using that queue's own `schema.json`, so a `number` field is a number and a `date` field must be ISO:
+
+```python
+from testkit import evaluate_formula
+
+FORMULAS = "envs/dev/workspaces/invoices/queues/cost-invoices/formulas"
+
+def test_total_is_net_plus_tax():
+    assert evaluate_formula(f"{FORMULAS}/amount_total.py", amount_net="100", amount_tax="21") == 121.0
+
+def test_line_total_per_row():
+    assert evaluate_formula(
+        f"{FORMULAS}/item_total.py",
+        rows={"line_items": [{"item_qty": "2", "item_price": "5"}]},
+    ) == [10.0]
+```
+
+`pytest -q` runs it. Existing files are never touched — `rdc init --force` re-generates them from the current binary, and on its own (no `--env`) that is all it does.
 
 For an env named `test`, you now have:
 
@@ -336,7 +355,7 @@ rather than duplicating them.
 
 | Command | What it does |
 |---|---|
-| `rdc init` | Create a new project, or add an env to an existing one. Prompts interactively; `--force` re-generates the scaffold files (`CLAUDE.md`, `README.md`, `.gitlab-ci.yml`). |
+| `rdc init` | Create a new project, or add an env to an existing one. Prompts interactively; regenerates the pipeline's env regions on every run; `--force` re-generates the scaffold files (`CLAUDE.md`, `README.md`, `.gitlab-ci.yml`, `testkit/`). |
 | `rdc auth <env>` | Set or refresh the API token for `<env>`. |
 | `rdc sync <env>` | Reconcile snapshot ↔ remote in one pass. |
 | `rdc migrate <src> <tgt>` | Copy one env's snapshot into another's, locally (slug remap, ref rewrite, overlay) — then push with `rdc sync <tgt>`. |
