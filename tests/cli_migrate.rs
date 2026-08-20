@@ -953,10 +953,15 @@ fn migrate_ignores_inbox_email_prefix_by_default() {
     );
 }
 
-/// A brand-new target inbox drops `email_prefix` entirely, so the server
-/// derives the target env's own address instead of inheriting the source's.
+/// A brand-new target inbox KEEPS the source's `email_prefix`. The field is
+/// mandatory on create — `POST /inboxes` answers `400 non_field_errors: One of
+/// fields 'email_prefix' or 'email' needs to be provided`, and rdc strips the
+/// server-assigned `email` — so dropping it (as the score-threshold reconcile
+/// this was modelled on does) emitted an object no sync could ever push. A
+/// created mailbox has no senders to strand, so inheriting is safe here in a
+/// way overwriting a live target's prefix is not; migrate warns about each one.
 #[test]
-fn migrate_drops_inbox_email_prefix_for_new_object() {
+fn migrate_keeps_source_inbox_email_prefix_for_new_object() {
     let project = setup_inbox_prefix_project("acme-dev--ops", None);
     let root = project.path();
 
@@ -968,9 +973,34 @@ fn migrate_drops_inbox_email_prefix_for_new_object() {
     result.expect("migrate should succeed");
 
     let inbox = read_json(&root.join("envs/prod/workspaces/main/queues/invoices/inbox.json"));
-    assert!(
-        inbox.get("email_prefix").is_none(),
-        "a new target inbox must not inherit the source env's email_prefix: {inbox}"
+    assert_eq!(
+        inbox["email_prefix"],
+        serde_json::json!("acme-dev--ops"),
+        "a new target inbox must stay pushable, so it keeps the source's email_prefix: {inbox}"
+    );
+}
+
+/// The same when the target inbox file exists but carries no prefix — the state
+/// every migrate between the drop's introduction and this fix left behind. It
+/// is still a create (nothing in the target lockfile), so it must be repaired
+/// rather than left permanently unpushable.
+#[test]
+fn migrate_fills_missing_email_prefix_on_an_undeployed_target_inbox() {
+    let project = setup_inbox_prefix_project("acme-dev--ops", Some(None));
+    let root = project.path();
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], false, false);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("migrate should succeed");
+
+    let inbox = read_json(&root.join("envs/prod/workspaces/main/queues/invoices/inbox.json"));
+    assert_eq!(
+        inbox["email_prefix"],
+        serde_json::json!("acme-dev--ops"),
+        "a prefix-less, undeployed target inbox must be repaired, not left unpushable: {inbox}"
     );
 }
 

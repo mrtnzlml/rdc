@@ -265,13 +265,14 @@ pub(crate) async fn run_cycle(
     let (_scanned, changes, tombstones) = crate::cli::push::scan::scan(&paths, &lockfile)?;
     let parse_errors = changes.json_parse_errors();
     let limit_violations = changes.field_limit_violations();
+    let missing_create_fields = changes.missing_create_fields(&lockfile);
 
     // `--no-push` is an audit mode: there is nothing to half-apply, so it
     // proceeds and merely reports. `--dry-run` proceeds too — its job is
-    // to print the COMPLETE plan, and it already surfaces both classes in
-    // dedicated sections further down.
+    // to print the COMPLETE plan, and it already surfaces all three classes
+    // in dedicated sections further down.
     if !no_push && !dry_run {
-        refuse_on_offline_defects(&parse_errors, &limit_violations)?;
+        refuse_on_offline_defects(&parse_errors, &limit_violations, &missing_create_fields)?;
     }
 
     let token = match token_override {
@@ -515,6 +516,24 @@ pub(crate) async fn run_cycle(
             progress.block(&body);
         }
 
+        if !missing_create_fields.is_empty() {
+            progress.event(Action::Plan, "missing required fields");
+            let mut body = String::new();
+            use std::fmt::Write as _;
+            for m in &missing_create_fields {
+                let _ = writeln!(
+                    body,
+                    "- {}/{} -- {}: `{}` is missing; POST /{} would be rejected",
+                    m.kind,
+                    m.slug,
+                    m.path.display(),
+                    m.field,
+                    m.kind,
+                );
+            }
+            progress.block(&body);
+        }
+
         if !renderer_was_supplied {
             let parse_suffix = if parse_errors.is_empty() {
                 String::new()
@@ -534,7 +553,16 @@ pub(crate) async fn run_cycle(
                     if limit_violations.len() == 1 { "" } else { "s" }
                 )
             };
-            let parse_suffix = format!("{parse_suffix}{limit_suffix}");
+            let missing_suffix = if missing_create_fields.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", {} missing required field{}",
+                    missing_create_fields.len(),
+                    if missing_create_fields.len() == 1 { "" } else { "s" }
+                )
+            };
+            let parse_suffix = format!("{parse_suffix}{limit_suffix}{missing_suffix}");
             progress.event(
                 Action::Done,
                 &format!(
@@ -1461,14 +1489,17 @@ pub fn from_catalog_scan_lockfile(
 
 /// Refuse a push over defects that are knowable from local bytes alone.
 ///
-/// Both classes are *permanent*: an unparseable file and an over-length
-/// field can never be accepted by the server, so attempting the push
-/// aborts the cycle before the pull phase on every single run — wedging
-/// the project until a human notices. Raising them here keeps the remote
-/// untouched and names exactly what to fix.
+/// All three classes are *permanent*: an unparseable file, an over-length
+/// field, and a create missing a field the API demands can never be
+/// accepted by the server, so attempting the push aborts the cycle before
+/// the pull phase on every single run — wedging the project until a human
+/// notices, and (for the create case) after earlier kinds are already
+/// written. Raising them here keeps the remote untouched and names exactly
+/// what to fix.
 fn refuse_on_offline_defects(
     parse_errors: &[crate::cli::push::scan::JsonParseError],
     limit_violations: &[crate::cli::push::scan::FieldLimitViolation],
+    missing_create_fields: &[crate::cli::push::scan::MissingCreateField],
 ) -> Result<()> {
     use std::fmt::Write as _;
 
@@ -1510,6 +1541,33 @@ fn refuse_on_offline_defects(
                 v.actual.saturating_sub(v.limit),
             );
         }
+        anyhow::bail!("{msg}");
+    }
+
+    if !missing_create_fields.is_empty() {
+        let mut msg = format!(
+            "{} object(s) would be created without a field the Rossum API requires; \
+             refusing to push before any remote write:",
+            missing_create_fields.len()
+        );
+        for m in missing_create_fields {
+            let _ = write!(
+                msg,
+                "\n  - {}/{} -- {}: `{}` is missing (POST /{} rejects it)",
+                m.kind,
+                m.slug,
+                m.path.display(),
+                m.field,
+                m.kind,
+            );
+        }
+        // The overlay is the supported place to declare a per-env value, and
+        // the only one that survives the next `migrate`.
+        let _ = write!(
+            msg,
+            "\n  Set it in the file, or per env in envs/<env>/overlay.toml \
+             (e.g. [inboxes.<queue-slug>] email_prefix = \"...\") and re-run migrate."
+        );
         anyhow::bail!("{msg}");
     }
 
@@ -2072,5 +2130,30 @@ mod tests {
             item.remote_hash,
             item.base_hash,
         );
+    }
+
+    /// The pre-flight must refuse a create the API can only reject, before the
+    /// first remote write — the failure mode that half-created an env: the
+    /// workspaces, schemas and queues were POSTed, then the first inbox 400ed.
+    #[test]
+    fn refuse_on_offline_defects_bails_on_a_missing_create_field() {
+        let missing = vec![crate::cli::push::scan::MissingCreateField {
+            kind: "inboxes",
+            slug: "invoices".to_string(),
+            path: std::path::PathBuf::from("envs/prod/workspaces/main/queues/invoices/inbox.json"),
+            field: "email_prefix",
+        }];
+        let err = refuse_on_offline_defects(&[], &[], &missing)
+            .expect_err("a doomed create must refuse the push");
+        let msg = err.to_string();
+        assert!(msg.contains("inboxes/invoices"), "{msg}");
+        assert!(msg.contains("email_prefix"), "{msg}");
+        assert!(msg.contains("overlay.toml"), "{msg}");
+    }
+
+    /// ...and must stay silent when there is nothing to refuse.
+    #[test]
+    fn refuse_on_offline_defects_passes_a_clean_change_list() {
+        refuse_on_offline_defects(&[], &[], &[]).expect("a clean scan must not refuse");
     }
 }

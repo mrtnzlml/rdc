@@ -578,10 +578,12 @@ fn transform_file(
     tgt_org_url: &str,
     migrate_score_thresholds: bool,
     src_lockfile: &crate::state::Lockfile,
+    tgt_lockfile: &crate::state::Lockfile,
     dry_run: bool,
     migrate_email_prefixes: bool,
     id_remap: &IdRemap,
     id_hits: &mut Vec<(String, u64, u64)>,
+    carried_prefixes: &mut Vec<(String, String)>,
 ) -> Result<FileOutcome> {
     let src_path = src_root.join(rel);
     let dst_rel = remap_relative(rel, mapping);
@@ -721,13 +723,30 @@ fn transform_file(
 
     // An inbox's `email_prefix`, unless the user opted to carry it. The prefix
     // is the left-hand side of the inbox's PUBLIC address, so promoting the
-    // source env's value re-addresses the target's mailbox. Like the score
-    // thresholds, a matched target keeps its own and a brand-new inbox drops the
-    // field.
+    // source env's value re-addresses the target's mailbox — but unlike the
+    // score thresholds it is MANDATORY on create, so a brand-new inbox keeps
+    // the source's (and is warned about) instead of dropping it into a body the
+    // API rejects. "Brand-new" is the target LOCKFILE's verdict, not the file's:
+    // an object the target has never deployed is the one the push will POST.
+    //
+    // The reported carry is only PROVISIONAL here — the overlay runs after this
+    // and may replace the value, which is the documented way to choose a new
+    // env's address. It is confirmed further down, once the final value is
+    // known, so the warning never names a prefix the user has already overridden.
+    let mut provisional_carry: Option<(String, String)> = None;
     if !migrate_email_prefixes
-        && let Some((kind, _)) = classify(rel)
+        && let Some((kind, src_slug)) = classify(rel)
+        && kind == "inboxes"
     {
-        reconcile_email_prefix(&mut value, kind, &dst_path);
+        let slug = tgt_slug(mapping, kind, &src_slug);
+        let will_create = tgt_lockfile
+            .objects
+            .get(kind)
+            .and_then(|m| m.get(&slug))
+            .is_none();
+        if let Some(prefix) = reconcile_email_prefix(&mut value, kind, &dst_path, will_create) {
+            provisional_carry = Some((slug, prefix));
+        }
     }
 
     // Remap raw numeric object ids embedded in deployable content (the stock
@@ -762,6 +781,16 @@ fn transform_file(
         if let Some(overrides) = overlay_for(ov, mapping, kind, &src_slug) {
             apply_overrides(&mut value, overrides);
         }
+    }
+
+    // Confirm the provisional inbox-prefix carry recorded above, now that the
+    // overlay has had its say. If an overlay entry replaced the value, the user
+    // has already chosen this env's address deliberately — reporting the source's
+    // would name a prefix that is not used and nag about a decision already made.
+    if let Some((slug, prefix)) = provisional_carry
+        && value.get("email_prefix").and_then(|v| v.as_str()) == Some(prefix.as_str())
+    {
+        carried_prefixes.push((slug, prefix));
     }
 
     // Trailing-whitespace normalization: Rossum strips trailing whitespace from
@@ -1337,40 +1366,116 @@ fn reconcile_training_enabled(value: &mut serde_json::Value, kind: &str, tgt_pat
 /// the same problem, so it follows the same rule as
 /// [`reconcile_score_thresholds`]:
 ///
-/// - **Matched target** (`tgt_path` exists + carries a prefix): adopt the
-///   TARGET's, so each env keeps the address its senders already use.
-/// - **New target** (or the target has no prefix): drop the field, so the
-///   server derives the target env's own address rather than inheriting the
-///   source's.
+/// - **Target file carries a prefix**: adopt the TARGET's, so each env keeps
+///   the address its senders already use (and a deliberate local value is
+///   never overwritten).
+/// - **Target has no prefix and the object is NEW** (`will_create`, i.e. absent
+///   from the target lockfile): keep the SOURCE's. The field is *mandatory* on
+///   create and rdc has no other value to offer — see below.
+/// - **Target has no prefix and the object is deployed**: drop the field. The
+///   push PATCHes, and a PATCH that omits the key leaves the remote's own
+///   address untouched.
+///
+/// The create case is not symmetric with [`reconcile_score_thresholds`] /
+/// [`reconcile_training_enabled`], which this originally copied: those fields
+/// are OPTIONAL on create, so dropping them lets the server apply its default.
+/// `email_prefix` is not — `POST /inboxes` answers
+/// `400 non_field_errors: One of fields 'email_prefix' or 'email' needs to be
+/// provided`, and [`crate::snapshot::create::strip_for_create`] removes `email`
+/// for inboxes, so a dropped prefix left a body the API can never accept and
+/// every brand-new inbox was unpushable (verified live: a first `migrate` into
+/// an empty env aborted the sync mid-push, after the queues were created).
+/// Carrying the source's value is safe where overwriting a live one is not: a
+/// created mailbox has no senders yet, the address is host-scoped to the target
+/// org, and `email_prefix` is NOT unique per org (verified: 7 inboxes in one
+/// org share a prefix; the server appends its own `-<6hex>` discriminator).
+/// Every carry is reported by [`format_carried_email_prefix_warning`], because
+/// a source prefix that names its env (`acme-sandbox`) would otherwise reach a
+/// production address unannounced.
+///
+/// Returns `Some(prefix)` when an inbox the push will CREATE ends up carrying
+/// the SOURCE env's prefix — whether this run wrote it or an earlier one did —
+/// so the caller can name it in that warning until it is deployed or changed.
 ///
 /// A source inbox that carries no prefix is left alone — this only ever
-/// protects a value the target already owns. Set one deliberately per env with
-/// an `[inboxes.<queue-slug>]` entry in the target's `overlay.toml`, which is
-/// applied before this runs and therefore still wins.
+/// protects a value the target already owns; the push pre-flight
+/// (`ChangeList::missing_create_fields`) refuses a create with no prefix at
+/// all. Set one deliberately per env with an `[inboxes.<queue-slug>]` entry in
+/// the target's `overlay.toml`, which is applied after this runs and therefore
+/// always wins.
 ///
 /// A no-op for any kind other than `inboxes`.
-fn reconcile_email_prefix(value: &mut serde_json::Value, kind: &str, tgt_path: &Path) {
+fn reconcile_email_prefix(
+    value: &mut serde_json::Value,
+    kind: &str,
+    tgt_path: &Path,
+    will_create: bool,
+) -> Option<String> {
     const KEY: &str = "email_prefix";
     if kind != "inboxes" {
-        return;
+        return None;
     }
-    let Some(obj) = value.as_object_mut() else {
-        return;
-    };
+    let obj = value.as_object_mut()?;
     if !obj.contains_key(KEY) {
-        return;
+        return None;
     }
+    let source_prefix = obj.get(KEY).and_then(|v| v.as_str()).map(str::to_string);
     let target: Option<serde_json::Value> = std::fs::read(tgt_path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok());
-    match target.as_ref().and_then(|t| t.get(KEY)).cloned() {
+    // An explicit `null` is not a prefix: adopting it would send
+    // `email_prefix: null` and hit the same 400 as omitting the key.
+    let target_prefix = target
+        .as_ref()
+        .and_then(|t| t.get(KEY))
+        .filter(|v| !v.is_null())
+        .cloned();
+    match target_prefix {
         Some(v) => {
             obj.insert(KEY.to_string(), v);
         }
+        None if will_create => {} // keep the source's — mandatory on create
         None => {
             obj.shift_remove(KEY);
         }
     }
+    // Report whenever an inbox the push will CREATE ends up addressed with the
+    // source env's prefix — not only on the run that first wrote it. The value
+    // survives in the target snapshot, so a first-run-only notice would go
+    // silent exactly when someone re-runs `migrate && sync` and is the last
+    // chance to catch a dev-flavoured prefix before it becomes a live address.
+    let final_prefix = obj.get(KEY).and_then(|v| v.as_str()).map(str::to_string);
+    if will_create && final_prefix.is_some() && final_prefix == source_prefix {
+        return final_prefix;
+    }
+    None
+}
+
+/// The `warn` migrate emits for every brand-new inbox that kept the SOURCE
+/// env's `email_prefix` (see [`reconcile_email_prefix`]).
+///
+/// Split out as a pure function so the wording is unit-testable: this is the
+/// only notice a user gets that a production mailbox is about to be addressed
+/// with a prefix chosen for another env, so it has to name the inbox, the
+/// value, and the exact `overlay.toml` key that overrides it.
+fn format_carried_email_prefix_warning(
+    src: &str,
+    tgt: &str,
+    carried: &[(String, String)],
+) -> String {
+    use std::fmt::Write as _;
+    let mut msg = format!(
+        "{} new inbox(es) in '{tgt}' keep the source env's email_prefix — each public \
+         address becomes <prefix>-<hash>@<{tgt} host>. POST /inboxes requires one, so \
+         migrate carries '{src}'s rather than write an object the API rejects. Change any \
+         of them before syncing, in envs/{tgt}/overlay.toml — a new overlay file also \
+         needs `version = 1` (values below are the ones that will be used):",
+        carried.len(),
+    );
+    for (slug, prefix) in carried {
+        let _ = write!(msg, "\n  [inboxes.{slug}]\n  email_prefix = \"{prefix}\"");
+    }
+    msg
 }
 
 /// Collect `id -> score_threshold` for every object that has BOTH a string `id`
@@ -2052,6 +2157,7 @@ pub fn run_at(
     let mut renamed = 0usize;
     let mut obj_status: BTreeMap<(&'static str, String), ObjStatus> = BTreeMap::new();
     let mut id_hits: Vec<(String, u64, u64)> = Vec::new();
+    let mut carried_prefixes: Vec<(String, String)> = Vec::new();
 
     for rel in &files {
         // Un-creatable duplicate unique-typed email templates (see above).
@@ -2098,10 +2204,12 @@ pub fn run_at(
             &tgt_org_url,
             migrate_score_thresholds,
             &src_lockfile,
+            &tgt_lockfile,
             dry_run,
             migrate_email_prefixes,
             &id_remap,
             &mut id_hits,
+            &mut carried_prefixes,
         )
         .with_context(|| format!("migrating {}", rel.display()))?;
         if outcome != FileOutcome::Unchanged {
@@ -2126,6 +2234,18 @@ pub fn run_at(
         }
         record_object_status(&mut obj_status, &dst_rel, outcome);
     }
+
+    // Every brand-new inbox that inherited the source env's public address
+    // prefix, named once for the whole run. Emitted in `--dry-run` too: the
+    // transform runs in both modes, and forecasting the address is exactly what
+    // the dry run is for.
+    if !carried_prefixes.is_empty() {
+        log.event(
+            crate::log::Action::Warn,
+            &format_carried_email_prefix_warning(src, tgt, &carried_prefixes),
+        );
+    }
+
     let creates = obj_status
         .values()
         .filter(|s| **s == ObjStatus::Created)
@@ -2859,10 +2979,12 @@ mod tests {
             "https://tgt.example/api/v1/organizations/2",
             true,
             &src_lock,
+            &crate::state::Lockfile::default(),
             false,
             false,
             &remap,
             &mut hits,
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -3059,7 +3181,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new()).unwrap();
 
         // File landed at the remapped path.
         let dst = tgt
@@ -3128,9 +3250,11 @@ mod tests {
             "https://tgt.example/api/v1/organizations/2",
             true,
             &src_lock,
+            &crate::state::Lockfile::default(),
             false,
             false,
             &IdRemap::default(),
+            &mut Vec::new(),
             &mut Vec::new(),
         )
         .unwrap();
@@ -3175,7 +3299,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("hooks/extractor-prod.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -3217,7 +3341,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("hooks/any-hook.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -3265,7 +3389,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("hooks/special-hook.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -3306,7 +3430,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("rules/some-rule.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -3381,9 +3505,11 @@ mod tests {
             "https://acme-test.rossum.app/api/v1/organizations/2",
             true,
             &crate::state::Lockfile::default(),
+            &crate::state::Lockfile::default(),
             false,
             false,
             &IdRemap::default(),
+            &mut Vec::new(),
             &mut Vec::new(),
         )
         .unwrap();
@@ -3433,7 +3559,7 @@ mod tests {
         fs::write(&src_file, code).unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("hooks/extractor-prod.py");
         assert_eq!(
@@ -3787,29 +3913,86 @@ mod tests {
         // address. A matched target keeps its own.
         let mut source = serde_json::json!({ "name": "In", "email_prefix": "acme-dev--ops" });
         let (_d, tgt) = tgt_file(&serde_json::json!({ "name": "In", "email_prefix": "acme" }));
-        reconcile_email_prefix(&mut source, "inboxes", &tgt);
+        let carried = reconcile_email_prefix(&mut source, "inboxes", &tgt, false);
         assert_eq!(source["email_prefix"], serde_json::json!("acme"));
+        assert_eq!(carried, None, "adopting the target's is not a carry");
     }
 
     #[test]
-    fn reconcile_email_prefix_new_target_drops_it() {
-        // No target => brand-new inbox => drop the field so the server derives
-        // the target env's own address instead of inheriting the source's.
+    fn reconcile_email_prefix_new_object_keeps_source_value() {
+        // No target file => the next sync POSTs this inbox => the source's
+        // prefix must survive: `POST /inboxes` rejects a body with neither
+        // `email_prefix` nor `email` (400 non_field_errors), and
+        // `strip_for_create` removes `email`. Dropping it here made every
+        // brand-new inbox unpushable.
         let mut source = serde_json::json!({ "name": "In", "email_prefix": "acme-dev--ops" });
         let missing = std::path::Path::new("/nonexistent/does-not-exist/inbox.json");
-        reconcile_email_prefix(&mut source, "inboxes", missing);
-        assert!(source.get("email_prefix").is_none());
+        let carried = reconcile_email_prefix(&mut source, "inboxes", missing, true);
+        assert_eq!(source["email_prefix"], serde_json::json!("acme-dev--ops"));
+        assert_eq!(carried.as_deref(), Some("acme-dev--ops"));
     }
 
     #[test]
-    fn reconcile_email_prefix_matched_target_without_prefix_drops_it() {
-        // The target inbox exists but carries no prefix of its own: the source's
-        // must not fill the gap, or the first migrate silently assigns the
-        // target an address derived from the source env.
+    fn reconcile_email_prefix_new_object_still_prefers_the_target_file() {
+        // A target inbox that is not deployed yet but already carries a prefix
+        // (hand-authored, or written by an earlier migrate) keeps it: the
+        // create has a prefix either way, so there is nothing to repair and a
+        // deliberate local value must not be overwritten every run.
+        let mut source = serde_json::json!({ "name": "In", "email_prefix": "acme-dev--ops" });
+        let (_d, tgt) = tgt_file(&serde_json::json!({ "name": "In", "email_prefix": "acme" }));
+        let carried = reconcile_email_prefix(&mut source, "inboxes", &tgt, true);
+        assert_eq!(source["email_prefix"], serde_json::json!("acme"));
+        assert_eq!(carried, None);
+    }
+
+    #[test]
+    fn reconcile_email_prefix_reports_a_new_inbox_that_already_holds_the_source_value() {
+        // The target file was written by an earlier migrate (or names the same
+        // prefix by hand) and the inbox is still not deployed: the warning must
+        // fire again, because this run is still the last chance to change the
+        // address before `sync` creates it.
+        let mut source = serde_json::json!({ "name": "In", "email_prefix": "acme-dev--ops" });
+        let (_d, tgt) =
+            tgt_file(&serde_json::json!({ "name": "In", "email_prefix": "acme-dev--ops" }));
+        let carried = reconcile_email_prefix(&mut source, "inboxes", &tgt, true);
+        assert_eq!(carried.as_deref(), Some("acme-dev--ops"));
+    }
+
+    #[test]
+    fn reconcile_email_prefix_is_quiet_once_the_inbox_is_deployed() {
+        // Same values, but the object is in the target lockfile: it is a PATCH
+        // of a live mailbox that already uses this address — nothing to warn
+        // about, and the notice must not become permanent noise.
+        let mut source = serde_json::json!({ "name": "In", "email_prefix": "acme-dev--ops" });
+        let (_d, tgt) =
+            tgt_file(&serde_json::json!({ "name": "In", "email_prefix": "acme-dev--ops" }));
+        let carried = reconcile_email_prefix(&mut source, "inboxes", &tgt, false);
+        assert_eq!(carried, None);
+    }
+
+    #[test]
+    fn reconcile_email_prefix_deployed_target_without_prefix_drops_it() {
+        // The inbox is already deployed (in the target lockfile) and the target
+        // file carries no prefix: drop the field. The push PATCHes, and a PATCH
+        // that omits the key leaves the remote's own address untouched —
+        // filling the gap from the source would re-address a live mailbox.
         let mut source = serde_json::json!({ "name": "In", "email_prefix": "acme-dev--ops" });
         let (_d, tgt) = tgt_file(&serde_json::json!({ "name": "In" }));
-        reconcile_email_prefix(&mut source, "inboxes", &tgt);
+        let carried = reconcile_email_prefix(&mut source, "inboxes", &tgt, false);
         assert!(source.get("email_prefix").is_none());
+        assert_eq!(carried, None);
+    }
+
+    #[test]
+    fn reconcile_email_prefix_null_target_value_is_not_adopted() {
+        // An explicit `null` is not a prefix: adopting it would POST
+        // `email_prefix: null` and hit the same 400 as omitting the key.
+        let mut source = serde_json::json!({ "name": "In", "email_prefix": "acme-dev--ops" });
+        let (_d, tgt) =
+            tgt_file(&serde_json::json!({ "name": "In", "email_prefix": serde_json::Value::Null }));
+        let carried = reconcile_email_prefix(&mut source, "inboxes", &tgt, true);
+        assert_eq!(source["email_prefix"], serde_json::json!("acme-dev--ops"));
+        assert_eq!(carried.as_deref(), Some("acme-dev--ops"));
     }
 
     #[test]
@@ -3818,18 +4001,120 @@ mod tests {
         // is not ours to touch.
         let mut source = serde_json::json!({ "name": "H", "email_prefix": "acme-dev--ops" });
         let (_d, tgt) = tgt_file(&serde_json::json!({ "name": "H", "email_prefix": "acme" }));
-        reconcile_email_prefix(&mut source, "hooks", &tgt);
+        let carried = reconcile_email_prefix(&mut source, "hooks", &tgt, false);
         assert_eq!(source["email_prefix"], serde_json::json!("acme-dev--ops"));
+        assert_eq!(carried, None);
     }
 
     #[test]
     fn reconcile_email_prefix_absent_in_source_stays_absent() {
         // A source inbox with no prefix must not gain the target's — the
-        // reconcile only ever protects a value the target already owns.
+        // reconcile only ever protects a value the target already owns. The
+        // push pre-flight (`missing_create_fields`) is what catches a create
+        // that ends up with no prefix at all.
         let mut source = serde_json::json!({ "name": "In" });
         let (_d, tgt) = tgt_file(&serde_json::json!({ "name": "In", "email_prefix": "acme" }));
-        reconcile_email_prefix(&mut source, "inboxes", &tgt);
+        let carried = reconcile_email_prefix(&mut source, "inboxes", &tgt, true);
         assert!(source.get("email_prefix").is_none());
+        assert_eq!(carried, None);
+    }
+
+    /// Helper: run `transform_file` on one source `inbox.json` and return the
+    /// carries it reported. `overlay` is applied as the target env's.
+    fn carries_for_inbox(
+        source: &serde_json::Value,
+        overlay: Option<&Overlay>,
+    ) -> Vec<(String, String)> {
+        use std::fs;
+        let src = tempfile::TempDir::new().unwrap();
+        let tgt = tempfile::TempDir::new().unwrap();
+        let mut m = Mapping::default();
+        m.workspaces.insert("main".into(), "main".into());
+        m.queues.insert("invoices".into(), "invoices".into());
+
+        let rel = Path::new("workspaces/main/queues/invoices/inbox.json");
+        let src_file = src.path().join(rel);
+        fs::create_dir_all(src_file.parent().unwrap()).unwrap();
+        fs::write(&src_file, serde_json::to_vec(source).unwrap()).unwrap();
+
+        let subst = build_subst(&m);
+        let mut carries = Vec::new();
+        transform_file(
+            rel,
+            src.path(),
+            tgt.path(),
+            &m,
+            &subst,
+            overlay,
+            "https://tgt.example/api/v1/organizations/2",
+            false,
+            &crate::state::Lockfile::default(),
+            &crate::state::Lockfile::default(), // empty tgt lockfile => a create
+            false,
+            false,
+            &IdRemap::default(),
+            &mut Vec::new(),
+            &mut carries,
+        )
+        .unwrap();
+        carries
+    }
+
+    #[test]
+    fn transform_reports_a_carried_inbox_prefix() {
+        let carries = carries_for_inbox(
+            &serde_json::json!({ "name": "In", "email_prefix": "acme-dev--ops" }),
+            None,
+        );
+        assert_eq!(
+            carries,
+            vec![("invoices".to_string(), "acme-dev--ops".to_string())]
+        );
+    }
+
+    #[test]
+    fn transform_does_not_report_a_prefix_the_overlay_replaced() {
+        // The overlay is applied AFTER the reconcile, so the provisional carry
+        // must be re-checked against the final value. Reporting it here would
+        // name a prefix that is not used and nag about a decision the user has
+        // already made — the documented way to choose a new env's address.
+        let mut overlay = Overlay::default();
+        let mut ov = BTreeMap::new();
+        ov.insert(
+            "email_prefix".to_string(),
+            serde_json::Value::String("acme-prod".into()),
+        );
+        overlay.inboxes.insert("invoices".to_string(), ov);
+
+        let carries = carries_for_inbox(
+            &serde_json::json!({ "name": "In", "email_prefix": "acme-dev--ops" }),
+            Some(&overlay),
+        );
+        assert!(
+            carries.is_empty(),
+            "an overlay-chosen prefix is not a carry: {carries:?}"
+        );
+    }
+
+    #[test]
+    fn carried_email_prefix_warning_names_the_overlay_key() {
+        // The warning is the only place a user learns that a brand-new
+        // production mailbox is about to be addressed with the source env's
+        // prefix, so it must name the inbox, the value, and the exact overlay
+        // key that overrides it.
+        let msg = format_carried_email_prefix_warning(
+            "test",
+            "prod",
+            &[
+                ("invoices".to_string(), "acme-sandbox".to_string()),
+                ("receipts".to_string(), "acme".to_string()),
+            ],
+        );
+        assert!(msg.contains("2 new inbox"), "{msg}");
+        assert!(msg.contains("envs/prod/overlay.toml"), "{msg}");
+        assert!(msg.contains("[inboxes.invoices]"), "{msg}");
+        assert!(msg.contains("acme-sandbox"), "{msg}");
+        assert!(msg.contains("[inboxes.receipts]"), "{msg}");
     }
 
     #[test]
@@ -3874,9 +4159,11 @@ mod tests {
             "https://tgt.example/api/v1/organizations/2",
             /* migrate_score_thresholds = */ true,
             &crate::state::Lockfile::default(),
+            &crate::state::Lockfile::default(),
             false,
             /* migrate_email_prefixes = */ false,
             &IdRemap::default(),
+            &mut Vec::new(),
             &mut Vec::new(),
         )
         .unwrap();
@@ -3929,9 +4216,11 @@ mod tests {
             "https://tgt.example/api/v1/organizations/2",
             /* migrate_score_thresholds = */ false,
             &crate::state::Lockfile::default(),
+            &crate::state::Lockfile::default(),
             false,
             /* migrate_email_prefixes = */ false,
             &IdRemap::default(),
+            &mut Vec::new(),
             &mut Vec::new(),
         )
         .unwrap();

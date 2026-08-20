@@ -214,6 +214,67 @@ impl ChangeList {
 
         out
     }
+
+    /// Validate every changed local file the push would CREATE against the
+    /// fields the API requires on create (see
+    /// [`crate::snapshot::limits::required_for_create`]).
+    ///
+    /// Same permanence argument as [`ChangeList::field_limit_violations`]: the
+    /// server's `400` can never be satisfied by retrying, and because the push
+    /// phase precedes the pull phase its error aborts the whole cycle — leaving
+    /// an env half-created, which is exactly how this surfaced (a first
+    /// `migrate` into an empty env pushed its workspaces, schemas and queues,
+    /// then died on the first `POST /inboxes`).
+    ///
+    /// Scoped to creates by the lockfile: an object with an entry is PATCHed,
+    /// and a PATCH that omits the key leaves the remote's value alone. Each
+    /// file is stripped with `strip_for_create` first, so the check sees the
+    /// bytes that actually reach the wire (an `email` key in the file, for
+    /// instance, is gone by then and cannot mask a missing prefix).
+    pub fn missing_create_fields(&self, lockfile: &Lockfile) -> Vec<MissingCreateField> {
+        let mut out = Vec::new();
+        let mut check = |kind: &'static str, map: &BTreeMap<String, std::path::PathBuf>| {
+            if crate::snapshot::limits::required_for_create(kind).is_empty() {
+                return;
+            }
+            for (slug, path) in map {
+                let tracked = lockfile
+                    .objects
+                    .get(kind)
+                    .and_then(|m| m.get(slug.as_str()))
+                    .is_some();
+                if tracked {
+                    continue; // a PATCH, not a POST
+                }
+                let Ok(bytes) = std::fs::read(path) else {
+                    continue; // unreadable — push surfaces I/O errors
+                };
+                let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                    continue; // unparseable — reported by json_parse_errors
+                };
+                crate::snapshot::create::strip_for_create(&mut body, kind);
+                for field in crate::snapshot::limits::missing_required_for_create(kind, &body) {
+                    out.push(MissingCreateField {
+                        kind,
+                        slug: slug.clone(),
+                        path: path.clone(),
+                        field,
+                    });
+                }
+            }
+        };
+        check("workspaces", &self.workspaces);
+        check("hooks", &self.hooks);
+        check("rules", &self.rules);
+        check("labels", &self.labels);
+        check("queues", &self.queues);
+        check("schemas", &self.schemas);
+        check("inboxes", &self.inboxes);
+        check("email_templates", &self.email_templates);
+        check("engines", &self.engines);
+        check("engine_fields", &self.engine_fields);
+        out
+    }
 }
 
 /// Build a [`FieldLimitViolation`] from a [`crate::snapshot::limits::LimitViolation`],
@@ -254,6 +315,17 @@ pub struct FieldLimitViolation {
     pub limit: usize,
     /// The local value's length, in characters.
     pub actual: usize,
+}
+
+/// One object the push would CREATE without a field the API requires on
+/// create, as reported by [`ChangeList::missing_create_fields`].
+#[derive(Debug)]
+pub struct MissingCreateField {
+    pub kind: &'static str,
+    pub slug: String,
+    pub path: std::path::PathBuf,
+    /// The absent field, from [`crate::snapshot::limits::required_for_create`].
+    pub field: &'static str,
 }
 
 /// One unparseable changed local file, as reported by
@@ -1149,6 +1221,80 @@ pub fn detect_slug_collisions(paths: &Paths) -> BTreeMap<String, Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Helper: a ChangeList holding one inbox file with the given body.
+    fn inbox_change(
+        dir: &std::path::Path,
+        body: serde_json::Value,
+    ) -> (ChangeList, std::path::PathBuf) {
+        let p = dir.join("inbox.json");
+        std::fs::write(&p, serde_json::to_vec(&body).unwrap()).unwrap();
+        let mut cl = ChangeList::default();
+        cl.inboxes.insert("invoices".to_string(), p.clone());
+        (cl, p)
+    }
+
+    /// The failure this check exists for: an inbox with no `email_prefix` that
+    /// the push would POST. `POST /inboxes` rejects it permanently, aborting
+    /// the cycle after earlier kinds are already created.
+    #[test]
+    fn missing_create_fields_reports_new_inbox_without_email_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cl, p) = inbox_change(tmp.path(), serde_json::json!({ "name": "In" }));
+
+        let v = cl.missing_create_fields(&Lockfile::default());
+        assert_eq!(v.len(), 1, "expected exactly one missing field: {v:?}");
+        assert_eq!(v[0].kind, "inboxes");
+        assert_eq!(v[0].slug, "invoices");
+        assert_eq!(v[0].path, p);
+        assert_eq!(v[0].field, "email_prefix");
+    }
+
+    #[test]
+    fn missing_create_fields_ignores_new_inbox_with_email_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cl, _) = inbox_change(
+            tmp.path(),
+            serde_json::json!({ "name": "In", "email_prefix": "acme" }),
+        );
+        assert!(cl.missing_create_fields(&Lockfile::default()).is_empty());
+    }
+
+    /// A tracked inbox is PATCHed, and a PATCH that omits `email_prefix`
+    /// leaves the remote's own address alone — blocking it would refuse a
+    /// legitimate push.
+    #[test]
+    fn missing_create_fields_ignores_a_tracked_inbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cl, _) = inbox_change(tmp.path(), serde_json::json!({ "name": "In" }));
+        let mut lf = Lockfile::default();
+        lf.upsert(
+            "inboxes",
+            "invoices",
+            crate::state::ObjectEntry {
+                id: 7,
+                modified_at: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        assert!(cl.missing_create_fields(&lf).is_empty());
+    }
+
+    /// A hand-written `email` cannot stand in for the prefix: `strip_for_create`
+    /// removes it before the POST, so the body still reaches the API without
+    /// either field.
+    #[test]
+    fn missing_create_fields_does_not_accept_a_stripped_email() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cl, _) = inbox_change(
+            tmp.path(),
+            serde_json::json!({ "name": "In", "email": "in-a1b2c3@acme.rossum.app" }),
+        );
+        let v = cl.missing_create_fields(&Lockfile::default());
+        assert_eq!(v.len(), 1, "strip_for_create drops `email`: {v:?}");
+        assert_eq!(v[0].field, "email_prefix");
+    }
 
     /// An oversized field in a changed local file must be reported with
     /// enough context to fix it: kind, slug, path, field, actual, limit.

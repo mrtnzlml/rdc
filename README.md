@@ -289,7 +289,9 @@ rdc migrate test prod --migrate-score-thresholds # promote thresholds too
 
 ### Inbox email prefixes
 
-An inbox's `email_prefix` is the left-hand side of its **public address** — Rossum derives `email` as `<email_prefix>-<hash>@<host>` — so promoting the source env's value re-addresses the target's mailbox and mail sent to the old address stops arriving. migrate therefore **ignores it by default**: a matched target keeps its own prefix, and a brand-new inbox drops the field so the server derives the target env's own address. Pass `--migrate-email-prefixes` to carry the source env's value instead.
+An inbox's `email_prefix` is the left-hand side of its **public address** — Rossum derives `email` as `<email_prefix>-<hash>@<host>` — so promoting the source env's value re-addresses the target's mailbox and mail sent to the old address stops arriving. migrate therefore **ignores it by default**: a target that already has a prefix keeps its own. Pass `--migrate-email-prefixes` to carry the source env's value instead.
+
+A **brand-new** inbox is the exception, because the field is mandatory on create: `POST /inboxes` rejects a body with neither `email_prefix` nor `email`, and rdc strips the server-derived `email`. Such an inbox keeps the source's prefix — nobody is sending to a mailbox that does not exist yet, so there is no address to strand — and migrate `warn`s for each one, naming the overlay key that overrides it. The warning repeats on every migrate until the inbox is deployed or you change the value.
 
 ```sh
 rdc migrate test prod                           # prod keeps its own inbox address

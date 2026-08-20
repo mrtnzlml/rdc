@@ -278,10 +278,96 @@ pub fn check_text(field: impl Into<String>, limit: usize, text: &str) -> Option<
     (actual > limit).then(|| LimitViolation { field: field.into(), limit, actual })
 }
 
+/// Fields the API refuses to CREATE an object without, and that rdc can
+/// legitimately end up not sending.
+///
+/// Deliberately tiny, and for the same reason [`field_limits`] is: the server
+/// stays the authority, this is only an earlier and friendlier rejection. A
+/// kind is listed here only when a *local, decidable* condition makes the
+/// create doomed — never to re-declare the API's whole schema.
+///
+/// - **`inboxes` → `email_prefix`.** `POST /inboxes` answers
+///   `400 non_field_errors: One of fields 'email_prefix' or 'email' needs to be
+///   provided` (observed live). `email` cannot satisfy it from rdc's side:
+///   [`crate::snapshot::create::strip_for_create`] removes it for inboxes
+///   because it is server-derived (`<email_prefix>-<hash>@<host>`), so a
+///   hand-written `email` never reaches the wire either. That leaves
+///   `email_prefix` as the operative requirement.
+///
+/// Checked only for objects the push will POST; a PATCH that omits a key
+/// leaves the remote's value alone and needs nothing from this table.
+pub fn required_for_create(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "inboxes" => &["email_prefix"],
+        _ => &[],
+    }
+}
+
+/// The [`required_for_create`] fields missing from one create payload.
+///
+/// "Missing" means absent, `null`, or an empty/whitespace-only string — all
+/// three fail the server's `blank=False` check identically, and treating an
+/// empty string as present would let the doomed body through.
+pub fn missing_required_for_create(kind: &str, body: &Value) -> Vec<&'static str> {
+    let Some(obj) = body.as_object() else {
+        return Vec::new();
+    };
+    required_for_create(kind)
+        .iter()
+        .copied()
+        .filter(|field| match obj.get(*field) {
+            None | Some(Value::Null) => true,
+            Some(Value::String(s)) => s.trim().is_empty(),
+            Some(_) => false,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn new_inbox_without_email_prefix_is_reported() {
+        // The shape `migrate` produced for every brand-new inbox: no
+        // `email_prefix` (dropped as env-specific) and no `email`
+        // (`strip_for_create` removes it) — a body `POST /inboxes` rejects.
+        let body = json!({ "name": "In", "queues": ["rdc://queues/invoices"] });
+        assert_eq!(missing_required_for_create("inboxes", &body), vec!["email_prefix"]);
+    }
+
+    #[test]
+    fn new_inbox_with_email_prefix_passes() {
+        let body = json!({ "name": "In", "email_prefix": "acme" });
+        assert!(missing_required_for_create("inboxes", &body).is_empty());
+    }
+
+    #[test]
+    fn null_or_blank_email_prefix_counts_as_missing() {
+        // Both reach the server as "no prefix": `null` fails the same
+        // non_field_errors check, and an empty string fails `blank=False`.
+        for v in [json!(null), json!(""), json!("   ")] {
+            let body = json!({ "name": "In", "email_prefix": v });
+            assert_eq!(
+                missing_required_for_create("inboxes", &body),
+                vec!["email_prefix"],
+                "expected {v} to count as missing"
+            );
+        }
+    }
+
+    #[test]
+    fn other_kinds_have_no_create_requirements() {
+        // The table is opt-in per kind; nothing else may be blocked offline.
+        for kind in ["hooks", "queues", "schemas", "workspaces", "rules", "labels"] {
+            assert!(
+                required_for_create(kind).is_empty(),
+                "{kind} must not gain an offline create requirement"
+            );
+            assert!(missing_required_for_create(kind, &json!({})).is_empty());
+        }
+    }
 
     /// The reported incident: a hook whose `description` grew past 2000
     /// characters. Before this check, the only signal was a mid-push 400.

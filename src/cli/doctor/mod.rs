@@ -37,7 +37,7 @@ pub async fn run(env: &str, dry_run: bool) -> Result<()> {
     let log = Log::new(crate::cli::resolve::detect_color_mode());
 
     // 1. Pre-flight: local changes not yet pushed to the remote (offline).
-    let (unpushed, limit_violations) = scan_unpushed(&paths, &api_base)?;
+    let (unpushed, limit_violations, missing_create_fields) = scan_unpushed(&paths, &api_base)?;
 
     // Fields the API will reject on length. Reported here — the offline
     // pre-flight — because it is the cheapest place to learn: `rdc sync`
@@ -58,6 +58,26 @@ pub async fn run(env: &str, dry_run: bool) -> Result<()> {
                 v.actual,
                 v.limit,
                 v.actual.saturating_sub(v.limit),
+            ),
+        );
+    }
+
+    // Objects that would be CREATED without a field the API demands on create.
+    // Same reason as above for reporting it here: the value is decidable from
+    // local bytes, and the alternative is learning about it from a mid-push
+    // 400 that has already half-created the env.
+    for m in &missing_create_fields {
+        log.event(
+            Action::Warn,
+            &format!(
+                "{}/{} -- {}: `{}` is missing and POST /{} requires it; \
+                 `rdc sync {env}` will refuse to push until it is set \
+                 (in the file, or per env in envs/{env}/overlay.toml)",
+                m.kind,
+                m.slug,
+                m.path.display(),
+                m.field,
+                m.kind,
             ),
         );
     }
@@ -127,10 +147,14 @@ pub async fn run(env: &str, dry_run: bool) -> Result<()> {
 fn scan_unpushed(
     paths: &Paths,
     api_base: &str,
-) -> Result<(usize, Vec<crate::cli::push::scan::FieldLimitViolation>)> {
+) -> Result<(
+    usize,
+    Vec<crate::cli::push::scan::FieldLimitViolation>,
+    Vec<crate::cli::push::scan::MissingCreateField>,
+)> {
     let lockfile_path = paths.lockfile();
     if !lockfile_path.exists() {
-        return Ok((0, Vec::new()));
+        return Ok((0, Vec::new(), Vec::new()));
     }
     let mut lockfile = Lockfile::load(&lockfile_path)?;
     lockfile.api_base = api_base.to_string();
@@ -138,5 +162,6 @@ fn scan_unpushed(
     Ok((
         changes.total() + tombstones.total(),
         changes.field_limit_violations(),
+        changes.missing_create_fields(&lockfile),
     ))
 }

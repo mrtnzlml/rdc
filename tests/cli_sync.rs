@@ -9763,7 +9763,8 @@ async fn push_create_inbox_and_email_template() {
         "id": 300,
         "url": format!("{}/api/v1/inboxes/300", server.uri()),
         "name": "Cost Invoices Inbox",
-        "email": "cost-invoices@mock.rossum.app",
+        "email": "cost-invoices-a1b2c3@mock.rossum.app",
+        "email_prefix": "cost-invoices",
         "queues": [queue_url.clone()],
         "filters": [],
         "modified_at": "2026-05-01T08:00:00Z"
@@ -9885,10 +9886,16 @@ async fn push_create_inbox_and_email_template() {
     let q_dir = project
         .path()
         .join("envs/dev/workspaces/invoices-ap/queues/cost-invoices");
+    // `email_prefix` is mandatory on create — `POST /inboxes` answers
+    // `400 non_field_errors: One of fields 'email_prefix' or 'email' needs to
+    // be provided`, and rdc strips the server-derived `email`. The offline
+    // pre-flight refuses a create without it, so a fixture missing it would be
+    // testing a payload the real API rejects.
     let inbox_json = serde_json::json!({
         "id": 0, "url": "",
         "name": "Cost Invoices Inbox",
         "queues": ["rdc://queues/cost-invoices"],
+        "email_prefix": "cost-invoices",
         "filters": []
     });
     let mut b = serde_json::to_vec_pretty(&inbox_json).unwrap();
@@ -11724,6 +11731,92 @@ async fn sync_dry_run_reports_oversized_field() {
     assert!(
         combined.contains("description"),
         "dry run must name the offending field: {combined}"
+    );
+}
+
+/// A brand-new inbox with no `email_prefix` is the same class of defect:
+/// `POST /inboxes` answers `400 non_field_errors: One of fields 'email_prefix'
+/// or 'email' needs to be provided`, and rdc strips the server-derived `email`,
+/// so the create can never succeed. It has to be refused offline — the live
+/// failure created the workspaces, schemas and queues first and died on the
+/// first inbox, leaving the env half-built.
+#[tokio::test]
+async fn sync_refuses_inbox_without_email_prefix_before_any_network_call() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &[]).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // Pull once against the empty org so the lockfile exists.
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev", "--no-push", "--yes"])
+        .assert()
+        .success();
+
+    // A local-only queue tree whose inbox carries neither `email_prefix` nor
+    // `email` — exactly what `migrate` used to write into a fresh env.
+    let q_dir = project.path().join("envs/dev/workspaces/main/queues/invoices");
+    std::fs::create_dir_all(&q_dir).unwrap();
+    std::fs::write(
+        project.path().join("envs/dev/workspaces/main/workspace.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({ "name": "Main" })).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        q_dir.join("queue.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "Invoices",
+            "workspace": "rdc://workspaces/main",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        q_dir.join("inbox.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "Invoices Inbox",
+            "queues": ["rdc://queues/invoices"],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let before = server.received_requests().await.unwrap_or_default().len();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("email_prefix"))
+        .stderr(predicates::str::contains("inboxes/invoices"));
+
+    let after = server.received_requests().await.unwrap_or_default().len();
+    assert_eq!(
+        before, after,
+        "sync must refuse a doomed create without issuing ANY request; \
+         it made {} call(s) before failing",
+        after - before
     );
 }
 
