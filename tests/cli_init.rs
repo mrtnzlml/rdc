@@ -785,7 +785,7 @@ fn init_force_regenerates_a_markerless_pipeline() {
         .args(["init", "--force"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(".gitlab-ci.yml   rewritten"));
+        .stdout(predicate::str::contains(".gitlab-ci.yml                 rewritten"));
 
     let after = std::fs::read_to_string(dir.path().join(".gitlab-ci.yml")).unwrap();
     assert!(after.contains("- RDC_ENV: \"dev\""));
@@ -840,10 +840,10 @@ fn init_force_without_env_regenerates_scaffold_files() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Scaffold files:"))
-        .stdout(predicate::str::contains("CLAUDE.md        rewritten"))
-        .stdout(predicate::str::contains("README.md        rewritten"))
-        .stdout(predicate::str::contains(".gitlab-ci.yml   rewritten"))
-        .stdout(predicate::str::contains(".gitignore       unchanged"))
+        .stdout(predicate::str::contains("CLAUDE.md                      rewritten"))
+        .stdout(predicate::str::contains("README.md                      rewritten"))
+        .stdout(predicate::str::contains(".gitlab-ci.yml                 rewritten"))
+        .stdout(predicate::str::contains(".gitignore                     unchanged"))
         // Regenerate-only: no env was added, so no env line and no next steps.
         .stdout(predicate::str::contains("Added env(s)").not())
         .stdout(predicate::str::contains("Next steps").not());
@@ -892,9 +892,9 @@ fn init_force_reports_unchanged_when_scaffold_matches() {
         .args(["init", "--force"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("CLAUDE.md        unchanged"))
-        .stdout(predicate::str::contains("README.md        unchanged"))
-        .stdout(predicate::str::contains(".gitlab-ci.yml   unchanged"))
+        .stdout(predicate::str::contains("CLAUDE.md                      unchanged"))
+        .stdout(predicate::str::contains("README.md                      unchanged"))
+        .stdout(predicate::str::contains(".gitlab-ci.yml                 unchanged"))
         .stdout(predicate::str::contains("rewritten").not());
 }
 
@@ -912,7 +912,7 @@ fn init_force_with_env_adds_env_and_prints_summary() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains(".gitlab-ci.yml   created"))
+        .stdout(predicate::str::contains(".gitlab-ci.yml                 created"))
         .stdout(predicate::str::contains("Initialized rdc project with envs: dev"));
 
     assert!(dir.path().join(".gitlab-ci.yml").exists());
@@ -935,4 +935,86 @@ fn init_force_without_project_errors() {
 
     assert!(!dir.path().join("rdc.toml").exists());
     assert!(!dir.path().join(".gitlab-ci.yml").exists());
+}
+
+#[test]
+fn init_scaffolds_the_testkit_byte_for_byte() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "dev=https://example.rossum.app/api/v1:1"])
+        .assert()
+        .success();
+
+    for rel in [
+        "testkit/__init__.py",
+        "testkit/txscript_eval.py",
+        "testkit/test_txscript_eval.py",
+        "conftest.py",
+        "pytest.ini",
+        "requirements-dev.txt",
+    ] {
+        let written = std::fs::read_to_string(dir.path().join(rel)).unwrap();
+        let template = std::fs::read_to_string(format!("templates/{rel}")).unwrap();
+        assert_eq!(written, template, "{rel} must match templates/{rel}");
+    }
+}
+
+#[test]
+fn init_gitignores_the_python_caches() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "dev=https://example.rossum.app/api/v1:1"])
+        .assert()
+        .success();
+    let gitignore = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+    assert!(gitignore.contains("__pycache__/"));
+    assert!(gitignore.contains("/.pytest_cache"));
+}
+
+#[test]
+fn init_does_not_clobber_an_existing_testkit() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir(dir.path().join("testkit")).unwrap();
+    std::fs::write(dir.path().join("testkit/txscript_eval.py"), "mine\n").unwrap();
+    std::fs::write(dir.path().join("requirements-dev.txt"), "mine\n").unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "dev=https://example.rossum.app/api/v1:1"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("testkit/txscript_eval.py")).unwrap(),
+        "mine\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("requirements-dev.txt")).unwrap(),
+        "mine\n"
+    );
+}
+
+#[test]
+fn init_force_reports_every_testkit_file() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "dev=https://example.rossum.app/api/v1:1"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("testkit/txscript_eval.py"))
+        .stdout(predicate::str::contains("requirements-dev.txt"));
 }

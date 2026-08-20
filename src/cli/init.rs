@@ -110,13 +110,14 @@ pub async fn run(env_specs: Vec<String>, force: bool) -> Result<()> {
         cfg.save(&cfg_path)?;
     }
 
-    let scaffold: Vec<(&str, Scaffolded)> = vec![
+    let mut scaffold: Vec<(&str, Scaffolded)> = vec![
         (".gitignore", write_gitignore(&cwd)?),
         (".gitattributes", write_gitattributes(&cwd)?),
         ("CLAUDE.md", write_claude_md(&cwd, force)?),
         ("README.md", write_readme(&cwd, &cfg, force)?),
         (".gitlab-ci.yml", write_gitlab_ci(&cwd, &cfg, force)?),
     ];
+    scaffold.extend(write_testkit(&cwd, force)?);
     std::fs::create_dir_all(cwd.join("secrets"))
         .with_context(|| format!("creating {}", cwd.join("secrets").display()))?;
     for env in &new_env_names {
@@ -133,7 +134,7 @@ pub async fn run(env_specs: Vec<String>, force: bool) -> Result<()> {
     if force {
         println!("Scaffold files:");
         for (name, outcome) in &scaffold {
-            println!("  {name:<16} {}", outcome.label());
+            println!("  {name:<30} {}", outcome.label());
         }
     }
 
@@ -538,6 +539,9 @@ fn write_gitignore(root: &Path) -> Result<Scaffolded> {
         "/.rdc/state/*.lock",
         "/.rdc/state/*.base",
         "/.rdc/conflicts",
+        // pytest + CPython leave these beside the scaffolded testkit.
+        "__pycache__/",
+        "/.pytest_cache",
     ];
 
     if !path.exists() {
@@ -675,6 +679,22 @@ fn write_gitlab_ci(root: &Path, cfg: &ProjectConfig, force: bool) -> Result<Scaf
     }
 }
 
+/// Write the Python test harness and its pytest wiring. Same scaffold contract
+/// as every other template: each file is created when absent and replaced only
+/// under `--force`, so a project that has evolved its own copy keeps it.
+///
+/// The harness's own self-tests ship with it on purpose: `pytest -q` with
+/// nothing collected exits 5, which would make the pipeline's test job red on a
+/// project that has not written any tests yet.
+fn write_testkit(root: &Path, force: bool) -> Result<Vec<(&'static str, Scaffolded)>> {
+    std::fs::create_dir_all(root.join("testkit"))
+        .with_context(|| format!("creating {}", root.join("testkit").display()))?;
+    TESTKIT_TEMPLATES
+        .iter()
+        .map(|(rel, body)| Ok((*rel, write_template_file(&root.join(rel), body, force)?)))
+        .collect()
+}
+
 /// `write_template_file`'s force semantics against bytes already in hand.
 fn write_template_file_bytes(
     path: &Path,
@@ -788,10 +808,10 @@ fn write_readme(root: &Path, cfg: &ProjectConfig, force: bool) -> Result<Scaffol
     write_template_file(&path, &md, force)
 }
 
-/// Write the five init-time scaffold files (`.gitignore`, `.gitattributes`,
-/// `CLAUDE.md`, `README.md`, `.gitlab-ci.yml`) at `cwd`, given a single-env
-/// project shape. Idempotent: each underlying writer skips when the file
-/// already exists.
+/// Write the init-time scaffold files (`.gitignore`, `.gitattributes`,
+/// `CLAUDE.md`, `README.md`, `.gitlab-ci.yml`, and the Python testkit) at
+/// `cwd`, given a single-env project shape. Idempotent: each underlying
+/// writer skips when the file already exists.
 ///
 /// Exposed for embedders (e.g. the Rossum Local desktop app) that need
 /// a Connection folder to look identical to one produced by `rdc init`
@@ -815,12 +835,28 @@ pub fn write_scaffold_files(
     );
     write_readme(cwd, &cfg, false)?;
     write_gitlab_ci(cwd, &cfg, false)?;
+    write_testkit(cwd, false)?;
     Ok(())
 }
 
 /// The GitLab CI pipeline `rdc init` drops into a project, embedded from the
 /// repo's `templates/gitlab-ci.yml` (see [`write_gitlab_ci`]).
 pub(crate) const GITLAB_CI_TEMPLATE: &str = include_str!("../../templates/gitlab-ci.yml");
+
+/// The Python test harness `rdc init` scaffolds, embedded from `templates/`
+/// like the pipeline is, so the shipped copy and the repo copy cannot drift.
+/// Paired as (path relative to the project root, body).
+const TESTKIT_TEMPLATES: [(&str, &str); 6] = [
+    ("testkit/__init__.py", include_str!("../../templates/testkit/__init__.py")),
+    ("testkit/txscript_eval.py", include_str!("../../templates/testkit/txscript_eval.py")),
+    (
+        "testkit/test_txscript_eval.py",
+        include_str!("../../templates/testkit/test_txscript_eval.py"),
+    ),
+    ("conftest.py", include_str!("../../templates/conftest.py")),
+    ("pytest.ini", include_str!("../../templates/pytest.ini")),
+    ("requirements-dev.txt", include_str!("../../templates/requirements-dev.txt")),
+];
 
 const CLAUDE_MD_TEMPLATE: &str = r#"# Agent guide
 
@@ -843,6 +879,8 @@ code.
 ```
 rdc.toml                                  project + env definitions
 .gitlab-ci.yml                            scheduled archive + deploy buttons; fill in its TODOs
+testkit/                                  formula/hook test harness (real txscript); `pytest -q`
+requirements-dev.txt                      pinned pytest + txscript for the CI test job
 secrets/<env>.secrets.json                API tokens (gitignored)
 envs/<env>/
   _index.md                               auto-regenerated; do not edit
@@ -1021,6 +1059,12 @@ mod tests {
             "CLAUDE.md",
             "README.md",
             ".gitlab-ci.yml",
+            "testkit/__init__.py",
+            "testkit/txscript_eval.py",
+            "testkit/test_txscript_eval.py",
+            "conftest.py",
+            "pytest.ini",
+            "requirements-dev.txt",
         ] {
             assert!(dir.path().join(name).exists(), "{name} should be written");
         }
