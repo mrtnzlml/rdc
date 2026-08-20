@@ -100,19 +100,23 @@ pub fn save_password_credentials(
 /// still applies (e.g. `dev-us` and `dev_us` normalize to the same
 /// suffix). The `rdc init` wizard prevents this collision at project
 /// creation time.
+/// The normalized, shell-safe suffix rdc appends to a per-env credential
+/// variable name: ASCII alphanumerics uppercased, every other character `_`
+/// (so the shell can export it). `dev-us` -> `DEV_US`.
+pub fn env_var_suffix(env: &str) -> String {
+    env.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 pub fn env_var_for(env: &str, suffix: &str) -> String {
-    let mut out = String::with_capacity("RDC_".len() + suffix.len() + 1 + env.len());
-    out.push_str("RDC_");
-    out.push_str(suffix);
-    out.push('_');
-    for c in env.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_uppercase());
-        } else {
-            out.push('_');
-        }
-    }
-    out
+    format!("RDC_{suffix}_{}", env_var_suffix(env))
 }
 
 /// Outcome of synchronously inspecting the per-env credential
