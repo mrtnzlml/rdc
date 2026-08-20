@@ -664,7 +664,8 @@ fn write_gitlab_ci(root: &Path, cfg: &ProjectConfig, force: bool) -> Result<Scaf
         return write_template_file_bytes(&path, generated()?.as_bytes(), &existing, force);
     };
 
-    match crate::cli::gitlab_ci::splice(&text, &crate::cli::gitlab_ci::render_regions(&cfg.envs))
+    let regions = crate::cli::gitlab_ci::render_regions(&cfg.envs);
+    match crate::cli::regions::splice(&text, &regions, crate::cli::regions::YAML)
         .with_context(|| format!("updating the rdc regions in {}", path.display()))?
     {
         Some(spliced) => {
