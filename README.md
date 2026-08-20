@@ -20,15 +20,21 @@ Homebrew (macOS, Linux x86_64):
 brew install mrtnzlml/tap/rdc
 ```
 
-Windows (PowerShell):
+Windows (PowerShell). Needs an authenticated [GitHub CLI](https://cli.github.com)
+(`gh auth login`) because this repo is private — `github.com/.../releases/download/...`
+serves a browser session only and 404s otherwise, even with a token:
 
 ```powershell
 $dest = "$env:USERPROFILE\.rdc\bin"
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
-Invoke-WebRequest -Uri "https://github.com/mrtnzlml/rdc/releases/latest/download/rdc-x86_64-pc-windows-msvc.tar.gz" -OutFile "$env:TEMP\rdc.tar.gz"
-tar -xzf "$env:TEMP\rdc.tar.gz" -C $dest
+gh release download --repo mrtnzlml/rdc --pattern "*-x86_64-pc-windows-msvc.tar.gz" --dir $env:TEMP --clobber
+$tgz = Get-ChildItem "$env:TEMP\*-x86_64-pc-windows-msvc.tar.gz" | Select-Object -First 1
+tar -xzf $tgz.FullName -C $dest
 [Environment]::SetEnvironmentVariable("Path", "$env:Path;$dest", "User")
 ```
+
+The `--pattern` matches on the platform suffix rather than a full filename, so it
+keeps working as the version in the asset name changes.
 
 From source:
 
@@ -64,7 +70,31 @@ connections and pulling Rossum orgs into local folders. It bridges to the rdc
 core in-process through the `rdc_bridge` crate (via
 [flutter_rust_bridge](https://cjycode.com/flutter_rust_bridge/)) and shares the
 same on-disk project format as the CLI, so both operate on the same folders.
-See [`desktop/README.md`](desktop/README.md) to build and run it.
+See [`desktop/README.md`](desktop/README.md) to build and run it from source.
+
+### Download
+
+Pre-built apps ship with every release, alongside the CLI binaries:
+
+| Asset | Platform |
+| --- | --- |
+| `rdc-desktop-<version>.dmg` | macOS (universal — Intel + Apple Silicon) |
+| `rdc-desktop-<version>-windows-x64.zip` | Windows x86_64 |
+| `rdc-desktop-<version>-linux-x64.tar.gz` | Linux x86_64 |
+
+```sh
+gh release download --repo mrtnzlml/rdc --pattern "rdc-desktop-*.dmg"
+```
+
+The macOS build is **ad-hoc signed and not notarized**. Downloading it with
+`gh` or `curl` attaches no quarantine attribute, so it opens normally. A
+*browser* download is quarantined, and since macOS 15 the Control-click bypass
+is gone — allow it under System Settings → Privacy & Security → "Open Anyway",
+or strip the attribute yourself:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/rdc.app
+```
 
 ## Quick start
 

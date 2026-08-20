@@ -46,23 +46,45 @@ jobs:
 
       - name: Package
         shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
-          cd target/${{ matrix.target }}/release
+          # Asset names carry the version so a downloaded tarball identifies
+          # itself. templates/gitlab-ci.yml matches on the trailing platform
+          # suffix, which keeps working for the pre-0.7 unversioned names too.
+          version=${TAG#v}
+          src=target/${{ matrix.target }}/release
+          mkdir -p dist
           # Pick `rdc.exe` on Windows, `rdc` otherwise.
           binary=rdc
-          [ -f rdc.exe ] && binary=rdc.exe
-          tar czf ../../../rdc-${{ matrix.target }}.tar.gz "$binary"
+          if [ -f "$src/rdc.exe" ]; then binary=rdc.exe; fi
+          tar czf "dist/rdc-$version-${{ matrix.target }}.tar.gz" -C "$src" "$binary"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: rdc-${{ matrix.target }}
-          path: rdc-${{ matrix.target }}.tar.gz
+          path: dist/*
           retention-days: 1
+
+  # The desktop app ships in this same release. Deliberately its own job: a
+  # desktop failure must never withhold the CLI binaries -- see `release`'s
+  # `if`. Calls the same reusable workflow the manual probe runs, so the
+  # verified path and the release path cannot drift.
+  build-desktop:
+    name: Build desktop
+    uses: ./.github/workflows/desktop-build.yml
+    secrets: inherit
+    with:
+      version_label: ${{ github.ref_name }}
 
   release:
     name: Publish release
-    needs: build
+    needs: [build, build-desktop]
+    # Publish as long as the CLI matrix succeeded, whatever the desktop jobs
+    # did. Without `always()` a failed desktop build would skip this job and
+    # withhold the CLI tarballs.
+    if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -79,7 +101,10 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.tar.gz
+          # Widened from *.tar.gz to also pick up the desktop .dmg and .zip.
+          # The glob still matches the CLI tarballs when the desktop jobs
+          # failed, so fail_on_unmatched_files keeps the strength it had.
+          files: artifacts/*
           generate_release_notes: true
           fail_on_unmatched_files: true
 
@@ -108,9 +133,9 @@ jobs:
           version="${TAG#v}"
           base="https://github.com/mrtnzlml/rdc/releases/download/${TAG}"
           sha_of() { curl -fsSL "$1" | sha256sum | awk '{ print $1 }'; }
-          darwin_arm_sha=$(sha_of "$base/rdc-aarch64-apple-darwin.tar.gz")
-          darwin_x86_sha=$(sha_of "$base/rdc-x86_64-apple-darwin.tar.gz")
-          linux_x86_sha=$(sha_of "$base/rdc-x86_64-unknown-linux-gnu.tar.gz")
+          darwin_arm_sha=$(sha_of "$base/rdc-${version}-aarch64-apple-darwin.tar.gz")
+          darwin_x86_sha=$(sha_of "$base/rdc-${version}-x86_64-apple-darwin.tar.gz")
+          linux_x86_sha=$(sha_of "$base/rdc-${version}-x86_64-unknown-linux-gnu.tar.gz")
 
           mkdir -p tap/Formula
           cat > tap/Formula/rdc.rb <<RUBY
@@ -122,18 +147,18 @@ jobs:
 
             on_macos do
               on_arm do
-                url "${base}/rdc-aarch64-apple-darwin.tar.gz"
+                url "${base}/rdc-${version}-aarch64-apple-darwin.tar.gz"
                 sha256 "${darwin_arm_sha}"
               end
               on_intel do
-                url "${base}/rdc-x86_64-apple-darwin.tar.gz"
+                url "${base}/rdc-${version}-x86_64-apple-darwin.tar.gz"
                 sha256 "${darwin_x86_sha}"
               end
             end
 
             on_linux do
               on_intel do
-                url "${base}/rdc-x86_64-unknown-linux-gnu.tar.gz"
+                url "${base}/rdc-${version}-x86_64-unknown-linux-gnu.tar.gz"
                 sha256 "${linux_x86_sha}"
               end
             end

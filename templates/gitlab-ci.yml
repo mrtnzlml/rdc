@@ -33,7 +33,11 @@ variables:
   # unattended, destructive sync does.
   RDC_VERSION: "v0.6.0"
   RDC_REPO: "mrtnzlml/rdc"
-  RDC_ASSET: "rdc-x86_64-unknown-linux-gnu.tar.gz"
+  # Matched against the END of the asset name, because release assets carry the
+  # version (rdc-0.7.0-x86_64-unknown-linux-gnu.tar.gz). A suffix also matches
+  # the pre-0.7 unversioned names, so this pipeline works against old and new
+  # releases alike. Swap the platform here to install a different build.
+  RDC_ASSET_SUFFIX: "-x86_64-unknown-linux-gnu.tar.gz"
   # Commit-back author and committer. GitLab push rules can require these to
   # match a pattern; if yours does, use an address that satisfies it.
   RDC_GIT_EMAIL: "rdc-ci@example.com"  # TODO
@@ -65,8 +69,14 @@ variables:
       release=$(curl -sSfL -H "$auth" "$api/releases?per_page=100" | PREFIX="$pfx" python3 -c 'import json,os,sys; p=os.environ["PREFIX"]+"."; r=[x for x in json.load(sys.stdin) if not x["draft"] and not x["prerelease"] and x["tag_name"].startswith(p)]; sys.exit("no release matching "+p+"*") if not r else json.dump(r[0], sys.stdout)')
       ;;
   esac
-  asset_id=$(printf '%s' "$release" | ASSET=$RDC_ASSET python3 -c 'import json,os,sys; print(*[a["id"] for a in json.load(sys.stdin)["assets"] if a["name"]==os.environ["ASSET"]])')
-  : "${asset_id:?no asset named $RDC_ASSET for RDC_VERSION=$RDC_VERSION}"
+  # RDC_ASSET (an exact name) was replaced by RDC_ASSET_SUFFIX. Fail loudly
+  # rather than silently ignore a stale override and install the wrong build.
+  if [ -n "${RDC_ASSET:-}" ]; then
+    echo "RDC_ASSET is gone; use RDC_ASSET_SUFFIX (e.g. -x86_64-unknown-linux-gnu.tar.gz)" >&2
+    exit 1
+  fi
+  asset_id=$(printf '%s' "$release" | SUFFIX=$RDC_ASSET_SUFFIX python3 -c 'import json,os,sys; s=os.environ["SUFFIX"]; m=[a["id"] for a in json.load(sys.stdin)["assets"] if a["name"].endswith(s)]; sys.exit("expected exactly 1 asset ending in "+s+", found "+str(len(m))) if len(m)!=1 else print(m[0])')
+  : "${asset_id:?no asset ending in $RDC_ASSET_SUFFIX for RDC_VERSION=$RDC_VERSION}"
   curl -sSfL -H "$auth" -H "Accept: application/octet-stream" \
     "https://api.github.com/repos/$RDC_REPO/releases/assets/$asset_id" \
     | tar -xz -C "$install_dir"
