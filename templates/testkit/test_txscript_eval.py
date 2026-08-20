@@ -80,6 +80,7 @@ def queue(tmp_path, **formulas):
                     {"category": "datapoint", "id": "due_date_out", "type": "date"},
                     {"category": "datapoint", "id": "terms", "type": "enum", "enum_value_type": "string"},
                     {"category": "datapoint", "id": "terms_out", "type": "string"},
+                    {"category": "datapoint", "id": "terms_numeric", "type": "enum", "enum_value_type": "number"},
                     {"category": "datapoint", "id": "row_total", "type": "number"},
                 ],
             },
@@ -154,8 +155,16 @@ def test_a_date_the_runtime_cannot_parse_reads_empty(tmp_path):
 
 
 def test_enum_field_behaves_as_its_value_type(tmp_path):
-    formulas = queue(tmp_path, terms_out="default_to(field.terms, \"\").upper()")
+    """enum_value_type decides the Python type: the common `string` case reads as
+    text, while `number` really arrives as a number -- which an all-string
+    synthesized schema cannot reproduce."""
+    formulas = queue(
+        tmp_path,
+        terms_out='default_to(field.terms, "").upper()',
+        row_total="field.terms_numeric * 2",
+    )
     assert evaluate_formula(formulas / "terms_out.py", terms="net30") == "NET30"
+    assert evaluate_formula(formulas / "row_total.py", terms_numeric="30") == 60.0
 
 
 def test_unknown_input_field_is_rejected(tmp_path):

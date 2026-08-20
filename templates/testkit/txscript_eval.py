@@ -8,7 +8,7 @@ version bump should only require changes here. It supports txscript 1.1.0 and
 
 When the formula sits in an rdc snapshot -- `<queue>/formulas/<field_id>.py`
 next to `<queue>/schema.json` -- the queue's real schema is used, so field types
-(number, date, boolean, enum), the line-item table structure, and the set of
+(number, date, enum), the line-item table structure, and the set of
 fields that exist are the tenant's own. A formula with no schema beside it falls
 back to a synthesized all-string schema, which is enough for testing a formula
 written inline in a test.
