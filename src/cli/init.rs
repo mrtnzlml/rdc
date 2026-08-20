@@ -604,22 +604,16 @@ fn write_gitattributes(root: &Path) -> Result<Scaffolded> {
 /// created, an existing one is left alone unless `force`. Under `--force` the
 /// bytes are compared first, so re-running on an untouched project reports
 /// `Unchanged` instead of churning mtimes (and the comparison is byte-wise, so
-/// a hand-edited file that isn't valid UTF-8 doesn't fail the run).
+/// a hand-edited file that isn't valid UTF-8 doesn't fail the run) --
+/// delegated to [`write_template_file_bytes`] once the existing bytes (if
+/// any) are in hand.
 fn write_template_file(path: &Path, body: &str, force: bool) -> Result<Scaffolded> {
-    if path.exists() {
-        if !force {
-            return Ok(Scaffolded::Unchanged);
-        }
-        let existing =
-            std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        if existing == body.as_bytes() {
-            return Ok(Scaffolded::Unchanged);
-        }
+    if !path.exists() {
         write_atomic(path, body.as_bytes())?;
-        return Ok(Scaffolded::Rewritten);
+        return Ok(Scaffolded::Created);
     }
-    write_atomic(path, body.as_bytes())?;
-    Ok(Scaffolded::Created)
+    let existing = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    write_template_file_bytes(path, body.as_bytes(), &existing, force)
 }
 
 /// Write the GitLab CI pipeline at `<root>/.gitlab-ci.yml`.
@@ -1041,6 +1035,24 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join(".gitlab-ci.yml")).unwrap(),
             crate::cli::gitlab_ci::generate(GITLAB_CI_TEMPLATE, &cfg.envs).unwrap()
+        );
+    }
+
+    /// A hand-emptied `rdc.toml` (no envs at all) must not reach the splicer:
+    /// `render_archive_envs` would emit an empty `parallel:matrix`, which
+    /// isn't valid YAML. Falling back to the verbatim template keeps the
+    /// committed example (`dev`/`prod`/`test`) intact instead.
+    #[test]
+    fn write_gitlab_ci_with_no_envs_writes_the_template_verbatim() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = ProjectConfig::default();
+        assert!(cfg.envs.is_empty());
+
+        write_gitlab_ci(dir.path(), &cfg, false).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".gitlab-ci.yml")).unwrap(),
+            GITLAB_CI_TEMPLATE
         );
     }
 
