@@ -174,6 +174,90 @@ fn init_does_not_clobber_existing_claude_md() {
     assert_eq!(after, user_content, "init must not overwrite a pre-existing CLAUDE.md");
 }
 
+/// `rdc init` prefills the generated regions of both CLAUDE.md and README.md
+/// straight from `rdc.toml` — the env table (with credential suffix) and the
+/// promote recipe naming this project's own envs.
+#[test]
+fn init_prefills_the_docs_from_rdc_toml() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--env", "dev=https://example.rossum.app/api/v1:11",
+            "--env", "prod-eu=https://example.rossum.app/api/v1:22",
+        ])
+        .assert()
+        .success();
+
+    let claude = std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
+    assert!(claude.contains("| `dev` | `https://example.rossum.app/api/v1` | 11 | `DEV` |"));
+    assert!(claude.contains("| `prod-eu` | `https://example.rossum.app/api/v1` | 22 | `PROD_EU` |"));
+    assert!(claude.contains("rdc migrate dev prod-eu --dry-run"));
+    // the two factual fixes
+    assert!(!claude.contains("project name"), "rdc.toml has no project name");
+    assert!(!claude.contains("fill in its TODOs"));
+
+    let readme = std::fs::read_to_string(dir.path().join("README.md")).unwrap();
+    assert!(readme.contains("| `dev` | `https://example.rossum.app/api/v1` | 11 | `DEV` |"));
+}
+
+/// The generated regions refresh on a later `rdc init` that adds an env,
+/// while hand-added prose outside the regions survives untouched.
+#[test]
+fn init_refreshes_the_doc_regions_when_an_env_is_added() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "dev=https://example.rossum.app/api/v1:11"])
+        .assert()
+        .success();
+
+    // the user's own prose, outside the regions
+    let claude_path = dir.path().join("CLAUDE.md");
+    let mut claude = std::fs::read_to_string(&claude_path).unwrap();
+    claude.push_str("\n## House rules\n\nAlways run the linter.\n");
+    std::fs::write(&claude_path, &claude).unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "test=https://example.rossum.app/api/v1:22"])
+        .assert()
+        .success();
+
+    let after = std::fs::read_to_string(&claude_path).unwrap();
+    assert!(after.contains("## House rules"), "hand-added prose must survive");
+    assert!(after.contains("| `test` |"), "the new env must reach the table");
+    assert!(after.contains("rdc migrate dev test --dry-run"), "promote pair must refresh");
+}
+
+/// A CLAUDE.md with no rdc region markers at all (fully hand-written) is
+/// never spliced, matching the pipeline's contract for a hand-written file.
+#[test]
+fn init_never_touches_docs_without_rdc_markers() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "dev=https://example.rossum.app/api/v1:11"])
+        .assert()
+        .success();
+    let hand = "# My own guide\n\nNothing generated here.\n";
+    std::fs::write(dir.path().join("CLAUDE.md"), hand).unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "test=https://example.rossum.app/api/v1:22"])
+        .assert()
+        .success();
+
+    assert_eq!(std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap(), hand);
+}
+
 /// Fresh init must drop a README.md with the run-the-project commands —
 /// `rdc sync` for every env defined in `rdc.toml` and pointers to the
 /// other doc surfaces. Single-env projects have nothing to deploy, so

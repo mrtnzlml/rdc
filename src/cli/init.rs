@@ -113,7 +113,7 @@ pub async fn run(env_specs: Vec<String>, force: bool) -> Result<()> {
     let mut scaffold: Vec<(&str, Scaffolded)> = vec![
         (".gitignore", write_gitignore(&cwd)?),
         (".gitattributes", write_gitattributes(&cwd)?),
-        ("CLAUDE.md", write_claude_md(&cwd, force)?),
+        ("CLAUDE.md", write_claude_md(&cwd, &cfg, force)?),
         ("README.md", write_readme(&cwd, &cfg, force)?),
         (".gitlab-ci.yml", write_gitlab_ci(&cwd, &cfg, force)?),
     ];
@@ -713,32 +713,77 @@ fn write_template_file_bytes(
     Ok(Scaffolded::Rewritten)
 }
 
-/// Write an agent guide at `<root>/CLAUDE.md`. Unlike `_index.md`, this
-/// is a once-only file — `rdc init` creates it, but sync never
-/// overwrites it. Existing files (e.g. when re-running init on an
-/// already-bootstrapped repo, or when the user has hand-edited the
-/// guide) are left untouched unless `force` is set.
-fn write_claude_md(root: &Path, force: bool) -> Result<Scaffolded> {
-    write_template_file(&root.join("CLAUDE.md"), CLAUDE_MD_TEMPLATE, force)
+/// Write an agent guide at `<root>/CLAUDE.md`.
+///
+/// Mostly a static template, with two generated regions (the env table and the
+/// promote walkthrough) filled from `cfg`. Like the pipeline, an existing file
+/// carrying the markers has only its regions refreshed — so a project's own
+/// notes survive every `rdc init` — and a file with no markers is left alone
+/// unless `--force`.
+fn write_claude_md(root: &Path, cfg: &ProjectConfig, force: bool) -> Result<Scaffolded> {
+    write_doc_with_regions(&root.join("CLAUDE.md"), CLAUDE_MD_TEMPLATE, cfg, force)
+}
+
+/// Shared body for the two Markdown scaffolds: generate from `template` when
+/// absent, splice the rdc regions when present, honour `--force` for a file
+/// that has no markers at all.
+fn write_doc_with_regions(
+    path: &Path,
+    template: &str,
+    cfg: &ProjectConfig,
+    force: bool,
+) -> Result<Scaffolded> {
+    let regions = crate::cli::scaffold_docs::render_doc_regions(&cfg.envs);
+    let style = crate::cli::regions::MARKDOWN;
+    let generated = || -> Result<String> {
+        crate::cli::regions::splice(template, &regions, style)?.ok_or_else(|| {
+            anyhow!(
+                "the embedded template for {} has no rdc region markers",
+                path.display()
+            )
+        })
+    };
+
+    if !path.exists() {
+        let body = generated()?;
+        write_atomic(path, body.as_bytes())?;
+        return Ok(Scaffolded::Created);
+    }
+
+    let existing = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let Ok(text) = String::from_utf8(existing.clone()) else {
+        return write_template_file_bytes(path, generated()?.as_bytes(), &existing, force);
+    };
+    match crate::cli::regions::splice(&text, &regions, style)
+        .with_context(|| format!("updating the rdc regions in {}", path.display()))?
+    {
+        Some(spliced) => {
+            if spliced.as_bytes() == existing.as_slice() {
+                Ok(Scaffolded::Unchanged)
+            } else {
+                write_atomic(path, spliced.as_bytes())?;
+                Ok(Scaffolded::Merged)
+            }
+        }
+        None => write_template_file_bytes(path, generated()?.as_bytes(), &existing, force),
+    }
 }
 
 /// Write a human-facing `README.md` at the project root listing the
 /// run-the-project commands: one `rdc sync <env>` per env defined in
 /// `cfg`, and — when there are at least two envs — a promote example
-/// (`rdc migrate` + `rdc sync`) using the first two envs alphabetically. Same
-/// once-only contract as [`write_claude_md`]: skipped when README.md
-/// already exists (unless `force`), so the user's content is never
-/// clobbered by an ordinary init.
+/// (`rdc migrate` + `rdc sync`) using the first two envs alphabetically,
+/// plus a generated `## Environments` table (see [`write_claude_md`]).
+/// Same scaffold contract as [`write_claude_md`]: everything outside the
+/// `rdc:envs` region is written once and left alone on a later `rdc init`
+/// (unless `force`), while the region itself is refreshed every time so it
+/// never drifts from `rdc.toml`.
 ///
 /// Title is the project root's basename (matches the user's mental
 /// model of "what is this repo called"); falls back to a generic title
 /// when the basename isn't valid UTF-8 or is empty.
 fn write_readme(root: &Path, cfg: &ProjectConfig, force: bool) -> Result<Scaffolded> {
     let path = root.join("README.md");
-    // Cheap exit before building the body, which the non-force path throws away.
-    if path.exists() && !force {
-        return Ok(Scaffolded::Unchanged);
-    }
     let title = root
         .file_name()
         .and_then(|n| n.to_str())
@@ -769,6 +814,13 @@ fn write_readme(root: &Path, cfg: &ProjectConfig, force: bool) -> Result<Scaffol
         }
         md.push_str("```\n\n");
     }
+
+    // Unconditional: write_doc_with_regions errors if the template it splices
+    // carries no markers, so a hand-emptied rdc.toml must still produce one
+    // (render_envs renders a "No environments defined yet" line for that case).
+    md.push_str("## Environments\n\n");
+    md.push_str("<!-- >>> rdc:envs (generated from rdc.toml — `rdc init` refreshes it) -->\n");
+    md.push_str("<!-- <<< rdc:envs -->\n\n");
 
     // Promote section only when there are two envs to promote between.
     // BTreeMap iteration is already sorted, so the first two keys give
@@ -806,7 +858,7 @@ fn write_readme(root: &Path, cfg: &ProjectConfig, force: bool) -> Result<Scaffol
          env; its header lists the CI variables to set.\n",
     );
 
-    write_template_file(&path, &md, force)
+    write_doc_with_regions(&path, &md, cfg, force)
 }
 
 /// Write the init-time scaffold files (`.gitignore`, `.gitattributes`,
@@ -825,7 +877,6 @@ pub fn write_scaffold_files(
 ) -> Result<()> {
     write_gitignore(cwd)?;
     write_gitattributes(cwd)?;
-    write_claude_md(cwd, false)?;
     let mut cfg = ProjectConfig::default();
     cfg.envs.insert(
         env_name.to_string(),
@@ -834,6 +885,7 @@ pub fn write_scaffold_files(
             org_id,
         },
     );
+    write_claude_md(cwd, &cfg, false)?;
     write_readme(cwd, &cfg, false)?;
     write_gitlab_ci(cwd, &cfg, false)?;
     write_testkit(cwd, false)?;
@@ -873,13 +925,20 @@ code.
   related objects it points at (or that point at it). Start here when
   you need to find something or understand the shape of an env.
   Regenerated on every `rdc sync` — never hand-edit.
-- **`rdc.toml`** — project name and per-env API base URL + org id.
+- **`rdc.toml`** — the per-env API base URL and org id. There is no project
+  name; the config is just envs.
+
+## Environments
+
+<!-- >>> rdc:envs (generated from rdc.toml — `rdc init` refreshes it) -->
+<!-- <<< rdc:envs -->
 
 ## Repo layout
 
 ```
 rdc.toml                                  project + env definitions
-.gitlab-ci.yml                            scheduled archive + deploy buttons; fill in its TODOs
+.gitlab-ci.yml                            archive per env + one deploy draft per env;
+                                          the `# >>> rdc:` regions are generated
 testkit/                                  formula/hook test harness (real txscript); `pytest -q`
 requirements-dev.txt                      pinned pytest + txscript for the CI test job
 secrets/<env>.secrets.json                API tokens (gitignored)
@@ -1009,17 +1068,10 @@ The same drift check runs before each PATCH on the push side. The
 prompt is `[k]` (force-push), `[r]` (adopt remote), `[s]` (skip),
 `[a]` (abort).
 
-## Promoting changes between environments (e.g. dev → prod)
+## Promoting changes between environments
 
-1. `rdc sync dev` and `rdc sync prod` so both lockfiles are populated.
-2. `rdc migrate dev prod --dry-run` — preview the local file transform.
-3. `rdc migrate dev prod` — copy dev's snapshot into `envs/prod/`,
-   renaming slugs per the mapping (one hand-editable file,
-   `.rdc/mapping.toml`, where each environment names its own slug for
-   an object; objects with identical slugs need no entry), rewriting
-   portable `rdc://` refs, and applying prod's `overlay.toml`.
-4. Review the result with `git diff`, then `rdc sync prod` to push —
-   sync creates missing objects in dependency order.
+<!-- >>> rdc:promote (generated from rdc.toml — `rdc init` refreshes it) -->
+<!-- <<< rdc:promote -->
 
 ## What NOT to edit
 

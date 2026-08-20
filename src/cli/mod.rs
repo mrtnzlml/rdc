@@ -472,6 +472,7 @@ pub mod pull;
 pub mod push;
 pub mod doctor;
 pub mod resolve;
+pub mod scaffold_docs;
 pub(crate) mod stdin_coord;
 pub mod sync;
 
