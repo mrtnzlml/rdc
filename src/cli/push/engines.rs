@@ -119,6 +119,9 @@ pub async fn push(
         let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
             .with_context(|| format!("parsing {}", path.display()))?;
         let mut deferred = crate::snapshot::refs::resolve_value_deferring(&mut payload, lockfile);
+        // `update_engine` sends a typed `Engine`; only `url` is modeled among
+        // the ref-bearing fields, and it must not be sent empty.
+        crate::cli::push::relink::restore_undeferrable("engines", &mut payload, &mut deferred);
         let payload_engine: crate::model::Engine = serde_json::from_value(payload)
             .with_context(|| format!("deserializing overlay-applied engine '{slug}'"))?;
 
@@ -160,6 +163,7 @@ pub async fn push(
                         let mut ov: serde_json::Value = serde_json::from_slice(&bytes)
                             .with_context(|| format!("re-deserializing edited engine '{slug}'"))?;
                         deferred = crate::snapshot::refs::resolve_value_deferring(&mut ov, lockfile);
+                        crate::cli::push::relink::restore_undeferrable("engines", &mut ov, &mut deferred);
                         payload_to_send = serde_json::from_value(ov)
                             .with_context(|| format!("re-deserializing edited engine '{slug}'"))?;
                     }

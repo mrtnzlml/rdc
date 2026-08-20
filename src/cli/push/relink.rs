@@ -55,6 +55,64 @@ pub fn resolve_relink_body(
     }
 }
 
+/// Keys that must NOT be deferred, per kind, because that driver builds its
+/// PATCH body from a **typed** model: an absent key is re-materialized by the
+/// round-trip as `null` (`Option<String>`) rather than omitted, and the API
+/// reads `null` as "clear this field", not "leave it alone". Deferring one
+/// would silently unlink a live object instead of postponing the link.
+///
+/// Only fields that are (a) modeled explicitly and (b) lack
+/// `skip_serializing_if` need listing. A queue's `inbox` is modeled but skips
+/// serializing when `None` (the API rejects `inbox: null` — see `model::Queue`),
+/// so it omits cleanly and stays deferrable. Everything in a model's
+/// `#[serde(flatten)] extra` map — a hook's `run_after`, an engine's
+/// `training_queues` — disappears from the body when absent and is deferrable
+/// by construction.
+///
+/// `hooks` is deliberately absent: its driver serializes to a `Value` and
+/// removes the deferred keys from the body itself, so every field defers
+/// cleanly there, including the modeled `queues`.
+fn undeferrable(kind: &str) -> &'static [&'static str] {
+    match kind {
+        // `workspace`/`schema` are mandatory links; `url` is the queue's own
+        // identity. None can be sent as `null`.
+        "queues" => &["url", "workspace", "schema"],
+        // `Engine` models only id/url/name; the rest lives in `extra`.
+        "engines" => &["url"],
+        _ => &[],
+    }
+}
+
+/// Put back any deferred field this `kind` cannot safely omit, restoring its
+/// ORIGINAL (still-`rdc://`) value into the payload.
+///
+/// The effect is that such a field keeps the pre-deferral behavior: the
+/// unresolved reference stays in the body and the pre-send guard refuses the
+/// request, naming it. That is the honest outcome — a queue whose `workspace`
+/// cannot resolve is broken now, not later, and workspaces/schemas are pushed
+/// before queues so it only happens when their own create failed.
+pub fn restore_undeferrable(
+    kind: &str,
+    payload: &mut Value,
+    deferred: &mut Vec<(String, Value)>,
+) {
+    let never = undeferrable(kind);
+    if never.is_empty() {
+        return;
+    }
+    let Some(obj) = payload.as_object_mut() else {
+        return;
+    };
+    deferred.retain(|(name, orig)| {
+        if never.contains(&name.as_str()) {
+            obj.insert(name.clone(), orig.clone());
+            false
+        } else {
+            true
+        }
+    });
+}
+
 use crate::api::RossumClient;
 use crate::log::{Action, Log};
 use crate::paths::Paths;
@@ -147,6 +205,41 @@ mod tests {
         let mut lf = Lockfile { api_base: api_base.to_string(), ..Lockfile::default() };
         lf.upsert(kind, slug, ObjectEntry { id, modified_at: None, content_hash: None, secrets_hash: None });
         lf
+    }
+
+    #[test]
+    fn restore_undeferrable_puts_back_a_queue_workspace_and_keeps_the_rest() {
+        // `workspace` cannot be deferred: `update_queue` sends a typed `Queue`,
+        // so an absent key goes out as `workspace: null` — the API reads that
+        // as "clear it". Restoring the original leaves the unresolved ref in
+        // the body, where the pre-send guard refuses it by name.
+        let mut payload = serde_json::json!({ "name": "Q" });
+        let mut deferred = vec![
+            ("workspace".to_string(), serde_json::json!("rdc://workspaces/main")),
+            ("engine".to_string(), serde_json::json!("rdc://engines/e1")),
+        ];
+        restore_undeferrable("queues", &mut payload, &mut deferred);
+        assert_eq!(payload["workspace"], serde_json::json!("rdc://workspaces/main"));
+        assert_eq!(
+            deferred,
+            vec![("engine".to_string(), serde_json::json!("rdc://engines/e1"))],
+            "only the undeferrable field is taken back"
+        );
+    }
+
+    #[test]
+    fn restore_undeferrable_leaves_hooks_alone() {
+        // The hooks driver scrubs deferred keys from its Value body itself, so
+        // every field defers cleanly there — including the modeled `queues`.
+        let mut payload = serde_json::json!({ "name": "H" });
+        let mut deferred = vec![
+            ("run_after".to_string(), serde_json::json!(["rdc://hooks/x"])),
+            ("queues".to_string(), serde_json::json!(["rdc://queues/q1"])),
+        ];
+        let before = deferred.clone();
+        restore_undeferrable("hooks", &mut payload, &mut deferred);
+        assert_eq!(deferred, before);
+        assert!(payload.get("queues").is_none());
     }
 
     #[test]

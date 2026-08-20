@@ -113,6 +113,9 @@ pub async fn push(
         let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
             .with_context(|| format!("parsing {}", queue_path.display()))?;
         let mut deferred = crate::snapshot::refs::resolve_value_deferring(&mut payload, lockfile);
+        // `update_queue` sends a typed `Queue`: an absent `workspace`/`schema`/
+        // `url` would go out as `null` (= "clear it"), so those never defer.
+        crate::cli::push::relink::restore_undeferrable("queues", &mut payload, &mut deferred);
         let payload_queue: crate::model::Queue = serde_json::from_value(payload)
             .with_context(|| format!("deserializing overlay-applied queue '{q_slug}'"))?;
 
@@ -154,6 +157,7 @@ pub async fn push(
                         let mut ov: serde_json::Value = serde_json::from_slice(&bytes)
                             .with_context(|| format!("re-deserializing edited queue '{q_slug}'"))?;
                         deferred = crate::snapshot::refs::resolve_value_deferring(&mut ov, lockfile);
+                        crate::cli::push::relink::restore_undeferrable("queues", &mut ov, &mut deferred);
                         payload_to_send = serde_json::from_value(ov)
                             .with_context(|| format!("re-deserializing edited queue '{q_slug}'"))?;
                     }

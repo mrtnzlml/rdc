@@ -10234,6 +10234,201 @@ async fn sync_inbox_push_then_resync_is_clean() {
 /// Because `validator` doesn't exist in the lockfile yet when `post-validator`
 /// is processed, `resolve_value_deferring` must strip `run_after` from the
 /// create POST body (the ref cannot be resolved yet) and queue a `DeferredRelink`
+/// The PATCH-path twin of the create-path relink test below, and the shape of
+/// the reported incident: an ALREADY-DEPLOYED hook whose `run_after` names a
+/// hook that does not exist in this env yet. Hooks are pushed in slug order, so
+/// `alpha-consumer` is patched before `zulu-provider` is created — the ref
+/// cannot resolve at PATCH time.
+///
+/// Before the fix the patch path resolved eagerly, the unresolved-ref guard
+/// refused the request, and the whole sync aborted mid-push (observed live:
+/// `PATCH /hooks/<id>: refusing to send … [rdc://hooks/…]`), permanently
+/// wedging any env in that state. Now the field defers, the create lands, and
+/// the relink pass PATCHes the real link in the same run.
+#[tokio::test]
+async fn sync_push_hook_run_after_deferred_relink_on_the_patch_path() {
+    let _cwd_guard = cwd_lock();
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let server_uri = server.uri();
+    let alpha_id = 901u64;
+    let zulu_id = 902u64;
+    let alpha_url = format!("{server_uri}/api/v1/hooks/{alpha_id}");
+    let zulu_url = format!("{server_uri}/api/v1/hooks/{zulu_id}");
+
+    let alpha = |run_after: serde_json::Value| {
+        serde_json::json!({
+            "id": alpha_id,
+            "url": alpha_url,
+            "name": "Alpha Consumer",
+            "type": "function",
+            "events": ["annotation_content"],
+            "queues": [],
+            "config": { "runtime": "python3.12", "code": "def f(p):\n    return {}\n" },
+            "run_after": run_after,
+            "modified_at": "2026-06-01T10:00:00Z"
+        })
+    };
+    let zulu = serde_json::json!({
+        "id": zulu_id,
+        "url": zulu_url,
+        "name": "Zulu Provider",
+        "type": "function",
+        "events": ["annotation_content"],
+        "queues": [],
+        "config": { "runtime": "python3.12", "code": "def f(p):\n    return {}\n" },
+        "run_after": [],
+        "modified_at": "2026-06-01T10:00:01Z"
+    });
+
+    // Hook listing: alpha alone until zulu is created, both afterwards.
+    let created = Arc::new(AtomicUsize::new(0));
+    let seen = created.clone();
+    let a_list = alpha(serde_json::json!([]));
+    let z_list = zulu.clone();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(move |_req: &Request| {
+            let results = if seen.load(Ordering::SeqCst) == 0 {
+                vec![a_list.clone()]
+            } else {
+                vec![a_list.clone(), z_list.clone()]
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pagination": { "next": null }, "results": results
+            }))
+        })
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &["/api/v1/hooks"]).await;
+
+    let bump = created.clone();
+    let z_created = zulu.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/v1/hooks"))
+        .respond_with(move |_req: &Request| {
+            bump.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(201).set_body_json(z_created.clone())
+        })
+        .mount(&server)
+        .await;
+
+    // PATCH /hooks/901: the push PATCH (run_after deferred, so the remote keeps
+    // its empty list), then the relink PATCH that actually sets the link.
+    let patch_calls = Arc::new(AtomicUsize::new(0));
+    let pc = patch_calls.clone();
+    let a_empty = alpha(serde_json::json!([]));
+    let a_linked = alpha(serde_json::json!([zulu_url.clone()]));
+    Mock::given(method("PATCH"))
+        .and(path(format!("/api/v1/hooks/{alpha_id}")))
+        .respond_with(move |_req: &Request| {
+            let n = pc.fetch_add(1, Ordering::SeqCst);
+            let body = if n == 0 { a_empty.clone() } else { a_linked.clone() };
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={server_uri}/api/v1:1")])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // Pull once so alpha is tracked in the lockfile — that is what makes the
+    // next push a PATCH rather than a create.
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev", "--no-push", "--yes"])
+        .assert()
+        .success();
+
+    // Local edit: alpha now runs after a hook that does not exist here yet...
+    let hooks_dir = project.path().join("envs/dev/hooks");
+    let alpha_path = hooks_dir.join("alpha-consumer.json");
+    let mut local: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&alpha_path).unwrap()).unwrap();
+    local["run_after"] = serde_json::json!(["rdc://hooks/zulu-provider"]);
+    let mut b = serde_json::to_vec_pretty(&local).unwrap();
+    b.push(b'\n');
+    std::fs::write(&alpha_path, &b).unwrap();
+
+    // ...and that hook is created by this same sync (it sorts after alpha).
+    let zulu_local = serde_json::json!({
+        "id": 0,
+        "url": "",
+        "name": "Zulu Provider",
+        "type": "function",
+        "events": ["annotation_content"],
+        "queues": [],
+        "run_after": [],
+        "config": { "runtime": "python3.12" }
+    });
+    let mut b = serde_json::to_vec_pretty(&zulu_local).unwrap();
+    b.push(b'\n');
+    std::fs::write(hooks_dir.join("zulu-provider.json"), &b).unwrap();
+    std::fs::write(
+        hooks_dir.join("zulu-provider.py"),
+        b"def f(p):\n    return {}\n",
+    )
+    .unwrap();
+
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+    result.expect("a forward run_after ref on the patch path must not abort the sync");
+
+    let reqs = server.received_requests().await.unwrap_or_default();
+    let alpha_patches: Vec<serde_json::Value> = reqs
+        .iter()
+        .filter(|r| {
+            r.method == http::Method::PATCH
+                && r.url.path() == format!("/api/v1/hooks/{alpha_id}")
+        })
+        .filter_map(|r| serde_json::from_slice(&r.body).ok())
+        .collect();
+    assert_eq!(
+        alpha_patches.len(),
+        2,
+        "expected the push PATCH plus the relink PATCH; got {alpha_patches:?}"
+    );
+    assert!(
+        alpha_patches[0].get("run_after").is_none(),
+        "the push PATCH must omit the deferred field entirely (sending [] would \
+         clear the remote's links): {}",
+        alpha_patches[0]
+    );
+    assert_eq!(
+        alpha_patches[1]["run_after"],
+        serde_json::json!([zulu_url]),
+        "the relink PATCH must set the resolved link: {}",
+        alpha_patches[1]
+    );
+
+    // The snapshot must end the run carrying the portable ref, not the empty
+    // list the first PATCH response echoed back.
+    let on_disk = std::fs::read_to_string(&alpha_path).unwrap();
+    assert!(
+        on_disk.contains("rdc://hooks/zulu-provider"),
+        "post-relink snapshot must keep the portable run_after ref:\n{on_disk}"
+    );
+}
+
 /// entry. After both hooks are created the relink pass PATCHes `post-validator`
 /// with `run_after` resolved to the validator hook's env URL.
 ///

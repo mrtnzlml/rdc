@@ -113,7 +113,7 @@ pub async fn push(
             // Two-phase relink: resolve what we can; defer top-level fields whose
             // rdc:// refs target a hook not yet created (e.g. `run_after` pointing
             // at another new hook). The relink pass PATCHes them once all hooks
-            // exist. (Patch path intentionally not deferred — see plan ① scope.)
+            // exist. The patch path below does the same.
             let deferred = crate::snapshot::refs::resolve_value_deferring(&mut payload, lockfile);
 
             // Anomaly guard, then dispatch on extension type.
@@ -301,7 +301,14 @@ pub async fn push(
             .with_context(|| format!("reading local hook '{slug}'"))?;
         // The on-disk sidecar is whatever the local JSON declared.
         let local_ext = hook_code_extension_from_value(&payload);
-        crate::snapshot::refs::resolve_value(&mut payload, lockfile);
+        // Two-phase relink, same as the create path above and as
+        // `queues`/`engines` do on BOTH of their paths. Hooks are pushed in
+        // slug order, so an already-deployed hook whose `run_after` names one
+        // created later in this same pass is an ordinary forward reference —
+        // resolving eagerly here left an `rdc://` in the body and the
+        // unresolved-ref guard aborted the entire cycle, permanently wedging
+        // any env where a tracked hook points at a not-yet-created one.
+        let mut deferred = crate::snapshot::refs::resolve_value_deferring(&mut payload, lockfile);
         let payload_hook: crate::model::Hook = serde_json::from_value(payload)
             .with_context(|| format!("deserializing hook '{slug}'"))?;
 
@@ -341,7 +348,9 @@ pub async fn push(
                     if let Some(bytes) = payload_override {
                         let mut ov: serde_json::Value = serde_json::from_slice(&bytes)
                             .with_context(|| format!("re-deserializing edited hook '{slug}'"))?;
-                        crate::snapshot::refs::resolve_value(&mut ov, lockfile);
+                        // The edited body replaces the one deferral was computed
+                        // from, so recompute it (mirrors `push::queues`).
+                        deferred = crate::snapshot::refs::resolve_value_deferring(&mut ov, lockfile);
                         payload_to_send = serde_json::from_value(ov)
                             .with_context(|| format!("re-deserializing edited hook '{slug}'"))?;
                     }
@@ -414,6 +423,17 @@ pub async fn push(
         // have no place on the typed `Hook` model) can ride this PATCH.
         let mut body = serde_json::to_value(&payload_to_send)
             .with_context(|| format!("serializing hook '{slug}' for PATCH"))?;
+        // A deferred field must not ride this PATCH at all. Removing the key
+        // from the Value is not enough on its own: `queues` is a MODELED field
+        // on `Hook`, so the typed round-trip re-materializes it as `[]` and the
+        // PATCH would detach the hook from every queue until the relink lands —
+        // permanently if the relink never resolves. Omitting the key leaves the
+        // remote's current value untouched, which is what deferral means.
+        if let Some(obj) = body.as_object_mut() {
+            for (field, _) in &deferred {
+                obj.remove(field);
+            }
+        }
         // `status` is a read-only server health field that's redacted to the
         // sentinel on disk; strip it (and the other server fields) so the
         // PATCH body matches the CREATE contract instead of echoing the
@@ -484,6 +504,14 @@ pub async fn push(
                 secrets_hash: Some(updated_secrets_hash),
             },
         );
+        if !deferred.is_empty() {
+            relink.push(crate::cli::push::relink::DeferredRelink {
+                kind: "hooks".to_string(),
+                slug: slug.clone(),
+                path: local_json_path.clone(),
+                fields: deferred,
+            });
+        }
         progress.event(Action::Patch, &format!("hook/{slug}"));
         pushed += 1;
     }
@@ -888,6 +916,232 @@ mod tests {
         assert!(
             on_disk.contains("rdc://hooks/upstream"),
             "run_after ref portable:\n{on_disk}"
+        );
+    }
+
+    /// Regression (the reported incident): PATCHing a hook whose `run_after`
+    /// names a hook that does not exist in this env yet must DEFER that field,
+    /// not abort the push. Hooks are pushed in slug order, so a forward
+    /// reference — an already-deployed hook pointing at one created later in
+    /// the same pass — is normal; the create path has always deferred it, but
+    /// the patch path resolved eagerly and the unresolved-ref guard killed the
+    /// whole cycle. `queues.rs`/`engines.rs` defer on both paths; hooks only
+    /// did so on create.
+    #[tokio::test]
+    async fn push_patch_hook_defers_unresolvable_run_after_instead_of_failing() {
+        use crate::paths::Paths;
+        use crate::snapshot::hook::serialize_hook;
+        use crate::state::hook_combined_hash;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let api = format!("{}/api/v1", server.uri());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        let hooks_dir = paths.hooks_dir();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+
+        let local = serde_json::json!({
+            "name": "My Hook",
+            "type": "function",
+            "url": "rdc://hooks/my-hook",
+            "queues": ["rdc://queues/q1"],
+            // `not-yet-created` sorts after `my-hook`: it is created later in
+            // this same push pass, so it cannot resolve now.
+            "run_after": ["rdc://hooks/not-yet-created"],
+            "events": ["annotation_content"],
+            "config": { "runtime": "python3.12" }
+        });
+        std::fs::write(
+            hooks_dir.join("my-hook.json"),
+            serde_json::to_vec_pretty(&local).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(hooks_dir.join("my-hook.py"), b"x = 2\n").unwrap();
+
+        let mut lockfile = Lockfile { api_base: api.clone(), ..Lockfile::default() };
+        lockfile.upsert(
+            "queues",
+            "q1",
+            ObjectEntry { id: 100, modified_at: None, content_hash: Some("h".into()), secrets_hash: None },
+        );
+        lockfile.upsert(
+            "hooks",
+            "my-hook",
+            ObjectEntry { id: 500, modified_at: None, content_hash: None, secrets_hash: None },
+        );
+
+        let remote = serde_json::json!({
+            "id": 500,
+            "url": format!("{api}/hooks/500"),
+            "name": "My Hook",
+            "type": "function",
+            "queues": [format!("{api}/queues/100")],
+            "run_after": [],
+            "events": ["annotation_content"],
+            "config": { "runtime": "python3.12", "code": "x = 2\n" }
+        });
+        let remote_hook: crate::model::Hook = serde_json::from_value(remote.clone()).unwrap();
+        let (rj, rc) = serialize_hook(&remote_hook).unwrap();
+        let base = hook_combined_hash(&rj, &rc, &lockfile);
+        lockfile.upsert(
+            "hooks",
+            "my-hook",
+            ObjectEntry { id: 500, modified_at: None, content_hash: Some(base), secrets_hash: None },
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/hooks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pagination": { "next": null }, "results": [remote.clone()]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/hooks/500"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(remote))
+            .mount(&server)
+            .await;
+
+        let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
+        let progress =
+            std::sync::Arc::new(crate::log::Log::new(crate::cli::resolve::ColorMode::Plain));
+        let mut relink = Vec::new();
+        let mut changes = BTreeMap::new();
+        changes.insert("my-hook".to_string(), hooks_dir.join("my-hook.json"));
+
+        let (pushed, _skipped) = push(
+            &paths, &client, &mut lockfile, false, &changes, &[], &mut relink, &progress, "dev",
+        )
+        .await
+        .expect("a forward run_after ref must not abort the push");
+        assert_eq!(pushed, 1, "the hook should still be patched");
+
+        // The deferred field must be recorded for the relink pass, with its
+        // ORIGINAL rdc:// value so it can be re-resolved once the target exists.
+        assert_eq!(relink.len(), 1, "expected one deferred relink: {relink:?}");
+        assert_eq!(relink[0].kind, "hooks");
+        assert_eq!(relink[0].slug, "my-hook");
+        assert_eq!(
+            relink[0].fields,
+            vec![(
+                "run_after".to_string(),
+                serde_json::json!(["rdc://hooks/not-yet-created"])
+            )]
+        );
+
+        // ...and must not ride the PATCH at all: sending `run_after: []` would
+        // clear the remote's links rather than leave them for the relink.
+        let reqs = server.received_requests().await.unwrap_or_default();
+        let patch = reqs
+            .iter()
+            .find(|r| r.method == http::Method::PATCH)
+            .expect("a PATCH must have been issued");
+        let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        assert!(
+            body.get("run_after").is_none(),
+            "deferred field must be absent from the PATCH body: {body}"
+        );
+    }
+
+    /// The same deferral must not silently UNBIND a hook. `Hook.queues` is a
+    /// modeled `Vec<String>`, so a deferred `queues` round-trips through the
+    /// typed struct as `[]` — PATCHing that would detach the hook from every
+    /// queue until the relink lands (and permanently if it never does). The
+    /// key has to be dropped from the body, not emptied.
+    #[tokio::test]
+    async fn push_patch_hook_omits_a_deferred_queues_field_rather_than_emptying_it() {
+        use crate::paths::Paths;
+        use crate::snapshot::hook::serialize_hook;
+        use crate::state::hook_combined_hash;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let api = format!("{}/api/v1", server.uri());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        let hooks_dir = paths.hooks_dir();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+
+        let local = serde_json::json!({
+            "name": "My Hook",
+            "type": "function",
+            "url": "rdc://hooks/my-hook",
+            "queues": ["rdc://queues/never-created"],
+            "events": ["annotation_content"],
+            "config": { "runtime": "python3.12" }
+        });
+        std::fs::write(
+            hooks_dir.join("my-hook.json"),
+            serde_json::to_vec_pretty(&local).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(hooks_dir.join("my-hook.py"), b"x = 2\n").unwrap();
+
+        let mut lockfile = Lockfile { api_base: api.clone(), ..Lockfile::default() };
+        lockfile.upsert(
+            "hooks",
+            "my-hook",
+            ObjectEntry { id: 500, modified_at: None, content_hash: None, secrets_hash: None },
+        );
+
+        let remote = serde_json::json!({
+            "id": 500,
+            "url": format!("{api}/hooks/500"),
+            "name": "My Hook",
+            "type": "function",
+            "queues": [],
+            "events": ["annotation_content"],
+            "config": { "runtime": "python3.12", "code": "x = 2\n" }
+        });
+        let remote_hook: crate::model::Hook = serde_json::from_value(remote.clone()).unwrap();
+        let (rj, rc) = serialize_hook(&remote_hook).unwrap();
+        let base = hook_combined_hash(&rj, &rc, &lockfile);
+        lockfile.upsert(
+            "hooks",
+            "my-hook",
+            ObjectEntry { id: 500, modified_at: None, content_hash: Some(base), secrets_hash: None },
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/hooks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pagination": { "next": null }, "results": [remote.clone()]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/hooks/500"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(remote))
+            .mount(&server)
+            .await;
+
+        let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
+        let progress =
+            std::sync::Arc::new(crate::log::Log::new(crate::cli::resolve::ColorMode::Plain));
+        let mut relink = Vec::new();
+        let mut changes = BTreeMap::new();
+        changes.insert("my-hook".to_string(), hooks_dir.join("my-hook.json"));
+
+        push(
+            &paths, &client, &mut lockfile, false, &changes, &[], &mut relink, &progress, "dev",
+        )
+        .await
+        .expect("push should succeed");
+
+        let reqs = server.received_requests().await.unwrap_or_default();
+        let patch = reqs
+            .iter()
+            .find(|r| r.method == http::Method::PATCH)
+            .expect("a PATCH must have been issued");
+        let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        assert!(
+            body.get("queues").is_none(),
+            "a deferred `queues` must be omitted, never sent as []: {body}"
         );
     }
 
