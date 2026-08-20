@@ -25,3 +25,16 @@ tempfile = "3"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
+
+# Deliberately sets ONLY `strip` -- `panic` must stay at cargo's default
+# (unwind), which is the whole reason this crate is its own workspace.
+#
+# Measured on the FRB bridge: this shrinks the cdylib 13.7% (12,054,432 ->
+# 10,399,312 bytes), which is what Linux (.so) and Windows (.dll) ship. It is a
+# NO-OP for macOS, which ships the staticlib: rust_builder/macos's podspec links
+# it with `-force_load ${BUILT_PRODUCTS_DIR}/librdc_bridge.a`, so Xcode -- not
+# cargo -- performs the final link (the .a moves only 53,419,408 -> 53,405,368).
+# Shrinking the macOS binary needs an Xcode-side strip instead; stripping the
+# shipped universal framework by hand measured 20.2% (51.7MB -> 41.3MB).
+[profile.release]
+strip = "symbols"
