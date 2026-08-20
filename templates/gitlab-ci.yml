@@ -12,6 +12,12 @@
 # Rehearse every new deploy target before its first press:
 #   rdc migrate <src> <tgt> --mirror --dry-run && rdc sync <tgt> --dry-run
 #
+# The regions marked `# >>> rdc:…` are generated from rdc.toml: `rdc init`
+# refreshes them in place on every run, including when you add an env, and
+# leaves every other line of this file alone. Fill in each deploy draft's
+# RDC_SRC, delete the drafts for envs you author by hand, and edit freely
+# outside the markers.
+#
 # CAUTION: deploy writes to Rossum and CAN DELETE -- `migrate --mirror` prunes
 # target objects the source no longer has, and `sync --allow-deletes` turns
 # those into remote DELETEs. Keep hand-authored source envs (dev) out of the
@@ -106,9 +112,11 @@ variables:
     git push -q -o ci.skip "$remote" "HEAD:refs/heads/$CI_DEFAULT_BRANCH"
   }
 
-# EXAMPLE placeholder for your repo's own checks. The deploy buttons depend on
-# it, so a deploy cannot run against a snapshot that failed validation. No tests
-# in this repo? Delete this job AND the `needs:` in .rdc-deploy.
+# `rdc init` scaffolds `requirements-dev.txt`, `pytest.ini`, `conftest.py` and a
+# `testkit/` whose self-tests run the real txscript runtime, so this job is green
+# on a fresh project (with nothing collected, pytest exits 5 and the job is red).
+# The deploy buttons depend on it, so a deploy cannot run against a snapshot that
+# failed validation.
 pytest:
   stage: test
   image: python:3.12-slim
@@ -133,17 +141,35 @@ archive:
     GIT_DEPTH: "0"  # the commit-back rebases onto the default branch
   parallel:
     matrix:
-      - RDC_ENV: [dev]  # TODO: the envs to archive
+      # >>> rdc:archive-envs  (generated from rdc.toml -- `rdc init --force` to refresh)
+      - RDC_ENV: "dev"
+        RDC_VAR_SUFFIX: "DEV"
+      - RDC_ENV: "prod"
+        RDC_VAR_SUFFIX: "PROD"
+      - RDC_ENV: "test"
+        RDC_VAR_SUFFIX: "TEST"
+      # <<< rdc:archive-envs
   before_script:
     - *rdc-install-script
     - *rdc-writeback
     - git config user.name "rdc-archive[bot]"
     - git config user.email "$RDC_GIT_EMAIL"
   script:
-    # use-remote: the tenant wins, or the archive silently omits diverged objects.
-    - rdc sync "$RDC_ENV" --no-push --yes --conflict use-remote
     - |
       set -eu
+      # An env whose credentials are not wired up yet is SKIPPED, not failed: a
+      # project sets them one env at a time, and a scheduled archive has to stay
+      # green meanwhile. One `script:` block on purpose -- `exit 0` then really
+      # does stop the job here.
+      if [ -z "$(printenv "RDC_TOKEN_$RDC_VAR_SUFFIX" || true)" ] \
+      && [ -z "$(printenv "RDC_PASS_$RDC_VAR_SUFFIX" || true)" ]; then
+        echo "$RDC_ENV: neither RDC_TOKEN_$RDC_VAR_SUFFIX nor RDC_PASS_$RDC_VAR_SUFFIX is set; skipping."
+        exit 0
+      fi
+
+      # use-remote: the tenant wins, or the archive silently omits diverged objects.
+      rdc sync "$RDC_ENV" --no-push --yes --conflict use-remote
+
       if ! writeback "chore(archive): $RDC_ENV snapshot ($(date -u +%Y-%m-%d))"; then
         echo "ERROR: could not commit the $RDC_ENV archive back; see the git output above" >&2
         echo "(default branch moved, or a push rule rejected the commit)." >&2
@@ -178,6 +204,12 @@ archive:
   script:
     - |
       set -eu
+      # A generated deploy job is a DRAFT: rdc cannot know which env promotes
+      # into this one, so RDC_SRC ships empty. `${VAR:?}` fires on unset OR
+      # empty, and it fires here -- before migrate (offline) or sync (writes) --
+      # so an unpressed-ready button cannot touch the tenant.
+      : "${RDC_SRC:?this deploy button is still a draft -- set RDC_SRC to the env to promote from}"
+
       shadow_dir=".rdc/conflicts/$RDC_ENV"
       # The tree is gitignored, so it never arrives via the clone -- but a reused
       # workspace can carry one, and a stale shadow makes rdc skip that object
@@ -222,20 +254,35 @@ archive:
 # The promotion chain. `resource_group` serializes every pipeline that deploys
 # the same env, so two runs can never interleave writes into one tenant;
 # `environment` records the deployment under Operate -> Environments.
-deploy:test:  # TODO: one job per target env, source -> target
-  extends: .rdc-deploy
-  resource_group: test
-  environment:
-    name: test
-  variables:
-    RDC_ENV: test
-    RDC_SRC: dev
+# >>> rdc:deploy-jobs  (generated from rdc.toml -- `rdc init --force` to refresh)
+# DRAFTS. Each button needs its RDC_SRC filled in before it can be pressed,
+# and the jobs for hand-authored source envs (a dev env people edit) should
+# be deleted -- an archive records those, a deploy would overwrite them.
 
-deploy:prod:
+"deploy:dev":
   extends: .rdc-deploy
-  resource_group: prod
+  resource_group: "dev"
   environment:
-    name: prod
+    name: "dev"
   variables:
-    RDC_ENV: prod
-    RDC_SRC: test
+    RDC_ENV: "dev"
+    RDC_SRC: ""   # TODO: env to promote from
+
+"deploy:prod":
+  extends: .rdc-deploy
+  resource_group: "prod"
+  environment:
+    name: "prod"
+  variables:
+    RDC_ENV: "prod"
+    RDC_SRC: ""   # TODO: env to promote from
+
+"deploy:test":
+  extends: .rdc-deploy
+  resource_group: "test"
+  environment:
+    name: "test"
+  variables:
+    RDC_ENV: "test"
+    RDC_SRC: ""   # TODO: env to promote from
+# <<< rdc:deploy-jobs

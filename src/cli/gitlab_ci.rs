@@ -386,4 +386,36 @@ after
         let twice = splice(&once, &regions).unwrap().unwrap();
         assert_eq!(once, twice);
     }
+
+    #[test]
+    fn template_carries_both_regions() {
+        // The template is ours; a missing marker is a bug in this repo.
+        let present = regions_present(crate::cli::init::GITLAB_CI_TEMPLATE);
+        for region in REGIONS {
+            assert!(present.contains(region), "template is missing {region}");
+        }
+    }
+
+    #[test]
+    fn generate_fills_the_embedded_template() {
+        let out = generate(crate::cli::init::GITLAB_CI_TEMPLATE, &envs(&["dev", "test"])).unwrap();
+        assert!(out.contains("- RDC_ENV: \"dev\""));
+        assert!(out.contains("\"deploy:test\":"));
+        assert!(!out.contains("# TODO: the envs to archive"));
+    }
+
+    /// The committed regions must be exactly what the renderer produces for the
+    /// canonical example, so the file on GitHub and the file the binary writes
+    /// cannot drift. This is one half of what the old byte-for-byte assertion did.
+    #[test]
+    fn committed_template_regions_match_the_renderer() {
+        let template = crate::cli::init::GITLAB_CI_TEMPLATE;
+        let rendered = render_regions(&envs(&["dev", "prod", "test"]));
+        // Re-splicing the canonical envs into the template must be a no-op.
+        assert_eq!(
+            splice(template, &rendered).unwrap().unwrap(),
+            template,
+            "templates/gitlab-ci.yml's regions differ from render_regions(dev, prod, test)"
+        );
+    }
 }
