@@ -176,6 +176,13 @@ mod tests {
             .collect()
     }
 
+    /// A single region with fixed, recognizable content -- used by the tests
+    /// below that exercise style-specific marker syntax directly, where the
+    /// assertion is about the marker text rather than a real rendered body.
+    fn one_region() -> BTreeMap<&'static str, String> {
+        BTreeMap::from([("rdc:envs", "fresh line one\nfresh line two".to_string())])
+    }
+
     const FILE: &str = "\
 before
   parallel:
@@ -256,6 +263,9 @@ after
         let err =
             format!("{:#}", splice(broken, &render_regions(&envs(&["dev"])), YAML).unwrap_err());
         assert!(err.contains("unknown rdc region"), "{err}");
+        // The `regions.keys()` change (replacing the old REGIONS const) must
+        // still populate the "known: ..." list from the caller's map.
+        assert!(err.contains("rdc:archive-envs"), "the error must list what IS known: {err}");
     }
 
     #[test]
@@ -286,6 +296,27 @@ after
         // ...and a Markdown doc from ever being spliced with a YAML body.
         let doc = "before\n<!-- >>> rdc:envs -->\nstale\n<!-- <<< rdc:envs -->\nafter\n";
         assert!(regions_present(doc, YAML).is_empty());
+    }
+
+    #[test]
+    fn markdown_markers_are_html_comments_not_headings() {
+        // `# >>> rdc:envs` would render as an H1 in Markdown.
+        let doc = "# Title\n\n<!-- >>> rdc:envs (generated) -->\nstale\n\
+                   <!-- <<< rdc:envs -->\n\nkeep me\n";
+        let out = splice(doc, &one_region(), MARKDOWN).unwrap().unwrap();
+        assert!(out.contains("fresh line one\nfresh line two\n"));
+        assert!(!out.contains("stale"));
+        assert!(out.starts_with("# Title\n"));
+        assert!(out.ends_with("keep me\n"));
+        assert!(out.contains("<!-- >>> rdc:envs (generated) -->"));
+    }
+
+    #[test]
+    fn a_markdown_marker_with_no_space_before_the_close_still_parses() {
+        let doc = "<!-- >>> rdc:envs-->\nstale\n<!-- <<< rdc:envs-->\n";
+        let out = splice(doc, &one_region(), MARKDOWN).unwrap().unwrap();
+        assert!(out.contains("fresh line one"));
+        assert!(!out.contains("stale"));
     }
 
     #[test]
