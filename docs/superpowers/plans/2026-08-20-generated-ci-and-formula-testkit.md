@@ -396,29 +396,12 @@ after
         let twice = splice(&once, &regions).unwrap().unwrap();
         assert_eq!(once, twice);
     }
-
-    #[test]
-    fn generate_fills_the_embedded_template() {
-        let out = generate(crate::cli::init::GITLAB_CI_TEMPLATE, &envs(&["dev", "test"])).unwrap();
-        assert!(out.contains("- RDC_ENV: \"dev\""));
-        assert!(out.contains("\"deploy:test\":"));
-        assert!(!out.contains("# TODO: the envs to archive"));
-    }
-
-    #[test]
-    fn template_carries_both_regions() {
-        // The template is ours; a missing marker is a bug in this repo.
-        let present = regions_present(crate::cli::init::GITLAB_CI_TEMPLATE);
-        for region in REGIONS {
-            assert!(present.contains(region), "template is missing {region}");
-        }
-    }
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test --lib gitlab_ci`
-Expected: FAIL — `cannot find function splice` / `regions_present` / `generate`. (`generate_fills_the_embedded_template` and `template_carries_both_regions` will keep failing until Task 3 adds the markers to the template; that is expected and called out again there.)
+Expected: FAIL — `cannot find function splice` / `regions_present` / `generate`.
 
 - [ ] **Step 3: Implement splicing and generation**
 
@@ -564,7 +547,7 @@ Make the template constant reachable from the test: in `src/cli/init.rs:767`, ch
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test --lib gitlab_ci`
-Expected: every test PASSES except `generate_fills_the_embedded_template` and `template_carries_both_regions`, which fail with "template is missing rdc:archive-envs" until Task 3. Confirm the failure message is exactly that — it proves `generate`'s guard works.
+Expected: PASS, all tests. (The two tests that pin the *committed template's* regions to this renderer live in Task 3, which is where the template gains its markers — so this task commits green.)
 
 - [ ] **Step 5: Commit**
 
@@ -579,7 +562,8 @@ git commit -m "feat(ci): splice rdc-owned regions into an existing pipeline"
 
 **Files:**
 - Modify: `templates/gitlab-ci.yml`
-- Test: `src/cli/gitlab_ci.rs` (the two tests left failing by Task 2 now pass)
+- Modify: `src/cli/gitlab_ci.rs` (add three tests that pin the committed template)
+- Test: `src/cli/gitlab_ci.rs` (inline tests)
 
 **Interfaces:**
 - Consumes: `render_regions` (Task 1) — the committed region bodies must equal what it renders for `dev`/`test`/`prod`.
@@ -717,7 +701,46 @@ And in the header comment block at the top of the file, after the "Rehearse ever
 # outside the markers.
 ```
 
-- [ ] **Step 6: Run the tests to verify they now pass**
+- [ ] **Step 6: Add the tests that pin the committed template to the renderer**
+
+Append to the `mod tests` block in `src/cli/gitlab_ci.rs`. These live here, not in
+Task 2, because they assert a property of the template this task creates:
+
+```rust
+    #[test]
+    fn template_carries_both_regions() {
+        // The template is ours; a missing marker is a bug in this repo.
+        let present = regions_present(crate::cli::init::GITLAB_CI_TEMPLATE);
+        for region in REGIONS {
+            assert!(present.contains(region), "template is missing {region}");
+        }
+    }
+
+    #[test]
+    fn generate_fills_the_embedded_template() {
+        let out = generate(crate::cli::init::GITLAB_CI_TEMPLATE, &envs(&["dev", "test"])).unwrap();
+        assert!(out.contains("- RDC_ENV: \"dev\""));
+        assert!(out.contains("\"deploy:test\":"));
+        assert!(!out.contains("# TODO: the envs to archive"));
+    }
+
+    /// The committed regions must be exactly what the renderer produces for the
+    /// canonical example, so the file on GitHub and the file the binary writes
+    /// cannot drift. This is one half of what the old byte-for-byte assertion did.
+    #[test]
+    fn committed_template_regions_match_the_renderer() {
+        let template = crate::cli::init::GITLAB_CI_TEMPLATE;
+        let rendered = render_regions(&envs(&["dev", "prod", "test"]));
+        // Re-splicing the canonical envs into the template must be a no-op.
+        assert_eq!(
+            splice(template, &rendered).unwrap().unwrap(),
+            template,
+            "templates/gitlab-ci.yml's regions differ from render_regions(dev, prod, test)"
+        );
+    }
+```
+
+- [ ] **Step 7: Run the tests to verify they now pass**
 
 Run: `cargo test --lib gitlab_ci`
 Expected: PASS, all tests including `template_carries_both_regions` and
@@ -725,15 +748,15 @@ Expected: PASS, all tests including `template_carries_both_regions` and
 region bodies to `render_regions`' output — if the envs in the template's
 regions ever drift from alphabetical `dev`/`prod`/`test`, it fails here.
 
-- [ ] **Step 7: Verify the template is still valid YAML**
+- [ ] **Step 8: Verify the template is still valid YAML**
 
 Run: `python3 -c "import yaml,sys; d=yaml.safe_load(open('templates/gitlab-ci.yml')); print(sorted(k for k in d if not k.startswith('.')))"`
 Expected: prints the job list including `archive`, `pytest`, `deploy:dev`, `deploy:prod`, `deploy:test`, `stages`, `variables`, `default`. If `yaml` is not installed, run `python3 -m pip install --user pyyaml` first. This catches an indentation slip in the spliced matrix that no Rust test would see.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add templates/gitlab-ci.yml
+git add templates/gitlab-ci.yml src/cli/gitlab_ci.rs
 git commit -m "feat(templates): mark the env-shaped regions and guard the deploy drafts"
 ```
 
