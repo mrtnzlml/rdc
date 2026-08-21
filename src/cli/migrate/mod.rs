@@ -656,10 +656,11 @@ fn transform_file(
     // / reverse-ref fields); for a new object (no tgt file), strip them to a
     // clean create payload so `rdc sync` POSTs and the server assigns identity.
     // Runs BEFORE the overlay so an explicit overlay override still wins.
+    let mut matched_in_target = false;
     if let Some((kind, _)) = classify(rel)
         && let Some(codec) = crate::snapshot::codec::codec(kind)
     {
-        reconcile_target_identity(&mut value, &dst_path, codec, tgt_org_url);
+        matched_in_target = reconcile_target_identity(&mut value, &dst_path, codec, tgt_org_url);
     }
 
     // `reconcile_target_identity` restores env-field values verbatim from the
@@ -691,9 +692,32 @@ fn transform_file(
     // `cross_env_body`, so deployable content (a hook's lookup `settings`, …) is
     // never touched here — an unresolvable source-host ref there is a source
     // data bug the user must fix, not something migrate may silently rewrite.
+    //
+    // The heuristic needs one host per env. For a project whose envs are two
+    // ORGANIZATIONS inside a single Rossum instance — one `api_base`, two
+    // `org_id`s — "carries the source host" says nothing about whose ref it is:
+    // the target's own `created_by`, `modified_by`, `token_owner`,
+    // `hook_template`, `guide`, an inbox's `email`, a queue's `generic_engine`
+    // and back-refs all carry it too. Applied to a MATCHED object it deleted
+    // exactly the values `reconcile_target_identity` had just restored FROM the
+    // target file, so migrate's output no longer matched the target's own pull:
+    // `rdc sync` classified every object as a local edit, PATCHed it, wrote the
+    // server's response back — and the next migrate stripped the fields again.
+    // A migrate&&sync chain that never converges, re-pushing the whole env on
+    // every run. So on a shared host the cleanup is skipped for a matched
+    // object: there is nothing source-derived left in its env fields to clean
+    // (contamination in one is then undetectable — same host, same shape — and
+    // keeping the target's pulled value is the conservative half of that
+    // trade). `organization` is unaffected either way: it stays owned by
+    // `reconcile_target_identity`, which sets it from `rdc.toml`.
+    //
+    // A NEW object is still cleaned on any host — nothing restored it, so its
+    // env fields ARE the source's — and a host-per-env promotion is unchanged.
+    let shared_host = url_host(tgt_org_url) == url_host(&src_lockfile.api_base);
     if let Some((kind, _)) = classify(rel)
         && let Some(codec) = crate::snapshot::codec::codec(kind)
         && let Some(src_host) = url_host(&src_lockfile.api_base)
+        && !(matched_in_target && shared_host)
     {
         strip_source_host_env_refs(&mut value, codec, &src_host);
     }
@@ -1710,14 +1734,19 @@ fn remove_key_everywhere(value: &mut serde_json::Value, key: &str) {
 ///   forward refs like a hook's `queues` — stays the source's.
 /// - **New** (no target file): strip the server-assigned fields to a clean
 ///   create payload (`create_body`) so the subsequent `rdc sync` POSTs.
+///
+/// Returns whether the object was MATCHED — the target already held it, so
+/// every env field in `value` is now the target's own. `transform_file` needs
+/// that verdict to decide whether the source-host cleanup still has anything
+/// legitimate to do (see `strip_source_host_env_refs`).
 fn reconcile_target_identity(
     value: &mut serde_json::Value,
     tgt_path: &Path,
     codec: &'static dyn crate::snapshot::codec::KindCodec,
     tgt_org_url: &str,
-) {
+) -> bool {
     if !value.is_object() {
-        return;
+        return false;
     }
 
     // The env-specific field set = top-level keys `cross_env_body` removes
@@ -1744,6 +1773,7 @@ fn reconcile_target_identity(
     let had_org = value.get("organization").is_some();
 
     let tgt_obj = tgt.as_ref().and_then(|t| t.as_object());
+    let matched = tgt_obj.is_some();
     let obj = value.as_object_mut().expect("checked is_object above");
 
     match tgt_obj {
@@ -1803,6 +1833,8 @@ fn reconcile_target_identity(
             serde_json::Value::String(tgt_org_url.to_string()),
         );
     }
+
+    matched
 }
 
 /// rdc-managed top-level directories under an env root — the same per-kind
@@ -3407,6 +3439,146 @@ mod tests {
             "organization must survive even when it carries the source host: {v}"
         );
         assert_eq!(v["queues"], serde_json::json!([]), "other env refs still cleaned");
+    }
+
+    /// Two envs in ONE Rossum instance (one `api_base`, two `org_id`s). The
+    /// source-host cleanup's premise — "an env field carrying the SOURCE host is
+    /// a leaked source ref" — is false there: the TARGET's own refs carry that
+    /// same host. On a MATCHED object it therefore deleted the very values
+    /// `reconcile_target_identity` had just restored from the target file
+    /// (`created_by`, `modified_by`, a hook's `token_owner` / `hook_template` /
+    /// `guide`, an inbox's `email`, a queue's `generic_engine` and back-refs).
+    /// `rdc sync` then saw ~every object as locally edited, pushed it, and wrote
+    /// the server's response back — restoring the fields for the next migrate to
+    /// strip again: a migrate↔sync ping-pong that never converges.
+    #[test]
+    fn shared_host_migrate_keeps_a_matched_targets_env_fields() {
+        use std::fs;
+        const HOST: &str = "https://acme.rossum.app/api/v1";
+
+        let mut m = Mapping::default();
+        m.workspaces.insert("main".into(), "main".into());
+        let subst = build_subst(&m);
+        let rel = Path::new("workspaces/main/workspace.json");
+
+        // `src_api_base` decides whether the promotion is same-host (two orgs in
+        // one instance) or the classic host-per-env pair; `tgt_seed` whether the
+        // object already exists in the target.
+        let run = |src_api_base: &str, tgt_seed: Option<serde_json::Value>| -> serde_json::Value {
+            let src = tempfile::TempDir::new().unwrap();
+            let tgt = tempfile::TempDir::new().unwrap();
+            let mut src_lf = crate::state::Lockfile::default();
+            src_lf.api_base = src_api_base.into();
+            let src_file = src.path().join(rel);
+            fs::create_dir_all(src_file.parent().unwrap()).unwrap();
+            fs::write(
+                &src_file,
+                serde_json::to_vec(&serde_json::json!({
+                    "id": 111,
+                    "url": "rdc://workspaces/main",
+                    "name": "Main",
+                    "organization": format!("{src_api_base}/organizations/1"),
+                    "queues": [format!("{src_api_base}/queues/9")],
+                    "metadata": {},
+                    "created_by": format!("{src_api_base}/users/1"),
+                    "modified_by": format!("{src_api_base}/users/1"),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let dst = tgt.path().join(rel);
+            if let Some(seed) = tgt_seed {
+                fs::create_dir_all(dst.parent().unwrap()).unwrap();
+                fs::write(&dst, serde_json::to_vec(&seed).unwrap()).unwrap();
+            }
+            transform_file(
+                rel,
+                src.path(),
+                tgt.path(),
+                &m,
+                &subst,
+                None,
+                &format!("{HOST}/organizations/2"),
+                true,
+                &src_lf,
+                &crate::state::Lockfile::default(),
+                false,
+                false,
+                &IdRemap::default(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap();
+            serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap()
+        };
+
+        // The target's own snapshot, exactly as a pull from the target org wrote
+        // it: same host as the source, different org and users.
+        let pulled = serde_json::json!({
+            "name": "Main",
+            "organization": format!("{HOST}/organizations/2"),
+            "queues": [format!("{HOST}/queues/77")],
+            "metadata": {},
+            "created_by": format!("{HOST}/users/8"),
+            "modified_by": format!("{HOST}/users/8"),
+        });
+
+        // ---- matched, shared host: the target's env fields must survive ----
+        let matched = run(HOST, Some(pulled.clone()));
+        for field in ["created_by", "modified_by"] {
+            assert_eq!(
+                matched.get(field).and_then(|v| v.as_str()),
+                Some(format!("{HOST}/users/8").as_str()),
+                "the matched target's own {field} must survive a same-host promotion: {matched}"
+            );
+        }
+        assert_eq!(
+            matched["queues"],
+            serde_json::json!([format!("{HOST}/queues/77")]),
+            "the matched target's own back-refs must survive too: {matched}"
+        );
+        // Byte-for-byte agreement with the target's pulled snapshot is what makes
+        // the chain converge: `rdc sync` sees no local edit, so it pushes nothing.
+        assert_eq!(
+            serde_json::to_vec(&matched).unwrap(),
+            serde_json::to_vec(&pulled).unwrap(),
+            "migrate output must equal a fresh target pull: {matched}"
+        );
+
+        // ---- new object, shared host: source refs must still be cleaned ----
+        // `queues` is a reverse-ref env field the server recomputes, so a brand
+        // new workspace must not ship the SOURCE's queue list. Same host or not,
+        // an unmatched object's env fields are the source's by construction.
+        let created = run(HOST, None);
+        assert_eq!(
+            created["queues"],
+            serde_json::json!([]),
+            "a new object's source-derived back-refs must still be stripped: {created}"
+        );
+        assert!(
+            !created.as_object().unwrap().contains_key("created_by"),
+            "a new object must post a clean create body: {created}"
+        );
+
+        // ---- matched, host per env: contamination cleanup unchanged ----
+        // The target file carries a SOURCE-host `created_by` an older leaky
+        // migrate wrote. Hosts differ, so the heuristic is sound and must still
+        // drop it.
+        const SRC_HOST: &str = "https://org-dev.rossum.app/api/v1";
+        let contaminated = run(
+            SRC_HOST,
+            Some(serde_json::json!({
+                "name": "Main",
+                "organization": format!("{HOST}/organizations/2"),
+                "queues": [],
+                "metadata": {},
+                "created_by": format!("{SRC_HOST}/users/1"),
+            })),
+        );
+        assert!(
+            !contaminated.as_object().unwrap().contains_key("created_by"),
+            "a cross-host promotion must still drop a source-host ref: {contaminated}"
+        );
     }
 
     #[test]
