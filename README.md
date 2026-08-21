@@ -105,7 +105,7 @@ rdc init
 
 `rdc init` walks you through setting up one or more envs — env name, API base URL, org ID, API token — then syncs each into a local snapshot.
 
-Alongside the snapshot it scaffolds `CLAUDE.md`, `README.md`, `.gitignore`, `.gitattributes`, a `.gitlab-ci.yml` pipeline, and a Python test harness (`testkit/`, `conftest.py`, `pytest.ini`, `requirements-dev.txt`). The pipeline's archive matrix and its deploy buttons are generated from the envs in `rdc.toml` — one archive job per env, one drafted deploy button per env — inside two `# >>> rdc:…` marked regions that `rdc init` refreshes on every run, including when you add an env. Everything outside those markers is yours and is never touched; a pipeline with no markers at all is left completely alone unless `--force` is passed, which replaces it wholesale. Fill in each draft's `RDC_SRC` before pressing it (it refuses to run until you do) and delete the drafts for envs you author by hand.
+Alongside the snapshot it scaffolds `CLAUDE.md`, `README.md`, `.gitignore`, `.gitattributes`, a `.gitlab-ci.yml` pipeline, and a Python test harness (`testkit/`, `conftest.py`, `pytest.ini`, `requirements-dev.txt`). The pipeline's archive matrix and its deploy buttons come from the envs in `rdc.toml` — one archive job per env, one drafted deploy button per env — inside two `# >>> rdc:…` marked regions `rdc init` maintains on every run, including when you add an env. The archive matrix is regenerated, so it always lists exactly your envs. The deploy region is only ever **added to**: fill in a draft's `RDC_SRC` (it refuses to run until you do), delete the drafts for envs you author by hand, add keys of your own — a later `rdc init` keeps all of it and only appends a draft for an env that has never had one. Everything outside the markers is yours and is never touched; a pipeline with no markers at all is left completely alone unless `--force` is passed, which replaces it wholesale.
 
 The harness evaluates a queue's formulas against the **real** txscript runtime, using that queue's own `schema.json`, so a `number` field is a number and a `date` field must be ISO:
 
@@ -124,7 +124,7 @@ def test_line_total_per_row():
     ) == [10.0]
 ```
 
-`pytest -q` runs it. Existing files are never touched — `rdc init --force` re-generates them from the current binary, and on its own (no `--env`) that is all it does.
+`pytest -q` runs it; your own tests go under `tests/`. Existing files are never touched by a plain `rdc init`. `rdc init --force` refreshes the generated regions of the three markered scaffolds (`CLAUDE.md`, `README.md`, `.gitlab-ci.yml`) and leaves their static prose — and any deploy button you have finished — exactly as it is; the markerless files (`testkit/`, `conftest.py`, `pytest.ini`, `requirements-dev.txt`) are rewritten from the current binary. To take a newer binary's static content for a markered file, delete that file and re-run `rdc init`. On its own (no `--env`), refreshing the scaffolds is all `--force` does.
 
 For an env named `test`, you now have:
 
@@ -165,7 +165,7 @@ $EDITOR envs/test/hooks/validator-invoices.py
 rdc sync test
 ```
 
-To promote changes between envs, see [Deploy](#rdc-deploy).
+To promote changes between envs, see [`rdc migrate`](#rdc-migrate).
 
 ## `rdc sync`
 
@@ -227,25 +227,36 @@ Proceed with deletion? [y/N] y
 
 ## `rdc migrate`
 
-Promotes one env's snapshot to another, in two reviewable steps. `rdc migrate <src> <tgt>` is pure-local — zero remote calls: it copies `envs/<src>/` into `envs/<tgt>/`, renaming slugs per the mapping, rewriting portable `rdc://<kind>/<slug>` references, and applying the target env's `overlay.toml`. Pushing is a separate, explicit step.
+Promotes one env's snapshot to another. The usual promotion is one chain:
+
+```sh
+rdc sync test && rdc migrate test prod --mirror && rdc sync prod --allow-deletes
+```
+
+`rdc sync test` refreshes the source snapshot, so you promote the source's current state rather than a stale one. `rdc migrate test prod --mirror` is pure-local — zero remote calls: it copies `envs/test/` into `envs/prod/`, renaming slugs per the mapping, rewriting portable `rdc://<kind>/<slug>` references, applying the target env's `overlay.toml`, and (because of `--mirror`) pruning target files with no source counterpart. `rdc sync prod --allow-deletes` pushes the result: it creates missing objects in dependency order and turns those pruned files into remote deletions.
+
+**The chain deletes.** `--mirror` plus `--allow-deletes` removes objects from the target that the source does not have. Rehearse both halves before the first run against a new target, and on the real run stop between the migrate and the sync to read `git diff` — that diff is exactly what the sync will push:
+
+```sh
+rdc migrate test prod --mirror --dry-run   # preview the per-file plan
+rdc sync prod --dry-run                    # preview the remote delta
+rdc migrate test prod --mirror             # transform envs/prod/ locally
+git diff                                   # review the actual delta
+rdc sync prod --allow-deletes              # push — creates, updates, deletes
+```
+
+This is the same chain the shipped `templates/gitlab-ci.yml` deploy button runs (with `--yes`), minus the source sync — there, the scheduled `archive` job is what keeps the committed snapshot current.
 
 Slug alignment across envs lives in one hand-editable file,
 `.rdc/mapping.toml`: each entry is a logical object, and each environment
 names its own slug. Objects whose slug is identical everywhere need no entry
 (they map 1:1). The file is often empty or absent.
 
-```sh
-rdc migrate test prod --dry-run   # preview the per-file plan
-rdc migrate test prod             # transform envs/prod/ locally
-git diff                          # review the actual delta
-rdc sync prod                     # push — creates objects in dependency order
-```
-
 Re-running on an already-migrated snapshot is a no-op (matched objects keep the target's identity).
 
 ### Mirror semantics
 
-By default migrate is additive — objects that exist only in the target are left intact. `--mirror` also deletes target snapshot files with no source counterpart (local file removals; review with `git diff` before syncing).
+Without `--mirror`, migrate is additive — objects that exist only in the target are left intact and nothing is ever removed. That is the deliberate alternative for a target that legitimately holds work the source lacks. `--mirror` instead deletes target snapshot files with no source counterpart; those are local file removals, so they reach the tenant only when the following `rdc sync <tgt>` is given `--allow-deletes` (or you confirm its prompt). Review with `git diff` before syncing.
 
 ### Selective migrate
 
@@ -355,7 +366,7 @@ rather than duplicating them.
 
 | Command | What it does |
 |---|---|
-| `rdc init` | Create a new project, or add an env to an existing one. Prompts interactively; regenerates the pipeline's env regions on every run; `--force` re-generates the scaffold files (`CLAUDE.md`, `README.md`, `.gitlab-ci.yml`, `testkit/`). |
+| `rdc init` | Create a new project, or add an env to an existing one. Prompts interactively; maintains the pipeline's and docs' generated regions on every run; `--force` refreshes those regions and rewrites the markerless scaffolds (`testkit/`, `conftest.py`, `pytest.ini`, `requirements-dev.txt`) — delete a markered file and re-init to take its newer static content. |
 | `rdc auth <env>` | Set or refresh the API token for `<env>`. |
 | `rdc sync <env>` | Reconcile snapshot ↔ remote in one pass. |
 | `rdc migrate <src> <tgt>` | Copy one env's snapshot into another's, locally (slug remap, ref rewrite, overlay) — then push with `rdc sync <tgt>`. |
