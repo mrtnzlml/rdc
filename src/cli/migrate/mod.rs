@@ -606,6 +606,24 @@ fn transform_file(
         } else {
             std::fs::read(&src_path).with_context(|| format!("reading {}", src_path.display()))?
         };
+        // A sidecar that differs from the target's only in its EOF newline is
+        // the same code as far as rdc is concerned: `sidecar_bytes_for_hash`
+        // ignores trailing newlines on BOTH sides, because editors add them and
+        // the API returns bodies without them. So rewriting the target file to
+        // the source's (or an overlay shadow's) convention changes bytes that
+        // no `content_hash` can see — `rdc sync` correctly finds nothing to
+        // push, the file stays modified in `git diff`, and the next migrate does
+        // it again: a working tree that never comes clean. Keep what the target
+        // already has; a real content change still lands.
+        let bytes = match std::fs::read(&dst_path) {
+            Ok(existing)
+                if crate::snapshot::codec::sidecar_bytes_for_hash(&existing)
+                    == crate::snapshot::codec::sidecar_bytes_for_hash(&bytes) =>
+            {
+                existing
+            }
+            _ => bytes,
+        };
         return settle(&dst_path, &bytes, dry_run);
     }
 
@@ -3579,6 +3597,72 @@ mod tests {
             !contaminated.as_object().unwrap().contains_key("created_by"),
             "a cross-host promotion must still drop a source-host ref: {contaminated}"
         );
+    }
+
+    /// A sidecar (or its overlay shadow) whose only difference from the target's
+    /// file is the EOF newline must NOT be rewritten. `sidecar_bytes_for_hash`
+    /// ignores trailing newlines, so `rdc sync` sees nothing to push — leaving
+    /// migrate to flip those bytes on every run and a working tree that never
+    /// comes clean.
+    #[test]
+    fn transform_keeps_a_sidecars_eof_newline_convention() {
+        use std::fs;
+        let m = Mapping::default();
+        let subst = build_subst(&m);
+        let rel = Path::new("workspaces/main/queues/q/formulas/f.py");
+
+        let run = |src_body: &[u8], tgt_body: Option<&[u8]>| -> (FileOutcome, Vec<u8>) {
+            let src = tempfile::TempDir::new().unwrap();
+            let tgt = tempfile::TempDir::new().unwrap();
+            let src_file = src.path().join(rel);
+            fs::create_dir_all(src_file.parent().unwrap()).unwrap();
+            fs::write(&src_file, src_body).unwrap();
+            let dst = tgt.path().join(rel);
+            if let Some(body) = tgt_body {
+                fs::create_dir_all(dst.parent().unwrap()).unwrap();
+                fs::write(&dst, body).unwrap();
+            }
+            let outcome = transform_file(
+                rel,
+                src.path(),
+                tgt.path(),
+                &m,
+                &subst,
+                None,
+                "https://acme.rossum.app/api/v1/organizations/2",
+                true,
+                &crate::state::Lockfile::default(),
+                &crate::state::Lockfile::default(),
+                false,
+                false,
+                &IdRemap::default(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap();
+            (outcome, fs::read(&dst).unwrap())
+        };
+
+        // Source ends with a newline (an editor's "insert final newline"), the
+        // target's pulled copy does not: keep the target's bytes.
+        let (outcome, bytes) = run(b"x = 1\n", Some(b"x = 1"));
+        assert_eq!(outcome, FileOutcome::Unchanged, "EOF-newline-only diff must be a no-op");
+        assert_eq!(bytes, b"x = 1", "the target's own EOF convention must survive");
+
+        // And the other way round, so migrate never churns in either direction.
+        let (outcome, bytes) = run(b"x = 1", Some(b"x = 1\n"));
+        assert_eq!(outcome, FileOutcome::Unchanged);
+        assert_eq!(bytes, b"x = 1\n");
+
+        // A REAL content change still lands, EOF newline and all.
+        let (outcome, bytes) = run(b"x = 2\n", Some(b"x = 1"));
+        assert_eq!(outcome, FileOutcome::Updated);
+        assert_eq!(bytes, b"x = 2\n");
+
+        // No target file yet: the source's bytes are written verbatim.
+        let (outcome, bytes) = run(b"x = 1\n", None);
+        assert_eq!(outcome, FileOutcome::Created);
+        assert_eq!(bytes, b"x = 1\n");
     }
 
     #[test]
