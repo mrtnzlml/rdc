@@ -1,4 +1,7 @@
-pytest>=8,<9
+# Major-pinned on purpose: pytest majors remove deprecated APIs (9.0 turned
+# PytestRemovedIn9Warning into an error, 9.1 removed the features), so a
+# floating major could fail your tests on an unrelated pipeline run.
+pytest>=9,<10
 
 # The real Rossum formula runtime. Pinned: 1.2.0 dereferences payload["document"]
 # and returns an EvalResult where 1.1.0 returned the value raw, so an unpinned

@@ -69,7 +69,7 @@ jobs:
       # exposed job-wide; the certificate and passwords stay step-scoped.
       APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Strip a leading "v" once here so every packaging step can just use
       # $VERSION. Needs an explicit bash shell: `run:` defaults to pwsh on the
@@ -87,7 +87,7 @@ jobs:
       # (inside the Flutter/Xcode build tree), NOT desktop/rust/target, so only
       # the crate downloads are cacheable here -- not compiled artifacts.
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -192,7 +192,7 @@ jobs:
         # TODO: build an AppImage and/or .deb as a follow-up.
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rdc-desktop-${{ matrix.target }}
           path: desktop/dist/*

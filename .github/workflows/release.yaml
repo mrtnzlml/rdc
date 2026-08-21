@@ -25,7 +25,7 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -33,7 +33,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -61,7 +61,7 @@ jobs:
           tar czf "dist/rdc-$version-${{ matrix.target }}.tar.gz" -C "$src" "$binary"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rdc-${{ matrix.target }}
           path: dist/*
@@ -87,10 +87,10 @@ jobs:
     if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -99,7 +99,7 @@ jobs:
         run: ls -la artifacts/
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           # Widened from *.tar.gz to also pick up the desktop .dmg and .zip.
           # The glob still matches the CLI tarballs when the desktop jobs
@@ -118,7 +118,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout tap repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: mrtnzlml/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
