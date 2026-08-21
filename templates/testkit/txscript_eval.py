@@ -19,6 +19,7 @@ import datetime
 import importlib.util
 import json
 import pathlib
+import sys
 from typing import Any
 
 from txscript.formula import Formula
@@ -149,6 +150,10 @@ def load_hook(hook_path: str | pathlib.Path):
     if spec is None or spec.loader is None:
         raise FileNotFoundError(f"Cannot load hook module from {path}")
     module = importlib.util.module_from_spec(spec)
+    # Registered BEFORE execution: dataclasses, pickle and get_type_hints all
+    # look the defining module up in sys.modules while the module body runs, and
+    # a hook using any of them fails to import if it is not there yet.
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -266,8 +271,6 @@ def _serialize(value: Any) -> str:
         return value.date().isoformat()
     if isinstance(value, datetime.date):
         return value.isoformat()
-    if isinstance(value, bool):
-        return "True" if value else "False"
     return str(value)
 
 
