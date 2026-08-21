@@ -1055,6 +1055,16 @@ fn strip_source_host_env_refs(
         return;
     };
     for field in env_fields {
+        // `organization` is exempt: `reconcile_target_identity` just set it to
+        // the TARGET org, authoritatively, from `rdc.toml`. The source-host
+        // heuristic below cannot tell a source ref from a target one when both
+        // envs live on the SAME host — two orgs in one Rossum instance, e.g.
+        // `https://acme.rossum.app/api/v1` with `org_id` 1 and 2 — so it would
+        // delete the correct value it had just been given, leaving a body the
+        // API rejects with `organization: This field is required.` on create.
+        if field == "organization" {
+            continue;
+        }
         let drop_field = match obj.get_mut(&field) {
             Some(serde_json::Value::Array(arr)) => {
                 arr.retain(
@@ -1728,8 +1738,9 @@ fn reconcile_target_identity(
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok());
 
-    // Does the source object carry an `organization`? (Used only on the
-    // new-object path to decide whether to set the target org.)
+    // Does the source object carry an `organization`? Decides whether the
+    // field is set at all — never invent it for a kind whose API body has no
+    // such field (a queue, a schema, a hook).
     let had_org = value.get("organization").is_some();
 
     let tgt_obj = tgt.as_ref().and_then(|t| t.as_object());
@@ -1739,7 +1750,12 @@ fn reconcile_target_identity(
         Some(tobj) => {
             // Matched: take the TARGET's value for every env field (or drop it
             // if the target lacks it). Deployable content stays the source's.
+            // `organization` is excluded — it is set from `tgt_org_url` below on
+            // BOTH paths, never inherited and never dropped.
             for field in env_fields {
+                if field == "organization" {
+                    continue;
+                }
                 match tobj.get(&field) {
                     Some(tgt_field) => {
                         obj.insert(field, tgt_field.clone());
@@ -1754,21 +1770,38 @@ fn reconcile_target_identity(
             // New in tgt: there's no target identity to inherit. Strip only the
             // universally server-assigned fields (id/url/created_*/modified_*/
             // status) so `rdc sync` POSTs a clean create — the server assigns
-            // them. Set `organization` to the TARGET org (the object is created
-            // in tgt; src's org would be wrong/rejected). Leave the rest as the
-            // source's transformed content, including portable `rdc://` ref
-            // lists — the subst already remapped them to tgt slugs, and the
-            // server reconciles reverse-ref lists on create.
+            // them. Leave the rest as the source's transformed content,
+            // including portable `rdc://` ref lists — the subst already remapped
+            // them to tgt slugs, and the server reconciles reverse-ref lists on
+            // create.
             for field in crate::snapshot::create::UNIVERSAL_SERVER_FIELDS {
                 obj.shift_remove(*field);
             }
-            if had_org {
-                obj.insert(
-                    "organization".to_string(),
-                    serde_json::Value::String(tgt_org_url.to_string()),
-                );
-            }
         }
+    }
+
+    // `organization` is the one env field whose target value rdc KNOWS offline:
+    // `tgt_org_url` is built from the target env's own `api_base` + `org_id` in
+    // `rdc.toml`, and the object is being written into that org. So it is set
+    // here on both paths rather than inherited from the target file:
+    //
+    // * a matched target holds that same URL anyway (it was pulled from that
+    //   org), so this is a no-op for a healthy snapshot;
+    // * a matched target MISSING the field — one an older migrate wrote before
+    //   this was fixed — gets it back, instead of inheriting the absence for
+    //   ever and 400ing every create with `organization: This field is
+    //   required.`;
+    // * a new object gets the target org, never the source's (which would be
+    //   rejected).
+    //
+    // Setting an existing key keeps its position in the body, so migrate's bytes
+    // stay identical to a fresh target pull's (re-inserting after a removal
+    // would append the key at the end and churn the diff for ever).
+    if had_org {
+        obj.insert(
+            "organization".to_string(),
+            serde_json::Value::String(tgt_org_url.to_string()),
+        );
     }
 }
 
@@ -3241,6 +3274,139 @@ mod tests {
             !subst.contains_key("rdc://workspaces/main"),
             "identity pairs must not appear in the subst dict"
         );
+    }
+
+    /// Two envs sharing ONE API host — two organizations inside a single Rossum
+    /// instance (`https://acme.rossum.app/api/v1` with `org_id` 1 and 2), which
+    /// is how a customer-hosted org pair is addressed. The source-host cleanup
+    /// cannot tell a source ref from a target one there, and used to delete the
+    /// `organization` `reconcile_target_identity` had just set to the TARGET org
+    /// — so migrate wrote a body the API rejects with
+    /// `organization: This field is required.` on `POST /workspaces`.
+    #[test]
+    fn shared_host_migrate_keeps_the_target_organization() {
+        use std::fs;
+        const HOST: &str = "https://acme.rossum.app/api/v1";
+        let tgt_org = format!("{HOST}/organizations/2");
+
+        let mut m = Mapping::default();
+        m.workspaces.insert("main".into(), "main".into());
+        let subst = build_subst(&m);
+        let rel = Path::new("workspaces/main/workspace.json");
+
+        let mut src_lf = crate::state::Lockfile::default();
+        src_lf.api_base = HOST.into();
+
+        // `tgt_seed`: what already sits at the target path — None for a brand-new
+        // object, Some(bytes) for a matched one.
+        let run = |tgt_seed: Option<Vec<u8>>| -> serde_json::Value {
+            let src = tempfile::TempDir::new().unwrap();
+            let tgt = tempfile::TempDir::new().unwrap();
+            let src_file = src.path().join(rel);
+            fs::create_dir_all(src_file.parent().unwrap()).unwrap();
+            fs::write(
+                &src_file,
+                serde_json::to_vec(&serde_json::json!({
+                    "id": 111,
+                    "url": "rdc://workspaces/main",
+                    "name": "Main",
+                    "organization": format!("{HOST}/organizations/1"),
+                    "queues": [],
+                    "metadata": {},
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let dst = tgt.path().join(rel);
+            if let Some(bytes) = tgt_seed {
+                fs::create_dir_all(dst.parent().unwrap()).unwrap();
+                fs::write(&dst, bytes).unwrap();
+            }
+            transform_file(
+                rel,
+                src.path(),
+                tgt.path(),
+                &m,
+                &subst,
+                None,
+                &tgt_org,
+                true,
+                &src_lf,
+                &crate::state::Lockfile::default(),
+                false,
+                false,
+                &IdRemap::default(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap();
+            serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap()
+        };
+
+        // New in tgt: carries the TARGET org, never the source's.
+        let created = run(None);
+        assert_eq!(
+            created.get("organization").and_then(|o| o.as_str()),
+            Some(tgt_org.as_str()),
+            "a new object must carry the target org: {created}"
+        );
+        // Key order matches a fresh pull's (org right after `name`), so migrate
+        // and pull agree byte-for-byte.
+        assert_eq!(
+            created.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["name", "organization", "queues", "metadata"],
+            "organization must keep its position, not be appended: {created}"
+        );
+
+        // Matched, and the target file is MISSING `organization` — exactly what
+        // an older migrate left behind. The field is restored, not inherited as
+        // absent, so the project heals on the next migrate instead of failing
+        // every create for ever.
+        let healed = run(Some(
+            serde_json::to_vec(&serde_json::json!({ "name": "Main", "queues": [], "metadata": {} }))
+                .unwrap(),
+        ));
+        assert_eq!(
+            healed.get("organization").and_then(|o| o.as_str()),
+            Some(tgt_org.as_str()),
+            "a matched target missing the field must get the target org back: {healed}"
+        );
+
+        // Matched with a CONTAMINATED target org (an earlier leaky migrate wrote
+        // the source org's URL): the target env's own org wins.
+        let cleaned = run(Some(
+            serde_json::to_vec(&serde_json::json!({
+                "name": "Main",
+                "organization": format!("{HOST}/organizations/1"),
+                "queues": [],
+                "metadata": {},
+            }))
+            .unwrap(),
+        ));
+        assert_eq!(
+            cleaned.get("organization").and_then(|o| o.as_str()),
+            Some(tgt_org.as_str()),
+            "a contaminated target org must be replaced by the target env's: {cleaned}"
+        );
+    }
+
+    /// The source-host cleanup must leave `organization` alone — it is owned by
+    /// `reconcile_target_identity`, which runs immediately before it.
+    #[test]
+    fn strip_source_host_env_refs_leaves_organization_alone() {
+        let codec = crate::snapshot::codec::codec("workspaces").unwrap();
+        let host = "acme.rossum.app";
+        let mut v = serde_json::json!({
+            "name": "w",
+            "organization": format!("https://{host}/api/v1/organizations/2"),
+            "queues": [format!("https://{host}/api/v1/queues/9")],
+        });
+        strip_source_host_env_refs(&mut v, codec, host);
+        assert_eq!(
+            v["organization"], format!("https://{host}/api/v1/organizations/2"),
+            "organization must survive even when it carries the source host: {v}"
+        );
+        assert_eq!(v["queues"], serde_json::json!([]), "other env refs still cleaned");
     }
 
     #[test]
