@@ -31,7 +31,8 @@ mod workspaces;
 ///
 /// Each per-kind driver owns its own `Phase` from the shared
 /// `ProgressLog`; dispatch order matches the dependency graph
-/// (workspaces → schemas → queues → queue-children → org-level leaves).
+/// (workspaces → engines → engine fields → schemas → queues → queue-children
+/// → org-level leaves).
 ///
 /// `catalog_hooks` is the Phase-1 hook list, threaded into the hooks
 /// driver so its store-extension orphan check can avoid a redundant
@@ -60,6 +61,38 @@ pub(crate) async fn push_classified(
     if !changes.workspaces.is_empty() {
         tally(workspaces::push(paths, client, lockfile, interactive, &changes.workspaces, progress, env).await
             .with_context(|| format!("pushing workspaces for env '{env}'"))?);
+    }
+    // Engines and their fields before schemas and queues. Unlike every other
+    // edge in this graph, this one is not a reference the payload carries — it
+    // is a server-side CONTENT check: `POST /queues` validates the queue's
+    // schema against the bound engine's field NAMES and refuses the create with
+    //
+    //   non_field_errors: Engine (id: N) restriction: extracted field
+    //   '<schema field>' is not present among names of engine fields
+    //
+    // for every extracted field the engine does not (yet) have. Pushed last, as
+    // "org-level leaves", the engine fields did not exist yet and a promote into
+    // a fresh env died on its first queue.
+    //
+    // The failure was hidden while the target engine was NEW: the queue's
+    // `engine` ref could not resolve, so it was deferred out of the create body
+    // and PATCHed by `run_relink` after the engine fields existed. It bites only
+    // when the engine ALREADY exists in the target — the ref resolves, the
+    // binding ships with the create, and it is validated against an engine whose
+    // fields are still queued behind the queue.
+    //
+    // Safe this early: an engine's only queue-facing ref is `training_queues`,
+    // which lives in `extra` and is therefore deferrable by construction (see
+    // `relink::undeferrable`, where `engines` protects only `url`), so it is
+    // postponed to the relink pass exactly as a hook's `run_after` is. Engine
+    // fields reference only their engine, which is why they stay behind it.
+    if !changes.engines.is_empty() {
+        tally(engines::push(paths, client, lockfile, interactive, &changes.engines, relink, progress, env).await
+            .with_context(|| format!("pushing engines for env '{env}'"))?);
+    }
+    if !changes.engine_fields.is_empty() {
+        tally(engine_fields::push(paths, client, lockfile, interactive, &changes.engine_fields, progress, env).await
+            .with_context(|| format!("pushing engine fields for env '{env}'"))?);
     }
     if !changes.schemas.is_empty() {
         tally(schemas::push(paths, client, lockfile, interactive, &changes.schemas, progress, env).await
@@ -98,14 +131,6 @@ pub(crate) async fn push_classified(
     if !changes.rules.is_empty() {
         tally(rules::push(paths, client, lockfile, interactive, &changes.rules, progress, env).await
             .with_context(|| format!("pushing rules for env '{env}'"))?);
-    }
-    if !changes.engines.is_empty() {
-        tally(engines::push(paths, client, lockfile, interactive, &changes.engines, relink, progress, env).await
-            .with_context(|| format!("pushing engines for env '{env}'"))?);
-    }
-    if !changes.engine_fields.is_empty() {
-        tally(engine_fields::push(paths, client, lockfile, interactive, &changes.engine_fields, progress, env).await
-            .with_context(|| format!("pushing engine fields for env '{env}'"))?);
     }
     Ok((pushed, skipped))
 }
