@@ -194,7 +194,10 @@ fn init_prefills_the_docs_from_rdc_toml() {
     let claude = std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
     assert!(claude.contains("| `dev` | `https://example.rossum.app/api/v1` | 11 | `DEV` |"));
     assert!(claude.contains("| `prod-eu` | `https://example.rossum.app/api/v1` | 22 | `PROD_EU` |"));
-    assert!(claude.contains("rdc migrate dev prod-eu --dry-run"));
+    assert!(claude.contains(
+        "rdc sync dev && rdc migrate dev prod-eu --mirror && rdc sync prod-eu --allow-deletes"
+    ));
+    assert!(claude.contains("rdc migrate dev prod-eu --mirror --dry-run"));
     // the two factual fixes
     assert!(!claude.contains("project name"), "rdc.toml has no project name");
     assert!(!claude.contains("fill in its TODOs"));
@@ -231,7 +234,10 @@ fn init_refreshes_the_doc_regions_when_an_env_is_added() {
     let after = std::fs::read_to_string(&claude_path).unwrap();
     assert!(after.contains("## House rules"), "hand-added prose must survive");
     assert!(after.contains("| `test` |"), "the new env must reach the table");
-    assert!(after.contains("rdc migrate dev test --dry-run"), "promote pair must refresh");
+    assert!(
+        after.contains("rdc migrate dev test --mirror && rdc sync test --allow-deletes"),
+        "promote pair must refresh"
+    );
 }
 
 /// A CLAUDE.md with no rdc region markers at all (fully hand-written) is
@@ -320,6 +326,13 @@ fn init_readme_includes_promote_for_multiple_envs() {
         "expected migrate example with dev→prod: {body}"
     );
     assert!(body.contains("--dry-run"), "migrate --dry-run guidance missing: {body}");
+    // ...and the chain that is actually run, deletes named.
+    assert!(
+        body.contains(
+            "rdc sync dev && rdc migrate dev prod --mirror && rdc sync prod --allow-deletes"
+        ),
+        "README must lead with the real promotion chain: {body}"
+    );
     // The removed command must not be advertised anywhere in the scaffold.
     assert!(
         !body.contains("rdc deploy"),
@@ -1213,7 +1226,7 @@ fn scaffolded_testkit_passes_its_own_pytest_suite() {
             eprintln!(
                 "SKIP scaffolded_testkit_passes_its_own_pytest_suite: \
                  python3 with pytest + txscript not available \
-                 (pip install 'pytest>=8,<9' 'txscript==1.2.0')"
+                 (pip install 'pytest>=9,<10' 'txscript==1.2.0')"
             );
             return;
         }

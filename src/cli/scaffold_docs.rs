@@ -13,12 +13,35 @@ use std::collections::BTreeMap;
 pub const REGION_ENVS: &str = "rdc:envs";
 /// The promote walkthrough, naming this project's own envs.
 pub const REGION_PROMOTE: &str = "rdc:promote";
+/// The `rdc sync <env>` command list, one line per env (README only).
+pub const REGION_SYNC: &str = "rdc:sync";
 
+/// Every doc region rdc can fill. A file need not declare all of them —
+/// `CLAUDE.md` has no `rdc:sync` — but a name it *does* declare must be in
+/// here, or [`crate::cli::regions::splice`] rejects the file as a typo.
 pub fn render_doc_regions(envs: &BTreeMap<String, EnvConfig>) -> BTreeMap<&'static str, String> {
     BTreeMap::from([
         (REGION_ENVS, render_envs(envs)),
         (REGION_PROMOTE, render_promote(envs)),
+        (REGION_SYNC, render_sync(envs)),
     ])
+}
+
+/// One `rdc sync <env>` per env. Generated rather than static because it is
+/// env-derived, and an env-derived line outside a region never updates again
+/// (only the regions are spliced on an existing file).
+fn render_sync(envs: &BTreeMap<String, EnvConfig>) -> String {
+    if envs.is_empty() {
+        return "_No environments defined yet. Add one with \
+                `rdc init --env <env>=<api_base>:<org_id>`._"
+            .to_string();
+    }
+    let mut out = String::from("```sh\n");
+    for name in envs.keys() {
+        out.push_str(&format!("rdc sync {name}\n"));
+    }
+    out.push_str("```");
+    out
 }
 
 fn render_envs(envs: &BTreeMap<String, EnvConfig>) -> String {
@@ -57,15 +80,49 @@ fn render_promote(envs: &BTreeMap<String, EnvConfig>) -> String {
                 with the real commands."
             .to_string();
     };
+    // Leads with the chain because that is how a promotion is actually run —
+    // and names its destructive half plainly, because `--mirror` plus
+    // `--allow-deletes` is exactly what the pipeline's deploy button presses
+    // unattended. A reader who learns an additive recipe here and then presses
+    // that button has been taught the wrong workflow.
     format!(
-        "1. `rdc sync {src}` and `rdc sync {tgt}` so both lockfiles are populated.\n\
-         2. `rdc migrate {src} {tgt} --dry-run` — preview the local file transform.\n\
-         3. `rdc migrate {src} {tgt}` — copy {src}'s snapshot into `envs/{tgt}/`, renaming\n   \
-            slugs per `.rdc/mapping.toml` (one hand-editable file where each env names its\n   \
-            own slug for an object; identical slugs need no entry), rewriting portable\n   \
-            `rdc://` refs, and applying {tgt}'s `overlay.toml`.\n\
-         4. Review the result with `git diff`, then `rdc sync {tgt}` to push — sync creates\n   \
-            missing objects in dependency order."
+        "The usual promotion is one chain:\n\
+         \n\
+         ```sh\n\
+         rdc sync {src} && rdc migrate {src} {tgt} --mirror && rdc sync {tgt} --allow-deletes\n\
+         ```\n\
+         \n\
+         - `rdc sync {src}` refreshes the source snapshot, so you promote {src}'s\n  \
+         current state rather than a stale one.\n\
+         - `rdc migrate {src} {tgt} --mirror` copies {src}'s snapshot into\n  \
+         `envs/{tgt}/` — renaming slugs per `.rdc/mapping.toml` (one hand-editable\n  \
+         file where each env names its own slug for an object; identical slugs need\n  \
+         no entry), rewriting portable `rdc://` refs, applying {tgt}'s\n  \
+         `overlay.toml` — and, because of `--mirror`, pruning target files {src} no\n  \
+         longer has. Still zero remote calls.\n\
+         - `rdc sync {tgt} --allow-deletes` pushes the result: it creates missing\n  \
+         objects in dependency order, and turns those pruned files into remote\n  \
+         deletions.\n\
+         \n\
+         **The chain deletes.** `--mirror` plus `--allow-deletes` removes objects from\n\
+         {tgt} that {src} does not have. Rehearse it before the first run against a\n\
+         new target:\n\
+         \n\
+         ```sh\n\
+         rdc migrate {src} {tgt} --mirror --dry-run\n\
+         rdc sync {tgt} --dry-run\n\
+         ```\n\
+         \n\
+         On a real run, stop between the migrate and the sync and read `git diff` —\n\
+         that diff is exactly what the sync will push.\n\
+         \n\
+         The pipeline's `deploy:{tgt}` button runs the same two writing steps with\n\
+         `--yes`; it skips `rdc sync {src}` only because the scheduled `archive` job\n\
+         keeps the committed snapshot current.\n\
+         \n\
+         Additive alternative: drop `--mirror` and `--allow-deletes` when {tgt}\n\
+         legitimately holds objects {src} lacks — nothing is then pruned locally or\n\
+         deleted remotely."
     )
 }
 
@@ -79,23 +136,7 @@ fn md_cell(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::EnvConfig;
-
-    fn envs(names: &[&str]) -> BTreeMap<String, EnvConfig> {
-        names
-            .iter()
-            .enumerate()
-            .map(|(i, n)| {
-                (
-                    (*n).to_string(),
-                    EnvConfig {
-                        api_base: "https://example.rossum.app/api/v1".to_string(),
-                        org_id: 100 + i as u64,
-                    },
-                )
-            })
-            .collect()
-    }
+    use crate::cli::gitlab_ci::test_envs as envs;
 
     #[test]
     fn env_table_carries_api_base_org_and_credential_suffix() {
@@ -116,12 +157,27 @@ mod tests {
         assert!(table.contains(r"a\|b"), "{table}");
     }
 
+    /// The recipe must teach the chain people actually run, name what it
+    /// deletes, and be recognisable as the pipeline's deploy button.
     #[test]
-    fn promote_recipe_names_the_first_two_envs() {
+    fn promote_recipe_leads_with_the_real_chain_and_names_the_deletes() {
         let r = render_doc_regions(&envs(&["dev", "prod", "test"]));
         let promote = &r[REGION_PROMOTE];
-        assert!(promote.contains("rdc migrate dev prod --dry-run"));
-        assert!(promote.contains("rdc sync prod"));
+        // the copy-pasteable line, with this project's own envs
+        assert!(
+            promote.contains(
+                "rdc sync dev && rdc migrate dev prod --mirror && rdc sync prod --allow-deletes"
+            ),
+            "{promote}"
+        );
+        // the destructive half, named and rehearsable
+        assert!(promote.contains("`--mirror` plus `--allow-deletes` removes objects"), "{promote}");
+        assert!(promote.contains("rdc migrate dev prod --mirror --dry-run"), "{promote}");
+        assert!(promote.contains("rdc sync prod --dry-run"), "{promote}");
+        assert!(promote.contains("`git diff`"), "{promote}");
+        // same workflow as the button, and the additive escape hatch
+        assert!(promote.contains("`deploy:prod` button"), "{promote}");
+        assert!(promote.contains("Additive alternative"), "{promote}");
         assert!(!promote.contains("<src>"), "placeholders must be resolved: {promote}");
     }
 
@@ -133,11 +189,20 @@ mod tests {
     }
 
     #[test]
-    fn no_envs_still_renders_both_regions() {
-        // A hand-emptied rdc.toml must not produce a broken table.
+    fn sync_region_lists_one_command_per_env() {
+        let r = render_doc_regions(&envs(&["dev", "prod-eu"]));
+        assert_eq!(r[REGION_SYNC], "```sh\nrdc sync dev\nrdc sync prod-eu\n```");
+    }
+
+    #[test]
+    fn no_envs_still_renders_every_region() {
+        // A hand-emptied rdc.toml must not produce a broken table -- and must
+        // still fill every region a scaffold declares, because splicing a
+        // template with no markers is a hard error.
         let r = render_doc_regions(&BTreeMap::new());
         assert!(r[REGION_ENVS].contains("No environments"));
         assert!(r[REGION_PROMOTE].contains("second env"));
+        assert!(r[REGION_SYNC].contains("No environments"));
     }
 
     #[test]

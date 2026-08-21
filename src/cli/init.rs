@@ -578,8 +578,8 @@ fn write_gitignore(root: &Path) -> Result<Scaffolded> {
 
 /// Mark rdc-owned files under `.rdc/` as generated so GitHub collapses
 /// their diffs by default and excludes them from language stats. The
-/// state lockfile (`state/<env>.lock.json`) and cross-env mappings
-/// (`map/<src>-to-<tgt>.toml`) are produced by the tool; reviewers
+/// state lockfile (`state/<env>.lock.json`) and the cross-env slug map
+/// (`mapping.toml`) are produced by the tool; reviewers
 /// shouldn't have to scroll past them.
 /// Additive like [`write_gitignore`], and for the same reason.
 fn write_gitattributes(root: &Path) -> Result<Scaffolded> {
@@ -776,15 +776,24 @@ fn write_doc_with_regions(
     }
 }
 
-/// Write a human-facing `README.md` at the project root listing the
-/// run-the-project commands: one `rdc sync <env>` per env defined in
-/// `cfg`, and — when there are at least two envs — a promote example
-/// (`rdc migrate` + `rdc sync`) using the first two envs alphabetically,
-/// plus a generated `## Environments` table (see [`write_claude_md`]).
+/// Write a human-facing `README.md` at the project root.
+///
+/// Every env-derived line lives inside a generated region — the
+/// `rdc sync <env>` list (`rdc:sync`), the environment table (`rdc:envs`) and
+/// the promote recipe (`rdc:promote`, the same body `CLAUDE.md` gets, rendered
+/// once in [`crate::cli::scaffold_docs`]). That is not decoration: on an
+/// existing README only the regions are spliced, so an env-derived line
+/// *outside* one would freeze at whatever `rdc.toml` said the day the file was
+/// created — a table listing two envs above a command block naming one.
+///
+/// Every region is emitted unconditionally, including for a hand-emptied
+/// `rdc.toml`: [`write_doc_with_regions`] hard-errors on a template with no
+/// markers, and each renderer has an explanatory body for the empty case.
+///
 /// Same scaffold contract as [`write_claude_md`]: everything outside the
-/// `rdc:envs` region is written once and left alone on a later `rdc init`
-/// (unless `force`), while the region itself is refreshed every time so it
-/// never drifts from `rdc.toml`.
+/// regions is written once and left alone on a later `rdc init` (unless
+/// `force`), while the regions are refreshed every time so they never drift
+/// from `rdc.toml`.
 ///
 /// Title is the project root's basename (matches the user's mental
 /// model of "what is this repo called"); falls back to a generic title
@@ -807,53 +816,29 @@ fn write_readme(root: &Path, cfg: &ProjectConfig, force: bool) -> Result<Scaffol
          and deployed like code.\n\n",
     );
 
-    if !cfg.envs.is_empty() {
-        md.push_str("## Sync each environment\n\n");
-        md.push_str(
-            "`rdc sync <env>` reconciles the local snapshot with the remote \
-             env in one pass — pulls remote edits, pushes local edits, \
-             creates new objects. Run it after cloning, after pulling new \
-             commits, and whenever you've edited files under `envs/<env>/`.\n\n",
-        );
-        md.push_str("```sh\n");
-        for env in cfg.envs.keys() {
-            md.push_str(&format!("rdc sync {env}\n"));
-        }
-        md.push_str("```\n\n");
-    }
+    md.push_str("## Sync each environment\n\n");
+    md.push_str(
+        "`rdc sync <env>` reconciles the local snapshot with the remote \
+         env in one pass — pulls remote edits, pushes local edits, \
+         creates new objects. Run it after cloning, after pulling new \
+         commits, and whenever you've edited files under `envs/<env>/`.\n\n",
+    );
+    md.push_str("<!-- >>> rdc:sync (generated from rdc.toml — `rdc init` refreshes it) -->\n");
+    md.push_str("<!-- <<< rdc:sync -->\n\n");
 
-    // Unconditional: write_doc_with_regions errors if the template it splices
-    // carries no markers, so a hand-emptied rdc.toml must still produce one
-    // (render_envs renders a "No environments defined yet" line for that case).
     md.push_str("## Environments\n\n");
     md.push_str("<!-- >>> rdc:envs (generated from rdc.toml — `rdc init` refreshes it) -->\n");
     md.push_str("<!-- <<< rdc:envs -->\n\n");
 
-    // Promote section only when there are two envs to promote between.
-    // BTreeMap iteration is already sorted, so the first two keys give
-    // a deterministic example without an extra sort step.
-    if cfg.envs.len() >= 2 {
-        let mut iter = cfg.envs.keys();
-        let src = iter.next().expect("len >= 2");
-        let tgt = iter.next().expect("len >= 2");
-        md.push_str("## Promote changes between environments\n\n");
-        md.push_str(
-            "`rdc migrate <src> <tgt>` copies one env's snapshot into \
-             another's, locally — slug remap, portable-ref rewrite, target \
-             overlay; zero remote calls. Review the transform with `git \
-             diff`, then push it with `rdc sync <tgt>`.\n\n",
-        );
-        md.push_str("```sh\n");
-        md.push_str(&format!(
-            "rdc migrate {src} {tgt} --dry-run   # preview the local transform\n"
-        ));
-        md.push_str(&format!("rdc migrate {src} {tgt}\n"));
-        md.push_str("git diff                          # review what would be pushed\n");
-        md.push_str(&format!(
-            "rdc sync {tgt}                      # push to the remote\n"
-        ));
-        md.push_str("```\n\n");
-    }
+    md.push_str("## Promote changes between environments\n\n");
+    md.push_str(
+        "Promotion is local-first: `rdc migrate` rewrites the target env's \
+         files with zero remote calls, so the whole transform is reviewable \
+         with `git diff` before a separate `rdc sync` sends any of it to a \
+         tenant.\n\n",
+    );
+    md.push_str("<!-- >>> rdc:promote (generated from rdc.toml — `rdc init` refreshes it) -->\n");
+    md.push_str("<!-- <<< rdc:promote -->\n\n");
 
     md.push_str("## See also\n\n");
     md.push_str(
@@ -870,12 +855,21 @@ fn write_readme(root: &Path, cfg: &ProjectConfig, force: bool) -> Result<Scaffol
 
 /// Write the init-time scaffold files (`.gitignore`, `.gitattributes`,
 /// `CLAUDE.md`, `README.md`, `.gitlab-ci.yml`, and the Python testkit) at
-/// `cwd`, given a single-env project shape. Idempotent: each underlying
-/// writer skips when the file already exists.
+/// `cwd`, for a project whose env set includes `env_name`. Idempotent: each
+/// underlying writer creates its file when absent and, for the three markered
+/// ones, refreshes only the generated regions.
 ///
 /// Exposed for embedders (e.g. the Rossum Local desktop app) that need
 /// a Connection folder to look identical to one produced by `rdc init`
 /// — including the agent guide that Claude Code reads.
+///
+/// The env set comes from `cwd/rdc.toml` when there is one, with `env_name`
+/// added if it is missing, and is synthesized from the arguments only for a
+/// genuinely new folder. This matters because the generated regions describe
+/// *every* env: rendering them from the one env an embedder happens to be
+/// syncing would delete the other envs' archive jobs from the pipeline and
+/// shrink the guide's env table to a single row — which the next local
+/// `rdc init` would put straight back.
 pub fn write_scaffold_files(
     cwd: &Path,
     env_name: &str,
@@ -884,17 +878,38 @@ pub fn write_scaffold_files(
 ) -> Result<()> {
     write_gitignore(cwd)?;
     write_gitattributes(cwd)?;
-    let mut cfg = ProjectConfig::default();
-    cfg.envs.insert(
-        env_name.to_string(),
-        crate::config::EnvConfig {
+    let cfg_path = cwd.join("rdc.toml");
+    let mut cfg = if cfg_path.exists() {
+        // An unreadable/undecodable rdc.toml is the local `rdc` commands'
+        // problem to report; here it just means "fall back to what the caller
+        // told us" rather than failing a sync that hasn't started.
+        ProjectConfig::load(&cfg_path).unwrap_or_default()
+    } else {
+        ProjectConfig::default()
+    };
+    cfg.envs
+        .entry(env_name.to_string())
+        .or_insert_with(|| crate::config::EnvConfig {
             api_base: api_base.to_string(),
             org_id,
-        },
-    );
-    write_claude_md(cwd, &cfg, false)?;
-    write_readme(cwd, &cfg, false)?;
-    write_gitlab_ci(cwd, &cfg, false)?;
+        });
+
+    // These three files are parsed on every embedder call now, and a malformed
+    // marker is a hard error — so a stray duplicated region in a file the user
+    // hand-edited must not take down a sync before it makes its first call.
+    // Degrade to leaving that one file exactly as it is.
+    let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
+    let tolerate = |what: &str, outcome: Result<Scaffolded>| {
+        if let Err(e) = outcome {
+            log.event(
+                crate::log::Action::Warn,
+                &format!("{what}: {e:#}; leaving the file unchanged"),
+            );
+        }
+    };
+    tolerate("CLAUDE.md", write_claude_md(cwd, &cfg, false));
+    tolerate("README.md", write_readme(cwd, &cfg, false));
+    tolerate(".gitlab-ci.yml", write_gitlab_ci(cwd, &cfg, false));
     write_testkit(cwd, false)?;
     Ok(())
 }
@@ -947,6 +962,7 @@ rdc.toml                                  project + env definitions
 .gitlab-ci.yml                            archive per env + one deploy draft per env;
                                           the `# >>> rdc:` regions are generated
 testkit/                                  formula/hook test harness (real txscript); `pytest -q`
+tests/                                    your own tests (this is where they go)
 requirements-dev.txt                      pinned pytest + txscript for the CI test job
 secrets/<env>.secrets.json                API tokens (gitignored)
 envs/<env>/
@@ -975,7 +991,8 @@ envs/<env>/
                                           plus data.jsonl when "data": "manual"
 .rdc/
   state/<env>.lock.json                   slug↔id + base hashes; never edit
-  map/<src>-to-<tgt>.toml                 cross-env slug mappings
+  mapping.toml                            cross-env slug names, one file for
+                                          every env pair; hand-editable
 ```
 
 ## Editing recipes
@@ -985,13 +1002,40 @@ envs/<env>/
 | Hook code (Python or Node.js) | `envs/<env>/hooks/<slug>.py` or `…/<slug>.js` | `rdc sync <env>` |
 | Hook config (events, queues, name) | `envs/<env>/hooks/<slug>.json` | `rdc sync <env>` |
 | Schema fields | `envs/<env>/workspaces/<ws>/queues/<q>/schema.json` | `rdc sync <env>` |
-| A formula | `envs/<env>/workspaces/<ws>/queues/<q>/formulas/<field>.py` | `rdc sync <env>` |
+| A formula | `envs/<env>/workspaces/<ws>/queues/<q>/formulas/<field>.py` | `pytest -q`, then `rdc sync <env>` |
 | Queue settings | `envs/<env>/workspaces/<ws>/queues/<q>/queue.json` | `rdc sync <env>` |
 | Rule's trigger condition (Python) | `envs/<env>/rules/<slug>.py` | `rdc sync <env>` |
 | Rule config (name, queues) | `envs/<env>/rules/<slug>.json` | `rdc sync <env>` |
 | Label name / colour | `envs/<env>/labels/<slug>.json` | `rdc sync <env>` |
 | Email template | `envs/<env>/workspaces/<ws>/queues/<q>/email-templates/<slug>.json` | `rdc sync <env>` |
 | Per-env override only | `envs/<env>/overlay.toml` | `rdc sync <env>` |
+
+## Testing formulas and hooks
+
+`testkit/` is a test harness that runs the **real** txscript runtime — the same
+one Rossum executes — against the files in this snapshot. `pytest -q` runs it
+(`pip install -r requirements-dev.txt` first), and the pipeline's `pytest` job
+runs the same command; the deploy buttons depend on it.
+
+Put your own tests under `tests/` (e.g. `tests/test_totals.py`):
+
+```python
+from testkit import evaluate_formula
+
+FORMULAS = "envs/dev/workspaces/<ws>/queues/<q>/formulas"
+
+def test_total_is_net_plus_tax():
+    assert evaluate_formula(f"{FORMULAS}/amount_total.py",
+                            amount_net="100", amount_tax="21") == 121.0
+```
+
+Field values are passed as keyword arguments named after the schema id, and the
+queue's own `schema.json` gives each one its real type. A `date` field must be
+given the ISO form `YYYY-MM-DD` — that is the only form the runtime parses, and
+anything else reads as empty, exactly as it would in the tenant. Table columns
+take `rows={"<multivalue_id>": [{...}, {...}]}` and return one value per row.
+`load_hook("envs/<env>/hooks/<slug>.py")` imports a function hook so its
+handlers can be called directly.
 
 ## Adding a new object
 
@@ -1177,6 +1221,77 @@ mod tests {
             std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap(),
             "mine\n"
         );
+    }
+
+    /// A two-env project as `write_scaffold_files` leaves it, plus the config
+    /// that describes it. The embedder is handed ONE env; everything generated
+    /// here describes both.
+    fn two_env_project() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = ProjectConfig::default();
+        for (name, org_id) in [("dev", 1u64), ("test", 2)] {
+            cfg.envs.insert(
+                name.to_string(),
+                EnvConfig {
+                    api_base: "https://example.rossum.app/api/v1".to_string(),
+                    org_id,
+                },
+            );
+        }
+        cfg.save(&dir.path().join("rdc.toml")).unwrap();
+        write_scaffold_files(dir.path(), "dev", "https://example.rossum.app/api/v1", 1).unwrap();
+        dir
+    }
+
+    /// The markered files are spliced on every embedder call, so the env set
+    /// they are spliced with must be the project's real one. Rendering them
+    /// from the single env an embedder happens to be syncing would delete the
+    /// other envs' archive jobs -- silently stopping their archive -- and shrink
+    /// the guide's env table to one row.
+    #[test]
+    fn write_scaffold_files_keeps_the_other_envs_regions() {
+        let dir = two_env_project();
+        let ci_path = dir.path().join(".gitlab-ci.yml");
+
+        // generated from rdc.toml, not from the one env we were handed
+        let ci = std::fs::read_to_string(&ci_path).unwrap();
+        assert!(ci.contains("- RDC_ENV: \"dev\""), "{ci}");
+        assert!(ci.contains("- RDC_ENV: \"test\""), "{ci}");
+        assert!(std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap().contains("| `test` |"));
+
+        // a hand edit outside the regions, then another embedder sync
+        let edited = format!("{ci}\nmy-own-job:\n  script:\n    - echo mine\n");
+        std::fs::write(&ci_path, &edited).unwrap();
+        write_scaffold_files(dir.path(), "dev", "https://example.rossum.app/api/v1", 1).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&ci_path).unwrap(),
+            edited,
+            "a second call must change nothing at all"
+        );
+        assert!(std::fs::read_to_string(dir.path().join("README.md"))
+            .unwrap()
+            .contains("rdc sync test"));
+    }
+
+    /// A malformed marker is a hard error in the splicer. On this path that
+    /// error must not fail the caller before it has made a single network call:
+    /// the file is left alone and the run continues.
+    #[test]
+    fn write_scaffold_files_tolerates_a_malformed_marker() {
+        let dir = two_env_project();
+        let ci_path = dir.path().join(".gitlab-ci.yml");
+        // the classic: a region pasted twice
+        let broken = format!(
+            "{}\n# >>> rdc:deploy-jobs\n# <<< rdc:deploy-jobs\n",
+            std::fs::read_to_string(&ci_path).unwrap()
+        );
+        std::fs::write(&ci_path, &broken).unwrap();
+
+        write_scaffold_files(dir.path(), "dev", "https://example.rossum.app/api/v1", 1)
+            .expect("a user's broken marker must not fail the embedder");
+
+        assert_eq!(std::fs::read_to_string(&ci_path).unwrap(), broken);
     }
 
     /// Create → skip → (force) rewrite only when the bytes actually differ, so
