@@ -194,6 +194,117 @@ pub fn check_rule_actions(body: &Value) -> Vec<LimitViolation> {
     out
 }
 
+/// A structural problem in an organization's `settings`: a wrong enum value, a
+/// missing required key, or the polymorphic wrapper shape `OPTIONS` advertises
+/// and the API rejects.
+///
+/// Distinct from [`LimitViolation`], which is only ever about length — most of
+/// these have no limit and no measured length to report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsProblem {
+    /// Where it lives, in terms a human can act on:
+    /// `settings.annotation_list_table.columns[0].data_type`.
+    pub location: String,
+    /// What is wrong, phrased so the message reads as the fix.
+    pub problem: String,
+}
+
+/// The two column tables under an organization's `settings`. Both take the
+/// identical column shape (verified via `OPTIONS /v1/organizations/{id}`).
+const ORG_COLUMN_TABLES: &[&str] = &["annotation_list_table", "request_dashboard_table"];
+/// `schema_id`'s declared `max_length` on an org column.
+const ORG_SCHEMA_ID_LIMIT: usize = 50;
+const ORG_DATA_TYPES: &[&str] = &["string", "boolean", "date", "number"];
+
+/// Validate the parts of an organization's `settings` that rdc pushes, against
+/// the shape `OPTIONS /v1/organizations/{id}` declares.
+///
+/// Worth doing offline rather than leaving to the server for one specific
+/// reason: `OPTIONS` advertises each column as a polymorphic wrapper
+/// (`{"schema": {…}}` / `{"meta": {…}}`) and the API then **rejects** that
+/// shape — the accepted body is flat. Anyone reading the API metadata and
+/// hand-writing a column hits a `400 column_type: This field is required.`
+/// mid-sync; this check names the trap instead.
+///
+/// A body with no `settings` key produces no problems. What an absent
+/// `settings` MEANS is the push driver's decision, not this function's.
+pub fn check_organization_settings(body: &Value) -> Vec<SettingsProblem> {
+    let mut out = Vec::new();
+    let Some(settings) = body.get("settings").and_then(|s| s.as_object()) else {
+        return out;
+    };
+    for table in ORG_COLUMN_TABLES {
+        let Some(columns) = settings
+            .get(*table)
+            .and_then(|t| t.get("columns"))
+            .and_then(|c| c.as_array())
+        else {
+            continue;
+        };
+        for (i, column) in columns.iter().enumerate() {
+            let at = format!("settings.{table}.columns[{i}]");
+            let Some(obj) = column.as_object() else {
+                out.push(SettingsProblem { location: at, problem: "must be an object".to_string() });
+                continue;
+            };
+            // The wrapper shape OPTIONS advertises and the API refuses.
+            if obj.len() == 1 && (obj.contains_key("schema") || obj.contains_key("meta")) {
+                out.push(SettingsProblem {
+                    location: at,
+                    problem: "column is wrapped in a \"schema\"/\"meta\" key; the API wants its \
+                              fields flat (OPTIONS advertises the wrapper but rejects it)"
+                        .to_string(),
+                });
+                continue;
+            }
+            let mut require = |keys: &[&str], out: &mut Vec<SettingsProblem>| {
+                for key in keys {
+                    if !obj.contains_key(*key) {
+                        out.push(SettingsProblem {
+                            location: at.clone(),
+                            problem: format!("missing required key `{key}`"),
+                        });
+                    }
+                }
+            };
+            match obj.get("column_type").and_then(|v| v.as_str()) {
+                Some("schema") => {
+                    require(&["visible", "width", "schema_id", "data_type"], &mut out);
+                    if let Some(Value::String(id)) = obj.get("schema_id") {
+                        let actual = id.trim().chars().count();
+                        if actual > ORG_SCHEMA_ID_LIMIT {
+                            out.push(SettingsProblem {
+                                location: format!("{at}.schema_id"),
+                                problem: format!(
+                                    "{actual} characters; the API accepts at most {ORG_SCHEMA_ID_LIMIT}"
+                                ),
+                            });
+                        }
+                    }
+                    if let Some(Value::String(dt)) = obj.get("data_type")
+                        && !ORG_DATA_TYPES.contains(&dt.as_str())
+                    {
+                        out.push(SettingsProblem {
+                            location: format!("{at}.data_type"),
+                            problem: format!("`{dt}` is not one of {}", ORG_DATA_TYPES.join(", ")),
+                        });
+                    }
+                }
+                Some("meta") => require(&["visible", "width", "meta_name"], &mut out),
+                Some(other) => out.push(SettingsProblem {
+                    location: format!("{at}.column_type"),
+                    problem: format!("`{other}` is not one of schema, meta"),
+                }),
+                None => out.push(SettingsProblem {
+                    location: at.clone(),
+                    problem: "missing required key `column_type`".to_string(),
+                }),
+            }
+        }
+    }
+    out
+}
+
 /// Declared `max_length` for each kind's top-level string fields.
 ///
 /// Kinds absent from this match (and fields absent from a kind's slice)
@@ -728,5 +839,98 @@ mod tests {
                 "{kind}.{container} is walked for nested limits but stripped before push",
             );
         }
+    }
+
+    fn org(cols: serde_json::Value) -> Value {
+        serde_json::json!({ "settings": { "annotation_list_table": { "columns": cols } } })
+    }
+
+    #[test]
+    fn org_settings_clean_body_has_no_problems() {
+        let v = org(serde_json::json!([
+            { "visible": true, "column_type": "schema", "width": 120.0,
+              "schema_id": "document_id", "data_type": "string" },
+            { "visible": false, "column_type": "meta", "width": 80.0, "meta_name": "status" },
+        ]));
+        assert_eq!(check_organization_settings(&v), Vec::new());
+    }
+
+    #[test]
+    fn org_settings_without_settings_key_is_not_a_problem() {
+        // Nothing to validate is not an error — the push driver decides what an
+        // absent `settings` means.
+        let v = serde_json::json!({ "id": 1, "name": "Acme" });
+        assert_eq!(check_organization_settings(&v), Vec::new());
+    }
+
+    #[test]
+    fn org_settings_rejects_the_options_wrapper_shape() {
+        let v = org(serde_json::json!([
+            { "schema": { "visible": true, "column_type": "schema", "width": 120.0,
+                          "schema_id": "document_id", "data_type": "string" } }
+        ]));
+        let problems = check_organization_settings(&v);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].location, "settings.annotation_list_table.columns[0]");
+        assert!(
+            problems[0].problem.contains("flat"),
+            "the message must point at the flat form: {}",
+            problems[0].problem
+        );
+    }
+
+    #[test]
+    fn org_settings_rejects_unknown_data_type() {
+        let v = org(serde_json::json!([
+            { "visible": true, "column_type": "schema", "width": 120.0,
+              "schema_id": "document_id", "data_type": "bogus" }
+        ]));
+        let problems = check_organization_settings(&v);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].location, "settings.annotation_list_table.columns[0].data_type");
+    }
+
+    #[test]
+    fn org_settings_rejects_unknown_column_type() {
+        let v = org(serde_json::json!([{ "visible": true, "column_type": "sideways", "width": 1.0 }]));
+        let problems = check_organization_settings(&v);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].problem.contains("schema"), "{}", problems[0].problem);
+    }
+
+    #[test]
+    fn org_settings_reports_each_missing_required_key() {
+        let v = org(serde_json::json!([{ "column_type": "schema" }]));
+        let problems = check_organization_settings(&v);
+        let locs: Vec<&str> = problems.iter().map(|p| p.problem.as_str()).collect();
+        assert_eq!(problems.len(), 4, "{problems:?}");
+        assert!(locs.iter().all(|p| p.contains("missing required key")), "{problems:?}");
+    }
+
+    #[test]
+    fn org_settings_schema_id_at_the_limit_is_accepted_and_one_over_is_not() {
+        let at = "a".repeat(50);
+        let over = "a".repeat(51);
+        let ok = org(serde_json::json!([
+            { "visible": true, "column_type": "schema", "width": 1.0, "schema_id": at, "data_type": "string" }
+        ]));
+        assert_eq!(check_organization_settings(&ok), Vec::new());
+        let bad = org(serde_json::json!([
+            { "visible": true, "column_type": "schema", "width": 1.0, "schema_id": over, "data_type": "string" }
+        ]));
+        let problems = check_organization_settings(&bad);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].problem.contains("50"), "{}", problems[0].problem);
+    }
+
+    #[test]
+    fn org_settings_checks_the_request_dashboard_table_too() {
+        let v = serde_json::json!({ "settings": { "request_dashboard_table": { "columns": [
+            { "visible": true, "column_type": "schema", "width": 1.0,
+              "schema_id": "document_id", "data_type": "nope" }
+        ] } } });
+        let problems = check_organization_settings(&v);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].location.starts_with("settings.request_dashboard_table"), "{problems:?}");
     }
 }
