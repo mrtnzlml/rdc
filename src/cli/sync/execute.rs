@@ -3577,6 +3577,10 @@ pub async fn run(
                 "email_templates" => {
                     change_list.email_templates.insert(slug, path);
                 }
+                "organization" => {
+                    // Singleton: no slug lookup needed, the path is fixed.
+                    change_list.organization = Some(path);
+                }
                 _ => {}
             }
         }

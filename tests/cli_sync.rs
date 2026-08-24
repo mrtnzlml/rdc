@@ -1807,6 +1807,90 @@ async fn sync_pushes_organization_settings_and_nothing_else() {
     );
 }
 
+/// The base-cache-missing fallback: when the driver cannot prove `settings`
+/// is unchanged (no `.rdc/state/<env>.base/organization.json` to compare
+/// against), it must fall through to pushing rather than silently skipping.
+/// Simulated by deleting only the base-cache mirror after a normal first
+/// sync — the lockfile still records the org (id + content_hash) and
+/// `envs/dev/organization.json` is unchanged from that first sync, exactly
+/// as if the cache file had never been written or had been pruned.
+#[tokio::test]
+async fn sync_pushes_organization_settings_when_the_base_cache_is_missing() {
+    let server = MockServer::start().await;
+    let org = fixture("organization.json");
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(org.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/organizations/285704"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(org.clone()))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &[]).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    // First sync: pull only, records the lockfile entry AND the base cache.
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("first sync");
+
+    // Simulate a missing base cache — the lockfile entry and the on-disk
+    // org file are untouched, only the cache mirror is gone.
+    let base_cache_path = project
+        .path()
+        .join(".rdc/state/dev.base/organization.json");
+    assert!(
+        base_cache_path.exists(),
+        "the first sync should have written the base cache"
+    );
+    std::fs::remove_file(&base_cache_path).unwrap();
+
+    // Local edit to the managed subtree.
+    let org_path = project.path().join("envs/dev/organization.json");
+    let mut on_disk: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&org_path).unwrap()).unwrap();
+    on_disk["settings"]["annotation_list_table"]["columns"] = serde_json::json!([
+        { "visible": true, "column_type": "meta", "width": 100.0, "meta_name": "status" }
+    ]);
+    std::fs::write(&org_path, serde_json::to_vec_pretty(&on_disk).unwrap()).unwrap();
+
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("second sync");
+    std::env::set_current_dir(&prev).unwrap();
+
+    let patches = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| {
+            r.method == http::Method::PATCH && r.url.path() == "/api/v1/organizations/285704"
+        })
+        .count();
+    assert_eq!(
+        patches, 1,
+        "a missing base cache must not be mistaken for \"settings unchanged\"; the edit must still push"
+    );
+}
+
 /// An edit confined to a field rdc does not manage must not produce a request,
 /// and must say so — the write-back would otherwise discard it silently.
 #[tokio::test]

@@ -33,12 +33,13 @@ pub async fn push(
 ) -> Result<(usize, usize)> {
     // The org's id comes from the lockfile: rdc never creates one, so a missing
     // entry means this project has not pulled the org yet. The pull half of the
-    // same sync records it; nothing to push this cycle.
-    let Some(id) = lockfile
+    // same sync records it; nothing to push this cycle. `lockfile_hash` backs
+    // the base-cache trust check below.
+    let Some((id, lockfile_hash)) = lockfile
         .objects
         .get("organization")
         .and_then(|m| m.get("self"))
-        .map(|e| e.id)
+        .map(|e| (e.id, e.content_hash.clone()))
     else {
         progress.event(
             Action::Warn,
@@ -90,13 +91,33 @@ pub async fn push(
     // discarding the unmanaged edit the push could never carry in the first
     // place. Compare against the base cache (the last canonical bytes
     // `pull`/`push` wrote) rather than re-fetching the remote, so this costs
-    // no extra round trip. Unreadable/missing/unparseable base cache (e.g. a
-    // push before any prior pull recorded one) is treated as "can't prove
-    // it's a no-op" and falls through to pushing — the safe default here is
-    // to send it, not to silently swallow a real change.
+    // no extra round trip.
+    //
+    // The cache is trustworthy for this comparison ONLY when its hash still
+    // matches the lockfile's recorded `content_hash`. A conflict auto-merge
+    // that keeps a local `settings` edit against a disjoint remote change
+    // (`execute::try_auto_merge`) deliberately breaks that equality: it
+    // writes the MERGED bytes into both the env file and the base-cache
+    // mirror (so a future 3-way merge sees the reconciled state), but pins
+    // the lockfile to the pre-merge remote hash on purpose, so the next
+    // classify sees `LocalEdit` and this driver gets a same-cycle chance to
+    // push it (see the `promoted_to_push` handling in `cli::sync::execute`).
+    // In that window the cache's `settings` already equals local's — using
+    // it here would read back as "unchanged" and silently drop an edit that
+    // has in fact never reached the remote. Unreadable/missing/unparseable/
+    // stale-relative-to-the-lockfile base cache is therefore treated the
+    // same as "can't prove it's a no-op" and falls through to pushing — the
+    // safe default is to send it, not to silently swallow a real change.
     let base_settings = crate::state::base_cache::read(paths, path)
         .ok()
         .flatten()
+        .filter(|b| {
+            lockfile_hash.as_deref()
+                == Some(
+                    crate::snapshot::codec::combined_hash(b, &[], &crate::state::Lockfile::default())
+                        .as_str(),
+                )
+        })
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| v.get("settings").cloned());
     if base_settings.as_ref() == Some(settings) {
@@ -115,26 +136,52 @@ pub async fn push(
         return Ok((0, 1));
     }
 
-    if !unmanaged.is_empty() {
-        progress.event(
-            Action::Info,
-            &format!(
-                "organization: only `settings` is pushed; {} stay as the env has them",
-                unmanaged.join(", ")
-            ),
-        );
-    }
-
     let body = serde_json::json!({ "settings": settings });
     let updated = client
         .update_organization(id, &body, Some(progress.clone()))
         .await
         .with_context(|| format!("patching organization settings for env '{env}'"))?;
 
+    // Compare local vs the server's response, ignoring `settings` (the
+    // subtree rdc actually manages) and the hidden stamps
+    // (`modified_at`/`modified_by` — stripped from disk by the codec, so
+    // they'd always look "locally absent" and falsely diverge; a stamp bump
+    // alone must never read as a discarded edit). Any other top-level key
+    // that differs between the two is about to be silently overwritten by
+    // the canonical write-back below — name exactly those keys, not the
+    // full `unmanaged` list, so the warning is accurate rather than noise
+    // on every push.
+    let value = serde_json::to_value(&updated).context("serializing patched organization")?;
+    let diverged: Vec<String> = {
+        const IGNORED: &[&str] = &["settings", "modified_at", "modified_by"];
+        let local_obj = local.as_object();
+        let remote_obj = value.as_object();
+        let mut keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        if let Some(o) = local_obj {
+            keys.extend(o.keys().map(String::as_str));
+        }
+        if let Some(o) = remote_obj {
+            keys.extend(o.keys().map(String::as_str));
+        }
+        keys.into_iter()
+            .filter(|k| !IGNORED.contains(k))
+            .filter(|k| local_obj.and_then(|o| o.get(*k)) != remote_obj.and_then(|o| o.get(*k)))
+            .map(str::to_string)
+            .collect()
+    };
+    if !diverged.is_empty() {
+        progress.event(
+            Action::Warn,
+            &format!(
+                "organization: {} will be overwritten by the env's value (rdc only manages `settings`)",
+                diverged.join(", ")
+            ),
+        );
+    }
+
     // Canonical write-back: the same bytes a pull would produce, so the next
     // sync sees `Clean` (this is also what normalizes `width: 120` to the
     // server's `120.0`).
-    let value = serde_json::to_value(&updated).context("serializing patched organization")?;
     let art = crate::snapshot::codec::codec("organization")
         .expect("organization codec must exist")
         .disk_bytes(&value)
