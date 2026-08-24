@@ -257,7 +257,7 @@ pub fn check_organization_settings(body: &Value) -> Vec<SettingsProblem> {
                 });
                 continue;
             }
-            let mut require = |keys: &[&str], out: &mut Vec<SettingsProblem>| {
+            let require = |keys: &[&str], out: &mut Vec<SettingsProblem>| {
                 for key in keys {
                     if !obj.contains_key(*key) {
                         out.push(SettingsProblem {
