@@ -65,11 +65,12 @@ impl KindCodec for Organization {
 
     fn overlay<'a>(
         &self,
-        _overlay: &'a Overlay,
+        overlay: &'a Overlay,
         _slug: &str,
     ) -> Option<&'a BTreeMap<String, Value>> {
-        // The organization has no per-object overlay surface.
-        None
+        // One org per env, so the section is slug-independent: `[organization]`,
+        // not `[organization.<slug>]`.
+        overlay.organization()
     }
 
     fn path(&self, paths: &Paths, _slug: &str) -> PathBuf {
@@ -169,5 +170,15 @@ mod tests {
     #[test]
     fn kind_is_organization() {
         assert_eq!(Organization.kind(), "organization");
+    }
+
+    #[test]
+    fn overlay_hook_returns_the_organization_section_for_any_slug() {
+        let ov: crate::overlay::Overlay = toml::from_str(
+            "version = 1\n\n[organization]\nsettings = { annotation_list_table = { columns = [] } }\n",
+        )
+        .unwrap();
+        assert!(Organization.overlay(&ov, "self").is_some());
+        assert!(Organization.overlay(&ov, "ignored").is_some(), "slug-independent");
     }
 }

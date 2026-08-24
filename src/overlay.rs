@@ -64,6 +64,16 @@ pub struct Overlay {
     /// Engine field overrides keyed by engine field slug.
     #[serde(default)]
     pub engine_fields: BTreeMap<String, BTreeMap<String, Value>>,
+    /// Organization overrides. The organization is a per-env SINGLETON, so this
+    /// is a flat field → value map with no slug layer: `[organization]` in
+    /// TOML, or a nested table such as
+    /// `[organization.settings.annotation_list_table]`.
+    ///
+    /// Deliberately NOT part of [`Overlay::kind_maps`]: that list drives
+    /// migrate's dangling-key check, which validates each key against a real
+    /// slug, and there are no slugs here to validate.
+    #[serde(default)]
+    pub organization: BTreeMap<String, Value>,
 }
 
 impl Overlay {
@@ -114,6 +124,12 @@ impl Overlay {
         self.engine_fields.get(slug)
     }
 
+    /// The organization overrides, or `None` when the section is absent or
+    /// empty — so a bare `[organization]` header is the same as no header.
+    pub fn organization(&self) -> Option<&BTreeMap<String, Value>> {
+        (!self.organization.is_empty()).then_some(&self.organization)
+    }
+
     /// Every override group as a `(kind, keys)` pair, using the same kind strings
     /// the migrate driver dispatches on (see [`crate::cli::migrate`]). Lets a
     /// caller iterate the whole overlay uniformly — e.g. to validate that each
@@ -147,6 +163,7 @@ impl Default for Overlay {
             email_templates: BTreeMap::new(),
             engines: BTreeMap::new(),
             engine_fields: BTreeMap::new(),
+            organization: BTreeMap::new(),
         }
     }
 }
@@ -313,5 +330,64 @@ token_owner = "https://prod/api/v1/users/938493"
             &Value::String("https://prod/api/v1/users/938493".into())
         );
         assert!(overlay.hook("master-data-hub").is_some());
+    }
+
+    #[test]
+    fn organization_section_parses_as_a_nested_table() {
+        let toml = r#"
+version = 1
+
+[organization.settings.annotation_list_table]
+columns = [
+  { visible = true, column_type = "meta", width = 120.0, meta_name = "status" },
+]
+"#;
+        let ov: Overlay = toml::from_str(toml).unwrap();
+        let org = ov.organization().expect("organization section present");
+        let cols = org["settings"]["annotation_list_table"]["columns"]
+            .as_array()
+            .expect("columns is an array");
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0]["meta_name"], serde_json::json!("status"));
+    }
+
+    #[test]
+    fn absent_organization_section_is_none() {
+        let ov: Overlay = toml::from_str("version = 1\n").unwrap();
+        assert!(ov.organization().is_none());
+    }
+
+    #[test]
+    fn organization_is_not_part_of_kind_maps() {
+        // `kind_maps` drives migrate's dangling-key check, which validates every
+        // key against a real slug. The org has no slugs, so it must stay out.
+        let ov: Overlay = toml::from_str("version = 1\n").unwrap();
+        assert_eq!(ov.kind_maps().len(), 9);
+        assert!(ov.kind_maps().iter().all(|(k, _)| *k != "organization"));
+    }
+
+    #[test]
+    fn organization_overlay_replaces_the_columns_array_wholesale() {
+        let toml = r#"
+version = 1
+
+[organization.settings.annotation_list_table]
+columns = [ { visible = true, column_type = "meta", width = 1.0, meta_name = "status" } ]
+"#;
+        let ov: Overlay = toml::from_str(toml).unwrap();
+        let mut value = serde_json::json!({
+            "settings": { "annotation_list_table": { "columns": [
+                { "visible": false, "column_type": "schema", "width": 9.0,
+                  "schema_id": "field_a", "data_type": "string" },
+                { "visible": false, "column_type": "schema", "width": 9.0,
+                  "schema_id": "field_b", "data_type": "string" },
+            ] } },
+            "name": "Acme",
+        });
+        apply_overrides(&mut value, ov.organization().unwrap());
+        let cols = value["settings"]["annotation_list_table"]["columns"].as_array().unwrap();
+        assert_eq!(cols.len(), 1, "arrays replace wholesale, they do not merge: {value}");
+        assert_eq!(cols[0]["meta_name"], serde_json::json!("status"));
+        assert_eq!(value["name"], serde_json::json!("Acme"), "untouched keys survive");
     }
 }
