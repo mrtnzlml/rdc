@@ -338,6 +338,28 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
         // its pull driver. mdh is pull-only and never raises BothDiverged
         // here (no push side); we still emit a warning if it shows up.
         let Some(refs) = (match it.kind.as_str() {
+            // The organization singleton. Slug is always "self", the path is
+            // fixed, and the hash is flat (no sidecars). Pull already writes the
+            // base cache for this file, so `try_auto_merge` can resolve
+            // divergence on disjoint keys — a local `settings` edit against a
+            // remote `ui_settings` change — with no prompt.
+            "organization" => {
+                let codec = crate::snapshot::codec::codec("organization")
+                    .expect("organization codec must exist");
+                serde_json::to_value(&catalog.organization)
+                    .ok()
+                    .and_then(|v| codec.disk_bytes(&v).ok())
+                    .map(|art| ConflictRefs {
+                        remote_bytes: art.json,
+                        remote_code: None,
+                        remote_formulas: Vec::new(),
+                        local_path: ctx.paths.organization_file(),
+                        id: catalog.organization.id,
+                        modified_at: catalog.organization.modified_at().map(|s| s.to_string()),
+                        modified_by: catalog.organization.modified_by().map(|s| s.to_string()),
+                        hash_strategy: HashStrategy::Flat,
+                    })
+            }
             "labels" => label_by_slug.get(it.slug.as_str()).copied().and_then(|l| {
                 let codec = crate::snapshot::codec::codec("labels")?;
                 let value = serde_json::to_value(l).ok()?;

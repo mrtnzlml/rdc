@@ -1903,6 +1903,74 @@ async fn sync_never_deletes_an_organization() {
     }
 }
 
+/// Local `settings` edit + a remote change to a DIFFERENT key is not a
+/// conflict: the JSON 3-way merge resolves disjoint keys, so this must sync
+/// without a prompt and without losing either side.
+#[tokio::test]
+async fn sync_auto_merges_disjoint_organization_divergence() {
+    let server = MockServer::start().await;
+    let base = fixture("organization.json");
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(base.clone()))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    // Second listing: the env changed `ui_settings`, which rdc does not manage.
+    let mut remote_changed = base.clone();
+    remote_changed["ui_settings"] = serde_json::json!({ "theme": "dark" });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(remote_changed.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/organizations/285704"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(remote_changed.clone()))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &[]).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .unwrap();
+
+    let org_path = project.path().join("envs/dev/organization.json");
+    let mut on_disk: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&org_path).unwrap()).unwrap();
+    on_disk["settings"] = serde_json::json!({ "annotation_list_table": { "columns": [
+        { "visible": true, "column_type": "meta", "width": 100.0, "meta_name": "status" }
+    ] } });
+    std::fs::write(&org_path, serde_json::to_vec_pretty(&on_disk).unwrap()).unwrap();
+
+    // Non-interactive: a real conflict would abort or shadow rather than merge.
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("disjoint divergence must auto-merge");
+    std::env::set_current_dir(&prev).unwrap();
+
+    assert!(
+        !project.path().join(".rdc/conflicts").exists(),
+        "disjoint keys must not produce a conflict shadow"
+    );
+}
+
 /// Pull-side RemoteCreate for a workspace: env exposes a workspace that
 /// doesn't exist locally and isn't in the lockfile. `sync` must classify
 /// it `RemoteCreate` and write `envs/dev/workspaces/<slug>/workspace.json`.
