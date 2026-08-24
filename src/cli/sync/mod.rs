@@ -266,13 +266,19 @@ pub(crate) async fn run_cycle(
     let parse_errors = changes.json_parse_errors();
     let limit_violations = changes.field_limit_violations();
     let missing_create_fields = changes.missing_create_fields(&lockfile);
+    let settings_problems = changes.organization_settings_problems();
 
     // `--no-push` is an audit mode: there is nothing to half-apply, so it
     // proceeds and merely reports. `--dry-run` proceeds too — its job is
-    // to print the COMPLETE plan, and it already surfaces all three classes
+    // to print the COMPLETE plan, and it already surfaces all four classes
     // in dedicated sections further down.
     if !no_push && !dry_run {
-        refuse_on_offline_defects(&parse_errors, &limit_violations, &missing_create_fields)?;
+        refuse_on_offline_defects(
+            &parse_errors,
+            &limit_violations,
+            &missing_create_fields,
+            &settings_problems,
+        )?;
     }
 
     let token = match token_override {
@@ -534,6 +540,16 @@ pub(crate) async fn run_cycle(
             progress.block(&body);
         }
 
+        if !settings_problems.is_empty() {
+            progress.event(Action::Plan, "organization settings problems");
+            let mut body = String::new();
+            use std::fmt::Write as _;
+            for (path, p) in &settings_problems {
+                let _ = writeln!(body, "- {} -- {}: {}", path.display(), p.location, p.problem);
+            }
+            progress.block(&body);
+        }
+
         if !renderer_was_supplied {
             let parse_suffix = if parse_errors.is_empty() {
                 String::new()
@@ -562,7 +578,17 @@ pub(crate) async fn run_cycle(
                     if missing_create_fields.len() == 1 { "" } else { "s" }
                 )
             };
-            let parse_suffix = format!("{parse_suffix}{limit_suffix}{missing_suffix}");
+            let settings_suffix = if settings_problems.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", {} organization settings problem{}",
+                    settings_problems.len(),
+                    if settings_problems.len() == 1 { "" } else { "s" }
+                )
+            };
+            let parse_suffix =
+                format!("{parse_suffix}{limit_suffix}{missing_suffix}{settings_suffix}");
             progress.event(
                 Action::Done,
                 &format!(
@@ -849,6 +875,18 @@ pub fn from_catalog_scan_lockfile(
                 if let Some(h) = &entry.content_hash {
                     locked.insert(("organization".to_string(), slug.clone()), h.clone());
                 }
+            }
+        }
+        // Scan changes: the org is now push-capable (Task 4), so a local
+        // `settings` edit must be visible to the classifier exactly like every
+        // other push-capable kind's scan changes above. Slug is always "self".
+        // There is deliberately no tombstone counterpart here — rdc cannot
+        // delete an organization, so a missing file means nothing to push, not
+        // a delete request; the pull half of the same sync restores it.
+        if let Some(path) = &changes.organization {
+            if let Ok(bytes) = std::fs::read(path) {
+                let hash = crate::state::content_hash(&bytes, &crate::state::Lockfile::default());
+                scan_changes.insert(("organization".to_string(), "self".to_string()), hash);
             }
         }
     }
@@ -1490,17 +1528,18 @@ pub fn from_catalog_scan_lockfile(
 
 /// Refuse a push over defects that are knowable from local bytes alone.
 ///
-/// All three classes are *permanent*: an unparseable file, an over-length
-/// field, and a create missing a field the API demands can never be
-/// accepted by the server, so attempting the push aborts the cycle before
-/// the pull phase on every single run — wedging the project until a human
-/// notices, and (for the create case) after earlier kinds are already
-/// written. Raising them here keeps the remote untouched and names exactly
-/// what to fix.
+/// All four classes are *permanent*: an unparseable file, an over-length
+/// field, a create missing a field the API demands, and a structural problem
+/// in an organization's `settings` can never be accepted by the server, so
+/// attempting the push aborts the cycle before the pull phase on every single
+/// run — wedging the project until a human notices, and (for the create case)
+/// after earlier kinds are already written. Raising them here keeps the
+/// remote untouched and names exactly what to fix.
 fn refuse_on_offline_defects(
     parse_errors: &[crate::cli::push::scan::JsonParseError],
     limit_violations: &[crate::cli::push::scan::FieldLimitViolation],
     missing_create_fields: &[crate::cli::push::scan::MissingCreateField],
+    settings_problems: &[(std::path::PathBuf, crate::snapshot::limits::SettingsProblem)],
 ) -> Result<()> {
     use std::fmt::Write as _;
 
@@ -1569,6 +1608,18 @@ fn refuse_on_offline_defects(
             "\n  Set it in the file, or per env in envs/<env>/overlay.toml \
              (e.g. [inboxes.<queue-slug>] email_prefix = \"...\") and re-run migrate."
         );
+        anyhow::bail!("{msg}");
+    }
+
+    if !settings_problems.is_empty() {
+        let mut msg = format!(
+            "{} structural problem(s) in the organization's `settings`; refusing to push \
+             before any remote write:",
+            settings_problems.len()
+        );
+        for (path, p) in settings_problems {
+            let _ = write!(msg, "\n  - {}: {} -- {}", path.display(), p.location, p.problem);
+        }
         anyhow::bail!("{msg}");
     }
 
@@ -2150,7 +2201,7 @@ mod tests {
             path: std::path::PathBuf::from("envs/prod/workspaces/main/queues/invoices/inbox.json"),
             field: "email_prefix",
         }];
-        let err = refuse_on_offline_defects(&[], &[], &missing)
+        let err = refuse_on_offline_defects(&[], &[], &missing, &[])
             .expect_err("a doomed create must refuse the push");
         let msg = err.to_string();
         assert!(msg.contains("inboxes/invoices"), "{msg}");
@@ -2161,6 +2212,6 @@ mod tests {
     /// ...and must stay silent when there is nothing to refuse.
     #[test]
     fn refuse_on_offline_defects_passes_a_clean_change_list() {
-        refuse_on_offline_defects(&[], &[], &[]).expect("a clean scan must not refuse");
+        refuse_on_offline_defects(&[], &[], &[], &[]).expect("a clean scan must not refuse");
     }
 }

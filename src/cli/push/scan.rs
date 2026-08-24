@@ -27,6 +27,11 @@ pub struct ChangeList {
     pub email_templates: BTreeMap<String, std::path::PathBuf>,
     pub engines: BTreeMap<String, std::path::PathBuf>,
     pub engine_fields: BTreeMap<String, std::path::PathBuf>,
+    /// The organization, when `organization.json` differs from its recorded
+    /// base. A singleton (lockfile slug `"self"`), so an `Option` rather than a
+    /// map — and there is no tombstone counterpart: rdc cannot delete an
+    /// organization.
+    pub organization: Option<std::path::PathBuf>,
 }
 
 impl ChangeList {
@@ -41,6 +46,7 @@ impl ChangeList {
             + self.email_templates.len()
             + self.engines.len()
             + self.engine_fields.len()
+            + usize::from(self.organization.is_some())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -70,6 +76,13 @@ impl ChangeList {
                 }
             }
         };
+        // The org singleton, wrapped so it can go through the same `check`.
+        let org_map: BTreeMap<String, std::path::PathBuf> = self
+            .organization
+            .iter()
+            .map(|p| ("self".to_string(), p.clone()))
+            .collect();
+        check("organization", &org_map);
         check("workspaces", &self.workspaces);
         check("hooks", &self.hooks);
         check("rules", &self.rules);
@@ -275,6 +288,27 @@ impl ChangeList {
         check("engine_fields", &self.engine_fields);
         out
     }
+
+    /// Structural problems in the organization's `settings` — the subtree push
+    /// sends. See [`crate::snapshot::limits::check_organization_settings`] for
+    /// why this is worth catching offline.
+    pub fn organization_settings_problems(
+        &self,
+    ) -> Vec<(std::path::PathBuf, crate::snapshot::limits::SettingsProblem)> {
+        let Some(path) = &self.organization else {
+            return Vec::new();
+        };
+        let Ok(bytes) = std::fs::read(path) else {
+            return Vec::new();
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return Vec::new(); // a parse error is reported by json_parse_errors
+        };
+        crate::snapshot::limits::check_organization_settings(&value)
+            .into_iter()
+            .map(|p| (path.clone(), p))
+            .collect()
+    }
 }
 
 /// Build a [`FieldLimitViolation`] from a [`crate::snapshot::limits::LimitViolation`],
@@ -405,6 +439,7 @@ pub fn scan(paths: &Paths, lockfile: &Lockfile) -> Result<(usize, ChangeList, To
     scanned += scan_email_templates(paths, lockfile, &mut changes.email_templates)?;
     scanned += scan_engines(paths, lockfile, &mut changes.engines)?;
     scanned += scan_engine_fields(paths, lockfile, &mut changes.engine_fields)?;
+    scanned += scan_organization(paths, lockfile, &mut changes.organization)?;
 
     let tombstones = detect_tombstones(paths, lockfile);
 
@@ -1020,6 +1055,34 @@ fn scan_email_templates(
     Ok(scanned)
 }
 
+/// Hash `organization.json` and report it when it differs from the lockfile
+/// base. The org is a singleton (`slug = "self"`) with no create and no delete:
+/// a MISSING file is not a tombstone — rdc cannot delete an organization — it
+/// simply means there is nothing to push, and the pull half of the same sync
+/// writes the file back.
+fn scan_organization(
+    paths: &Paths,
+    lockfile: &Lockfile,
+    out: &mut Option<std::path::PathBuf>,
+) -> Result<usize> {
+    use crate::state::content_hash;
+    let path = paths.organization_file();
+    if !path.exists() {
+        return Ok(0);
+    }
+    let bytes = std::fs::read(&path)?;
+    let local_hash = content_hash(&bytes, &crate::state::Lockfile::default());
+    let base_hash = lockfile
+        .objects
+        .get("organization")
+        .and_then(|m| m.get("self"))
+        .and_then(|e| e.content_hash.as_deref());
+    if base_hash != Some(local_hash.as_str()) {
+        *out = Some(path);
+    }
+    Ok(1)
+}
+
 /// Convert a list of classified items (from `cli::sync::classify`) into a
 /// push-side `ChangeList`. Only `LocalEdit` and `LocalCreate` items are
 /// retained — those are the classes the push pipeline knows how to PATCH /
@@ -1035,9 +1098,10 @@ fn scan_email_templates(
 /// owning workspace. For `email_templates` the slug is already the
 /// `<ws>/<queue>/<template>` compound, so the split is unambiguous. For
 /// `engine_fields` we sweep `engines/*/fields/<slug>.json` (lockfile keys
-/// fields by field slug alone, same as the existing scanner). Kinds that
-/// don't go through the push pipeline (`mdh`, `workflows`,
-/// `workflow_steps`, `organization`) are silently dropped.
+/// fields by field slug alone, same as the existing scanner). `organization`
+/// is a singleton keyed by the constant slug `"self"`, and its location is
+/// fixed — no sweep needed. Kinds that don't go through the push pipeline at
+/// all (`mdh`, `workflows`, `workflow_steps`) are silently dropped.
 pub fn change_list_from_classified(
     paths: &crate::paths::Paths,
     items: &[crate::cli::sync::classify::ClassifiedItem],
@@ -1109,10 +1173,18 @@ pub fn change_list_from_classified(
                     cl.email_templates.insert(it.slug.clone(), p);
                 }
             }
-            // Other kinds (mdh, workflows, workflow_steps, organization) don't
-            // go through the push pipeline; silently drop. Workflows and
-            // workflow_steps are read-only at the Rossum API; organization is
-            // singleton-read.
+            "organization" => {
+                // Singleton: slug is always "self" and the on-disk location is
+                // fixed, so — unlike queues/schemas/inboxes — no sweep is
+                // needed to find it. `LocalCreate` is unreachable (the org
+                // always exists remotely already) and `LocalDelete` has no
+                // push meaning (see the doc comment above), so this only ever
+                // fires for `LocalEdit`.
+                cl.organization = Some(paths.organization_file());
+            }
+            // Other kinds (mdh, workflows, workflow_steps) don't go through
+            // the push pipeline; silently drop — both are read-only at the
+            // Rossum API.
             _ => {}
         }
     }

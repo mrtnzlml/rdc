@@ -18,6 +18,7 @@ mod inboxes;
 mod labels;
 pub mod mdh;
 pub mod mdh_data;
+mod organization;
 mod queues;
 mod rules;
 pub mod scan;
@@ -131,6 +132,15 @@ pub(crate) async fn push_classified(
     if !changes.rules.is_empty() {
         tally(rules::push(paths, client, lockfile, interactive, &changes.rules, progress, env).await
             .with_context(|| format!("pushing rules for env '{env}'"))?);
+    }
+    // Last: the organization singleton references nothing and nothing
+    // references it, so its ordering relative to every other kind is free.
+    if let Some(path) = &changes.organization {
+        tally(
+            organization::push(paths, client, lockfile, path, progress, env)
+                .await
+                .with_context(|| format!("pushing organization for env '{env}'"))?,
+        );
     }
     Ok((pushed, skipped))
 }

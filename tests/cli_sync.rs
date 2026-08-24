@@ -1723,6 +1723,186 @@ async fn sync_records_server_stamps_in_lockfile_and_hides_them_from_disk() {
     );
 }
 
+/// A local edit to the org's `settings` produces exactly one
+/// `PATCH /organizations/{id}` whose body is `{"settings": …}` and nothing
+/// else — no `ui_settings`, no read-only field.
+///
+/// The PATCH targets `/organizations/285704` — the fixture's own `id`, which
+/// is what the lockfile records from the GET response and what the push
+/// driver addresses. That id is independent of the env's configured org id
+/// ("1" in `dev=...:1` below), which only selects which GET endpoint the env
+/// binds to.
+#[tokio::test]
+async fn sync_pushes_organization_settings_and_nothing_else() {
+    let server = MockServer::start().await;
+    let mut org = fixture("organization.json");
+    org["settings"] = serde_json::json!({ "annotation_list_table": { "columns": [] } });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(org.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/organizations/285704"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(org.clone()))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &[]).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    // First sync: pull only, records the base.
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("first sync");
+
+    // Local edit to the managed subtree.
+    let org_path = project.path().join("envs/dev/organization.json");
+    let mut on_disk: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&org_path).unwrap()).unwrap();
+    on_disk["settings"]["annotation_list_table"]["columns"] = serde_json::json!([
+        { "visible": true, "column_type": "meta", "width": 100.0, "meta_name": "status" }
+    ]);
+    std::fs::write(&org_path, serde_json::to_vec_pretty(&on_disk).unwrap()).unwrap();
+
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("second sync");
+    std::env::set_current_dir(&prev).unwrap();
+
+    let patches: Vec<serde_json::Value> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| {
+            r.method == http::Method::PATCH && r.url.path() == "/api/v1/organizations/285704"
+        })
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(patches.len(), 1, "exactly one org PATCH: {patches:?}");
+    let body = &patches[0];
+    assert_eq!(
+        body.as_object().unwrap().keys().collect::<Vec<_>>(),
+        vec!["settings"],
+        "the body must carry `settings` and nothing else: {body}"
+    );
+    assert_eq!(
+        body["settings"]["annotation_list_table"]["columns"][0]["meta_name"],
+        serde_json::json!("status")
+    );
+}
+
+/// An edit confined to a field rdc does not manage must not produce a request,
+/// and must say so — the write-back would otherwise discard it silently.
+#[tokio::test]
+async fn sync_warns_and_sends_nothing_for_an_unmanaged_organization_edit() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &[]).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .unwrap();
+
+    let org_path = project.path().join("envs/dev/organization.json");
+    let mut on_disk: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&org_path).unwrap()).unwrap();
+    on_disk["ui_settings"] = serde_json::json!({ "theme": "dark" });
+    std::fs::write(&org_path, serde_json::to_vec_pretty(&on_disk).unwrap()).unwrap();
+
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .unwrap();
+    std::env::set_current_dir(&prev).unwrap();
+
+    for req in server.received_requests().await.unwrap_or_default() {
+        assert_ne!(
+            req.method,
+            http::Method::PATCH,
+            "an unmanaged-field edit must not PATCH: {} {}",
+            req.method,
+            req.url.path()
+        );
+    }
+}
+
+/// Deleting `organization.json` must never reach a DELETE. rdc cannot delete an
+/// organization and the file is simply re-pulled.
+#[tokio::test]
+async fn sync_never_deletes_an_organization() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &[]).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .unwrap();
+    std::fs::remove_file(project.path().join("envs/dev/organization.json")).unwrap();
+    rdc::cli::sync::run("dev", true, false, true, false, false, None)
+        .await
+        .expect("sync with --allow-deletes must still succeed");
+    std::env::set_current_dir(&prev).unwrap();
+
+    for req in server.received_requests().await.unwrap_or_default() {
+        assert_ne!(req.method, http::Method::DELETE, "no DELETE, ever");
+    }
+}
+
 /// Pull-side RemoteCreate for a workspace: env exposes a workspace that
 /// doesn't exist locally and isn't in the lockfile. `sync` must classify
 /// it `RemoteCreate` and write `envs/dev/workspaces/<slug>/workspace.json`.

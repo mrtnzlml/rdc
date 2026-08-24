@@ -301,6 +301,22 @@ impl RossumClient {
         self.patch_json(&format!("/labels/{id}"), label, progress).await
     }
 
+    /// `PATCH /organizations/{id}`.
+    ///
+    /// The only write rdc ever makes to an organization: there is no POST (one
+    /// org per env, created outside rdc) and no DELETE. `body` carries exactly
+    /// the subtree rdc manages — `{"settings": …}` — because a partial
+    /// `settings` PATCH REPLACES the object server-side, so a fragment would
+    /// silently drop the sibling keys.
+    pub async fn update_organization(
+        &self,
+        id: u64,
+        body: &serde_json::Value,
+        progress: ProgressHandle,
+    ) -> Result<Organization> {
+        self.patch_json(&format!("/organizations/{id}"), body, progress).await
+    }
+
     pub async fn update_engine(&self, id: u64, engine: &Engine, progress: ProgressHandle) -> Result<Engine> {
         self.patch_json(&format!("/engines/{id}"), engine, progress).await
     }
