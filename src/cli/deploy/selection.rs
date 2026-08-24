@@ -16,7 +16,9 @@ use std::collections::BTreeSet;
 /// Kinds we deploy/migrate, in dependency order (POST order). Workflows are
 /// pull-only at the Rossum API (PATCH returns 405) and so are not deployable;
 /// `mdh` (index sets and manual row data) IS writable and is last — nothing
-/// references a dataset, so it has no ordering constraint.
+/// references a dataset, so it has no ordering constraint. `organization` is
+/// PATCH-only (rdc never creates the org) and, like `mdh`, has no create-order
+/// dependency on anything else — its position here is arbitrary.
 pub(crate) const DEPLOYABLE_KINDS: &[&str] = &[
     "workspaces",
     "schemas",
@@ -29,6 +31,7 @@ pub(crate) const DEPLOYABLE_KINDS: &[&str] = &[
     "engines",
     "engine_fields",
     "mdh",
+    "organization",
 ];
 
 #[derive(Debug, Default, Clone)]
@@ -217,8 +220,19 @@ pub(crate) fn list_slugs(paths: &Paths, kind: &str) -> Result<Vec<String>> {
         "engines" => list_engine_slugs(paths),
         "engine_fields" => list_engine_field_slugs(paths),
         "mdh" => list_mdh_slugs(paths),
+        "organization" => list_organization_slug(paths),
         _ => Ok(Vec::new()),
     }
+}
+
+/// The organization's one slug (`"self"`, matching the codec's and the
+/// lockfile's convention), or none when the env has no `organization.json`.
+fn list_organization_slug(paths: &Paths) -> Result<Vec<String>> {
+    Ok(if paths.organization_file().exists() {
+        vec!["self".to_string()]
+    } else {
+        Vec::new()
+    })
 }
 
 /// MDH dataset slugs: directories under `mdh/` holding an `indexes.json`. Same

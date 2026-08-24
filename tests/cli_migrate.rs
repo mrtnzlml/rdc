@@ -2011,3 +2011,177 @@ fn migrate_mirror_dry_run_plans_the_directory_removal() {
         "--dry-run must not remove the directory either: {stderr}"
     );
 }
+
+// ---- organization promotion ------------------------------------------
+
+/// Promotion carries `settings` and leaves the target's own identity alone.
+#[test]
+fn migrate_promotes_organization_settings_only() {
+    let project = init_two_env_project();
+    let root = project.path();
+
+    write(
+        &root.join("envs/test/organization.json"),
+        &serde_json::json!({
+            "id": 1, "url": "https://test.example/api/v1/organizations/1", "name": "Acme Test",
+            "ui_settings": { "theme": "white" },
+            "settings": { "annotation_list_table": { "columns": [
+                { "visible": true, "column_type": "schema", "width": 120.0,
+                  "schema_id": "field_a", "data_type": "string" }
+            ] } }
+        }),
+    );
+    write(
+        &root.join("envs/prod/organization.json"),
+        &serde_json::json!({
+            "id": 2, "url": "https://prod.example/api/v1/organizations/2", "name": "Acme Prod",
+            "ui_settings": { "theme": "dark" },
+            "settings": { "annotation_list_table": { "columns": [] } }
+        }),
+    );
+
+    let _guard = cwd_lock();
+    std::env::set_current_dir(root).unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(root)
+        .args(["migrate", "test", "prod"])
+        .assert()
+        .success();
+
+    let tgt = read_json(&root.join("envs/prod/organization.json"));
+    assert_eq!(
+        tgt["settings"]["annotation_list_table"]["columns"][0]["schema_id"],
+        serde_json::json!("field_a"),
+        "settings promoted: {tgt}"
+    );
+    assert_eq!(tgt["id"], serde_json::json!(2), "target identity preserved");
+    assert_eq!(tgt["name"], serde_json::json!("Acme Prod"), "target name preserved");
+    assert_eq!(
+        tgt["ui_settings"]["theme"],
+        serde_json::json!("dark"),
+        "ui_settings is env-local and must not be promoted"
+    );
+}
+
+/// No target `organization.json` → skip with a warning, never emit a
+/// settings-only file.
+#[test]
+fn migrate_skips_the_organization_when_the_target_has_none() {
+    let project = init_two_env_project();
+    let root = project.path();
+    write(
+        &root.join("envs/test/organization.json"),
+        &serde_json::json!({ "id": 1, "name": "Acme Test", "settings": {} }),
+    );
+
+    let _guard = cwd_lock();
+    std::env::set_current_dir(root).unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(root)
+        .args(["migrate", "test", "prod"])
+        .assert()
+        .success();
+
+    assert!(
+        !root.join("envs/prod/organization.json").exists(),
+        "must not create a target org file out of a source-only body"
+    );
+}
+
+/// `--mirror` must never prune the target's org file, even when the source env
+/// has never been pulled.
+#[test]
+fn migrate_mirror_never_prunes_the_organization() {
+    let project = init_two_env_project();
+    let root = project.path();
+    write(
+        &root.join("envs/prod/organization.json"),
+        &serde_json::json!({ "id": 2, "name": "Acme Prod", "settings": {} }),
+    );
+
+    let _guard = cwd_lock();
+    std::env::set_current_dir(root).unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(root)
+        .args(["migrate", "test", "prod", "--mirror"])
+        .assert()
+        .success();
+
+    assert!(
+        root.join("envs/prod/organization.json").exists(),
+        "a per-env singleton is never a target-only object"
+    );
+}
+
+/// An `[organization]` overlay entry beats the promoted value.
+#[test]
+fn migrate_organization_overlay_wins() {
+    let project = init_two_env_project();
+    let root = project.path();
+    write(
+        &root.join("envs/test/organization.json"),
+        &serde_json::json!({ "id": 1, "name": "Acme Test", "settings": {
+            "annotation_list_table": { "columns": [
+                { "visible": true, "column_type": "schema", "width": 120.0,
+                  "schema_id": "field_a", "data_type": "string" }
+            ] } } }),
+    );
+    write(
+        &root.join("envs/prod/organization.json"),
+        &serde_json::json!({ "id": 2, "name": "Acme Prod", "settings": {} }),
+    );
+    std::fs::write(
+        root.join("envs/prod/overlay.toml"),
+        "version = 1\n\n[organization.settings.annotation_list_table]\n\
+         columns = [ { visible = true, column_type = \"meta\", width = 80.0, meta_name = \"status\" } ]\n",
+    )
+    .unwrap();
+
+    let _guard = cwd_lock();
+    std::env::set_current_dir(root).unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(root)
+        .args(["migrate", "test", "prod"])
+        .assert()
+        .success();
+
+    let tgt = read_json(&root.join("envs/prod/organization.json"));
+    assert_eq!(
+        tgt["settings"]["annotation_list_table"]["columns"][0]["meta_name"],
+        serde_json::json!("status"),
+        "overlay must win over the promoted value: {tgt}"
+    );
+}
+
+/// A promoted `column_type: "schema"` column whose `schema_id` no target
+/// schema defines is warned about, never dropped.
+#[test]
+fn migrate_warns_about_org_columns_absent_from_the_target_schemas() {
+    let project = init_two_env_project();
+    let root = project.path();
+    write(&root.join("envs/test/organization.json"), &serde_json::json!({
+        "id": 1, "name": "Acme Test", "settings": { "annotation_list_table": { "columns": [
+            { "visible": true, "column_type": "schema", "width": 1.0,
+              "schema_id": "not_in_prod", "data_type": "string" },
+            { "visible": true, "column_type": "meta", "width": 1.0, "meta_name": "status" }
+        ] } }
+    }));
+    write(&root.join("envs/prod/organization.json"),
+          &serde_json::json!({ "id": 2, "name": "Acme Prod", "settings": {} }));
+    write(&root.join("envs/prod/workspaces/main/queues/invoices/schema.json"),
+          &serde_json::json!({ "name": "s", "content": [ { "id": "in_prod", "category": "datapoint" } ] }));
+
+    let _guard = cwd_lock();
+    std::env::set_current_dir(root).unwrap();
+    let out = assert_cmd::Command::cargo_bin("rdc").unwrap()
+        .current_dir(root).args(["migrate", "test", "prod"]).assert().success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    let all = format!("{stdout}{stderr}");
+    assert!(all.contains("not_in_prod"), "must name the missing schema_id: {all}");
+    assert!(!all.contains("status"), "a meta column has no schema_id to check: {all}");
+}

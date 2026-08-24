@@ -270,6 +270,12 @@ pub(crate) fn classify(rel: &Path) -> Option<(&'static str, String)> {
             }
         }
         Some("workspaces") => classify_workspace(&comps),
+        // The organization singleton, at the env root. Slug-independent (one
+        // per env), so the reserved constant `"self"` stands in for a slug —
+        // matching the codec's and the lockfile's convention.
+        Some("organization.json") if comps.len() == 1 => {
+            Some(("organization", "self".to_string()))
+        }
         _ => None,
     }
 }
@@ -584,6 +590,8 @@ fn transform_file(
     id_remap: &IdRemap,
     id_hits: &mut Vec<(String, u64, u64)>,
     carried_prefixes: &mut Vec<(String, String)>,
+    tgt_env: &str,
+    missing_schema_ids: &mut Vec<String>,
 ) -> Result<FileOutcome> {
     let src_path = src_root.join(rel);
     let dst_rel = remap_relative(rel, mapping);
@@ -844,15 +852,40 @@ fn transform_file(
     // env-tuned reconciles above, so an overlay value overrides the object's
     // reconciled/source content. Precedence:
     // per-object override > kind-wide `"*"` default > reconciled value.
+    //
+    // `organization` is a per-env SINGLETON — no slug, so no `"*"` wildcard and
+    // no `overlay_for`/`tgt_slug` lookup — so it is dispatched separately, via
+    // the codec's own `overlay()` hook (`Organization::overlay` returns
+    // `Overlay::organization()` regardless of the slug it's passed).
     if let Some((kind, src_slug)) = classify(rel)
         && let Some(ov) = overlay
     {
-        if let Some(defaults) = overlay_slug(ov, kind, "*") {
-            apply_overrides(&mut value, defaults);
+        if kind == "organization" {
+            if let Some(codec) = crate::snapshot::codec::codec(kind)
+                && let Some(overrides) = codec.overlay(ov, &src_slug)
+            {
+                apply_overrides(&mut value, overrides);
+            }
+        } else {
+            if let Some(defaults) = overlay_slug(ov, kind, "*") {
+                apply_overrides(&mut value, defaults);
+            }
+            if let Some(overrides) = overlay_for(ov, mapping, kind, &src_slug) {
+                apply_overrides(&mut value, overrides);
+            }
         }
-        if let Some(overrides) = overlay_for(ov, mapping, kind, &src_slug) {
-            apply_overrides(&mut value, overrides);
-        }
+    }
+
+    // Warn (never drop) when a promoted `column_type: "schema"` column names a
+    // `schema_id` no schema under the target env defines. The API accepts an
+    // unknown id with a 200 (verified against the live sandbox), so the server
+    // never catches this — offline is the only place it can surface, and
+    // silently editing deployable content is worse than a dead column the
+    // warning names.
+    if let Some((kind, _)) = classify(rel)
+        && kind == "organization"
+    {
+        missing_schema_ids.extend(org_columns_missing_in_target(&value, tgt_root, tgt_env));
     }
 
     // Confirm the provisional inbox-prefix carry recorded above, now that the
@@ -887,6 +920,72 @@ fn transform_file(
     let mut json = serde_json::to_vec_pretty(&value)?;
     json.push(b'\n');
     settle(&dst_path, &json, dry_run)
+}
+
+/// Every promoted `column_type: "schema"` column (in either
+/// `annotation_list_table` or `request_dashboard_table`) whose `schema_id`
+/// appears in no schema under the target env, named for a warning. `value` is
+/// the organization body post-overlay — the final promoted content.
+///
+/// A read error while scanning `tgt_root` (a vanished dir, an unreadable file)
+/// is treated as "no schemas found" rather than aborting the migration: this
+/// check is advisory, never a gate.
+fn org_columns_missing_in_target(
+    value: &serde_json::Value,
+    tgt_root: &Path,
+    tgt_env: &str,
+) -> Vec<String> {
+    let mut known = std::collections::BTreeSet::new();
+    if let Ok(files) = enumerate_files(tgt_root, tgt_env) {
+        for rel in files {
+            if rel.file_name().and_then(|n| n.to_str()) != Some("schema.json") {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(tgt_root.join(&rel))
+                && let Ok(schema) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            {
+                collect_schema_ids(&schema, &mut known);
+            }
+        }
+    }
+    let mut missing = Vec::new();
+    for table in ["annotation_list_table", "request_dashboard_table"] {
+        let Some(cols) = value
+            .get("settings")
+            .and_then(|s| s.get(table))
+            .and_then(|t| t.get("columns"))
+            .and_then(|c| c.as_array())
+        else {
+            continue;
+        };
+        for col in cols {
+            if col.get("column_type").and_then(|v| v.as_str()) == Some("schema")
+                && let Some(id) = col.get("schema_id").and_then(|v| v.as_str())
+                && !known.contains(id)
+            {
+                missing.push(id.to_string());
+            }
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+/// Every `schema_id` in a schema's `content` tree, at any depth.
+fn collect_schema_ids(value: &serde_json::Value, out: &mut std::collections::BTreeSet<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::String(id)) = map.get("id") {
+                out.insert(id.clone());
+            }
+            for v in map.values() {
+                collect_schema_ids(v, out);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter().for_each(|v| collect_schema_ids(v, out)),
+        _ => {}
+    }
 }
 
 /// What migrating one file did (or, under `--dry-run`, would do) to the target
@@ -1859,9 +1958,12 @@ fn reconcile_target_identity(
 /// dirs `paths.rs` exposes and `push::scan` reads. Migrate copies only files
 /// WITHIN these. Everything else under `envs/<env>/` — user pytest `tests/`,
 /// helper `scripts/`, `README`s, `__pycache__`, and the per-env singletons
-/// (`_index.md`, `overlay.toml`, `organization.json`) — is NOT rdc-managed and
-/// must be left untouched: a snapshot→snapshot transform has no business
-/// copying files rdc neither pulls nor pushes.
+/// `_index.md` / `overlay.toml` — is NOT rdc-managed and must be left
+/// untouched: a snapshot→snapshot transform has no business copying files rdc
+/// neither pulls nor pushes. `organization.json` is also a per-env singleton
+/// living outside these dirs, but [`enumerate_files`] adds it back in
+/// explicitly: unlike the others it IS promoted (its `settings` subtree only —
+/// see [`classify`], `reconcile_target_identity`).
 const MANAGED_DIRS: &[&str] = &[
     "hooks",
     "workspaces",
@@ -1874,9 +1976,10 @@ const MANAGED_DIRS: &[&str] = &[
 
 /// Enumerate every rdc-managed snapshot file under `env_root`, returning paths
 /// relative to `env_root`. Only descends into [`MANAGED_DIRS`]; any other
-/// top-level entry is ignored entirely. Within a managed dir, sync shadow
-/// artifacts (`<file>.<env>` / `<file>.<env>-deleted`) are skipped via
-/// [`should_skip`].
+/// top-level entry is ignored entirely, except `organization.json` — the
+/// env-root singleton — which is appended when present. Within a managed dir,
+/// sync shadow artifacts (`<file>.<env>` / `<file>.<env>-deleted`) are skipped
+/// via [`should_skip`].
 fn enumerate_files(env_root: &Path, env: &str) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for dir in MANAGED_DIRS {
@@ -1884,6 +1987,12 @@ fn enumerate_files(env_root: &Path, env: &str) -> Result<Vec<PathBuf>> {
         if managed.exists() {
             walk_dir(env_root, &managed, env, &mut out)?;
         }
+    }
+    // The organization singleton lives at the env root, outside MANAGED_DIRS, so
+    // it is added explicitly rather than by loosening `should_skip` (which also
+    // guards `_index.md` / `overlay.toml`, both of which stay excluded).
+    if env_root.join("organization.json").exists() {
+        out.push(PathBuf::from("organization.json"));
     }
     out.sort();
     Ok(out)
@@ -1973,7 +2082,9 @@ fn should_skip(name: &str, env: &str) -> bool {
 /// relative to the *target* env root. `skip` holds source-relative paths the
 /// migration refuses to produce (un-creatable unique-typed email-template
 /// duplicates) — their target counterparts count as NOT produced, so a stale
-/// copy left by an earlier migrate gets pruned.
+/// copy left by an earlier migrate gets pruned. `organization.json` is always
+/// exempt — a per-env singleton is never a "target-only object", even when the
+/// source env has no org file of its own to have produced it from.
 fn mirror_prune_paths(
     src_root: &Path,
     src_env: &str,
@@ -1991,6 +2102,9 @@ fn mirror_prune_paths(
     let existing = enumerate_files(tgt_root, tgt_env)?;
     Ok(existing
         .into_iter()
+        // A per-env singleton is never a "target-only object": the target's org
+        // file must survive even when the source env has never been pulled.
+        .filter(|rel| rel != Path::new("organization.json"))
         .filter(|rel| !produced.contains(rel))
         .collect())
 }
@@ -2333,6 +2447,7 @@ pub fn run_at(
     let mut obj_status: BTreeMap<(&'static str, String), ObjStatus> = BTreeMap::new();
     let mut id_hits: Vec<(String, u64, u64)> = Vec::new();
     let mut carried_prefixes: Vec<(String, String)> = Vec::new();
+    let mut missing_schema_ids: Vec<String> = Vec::new();
 
     for rel in &files {
         // Un-creatable duplicate unique-typed email templates (see above).
@@ -2351,6 +2466,22 @@ pub fn run_at(
                 Some((kind, slug)) if sel.contains(kind, &slug) => {}
                 _ => continue,
             }
+        }
+
+        // Organization promotion writes the source's `settings` into the
+        // TARGET's own org object: `reconcile_target_identity` restores
+        // id/url/name/ui_settings/metadata from the target's file. With no
+        // target file there is nothing to restore, so skip rather than emit a
+        // settings-only `organization.json` no pull would ever produce.
+        if rel.as_path() == Path::new("organization.json") && !tgt_root.join(rel).exists() {
+            log.event(
+                crate::log::Action::Warn,
+                &format!(
+                    "envs/{tgt}/organization.json does not exist yet — organization \
+                     settings not promoted; run `rdc sync {tgt}` to pull it first"
+                ),
+            );
+            continue;
         }
 
         let dst_rel = remap_relative(rel, &mapping);
@@ -2385,6 +2516,8 @@ pub fn run_at(
             &id_remap,
             &mut id_hits,
             &mut carried_prefixes,
+            tgt,
+            &mut missing_schema_ids,
         )
         .with_context(|| format!("migrating {}", rel.display()))?;
         if outcome != FileOutcome::Unchanged {
@@ -2419,6 +2552,23 @@ pub fn run_at(
             crate::log::Action::Warn,
             &format_carried_email_prefix_warning(src, tgt, &carried_prefixes),
         );
+    }
+
+    // Every promoted organization column whose `schema_id` names a field no
+    // target schema defines, named once for the whole run. Emitted in
+    // `--dry-run` too, like the carried-prefix warning above.
+    if !missing_schema_ids.is_empty() {
+        missing_schema_ids.sort();
+        missing_schema_ids.dedup();
+        for id in &missing_schema_ids {
+            log.event(
+                crate::log::Action::Warn,
+                &format!(
+                    "organization: column schema_id `{id}` does not exist in {tgt} — \
+                     the column will render empty"
+                ),
+            );
+        }
     }
 
     let creates = obj_status
@@ -3160,6 +3310,8 @@ mod tests {
             &remap,
             &mut hits,
             &mut Vec::new(),
+            "tgt",
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -3388,6 +3540,8 @@ mod tests {
                 &IdRemap::default(),
                 &mut Vec::new(),
                 &mut Vec::new(),
+                "tgt",
+                &mut Vec::new(),
             )
             .unwrap();
             serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap()
@@ -3525,6 +3679,8 @@ mod tests {
                 &IdRemap::default(),
                 &mut Vec::new(),
                 &mut Vec::new(),
+                "tgt",
+                &mut Vec::new(),
             )
             .unwrap();
             serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap()
@@ -3638,6 +3794,8 @@ mod tests {
                 &IdRemap::default(),
                 &mut Vec::new(),
                 &mut Vec::new(),
+                "tgt",
+                &mut Vec::new(),
             )
             .unwrap();
             (outcome, fs::read(&dst).unwrap())
@@ -3695,7 +3853,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new()).unwrap();
 
         // File landed at the remapped path.
         let dst = tgt
@@ -3770,6 +3928,8 @@ mod tests {
             &IdRemap::default(),
             &mut Vec::new(),
             &mut Vec::new(),
+            "tgt",
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -3813,7 +3973,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("hooks/extractor-prod.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -3855,7 +4015,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("hooks/any-hook.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -3903,7 +4063,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("hooks/special-hook.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -3944,7 +4104,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("rules/some-rule.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -4025,6 +4185,8 @@ mod tests {
             &IdRemap::default(),
             &mut Vec::new(),
             &mut Vec::new(),
+            "tgt",
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -4073,7 +4235,7 @@ mod tests {
         fs::write(&src_file, code).unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("hooks/extractor-prod.py");
         assert_eq!(
@@ -4569,6 +4731,8 @@ mod tests {
             &IdRemap::default(),
             &mut Vec::new(),
             &mut carries,
+            "tgt",
+            &mut Vec::new(),
         )
         .unwrap();
         carries
@@ -4749,6 +4913,8 @@ mod tests {
             &IdRemap::default(),
             &mut Vec::new(),
             &mut Vec::new(),
+            "tgt",
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -4805,6 +4971,8 @@ mod tests {
             /* migrate_email_prefixes = */ false,
             &IdRemap::default(),
             &mut Vec::new(),
+            &mut Vec::new(),
+            "tgt",
             &mut Vec::new(),
         )
         .unwrap();
