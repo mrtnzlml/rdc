@@ -12,11 +12,19 @@
 # Rehearse every new deploy target before its first press:
 #   rdc migrate <src> <tgt> --mirror --dry-run && rdc sync <tgt> --dry-run
 #
-# The regions marked `# >>> rdc:…` are generated from rdc.toml: `rdc init`
-# refreshes them in place on every run, including when you add an env, and
-# leaves every other line of this file alone. Fill in each deploy draft's
-# RDC_SRC, delete the drafts for envs you author by hand, and edit freely
-# outside the markers.
+# The regions marked `# >>> rdc:…` come from rdc.toml. `rdc init` maintains
+# them on every run and leaves every other line of this file alone -- but the
+# two are maintained differently:
+#   rdc:archive-envs  REGENERATED: it always lists exactly the envs in rdc.toml.
+#   rdc:deploy-jobs   APPENDED TO ONLY: whatever is in it stays exactly as you
+#     leave it, and an env that has never been drafted here gets a draft added.
+#     Fill in a draft's RDC_SRC, delete the drafts for envs you author by hand,
+#     add keys of your own -- none of that is reverted and nothing comes back.
+#     (To start from this version's file again, delete it and re-run rdc init.)
+#
+# Set each RDC_SRC on its job, in THIS FILE. A project- or group-level RDC_SRC
+# defined in GitLab's CI/CD settings outranks a job's `variables:` block, so one
+# there would silently become the promotion source of every button at once.
 #
 # CAUTION: deploy writes to Rossum and CAN DELETE -- `migrate --mirror` prunes
 # target objects the source no longer has, and `sync --allow-deletes` turns
@@ -141,7 +149,7 @@ archive:
     GIT_DEPTH: "0"  # the commit-back rebases onto the default branch
   parallel:
     matrix:
-      # >>> rdc:archive-envs  (generated from rdc.toml -- `rdc init --force` to refresh)
+      # >>> rdc:archive-envs  (generated from rdc.toml -- every `rdc init` refreshes it)
       - RDC_ENV: "dev"
         RDC_VAR_SUFFIX: "DEV"
       - RDC_ENV: "prod"
@@ -157,13 +165,20 @@ archive:
   script:
     - |
       set -eu
-      # An env whose credentials are not wired up yet is SKIPPED, not failed: a
-      # project sets them one env at a time, and a scheduled archive has to stay
-      # green meanwhile. One `script:` block on purpose -- `exit 0` then really
-      # does stop the job here.
-      if [ -z "$(printenv "RDC_TOKEN_$RDC_VAR_SUFFIX" || true)" ] \
-      && [ -z "$(printenv "RDC_PASS_$RDC_VAR_SUFFIX" || true)" ]; then
-        echo "$RDC_ENV: neither RDC_TOKEN_$RDC_VAR_SUFFIX nor RDC_PASS_$RDC_VAR_SUFFIX is set; skipping."
+      # QUIET (skip, job green): this env has NO credential of any kind, so it
+      # has not been wired up yet. A project sets them one env at a time and a
+      # scheduled archive has to stay green meanwhile. One `script:` block on
+      # purpose -- `exit 0` then really does stop the job here.
+      #
+      # LOUD (fall through, rdc fails the job): anything else, including a
+      # half-configured env -- RDC_USER_ without RDC_PASS_, or a token that has
+      # been revoked. Those must not read as "not wired up yet", or this env
+      # silently stops being archived while the schedule stays green forever.
+      rdc_token=$(printenv "RDC_TOKEN_$RDC_VAR_SUFFIX" || true)
+      rdc_user=$(printenv "RDC_USER_$RDC_VAR_SUFFIX" || true)
+      rdc_pass=$(printenv "RDC_PASS_$RDC_VAR_SUFFIX" || true)
+      if [ -z "$rdc_token" ] && [ -z "$rdc_user" ] && [ -z "$rdc_pass" ]; then
+        echo "$RDC_ENV: no RDC_TOKEN_$RDC_VAR_SUFFIX, RDC_USER_$RDC_VAR_SUFFIX or RDC_PASS_$RDC_VAR_SUFFIX; skipping."
         exit 0
       fi
 
@@ -216,6 +231,8 @@ archive:
       # indefinitely, besides tripping the divergence check below.
       rm -rf "$shadow_dir"
 
+      echo "deploying $RDC_ENV from $RDC_SRC"
+
       rdc migrate "$RDC_SRC" "$RDC_ENV" --mirror --yes
 
       # Keep the status instead of letting `set -e` abort: sync may have written
@@ -254,7 +271,7 @@ archive:
 # The promotion chain. `resource_group` serializes every pipeline that deploys
 # the same env, so two runs can never interleave writes into one tenant;
 # `environment` records the deployment under Operate -> Environments.
-# >>> rdc:deploy-jobs  (generated from rdc.toml -- `rdc init --force` to refresh)
+# >>> rdc:deploy-jobs  (rdc appends a draft per new env; your edits here are kept)
 # DRAFTS. Each button needs its RDC_SRC filled in before it can be pressed,
 # and the jobs for hand-authored source envs (a dev env people edit) should
 # be deleted -- an archive records those, a deploy would overwrite them.
