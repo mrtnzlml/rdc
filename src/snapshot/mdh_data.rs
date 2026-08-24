@@ -28,7 +28,7 @@ pub const DATA_FILE: &str = "data.jsonl";
 pub const ROW_WARN_THRESHOLD: usize = 1_000;
 
 /// Row count above which rdc refuses to version a dataset at all.
-pub const ROW_HARD_LIMIT: usize = 10_000;
+pub const ROW_HARD_LIMIT: usize = 25_000;
 
 /// True when `v` is the EJSON wrapper for a server-generated ObjectId: an
 /// object whose single key is `$oid`.

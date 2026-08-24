@@ -1829,7 +1829,8 @@ mod tests {
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("10001"), "must state the count: {msg}");
+        let over = (crate::snapshot::mdh_data::ROW_HARD_LIMIT + 1).to_string();
+        assert!(msg.contains(&over), "must state the count: {msg}");
         assert!(!paths.dataset_data("gl-codes").exists(), "must write nothing");
     }
 
