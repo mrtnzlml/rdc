@@ -1989,9 +1989,18 @@ async fn sync_never_deletes_an_organization() {
 
 /// Local `settings` edit + a remote change to a DIFFERENT key is not a
 /// conflict: the JSON 3-way merge resolves disjoint keys, so this must sync
-/// without a prompt and without losing either side.
+/// without a prompt and without losing either side — AND the merged local
+/// `settings` edit must actually reach the remote in the SAME cycle via
+/// `promoted_to_push`, not just survive on disk. Without the
+/// `promoted_to_push` "organization" arm, the promotion is silently
+/// dropped and no PATCH ever lands; without the base-cache trust check in
+/// the push driver, the promoted edit reads back as a no-op against the
+/// auto-merge's own (deliberately stale-vs-lockfile) cache write and is
+/// skipped as a phantom "settings unchanged" — either regression leaves
+/// the conflict-shadow assertion below green, so this test also counts
+/// and inspects the PATCH itself.
 #[tokio::test]
-async fn sync_auto_merges_disjoint_organization_divergence() {
+async fn sync_auto_merges_disjoint_organization_divergence_and_pushes_in_the_same_cycle() {
     let server = MockServer::start().await;
     let base = fixture("organization.json");
     Mock::given(method("GET"))
@@ -2052,6 +2061,33 @@ async fn sync_auto_merges_disjoint_organization_divergence() {
     assert!(
         !project.path().join(".rdc/conflicts").exists(),
         "disjoint keys must not produce a conflict shadow"
+    );
+
+    // The merge alone isn't the whole story: the local `settings` edit it
+    // kept must actually reach the remote in this same cycle, via the
+    // `promoted_to_push` "organization" arm — and it must reach the remote
+    // for real, not be waved through as a phantom no-op by the base-cache
+    // trust check.
+    let patches: Vec<serde_json::Value> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| {
+            r.method == http::Method::PATCH && r.url.path() == "/api/v1/organizations/285704"
+        })
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(
+        patches.len(),
+        1,
+        "the merged local settings edit must push exactly once in this cycle: {patches:?}"
+    );
+    assert_eq!(
+        patches[0]["settings"]["annotation_list_table"]["columns"][0]["meta_name"],
+        serde_json::json!("status"),
+        "the PATCH body must carry the merged (kept-local) settings edit: {:?}",
+        patches[0]
     );
 }
 
