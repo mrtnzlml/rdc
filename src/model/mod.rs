@@ -69,3 +69,10 @@ where
 pub(crate) fn modified_at(extra: &IndexMap<String, Value>) -> Option<&str> {
     extra.get("modified_at").and_then(|v| v.as_str())
 }
+
+/// Read the server's `modified_by` (a Rossum user URL) out of a model's
+/// flattened extras. Companion to [`modified_at`]: both are stripped from the
+/// on-disk JSON and recorded in the lockfile instead.
+pub(crate) fn modified_by(extra: &IndexMap<String, Value>) -> Option<&str> {
+    extra.get("modified_by").and_then(|v| v.as_str())
+}

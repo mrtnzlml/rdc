@@ -29,6 +29,10 @@ impl Hook {
         crate::model::modified_at(&self.extra)
     }
 
+    pub fn modified_by(&self) -> Option<&str> {
+        crate::model::modified_by(&self.extra)
+    }
+
     /// Returns the `extension_source` value if present and a string —
     /// `"rossum_store"` for store extensions, `"custom"` for user-created
     /// hooks, or `None` if the field is absent or null on the wire.

@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::paths::Paths;
 use crate::snapshot::codec::{DiskArtifact, KindCodec};
 use crate::snapshot::create::{strip_for_create, strip_for_cross_env_patch};
-use crate::snapshot::key_order::strip_hidden_fields_recursive;
+use crate::snapshot::key_order::strip_hidden_fields;
 
 pub struct Workspaces;
 
@@ -21,7 +21,7 @@ impl KindCodec for Workspaces {
         // No redaction for workspaces — `redact_on_pull("workspaces")` is empty.
         // Strip `modified_at` recursively so that nested timestamps (e.g. inside
         // a sub-object) don't survive to disk and cause spurious sync drift.
-        strip_hidden_fields_recursive(&mut v);
+        strip_hidden_fields(&mut v);
         let mut json = serde_json::to_vec_pretty(&v)?;
         json.push(b'\n');
         Ok(DiskArtifact {
@@ -60,6 +60,7 @@ mod tests {
             "organization": "https://x.rossum.app/api/v1/organizations/285704",
             "queues": ["https://x.rossum.app/api/v1/queues/2137275"],
             "modified_at": "2026-03-15T11:00:00Z",
+            "modified_by": "https://x.rossum.app/api/v1/users/9",
             "metadata": {
                 "tag": "ap",
                 "modified_at": "2026-03-15T11:00:00Z"
@@ -67,12 +68,14 @@ mod tests {
         })
     }
 
-    /// The nested `modified_at` inside `metadata` must be stripped from disk.
-    /// This is the fix for a known sync bug where only the top-level
-    /// `modified_at` was stripped, leaving nested timestamps to cause
-    /// spurious remote drift on every re-pull.
+    /// Only the object's OWN top-level stamps are stripped. A stamp-named key
+    /// nested inside `metadata` is user data — `metadata` is user-writable and
+    /// push sends it wholesale, so stripping it would delete it server-side.
+    /// Drift is prevented by the hash, not by this strip: `canonicalize_for_hash`
+    /// drops these names at any depth (see `noise::NOISE_FIELDS`), so a nested
+    /// timestamp cannot register as remote drift.
     #[test]
-    fn disk_bytes_strips_modified_at_recursively() {
+    fn disk_bytes_strips_top_level_stamps_only() {
         let codec = Workspaces;
         let art = codec.disk_bytes(&sample_workspace()).unwrap();
 
@@ -85,8 +88,13 @@ mod tests {
             "top-level modified_at must be stripped"
         );
         assert!(
-            out["metadata"].get("modified_at").is_none(),
-            "nested modified_at inside metadata must also be stripped (sync bug fix)"
+            out.get("modified_by").is_none(),
+            "top-level modified_by must be stripped"
+        );
+        assert_eq!(
+            out["metadata"].get("modified_at").and_then(|v| v.as_str()),
+            Some("2026-03-15T11:00:00Z"),
+            "a nested stamp is user data and must survive"
         );
         // Meaningful fields preserved — no redaction for workspaces.
         assert_eq!(out["name"], json!("Invoices AP"));

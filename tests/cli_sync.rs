@@ -1656,6 +1656,73 @@ async fn sync_remote_create_writes_local_organization() {
     );
 }
 
+/// Both server stamps are hidden from the snapshot and recorded in the
+/// lockfile instead: `envs/dev/organization.json` must not carry
+/// `modified_at`/`modified_by`, and the lockfile entry must hold both.
+#[tokio::test]
+async fn sync_records_server_stamps_in_lockfile_and_hides_them_from_disk() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &[]).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+    result.expect("sync should succeed");
+
+    let disk =
+        std::fs::read_to_string(project.path().join("envs/dev/organization.json")).unwrap();
+    assert!(
+        !disk.contains("modified_by"),
+        "modified_by must not reach the snapshot: {disk}"
+    );
+    assert!(
+        !disk.contains("modified_at"),
+        "modified_at must not reach the snapshot: {disk}"
+    );
+
+    let lf: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap(),
+    )
+    .unwrap();
+    let entry = &lf["objects"]["organization"]["self"];
+    assert_eq!(
+        entry["modified_by"].as_str(),
+        Some("https://mock.rossum.app/api/v1/users/1"),
+        "lockfile must record modified_by: {entry}"
+    );
+    assert_eq!(
+        entry["modified_at"].as_str(),
+        Some("2026-03-01T08:00:00Z"),
+        "lockfile must still record modified_at: {entry}"
+    );
+}
+
 /// Pull-side RemoteCreate for a workspace: env exposes a workspace that
 /// doesn't exist locally and isn't in the lockfile. `sync` must classify
 /// it `RemoteCreate` and write `envs/dev/workspaces/<slug>/workspace.json`.

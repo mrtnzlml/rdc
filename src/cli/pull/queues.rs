@@ -242,6 +242,7 @@ pub async fn process(
                 &q_slug,
                 q.id,
                 q.modified_at().map(|s| s.to_string()),
+                q.modified_by().map(|s| s.to_string()),
                 Some(q_recorded),
             );
             counts.queues += 1;
@@ -415,6 +416,7 @@ pub async fn refresh_backrefs(
             &q_slug,
             q.id,
             q.modified_at().map(|s| s.to_string()),
+            q.modified_by().map(|s| s.to_string()),
             Some(recorded),
         );
         refreshed += 1;
@@ -606,6 +608,7 @@ fn write_schema_for_queue(
         &w.q_slug,
         schema.id,
         schema.modified_at().map(|s| s.to_string()),
+        schema.modified_by().map(|s| s.to_string()),
         Some(schema_recorded),
     );
     counts.schemas += 1;
@@ -659,6 +662,7 @@ fn write_inbox_for_queue(
         &w.q_slug,
         inbox.id,
         inbox.modified_at().map(|s| s.to_string()),
+        inbox.modified_by().map(|s| s.to_string()),
         Some(i_recorded),
     );
     counts.inboxes += 1;

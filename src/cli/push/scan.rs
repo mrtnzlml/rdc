@@ -1274,6 +1274,7 @@ mod tests {
             crate::state::ObjectEntry {
                 id: 7,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },

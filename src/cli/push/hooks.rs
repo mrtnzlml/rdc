@@ -236,6 +236,7 @@ pub async fn push(
                 ObjectEntry {
                     id: created.id,
                     modified_at: created.modified_at().map(|s| s.to_string()),
+                    modified_by: created.modified_by().map(|s| s.to_string()),
                     content_hash: None,
                     secrets_hash: None,
                 },
@@ -264,6 +265,7 @@ pub async fn push(
                 ObjectEntry {
                     id: created.id,
                     modified_at: created.modified_at().map(|s| s.to_string()),
+                    modified_by: created.modified_by().map(|s| s.to_string()),
                     content_hash: Some(created_hash),
                     secrets_hash: Some(created_secrets_hash),
                 },
@@ -400,6 +402,7 @@ pub async fn push(
                         ObjectEntry {
                             id,
                             modified_at: remote_hook.modified_at().map(|s| s.to_string()),
+                            modified_by: remote_hook.modified_by().map(|s| s.to_string()),
                             content_hash: Some(remote_combined),
                             secrets_hash: prior_secrets_hash,
                         },
@@ -500,6 +503,7 @@ pub async fn push(
             ObjectEntry {
                 id: updated.id,
                 modified_at: updated.modified_at().map(|s| s.to_string()),
+                modified_by: updated.modified_by().map(|s| s.to_string()),
                 content_hash: Some(updated_hash),
                 secrets_hash: Some(updated_secrets_hash),
             },
@@ -569,6 +573,7 @@ pub async fn push(
             ObjectEntry {
                 id: updated.id,
                 modified_at: updated.modified_at().map(|s| s.to_string()),
+                modified_by: updated.modified_by().map(|s| s.to_string()),
                 content_hash: prior_content_hash,
                 secrets_hash: Some(local_hash),
             },
@@ -655,6 +660,7 @@ mod tests {
         ObjectEntry {
             id,
             modified_at: None,
+            modified_by: None,
             content_hash: None,
             secrets_hash: secrets_hash.map(str::to_string),
         }
@@ -749,6 +755,7 @@ mod tests {
             ObjectEntry {
                 id: 100,
                 modified_at: None,
+                modified_by: None,
                 content_hash: Some("h".into()),
                 secrets_hash: None,
             },
@@ -845,17 +852,17 @@ mod tests {
         lockfile.upsert(
             "queues",
             "q1",
-            ObjectEntry { id: 100, modified_at: None, content_hash: Some("h".into()), secrets_hash: None },
+            ObjectEntry { id: 100, modified_at: None, modified_by: None, content_hash: Some("h".into()), secrets_hash: None },
         );
         lockfile.upsert(
             "hooks",
             "upstream",
-            ObjectEntry { id: 400, modified_at: None, content_hash: Some("h".into()), secrets_hash: None },
+            ObjectEntry { id: 400, modified_at: None, modified_by: None, content_hash: Some("h".into()), secrets_hash: None },
         );
         lockfile.upsert(
             "hooks",
             "my-hook",
-            ObjectEntry { id: 500, modified_at: None, content_hash: None, secrets_hash: None },
+            ObjectEntry { id: 500, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None },
         );
 
         // The remote hook (concrete urls). base := its canonical hash so the
@@ -876,7 +883,7 @@ mod tests {
         lockfile.upsert(
             "hooks",
             "my-hook",
-            ObjectEntry { id: 500, modified_at: None, content_hash: Some(base), secrets_hash: None },
+            ObjectEntry { id: 500, modified_at: None, modified_by: None, content_hash: Some(base), secrets_hash: None },
         );
 
         Mock::given(method("GET"))
@@ -965,12 +972,12 @@ mod tests {
         lockfile.upsert(
             "queues",
             "q1",
-            ObjectEntry { id: 100, modified_at: None, content_hash: Some("h".into()), secrets_hash: None },
+            ObjectEntry { id: 100, modified_at: None, modified_by: None, content_hash: Some("h".into()), secrets_hash: None },
         );
         lockfile.upsert(
             "hooks",
             "my-hook",
-            ObjectEntry { id: 500, modified_at: None, content_hash: None, secrets_hash: None },
+            ObjectEntry { id: 500, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None },
         );
 
         let remote = serde_json::json!({
@@ -989,7 +996,7 @@ mod tests {
         lockfile.upsert(
             "hooks",
             "my-hook",
-            ObjectEntry { id: 500, modified_at: None, content_hash: Some(base), secrets_hash: None },
+            ObjectEntry { id: 500, modified_at: None, modified_by: None, content_hash: Some(base), secrets_hash: None },
         );
 
         Mock::given(method("GET"))
@@ -1086,7 +1093,7 @@ mod tests {
         lockfile.upsert(
             "hooks",
             "my-hook",
-            ObjectEntry { id: 500, modified_at: None, content_hash: None, secrets_hash: None },
+            ObjectEntry { id: 500, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None },
         );
 
         let remote = serde_json::json!({
@@ -1104,7 +1111,7 @@ mod tests {
         lockfile.upsert(
             "hooks",
             "my-hook",
-            ObjectEntry { id: 500, modified_at: None, content_hash: Some(base), secrets_hash: None },
+            ObjectEntry { id: 500, modified_at: None, modified_by: None, content_hash: Some(base), secrets_hash: None },
         );
 
         Mock::given(method("GET"))
@@ -1196,6 +1203,7 @@ mod tests {
             ObjectEntry {
                 id: 500,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -1220,6 +1228,7 @@ mod tests {
             ObjectEntry {
                 id: 500,
                 modified_at: None,
+                modified_by: None,
                 content_hash: Some(base),
                 secrets_hash: None,
             },

@@ -96,6 +96,7 @@ pub async fn process(
                 &slug,
                 w.id,
                 w.modified_at().map(|s| s.to_string()),
+                w.modified_by().map(|s| s.to_string()),
                 Some(recorded_hash),
             );
             written += 1;

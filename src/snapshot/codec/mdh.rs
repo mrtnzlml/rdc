@@ -22,7 +22,7 @@ use crate::model::IndexSet;
 use crate::overlay::Overlay;
 use crate::paths::Paths;
 use crate::snapshot::codec::{DiskArtifact, KindCodec};
-use crate::snapshot::key_order::strip_hidden_fields_recursive;
+use crate::snapshot::key_order::strip_hidden_fields;
 
 pub struct Mdh;
 
@@ -34,15 +34,18 @@ impl KindCodec for Mdh {
     fn disk_bytes(&self, value: &Value) -> anyhow::Result<DiskArtifact> {
         // Deserialize into the typed set, apply the same server-managed strip
         // the pull driver applied before writing `indexes.json`, then
-        // re-serialize. Run `strip_hidden_fields_recursive` defensively after
-        // re-encoding — a no-op on the `{regular, search}` shape today but
-        // hash-neutral if a future API revision adds `modified_at`.
+        // re-serialize. `strip_hidden_fields` runs defensively after
+        // re-encoding, in case a future API revision stamps the set itself. It
+        // is TOP-LEVEL only, which matters here: an index spec keys each index
+        // by COLUMN name (`{"key": {"col": 1}}`), so a recursive strip would
+        // delete the index of a dataset column named `modified_at` /
+        // `modified_by` — see `key_order::HIDDEN_FIELDS`.
         let set: IndexSet = serde_json::from_value(value.clone())
             .map_err(|e| anyhow::anyhow!("deserializing MDH index set: {e}"))?;
         let trimmed = strip_server_managed(&set);
         let mut v = serde_json::to_value(&trimmed)
             .map_err(|e| anyhow::anyhow!("re-encoding trimmed MDH index set: {e}"))?;
-        strip_hidden_fields_recursive(&mut v);
+        strip_hidden_fields(&mut v);
         let mut json = serde_json::to_vec_pretty(&v)?;
         json.push(b'\n');
         Ok(DiskArtifact {
@@ -247,5 +250,32 @@ mod tests {
         });
         let got = normalize_search_index(&raw).expect("normalizes");
         assert_eq!(got, json!({"name": "sx_a", "mappings": {"dynamic": true}}));
+    }
+
+    /// A dataset column can legitimately be named `modified_at`/`modified_by`,
+    /// and an index spec keys each index by COLUMN name. The hidden-field strip
+    /// must not reach into that map, or the index silently disappears from the
+    /// snapshot — and with it from what push reconciles.
+    #[test]
+    fn index_keyed_by_a_stamp_named_column_survives() {
+        let set = json!({
+            "regular": [
+                { "key": { "modified_by": 1 }, "name": "modified_by_idx" },
+                { "key": { "modified_at": -1 }, "name": "modified_at_idx" }
+            ],
+            "search": []
+        });
+        let art = Mdh.disk_bytes(&set).unwrap();
+        let disk: Value = serde_json::from_slice(&art.json).unwrap();
+        assert_eq!(
+            disk["regular"][0]["key"],
+            json!({ "modified_by": 1 }),
+            "an index keyed by a `modified_by` column must survive: {disk}"
+        );
+        assert_eq!(
+            disk["regular"][1]["key"],
+            json!({ "modified_at": -1 }),
+            "an index keyed by a `modified_at` column must survive: {disk}"
+        );
     }
 }

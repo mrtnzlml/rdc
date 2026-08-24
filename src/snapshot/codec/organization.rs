@@ -17,7 +17,7 @@ use serde_json::Value;
 use crate::overlay::Overlay;
 use crate::paths::Paths;
 use crate::snapshot::codec::{DiskArtifact, KindCodec};
-use crate::snapshot::key_order::strip_hidden_fields_recursive;
+use crate::snapshot::key_order::strip_hidden_fields;
 
 pub struct Organization;
 
@@ -29,9 +29,9 @@ impl KindCodec for Organization {
     fn disk_bytes(&self, value: &Value) -> anyhow::Result<DiskArtifact> {
         // Flat plain: no per-kind redaction (organization has no entry in
         // `create::redact_on_pull`). Only the universal hidden-field strip
-        // (`modified_at`) is applied.
+        // (`modified_at` / `modified_by`, top level) is applied.
         let mut v = value.clone();
-        strip_hidden_fields_recursive(&mut v);
+        strip_hidden_fields(&mut v);
         let mut json = serde_json::to_vec_pretty(&v)?;
         json.push(b'\n');
         Ok(DiskArtifact {
@@ -77,12 +77,13 @@ mod tests {
             "modified_at": "2026-03-01T08:00:00Z",
             "settings": { "ui_settings": { "language": "en" } },
             "users": ["https://x.rossum.app/api/v1/users/1"],
+            "modified_by": "https://x.rossum.app/api/v1/users/1",
             "metadata": { "tag": "primary", "modified_at": "2026-03-01T08:00:00Z" }
         })
     }
 
     #[test]
-    fn modified_at_stripped_from_disk() {
+    fn top_level_stamps_stripped_from_disk() {
         let art = Organization.disk_bytes(&org_value()).unwrap();
         let disk: Value = serde_json::from_slice(&art.json).unwrap();
         assert!(
@@ -90,8 +91,21 @@ mod tests {
             "top-level modified_at must be stripped from disk"
         );
         assert!(
-            disk["metadata"].get("modified_at").is_none(),
-            "nested modified_at must be stripped too (recursive)"
+            disk.get("modified_by").is_none(),
+            "top-level modified_by must be stripped from disk"
+        );
+    }
+
+    #[test]
+    fn nested_stamp_inside_user_metadata_is_preserved() {
+        // `metadata` is user-writable and push sends it wholesale — stripping a
+        // stamp-named key inside it would delete the user's data server-side.
+        let art = Organization.disk_bytes(&org_value()).unwrap();
+        let disk: Value = serde_json::from_slice(&art.json).unwrap();
+        assert_eq!(
+            disk["metadata"].get("modified_at").and_then(|v| v.as_str()),
+            Some("2026-03-01T08:00:00Z"),
+            "a nested stamp is user data and must survive: {disk}"
         );
     }
 

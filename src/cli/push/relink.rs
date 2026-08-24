@@ -184,8 +184,12 @@ pub async fn run_relink(
                         .get("modified_at")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
+                    let modified_by = updated
+                        .get("modified_by")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
                     crate::cli::pull::common::record_object(
-                        lockfile, &it.kind, &it.slug, id, modified_at, Some(hash),
+                        lockfile, &it.kind, &it.slug, id, modified_at, modified_by, Some(hash),
                     );
                 }
                 progress.event(Action::Patch, &format!("relink {}/{} {:?}", it.kind, it.slug, relinked));
@@ -203,7 +207,7 @@ mod tests {
 
     fn lf(api_base: &str, kind: &str, slug: &str, id: u64) -> Lockfile {
         let mut lf = Lockfile { api_base: api_base.to_string(), ..Lockfile::default() };
-        lf.upsert(kind, slug, ObjectEntry { id, modified_at: None, content_hash: None, secrets_hash: None });
+        lf.upsert(kind, slug, ObjectEntry { id, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None });
         lf
     }
 
@@ -273,7 +277,7 @@ mod tests {
         let api_base = "https://x.rossum.app/api/v1";
         let mut lockfile = lf(api_base, "engines", "e1", 392);
         lockfile.upsert("hooks", "validator",
-            ObjectEntry { id: 55, modified_at: None, content_hash: None, secrets_hash: None });
+            ObjectEntry { id: 55, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None });
         // `webhooks` resolves fine (to /hooks/55) but must still be dropped;
         // `engine` is a real cross-ref and must survive.
         let fields = vec![
@@ -292,7 +296,7 @@ mod tests {
         let api_base = "https://x.rossum.app/api/v1";
         let mut lockfile = Lockfile { api_base: api_base.into(), ..Lockfile::default() };
         lockfile.upsert("hooks", "validator",
-            ObjectEntry { id: 55, modified_at: None, content_hash: None, secrets_hash: None });
+            ObjectEntry { id: 55, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None });
         let fields = vec![
             ("webhooks".to_string(), serde_json::json!(["rdc://hooks/validator"])),
             ("url".to_string(), serde_json::json!("rdc://queues/q1")),

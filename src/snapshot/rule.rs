@@ -59,7 +59,7 @@ pub fn serialize_rule(r: &Rule) -> Result<(Vec<u8>, Option<String>)> {
     // Rossum API), leave it in the JSON so round-trip stays lossless.
     let code = split_rule_trigger_condition(&mut json_value);
 
-    crate::snapshot::key_order::strip_hidden_fields_recursive(&mut json_value);
+    crate::snapshot::key_order::strip_hidden_fields(&mut json_value);
 
     let mut bytes = serde_json::to_vec_pretty(&json_value).context("serializing rule json")?;
     bytes.push(b'\n');

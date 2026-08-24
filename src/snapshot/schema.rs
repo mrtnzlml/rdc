@@ -141,7 +141,7 @@ pub fn serialize_schema(schema: &Schema) -> Result<SchemaJsonAndFormulas> {
 
     let formulas = split_schema_formulas(&mut value);
 
-    crate::snapshot::key_order::strip_hidden_fields_recursive(&mut value);
+    crate::snapshot::key_order::strip_hidden_fields(&mut value);
 
     let mut bytes = serde_json::to_vec_pretty(&value)
         .context("serializing schema json")?;

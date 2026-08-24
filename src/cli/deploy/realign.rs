@@ -1454,6 +1454,7 @@ mod tests {
             ObjectEntry {
                 id: 1,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -1464,6 +1465,7 @@ mod tests {
             ObjectEntry {
                 id: 2,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -1474,6 +1476,7 @@ mod tests {
             ObjectEntry {
                 id: 3,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -1496,6 +1499,7 @@ mod tests {
             ObjectEntry {
                 id: 1,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -1506,6 +1510,7 @@ mod tests {
             ObjectEntry {
                 id: 2,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -1523,6 +1528,7 @@ mod tests {
         let entry = ObjectEntry {
             id: 42,
             modified_at: None,
+            modified_by: None,
             content_hash: Some("abc".into()),
             secrets_hash: None,
         };
@@ -1582,6 +1588,7 @@ mod tests {
             ObjectEntry {
                 id: 1,
                 modified_at: None,
+                modified_by: None,
                 content_hash: Some("h".into()),
                 secrets_hash: None,
             },
@@ -1645,6 +1652,7 @@ mod tests {
             ObjectEntry {
                 id: 1,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -1655,6 +1663,7 @@ mod tests {
             ObjectEntry {
                 id: 10,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -1665,6 +1674,7 @@ mod tests {
             ObjectEntry {
                 id: 11,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -1675,6 +1685,7 @@ mod tests {
             ObjectEntry {
                 id: 99,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -1726,6 +1737,7 @@ mod tests {
             ObjectEntry {
                 id: 9,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -1736,6 +1748,7 @@ mod tests {
             ObjectEntry {
                 id: 1,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -1746,6 +1759,7 @@ mod tests {
             ObjectEntry {
                 id: 2,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -1756,6 +1770,7 @@ mod tests {
             ObjectEntry {
                 id: 3,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -1766,6 +1781,7 @@ mod tests {
             ObjectEntry {
                 id: 4,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -1776,6 +1792,7 @@ mod tests {
             ObjectEntry {
                 id: 5,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -1871,6 +1888,7 @@ mod tests {
             ObjectEntry {
                 id: 1,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -1881,6 +1899,7 @@ mod tests {
             ObjectEntry {
                 id: 2,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -1918,12 +1937,12 @@ mod tests {
         lockfile.upsert(
             "hooks",
             "val",
-            ObjectEntry { id: 1, modified_at: None, content_hash: Some("h".into()), secrets_hash: None },
+            ObjectEntry { id: 1, modified_at: None, modified_by: None, content_hash: Some("h".into()), secrets_hash: None },
         );
         lockfile.upsert(
             "queues",
             "q1",
-            ObjectEntry { id: 2, modified_at: None, content_hash: None, secrets_hash: None },
+            ObjectEntry { id: 2, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None },
         );
 
         let pending = detect(&paths, &lockfile);
@@ -1992,7 +2011,7 @@ mod tests {
             lockfile.upsert(
                 kind,
                 slug,
-                ObjectEntry { id, modified_at: None, content_hash: None, secrets_hash: None },
+                ObjectEntry { id, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None },
             );
         }
 
@@ -2044,7 +2063,7 @@ mod tests {
         lockfile.upsert(
             "labels",
             "hold",
-            ObjectEntry { id: 1, modified_at: None, content_hash: None, secrets_hash: None },
+            ObjectEntry { id: 1, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None },
         );
 
         let pending = detect(&paths, &lockfile);
@@ -2098,12 +2117,12 @@ mod tests {
         lockfile.upsert(
             "hooks",
             "val",
-            ObjectEntry { id: 1, modified_at: None, content_hash: Some("h".into()), secrets_hash: None },
+            ObjectEntry { id: 1, modified_at: None, modified_by: None, content_hash: Some("h".into()), secrets_hash: None },
         );
         lockfile.upsert(
             "queues",
             "q1",
-            ObjectEntry { id: 2, modified_at: None, content_hash: None, secrets_hash: None },
+            ObjectEntry { id: 2, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None },
         );
 
         let pending = detect(&paths, &lockfile);
@@ -2151,19 +2170,19 @@ mod tests {
         lockfile.upsert(
             "workspaces",
             "ws1",
-            ObjectEntry { id: 9, modified_at: None, content_hash: None, secrets_hash: None },
+            ObjectEntry { id: 9, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None },
         );
         for (kind, slug, id) in [("queues", "cost", 2u64), ("schemas", "cost", 3)] {
             lockfile.upsert(
                 kind,
                 slug,
-                ObjectEntry { id, modified_at: None, content_hash: None, secrets_hash: None },
+                ObjectEntry { id, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None },
             );
         }
         lockfile.upsert(
             "email_templates",
             "ws1/cost/welcome",
-            ObjectEntry { id: 7, modified_at: None, content_hash: None, secrets_hash: None },
+            ObjectEntry { id: 7, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None },
         );
 
         let pending = detect(&paths, &lockfile);
@@ -2214,12 +2233,12 @@ mod tests {
         lockfile.upsert(
             "engines",
             "old-eng",
-            ObjectEntry { id: 1, modified_at: None, content_hash: None, secrets_hash: None },
+            ObjectEntry { id: 1, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None },
         );
         lockfile.upsert(
             "engine_fields",
             "old-eng/amount",
-            ObjectEntry { id: 2, modified_at: None, content_hash: None, secrets_hash: None },
+            ObjectEntry { id: 2, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None },
         );
 
         let pending = detect(&paths, &lockfile);
@@ -2278,22 +2297,22 @@ mod tests {
         lockfile.upsert(
             "workspaces",
             "ws1",
-            ObjectEntry { id: 9, modified_at: None, content_hash: None, secrets_hash: None },
+            ObjectEntry { id: 9, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None },
         );
         lockfile.upsert(
             "queues",
             "q1",
-            ObjectEntry { id: 5, modified_at: None, content_hash: None, secrets_hash: None },
+            ObjectEntry { id: 5, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None },
         );
         lockfile.upsert(
             "workflows",
             "old-wf",
-            ObjectEntry { id: 1, modified_at: None, content_hash: None, secrets_hash: None },
+            ObjectEntry { id: 1, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None },
         );
         lockfile.upsert(
             "workflow_steps",
             "old-wf/review",
-            ObjectEntry { id: 2, modified_at: None, content_hash: None, secrets_hash: None },
+            ObjectEntry { id: 2, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None },
         );
 
         let pending = detect(&paths, &lockfile);
@@ -2497,7 +2516,7 @@ mod tests {
         lockfile.upsert(
             "hooks",
             "sftp-import-initial-load",
-            ObjectEntry { id: 1, modified_at: None, content_hash: None, secrets_hash: None },
+            ObjectEntry { id: 1, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None },
         );
 
         let pending = detect(&paths, &lockfile);

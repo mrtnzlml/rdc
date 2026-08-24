@@ -139,6 +139,7 @@ pub async fn process(
                 &composite_key,
                 f.id,
                 f.modified_at().map(|s| s.to_string()),
+                f.modified_by().map(|s| s.to_string()),
                 Some(recorded_hash),
             );
             written += 1;

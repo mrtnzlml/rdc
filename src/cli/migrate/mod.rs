@@ -2943,7 +2943,7 @@ mod tests {
     // ---- object-id remap ------------------------------------------------
 
     fn entry(id: u64) -> crate::state::ObjectEntry {
-        crate::state::ObjectEntry { id, modified_at: None, content_hash: None, secrets_hash: None }
+        crate::state::ObjectEntry { id, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None }
     }
 
     #[test]
@@ -3750,7 +3750,7 @@ mod tests {
         src_lock.upsert(
             "hooks",
             "my-hook",
-            ObjectEntry { id: 99, modified_at: None, content_hash: None, secrets_hash: None },
+            ObjectEntry { id: 99, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None },
         );
 
         let subst = build_subst(&m);

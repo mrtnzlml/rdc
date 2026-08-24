@@ -64,6 +64,7 @@ pub async fn process(
             "self",
             org.id,
             org.modified_at().map(|s| s.to_string()),
+            org.modified_by().map(|s| s.to_string()),
             Some(recorded_hash),
         );
         progress.event(Action::Pull, &format!("organization ({} pulled)", org.name));

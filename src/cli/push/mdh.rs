@@ -216,6 +216,7 @@ pub async fn push_dataset(
             ObjectEntry {
                 id: 0,
                 modified_at: None,
+                modified_by: None,
                 content_hash: Some(hash),
                 secrets_hash: None,
             },

@@ -29,7 +29,7 @@ use crate::overlay::Overlay;
 use crate::paths::Paths;
 use crate::snapshot::codec::{DiskArtifact, KindCodec};
 use crate::snapshot::create::{strip_for_create, strip_for_cross_env_patch};
-use crate::snapshot::key_order::strip_hidden_fields_recursive;
+use crate::snapshot::key_order::strip_hidden_fields;
 
 pub struct EmailTemplates;
 
@@ -43,7 +43,7 @@ impl KindCodec for EmailTemplates {
         // `create::redact_on_pull`). Only the universal hidden-field strip
         // (`modified_at`) is applied.
         let mut v = value.clone();
-        strip_hidden_fields_recursive(&mut v);
+        strip_hidden_fields(&mut v);
         let mut json = serde_json::to_vec_pretty(&v)?;
         json.push(b'\n');
         Ok(DiskArtifact {

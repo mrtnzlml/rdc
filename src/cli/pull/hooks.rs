@@ -309,6 +309,7 @@ pub async fn process(
                 &slug,
                 hook.id,
                 hook.modified_at().map(|s| s.to_string()),
+                hook.modified_by().map(|s| s.to_string()),
                 Some(recorded_hash),
             );
             written += 1;

@@ -19,6 +19,10 @@ impl EngineField {
     pub fn modified_at(&self) -> Option<&str> {
         crate::model::modified_at(&self.extra)
     }
+
+    pub fn modified_by(&self) -> Option<&str> {
+        crate::model::modified_by(&self.extra)
+    }
 }
 
 #[cfg(test)]

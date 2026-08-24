@@ -126,6 +126,7 @@ pub async fn process(
                 &lockfile_key,
                 t.id,
                 t.modified_at().map(|s| s.to_string()),
+                t.modified_by().map(|s| s.to_string()),
                 Some(recorded_hash),
             );
             count += 1;

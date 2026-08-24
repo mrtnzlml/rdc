@@ -6,7 +6,7 @@
 //! extracted into a `<queue_dir>/formulas/<field_id>.py` sidecar (sorted by
 //! field_id). There is NO redaction for schemas; the only on-disk
 //! normalization is the `modified_at` strip, which `serialize_schema` already
-//! performs via `strip_hidden_fields_recursive`.
+//! performs via `strip_hidden_fields`.
 //!
 //! Slug / path: a schema is keyed by the composite `"<ws_slug>/<q_slug>"`
 //! key in the lockfile and overlay (each queue has exactly one schema). The

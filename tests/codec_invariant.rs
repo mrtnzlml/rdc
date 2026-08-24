@@ -111,8 +111,19 @@ fn sample_inbox() -> serde_json::Value {
     })
 }
 
+/// True when neither server stamp appears as a TOP-LEVEL key of `json`.
+/// Structural rather than substring: the strip is top-level only, so a nested
+/// occurrence (user `metadata`, an MDH index keyed by column name) is data that
+/// must survive, and a substring check would wrongly flag it.
+fn top_level_stamps_absent(json: &[u8]) -> bool {
+    let v: serde_json::Value = serde_json::from_slice(json).expect("disk bytes must be JSON");
+    v.get("modified_at").is_none() && v.get("modified_by").is_none()
+}
+
 fn sample_workspace() -> serde_json::Value {
-    // Includes a nested `modified_at` to exercise recursive stripping.
+    // Includes a nested `modified_at` inside user-writable `metadata`: the
+    // strip is top-level only, so that one must SURVIVE (it is user data push
+    // sends wholesale). The hash ignores it at any depth, so it cannot churn.
     json!({
         "id": 700852,
         "url": "https://x/api/v1/workspaces/700852",
@@ -120,6 +131,7 @@ fn sample_workspace() -> serde_json::Value {
         "organization": "https://x/api/v1/organizations/285704",
         "queues": ["https://x/api/v1/queues/2137275"],
         "modified_at": "2026-03-15T11:00:00Z",
+        "modified_by": "https://x/api/v1/users/9",
         "metadata": {
             "tag": "ap",
             "modified_at": "2026-03-15T11:00:00Z"
@@ -398,8 +410,8 @@ fn engines_redaction_correct() {
         "redaction sentinel must be present on disk; got:\n{disk_str}"
     );
     assert!(
-        !disk_str.contains("modified_at"),
-        "modified_at must be stripped from on-disk bytes; got:\n{disk_str}"
+        top_level_stamps_absent(&art.json),
+        "modified_at must be stripped (top level) from on-disk bytes; got:\n{disk_str}"
     );
 }
 
@@ -424,8 +436,8 @@ fn hooks_redaction_correct() {
         "redaction sentinel must be present for hook status; got:\n{disk_str}"
     );
     assert!(
-        !disk_str.contains("modified_at"),
-        "modified_at must be stripped from hook disk bytes; got:\n{disk_str}"
+        top_level_stamps_absent(&art.json),
+        "modified_at must be stripped (top level) from hook disk bytes; got:\n{disk_str}"
     );
     assert!(
         !disk_str.contains("def hook"),
@@ -456,8 +468,8 @@ fn queues_redaction_correct() {
         "redaction sentinel must be present for queue counts; got:\n{disk_str}"
     );
     assert!(
-        !disk_str.contains("modified_at"),
-        "modified_at must be stripped from queue disk bytes; got:\n{disk_str}"
+        top_level_stamps_absent(&art.json),
+        "modified_at must be stripped (top level) from queue disk bytes; got:\n{disk_str}"
     );
     assert!(art.sidecars.is_empty(), "queues must produce no sidecars");
 }
@@ -514,8 +526,8 @@ fn labels_invariants() {
     let disk_str = std::str::from_utf8(&art.json).expect("disk bytes must be UTF-8");
 
     assert!(
-        !disk_str.contains("modified_at"),
-        "modified_at must be stripped from label disk bytes; got:\n{disk_str}"
+        top_level_stamps_absent(&art.json),
+        "modified_at must be stripped (top level) from label disk bytes; got:\n{disk_str}"
     );
     assert!(
         !disk_str.contains("refreshed live in Rossum"),
@@ -538,8 +550,8 @@ fn rules_sidecar_invariants() {
         "trigger_condition must be extracted to sidecar; got:\n{disk_str}"
     );
     assert!(
-        !disk_str.contains("modified_at"),
-        "modified_at must be stripped from rule disk bytes; got:\n{disk_str}"
+        top_level_stamps_absent(&art.json),
+        "modified_at must be stripped (top level) from rule disk bytes; got:\n{disk_str}"
     );
     assert_eq!(
         art.sidecars.len(),
@@ -567,8 +579,8 @@ fn schemas_sidecar_invariants() {
         "formula must be extracted to sidecar; got:\n{disk_str}"
     );
     assert!(
-        !disk_str.contains("modified_at"),
-        "modified_at must be stripped from schema disk bytes; got:\n{disk_str}"
+        top_level_stamps_absent(&art.json),
+        "modified_at must be stripped (top level) from schema disk bytes; got:\n{disk_str}"
     );
     assert!(
         !disk_str.contains("refreshed live in Rossum"),
@@ -596,8 +608,8 @@ fn workspaces_invariants() {
     let disk_str = std::str::from_utf8(&art.json).expect("disk bytes must be UTF-8");
 
     assert!(
-        !disk_str.contains("modified_at"),
-        "modified_at (including nested) must be stripped from workspace disk bytes; got:\n{disk_str}"
+        top_level_stamps_absent(&art.json),
+        "modified_at (including nested) must be stripped (top level) from workspace disk bytes; got:\n{disk_str}"
     );
     assert!(
         !disk_str.contains("refreshed live in Rossum"),
@@ -620,8 +632,8 @@ fn engine_fields_invariants() {
     let disk_str = std::str::from_utf8(&art.json).expect("disk bytes must be UTF-8");
 
     assert!(
-        !disk_str.contains("modified_at"),
-        "modified_at must be stripped from engine_fields disk bytes; got:\n{disk_str}"
+        top_level_stamps_absent(&art.json),
+        "modified_at must be stripped (top level) from engine_fields disk bytes; got:\n{disk_str}"
     );
     assert!(
         !disk_str.contains("refreshed live in Rossum"),
@@ -659,8 +671,8 @@ fn workflows_invariants() {
     let disk_str = std::str::from_utf8(&art.json).expect("disk bytes must be UTF-8");
 
     assert!(
-        !disk_str.contains("modified_at"),
-        "modified_at must be stripped from workflow disk bytes; got:\n{disk_str}"
+        top_level_stamps_absent(&art.json),
+        "modified_at must be stripped (top level) from workflow disk bytes; got:\n{disk_str}"
     );
     assert!(
         !disk_str.contains("refreshed live in Rossum"),
@@ -682,8 +694,8 @@ fn workflow_steps_invariants() {
     let disk_str = std::str::from_utf8(&art.json).expect("disk bytes must be UTF-8");
 
     assert!(
-        !disk_str.contains("modified_at"),
-        "modified_at must be stripped from workflow_steps disk bytes; got:\n{disk_str}"
+        top_level_stamps_absent(&art.json),
+        "modified_at must be stripped (top level) from workflow_steps disk bytes; got:\n{disk_str}"
     );
     assert!(
         !disk_str.contains("refreshed live in Rossum"),
@@ -706,8 +718,8 @@ fn inboxes_invariants() {
     let disk_str = std::str::from_utf8(&art.json).expect("disk bytes must be UTF-8");
 
     assert!(
-        !disk_str.contains("modified_at"),
-        "modified_at must be stripped from inbox disk bytes; got:\n{disk_str}"
+        top_level_stamps_absent(&art.json),
+        "modified_at must be stripped (top level) from inbox disk bytes; got:\n{disk_str}"
     );
     assert!(
         !disk_str.contains("refreshed live in Rossum"),
@@ -735,8 +747,8 @@ fn email_templates_invariants() {
     let disk_str = std::str::from_utf8(&art.json).expect("disk bytes must be UTF-8");
 
     assert!(
-        !disk_str.contains("modified_at"),
-        "modified_at must be stripped from email_templates disk bytes; got:\n{disk_str}"
+        top_level_stamps_absent(&art.json),
+        "modified_at must be stripped (top level) from email_templates disk bytes; got:\n{disk_str}"
     );
     assert!(
         !disk_str.contains("refreshed live in Rossum"),
@@ -767,8 +779,8 @@ fn organization_invariants() {
     let disk_str = std::str::from_utf8(&art.json).expect("disk bytes must be UTF-8");
 
     assert!(
-        !disk_str.contains("modified_at"),
-        "modified_at must be stripped from organization disk bytes; got:\n{disk_str}"
+        top_level_stamps_absent(&art.json),
+        "modified_at must be stripped (top level) from organization disk bytes; got:\n{disk_str}"
     );
     assert!(
         !disk_str.contains("refreshed live in Rossum"),
@@ -805,15 +817,15 @@ fn mdh_invariants() {
 
     assert!(
         !disk_str.contains("\"_id_\""),
-        "_id_ index must be stripped from mdh disk bytes; got:\n{disk_str}"
+        "_id_ index must be stripped (top level) from mdh disk bytes; got:\n{disk_str}"
     );
     assert!(
         !disk_str.contains("\"v\""),
-        "v field must be stripped from mdh disk bytes; got:\n{disk_str}"
+        "v field must be stripped (top level) from mdh disk bytes; got:\n{disk_str}"
     );
     assert!(
         !disk_str.contains("latest_definition"),
-        "latest_definition envelope must be stripped from mdh disk bytes; got:\n{disk_str}"
+        "latest_definition envelope must be stripped (top level) from mdh disk bytes; got:\n{disk_str}"
     );
     assert!(art.sidecars.is_empty(), "mdh must produce no sidecars");
 

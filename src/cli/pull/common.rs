@@ -469,6 +469,7 @@ pub fn record_object(
     slug: &str,
     id: u64,
     modified_at: Option<String>,
+    modified_by: Option<String>,
     content_hash: Option<String>,
 ) {
     lockfile.upsert(
@@ -477,6 +478,7 @@ pub fn record_object(
         ObjectEntry {
             id,
             modified_at,
+            modified_by,
             content_hash,
             secrets_hash: None,
         },

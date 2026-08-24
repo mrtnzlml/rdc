@@ -83,6 +83,7 @@ pub async fn process(
                 &slug,
                 ws.id,
                 ws.modified_at().map(|s| s.to_string()),
+                ws.modified_by().map(|s| s.to_string()),
                 Some(hash),
             );
 

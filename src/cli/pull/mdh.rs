@@ -657,7 +657,7 @@ pub(crate) async fn pull_dataset_data(
             HashMode::Raw,
         )?
     };
-    record_object(ctx.lockfile, "mdh_data", slug, 0, None, Some(recorded));
+    record_object(ctx.lockfile, "mdh_data", slug, 0, None, None, Some(recorded));
 
     Ok((
         matches!(action, PullAction::Write | PullAction::Conflict),
@@ -890,7 +890,7 @@ pub async fn process(
                     Some(ctx.paths),
                 )?
             };
-            record_object(ctx.lockfile, "mdh_indexes", slug, 0, None, Some(i_recorded));
+            record_object(ctx.lockfile, "mdh_indexes", slug, 0, None, None, Some(i_recorded));
             Ok(i_action)
         })()?;
         // `Write` overwrote the local indexes.json; `Conflict` wrote merged
@@ -1078,6 +1078,7 @@ mod tests {
         let entry = |h: &str| ObjectEntry {
             id: 0,
             modified_at: None,
+            modified_by: None,
             content_hash: Some(h.to_string()),
             secrets_hash: None,
         };
@@ -1171,6 +1172,7 @@ mod tests {
         let entry = |h: &str| ObjectEntry {
             id: 0,
             modified_at: None,
+            modified_by: None,
             content_hash: Some(h.to_string()),
             secrets_hash: None,
         };
@@ -1428,6 +1430,7 @@ mod tests {
             crate::state::ObjectEntry {
                 id: 0,
                 modified_at: None,
+                modified_by: None,
                 content_hash: Some(content_hash(local, &Lockfile::default())),
                 secrets_hash: None,
             },
@@ -1527,6 +1530,7 @@ mod tests {
             crate::state::ObjectEntry {
                 id: 0,
                 modified_at: None,
+                modified_by: None,
                 content_hash: Some(content_hash(&empty_ix, &Lockfile::default())),
                 secrets_hash: None,
             },
@@ -1538,6 +1542,7 @@ mod tests {
             crate::state::ObjectEntry {
                 id: 0,
                 modified_at: None,
+                modified_by: None,
                 content_hash: Some(raw_content_hash(local_rows)),
                 secrets_hash: None,
             },
@@ -1620,6 +1625,7 @@ mod tests {
             crate::state::ObjectEntry {
                 id: 0,
                 modified_at: None,
+                modified_by: None,
                 content_hash: Some(content_hash(&empty_ix, &Lockfile::default())),
                 secrets_hash: None,
             },
@@ -1889,7 +1895,7 @@ mod tests {
         .unwrap();
         let client = DataStorageClient::new(server.uri(), "t".to_string()).unwrap();
         let mut lockfile = crate::state::Lockfile::default();
-        record_object(&mut lockfile, "mdh_data", "gl-codes", 0, None, Some(base_hash.clone()));
+        record_object(&mut lockfile, "mdh_data", "gl-codes", 0, None, None, Some(base_hash.clone()));
         let mut ctx = PullCtx {
             paths: &paths,
             client: &rossum,

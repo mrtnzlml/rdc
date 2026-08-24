@@ -57,6 +57,7 @@ pub async fn push(
                 ObjectEntry {
                     id: created.id,
                     modified_at: created.modified_at().map(|s| s.to_string()),
+                    modified_by: created.modified_by().map(|s| s.to_string()),
                     content_hash: None,
                     secrets_hash: None,
                 },
@@ -73,6 +74,7 @@ pub async fn push(
                 ObjectEntry {
                     id: created.id,
                     modified_at: created.modified_at().map(|s| s.to_string()),
+                    modified_by: created.modified_by().map(|s| s.to_string()),
                     content_hash: Some(created_hash),
                     secrets_hash: None,
                 },
@@ -143,6 +145,7 @@ pub async fn push(
                         ObjectEntry {
                             id,
                             modified_at: remote_inbox.modified_at().map(|s| s.to_string()),
+                            modified_by: remote_inbox.modified_by().map(|s| s.to_string()),
                             content_hash: Some(remote_combined),
                             secrets_hash: None,
                         },
@@ -211,6 +214,7 @@ pub async fn push(
             ObjectEntry {
                 id: refetched.id,
                 modified_at: refetched.modified_at().map(|s| s.to_string()),
+                modified_by: refetched.modified_by().map(|s| s.to_string()),
                 content_hash: Some(updated_hash),
                 secrets_hash: None,
             },

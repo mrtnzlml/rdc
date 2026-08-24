@@ -60,6 +60,7 @@ pub async fn push(
                 ObjectEntry {
                     id: created.id,
                     modified_at: created.modified_at().map(|s| s.to_string()),
+                    modified_by: created.modified_by().map(|s| s.to_string()),
                     content_hash: None,
                     secrets_hash: None,
                 },
@@ -75,6 +76,7 @@ pub async fn push(
                 ObjectEntry {
                     id: created.id,
                     modified_at: created.modified_at().map(|s| s.to_string()),
+                    modified_by: created.modified_by().map(|s| s.to_string()),
                     content_hash: Some(created_hash),
                     secrets_hash: None,
                 },
@@ -165,6 +167,7 @@ pub async fn push(
                         ObjectEntry {
                             id,
                             modified_at: remote_field.modified_at().map(|s| s.to_string()),
+                            modified_by: remote_field.modified_by().map(|s| s.to_string()),
                             content_hash: Some(remote_combined),
                             secrets_hash: None,
                         },
@@ -234,6 +237,7 @@ pub async fn push(
             ObjectEntry {
                 id: updated.id,
                 modified_at: updated.modified_at().map(|s| s.to_string()),
+                modified_by: updated.modified_by().map(|s| s.to_string()),
                 content_hash: Some(updated_hash),
                 secrets_hash: None,
             },

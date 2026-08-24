@@ -877,6 +877,7 @@ mod tests {
         ObjectEntry {
             id,
             modified_at: None,
+            modified_by: None,
             content_hash: None,
             secrets_hash: None,
         }

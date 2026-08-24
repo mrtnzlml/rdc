@@ -41,6 +41,17 @@ pub struct ObjectEntry {
     /// ISO 8601 server timestamp from `modified_at`, if present.
     #[serde(default)]
     pub modified_at: Option<String>,
+    /// Rossum user URL from `modified_by`, if present — who last touched the
+    /// object server-side. Recorded here so the snapshot JSON doesn't have to
+    /// carry it (see [`crate::snapshot::key_order::HIDDEN_FIELDS`]), the same
+    /// trade `modified_at` makes. Informational: no rdc decision reads it.
+    ///
+    /// `skip_serializing_if` keeps it out of entries that have no value, and
+    /// `default` keeps lockfiles written before the field existed loadable at
+    /// the SAME [`LOCKFILE_VERSION`] — bumping the version would make every
+    /// older rdc refuse the file outright.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_by: Option<String>,
     /// Hex-encoded SHA-256 of the snapshot bytes that produced this entry.
     /// The merge base for the three-way comparison on subsequent pulls
     /// and pushes.
@@ -423,6 +434,7 @@ mod tests {
             ObjectEntry {
                 id: 1,
                 modified_at: Some("2026-04-01T10:00:00Z".to_string()),
+                modified_by: None,
                 content_hash: Some("a".repeat(64)),
                 secrets_hash: None,
             },
@@ -439,6 +451,82 @@ mod tests {
         std::fs::write(&path, r#"{"version":999,"objects":{}}"#).unwrap();
         let err = Lockfile::load(&path).unwrap_err();
         assert!(format!("{err:#}").contains("version"));
+    }
+
+    /// `modified_by` rides alongside `modified_at`: recorded on pull, kept out
+    /// of the snapshot JSON. Both survive a save/load round-trip.
+    #[test]
+    fn object_entry_round_trips_modified_by() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dev.lock.json");
+        let mut lf = Lockfile::default();
+        lf.upsert(
+            "hooks",
+            "validator",
+            ObjectEntry {
+                id: 7,
+                modified_at: Some("2026-03-01T09:00:00Z".to_string()),
+                modified_by: Some("https://x/api/v1/users/4".to_string()),
+                content_hash: Some("abc".to_string()),
+                secrets_hash: None,
+            },
+        );
+        lf.save(&path).unwrap();
+
+        let loaded = Lockfile::load(&path).unwrap();
+        let entry = &loaded.objects["hooks"]["validator"];
+        assert_eq!(entry.modified_by.as_deref(), Some("https://x/api/v1/users/4"));
+        assert_eq!(entry.modified_at.as_deref(), Some("2026-03-01T09:00:00Z"));
+    }
+
+    /// A lockfile written before the field existed must still load — and must
+    /// NOT need a `LOCKFILE_VERSION` bump, which would make every older rdc
+    /// refuse the file. The field is additive: absent means `None`.
+    #[test]
+    fn lockfile_without_modified_by_loads_as_none_at_current_version() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dev.lock.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "version": 3,
+  "api_base": "https://api.elis.rossum.ai/v1",
+  "objects": {
+    "queues": {
+      "invoices": { "id": 123, "modified_at": "2026-03-01T09:00:00Z", "content_hash": "abc" }
+    }
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let lf = Lockfile::load(&path).unwrap();
+        assert_eq!(lf.version, LOCKFILE_VERSION);
+        assert!(lf.objects["queues"]["invoices"].modified_by.is_none());
+    }
+
+    /// An entry with no `modified_by` must not serialize the key at all, so
+    /// existing lockfiles don't grow a wall of `"modified_by": null` lines.
+    #[test]
+    fn absent_modified_by_is_not_serialized() {
+        let mut lf = Lockfile::default();
+        lf.upsert(
+            "labels",
+            "urgent",
+            ObjectEntry {
+                id: 1,
+                modified_at: None,
+                modified_by: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        let json = serde_json::to_string_pretty(&lf).unwrap();
+        assert!(
+            !json.contains("modified_by"),
+            "absent modified_by must be omitted: {json}"
+        );
     }
 
     #[test]
@@ -546,6 +634,7 @@ mod tests {
             ObjectEntry {
                 id: 123,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -556,6 +645,7 @@ mod tests {
             ObjectEntry {
                 id: 5,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -566,6 +656,7 @@ mod tests {
             ObjectEntry {
                 id: 0,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -576,6 +667,7 @@ mod tests {
             ObjectEntry {
                 id: 0,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -618,6 +710,7 @@ mod tests {
             ObjectEntry {
                 id: 123,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -628,6 +721,7 @@ mod tests {
             ObjectEntry {
                 id: 5,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -914,6 +1008,7 @@ mod tests {
             ObjectEntry {
                 id: 42,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -932,6 +1027,7 @@ mod tests {
             ObjectEntry {
                 id: 1,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -968,6 +1064,7 @@ mod tests {
             ObjectEntry {
                 id: 55,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },

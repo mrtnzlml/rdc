@@ -3,6 +3,7 @@
   "url": "https://mock.rossum.app/api/v1/organizations/285704",
   "name": "Acme Test Org",
   "modified_at": "2026-03-01T08:00:00Z",
+  "modified_by": "https://mock.rossum.app/api/v1/users/1",
   "settings": { "ui_settings": { "language": "en" } },
   "users": ["https://mock.rossum.app/api/v1/users/1"]
 }

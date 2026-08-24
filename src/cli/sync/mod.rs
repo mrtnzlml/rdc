@@ -721,6 +721,7 @@ pub fn from_catalog_scan_lockfile(
                     crate::state::ObjectEntry {
                         id,
                         modified_at: None,
+                        modified_by: None,
                         content_hash: None,
                         secrets_hash: None,
                     },
@@ -1653,6 +1654,7 @@ mod tests {
             ObjectEntry {
                 id: h.id,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -1719,6 +1721,7 @@ mod tests {
             ObjectEntry {
                 id: 501,
                 modified_at: Some("2026-04-20T08:00:00Z".to_string()),
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -1840,6 +1843,7 @@ mod tests {
             ObjectEntry {
                 id: 42,
                 modified_at: Some("2026-05-14T08:00:00Z".to_string()),
+                modified_by: None,
                 content_hash: Some(base_hash.clone()),
                 secrets_hash: None,
             },
@@ -1998,6 +2002,7 @@ mod tests {
             ObjectEntry {
                 id: 42,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -2017,6 +2022,7 @@ mod tests {
             ObjectEntry {
                 id: 42,
                 modified_at: Some("2026-05-14T08:00:00Z".to_string()),
+                modified_by: None,
                 content_hash: Some(base_hash.clone()),
                 secrets_hash: None,
             },
@@ -2101,6 +2107,7 @@ mod tests {
             ObjectEntry {
                 id: 42,
                 modified_at: Some("2026-05-14T08:00:00Z".to_string()),
+                modified_by: None,
                 content_hash: Some(base_hash.clone()),
                 secrets_hash: None,
             },

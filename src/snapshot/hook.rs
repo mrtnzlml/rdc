@@ -104,7 +104,7 @@ pub fn serialize_hook(hook: &Hook) -> Result<(Vec<u8>, Option<String>)> {
 
     sort_queues(&mut json_value);
 
-    crate::snapshot::key_order::strip_hidden_fields_recursive(&mut json_value);
+    crate::snapshot::key_order::strip_hidden_fields(&mut json_value);
     crate::snapshot::key_order::reorder_top_level(
         &mut json_value,
         crate::snapshot::key_order::HOOK_KEY_ORDER,
@@ -474,7 +474,7 @@ mod tests {
             !raw.contains("modified_at"),
             "modified_at must not appear on disk: {raw}"
         );
-        // modifier stays — only modified_at is in HIDDEN_FIELDS today.
+        // modifier stays — only modified_at / modified_by are in HIDDEN_FIELDS.
         assert!(
             raw.contains("modifier"),
             "modifier must still appear on disk: {raw}"

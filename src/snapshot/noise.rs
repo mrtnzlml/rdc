@@ -12,7 +12,12 @@
 /// Top-level and nested JSON keys removed from the canonical projection
 /// before content_hash is computed.
 ///
-/// - `modified_at` / `modifier`: stamped by the server on every touch.
+/// - `modified_at` / `modified_by` / `modifier`: stamped by the server on every
+///   touch. Both `modified_at` and `modified_by` are also hidden from the
+///   on-disk JSON ([`crate::snapshot::key_order::HIDDEN_FIELDS`]) and recorded
+///   in the lockfile instead. That strip is TOP-LEVEL only, so a nested
+///   occurrence still reaches this hash input — dropping these names at any
+///   depth here is what keeps a nested stamp from reading as drift.
 /// - `training_enabled`: a per-queue (and org-default) engine-training toggle
 ///   that Rossum RESETS to `false` when a queue is created. Because the server
 ///   overrides whatever value is posted, the deployed value never matches the
@@ -21,7 +26,7 @@
 ///   perpetually conflict (source `true` vs deployed `false`) with no way to
 ///   converge, since migrate cannot observe the remote. Excluding it from the
 ///   hash keeps drift detection stable; the on-disk value is untouched.
-pub const NOISE_FIELDS: &[&str] = &["modified_at", "modifier", "training_enabled"];
+pub const NOISE_FIELDS: &[&str] = &["modified_at", "modified_by", "modifier", "training_enabled"];
 
 /// Walk `value` and remove any object key whose name is in NOISE_FIELDS.
 /// Recurses into nested objects and arrays. Mutates in place.
@@ -199,6 +204,27 @@ fn is_url(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::Lockfile;
+
+    #[test]
+    fn top_level_modified_by_difference_does_not_change_the_hash() {
+        let lf = Lockfile::default();
+        let a = br#"{"name":"n","modified_by":"https://x/api/v1/users/1"}"#;
+        let b = br#"{"name":"n","modified_by":"https://x/api/v1/users/2"}"#;
+        assert_eq!(canonicalize_for_hash(a, &lf), canonicalize_for_hash(b, &lf));
+    }
+
+    #[test]
+    fn nested_stamp_difference_does_not_change_the_hash() {
+        // The disk strip is top-level only, so nested stamps DO reach the hash
+        // input. The recursive noise strip is what keeps them from registering
+        // as drift — without it, top-level-only stripping would churn.
+        let lf = Lockfile::default();
+        let a = br#"{"name":"n","metadata":{"modified_at":"t1","modified_by":"u1"}}"#;
+        let b = br#"{"name":"n","metadata":{"modified_at":"t2","modified_by":"u2"}}"#;
+        assert_eq!(canonicalize_for_hash(a, &lf), canonicalize_for_hash(b, &lf));
+    }
+
     use serde_json::json;
 
     #[test]
@@ -423,7 +449,7 @@ mod tests {
         lf.upsert(
             "hooks",
             "validator",
-            ObjectEntry { id: 55, modified_at: None, content_hash: None, secrets_hash: None },
+            ObjectEntry { id: 55, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None },
         );
         let hooks_form = br#"{"hooks":["https://x.rossum.app/api/v1/hooks/55"]}"#;
         let webhooks_form = br#"{"webhooks":["https://x.rossum.app/api/v1/webhooks/55"]}"#;

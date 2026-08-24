@@ -7,10 +7,11 @@
 //! * **Key ordering** — `reorder_top_level` moves "important" keys
 //!   (per-kind constants like [`HOOK_KEY_ORDER`]) to the front of the
 //!   top-level object.
-//! * **Field hiding** — [`strip_hidden_fields_recursive`] removes
+//! * **Field hiding** — [`strip_hidden_fields`] removes
 //!   server-managed fields ([`HIDDEN_FIELDS`]) so they don't churn the
-//!   on-disk JSON. Today only `modified_at` is hidden (already tracked
-//!   in the lockfile's `ObjectEntry::modified_at`).
+//!   on-disk JSON. `modified_at` and `modified_by` are hidden (both
+//!   already tracked in the lockfile, as `ObjectEntry::modified_at` /
+//!   `ObjectEntry::modified_by`).
 //!
 //! Requires the `preserve_order` feature on `serde_json` so
 //! `Value::Object` is an `IndexMap` (insertion-order preserving). With
@@ -27,11 +28,25 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 
-/// Server-managed top-level (or nested) keys removed from on-disk JSON
-/// before write. `modified_at` is already preserved in
-/// `ObjectEntry::modified_at` in the lockfile, so removing it from the
-/// JSON eliminates `git diff` noise without losing information.
-pub const HIDDEN_FIELDS: &[&str] = &["modified_at"];
+/// Server-managed keys removed from on-disk JSON before write. Both are
+/// preserved in the lockfile (`ObjectEntry::modified_at` /
+/// `ObjectEntry::modified_by`), so dropping them from the JSON loses no
+/// information.
+///
+/// **Top-level only, deliberately.** An earlier version recursed, which is a
+/// silent-corruption path in two places rdc does not own:
+///
+/// - `metadata` is a user-writable free-form object that push sends WHOLESALE,
+///   so a stripped `metadata.modified_by` would be deleted server-side on the
+///   next push.
+/// - an MDH index spec keys each index by COLUMN name (`{"key": {"col": 1}}`),
+///   so a dataset column named `modified_by` would lose its index.
+///
+/// rdc owns the object's own top-level stamps and nothing below them. The
+/// content hash still ignores these names at any depth (see
+/// [`crate::snapshot::noise::NOISE_FIELDS`]), so a nested occurrence stays on
+/// disk without ever churning.
+pub const HIDDEN_FIELDS: &[&str] = &["modified_at", "modified_by"];
 
 /// Hook top-level key importance. Listed keys land first in this order;
 /// remaining keys (typed fields not listed, then any flattened extras)
@@ -47,45 +62,30 @@ pub const HOOK_KEY_ORDER: &[&str] = &[
     "run_after",
 ];
 
-/// Strip every key in [`HIDDEN_FIELDS`] from `value`, recursing into
-/// nested objects and arrays. Mutates in place.
-pub fn strip_hidden_fields_recursive(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            for f in HIDDEN_FIELDS {
-                map.shift_remove(*f);
-            }
-            for child in map.values_mut() {
-                strip_hidden_fields_recursive(child);
-            }
-        }
-        Value::Array(arr) => {
-            for item in arr.iter_mut() {
-                strip_hidden_fields_recursive(item);
-            }
-        }
-        _ => {}
+/// Strip every key in [`HIDDEN_FIELDS`] from the TOP LEVEL of `value`.
+/// Nested objects and arrays are left untouched — see [`HIDDEN_FIELDS`] for
+/// why. Mutates in place; a no-op for a non-object.
+pub fn strip_hidden_fields(value: &mut Value) {
+    let Some(map) = value.as_object_mut() else {
+        return;
+    };
+    for f in HIDDEN_FIELDS {
+        map.shift_remove(*f);
     }
 }
 
-/// True iff `bytes` parse as JSON containing any field in
-/// [`HIDDEN_FIELDS`] (top-level or nested). Used by the pull driver to
-/// detect a legacy on-disk format and force a one-time rewrite even
-/// when the canonical content hash is unchanged.
+/// True iff `bytes` parse as a JSON object carrying a [`HIDDEN_FIELDS`] key at
+/// the TOP LEVEL. Used by the pull driver to detect a legacy on-disk format and
+/// force a one-time rewrite even when the canonical content hash is unchanged.
+/// Nested occurrences are data rdc leaves alone, so they must not nudge a
+/// rewrite — that would be permanent churn.
 pub fn contains_hidden_fields(bytes: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<Value>(bytes) else { return false; };
-    has_hidden_field(&value)
-}
-
-fn has_hidden_field(value: &Value) -> bool {
-    match value {
-        Value::Object(map) => {
-            HIDDEN_FIELDS.iter().any(|f| map.contains_key(*f))
-                || map.values().any(has_hidden_field)
-        }
-        Value::Array(arr) => arr.iter().any(has_hidden_field),
-        _ => false,
-    }
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return false;
+    };
+    value
+        .as_object()
+        .is_some_and(|map| HIDDEN_FIELDS.iter().any(|f| map.contains_key(*f)))
 }
 
 /// Serialize a typed value to canonical on-disk JSON bytes: convert via
@@ -94,7 +94,7 @@ fn has_hidden_field(value: &Value) -> bool {
 /// ordering, code extraction) on top.
 pub fn serialize_for_disk(typed: &impl Serialize) -> Result<Vec<u8>> {
     let mut value = serde_json::to_value(typed).context("serializing typed value")?;
-    strip_hidden_fields_recursive(&mut value);
+    strip_hidden_fields(&mut value);
     let mut bytes = serde_json::to_vec_pretty(&value).context("serializing JSON")?;
     bytes.push(b'\n');
     Ok(bytes)
@@ -223,47 +223,24 @@ mod tests {
     #[test]
     fn strip_hidden_removes_top_level_modified_at() {
         let mut v = json!({"id": 1, "modified_at": "2026-05-22T08:42:15Z", "name": "n"});
-        strip_hidden_fields_recursive(&mut v);
+        strip_hidden_fields(&mut v);
         assert_eq!(v, json!({"id": 1, "name": "n"}));
     }
 
     #[test]
-    fn strip_hidden_recurses_into_nested_objects_and_arrays() {
-        let mut v = json!({
-            "id": 1,
-            "modified_at": "t",
-            "child": {"modified_at": "t", "kept": true},
-            "items": [
-                {"id": 2, "modified_at": "t"},
-                {"id": 3, "modified_at": "t"},
-            ],
-        });
-        strip_hidden_fields_recursive(&mut v);
-        assert_eq!(
-            v,
-            json!({
-                "id": 1,
-                "child": {"kept": true},
-                "items": [{"id": 2}, {"id": 3}],
-            })
-        );
-    }
-
-    #[test]
     fn strip_hidden_leaves_modifier_and_other_server_fields_alone() {
-        // The user picked "just modified_at" — modifier, created_at,
-        // modified_by, status, etc. must NOT be stripped from on-disk
-        // JSON by this helper. They live elsewhere if needed.
+        // Only `modified_at` / `modified_by` are hidden — `modifier`,
+        // `created_at`, `created_by`, `status`, etc. must NOT be stripped from
+        // on-disk JSON by this helper. They live elsewhere if needed.
         let mut v = json!({
             "id": 1,
             "modified_at": "t",
             "modifier": "https://x/api/v1/users/4",
             "created_at": "t0",
             "created_by": "u",
-            "modified_by": "u",
             "status": "ready",
         });
-        strip_hidden_fields_recursive(&mut v);
+        strip_hidden_fields(&mut v);
         assert_eq!(
             v,
             json!({
@@ -271,22 +248,9 @@ mod tests {
                 "modifier": "https://x/api/v1/users/4",
                 "created_at": "t0",
                 "created_by": "u",
-                "modified_by": "u",
                 "status": "ready",
             })
         );
-    }
-
-    #[test]
-    fn contains_hidden_fields_detects_top_level_and_nested() {
-        assert!(contains_hidden_fields(b"{\"id\":1,\"modified_at\":\"t\"}"));
-        assert!(contains_hidden_fields(
-            b"{\"id\":1,\"child\":{\"modified_at\":\"t\"}}"
-        ));
-        assert!(contains_hidden_fields(
-            b"{\"items\":[{\"id\":1,\"modified_at\":\"t\"}]}"
-        ));
-        assert!(!contains_hidden_fields(b"{\"id\":1,\"name\":\"n\"}"));
     }
 
     #[test]
@@ -311,5 +275,50 @@ mod tests {
         );
         // And the trailing newline is added.
         assert_eq!(bytes.last(), Some(&b'\n'));
+    }
+    #[test]
+    fn strips_modified_by_from_top_level() {
+        let mut v = json!({
+            "id": 1,
+            "modified_at": "t",
+            "modified_by": "https://x/api/v1/users/4",
+            "name": "n",
+        });
+        strip_hidden_fields(&mut v);
+        assert_eq!(v, json!({"id": 1, "name": "n"}));
+    }
+
+    #[test]
+    fn keeps_nested_stamps_that_may_be_user_data() {
+        // `metadata` is user-writable and PATCHed wholesale, and an MDH index
+        // spec keys index definitions by COLUMN name (`{"key": {"col": 1}}`).
+        // Stripping a nested `modified_at`/`modified_by` would delete data rdc
+        // does not own — server-side, on the next push.
+        let mut v = json!({
+            "modified_by": "https://x/api/v1/users/4",
+            "metadata": {"modified_by": "ops", "modified_at": "t", "kept": true},
+            "key": {"modified_by": 1},
+            "items": [{"modified_at": "t"}],
+        });
+        strip_hidden_fields(&mut v);
+        assert_eq!(
+            v,
+            json!({
+                "metadata": {"modified_by": "ops", "modified_at": "t", "kept": true},
+                "key": {"modified_by": 1},
+                "items": [{"modified_at": "t"}],
+            })
+        );
+    }
+
+    #[test]
+    fn contains_hidden_fields_is_top_level_only() {
+        assert!(contains_hidden_fields(b"{\"id\":1,\"modified_by\":\"u\"}"));
+        assert!(!contains_hidden_fields(
+            b"{\"metadata\":{\"modified_at\":\"t\"}}"
+        ));
+        assert!(!contains_hidden_fields(
+            b"{\"items\":[{\"modified_by\":\"u\"}]}"
+        ));
     }
 }

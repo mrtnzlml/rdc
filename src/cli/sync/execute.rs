@@ -351,6 +351,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                     local_path,
                     id: l.id,
                     modified_at: l.modified_at().map(|s| s.to_string()),
+                    modified_by: l.modified_by().map(|s| s.to_string()),
                     hash_strategy: HashStrategy::Flat,
                 })
             }),
@@ -370,6 +371,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                         local_path,
                         id: w.id,
                         modified_at: w.modified_at().map(|s| s.to_string()),
+                        modified_by: w.modified_by().map(|s| s.to_string()),
                         hash_strategy: HashStrategy::Flat,
                     })
                 }),
@@ -386,6 +388,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                     local_path,
                     id: e.id,
                     modified_at: e.modified_at().map(|s| s.to_string()),
+                    modified_by: e.modified_by().map(|s| s.to_string()),
                     hash_strategy: HashStrategy::Flat,
                 })
             }),
@@ -415,6 +418,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                             local_path,
                             id: f.id,
                             modified_at: f.modified_at().map(|s| s.to_string()),
+                            modified_by: f.modified_by().map(|s| s.to_string()),
                             hash_strategy: HashStrategy::Flat,
                         })
                     })
@@ -440,6 +444,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                     local_path,
                     id: h.id,
                     modified_at: h.modified_at().map(|s| s.to_string()),
+                    modified_by: h.modified_by().map(|s| s.to_string()),
                     hash_strategy: HashStrategy::Hook,
                 })
             }),
@@ -461,6 +466,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                     local_path,
                     id: r.id,
                     modified_at: r.modified_at().map(|s| s.to_string()),
+                    modified_by: r.modified_by().map(|s| s.to_string()),
                     hash_strategy: HashStrategy::Rule,
                 })
             }),
@@ -482,6 +488,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                         local_path,
                         id: q.id,
                         modified_at: q.modified_at().map(|s| s.to_string()),
+                        modified_by: q.modified_by().map(|s| s.to_string()),
                         hash_strategy: HashStrategy::Flat,
                     })
                 }),
@@ -517,6 +524,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                             local_path,
                             id: schema.id,
                             modified_at: schema.modified_at().map(|s| s.to_string()),
+                            modified_by: schema.modified_by().map(|s| s.to_string()),
                             hash_strategy: HashStrategy::Schema,
                         })
                     })
@@ -537,6 +545,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                         local_path,
                         id: inbox.id,
                         modified_at: inbox.modified_at().map(|s| s.to_string()),
+                        modified_by: inbox.modified_by().map(|s| s.to_string()),
                         hash_strategy: HashStrategy::Flat,
                     })
                 }),
@@ -565,6 +574,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                             local_path,
                             id: t.id,
                             modified_at: t.modified_at().map(|s| s.to_string()),
+                            modified_by: t.modified_by().map(|s| s.to_string()),
                             hash_strategy: HashStrategy::Flat,
                         })
                     })
@@ -652,6 +662,9 @@ struct ConflictRefs {
     local_path: PathBuf,
     id: u64,
     modified_at: Option<String>,
+    /// The env's `modified_by`, recorded into the lockfile alongside
+    /// `modified_at` when a conflict resolves to the remote value.
+    modified_by: Option<String>,
     /// How to fold `(remote_bytes, remote_code)` into the lockfile
     /// `content_hash`. Flat kinds use `Flat` (just `content_hash`);
     /// `Hook` / `Rule` use their respective combined-hash helpers so the
@@ -802,11 +815,11 @@ fn try_auto_merge(
     };
 
     // Helper: strip noise fields a fresh pull would strip from disk
-    // (HIDDEN_FIELDS — currently just `modified_at`) so the merge
+    // (HIDDEN_FIELDS — `modified_at` / `modified_by`, top level) so the merge
     // never introduces them into the merged output.
     let parse_and_strip = |bytes: &[u8]| -> Option<serde_json::Value> {
         let mut v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-        crate::snapshot::key_order::strip_hidden_fields_recursive(&mut v);
+        crate::snapshot::key_order::strip_hidden_fields(&mut v);
         Some(v)
     };
     let Some(base_v) = parse_and_strip(&base_json_bytes) else {
@@ -1117,6 +1130,7 @@ fn resolve_one_conflict<R: BufRead>(
         local_path,
         id,
         modified_at,
+        modified_by,
         hash_strategy,
     } = refs;
 
@@ -1220,6 +1234,7 @@ fn resolve_one_conflict<R: BufRead>(
             &it.slug,
             id,
             modified_at,
+            modified_by,
             Some(canonical_local_hash),
         );
         // Refresh cache from disk so its hash matches the new lockfile.
@@ -1305,6 +1320,7 @@ fn resolve_one_conflict<R: BufRead>(
                 &it.slug,
                 id,
                 modified_at,
+                modified_by,
                 Some(merged_combined_hash),
             );
         } else {
@@ -1314,6 +1330,7 @@ fn resolve_one_conflict<R: BufRead>(
                 &it.slug,
                 id,
                 modified_at,
+                modified_by,
                 Some(canonical_remote_hash.clone()),
             );
             outcome
@@ -1375,6 +1392,7 @@ fn resolve_one_conflict<R: BufRead>(
             &it.slug,
             id,
             modified_at,
+            modified_by,
             preserved_hash,
         );
         return Ok(());
@@ -1598,6 +1616,7 @@ fn resolve_one_conflict<R: BufRead>(
                 &it.slug,
                 id,
                 modified_at,
+                modified_by,
                 Some(canonical_remote_hash.clone()),
             );
             sweep_conflict_artifacts(ctx.paths, &local_path);
@@ -1672,6 +1691,7 @@ fn resolve_one_conflict<R: BufRead>(
                 &it.slug,
                 id,
                 modified_at,
+                modified_by,
                 Some(canonical_remote_hash.clone()),
             );
             sweep_conflict_artifacts(ctx.paths, &local_path);
@@ -1702,6 +1722,7 @@ fn resolve_one_conflict<R: BufRead>(
                 &it.slug,
                 id,
                 modified_at,
+                modified_by,
                 Some(canonical_remote_hash.clone()),
             );
             sweep_conflict_artifacts(ctx.paths, &local_path);
@@ -1746,6 +1767,7 @@ fn resolve_one_conflict<R: BufRead>(
                 &it.slug,
                 id,
                 modified_at,
+                modified_by,
                 preserved_hash,
             );
         }
@@ -1788,6 +1810,7 @@ fn resolve_one_conflict<R: BufRead>(
                 &it.slug,
                 id,
                 modified_at,
+                modified_by,
                 preserved_hash,
             );
         }
@@ -2546,6 +2569,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             restore_formulas: Vec::new(),
                             id: body.map(|l| l.id),
                             modified_at: body.and_then(|l| l.modified_at().map(|s| s.to_string())),
+                            modified_by: body.and_then(|l| l.modified_by().map(|s| s.to_string())),
                             hash_strategy: HashStrategy::Flat,
                         })
                     }
@@ -2566,6 +2590,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             restore_formulas: Vec::new(),
                             id: body.map(|w| w.id),
                             modified_at: body.and_then(|w| w.modified_at().map(|s| s.to_string())),
+                            modified_by: body.and_then(|w| w.modified_by().map(|s| s.to_string())),
                             hash_strategy: HashStrategy::Flat,
                         })
                     }
@@ -2586,6 +2611,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             restore_formulas: Vec::new(),
                             id: body.map(|e| e.id),
                             modified_at: body.and_then(|e| e.modified_at().map(|s| s.to_string())),
+                            modified_by: body.and_then(|e| e.modified_by().map(|s| s.to_string())),
                             hash_strategy: HashStrategy::Flat,
                         })
                     }
@@ -2627,6 +2653,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             restore_formulas: Vec::new(),
                             id: body.map(|f| f.id),
                             modified_at: body.and_then(|f| f.modified_at().map(|s| s.to_string())),
+                            modified_by: body.and_then(|f| f.modified_by().map(|s| s.to_string())),
                             hash_strategy: HashStrategy::Flat,
                         })
                     }
@@ -2658,6 +2685,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             restore_formulas: Vec::new(),
                             id: body.map(|h| h.id),
                             modified_at: body.and_then(|h| h.modified_at().map(|s| s.to_string())),
+                            modified_by: body.and_then(|h| h.modified_by().map(|s| s.to_string())),
                             hash_strategy: HashStrategy::Hook,
                         })
                     }
@@ -2686,6 +2714,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             restore_formulas: Vec::new(),
                             id: body.map(|r| r.id),
                             modified_at: body.and_then(|r| r.modified_at().map(|s| s.to_string())),
+                            modified_by: body.and_then(|r| r.modified_by().map(|s| s.to_string())),
                             hash_strategy: HashStrategy::Rule,
                         })
                     }
@@ -2726,6 +2755,8 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             id: body.map(|(q, _)| q.id),
                             modified_at: body
                                 .and_then(|(q, _)| q.modified_at().map(|s| s.to_string())),
+                            modified_by: body
+                                .and_then(|(q, _)| q.modified_by().map(|s| s.to_string())),
                             hash_strategy: HashStrategy::Flat,
                         })
                     }
@@ -2791,6 +2822,9 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             modified_at: body_pair
                                 .as_ref()
                                 .and_then(|(s, _)| s.modified_at().map(|x| x.to_string())),
+                            modified_by: body_pair
+                                .as_ref()
+                                .and_then(|(s, _)| s.modified_by().map(|x| x.to_string())),
                             hash_strategy: HashStrategy::Schema,
                         })
                     }
@@ -2837,6 +2871,9 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             modified_at: body_pair
                                 .as_ref()
                                 .and_then(|(i, _)| i.modified_at().map(|x| x.to_string())),
+                            modified_by: body_pair
+                                .as_ref()
+                                .and_then(|(i, _)| i.modified_by().map(|x| x.to_string())),
                             hash_strategy: HashStrategy::Flat,
                         })
                     }
@@ -2869,6 +2906,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             restore_formulas: Vec::new(),
                             id: body.map(|t| t.id),
                             modified_at: body.and_then(|t| t.modified_at().map(|s| s.to_string())),
+                            modified_by: body.and_then(|t| t.modified_by().map(|s| s.to_string())),
                             hash_strategy: HashStrategy::Flat,
                         })
                     }
@@ -3137,14 +3175,18 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                                         &crate::state::Lockfile::default(),
                                     )
                                 };
-                                if let (Some(id), modified_at) = (refs.id, refs.modified_at.clone())
-                                {
+                                if let (Some(id), modified_at, modified_by) = (
+                                    refs.id,
+                                    refs.modified_at.clone(),
+                                    refs.modified_by.clone(),
+                                ) {
                                     crate::cli::pull::common::record_object(
                                         ctx.lockfile,
                                         &it.kind,
                                         &it.slug,
                                         id,
                                         modified_at,
+                                        modified_by,
                                         Some(h),
                                     );
                                 }
@@ -3214,6 +3256,9 @@ struct RemoteDeleteRefs {
     restore_formulas: Vec<(String, Vec<u8>)>,
     id: Option<u64>,
     modified_at: Option<String>,
+    /// The env's `modified_by`, recorded alongside `modified_at` when a
+    /// remote-delete conflict resolves to restoring the env's value.
+    modified_by: Option<String>,
     hash_strategy: HashStrategy,
 }
 
@@ -3910,6 +3955,7 @@ pub async fn run(
                                 crate::state::ObjectEntry {
                                     id: 0,
                                     modified_at: None,
+                                    modified_by: None,
                                     content_hash: Some(hash),
                                     secrets_hash: None,
                                 },
@@ -4304,6 +4350,7 @@ mod tests {
             ObjectEntry {
                 id: 99,
                 modified_at: None,
+                modified_by: None,
                 content_hash: Some(base_hash),
                 secrets_hash: None,
             },
@@ -5149,6 +5196,7 @@ mod tests {
             ObjectEntry {
                 id: 42,
                 modified_at: None,
+                modified_by: None,
                 content_hash: Some(base_hash),
                 secrets_hash: None,
             },
@@ -5419,6 +5467,7 @@ mod tests {
             ObjectEntry {
                 id: 0,
                 modified_at: None,
+                modified_by: None,
                 content_hash: Some(content_hash(bytes, &Lockfile::default())),
                 secrets_hash: None,
             },
@@ -5637,6 +5686,7 @@ mod tests {
             ObjectEntry {
                 id: 0,
                 modified_at: None,
+                modified_by: None,
                 // Row data hashes VERBATIM everywhere (push, pull, drift gate).
                 content_hash: Some(crate::state::raw_content_hash(rows)),
                 secrets_hash: None,
@@ -5850,6 +5900,7 @@ mod tests {
             ObjectEntry {
                 id: 0,
                 modified_at: None,
+                modified_by: None,
                 content_hash: Some("stale".to_string()),
                 secrets_hash: None,
             },
@@ -6150,6 +6201,7 @@ mod tests {
             ObjectEntry {
                 id: 42,
                 modified_at: None,
+                modified_by: None,
                 content_hash: Some("base".to_string()),
                 secrets_hash: None,
             },
@@ -6382,6 +6434,7 @@ mod tests {
             ObjectEntry {
                 id: 42,
                 modified_at: Some("2026-05-14T08:00:00Z".to_string()),
+                modified_by: None,
                 content_hash: Some(base_combined.clone()),
                 secrets_hash: None,
             },
@@ -6693,6 +6746,7 @@ mod tests {
             ObjectEntry {
                 id: 42,
                 modified_at: None,
+                modified_by: None,
                 content_hash: Some("base".to_string()),
                 secrets_hash: None,
             },
@@ -6703,6 +6757,7 @@ mod tests {
             ObjectEntry {
                 id: 100,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -6832,6 +6887,7 @@ mod tests {
             ObjectEntry {
                 id: 42,
                 modified_at: Some("2026-05-14T08:00:00Z".to_string()),
+                modified_by: None,
                 content_hash: Some(base_combined.clone()),
                 secrets_hash: None,
             },
@@ -6999,6 +7055,7 @@ mod tests {
             ObjectEntry {
                 id: 42,
                 modified_at: Some("2026-05-14T08:00:00Z".to_string()),
+                modified_by: None,
                 content_hash: Some(base_combined.clone()),
                 secrets_hash: None,
             },
@@ -7157,6 +7214,7 @@ mod tests {
             ObjectEntry {
                 id: schema_id,
                 modified_at: Some("2026-04-10T09:00:00Z".to_string()),
+                modified_by: None,
                 content_hash: Some(base_combined.clone()),
                 secrets_hash: None,
             },
@@ -7218,6 +7276,7 @@ mod tests {
             ObjectEntry {
                 id: 800,
                 modified_at: Some("2026-04-20T08:00:00Z".to_string()),
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -7228,6 +7287,7 @@ mod tests {
             ObjectEntry {
                 id: 100,
                 modified_at: Some("2026-04-20T08:00:00Z".to_string()),
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -7408,6 +7468,7 @@ mod tests {
             ObjectEntry {
                 id: 555,
                 modified_at: None,
+                modified_by: None,
                 content_hash: Some(String::new()), // placeholder, replaced below
                 secrets_hash: None,
             },
@@ -7437,6 +7498,7 @@ mod tests {
             ObjectEntry {
                 id: 555,
                 modified_at: None,
+                modified_by: None,
                 content_hash: Some(base_hash.clone()),
                 secrets_hash: None,
             },
@@ -7640,6 +7702,7 @@ mod tests {
             ObjectEntry {
                 id: ws.id,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -7650,6 +7713,7 @@ mod tests {
             ObjectEntry {
                 id: queue.id,
                 modified_at: None,
+                modified_by: None,
                 content_hash: None,
                 secrets_hash: None,
             },
@@ -7660,6 +7724,7 @@ mod tests {
             ObjectEntry {
                 id: schema.id,
                 modified_at: None,
+                modified_by: None,
                 content_hash: Some(schema_hash),
                 secrets_hash: None,
             },

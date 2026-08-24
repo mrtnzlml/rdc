@@ -262,6 +262,7 @@ mod tests {
             ObjectEntry {
                 id,
                 modified_at: None,
+                modified_by: None,
                 content_hash: Some("placeholder-hash".to_string()),
                 secrets_hash: None,
             },
