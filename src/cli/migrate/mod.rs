@@ -2910,8 +2910,13 @@ mod tests {
             owning_object(Path::new("mdh/vendors/collection.json")),
             Some(("mdh", "vendors".to_string()))
         );
-        // Env-level files belong to no object.
-        assert_eq!(owning_object(Path::new("organization.json")), None);
+        // The organization singleton resolves to its own object too — migrate
+        // promotes its `settings` subtree (via `classify`), so a file outcome
+        // for it must be attributable to something, like every other kind.
+        assert_eq!(
+            owning_object(Path::new("organization.json")),
+            Some(("organization", "self".to_string()))
+        );
     }
 
     #[test]
@@ -3413,7 +3418,6 @@ mod tests {
             "README.md",
             "_index.md",
             "overlay.toml",
-            "organization.json",
             // Inside managed dirs but not rdc's:
             "hooks/__pycache__/extractor.cpython-312.pyc",
             "workspaces/main/queues/inv/formulas/__pycache__/f.cpython-312.pyc",
@@ -3421,7 +3425,12 @@ mod tests {
             // Sync shadow artifact (must stay skipped):
             "hooks/extractor.json.test",
         ];
-        for rel in managed.iter().chain(non_managed.iter()) {
+        // The one deliberate exception: `organization.json` sits outside
+        // `MANAGED_DIRS` at the env root like the other per-env singletons
+        // above, but migrate now promotes it (its `settings` subtree — see
+        // `classify`), so `enumerate_files` adds it back in explicitly.
+        let org_file = "organization.json";
+        for rel in managed.iter().chain(non_managed.iter()).chain([&org_file]) {
             let p = root.join(rel);
             fs::create_dir_all(p.parent().unwrap()).unwrap();
             fs::write(&p, b"x").unwrap();
@@ -3436,6 +3445,11 @@ mod tests {
         for rel in managed {
             assert!(got.contains(rel), "managed file {rel} must be enumerated; got {got:?}");
         }
+        assert!(
+            got.contains(org_file),
+            "organization.json is the one non-MANAGED_DIRS entry that IS \
+             enumerated — migrate promotes its settings subtree; got {got:?}"
+        );
         for rel in non_managed {
             assert!(
                 !got.contains(rel),
