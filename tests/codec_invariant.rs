@@ -769,7 +769,10 @@ fn email_templates_invariants() {
 }
 
 /// Organization: no redaction, no sidecars, modified_at stripped recursively,
-/// create_body and cross_env_body are no-ops.
+/// create_body is a no-op (rdc never POSTs an organization), and
+/// cross_env_body retains only `settings` (so `migrate` can promote that
+/// subtree while `reconcile_target_identity` restores the target's own
+/// identity, `ui_settings`, and `metadata`).
 #[test]
 fn organization_invariants() {
     let c = codec("organization").expect("organization codec must be registered");
@@ -791,17 +794,23 @@ fn organization_invariants() {
         "organization must produce no sidecars"
     );
 
-    // Pull-only: create_body and cross_env_body must not change the value.
+    // rdc never creates an organization.
     let mut body = v.clone();
     c.create_body(&mut body);
     assert_eq!(
         body, v,
-        "create_body must be a no-op for the pull-only organization kind"
+        "create_body must be a no-op: rdc never POSTs an organization"
     );
+
+    // Cross-env promotion carries `settings` and nothing else — everything
+    // else (id, url, name, users, the stamps, ...) is either read-only or
+    // per-env state that `reconcile_target_identity` restores from the
+    // target's own organization.json.
     c.cross_env_body(&mut body);
     assert_eq!(
-        body, v,
-        "cross_env_body must be a no-op for the pull-only organization kind"
+        body,
+        json!({ "settings": { "ui_settings": { "language": "en" } } }),
+        "cross_env_body must retain only `settings`; got:\n{body}"
     );
 }
 
