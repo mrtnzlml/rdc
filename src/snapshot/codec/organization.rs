@@ -1,9 +1,11 @@
 //! [`KindCodec`] implementation for the `organization` kind.
 //!
 //! Archetype: **flat plain, pull-only**. There is exactly one organization per
-//! env, so rdc never *creates* it (`create_body` is a no-op). Migrate DOES
-//! promote it cross-env, but only its `settings` subtree — `cross_env_body`
-//! strips everything else so the target's own identity/branding survive.
+//! env, so rdc never *creates* it (`create_body` is a no-op) and today's
+//! `migrate` does not yet walk it as a promotable object. `cross_env_body`
+//! defines what a future cross-env promotion is allowed to carry — only the
+//! `settings` subtree, so identity/branding fields stay the target's own —
+//! ready for `migrate` to call once it treats the organization as a kind.
 //!
 //! Path / slug: the on-disk location is fixed (`organization.json` directly
 //! under the env root, via `Paths::organization_file()`) and does not depend
