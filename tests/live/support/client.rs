@@ -16,6 +16,31 @@ impl LiveClient {
         Ok(LiveClient { inner, org_url })
     }
 
+    /// Fetch the organization's `settings` subtree as raw JSON, straight from
+    /// `GET /organizations/{id}` — bypassing `rdc` entirely. Used to capture a
+    /// baseline before a test touches the (permanent, non-throwaway) org and
+    /// to confirm what a push actually persisted, independent of the push
+    /// path under test.
+    pub async fn get_organization_settings(&self, org_id: u64) -> Result<serde_json::Value> {
+        let org = self.inner.get_organization(org_id, None).await?;
+        let v = serde_json::to_value(&org)?;
+        Ok(v.get("settings").cloned().unwrap_or(serde_json::Value::Null))
+    }
+
+    /// `PATCH /organizations/{id}` with a body of exactly `{"settings": …}` —
+    /// the same shape `push::organization` sends. Called directly (not
+    /// through `rdc`) so a scenario can restore the org's original settings
+    /// even when the thing under test is that very push path.
+    pub async fn patch_organization_settings(
+        &self,
+        org_id: u64,
+        settings: &serde_json::Value,
+    ) -> Result<()> {
+        let body = serde_json::json!({ "settings": settings });
+        self.inner.update_organization(org_id, &body, None).await?;
+        Ok(())
+    }
+
     /// Create an object of `kind` from a fully-resolved body. Returns the
     /// server-assigned (id, url). `None` progress = silent.
     pub async fn create(&self, kind: &str, body: &serde_json::Value) -> Result<(u64, String)> {

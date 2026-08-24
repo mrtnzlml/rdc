@@ -167,6 +167,60 @@ rdc sync test
 
 To promote changes between envs, see [`rdc migrate`](#rdc-migrate).
 
+### Organization settings
+
+`envs/<env>/organization.json` holds the Rossum organization object. rdc
+manages exactly one subtree of it: **`settings`** — where the document-list
+column config lives (`settings.annotation_list_table.columns`, and
+`request_dashboard_table`'s equivalent). Edit them there and `rdc sync <env>`
+sends them:
+
+    PATCH /v1/organizations/<id>   { "settings": … }
+
+Everything else in the file is informational: `ui_settings` (branding, theme,
+the org's applied feature flags), `metadata`, and the read-only fields the API
+assigns. Editing those locally changes nothing remotely — the sync's
+write-back rewrites them from the env's response on every push, and a pull
+does the same. There is no create and no delete: one organization exists per
+env, made outside rdc, and a deleted `organization.json` simply means nothing
+to push (the next pull restores the file).
+
+Push only fires when `settings` itself actually changed since the last synced
+base — an edit confined to `ui_settings` or `metadata` produces no request at
+all. When it does push, and the server's response disagrees with the local
+file on some *other* top-level key (because the file was hand-edited, or the
+env changed underneath it), rdc says so, naming only the keys that actually
+diverged, before overwriting them from the response.
+
+A `settings` PATCH replaces the whole object server-side, so rdc always sends
+the complete subtree. That has one consequence worth knowing: **an absent
+`settings` key means "not managed", not "empty"** — rdc skips the push and
+warns, because guessing wrong would wipe the remote's settings. To clear the
+org's settings, write `"settings": {}` explicitly.
+
+`rdc migrate` promotes `settings` and nothing else, into the target's own org
+object — identity fields (`id`, `url`, `name`, `ui_settings`, `metadata`, …)
+stay the target's. A target env that has no `organization.json` yet is
+skipped with a warning (run `rdc sync <tgt>` first to pull one). Override the
+promoted value per env with a flat `[organization]` overlay section:
+
+```toml
+# envs/prod/overlay.toml
+[organization.settings.annotation_list_table]
+columns = [
+  { visible = true, column_type = "meta", width = 120.0, meta_name = "status" },
+]
+```
+
+A column's `schema_id` is a per-env schema field id and the API accepts an
+unknown one with a 200, so migrate warns (never drops) when a promoted column
+names a `schema_id` no schema in the target env defines — the column would
+render empty.
+
+Select just the org with [`--only`](#selective-migrate): `--only
+organization/self` (its one slug — `organization` alone is not valid, every
+selector needs a `/`).
+
 ## `rdc sync`
 
 Reconciles the local snapshot with the remote env in one pass — pulls remote changes, sends local edits, creates objects from new files, and deletes objects whose local files you removed (with confirmation).

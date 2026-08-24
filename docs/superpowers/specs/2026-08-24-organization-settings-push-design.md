@@ -187,8 +187,10 @@ Applies to `annotation_list_table` and `request_dashboard_table`.
   `apply_overrides` runs only in `migrate`. Push sends what is on disk, so an
   `[organization]` entry shapes the file that migrate writes, and push then
   sends that file's `settings`.
-- `--only organization` works via `DEPLOYABLE_KINDS`; conversely `--only
-  hooks/*` excludes the org.
+- `--only organization/self` (the org's one slug — `Matcher::parse` requires a
+  `<kind>/<slug>` form for every kind, so a bare `--only organization` errors
+  the same way a bare `--only hooks` does) works via `DEPLOYABLE_KINDS`;
+  conversely `--only hooks/*` excludes the org.
 - `mirror_prune_paths` skips the org file — a per-env singleton is never a
   "target-only object".
 - Offline reference check: for each promoted `column_type: "schema"` column,
