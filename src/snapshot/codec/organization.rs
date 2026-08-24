@@ -1,8 +1,9 @@
 //! [`KindCodec`] implementation for the `organization` kind.
 //!
 //! Archetype: **flat plain, pull-only**. There is exactly one organization per
-//! env, so rdc never *creates* or cross-env-PATCHes it — `create_body` /
-//! `cross_env_body` are no-ops.
+//! env, so rdc never *creates* it (`create_body` is a no-op). Migrate DOES
+//! promote it cross-env, but only its `settings` subtree — `cross_env_body`
+//! strips everything else so the target's own identity/branding survive.
 //!
 //! Path / slug: the on-disk location is fixed (`organization.json` directly
 //! under the env root, via `Paths::organization_file()`) and does not depend
@@ -44,8 +45,22 @@ impl KindCodec for Organization {
         // Pull-only kind: rdc never POSTs an organization. No-op.
     }
 
-    fn cross_env_body(&self, _body: &mut Value) {
-        // Pull-only kind: never part of a cross-env create/PATCH body. No-op.
+    fn cross_env_body(&self, body: &mut Value) {
+        // Cross-env promotion carries exactly ONE subtree: `settings`.
+        //
+        // Everything else on an organization is either read-only at the API
+        // (`id`, `url`, `name`, `sandbox`, the stamps, …) or per-env state that
+        // must not move between orgs: `ui_settings` holds branding and the
+        // org's applied feature flags, `metadata` is free-form. Stripping the
+        // rest here is precisely what makes `migrate`'s
+        // `reconcile_target_identity` restore those fields from the TARGET's own
+        // `organization.json`.
+        //
+        // A retain-list rather than a strip-list, so a field a future API
+        // revision adds defaults to env-local — the conservative direction.
+        if let Some(obj) = body.as_object_mut() {
+            obj.retain(|k, _| k == "settings");
+        }
     }
 
     fn overlay<'a>(
@@ -116,13 +131,31 @@ mod tests {
     }
 
     #[test]
-    fn create_and_cross_env_bodies_are_noops() {
+    fn create_body_is_a_noop() {
         let before = org_value();
         let mut v = before.clone();
         Organization.create_body(&mut v);
-        assert_eq!(v, before, "create_body must be a no-op");
+        assert_eq!(v, before, "create_body must be a no-op: rdc never POSTs an organization");
+    }
+
+    #[test]
+    fn cross_env_body_retains_only_settings() {
+        let mut v = org_value();
+        v["ui_settings"] = json!({ "theme": "white" });
+        v["metadata"] = json!({ "source": "registration" });
         Organization.cross_env_body(&mut v);
-        assert_eq!(v, before, "cross_env_body must be a no-op");
+        assert_eq!(
+            v,
+            json!({ "settings": { "ui_settings": { "language": "en" } } }),
+            "cross-env promotion carries `settings` and nothing else: {v}"
+        );
+    }
+
+    #[test]
+    fn cross_env_body_on_a_body_without_settings_yields_an_empty_object() {
+        let mut v = json!({ "id": 1, "name": "Acme", "ui_settings": { "theme": "white" } });
+        Organization.cross_env_body(&mut v);
+        assert_eq!(v, json!({}));
     }
 
     #[test]
