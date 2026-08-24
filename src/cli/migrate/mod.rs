@@ -1721,6 +1721,24 @@ fn format_carried_email_prefix_warning(
     msg
 }
 
+/// Format ONE aggregate warning naming every promoted organization column
+/// whose `schema_id` matches no schema in the target env — mirrors
+/// `format_carried_email_prefix_warning`'s shape (a single combined message,
+/// emitted once after the file loop) rather than one `log.event` per id.
+fn format_org_columns_missing_warning(tgt: &str, missing: &[String]) -> String {
+    use std::fmt::Write as _;
+    let mut msg = format!(
+        "{} organization column(s) name a schema_id absent from every schema in \
+         '{tgt}' — the API accepts an unknown id with 200, so nothing else catches \
+         this; each will render empty:",
+        missing.len(),
+    );
+    for id in missing {
+        let _ = write!(msg, "\n  schema_id `{id}`");
+    }
+    msg
+}
+
 /// Collect `id -> score_threshold` for every object that has BOTH a string `id`
 /// and a `score_threshold`, anywhere in the tree. Schema datapoint ids are
 /// unique within a schema, so this is an unambiguous per-field map.
@@ -2555,20 +2573,16 @@ pub fn run_at(
     }
 
     // Every promoted organization column whose `schema_id` names a field no
-    // target schema defines, named once for the whole run. Emitted in
-    // `--dry-run` too, like the carried-prefix warning above.
+    // target schema defines, folded into ONE aggregate warning (never one
+    // `log.event` per id — see `format_org_columns_missing_warning`). Emitted
+    // in `--dry-run` too, like the carried-prefix warning above.
     if !missing_schema_ids.is_empty() {
         missing_schema_ids.sort();
         missing_schema_ids.dedup();
-        for id in &missing_schema_ids {
-            log.event(
-                crate::log::Action::Warn,
-                &format!(
-                    "organization: column schema_id `{id}` does not exist in {tgt} — \
-                     the column will render empty"
-                ),
-            );
-        }
+        log.event(
+            crate::log::Action::Warn,
+            &format_org_columns_missing_warning(tgt, &missing_schema_ids),
+        );
     }
 
     let creates = obj_status
@@ -4877,6 +4891,20 @@ mod tests {
         assert!(msg.contains("[inboxes.invoices]"), "{msg}");
         assert!(msg.contains("acme-sandbox"), "{msg}");
         assert!(msg.contains("[inboxes.receipts]"), "{msg}");
+    }
+
+    #[test]
+    fn org_columns_missing_warning_names_the_target_and_every_id_once() {
+        // One combined message for the whole run, not one `log.event` per id —
+        // a project with many stale columns must not flood the log.
+        let msg = format_org_columns_missing_warning(
+            "prod",
+            &["field_a".to_string(), "not_in_prod".to_string()],
+        );
+        assert!(msg.contains("2 organization column"), "{msg}");
+        assert!(msg.contains("'prod'"), "{msg}");
+        assert!(msg.contains("schema_id `field_a`"), "{msg}");
+        assert!(msg.contains("schema_id `not_in_prod`"), "{msg}");
     }
 
     #[test]

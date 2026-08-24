@@ -2039,15 +2039,30 @@ fn migrate_promotes_organization_settings_only() {
             "settings": { "annotation_list_table": { "columns": [] } }
         }),
     );
+    // The target DOES define `field_a`, so this test stays exclusively about
+    // settings promotion — it must not also (silently) exercise the missing-
+    // schema_id warning, which has its own dedicated test.
+    write(
+        &root.join("envs/prod/workspaces/main/queues/invoices/schema.json"),
+        &serde_json::json!({ "name": "s", "content": [ { "id": "field_a", "category": "datapoint" } ] }),
+    );
 
     let _guard = cwd_lock();
     std::env::set_current_dir(root).unwrap();
-    assert_cmd::Command::cargo_bin("rdc")
+    let out = assert_cmd::Command::cargo_bin("rdc")
         .unwrap()
         .current_dir(root)
         .args(["migrate", "test", "prod"])
         .assert()
         .success();
+
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(
+        !format!("{stdout}{stderr}").contains("does not exist"),
+        "the promoted column's schema_id exists in the target — no warning \
+         should fire here: {stdout}{stderr}"
+    );
 
     let tgt = read_json(&root.join("envs/prod/organization.json"));
     assert_eq!(
