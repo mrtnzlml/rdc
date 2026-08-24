@@ -182,8 +182,14 @@ the org's applied feature flags), `metadata`, and the read-only fields the API
 assigns. Editing those locally changes nothing remotely — the sync's
 write-back rewrites them from the env's response on every push, and a pull
 does the same. There is no create and no delete: one organization exists per
-env, made outside rdc, and a deleted `organization.json` simply means nothing
-to push (the next pull restores the file).
+env, made outside rdc, and deleting `organization.json` is not treated as a
+delete request — rdc cannot tell it apart from an ordinary no-op, because the
+org has no tombstone tracking. That cuts both ways: `rdc sync` does not
+restore the file either. The deletion classifies as unchanged (`Clean`), so
+once `organization.json` is gone it simply stays missing until the org's
+lockfile entry is rebuilt from scratch (e.g. by deleting it from
+`.rdc/state/<env>.lock.json`, or on the env's very first sync), which forces
+a fresh pull.
 
 Push only fires when `settings` itself actually changed since the last synced
 base — an edit confined to `ui_settings` or `metadata` produces no request at

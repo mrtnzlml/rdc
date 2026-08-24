@@ -1945,6 +1945,239 @@ async fn sync_warns_and_sends_nothing_for_an_unmanaged_organization_edit() {
     }
 }
 
+/// The divergence notice must compare like with like. `local` (read straight
+/// off disk) is already in portable `rdc://…` ref form — that's how pull
+/// wrote it, and the org body can carry a portable-kind field like
+/// `workspaces` even though `organization` itself isn't a portable kind. The
+/// raw PATCH response never is. Before the fix, the diff compared `local`
+/// directly against that raw response, so on ANY real project with a
+/// snapshotted workspace, every single settings push would name `workspaces`
+/// as "diverged" — a false alarm on the one notice that has to stay
+/// trustworthy, since the write-back below was about to portabilize it right
+/// back to what `local` already said. The fix hoists that portabilization
+/// above the diff.
+#[tokio::test]
+async fn sync_organization_settings_push_does_not_false_positive_on_a_portabilized_workspace_ref() {
+    let server = MockServer::start().await;
+    let mut org = fixture("organization.json");
+    org["workspaces"] = serde_json::json!([format!("{}/api/v1/workspaces/401", server.uri())]);
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(org.clone()))
+        .mount(&server)
+        .await;
+
+    let workspaces_body = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 401,
+                "url": format!("{}/api/v1/workspaces/401", server.uri()),
+                "name": "Invoices",
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "queues": [],
+                "modified_at": "2026-04-20T08:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(workspaces_body))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/organizations/285704"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(org.clone()))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &["/api/v1/workspaces"]).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // First sync: pulls the org AND the workspace, then the post-pass
+    // portabilizes `organization.json`'s `workspaces` field to `rdc://…`.
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev"])
+        .assert()
+        .success();
+
+    let org_path = project.path().join("envs/dev/organization.json");
+    let on_disk_before: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&org_path).unwrap()).unwrap();
+    assert_eq!(
+        on_disk_before["workspaces"],
+        serde_json::json!(["rdc://workspaces/invoices"]),
+        "the first sync must have portabilized the workspace ref: {on_disk_before}"
+    );
+
+    // Local edit to the managed subtree only — `workspaces` is left as the
+    // portable ref the first sync wrote.
+    let mut on_disk = on_disk_before;
+    on_disk["settings"]["annotation_list_table"]["columns"] = serde_json::json!([
+        { "visible": true, "column_type": "meta", "width": 100.0, "meta_name": "status" }
+    ]);
+    std::fs::write(&org_path, serde_json::to_vec_pretty(&on_disk).unwrap()).unwrap();
+
+    let second = assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&second.get_output().stderr).to_string();
+    assert!(
+        !stderr.contains("will be overwritten"),
+        "a portable field the write-back is about to restore verbatim must not \
+         trigger a divergence notice: {stderr}"
+    );
+}
+
+/// The absent-`settings` guard is the one thing standing between a
+/// hand-trimmed `organization.json` and a wiped remote `settings` — rdc
+/// cannot tell "not managed" from "clear it", so a missing `settings` key
+/// must skip the push entirely AND say so. Modelled on
+/// `sync_warns_and_sends_nothing_for_an_unmanaged_organization_edit` above,
+/// but removing the key outright rather than editing an unmanaged sibling.
+#[tokio::test]
+async fn sync_warns_and_sends_nothing_when_organization_settings_is_absent() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &[]).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .unwrap();
+    std::env::set_current_dir(&prev).unwrap();
+
+    // Hand-trim the `settings` key entirely — the README teaches exactly
+    // this as how to say "this env does not manage settings".
+    let org_path = project.path().join("envs/dev/organization.json");
+    let mut on_disk: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&org_path).unwrap()).unwrap();
+    on_disk.as_object_mut().unwrap().remove("settings");
+    std::fs::write(&org_path, serde_json::to_vec_pretty(&on_disk).unwrap()).unwrap();
+
+    let second = assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev"])
+        .assert()
+        .success();
+
+    for req in server.received_requests().await.unwrap_or_default() {
+        assert_ne!(
+            req.method,
+            http::Method::PATCH,
+            "an absent `settings` key must never PATCH: {} {}",
+            req.method,
+            req.url.path()
+        );
+    }
+    let stderr = String::from_utf8_lossy(&second.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("no `settings` key"),
+        "rdc must warn when `settings` is absent: {stderr}"
+    );
+}
+
+/// A `settings: null` must be treated exactly like an absent `settings` key
+/// — never sent as `{"settings": null}` (an API shape nobody has probed,
+/// and one that risks the same "wipe the remote" the absent-key guard
+/// exists to prevent), and never silently ignored either: the same warning
+/// fires.
+#[tokio::test]
+async fn sync_warns_and_sends_nothing_when_organization_settings_is_null() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &[]).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .unwrap();
+    std::env::set_current_dir(&prev).unwrap();
+
+    let org_path = project.path().join("envs/dev/organization.json");
+    let mut on_disk: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&org_path).unwrap()).unwrap();
+    on_disk["settings"] = serde_json::Value::Null;
+    std::fs::write(&org_path, serde_json::to_vec_pretty(&on_disk).unwrap()).unwrap();
+
+    let second = assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev"])
+        .assert()
+        .success();
+
+    for req in server.received_requests().await.unwrap_or_default() {
+        assert_ne!(
+            req.method,
+            http::Method::PATCH,
+            "a null `settings` must never PATCH: {} {}",
+            req.method,
+            req.url.path()
+        );
+    }
+    let stderr = String::from_utf8_lossy(&second.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("no `settings` key"),
+        "a null `settings` must warn the same as an absent one: {stderr}"
+    );
+}
+
 /// Deleting `organization.json` must never reach a DELETE. rdc cannot delete an
 /// organization and the file is simply re-pulled.
 #[tokio::test]

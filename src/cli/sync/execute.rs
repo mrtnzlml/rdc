@@ -3660,11 +3660,15 @@ pub async fn run(
                 .await?;
         }
 
-        // organization is a pull-only singleton. The classifier only
-        // ever emits "organization"/"self" for RemoteEdit / RemoteCreate
-        // (no push side), so any `subsets.get("organization")` hit means
-        // we want the driver to write the local file. The driver takes
-        // the full Organization rather than a subset filter.
+        // The organization singleton has a push side too (the `settings`
+        // subtree — dispatched separately below via `change_list.organization`,
+        // not here), but THIS pull-side dispatch only reacts when `needs_pull_dispatch`
+        // put "organization"/"self" into `subsets` — i.e. RemoteEdit / RemoteCreate,
+        // or Clean with no lockfile entry yet, exactly like every other kind
+        // above. A local `settings` edit alone never lands here. So any
+        // `subsets.get("organization")` hit still just means "the remote side
+        // moved, write the local file". The driver takes the full Organization
+        // rather than a subset filter — it's a singleton, nothing to filter.
         if subsets.contains_key("organization") {
             crate::cli::pull::organization::process(ctx, catalog.organization.clone(), progress)
                 .await?;

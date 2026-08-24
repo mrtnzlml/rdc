@@ -23,6 +23,18 @@ impl Drop for RestoreSettings {
         let client = &self.client;
         let org_id = self.org_id;
         let original = &self.original;
+        // `get_organization_settings` returns `Null` when the org has no
+        // `settings` key at all (never observed in practice against a real
+        // env, but defensive). Sending `{"settings": null}` to "restore" that
+        // is not a probed API shape, and the push driver treats a `null`
+        // `settings` exactly like an absent one — never "clear it" — so
+        // there is nothing to restore: skip the PATCH entirely.
+        if original.is_null() {
+            eprintln!(
+                "restore organization settings: original `settings` was absent — nothing to restore"
+            );
+            return;
+        }
         std::thread::scope(|s| {
             s.spawn(|| {
                 let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -51,8 +63,9 @@ impl Drop for RestoreSettings {
 /// Deliberately narrow: this is the one live check that `rdc sync` actually
 /// round-trips a `settings` edit end-to-end against a real org. The push
 /// driver's other branches (unmanaged-field no-op, absent-`settings` skip,
-/// the "only settings pushed" notice) are covered by fast unit tests in
-/// `src/cli/push/organization.rs` and don't need network access to verify.
+/// the "only settings pushed" notice) are covered by fast, network-free
+/// integration tests in `tests/cli_sync.rs` and don't need network access
+/// to verify.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live: needs RDC_LIVE_* env"]
 async fn live_organization_settings_push() {

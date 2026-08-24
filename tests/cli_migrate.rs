@@ -2105,6 +2105,47 @@ fn migrate_skips_the_organization_when_the_target_has_none() {
     );
 }
 
+/// Source `organization.json` has no `settings` key → skip with a warning
+/// and leave the TARGET's own `organization.json` byte-untouched.
+///
+/// Without this guard, `reconcile_target_identity` derives its "env field"
+/// set from the SOURCE body's own keys (`cross_env_body` only retains
+/// `settings` when the source has it) — with no source `settings`, that set
+/// is empty, so every OTHER key gets restored from the target but `settings`
+/// itself, never having been a source key, is never re-inserted. The
+/// promoted file would lose the target's `settings` outright: a state no
+/// pull would ever produce, and one the push driver's own absent-`settings`
+/// guard can only contain after the fact (by refusing to push it back out) —
+/// not undo.
+#[test]
+fn migrate_skips_the_organization_when_the_source_has_no_settings() {
+    let project = init_two_env_project();
+    let root = project.path();
+    write(
+        &root.join("envs/test/organization.json"),
+        &serde_json::json!({ "id": 1, "name": "Acme Test", "ui_settings": { "theme": "white" } }),
+    );
+    let tgt_before = serde_json::json!({
+        "id": 2, "name": "Acme Prod", "ui_settings": { "theme": "dark" },
+        "settings": { "annotation_list_table": { "columns": [
+            { "visible": true, "column_type": "meta", "width": 100.0, "meta_name": "status" }
+        ] } }
+    });
+    write(&root.join("envs/prod/organization.json"), &tgt_before);
+
+    let stderr = migrate_stderr(root, &["test", "prod"]);
+
+    assert!(
+        stderr.contains("no `settings` key"),
+        "migrate must warn about the source's missing `settings`: {stderr}"
+    );
+    let tgt_after = read_json(&root.join("envs/prod/organization.json"));
+    assert_eq!(
+        tgt_after, tgt_before,
+        "the target's organization.json must be left byte-untouched: {tgt_after}"
+    );
+}
+
 /// `--mirror` must never prune the target's org file, even when the source env
 /// has never been pulled.
 #[test]

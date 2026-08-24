@@ -55,8 +55,12 @@ pub async fn push(
     // An absent `settings` is NOT the same as an empty one. rdc cannot tell
     // "this project does not manage org settings" from "clear them", and
     // guessing the second wipes the remote — so it does neither. Clearing is
-    // written explicitly, as `"settings": {}`.
-    let Some(settings) = local.get("settings") else {
+    // written explicitly, as `"settings": {}`. A `settings: null` is treated
+    // exactly the same as an absent key — it is not a probed API shape (only
+    // `{}` is), and `migrate` can produce it (see `reconcile_target_identity`),
+    // so guessing there too would risk the same wipe.
+    let settings = local.get("settings").filter(|v| !v.is_null());
+    let Some(settings) = settings else {
         progress.event(
             Action::Warn,
             &format!(
@@ -136,14 +140,45 @@ pub async fn push(
         return Ok((0, 1));
     }
 
-    let body = serde_json::json!({ "settings": settings });
+    // Resolve any `rdc://` refs before the wire, matching every other push
+    // driver (e.g. `labels.rs`, `rules.rs`, `queues.rs`). Not reachable with
+    // today's column shape — a document-list column never carries a portable
+    // ref — but `portabilize_value` walks every string leaf regardless of
+    // field name, and `migrate` actively rewrites refs inside a promoted
+    // body, so the organization IS a kind that could acquire an `rdc://…`
+    // string offline. Skipping this would PATCH that literal string into a
+    // remote setting.
+    let mut settings_resolved = settings.clone();
+    crate::snapshot::refs::resolve_value(&mut settings_resolved, lockfile);
+    let body = serde_json::json!({ "settings": settings_resolved });
     let updated = client
         .update_organization(id, &body, Some(progress.clone()))
         .await
         .with_context(|| format!("patching organization settings for env '{env}'"))?;
 
-    // Compare local vs the server's response, ignoring `settings` (the
-    // subtree rdc actually manages) and the hidden stamps
+    // Canonical write-back bytes: the same a pull would produce, so the next
+    // sync sees `Clean` (this is also what normalizes `width: 120` to the
+    // server's `120.0`). Computed here, ahead of the divergence diff below,
+    // because the diff must compare like with like: `local` (read from disk
+    // above) is already in portable `rdc://…` ref form — that's how pull
+    // wrote it — while the raw server response is not. Diffing raw-vs-portable
+    // would flag every portable-kind field the org body happens to carry
+    // (e.g. `workspaces`) as "diverged" on every single push, even though the
+    // write-back below is about to portabilize it right back to what `local`
+    // already says. That would be a false alarm on the one notice here that
+    // has to stay trustworthy, so the comparison uses the portabilized bytes
+    // instead.
+    let value = serde_json::to_value(&updated).context("serializing patched organization")?;
+    let art = crate::snapshot::codec::codec("organization")
+        .expect("organization codec must exist")
+        .disk_bytes(&value)
+        .context("serializing organization")?;
+    let json = crate::cli::pull::common::portabilize_proposed(&art.json, lockfile);
+    let portabilized: serde_json::Value =
+        serde_json::from_slice(&json).context("parsing portabilized organization")?;
+
+    // Compare local vs the portabilized server response, ignoring `settings`
+    // (the subtree rdc actually manages) and the hidden stamps
     // (`modified_at`/`modified_by` — stripped from disk by the codec, so
     // they'd always look "locally absent" and falsely diverge; a stamp bump
     // alone must never read as a discarded edit). Any other top-level key
@@ -151,11 +186,10 @@ pub async fn push(
     // the canonical write-back below — name exactly those keys, not the
     // full `unmanaged` list, so the warning is accurate rather than noise
     // on every push.
-    let value = serde_json::to_value(&updated).context("serializing patched organization")?;
     let diverged: Vec<String> = {
         const IGNORED: &[&str] = &["settings", "modified_at", "modified_by"];
         let local_obj = local.as_object();
-        let remote_obj = value.as_object();
+        let remote_obj = portabilized.as_object();
         let mut keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         if let Some(o) = local_obj {
             keys.extend(o.keys().map(String::as_str));
@@ -179,14 +213,6 @@ pub async fn push(
         );
     }
 
-    // Canonical write-back: the same bytes a pull would produce, so the next
-    // sync sees `Clean` (this is also what normalizes `width: 120` to the
-    // server's `120.0`).
-    let art = crate::snapshot::codec::codec("organization")
-        .expect("organization codec must exist")
-        .disk_bytes(&value)
-        .context("serializing organization")?;
-    let json = crate::cli::pull::common::portabilize_proposed(&art.json, lockfile);
     let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
     crate::state::base_cache::write_disk_and_cache(paths, path, &json)?;
     crate::cli::pull::common::record_object(

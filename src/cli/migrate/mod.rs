@@ -2491,15 +2491,43 @@ pub fn run_at(
         // id/url/name/ui_settings/metadata from the target's file. With no
         // target file there is nothing to restore, so skip rather than emit a
         // settings-only `organization.json` no pull would ever produce.
-        if rel.as_path() == Path::new("organization.json") && !tgt_root.join(rel).exists() {
-            log.event(
-                crate::log::Action::Warn,
-                &format!(
-                    "envs/{tgt}/organization.json does not exist yet — organization \
-                     settings not promoted; run `rdc sync {tgt}` to pull it first"
-                ),
-            );
-            continue;
+        if rel.as_path() == Path::new("organization.json") {
+            if !tgt_root.join(rel).exists() {
+                log.event(
+                    crate::log::Action::Warn,
+                    &format!(
+                        "envs/{tgt}/organization.json does not exist yet — organization \
+                         settings not promoted; run `rdc sync {tgt}` to pull it first"
+                    ),
+                );
+                continue;
+            }
+
+            // Symmetric guard on the SOURCE side. `reconcile_target_identity`
+            // derives its "env field" set from `cross_env_body`'s retain-list,
+            // which only keeps a top-level `settings` key when the SOURCE body
+            // has one. With no source `settings` (missing or `null` — treated
+            // the same, see the push driver), that set is empty: every key the
+            // source DOES have gets restored from the target, but `settings`
+            // itself was never a source key, so it is never re-inserted — the
+            // promoted file loses the target's own `settings` outright, a
+            // state no pull would ever produce. Skip instead: leave the
+            // target's `organization.json` byte-untouched, exactly as if this
+            // file were absent from the migration.
+            let src_has_settings = std::fs::read(src_root.join(rel))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .is_some_and(|v| v.get("settings").is_some_and(|s| !s.is_null()));
+            if !src_has_settings {
+                log.event(
+                    crate::log::Action::Warn,
+                    &format!(
+                        "envs/{src}/organization.json has no `settings` key — organization \
+                         settings not promoted; the target's own `settings` is left untouched"
+                    ),
+                );
+                continue;
+            }
         }
 
         let dst_rel = remap_relative(rel, &mapping);
