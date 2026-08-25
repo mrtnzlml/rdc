@@ -34,8 +34,8 @@ core path and it is a separate, safety-bearing design (see N1, N2).
 
 Nothing below is inferred. Service facts come from probes run 2026-08-24 against
 a test org on `api.elis.rossum.ai/v1` and its Data Storage service; rdc-level
-numbers come from the real release binary traced through
-`retry::send_with_retry`; code facts cite the tree.
+numbers come from the real release binary traced through `RDC_TRACE_HTTP`
+(see D11); code facts cite the tree.
 
 Code citations are line-pinned to **`108e320`**. This tree moves fast — 20
 commits landed while this document was being written — so re-check a line

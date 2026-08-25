@@ -34,6 +34,62 @@ use reqwest::{Response, StatusCode};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Opt-in HTTP trace. Set `RDC_TRACE_HTTP=<path>` to append one CSV line per
+/// HTTP **attempt** made by either client — the core API and Data Storage both
+/// funnel through [`send_with_retry`], so one file captures the whole run:
+///
+/// ```text
+/// epoch_ms,limiter_wait_ms,duration_ms,status,desc
+/// ```
+///
+/// `limiter_wait_ms` is time spent blocked on the token bucket (`0.0` for a
+/// client with no limiter), `duration_ms` is the round trip, `status` is the
+/// HTTP status code or `ERR` for a transport failure. `desc` is last and is
+/// **not** quoted — it may itself contain commas, so split on the first four.
+///
+/// The sink is a process-wide `OnceLock`: the variable is read once, on the
+/// first request, and never re-read. Disabled (the default) costs one atomic
+/// load per attempt and writes nothing.
+mod trace {
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+
+    fn sink() -> Option<&'static Mutex<std::fs::File>> {
+        static SINK: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+        SINK.get_or_init(|| {
+            let path = std::env::var("RDC_TRACE_HTTP").ok()?;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()?;
+            Some(Mutex::new(file))
+        })
+        .as_ref()
+    }
+
+    /// Cheap gate so a disabled trace never formats a status string.
+    pub fn enabled() -> bool {
+        sink().is_some()
+    }
+
+    pub fn record(limiter_wait_ms: f64, duration_ms: f64, status: &str, desc: &str) {
+        let Some(sink) = sink() else { return };
+        let epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        // A poisoned lock or a failed write must never take down a sync —
+        // this is diagnostics, not state.
+        if let Ok(mut file) = sink.lock() {
+            let _ = writeln!(
+                file,
+                "{epoch_ms:.1},{limiter_wait_ms:.1},{duration_ms:.1},{status},{desc}"
+            );
+        }
+    }
+}
+
 const MAX_ATTEMPTS: u32 = 5;
 const MAX_SLEEP_SECS: u64 = 60;
 
@@ -62,13 +118,7 @@ pub async fn send_with_retry(
     // taking a fresh token before the re-send keeps the proactive cap
     // accurate even when several requests are mid-retry.
     for attempt in 0..MAX_ATTEMPTS - 1 {
-        if let Some(l) = limiter {
-            l.acquire().await;
-        }
-        let resp = build()
-            .send()
-            .await
-            .with_context(|| format!("{desc} (attempt {})", attempt + 1))?;
+        let resp = send_once(&mut build, desc, limiter, attempt + 1).await?;
         let Some(reason) = retriable_reason(resp.status()) else {
             return Ok(resp);
         };
@@ -79,13 +129,41 @@ pub async fn send_with_retry(
         let wait = retry_after(&resp).unwrap_or_else(|| backoff(attempt));
         tokio::time::sleep(wait).await;
     }
+    send_once(&mut build, desc, limiter, MAX_ATTEMPTS).await
+}
+
+/// One rate-limited attempt, traced when `RDC_TRACE_HTTP` is set. Split out of
+/// [`send_with_retry`] so the retry loop and the final attempt share exactly
+/// one send path — and therefore one trace point.
+async fn send_once(
+    build: &mut impl FnMut() -> reqwest::RequestBuilder,
+    desc: &str,
+    limiter: Option<&Arc<RateLimiter>>,
+    attempt: u32,
+) -> Result<Response> {
+    let gate = std::time::Instant::now();
     if let Some(l) = limiter {
         l.acquire().await;
     }
-    build()
+    let limiter_wait_ms = gate.elapsed().as_secs_f64() * 1000.0;
+    let sent = std::time::Instant::now();
+    let out = build()
         .send()
         .await
-        .with_context(|| format!("{desc} (attempt {})", MAX_ATTEMPTS))
+        .with_context(|| format!("{desc} (attempt {attempt})"));
+    if trace::enabled() {
+        let status = match &out {
+            Ok(r) => r.status().as_str().to_string(),
+            Err(_) => "ERR".to_string(),
+        };
+        trace::record(
+            limiter_wait_ms,
+            sent.elapsed().as_secs_f64() * 1000.0,
+            &status,
+            desc,
+        );
+    }
+    out
 }
 
 /// Returns the human-readable reason a status is retriable, or None if not.
