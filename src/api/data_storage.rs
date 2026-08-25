@@ -23,18 +23,23 @@
 //! parent domain plus a service path (`elis.rossum.ai/svc/data-storage/api`).
 
 use crate::api::ApiError;
+use crate::api::rate_limit::RateLimiter;
 use crate::api::retry::ProgressHandle;
 use crate::model::Collection;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct DataStorageClient {
     base_url: String,
     token: String,
     http: Client,
+    /// Shared across clones so one logical client keeps one bucket, matching
+    /// the server's per-token scope (see [`RateLimiter::rossum_data_storage`]).
+    limiter: Arc<RateLimiter>,
 }
 
 /// Generic envelope wrapping every Data Storage response. Write
@@ -76,7 +81,12 @@ struct ReplaceResult {
 impl DataStorageClient {
     pub fn new(base_url: String, token: String) -> Result<Self> {
         let http = crate::api::build_http_client()?;
-        Ok(Self { base_url, token, http })
+        Ok(Self {
+            base_url,
+            token,
+            http,
+            limiter: Arc::new(RateLimiter::rossum_data_storage()),
+        })
     }
 
     /// `POST /v1/collections/list` with `{nameOnly: false}` returns full
@@ -396,10 +406,9 @@ impl DataStorageClient {
         progress: ProgressHandle,
     ) -> Result<(reqwest::StatusCode, Envelope<Value>)> {
         let url = format!("{}{}", self.base_url, path);
-        // Data Storage is a separate service from the core API and is not
-        // subject to the `default.core_api` 10 req/s policy that
-        // [`RossumClient`] paces itself against — no client-side limiter
-        // here.
+        // Data Storage is a separate service from the core API and throttles
+        // independently on the same token, so it gets its OWN bucket rather
+        // than spending core tokens on calls nobody asked us to pace.
         let resp = crate::api::retry::send_with_retry(
             || self.http
                 .post(&url)
@@ -407,7 +416,7 @@ impl DataStorageClient {
                 .json(&body),
             &format!("POST {url}"),
             progress,
-            None,
+            Some(&self.limiter),
         ).await?;
         let status = resp.status();
         if !status.is_success() {
@@ -707,5 +716,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(matched, 1);
+    }
+
+    /// Spec D1: every Data Storage request goes through the client's own
+    /// bucket. 40 concurrent list calls on one client must take at least the
+    /// bucket's own floor — 30 immediate + 10 more at 30/s = 333ms — proving
+    /// the limiter is actually threaded into `send_envelope` and that clones
+    /// share it. Real clock: `reqwest` does real IO, so the paused-time trick
+    /// used in `rate_limit`'s unit tests does not apply here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn data_storage_requests_are_paced_by_the_client_bucket() {
+        use futures::stream::StreamExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/indexes/list"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "code": "ok", "result": [] })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = DataStorageClient::new(server.uri(), "TEST".to_string()).unwrap();
+        let start = std::time::Instant::now();
+        // Clone per task: a clone must share the bucket, not get a fresh one.
+        let results: Vec<Result<Vec<Value>>> = futures::stream::iter(0..40)
+            .map(|_| {
+                let c = client.clone();
+                async move { c.list_indexes("vendors", None).await }
+            })
+            .buffer_unordered(40)
+            .collect()
+            .await;
+        assert!(results.iter().all(|r| r.is_ok()), "all 40 must succeed");
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(300),
+            "40 requests through a 30/s burst-30 bucket cannot finish faster \
+             than ~333ms; took {:?} — the limiter is not wired in",
+            start.elapsed(),
+        );
     }
 }

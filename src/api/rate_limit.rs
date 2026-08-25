@@ -60,6 +60,25 @@ impl RateLimiter {
         Self::new(10.0, 10.0)
     }
 
+    /// Bucket for Rossum's **Data Storage** service (MDH). A different
+    /// service from the core API, throttled independently on the same token:
+    /// probes on 2026-08-24 saw 80 concurrent POSTs return 0 × 429 (~143
+    /// req/s) and 320 requests at concurrency 20 sustain 36-63 req/s with a
+    /// flat p95 and 0 × 429, *while* the core API 429'd at its 11th
+    /// concurrent request on that same token.
+    ///
+    /// 30/s burst 30 is therefore a deliberate margin well under anything
+    /// that throttled, not a measured ceiling — no rate-limit header is
+    /// served by either service to read a real policy off (the
+    /// `x-limiter-core-api` header quoted above is no longer present on
+    /// responses, so re-verify before relying on it). If a cluster turns out
+    /// to be stricter, this constant is the one line to change;
+    /// [`crate::api::retry::send_with_retry`]'s `Retry-After` handling is the
+    /// backstop underneath it.
+    pub fn rossum_data_storage() -> Self {
+        Self::new(30.0, 30.0)
+    }
+
     /// Build a custom-rate limiter. Initial token count = `capacity`
     /// (so the first burst of `capacity` requests proceeds immediately,
     /// matching the server's burst policy).
@@ -169,6 +188,47 @@ mod tests {
             elapsed >= Duration::from_millis(1900) && elapsed <= Duration::from_millis(2200),
             "30 contending tokens at 10/s with burst 10 should take ~2s, got {:?}",
             elapsed,
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn data_storage_bucket_is_thirty_per_second_burst_thirty() {
+        // Spec D1: 30/s, burst 30. Probed ceilings are far higher (S3: 80
+        // concurrent → 0 × 429; S4: sustained 36-63 req/s → 0 × 429); 30 is a
+        // deliberate margin, not the measured limit.
+        let lim = RateLimiter::rossum_data_storage();
+        let start = tokio::time::Instant::now();
+        for _ in 0..30 {
+            lim.acquire().await;
+        }
+        assert!(
+            start.elapsed() < Duration::from_millis(5),
+            "the first 30 must be a burst, took {:?}",
+            start.elapsed(),
+        );
+        lim.acquire().await;
+        assert!(
+            start.elapsed() >= Duration::from_millis(33),
+            "the 31st must wait one 1/30s refill, took {:?}",
+            start.elapsed(),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn core_bucket_is_untouched_by_the_data_storage_bucket() {
+        // Spec D2/S2: the core policy is correctly calibrated at 10/s burst
+        // 10 and must not drift when a second bucket is introduced.
+        let lim = RateLimiter::rossum_core_api();
+        let start = tokio::time::Instant::now();
+        for _ in 0..10 {
+            lim.acquire().await;
+        }
+        assert!(start.elapsed() < Duration::from_millis(5));
+        lim.acquire().await;
+        assert!(
+            start.elapsed() >= Duration::from_millis(99),
+            "core must still refill at 10/s, took {:?}",
+            start.elapsed(),
         );
     }
 }
