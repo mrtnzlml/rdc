@@ -3143,7 +3143,13 @@ Expected: PASS, all binaries. Note the lib and `cli_sync` counts in the commit b
 - [ ] **Step 2: Lint**
 
 Run: `cargo clippy -p rdc --all-targets --locked -- -D warnings`
-Expected: no warnings. Do **not** run `cargo fmt` — this repo is not fmt-clean under the local rustfmt and a repo-wide format would bury the change.
+Expected: **exactly these three pre-existing errors and no others** — they were already on `main` at this plan's base commit `05678ee`, in files no task here touches, under a local toolchain (rustc/clippy 1.95.0) that is ahead of what the repo was last linted against:
+
+- `src/cli/sync/mod.rs:886` — `collapsible_if` (from `f077d62`)
+- `src/cli/migrate/mod.rs:3556` — `field_reassign_with_default` (from `9192bb9`)
+- `src/cli/migrate/mod.rs:3699` — `field_reassign_with_default` (from `9192bb9`)
+
+A fourth finding, or any finding in a file this plan touched, is a regression — fix it. Do not fix these three: they are outside this plan's scope and this tree is shared with a concurrent worker, so editing `sync/mod.rs` or `migrate/mod.rs` risks colliding with work in progress. Do **not** run `cargo fmt` either — this repo is not fmt-clean under the local rustfmt and a repo-wide format would bury the change.
 
 - [ ] **Step 3: Property tests explicitly**
 
