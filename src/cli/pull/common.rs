@@ -147,7 +147,6 @@ pub async fn list_remote(
         Workflows(Vec<crate::model::Workflow>),
         WorkflowSteps(Vec<crate::model::WorkflowStep>),
         EmailTemplates(Vec<crate::model::EmailTemplate>),
-        Mdh(crate::cli::pull::mdh::MdhListed),
     }
 
     #[derive(Clone, Copy)]
@@ -164,7 +163,6 @@ pub async fn list_remote(
         Workflows,
         WorkflowSteps,
         EmailTemplates,
-        Mdh,
     }
 
     let kinds = [
@@ -180,11 +178,16 @@ pub async fn list_remote(
         Kind::Workflows,
         Kind::WorkflowSteps,
         Kind::EmailTemplates,
-        Kind::Mdh,
     ];
 
     progress.start_phase(Action::List, "listing", 0);
-    let results: Vec<Listed> = futures::stream::iter(kinds.iter().copied())
+    // The core kinds share one bounded stream against the core API's 10 req/s
+    // bucket. MDH talks to a DIFFERENT service with its OWN bucket (spec S5:
+    // the two throttle independently on the same token), so it runs as a
+    // sibling rather than competing for a core slot — and, from the task that
+    // adds the index-set prefetch, so the whole MDH phase overlaps core
+    // listing instead of following it.
+    let core = futures::stream::iter(kinds.iter().copied())
         .map(|kind| {
             async move {
                 // Force a yield BEFORE each list call so the runtime can
@@ -286,22 +289,24 @@ pub async fn list_remote(
                         progress.event(Action::List, &format!("email_templates ({})", r.len()));
                         anyhow::Ok(Listed::EmailTemplates(r))
                     }
-                    Kind::Mdh => {
-                        let r = crate::cli::pull::mdh::list(env_cfg, token, progress)
-                            .await
-                            .with_context(|| format!("listing MDH datasets for env '{env}'"))?;
-                        progress.event(
-                            Action::List,
-                            &format!("mdh_datasets ({})", r.collections.len()),
-                        );
-                        anyhow::Ok(Listed::Mdh(r))
-                    }
                 }
             }
         })
         .buffer_unordered(PULL_FANOUT)
-        .try_collect()
-        .await?;
+        .try_collect::<Vec<Listed>>();
+
+    let mdh_arm = async {
+        let r = crate::cli::pull::mdh::list(env_cfg, token, progress)
+            .await
+            .with_context(|| format!("listing MDH datasets for env '{env}'"))?;
+        progress.event(
+            Action::List,
+            &format!("mdh_datasets ({})", r.collections.len()),
+        );
+        anyhow::Ok(r)
+    };
+
+    let (results, mdh) = tokio::try_join!(core, mdh_arm)?;
     progress.end_phase();
 
     // Re-group the results into typed bindings. Each variant appears
@@ -318,7 +323,6 @@ pub async fn list_remote(
     let mut workflows: Option<Vec<crate::model::Workflow>> = None;
     let mut workflow_steps: Option<Vec<crate::model::WorkflowStep>> = None;
     let mut email_templates: Option<Vec<crate::model::EmailTemplate>> = None;
-    let mut mdh: Option<crate::cli::pull::mdh::MdhListed> = None;
     for r in results {
         match r {
             Listed::Organization(v) => organization = Some(v),
@@ -333,7 +337,6 @@ pub async fn list_remote(
             Listed::Workflows(v) => workflows = Some(v),
             Listed::WorkflowSteps(v) => workflow_steps = Some(v),
             Listed::EmailTemplates(v) => email_templates = Some(v),
-            Listed::Mdh(v) => mdh = Some(v),
         }
     }
     let organization = organization.expect("organization listed");
@@ -348,7 +351,6 @@ pub async fn list_remote(
     let workflows = workflows.expect("workflows listed");
     let workflow_steps = workflow_steps.expect("workflow_steps listed");
     let email_templates = email_templates.expect("email_templates listed");
-    let mdh = mdh.expect("mdh listed");
     let inboxes_by_queue_id = inboxes_by_queue(inboxes);
 
     // Per-queue schema prefetch. The `/schemas` list omits `content`, so

@@ -12781,3 +12781,90 @@ async fn sync_refuses_oversized_field_before_any_network_call() {
         after - before
     );
 }
+
+/// Spec D5: the MDH listing must be dispatched as a SIBLING of the core list
+/// stream, not as its 13th arm.
+///
+/// Every core list endpoint is delayed 200ms; the Data Storage listing is not.
+/// As a sibling, the Data Storage request goes out in the very first wave, so
+/// it lands among the first handful of requests the server sees. As the 13th
+/// arm of a `buffer_unordered(5)` stream it could not start until two waves of
+/// core lists had completed, putting it eleventh or later.
+///
+/// This asserts arrival ORDER, which `received_requests()` preserves, rather
+/// than a wall-clock threshold — the scheduling is the thing under test.
+#[tokio::test]
+async fn mdh_listing_is_dispatched_alongside_the_core_list_stream() {
+    let server = MockServer::start().await;
+    let empty = serde_json::json!({ "pagination": { "next": null }, "results": [] });
+    let slow = |body: serde_json::Value| {
+        ResponseTemplate::new(200)
+            .set_body_json(body)
+            .set_delay(std::time::Duration::from_millis(200))
+    };
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(slow(fixture("organization.json")))
+        .mount(&server)
+        .await;
+    for ep in [
+        "/api/v1/workspaces",
+        "/api/v1/queues",
+        "/api/v1/inboxes",
+        "/api/v1/hooks",
+        "/api/v1/rules",
+        "/api/v1/labels",
+        "/api/v1/engines",
+        "/api/v1/engine_fields",
+        "/api/v1/workflows",
+        "/api/v1/workflow_steps",
+        "/api/v1/email_templates",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(ep))
+            .respond_with(slow(empty.clone()))
+            .mount(&server)
+            .await;
+    }
+    // Data Storage, on the same host: `derive_data_storage_base` turns
+    // `<uri>/api/v1` into `<uri>/svc/data-storage/api`. Answer instantly.
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/collections/list"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "code": "ok", "result": [] })),
+        )
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev", "--no-push"])
+        .assert()
+        .success();
+
+    let requests = server.received_requests().await.unwrap();
+    let ds_index = requests
+        .iter()
+        .position(|r| r.url.path() == "/svc/data-storage/api/v1/collections/list")
+        .expect("the Data Storage listing must happen");
+    assert!(
+        ds_index < 6,
+        "MDH listing must go out in the first wave, not queued behind the core \
+         list stream; it arrived at position {ds_index} of {}",
+        requests.len(),
+    );
+}
