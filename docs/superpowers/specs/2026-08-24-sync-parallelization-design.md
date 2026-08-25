@@ -37,6 +37,10 @@ a test org on `api.elis.rossum.ai/v1` and its Data Storage service; rdc-level
 numbers come from the real release binary traced through
 `retry::send_with_retry`; code facts cite the tree.
 
+Code citations are line-pinned to **`108e320`**. This tree moves fast — 20
+commits landed while this document was being written — so re-check a line
+number before trusting it rather than assuming the drift is cosmetic.
+
 ### Service limits
 
 | # | Fact | Consequence |
@@ -82,14 +86,14 @@ Medians of repeated runs against a snapshot of 3 queues, 34 hooks, 96 rules,
 
 | # | Fact |
 |---|---|
-| C1 | **Both** clients funnel every request through `retry::send_with_retry` — a single pacing and instrumentation point. DS passes `limiter: None` (`api/data_storage.rs:409`). |
+| C1 | **Both** clients funnel every request through `retry::send_with_retry` — a single pacing and instrumentation point. DS passes `limiter: None` (`api/data_storage.rs:410`). |
 | C2 | `fetch_index_set` (`cli/pull/mdh.rs:544`) awaits `list_indexes` **then** `list_search_indexes`. Two independent calls, serialized. |
 | C3 | `plan_mdh_index_edits` (`cli/pull/mdh.rs:370`) is a plain sequential `for` loop. |
 | C4 | MDH `collections/list` is one arm of the **same** `buffer_unordered(PULL_FANOUT)` as the 13 core list kinds (`cli/pull/common.rs:187`–`302`). Traced start: t=1.05s, queued behind 11 core lists. |
-| C5 | `slug_to_collection` (`cli/sync/execute.rs:3764`) covers **every** catalog collection, and the `subset` handed to `process` (`execute.rs:3965`) is all of them. So a real sync already fetches index sets for every collection. |
-| C6 | **Four** sites duplicate the same slug computation over `catalog.mdh.collections`: `mdh.rs:186`, `mdh.rs:384`, `mdh.rs:752`, `execute.rs:3764` — all `crate::slug::slugify_unique` in listing order. `plan_mdh_index_edits` carries a comment warning that a divergence would silently target the wrong collection. |
+| C5 | `slug_to_collection` (`cli/sync/execute.rs:3814`) covers **every** catalog collection, and the `subset` handed to `process` (`execute.rs:4043`) is all of them. So a real sync already fetches index sets for every collection. |
+| C6 | **Four** sites duplicate the same slug computation over `catalog.mdh.collections`: `mdh.rs:186`, `mdh.rs:384`, `mdh.rs:752`, `execute.rs:3814` — all `crate::slug::slugify_unique` in listing order. `plan_mdh_index_edits` carries a comment warning that a divergence would silently target the wrong collection. |
 | C7 | `resolve_value_deferring(&mut Value, &Lockfile)` borrows the lockfile **immutably** and runs on **both** the create and update paths for hooks / queues / engines. |
-| C8 | **No test asserts HTTP request order or push event order.** Every `received_requests()` assertion uses `.find()` or `.filter().count()`; the one stderr assertion (`tests/cli_sync.rs:10210`) is a single `contains`. |
+| C8 | **No test asserts HTTP request order or push event order.** Every `received_requests()` assertion uses `.find()` or `.filter().count()`; the one stderr assertion (`tests/cli_sync.rs:10895`) is a single `contains`. |
 | C9 | Push write-back needs `&mut Lockfile` (`lockfile.upsert`) and the filesystem; everything before the PATCH needs only `&Lockfile`. |
 | C10 | `DataStorageClient` is `#[derive(Clone)]`, so an `Arc<RateLimiter>` field gives every clone one shared bucket — matching the per-token server scope. |
 
@@ -100,7 +104,7 @@ Medians of repeated runs against a snapshot of 3 queues, 34 hooks, 96 rules,
 **D1 — Data Storage gets its own limiter, same mechanism.** Add
 `RateLimiter::rossum_data_storage()` = **30/s, burst 30**, stored as
 `Arc<RateLimiter>` on `DataStorageClient` and threaded into `send_envelope`
-(replacing the `None` at `data_storage.rs:409`). The doc comment records S3/S4
+(replacing the `None` at `data_storage.rs:410`). The doc comment records S3/S4
 the way `rate_limit.rs` already records the core policy, and S7 — that the
 header is gone and the numbers come from probes.
 
