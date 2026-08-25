@@ -374,18 +374,29 @@ pub(crate) async fn plan_mdh_index_edits(
     if !listed.available {
         return Ok(items);
     }
-    // Slug every collection exactly as the executor / `plan_mdh` do (listing
-    // order, unique dedup) so forecast slugs match the real run byte-for-byte.
-    for (slug, c) in listed.datasets() {
-        let ix_path = paths.dataset_dir(slug).join("indexes.json");
-        // No local dataset dir → `plan_mdh` stage 3 already forecasts "(new)";
-        // don't fetch (nothing to compare against) or double-report.
-        if !ix_path.is_file() {
-            continue;
-        }
 
-        let set = fetch_index_set(&listed.client, &c.name, progress).await?;
-        let proposed = proposed_index_bytes(&set)?;
+    // Offline pass: decide WHICH datasets need a fetch. A collection with no
+    // local `indexes.json` is territory `plan_mdh` stage 3 already forecasts
+    // as "(new)" — fetching it would have nothing to compare against and
+    // would double-report. Scope is therefore identical to the sequential
+    // version; only the scheduling below changes.
+    let wanted: Vec<(String, String)> = listed
+        .datasets()
+        .filter(|(slug, _)| paths.dataset_dir(slug).join("indexes.json").is_file())
+        .map(|(slug, c)| (slug.to_string(), c.name.clone()))
+        .collect();
+
+    // One batched fetch, shared with the real pull's sub-phase B so the
+    // preview can never schedule differently from the run it previews.
+    let sets = fetch_index_sets(&listed.client, &wanted, progress).await?;
+
+    // Sequential compare pass, in dataset listing order.
+    for (slug, name) in &wanted {
+        let ix_path = paths.dataset_dir(slug).join("indexes.json");
+        let set = sets
+            .get(slug)
+            .expect("fetch_index_sets returns an entry for every requested slug");
+        let proposed = proposed_index_bytes(set)?;
         let base = lockfile
             .objects
             .get("mdh_indexes")
@@ -407,7 +418,7 @@ pub(crate) async fn plan_mdh_index_edits(
             // or double-report. This is also what keeps an unflagged
             // dataset's cost unchanged: no manual opt-in, no fetch, ever.
             if data_path.is_file() {
-                let rows = listed.client.find_all(&c.name, Some(progress.clone())).await?;
+                let rows = listed.client.find_all(name, Some(progress.clone())).await?;
                 let proposed = crate::snapshot::mdh_data::to_jsonl(&rows)?;
                 let base = lockfile
                     .objects
@@ -1707,6 +1718,98 @@ mod tests {
         assert!(
             items.is_empty(),
             "no local data.jsonl must forecast no row item, and cost no row fetch: {items:?}"
+        );
+    }
+
+    /// Spec D4/B9: the dry-run index forecast must fan out across datasets
+    /// instead of walking them one round trip at a time — while fetching the
+    /// SAME set of datasets it always did (the ones with a local
+    /// `indexes.json`) and returning items in listing order.
+    ///
+    /// Three datasets have a local file and one does not. With every listing
+    /// delayed 200ms, sequential costs >= 6 x 200ms; concurrent costs ~200ms.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plan_mdh_index_edits_fans_out_across_datasets() {
+        use crate::state::{Lockfile, ObjectEntry, content_hash};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let delayed = |body: serde_json::Value| {
+            ResponseTemplate::new(200)
+                .set_body_json(body)
+                .set_delay(std::time::Duration::from_millis(200))
+        };
+        // Env advertises index "acct"; the local snapshots below say "acct_v2".
+        Mock::given(method("POST"))
+            .and(path("/v1/indexes/list"))
+            .respond_with(delayed(serde_json::json!({
+                "code": "ok",
+                "result": [ { "name": "acct", "key": { "accountName": 1 } } ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search_indexes/list"))
+            .respond_with(delayed(serde_json::json!({ "code": "ok", "result": [] })))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        let local = b"{\n  \"regular\": [\n    {\n      \"key\": {\n        \"accountName\": 1\n      },\n      \"name\": \"acct_v2\"\n    }\n  ],\n  \"search\": []\n}\n";
+        let mut lockfile = Lockfile::default();
+        let mut mdh = std::collections::BTreeMap::new();
+        for slug in ["a-set", "b-set", "c-set"] {
+            let dir = paths.dataset_dir(slug);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("indexes.json"), local).unwrap();
+            mdh.insert(
+                slug.to_string(),
+                ObjectEntry {
+                    id: 0,
+                    modified_at: None,
+                    modified_by: None,
+                    content_hash: Some(content_hash(local, &Lockfile::default())),
+                    secrets_hash: None,
+                },
+            );
+        }
+        lockfile.objects.insert("mdh_indexes".to_string(), mdh);
+
+        let mk = |name: &str| Collection { name: name.to_string(), extra: Default::default() };
+        let listed = MdhListed::new(
+            DataStorageClient::new(server.uri(), "TEST".to_string()).unwrap(),
+            // "d-set" has NO local dataset dir: it must not be fetched.
+            vec![mk("a-set"), mk("b-set"), mk("c-set"), mk("d-set")],
+            true,
+        );
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+
+        let start = std::time::Instant::now();
+        let items = plan_mdh_index_edits(&listed, &lockfile, &paths, &progress)
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            items.iter().map(|i| i.line.clone()).collect::<Vec<_>>(),
+            vec![
+                "mdh/a-set (index update)".to_string(),
+                "mdh/b-set (index update)".to_string(),
+                "mdh/c-set (index update)".to_string(),
+            ],
+            "items must stay in dataset listing order, and d-set must be absent"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            6,
+            "scope is unchanged: 3 datasets with a local file x 2 calls; the \
+             one without a local dir is still never fetched"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "3 datasets must overlap; sequential would be >= 1.2s, took {elapsed:?}",
         );
     }
 
