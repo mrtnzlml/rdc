@@ -179,9 +179,12 @@ sends them:
 
 Everything else in the file is informational: `ui_settings` (branding, theme,
 the org's applied feature flags), `metadata`, and the read-only fields the API
-assigns. Editing those locally changes nothing remotely, and the next pull
-reverts them from the env. The push itself leaves them alone: its write-back
-updates `settings` and nothing else. There is no create and no delete: one organization exists per
+assigns. Editing those locally changes nothing remotely, and the push leaves
+them alone too — its write-back updates `settings` and nothing else. The edit
+just sits on disk: while `settings` itself is unchanged there is nothing to
+push, so every sync says so and moves on, and the file stays as you left it.
+It is reverted the next time the org is genuinely pulled, which happens once a
+real `settings` change advances the synced base. There is no create and no delete: one organization exists per
 env, made outside rdc, and deleting `organization.json` is not treated as a
 delete request — rdc cannot tell it apart from an ordinary no-op, because the
 org has no tombstone tracking. That cuts both ways: `rdc sync` does not

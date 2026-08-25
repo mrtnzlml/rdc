@@ -114,8 +114,16 @@ Rules that follow from the API semantics:
   the env's first sync), which forces a fresh pull.
 - **Local edits outside `settings` are not pushed**, and the write-back leaves
   them alone: it replaces `settings` in the on-disk body and keeps every other
-  field as the pull wrote it. Such an edit is reverted by the next pull, like
-  any locally-edited field rdc does not own.
+  field as the pull wrote it.
+
+  Such an edit then PERSISTS rather than being reverted promptly, which is worth
+  stating because it surprised the author: with `settings` unchanged there is
+  nothing to push, so the driver returns the "`settings` unchanged" skip, the
+  lockfile base never advances, and the org keeps classifying `LocalEdit` — so
+  the pull driver never runs for it either. Live-verified: three consecutive
+  syncs each reported `0 changed` and left the edited field alone. It is
+  reverted only once a real `settings` change advances the base, after which the
+  org classifies `RemoteEdit` and the pull rewrites the file.
 
   This supersedes the original design, which wrote the server's response
   wholesale and warned about the top-level keys that differed. Live
