@@ -10,7 +10,7 @@ use crate::slug::slugify_unique;
 use anyhow::{Context, Result};
 use futures::stream::{StreamExt, TryStreamExt};
 use serde_json::Value;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 const KIND: &str = "mdh";
@@ -541,20 +541,72 @@ fn proposed_index_bytes(set: &IndexSet) -> Result<Vec<u8>> {
 
 /// Fetch a collection's regular + search index definitions from the env.
 /// Shared by the pull write path and the dry-run index-edit forecast.
+///
+/// The two listings are independent — spec S6: each REQUIRES its own
+/// `collectionName` (422 without it) and there is no bulk form — so awaiting
+/// them in sequence paid the sum of two round trips for nothing. `try_join!`
+/// makes a dataset cost `max(regular, search)` instead of their sum.
 async fn fetch_index_set(
     client: &DataStorageClient,
     collection_name: &str,
     progress: &Arc<Log>,
 ) -> Result<IndexSet> {
-    let regular = client
-        .list_indexes(collection_name, Some(progress.clone()))
-        .await
-        .with_context(|| format!("listing indexes for '{collection_name}'"))?;
-    let search = client
-        .list_search_indexes(collection_name, Some(progress.clone()))
-        .await
-        .with_context(|| format!("listing search indexes for '{collection_name}'"))?;
+    let (regular, search) = tokio::try_join!(
+        async {
+            client
+                .list_indexes(collection_name, Some(progress.clone()))
+                .await
+                .with_context(|| format!("listing indexes for '{collection_name}'"))
+        },
+        async {
+            client
+                .list_search_indexes(collection_name, Some(progress.clone()))
+                .await
+                .with_context(|| format!("listing search indexes for '{collection_name}'"))
+        },
+    )?;
     Ok(IndexSet { regular, search })
+}
+
+/// Bound on how many datasets' index fetches are outstanding at once.
+///
+/// This is NOT the throughput control. The Data Storage token bucket
+/// ([`crate::api::rate_limit::RateLimiter::rossum_data_storage`], 30/s) is what
+/// actually paces these calls; at the measured 111-372ms per listing a fan-out
+/// of 10 attempts 27-90 req/s, which the bucket then meters down to 30. Raising
+/// this constant buys nothing and only widens the blast radius of a failure.
+pub(crate) const MDH_FANOUT: usize = 10;
+
+/// Fetch index sets for a batch of datasets, concurrently.
+///
+/// Two levels of overlap, both governed by the Data Storage bucket:
+/// `try_join!` WITHIN a dataset (see [`fetch_index_set`]) and
+/// `buffer_unordered(MDH_FANOUT)` ACROSS datasets.
+///
+/// `wanted` is `(dataset_slug, collection_name)` and the returned map is keyed
+/// by **dataset slug**, carrying an entry for every requested slug. This helper
+/// deliberately does not decide WHICH datasets to fetch — each caller keeps its
+/// own scope, so request counts per command stay exactly what they were.
+pub(crate) async fn fetch_index_sets(
+    client: &DataStorageClient,
+    wanted: &[(String, String)],
+    progress: &Arc<Log>,
+) -> Result<BTreeMap<String, IndexSet>> {
+    if wanted.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let fetched: Vec<(String, IndexSet)> = futures::stream::iter(wanted.iter().cloned())
+        .map(|(slug, name)| {
+            let progress = progress.clone();
+            async move {
+                let set = fetch_index_set(client, &name, &progress).await?;
+                Ok::<_, anyhow::Error>((slug, set))
+            }
+        })
+        .buffer_unordered(MDH_FANOUT)
+        .try_collect()
+        .await?;
+    Ok(fetched.into_iter().collect())
 }
 
 /// Pull one manual dataset's rows into `data.jsonl`.
@@ -808,31 +860,19 @@ pub async fn process(
     }
 
     // === Sub-phase B: concurrent index fetches per collection (regular +
-    //            search). Bounded fan-out (see common::PULL_FANOUT); the
-    //            per-token rate limiter is the real throughput cap.
-    let client_ref = &client;
+    //            search), via the shared helper the dry-run forecast also
+    //            uses — so the preview can never schedule differently from
+    //            the run it previews.
     let total = dataset_dirs.len();
     if total == 0 {
         return Ok((0, conflicts));
     }
-    let fetched_result: Result<Vec<(String, IndexSet)>> = futures::stream::iter(
-        dataset_dirs
-            .iter()
-            .map(|(slug, _, c)| (slug.clone(), c.name.clone())),
-    )
-    .map(|(slug, name)| {
-        let progress = progress.clone();
-        async move {
-            let set = fetch_index_set(client_ref, &name, &progress).await?;
-            Ok::<_, anyhow::Error>((slug, set))
-        }
-    })
-    .buffer_unordered(crate::cli::pull::common::PULL_FANOUT)
-    .try_collect()
-    .await;
-    let fetched = fetched_result?;
+    let wanted: Vec<(String, String)> = dataset_dirs
+        .iter()
+        .map(|(slug, _, c)| (slug.clone(), c.name.clone()))
+        .collect();
+    let by_slug = fetch_index_sets(&client, &wanted, progress).await?;
     progress.event(Action::Pull, &format!("mdh_indexes ({total} fetched)"));
-    let by_slug: std::collections::HashMap<String, IndexSet> = fetched.into_iter().collect();
 
     // === Sub-phase C: per-collection indexes.json write decision (sequential
     //            because we mutate ctx.lockfile + counts). The set is
@@ -1929,6 +1969,105 @@ mod tests {
             recorded,
             Some(crate::state::raw_content_hash(local_edited)),
             "base must NOT advance to the local content"
+        );
+    }
+
+    /// Spec D3: the regular and search index listings for ONE dataset are
+    /// independent, so they must overlap. With both mocks delayed 200ms, a
+    /// sequential fetch costs ~400ms and a joined one ~200ms.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetch_index_set_overlaps_regular_and_search() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let delayed = |body: serde_json::Value| {
+            ResponseTemplate::new(200)
+                .set_body_json(body)
+                .set_delay(std::time::Duration::from_millis(200))
+        };
+        Mock::given(method("POST"))
+            .and(path("/v1/indexes/list"))
+            .respond_with(delayed(
+                serde_json::json!({ "code": "ok", "result": [ { "name": "acct" } ] }),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search_indexes/list"))
+            .respond_with(delayed(serde_json::json!({ "code": "ok", "result": [] })))
+            .mount(&server)
+            .await;
+
+        let client = DataStorageClient::new(server.uri(), "TEST".to_string()).unwrap();
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        let start = std::time::Instant::now();
+        let set = fetch_index_set(&client, "gl-codes", &progress).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(set.regular.len(), 1, "regular indexes must still be decoded");
+        assert!(set.search.is_empty(), "search indexes must still be decoded");
+        assert!(
+            elapsed < std::time::Duration::from_millis(350),
+            "the two listings must overlap; sequential would be ~400ms, took {elapsed:?}",
+        );
+    }
+
+    /// Spec D4: `fetch_index_sets` fans out across datasets, keys the result by
+    /// DATASET SLUG (not collection name), returns every requested slug, and
+    /// issues exactly the 2 calls per dataset that S6 makes a floor — no more,
+    /// no fewer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetch_index_sets_keys_by_slug_and_costs_two_calls_per_dataset() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/indexes/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "code": "ok", "result": [ { "name": "acct" } ] }),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search_indexes/list"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "code": "ok", "result": [] })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = DataStorageClient::new(server.uri(), "TEST".to_string()).unwrap();
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        // Slug deliberately differs from the collection name so a helper that
+        // keyed by name would fail this.
+        let wanted = vec![
+            ("gl-codes".to_string(), "GL Codes".to_string()),
+            ("vendors".to_string(), "vendors".to_string()),
+        ];
+        let sets = fetch_index_sets(&client, &wanted, &progress).await.unwrap();
+
+        assert_eq!(
+            sets.keys().collect::<Vec<_>>(),
+            vec!["gl-codes", "vendors"],
+            "the map must be keyed by dataset slug"
+        );
+        assert_eq!(sets["gl-codes"].regular.len(), 1);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            4,
+            "2 datasets x 2 calls (S6 floor) — no bulk form exists to do better"
+        );
+
+        // An empty batch must not touch the network at all.
+        let empty = fetch_index_sets(&client, &[], &progress).await.unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            4,
+            "an empty batch must issue no requests"
         );
     }
 }
