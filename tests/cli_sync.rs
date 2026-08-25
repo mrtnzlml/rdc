@@ -193,24 +193,28 @@ async fn sync_clean_env_does_no_writes() {
     );
 }
 
+/// The core list endpoints `list_remote` fans out over. Shared so a new core
+/// kind is added in one place rather than remembered in several.
+const CORE_LIST_ENDPOINTS: [&str; 11] = [
+    "/api/v1/hooks",
+    "/api/v1/workspaces",
+    "/api/v1/queues",
+    "/api/v1/inboxes",
+    "/api/v1/rules",
+    "/api/v1/labels",
+    "/api/v1/engines",
+    "/api/v1/engine_fields",
+    "/api/v1/workflows",
+    "/api/v1/workflow_steps",
+    "/api/v1/email_templates",
+];
+
 /// Helper: mock every Rossum listing endpoint with an empty body. The
 /// per-test caller can then override specific endpoints with real
 /// fixtures.
 async fn mock_empty_lists_except(server: &MockServer, override_paths: &[&str]) {
     let empty = serde_json::json!({ "pagination": { "next": null }, "results": [] });
-    for ep in [
-        "/api/v1/hooks",
-        "/api/v1/workspaces",
-        "/api/v1/queues",
-        "/api/v1/inboxes",
-        "/api/v1/rules",
-        "/api/v1/labels",
-        "/api/v1/engines",
-        "/api/v1/engine_fields",
-        "/api/v1/workflows",
-        "/api/v1/workflow_steps",
-        "/api/v1/email_templates",
-    ] {
+    for ep in CORE_LIST_ENDPOINTS {
         if override_paths.contains(&ep) {
             continue;
         }
@@ -12807,19 +12811,7 @@ async fn mdh_listing_is_dispatched_alongside_the_core_list_stream() {
         .respond_with(slow(fixture("organization.json")))
         .mount(&server)
         .await;
-    for ep in [
-        "/api/v1/workspaces",
-        "/api/v1/queues",
-        "/api/v1/inboxes",
-        "/api/v1/hooks",
-        "/api/v1/rules",
-        "/api/v1/labels",
-        "/api/v1/engines",
-        "/api/v1/engine_fields",
-        "/api/v1/workflows",
-        "/api/v1/workflow_steps",
-        "/api/v1/email_templates",
-    ] {
+    for ep in CORE_LIST_ENDPOINTS {
         Mock::given(method("GET"))
             .and(path(ep))
             .respond_with(slow(empty.clone()))
