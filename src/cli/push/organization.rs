@@ -156,62 +156,56 @@ pub async fn push(
         .await
         .with_context(|| format!("patching organization settings for env '{env}'"))?;
 
-    // Canonical write-back bytes: the same a pull would produce, so the next
-    // sync sees `Clean` (this is also what normalizes `width: 120` to the
-    // server's `120.0`). Computed here, ahead of the divergence diff below,
-    // because the diff must compare like with like: `local` (read from disk
-    // above) is already in portable `rdc://…` ref form — that's how pull
-    // wrote it — while the raw server response is not. Diffing raw-vs-portable
-    // would flag every portable-kind field the org body happens to carry
-    // (e.g. `workspaces`) as "diverged" on every single push, even though the
-    // write-back below is about to portabilize it right back to what `local`
-    // already says. That would be a false alarm on the one notice here that
-    // has to stay trustworthy, so the comparison uses the portabilized bytes
-    // instead.
-    let value = serde_json::to_value(&updated).context("serializing patched organization")?;
+    // Write back ONLY `settings`, merged into the body already on disk.
+    //
+    // The obvious thing — write the PATCH response — is wrong, and it took a
+    // live organization to show it: the response is NOT shaped like a `GET`.
+    // It carries `rir_key`, which `GET /organizations/{id}` omits entirely,
+    // and it returns `users` in a different order. Writing it wholesale put a
+    // field on disk that no pull ever produces, so the very next sync
+    // classified the org `RemoteEdit` and pulled it back to correct itself —
+    // one phantom "1 changed" cycle after every settings push. Every
+    // mock-based test missed it, because a mock naturally answers GET and
+    // PATCH with the same body; `sync_organization_write_back_keeps_the_shape_
+    // a_pull_would_produce` reproduces the asymmetry on purpose.
+    //
+    // Taking `settings` FROM the response is deliberate and is the whole
+    // reason to look at it at all: that is the subtree rdc manages, and the
+    // server normalizes it (`width: 140` comes back `140.0`,
+    // `annotation_list_table: {}` comes back `columns: []`), so the
+    // normalized form is what belongs on disk. Every other field keeps the
+    // value `pull` wrote, which is by definition the shape a pull produces.
+    //
+    // This also removes the need for the divergence notice that used to live
+    // here. It compared `local` against the response and warned that the
+    // differing keys "will be overwritten by the env's value" — but with the
+    // write-back scoped to `settings`, nothing outside `settings` is ever
+    // overwritten, so there was nothing truthful left to warn about. On a real
+    // org it fired on EVERY push (naming `rir_key`, `users`, `workspaces`),
+    // which is worse than silence: a warning that cries wolf on the happy
+    // path teaches people to ignore it. An unmanaged local edit is still not
+    // pushed — it simply stays on disk until the pull half reverts it, the
+    // same as any other locally-edited field rdc does not own.
+    let updated_settings = serde_json::to_value(&updated)
+        .context("serializing patched organization")?
+        .get("settings")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let mut merged = local.clone();
+    match merged.as_object_mut() {
+        Some(obj) => {
+            obj.insert("settings".to_string(), updated_settings);
+        }
+        // `local` parsed as a non-object cannot happen: the `settings` lookup
+        // above already required an object. Bail rather than write a body
+        // shaped like nothing pull would produce.
+        None => anyhow::bail!("{}: expected a JSON object", path.display()),
+    }
     let art = crate::snapshot::codec::codec("organization")
         .expect("organization codec must exist")
-        .disk_bytes(&value)
+        .disk_bytes(&merged)
         .context("serializing organization")?;
     let json = crate::cli::pull::common::portabilize_proposed(&art.json, lockfile);
-    let portabilized: serde_json::Value =
-        serde_json::from_slice(&json).context("parsing portabilized organization")?;
-
-    // Compare local vs the portabilized server response, ignoring `settings`
-    // (the subtree rdc actually manages) and the hidden stamps
-    // (`modified_at`/`modified_by` — stripped from disk by the codec, so
-    // they'd always look "locally absent" and falsely diverge; a stamp bump
-    // alone must never read as a discarded edit). Any other top-level key
-    // that differs between the two is about to be silently overwritten by
-    // the canonical write-back below — name exactly those keys, not the
-    // full `unmanaged` list, so the warning is accurate rather than noise
-    // on every push.
-    let diverged: Vec<String> = {
-        const IGNORED: &[&str] = &["settings", "modified_at", "modified_by"];
-        let local_obj = local.as_object();
-        let remote_obj = portabilized.as_object();
-        let mut keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-        if let Some(o) = local_obj {
-            keys.extend(o.keys().map(String::as_str));
-        }
-        if let Some(o) = remote_obj {
-            keys.extend(o.keys().map(String::as_str));
-        }
-        keys.into_iter()
-            .filter(|k| !IGNORED.contains(k))
-            .filter(|k| local_obj.and_then(|o| o.get(*k)) != remote_obj.and_then(|o| o.get(*k)))
-            .map(str::to_string)
-            .collect()
-    };
-    if !diverged.is_empty() {
-        progress.event(
-            Action::Warn,
-            &format!(
-                "organization: {} will be overwritten by the env's value (rdc only manages `settings`)",
-                diverged.join(", ")
-            ),
-        );
-    }
 
     let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
     crate::state::base_cache::write_disk_and_cache(paths, path, &json)?;

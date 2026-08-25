@@ -38,6 +38,7 @@ everything else.
 | `data_type: "bogus"` | **400** `{"settings":{"annotation_list_table":{"columns":{"0":{"data_type":["\"bogus\" is not a valid choice."]}}}}}` — really validated, not a blob |
 | `schema_id: "zzz_no_such_field"` | **200 — no existence validation.** An unknown field id is accepted silently |
 | the wrapper shape `OPTIONS` advertises, `{"schema":{…}}` | **400** `column_type: This field is required.` — OPTIONS lies; the wire shape is FLAT |
+| the PATCH response vs the GET response | **not the same shape** — PATCH returns `rir_key`, which GET omits entirely, and returns `users` in a different order (36 entries; `workspaces` order matched). A mock that answers both verbs with one body cannot see this |
 
 Writable on an organization: `settings`, `ui_settings`, `metadata`. Read-only
 per OPTIONS: `id`, `url`, `name`, `workspaces`, `users`, `rir_key`, `sandbox`,
@@ -106,12 +107,27 @@ Rules that follow from the API semantics:
   them", and guessing the second wipes the remote. Clearing is expressed
   explicitly, as `"settings": {}`.
 - **No create, no delete, ever.** The org is never added to `detect_tombstones`,
-  so a deleted `organization.json` is a no-op for push; the next pull restores
-  the file. There is no DELETE path to reach.
-- **Local edits outside `settings` are not pushed**, and the post-push write-back
-  rewrites the file from the server's response, which would discard them
-  silently. Before writing back, compare local vs remote ignoring `settings` and
-  warn naming the divergent top-level keys.
+  so a deleted `organization.json` is a no-op for push and there is no DELETE
+  path to reach. It cuts both ways: because the deletion classifies as `Clean`,
+  `rdc sync` does not restore the file either — it stays missing until the org's
+  lockfile entry is rebuilt (delete it from `.rdc/state/<env>.lock.json`, or on
+  the env's first sync), which forces a fresh pull.
+- **Local edits outside `settings` are not pushed**, and the write-back leaves
+  them alone: it replaces `settings` in the on-disk body and keeps every other
+  field as the pull wrote it. Such an edit is reverted by the next pull, like
+  any locally-edited field rdc does not own.
+
+  This supersedes the original design, which wrote the server's response
+  wholesale and warned about the top-level keys that differed. Live
+  verification killed that: the API's PATCH response is **not** shaped like its
+  `GET` — it carries `rir_key`, which `GET /organizations/{id}` omits, and
+  returns `users` in a different order. Adopting it wholesale put a field on
+  disk that no pull produces, so every settings push was followed by a
+  corrective pull, and the divergence notice fired on *every* push naming
+  `rir_key, users, workspaces` as "about to be overwritten" when nothing was.
+  Scoping the write-back to `settings` fixes both and retires the notice: with
+  nothing outside `settings` ever overwritten, there is nothing truthful for it
+  to say.
 
 Write-back follows the established pattern: canonical bytes via
 `codec("organization").disk_bytes`, then `record_object` with the response's id

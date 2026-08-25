@@ -1944,53 +1944,62 @@ async fn sync_warns_and_sends_nothing_for_an_unmanaged_organization_edit() {
         );
     }
 }
-
-/// The divergence notice must compare like with like. `local` (read straight
-/// off disk) is already in portable `rdc://…` ref form — that's how pull
-/// wrote it, and the org body can carry a portable-kind field like
-/// `workspaces` even though `organization` itself isn't a portable kind. The
-/// raw PATCH response never is. Before the fix, the diff compared `local`
-/// directly against that raw response, so on ANY real project with a
-/// snapshotted workspace, every single settings push would name `workspaces`
-/// as "diverged" — a false alarm on the one notice that has to stay
-/// trustworthy, since the write-back below was about to portabilize it right
-/// back to what `local` already said. The fix hoists that portabilization
-/// above the diff.
+/// The PATCH response is NOT shaped like a GET, and only a mock that reproduces
+/// that asymmetry can catch what follows. Verified against a live organization:
+/// `PATCH /organizations/{id}` returns `rir_key`, which `GET` omits entirely,
+/// and returns `users` in a different order. Writing that response wholesale
+/// therefore put a field on disk that no pull ever produces, so the very next
+/// sync had to pull the org back to correct it — one phantom "1 changed" cycle
+/// after every settings push. Every mock test missed it because the mock
+/// answered GET and PATCH with the same body; this one does not.
+///
+/// The write-back takes `settings` FROM the response (the server normalizes it:
+/// `width: 140` comes back `140.0`) and every other field from the body already
+/// on disk, which is exactly what a pull would have written.
 #[tokio::test]
-async fn sync_organization_settings_push_does_not_false_positive_on_a_portabilized_workspace_ref() {
+async fn sync_organization_write_back_keeps_the_shape_a_pull_would_produce() {
     let server = MockServer::start().await;
-    let mut org = fixture("organization.json");
-    org["workspaces"] = serde_json::json!([format!("{}/api/v1/workspaces/401", server.uri())]);
+
+    // GET: no `rir_key`, theme "white" — the shape a pull writes.
+    let mut get_body = fixture("organization.json");
+    get_body["settings"] = serde_json::json!({ "annotation_list_table": { "columns": [] } });
+    get_body["ui_settings"] = serde_json::json!({ "theme": "white" });
+
+    // PATCH: carries `rir_key`, a different theme, and the server-normalized
+    // `settings`. Only `settings` may reach disk from here.
+    let mut patch_body = get_body.clone();
+    patch_body["rir_key"] = serde_json::json!("tnt_live_must_not_reach_disk");
+    patch_body["ui_settings"] = serde_json::json!({ "theme": "dark" });
+    patch_body["settings"] = serde_json::json!({ "annotation_list_table": { "columns": [
+        { "visible": true, "column_type": "meta", "width": 140.0, "meta_name": "status" }
+    ] } });
+
+    // A real GET reflects the PATCH afterwards — and still omits `rir_key`.
+    // The first two listings (the pull cycle, then the push cycle, which lists
+    // before it writes) see the pre-push body; every later one sees the pushed
+    // `settings`. Without this the third sync would compare against a remote
+    // frozen in the past and "pull" forever, testing the mock instead of rdc.
+    let mut post_body = get_body.clone();
+    post_body["settings"] = patch_body["settings"].clone();
     Mock::given(method("GET"))
         .and(path("/api/v1/organizations/1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(org.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(get_body.clone()))
+        .up_to_n_times(2)
         .mount(&server)
         .await;
-
-    let workspaces_body = serde_json::json!({
-        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
-        "results": [
-            {
-                "id": 401,
-                "url": format!("{}/api/v1/workspaces/401", server.uri()),
-                "name": "Invoices",
-                "organization": format!("{}/api/v1/organizations/1", server.uri()),
-                "queues": [],
-                "modified_at": "2026-04-20T08:00:00Z"
-            }
-        ]
-    });
     Mock::given(method("GET"))
-        .and(path("/api/v1/workspaces"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(workspaces_body))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(post_body.clone()))
         .mount(&server)
         .await;
+    // The PATCH targets the fixture's own `id`, which is what the lockfile
+    // records from the pull — not the `org_id` in rdc.toml.
     Mock::given(method("PATCH"))
         .and(path("/api/v1/organizations/285704"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(org.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(patch_body.clone()))
         .mount(&server)
         .await;
-    mock_empty_lists_except(&server, &["/api/v1/workspaces"]).await;
+    mock_empty_lists_except(&server, &[]).await;
 
     let project = TempDir::new().unwrap();
     assert_cmd::Command::cargo_bin("rdc")
@@ -2005,43 +2014,51 @@ async fn sync_organization_settings_push_does_not_false_positive_on_a_portabiliz
     )
     .unwrap();
 
-    // First sync: pulls the org AND the workspace, then the post-pass
-    // portabilizes `organization.json`'s `workspaces` field to `rdc://…`.
-    assert_cmd::Command::cargo_bin("rdc")
-        .unwrap()
-        .current_dir(project.path())
-        .args(["sync", "dev"])
-        .assert()
-        .success();
+    let _cwd_guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("first sync (pull)");
 
+    // Edit only the managed subtree.
     let org_path = project.path().join("envs/dev/organization.json");
-    let on_disk_before: serde_json::Value =
+    let mut on_disk: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&org_path).unwrap()).unwrap();
-    assert_eq!(
-        on_disk_before["workspaces"],
-        serde_json::json!(["rdc://workspaces/invoices"]),
-        "the first sync must have portabilized the workspace ref: {on_disk_before}"
-    );
-
-    // Local edit to the managed subtree only — `workspaces` is left as the
-    // portable ref the first sync wrote.
-    let mut on_disk = on_disk_before;
     on_disk["settings"]["annotation_list_table"]["columns"] = serde_json::json!([
-        { "visible": true, "column_type": "meta", "width": 100.0, "meta_name": "status" }
+        { "visible": true, "column_type": "meta", "width": 140, "meta_name": "status" }
     ]);
     std::fs::write(&org_path, serde_json::to_vec_pretty(&on_disk).unwrap()).unwrap();
 
-    let second = assert_cmd::Command::cargo_bin("rdc")
-        .unwrap()
-        .current_dir(project.path())
-        .args(["sync", "dev"])
-        .assert()
-        .success();
-    let stderr = String::from_utf8_lossy(&second.get_output().stderr).to_string();
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("second sync (push)");
+
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&org_path).unwrap()).unwrap();
     assert!(
-        !stderr.contains("will be overwritten"),
-        "a portable field the write-back is about to restore verbatim must not \
-         trigger a divergence notice: {stderr}"
+        after.get("rir_key").is_none(),
+        "a PATCH-only field must never reach disk — a pull would never write it: {after}"
+    );
+    assert_eq!(
+        after["ui_settings"]["theme"],
+        serde_json::json!("white"),
+        "unmanaged fields keep the value pull wrote, not the PATCH response's: {after}"
+    );
+    assert_eq!(
+        after["settings"]["annotation_list_table"]["columns"][0]["width"],
+        serde_json::json!(140.0),
+        "`settings` IS adopted from the response, so the server's normalization sticks: {after}"
+    );
+
+    // The write-back wrote the pulled shape, so nothing is left to correct.
+    let settled = rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("third sync");
+    std::env::set_current_dir(&prev).unwrap();
+    assert_eq!(
+        settled.items_pulled, 0,
+        "no corrective pull may follow a settings push"
     );
 }
 

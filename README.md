@@ -179,9 +179,9 @@ sends them:
 
 Everything else in the file is informational: `ui_settings` (branding, theme,
 the org's applied feature flags), `metadata`, and the read-only fields the API
-assigns. Editing those locally changes nothing remotely — the sync's
-write-back rewrites them from the env's response on every push, and a pull
-does the same. There is no create and no delete: one organization exists per
+assigns. Editing those locally changes nothing remotely, and the next pull
+reverts them from the env. The push itself leaves them alone: its write-back
+updates `settings` and nothing else. There is no create and no delete: one organization exists per
 env, made outside rdc, and deleting `organization.json` is not treated as a
 delete request — rdc cannot tell it apart from an ordinary no-op, because the
 org has no tombstone tracking. That cuts both ways: `rdc sync` does not
@@ -193,10 +193,13 @@ a fresh pull.
 
 Push only fires when `settings` itself actually changed since the last synced
 base — an edit confined to `ui_settings` or `metadata` produces no request at
-all. When it does push, and the server's response disagrees with the local
-file on some *other* top-level key (because the file was hand-edited, or the
-env changed underneath it), rdc says so, naming only the keys that actually
-diverged, before overwriting them from the response.
+all. After a push, rdc writes back the server's `settings` (so its
+normalizations stick: `width: 140` comes back `140.0`) and keeps every other
+field exactly as the pull wrote it. That is deliberate: the API's PATCH
+response is not shaped like its `GET` — it carries a `rir_key` that `GET`
+omits — so adopting the response wholesale would leave a field on disk that no
+pull produces, and the next sync would have to pull the org back to correct
+itself.
 
 A `settings` PATCH replaces the whole object server-side, so rdc always sends
 the complete subtree. That has one consequence worth knowing: **an absent
