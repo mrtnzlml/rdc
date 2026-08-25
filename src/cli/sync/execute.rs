@@ -3806,14 +3806,10 @@ pub async fn run(
         //    deleted remotely. Kept gated on a NON-EMPTY listing so a
         //    transient empty/404 can never mass-delete every local dataset.
         if catalog.mdh.available {
-            use std::collections::HashSet as HashSetForSlugs;
             let mut slug_to_collection: BTreeMap<String, &crate::model::Collection> =
                 BTreeMap::new();
-            let mut used: HashSetForSlugs<String> = HashSetForSlugs::new();
-            for c in &catalog.mdh.collections {
-                let slug = crate::slug::slugify_unique(&c.name, &used);
-                used.insert(slug.clone());
-                slug_to_collection.insert(slug, c);
+            for (slug, c) in catalog.mdh.datasets() {
+                slug_to_collection.insert(slug.to_string(), c);
             }
 
             // Slugs whose collection this cycle's stage 2 just created. They
@@ -4042,11 +4038,7 @@ pub async fn run(
             for slug in slug_to_collection.keys() {
                 subset.insert(("mdh".to_string(), slug.clone()));
             }
-            let listed = crate::cli::pull::mdh::MdhListed {
-                client: catalog.mdh.client.clone(),
-                collections: catalog.mdh.collections.clone(),
-                available: catalog.mdh.available,
-            };
+            let listed = catalog.mdh.clone();
             crate::cli::pull::mdh::process(ctx, listed, &subset, progress).await?;
 
             // Stage 4: orphan prune. Gated on a NON-EMPTY remote listing so a
@@ -4304,15 +4296,15 @@ mod tests {
             workflows: vec![],
             workflow_steps: vec![],
             email_templates: vec![],
-            mdh: crate::cli::pull::mdh::MdhListed {
-                client: crate::api::data_storage::DataStorageClient::new(
+            mdh: crate::cli::pull::mdh::MdhListed::new(
+                crate::api::data_storage::DataStorageClient::new(
                     "https://unused.invalid/svc/data-storage/api/v1".to_string(),
                     "TEST".to_string(),
                 )
                 .unwrap(),
-                collections: vec![],
-                available: false,
-            },
+                vec![],
+                false,
+            ),
         }
     }
 

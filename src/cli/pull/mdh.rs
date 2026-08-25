@@ -180,12 +180,9 @@ pub(crate) fn plan_mdh(
 
     // Slug every env collection exactly as the executor does (listing order,
     // unique dedup) so predicted slugs match the real run byte-for-byte.
-    let mut used: HashSet<String> = HashSet::new();
     let mut remote_slugs: BTreeSet<String> = BTreeSet::new();
-    for c in &listed.collections {
-        let slug = slugify_unique(&c.name, &used);
-        used.insert(slug.clone());
-        remote_slugs.insert(slug);
+    for (slug, _c) in listed.datasets() {
+        remote_slugs.insert(slug.to_string());
     }
 
     let mdh_base = lockfile.objects.get("mdh_indexes");
@@ -379,12 +376,8 @@ pub(crate) async fn plan_mdh_index_edits(
     }
     // Slug every collection exactly as the executor / `plan_mdh` do (listing
     // order, unique dedup) so forecast slugs match the real run byte-for-byte.
-    let mut used: HashSet<String> = HashSet::new();
-    for c in &listed.collections {
-        let slug = slugify_unique(&c.name, &used);
-        used.insert(slug.clone());
-
-        let ix_path = paths.dataset_dir(&slug).join("indexes.json");
+    for (slug, c) in listed.datasets() {
+        let ix_path = paths.dataset_dir(slug).join("indexes.json");
         // No local dataset dir → `plan_mdh` stage 3 already forecasts "(new)";
         // don't fetch (nothing to compare against) or double-report.
         if !ix_path.is_file() {
@@ -396,9 +389,9 @@ pub(crate) async fn plan_mdh_index_edits(
         let base = lockfile
             .objects
             .get("mdh_indexes")
-            .and_then(|m| m.get(&slug))
+            .and_then(|m| m.get(slug))
             .and_then(|e| e.content_hash.clone());
-        if let Some(item) = index_edit_item(&slug, &ix_path, base.as_deref(), &proposed)? {
+        if let Some(item) = index_edit_item(slug, &ix_path, base.as_deref(), &proposed)? {
             items.push(item);
         }
 
@@ -407,8 +400,8 @@ pub(crate) async fn plan_mdh_index_edits(
         // is fallible and runs in the same dry-run pass as a real sync, so a
         // malformed "data" flag must fail the preview exactly like it fails
         // the real run (see the doc comment on this function).
-        if read_data_mode(&paths.dataset_dir(&slug))? == DataMode::Manual {
-            let data_path = paths.dataset_data(&slug);
+        if read_data_mode(&paths.dataset_dir(slug))? == DataMode::Manual {
+            let data_path = paths.dataset_data(slug);
             // No local `data.jsonl` yet → `plan_mdh` stage 3b already
             // forecasts "(new)"; don't fetch (nothing to compare against)
             // or double-report. This is also what keeps an unflagged
@@ -419,7 +412,7 @@ pub(crate) async fn plan_mdh_index_edits(
                 let base = lockfile
                     .objects
                     .get("mdh_data")
-                    .and_then(|m| m.get(&slug))
+                    .and_then(|m| m.get(slug))
                     .and_then(|e| e.content_hash.clone());
                 // `HashMode::Raw`: same reasoning as the pull driver at
                 // `pull_dataset_data` — the bytes ARE the artifact, so
@@ -720,9 +713,19 @@ pub(crate) async fn pull_dataset_data(
 /// Opaque listed state for MDH — the client handle plus the collection list.
 /// We carry the client here because it's constructed from env_cfg + token,
 /// which live in `run_drivers` scope.
+#[derive(Clone)]
 pub struct MdhListed {
     pub client: DataStorageClient,
     pub collections: Vec<Collection>,
+    /// Dataset slug for each entry of `collections`, **same index**, derived
+    /// once at listing time by [`MdhListed::new`].
+    ///
+    /// Four call sites used to re-derive this walk independently (the pull
+    /// write path, the dry-run structural plan, the dry-run index-edit
+    /// forecast and the sync executor's `slug_to_collection`). They must agree
+    /// byte-for-byte or a fetch silently targets the wrong collection — so the
+    /// walk happens exactly once and everyone reads the result.
+    pub slugs: Vec<String>,
     /// Whether MDH is provisioned on this env. `true` when the collection
     /// listing succeeded (even with zero collections); `false` when the
     /// Data Storage endpoint 404s (MDH not enabled on the cluster). A 404
@@ -731,6 +734,30 @@ pub struct MdhListed {
     /// collection creation (create on a fresh-but-enabled env; never attempt
     /// it against a cluster without MDH).
     pub available: bool,
+}
+
+impl MdhListed {
+    /// Build from a listing, deriving each collection's dataset slug once.
+    pub fn new(client: DataStorageClient, collections: Vec<Collection>, available: bool) -> Self {
+        let mut used: HashSet<String> = HashSet::new();
+        let slugs = collections
+            .iter()
+            .map(|c| {
+                let slug = slugify_unique(&c.name, &used);
+                used.insert(slug.clone());
+                slug
+            })
+            .collect();
+        Self { client, collections, slugs, available }
+    }
+
+    /// `(dataset_slug, collection)` in listing order.
+    pub fn datasets(&self) -> impl Iterator<Item = (&str, &Collection)> {
+        self.slugs
+            .iter()
+            .map(String::as_str)
+            .zip(self.collections.iter())
+    }
 }
 
 /// Phase 1: list MDH collections (or return an empty list if MDH is not
@@ -751,11 +778,7 @@ pub async fn list(env_cfg: &EnvConfig, token: &str, progress: &Arc<Log>) -> Resu
         Err(e) => return Err(e.context("listing MDH collections")),
     };
 
-    Ok(MdhListed {
-        client,
-        collections,
-        available,
-    })
+    Ok(MdhListed::new(client, collections, available))
 }
 
 /// Phase 2: write listed collections + indexes to disk.
@@ -777,6 +800,7 @@ pub async fn process(
     let MdhListed {
         client,
         collections,
+        slugs,
         available: _,
     } = listed;
 
@@ -784,7 +808,6 @@ pub async fn process(
         return Ok((0, 0));
     }
 
-    let mut used: HashSet<String> = HashSet::new();
     let mut conflicts = 0usize;
     // Slugs whose local representation actually changed THIS cycle (manifest
     // (re)written or indexes.json pulled). MDH bypasses the classifier and
@@ -800,10 +823,7 @@ pub async fn process(
     //            `mdh_collections` lockfile entry. The indexes.json write
     //            itself happens in sub-phase C after the parallel fetches.
     let mut dataset_dirs: Vec<(String, std::path::PathBuf, Collection)> = Vec::new();
-    for c in collections {
-        let slug = slugify_unique(&c.name, &used);
-        used.insert(slug.clone());
-
+    for (slug, c) in slugs.into_iter().zip(collections) {
         if !subset.contains(&(KIND.to_string(), slug.clone())) {
             continue;
         }
@@ -1141,12 +1161,11 @@ mod tests {
                 extra: Default::default(),
             })
             .collect();
-        let listed = MdhListed {
-            client: DataStorageClient::new("http://unused.invalid".to_string(), "t".to_string())
-                .unwrap(),
+        let listed = MdhListed::new(
+            DataStorageClient::new("http://unused.invalid".to_string(), "t".to_string()).unwrap(),
             collections,
-            available: true,
-        };
+            true,
+        );
 
         let mut got: Vec<(MdhPlanDir, String)> = plan_mdh(&listed, &lf, &paths, false)
             .into_iter()
@@ -1231,12 +1250,11 @@ mod tests {
             .iter()
             .map(|n| Collection { name: n.to_string(), extra: Default::default() })
             .collect();
-        let listed = MdhListed {
-            client: DataStorageClient::new("http://unused.invalid".to_string(), "t".to_string())
-                .unwrap(),
+        let listed = MdhListed::new(
+            DataStorageClient::new("http://unused.invalid".to_string(), "t".to_string()).unwrap(),
             collections,
-            available: true,
-        };
+            true,
+        );
 
         let lines: Vec<String> =
             plan_mdh(&listed, &lf, &paths, false).into_iter().map(|i| i.line).collect();
@@ -1266,15 +1284,14 @@ mod tests {
     fn plan_mdh_unavailable_env_yields_no_plan() {
         let root = tempfile::tempdir().unwrap();
         let paths = crate::paths::Paths::for_env(root.path(), "dev");
-        let listed = MdhListed {
-            client: DataStorageClient::new("http://unused.invalid".to_string(), "t".to_string())
-                .unwrap(),
-            collections: vec![Collection {
+        let listed = MdhListed::new(
+            DataStorageClient::new("http://unused.invalid".to_string(), "t".to_string()).unwrap(),
+            vec![Collection {
                 name: "vendors".to_string(),
                 extra: Default::default(),
             }],
-            available: false,
-        };
+            false,
+        );
         assert!(plan_mdh(&listed, &crate::state::Lockfile::default(), &paths, false).is_empty());
     }
 
@@ -1350,13 +1367,15 @@ mod tests {
         let mut lockfile = Lockfile::default();
         let subset: BTreeSet<(String, String)> =
             [("mdh".to_string(), "vendors".to_string())].into_iter().collect();
-        let mk_listed = || MdhListed {
-            client: DataStorageClient::new(server.uri(), "t".to_string()).unwrap(),
-            collections: vec![Collection {
-                name: "vendors".to_string(),
-                extra: Default::default(),
-            }],
-            available: true,
+        let mk_listed = || {
+            MdhListed::new(
+                DataStorageClient::new(server.uri(), "t".to_string()).unwrap(),
+                vec![Collection {
+                    name: "vendors".to_string(),
+                    extra: Default::default(),
+                }],
+                true,
+            )
         };
 
         let (changed1, conflicts1) = {
@@ -1477,14 +1496,14 @@ mod tests {
         );
         lockfile.objects.insert("mdh_indexes".to_string(), mdh);
 
-        let listed = MdhListed {
-            client: DataStorageClient::new(server.uri(), "t".to_string()).unwrap(),
-            collections: vec![Collection {
+        let listed = MdhListed::new(
+            DataStorageClient::new(server.uri(), "t".to_string()).unwrap(),
+            vec![Collection {
                 name: "gl-codes".to_string(),
                 extra: Default::default(),
             }],
-            available: true,
-        };
+            true,
+        );
         let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let items = plan_mdh_index_edits(&listed, &lockfile, &paths, &progress)
@@ -1589,14 +1608,14 @@ mod tests {
         );
         lockfile.objects.insert("mdh_data".to_string(), data);
 
-        let listed = MdhListed {
-            client: DataStorageClient::new(server.uri(), "t".to_string()).unwrap(),
-            collections: vec![Collection {
+        let listed = MdhListed::new(
+            DataStorageClient::new(server.uri(), "t".to_string()).unwrap(),
+            vec![Collection {
                 name: "gl-codes".to_string(),
                 extra: Default::default(),
             }],
-            available: true,
-        };
+            true,
+        );
         let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let items = plan_mdh_index_edits(&listed, &lockfile, &paths, &progress)
@@ -1672,14 +1691,14 @@ mod tests {
         );
         lockfile.objects.insert("mdh_indexes".to_string(), ixs);
 
-        let listed = MdhListed {
-            client: DataStorageClient::new(server.uri(), "t".to_string()).unwrap(),
-            collections: vec![Collection {
+        let listed = MdhListed::new(
+            DataStorageClient::new(server.uri(), "t".to_string()).unwrap(),
+            vec![Collection {
                 name: "gl-codes".to_string(),
                 extra: Default::default(),
             }],
-            available: true,
-        };
+            true,
+        );
         let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
 
         let items = plan_mdh_index_edits(&listed, &lockfile, &paths, &progress)
@@ -1730,14 +1749,14 @@ mod tests {
         let mut lockfile = crate::state::Lockfile::default();
         let subset: BTreeSet<(String, String)> =
             [("mdh".to_string(), "gl-codes".to_string())].into_iter().collect();
-        let listed = MdhListed {
-            client: DataStorageClient::new(server.uri(), "t".to_string()).unwrap(),
-            collections: vec![Collection {
+        let listed = MdhListed::new(
+            DataStorageClient::new(server.uri(), "t".to_string()).unwrap(),
+            vec![Collection {
                 name: "gl-codes".to_string(),
                 extra: Default::default(),
             }],
-            available: true,
-        };
+            true,
+        );
         let mut ctx = PullCtx {
             paths: &paths,
             client: &rossum,
@@ -2068,6 +2087,43 @@ mod tests {
             server.received_requests().await.unwrap().len(),
             4,
             "an empty batch must issue no requests"
+        );
+    }
+
+    /// Spec D7: the slug for each collection is derived ONCE, at listing time,
+    /// with the executor's exact rule (listing order, `slugify_unique` dedup) —
+    /// so no consumer can drift and silently target a different collection.
+    #[test]
+    fn mdh_listed_slugs_are_computed_once_in_listing_order() {
+        let client = DataStorageClient::new(
+            "https://unused.invalid/svc/data-storage/api/v1".to_string(),
+            "TEST".to_string(),
+        )
+        .unwrap();
+        // The first two names slugify to the same base: the SECOND must take
+        // the deduped slug, and only because it is second in the listing.
+        let listed = MdhListed::new(
+            client,
+            vec![
+                Collection { name: "GL Codes".to_string(), extra: Default::default() },
+                Collection { name: "gl codes".to_string(), extra: Default::default() },
+                Collection { name: "vendors".to_string(), extra: Default::default() },
+            ],
+            true,
+        );
+        assert_eq!(listed.slugs, vec!["gl-codes", "gl-codes-2", "vendors"]);
+        let pairs: Vec<(&str, &str)> = listed
+            .datasets()
+            .map(|(slug, c)| (slug, c.name.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("gl-codes", "GL Codes"),
+                ("gl-codes-2", "gl codes"),
+                ("vendors", "vendors"),
+            ],
+            "datasets() must pair each slug with ITS collection, positionally"
         );
     }
 }

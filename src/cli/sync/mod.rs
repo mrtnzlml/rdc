@@ -1660,15 +1660,15 @@ mod tests {
             workflows: vec![],
             workflow_steps: vec![],
             email_templates: vec![],
-            mdh: crate::cli::pull::mdh::MdhListed {
-                client: crate::api::data_storage::DataStorageClient::new(
+            mdh: crate::cli::pull::mdh::MdhListed::new(
+                crate::api::data_storage::DataStorageClient::new(
                     "https://unused.invalid/svc/data-storage/api/v1".to_string(),
                     "TEST".to_string(),
                 )
                 .unwrap(),
-                collections: vec![],
-                available: false,
-            },
+                vec![],
+                false,
+            ),
         }
     }
 
