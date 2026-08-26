@@ -43,6 +43,7 @@ create a tag and expect `release.yaml` to fire.
 | last four release runs | all `failure`; on run `32704367553` every job succeeded **except** `Bump Homebrew tap formula` |
 | commit-type discipline, last 100 commits | `feat` 30, `fix` 29, `docs` 21, `test` 9, `chore` 5, `refactor` 3, `ci` 2, `perf` 1 — conventional commits are used consistently enough to derive a bump level from |
 | paths touched by `docs:`/`test:` commits since `v0.7.0` | only `docs/`, `README.md`, `tests/` — none touched `src/` or `templates/`. (Historically some do: `docs(codec): correct organization module doc` edited `src/`.) |
+| commits touching **only** `desktop/`, last 200 | **49** — and desktop artifacts (`rdc-desktop-*.dmg`/`.tar.gz`/`.zip`) ship in every release, so `desktop/` has to count as shippable |
 | commit volume | 164 commits/month across 16 distinct days |
 | files a release commit touches | four — `Cargo.toml`, `Cargo.lock`, `desktop/rust/Cargo.lock`, `templates/gitlab-ci.yml` (confirmed against `ea4aa2e`) |
 | `desktop/pubspec.yaml` version | `1.0.0+1`, never bumped by a release — the desktop version is decoupled, `release.yaml` only passes the tag as an artifact filename label |
@@ -82,7 +83,7 @@ measured "+$0.83/release" for the desktop jobs (recomputed here as $0.89).
 | Bump level | **Derived from commit types**: any `feat:` → minor, otherwise patch |
 | Verification | **A gate inside the weekly job** — test, clippy, release build — not a separate push-CI workflow |
 | Human checkpoint | **None.** Gate green → bump, tag, build, publish |
-| "Worth releasing" | **Path-based**: a commit since the last tag touched `src/`, `templates/`, `Cargo.toml`, or `Cargo.lock` |
+| "Worth releasing" | **Path-based**: a commit since the last tag touched `src/`, `templates/`, `desktop/`, `Cargo.toml`, or `Cargo.lock` |
 | Failing tap job | **Fix it** with the job's own `GITHUB_TOKEN` |
 | Plumbing | **Make `release.yaml` callable** and call it; no PAT |
 
@@ -125,7 +126,10 @@ Permissions: `contents: write` (push the bump commit and tag).
 prev=$(git describe --tags --abbrev=0 --match 'v*')
 ```
 
-**Ship gate.** `git diff --name-only "$prev"..HEAD -- src templates Cargo.toml Cargo.lock`.
+**Ship gate.** `git diff --name-only "$prev"..HEAD -- src templates desktop Cargo.toml Cargo.lock`.
+`desktop/` is in the list because the desktop app ships as a release asset;
+without it a desktop-only week would be classified "nothing to release" and
+those fixes would never reach a user.
 Empty → emit a `::notice::` naming the commit count and exit **green**. A quiet
 week is a success, not a failure; it must not page anyone.
 
