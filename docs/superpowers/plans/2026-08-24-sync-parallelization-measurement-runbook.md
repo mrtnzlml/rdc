@@ -9,26 +9,46 @@ person running it already has.
 
 ## 0. Binaries
 
-Built on one machine, one toolchain, same `rdc 0.7.0` `Cargo.toml` version
-(the plan didn't bump it — the binaries are told apart by commit, not by
-`--version` string):
+This runbook is self-contained: it does not assume any binary from a prior
+session still exists (a session scratchpad does not survive past its
+session) and it does not pin `after` to a specific commit (a moving target —
+`main` keeps advancing, so pinning one here would go stale the moment it
+does). Build both fresh, on one machine, one toolchain, same `rdc 0.7.0`
+`Cargo.toml` version (the plan didn't bump it, so the two binaries are told
+apart by which `$BEFORE`/`$AFTER` variable you invoke, not by `--version`
+output — both report `rdc 0.7.0`).
 
-| build | commit | path | size | `--version` |
-|---|---|---|---|---|
-| before | `05678ee` (this plan's base, pre-Task-1) | `/private/tmp/claude-502/-Users-martin-zlamal-rossum-ai-Work-github-com-mrtnzlml-rdc/4e7b2bd7-b868-4699-b34d-1bb3fafba2d9/scratchpad/bin/rdc-before-05678ee` | 7,182,976 bytes | `rdc 0.7.0` |
-| after | `6d821a7` (HEAD, all 12 tasks) | `/private/tmp/claude-502/-Users-martin-zlamal-rossum-ai-Work-github-com-mrtnzlml-rdc/4e7b2bd7-b868-4699-b34d-1bb3fafba2d9/scratchpad/bin/rdc-after-6d821a7` | 7,331,936 bytes | `rdc 0.7.0` |
-
-Those paths are inside this session's scratchpad and may not survive past
-this session — if they're gone, rebuild: `before` from `git worktree add
-<dir> 05678ee` + `cargo build -p rdc --release --locked` there, `after` from
-the same at current `main`. Do the `before` build in a separate worktree, not
-by checking out the shared main tree, and remove the worktree afterward.
-
-Set shell variables for the rest of this runbook:
+`after` — **current `main`**, built in place in the shared repo checkout:
 
 ```bash
-BEFORE=/private/tmp/claude-502/-Users-martin-zlamal-rossum-ai-Work-github-com-mrtnzlml-rdc/4e7b2bd7-b868-4699-b34d-1bb3fafba2d9/scratchpad/bin/rdc-before-05678ee
-AFTER=/private/tmp/claude-502/-Users-martin-zlamal-rossum-ai-Work-github-com-mrtnzlml-rdc/4e7b2bd7-b868-4699-b34d-1bb3fafba2d9/scratchpad/bin/rdc-after-6d821a7
+cd <path to the rdc repo checkout>
+cargo build -p rdc --release --locked
+AFTER=$(pwd)/target/release/rdc
+```
+
+`before` — this plan's pre-Task-1 base (`05678ee`), built in an isolated
+`git worktree` so it never touches the shared main tree's working directory
+or `target/`:
+
+```bash
+BEFORE_WORKTREE=$(mktemp -d)
+git worktree add "$BEFORE_WORKTREE" 05678ee
+(cd "$BEFORE_WORKTREE" && cargo build -p rdc --release --locked)
+BEFORE="$BEFORE_WORKTREE/target/release/rdc"
+```
+
+Confirm the shell variables for the rest of this runbook:
+
+```bash
+echo "$BEFORE"
+echo "$AFTER"
+```
+
+When the runbook is done, remove the worktree so it doesn't linger in the
+shared tree's `git worktree list`:
+
+```bash
+git worktree remove "$BEFORE_WORKTREE"
 ```
 
 ## 1. Before you time anything: check the build lock

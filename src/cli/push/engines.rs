@@ -182,6 +182,20 @@ enum EnginePatched {
     /// whole driver; the apply stage reproduces both, which is why this rides
     /// `Prepared::Patched` rather than `Prepared::Skipped` — `Skipped` carries
     /// only a transcript line, and a transcript line is not a control signal.
+    ///
+    /// This is a widening of the SUCCESS path, not the error-path exception
+    /// the plan's Global Constraints document for Tasks 9-12 ("Do not change
+    /// what a command requests"): this match arm returns `Ok`, not `Err`, and
+    /// by the time the first 405 comes back `prepare_all` has already
+    /// dispatched every item in the batch — so this driver can issue N
+    /// rejected PATCHes where the old sequential loop's `break` sent exactly
+    /// one. It is the case that actually occurs in practice (engines are
+    /// 403/405 on the test sandbox — see the sibling 403-or-405 check on the
+    /// create path above). Impact is bounded and harmless: every extra
+    /// request is still paced by the same token bucket as everything else,
+    /// rejects rather than mutating anything, and the apply stage still
+    /// emits exactly one skip line for the whole run regardless of how many
+    /// PATCHes actually went out.
     ReadOnly,
 }
 

@@ -1029,6 +1029,18 @@ pub async fn process(
     // that already completed: a push's writes landed on the SERVER and
     // can't be undone, so the lockfile must not lie about them; a pull's
     // writes are local files that can simply be left unwritten.
+    //
+    // Peak-memory trade, recorded honestly: this collects EVERY manual
+    // dataset's rows into memory before sub-phase C writes anything, where
+    // the old sequential loop held at most one dataset's rows at a time. With
+    // `ROW_HARD_LIMIT` capping each dataset at 25,000 rows, peak memory here
+    // scales with the NUMBER of manual datasets rather than being capped at
+    // one — and nothing in this design bounds that count. Unlike every other
+    // cost in this change set (which is bounded by a fan-out constant or a
+    // token bucket), this one is a real, unbounded resource cost inherent to
+    // the concurrent-fetch/sequential-apply split; it was not considered by
+    // the design spec. Not fixed here — do not "fix" it by adding a
+    // memory-bound gate without a design decision on what it should do.
     let mut rows_by_slug = fetch_dataset_rows(&client, ctx.paths, &manual, progress).await?;
 
     // === Sub-phase C: per-collection indexes.json write decision (sequential

@@ -915,4 +915,182 @@ mod tests {
             "four 200ms PATCHes must overlap; sequential would be >= 800ms, took {elapsed:?}",
         );
     }
+
+    /// This driver's "create" is really an ADOPT-OR-CREATE branch that
+    /// shares `remote_cache` (and `claimed`) with the update batch — the
+    /// most stateful un-batched branch of any push driver. A regression here
+    /// could silently duplicate the `GET /email_templates` the hoisted drift
+    /// check already paid for, or let the adopt-or-create run concurrently
+    /// with an update it must act as a barrier against.
+    ///
+    /// Two tracked (update) templates with a NEW template — matching no
+    /// remote by name, so `pick_adoption_id` returns `None` and it genuinely
+    /// POSTs — sorting between them. The pre-create flush must PATCH the
+    /// first update BEFORE the POST, the trailing flush must PATCH the
+    /// second update AFTER it, and the whole push must cost exactly one
+    /// `GET /email_templates` despite that list being consulted by both the
+    /// adoption matcher and the update batch's drift check.
+    #[tokio::test]
+    async fn push_email_templates_barriers_on_a_create_and_lists_only_once() {
+        use crate::snapshot::codec::combined_hash;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let api = format!("{}/api/v1", server.uri());
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        let dir = paths.queue_email_templates_dir("main", "invoices");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut lockfile = Lockfile {
+            api_base: api.clone(),
+            ..Lockfile::default()
+        };
+        // The owning queue must be lockfile-pinned so `rdc://queues/invoices`
+        // resolves on the way out and portabilizes on the way back in.
+        lockfile.upsert(
+            "queues",
+            "invoices",
+            ObjectEntry {
+                id: 42,
+                modified_at: None,
+                modified_by: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+
+        let tpl_json = |slug: &str, id: Option<u64>| {
+            let mut v = serde_json::json!({
+                "url": match id {
+                    Some(id) => format!("{api}/email_templates/{id}"),
+                    None => format!("rdc://email_templates/main/invoices/{slug}"),
+                },
+                "name": slug,
+                "subject": "Hello",
+                "queue": match id {
+                    Some(_) => format!("{api}/queues/42"),
+                    None => "rdc://queues/invoices".to_string(),
+                },
+                "type": "custom",
+            });
+            if let Some(id) = id {
+                v["id"] = serde_json::json!(id);
+            }
+            v
+        };
+
+        let mut changes = BTreeMap::new();
+        for (slug, id) in [("a-update", 700u64), ("z-update", 702u64)] {
+            let key = format!("main/invoices/{slug}");
+            let tpl_path = dir.join(format!("{slug}.json"));
+            std::fs::write(
+                &tpl_path,
+                serde_json::to_vec_pretty(&tpl_json(slug, None)).unwrap(),
+            )
+            .unwrap();
+            lockfile.upsert(
+                "email_templates",
+                &key,
+                ObjectEntry {
+                    id,
+                    modified_at: None,
+                    modified_by: None,
+                    content_hash: None,
+                    secrets_hash: None,
+                },
+            );
+            let codec = crate::snapshot::codec::codec("email_templates").unwrap();
+            let art = codec.disk_bytes(&tpl_json(slug, Some(id))).unwrap();
+            let base = combined_hash(&art.json, &art.sidecars, &lockfile);
+            lockfile.upsert(
+                "email_templates",
+                &key,
+                ObjectEntry {
+                    id,
+                    modified_at: None,
+                    modified_by: None,
+                    content_hash: Some(base),
+                    secrets_hash: None,
+                },
+            );
+            changes.insert(key, tpl_path);
+        }
+        // No lockfile entry -> adopt-or-create. Sorts between the two
+        // updates. Name "m-create" matches neither remote template's name
+        // ("a-update" / "z-update"), so `pick_adoption_id` finds nothing and
+        // this genuinely POSTs.
+        let create_path = dir.join("m-create.json");
+        std::fs::write(
+            &create_path,
+            serde_json::to_vec_pretty(&tpl_json("m-create", None)).unwrap(),
+        )
+        .unwrap();
+        changes.insert("main/invoices/m-create".to_string(), create_path);
+
+        // The drift list never contains the template created mid-push — same
+        // as the old loop, whose cache was also filled before the POST.
+        Mock::given(method("GET"))
+            .and(path("/api/v1/email_templates"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pagination": { "next": null },
+                "results": [tpl_json("a-update", Some(700)), tpl_json("z-update", Some(702))],
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/email_templates"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(tpl_json("m-create", Some(701))),
+            )
+            .mount(&server)
+            .await;
+        for (slug, id) in [("a-update", 700u64), ("z-update", 702u64)] {
+            Mock::given(method("PATCH"))
+                .and(path(format!("/api/v1/email_templates/{id}")))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(tpl_json(slug, Some(id))),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
+        let progress = Arc::new(crate::log::Log::new(crate::cli::resolve::ColorMode::Plain));
+        let (pushed, skipped) = push(
+            &paths, &client, &mut lockfile, false, &changes, &progress, "dev",
+        )
+        .await
+        .expect("push should succeed");
+        assert_eq!((pushed, skipped), (3, 0));
+
+        let reqs = server.received_requests().await.unwrap_or_default();
+        let stream: Vec<String> = reqs
+            .iter()
+            .filter(|r| r.url.path().starts_with("/api/v1/email_templates"))
+            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .collect();
+        assert_eq!(
+            stream,
+            vec![
+                "GET /api/v1/email_templates".to_string(),
+                "PATCH /api/v1/email_templates/700".to_string(),
+                "POST /api/v1/email_templates".to_string(),
+                "PATCH /api/v1/email_templates/702".to_string(),
+            ],
+            "the adopt-or-create must sit BETWEEN the two updates, and the \
+             drift list must be fetched exactly once for the whole push \
+             despite being shared with the adoption matcher",
+        );
+        assert_eq!(
+            stream
+                .iter()
+                .filter(|r| *r == "GET /api/v1/email_templates")
+                .count(),
+            1,
+            "remote_cache is shared between the adopt-or-create branch and \
+             the update batch; a second run must reuse it, not refetch it",
+        );
+    }
 }

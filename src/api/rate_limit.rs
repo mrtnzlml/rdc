@@ -1,11 +1,21 @@
-//! Client-side token-bucket rate limiter for [`crate::api::RossumClient`].
+//! Client-side token-bucket rate limiter for the two services rdc paces:
+//! [`crate::api::RossumClient`] (the core API, via [`RateLimiter::rossum_core_api`])
+//! and [`crate::api::data_storage::DataStorageClient`] (Data Storage / MDH,
+//! via [`RateLimiter::rossum_data_storage`]). They throttle independently on
+//! the same token (spec S5), so each gets its own bucket rather than sharing
+//! one — a shared bucket would spend core tokens on Data Storage calls
+//! nobody asked us to pace.
 //!
 //! Rossum's ingress rate limiter enforces `default.core_api` at
 //! **10 req/s with burst 10** (window 1 s). Empirically verified against
 //! `api.elis.rossum.ai/v1` on 2026-05-22:
 //!
-//! - The `x-limiter-core-api` header on 200 responses reports
-//!   `{"config":{"rate_limit":10,"burst":10,"window":1,"action":"enforce"}}`.
+//! - The `x-limiter-core-api` header on 200 responses reported
+//!   `{"config":{"rate_limit":10,"burst":10,"window":1,"action":"enforce"}}`
+//!   **at the time**. This is now HISTORICAL, not a live mechanism: the
+//!   2026-08-24 Data Storage probes (spec S7) verified the header is no
+//!   longer present on responses from either service. Do not read a policy
+//!   off it — there is currently no rate-limit header to read one off at all.
 //! - A 15-request parallel burst on one token produced 11 × 200 and 4 ×
 //!   429, with `Retry-After: 1` on every 429. The bucket scope is
 //!   per-token (confirmed by watching `meta.remaining` drain across
@@ -20,11 +30,13 @@
 //! 429 is reserved for genuine contention (another rdc, the UI, or an
 //! integration sharing the same token).
 //!
-//! The limiter is intentionally **per-`RossumClient`**, not global: each
-//! client carries an `Arc<RateLimiter>` so all in-flight calls from one
-//! client share the same bucket while two clients (e.g. `rdc deploy`'s
-//! src + tgt) get independent buckets — matching the server's
-//! per-token scope.
+//! The limiter is intentionally **per-client**, not global: each
+//! `RossumClient` or `DataStorageClient` carries its own `Arc<RateLimiter>`
+//! so all in-flight calls from one client share the same bucket, while two
+//! clients of the same kind (e.g. `rdc deploy`'s src + tgt `RossumClient`s)
+//! get independent buckets — matching the server's per-token scope. See the
+//! bucket-lifetime note on [`RateLimiter::rossum_data_storage`] for how
+//! often each kind of client (and therefore each bucket) gets rebuilt.
 
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -75,6 +87,22 @@ impl RateLimiter {
     /// to be stricter, this constant is the one line to change;
     /// [`crate::api::retry::send_with_retry`]'s `Retry-After` handling is the
     /// backstop underneath it.
+    ///
+    /// **Bucket lifetime.** `DataStorageClient::new` has exactly one
+    /// production call site (inside `pull::mdh::list`, itself called once per
+    /// `sync::run_cycle` invocation via `pull::common::list_remote`), so this
+    /// bucket is rebuilt with a fresh full 30-token burst on every sync
+    /// cycle. That is NOT an asymmetry with the core API's bucket: the core
+    /// `RossumClient` is built at the top of `run_cycle` itself
+    /// (`src/cli/sync/mod.rs`) and is just as fresh every cycle — `run_cycle`
+    /// rebuilds its whole client/lockfile/catalog state from scratch on each
+    /// call, and `watch::run_watch`'s loop calls it once per cycle; the
+    /// renderer is the only object that loop explicitly carries across
+    /// cycles. So under `--watch` or a multi-cycle sync, BOTH pacing layers
+    /// get a fresh full burst every cycle, symmetrically. Harmless at the
+    /// measured ~143 req/s ceiling either way; recorded here because it is
+    /// the first thing that would matter if a cluster turned out to be
+    /// stricter.
     pub fn rossum_data_storage() -> Self {
         Self::new(30.0, 30.0)
     }

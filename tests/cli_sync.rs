@@ -12853,6 +12853,12 @@ async fn mdh_listing_is_dispatched_alongside_the_core_list_stream() {
         .iter()
         .position(|r| r.url.path() == "/svc/data-storage/api/v1/collections/list")
         .expect("the Data Storage listing must happen");
+    // `< 6` encodes "within the first wave of a `buffer_unordered(PULL_FANOUT)`
+    // stream" — 1 (organization) + `PULL_FANOUT` (= 5, `pull::common::PULL_FANOUT`)
+    // concurrent core-list requests. This is coupled to `PULL_FANOUT`'s value:
+    // raising that constant would fail this assertion for a reason unrelated
+    // to what it actually tests (that MDH listing overlaps the core stream
+    // rather than queuing behind it), not because the overlap regressed.
     assert!(
         ds_index < 6,
         "MDH listing must go out in the first wave, not queued behind the core \
