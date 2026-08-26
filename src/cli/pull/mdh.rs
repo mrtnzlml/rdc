@@ -216,7 +216,7 @@ pub(crate) fn plan_mdh(
         // parses as a single JSON value, so the canonical path would strip a
         // `modified_at` / `modifier` / `training_enabled` COLUMN at any
         // depth — those are ordinary export columns here, not Rossum
-        // metadata. `push_dataset_data` and `pull_dataset_data` both hash
+        // metadata. `push_dataset_data` and `apply_dataset_rows` both hash
         // raw; this forecast must match or it disagrees with the real run.
         //
         // `unwrap_or(DataMode::None)`: this function is infallible by design
@@ -435,7 +435,7 @@ pub(crate) async fn plan_mdh_index_edits(
                     .and_then(|m| m.get(slug))
                     .and_then(|e| e.content_hash.clone());
                 // `HashMode::Raw`: same reasoning as the pull driver at
-                // `pull_dataset_data` — the bytes ARE the artifact, so
+                // `apply_dataset_rows` — the bytes ARE the artifact, so
                 // hashing must be verbatim, never through the canonical
                 // JSON path that strips ordinary export columns.
                 let (action, _) =
@@ -766,33 +766,6 @@ pub(crate) async fn apply_dataset_rows(
         matches!(action, PullAction::Write | PullAction::Conflict),
         conflicts,
     ))
-}
-
-/// Pull one manual dataset's rows into `data.jsonl`.
-///
-/// Returns `(changed, conflicts)`. Costs two calls (`$count` for the guardrail,
-/// then one `find`) and is invoked ONLY for datasets flagged `"data": "manual"`,
-/// so a metadata-only dataset stays exactly as cheap as it is today. A thin
-/// `fetch` + `apply` wrapper over [`fetch_dataset_rows`] / [`apply_dataset_rows`].
-///
-/// `process` now calls those two directly (fetch batched across datasets,
-/// apply sequentially), so this single-dataset wrapper has no production
-/// caller left — `#[cfg(test)]` keeps it for the three tests below without
-/// tripping the workspace's `dead_code = "deny"` lint on real builds.
-#[cfg(test)]
-pub(crate) async fn pull_dataset_data(
-    ctx: &mut PullCtx<'_>,
-    client: &DataStorageClient,
-    collection_name: &str,
-    slug: &str,
-    progress: &Arc<Log>,
-) -> Result<(bool, usize)> {
-    let wanted = [(slug.to_string(), collection_name.to_string())];
-    let mut fetched = fetch_dataset_rows(client, ctx.paths, &wanted, progress).await?;
-    let (count, rows) = fetched
-        .remove(slug)
-        .expect("fetch_dataset_rows returns every requested slug");
-    apply_dataset_rows(ctx, slug, count, rows, progress).await
 }
 
 /// Opaque listed state for MDH — the client handle plus the collection list.
@@ -2083,10 +2056,14 @@ mod tests {
             interactive: false,
         };
 
-        let (changed, conflicts) =
-            pull_dataset_data(&mut ctx, &client, "GL_CODES", "gl-codes", &progress)
-                .await
-                .unwrap();
+        let wanted = [("gl-codes".to_string(), "GL_CODES".to_string())];
+        let mut fetched = fetch_dataset_rows(&client, ctx.paths, &wanted, &progress)
+            .await
+            .unwrap();
+        let (count, rows) = fetched.remove("gl-codes").unwrap();
+        let (changed, conflicts) = apply_dataset_rows(&mut ctx, "gl-codes", count, rows, &progress)
+            .await
+            .unwrap();
         assert!(changed);
         assert_eq!(conflicts, 0);
         // Server ids stripped, keys sorted, lines sorted.
@@ -2101,10 +2078,13 @@ mod tests {
         assert!(ctx.lockfile.objects["mdh_data"].contains_key("gl-codes"));
 
         // Second pull over identical remote state changes nothing.
-        let (changed2, _) =
-            pull_dataset_data(&mut ctx, &client, "GL_CODES", "gl-codes", &progress)
-                .await
-                .unwrap();
+        let mut fetched2 = fetch_dataset_rows(&client, ctx.paths, &wanted, &progress)
+            .await
+            .unwrap();
+        let (count2, rows2) = fetched2.remove("gl-codes").unwrap();
+        let (changed2, _) = apply_dataset_rows(&mut ctx, "gl-codes", count2, rows2, &progress)
+            .await
+            .unwrap();
         assert!(!changed2, "an unchanged re-pull must report no change");
     }
 
@@ -2141,16 +2121,23 @@ mod tests {
         .unwrap();
         let client = DataStorageClient::new(server.uri(), "t".to_string()).unwrap();
         let mut lockfile = crate::state::Lockfile::default();
-        let mut ctx = PullCtx {
+        let ctx = PullCtx {
             paths: &paths,
             client: &rossum,
             lockfile: &mut lockfile,
             queue_locations: std::collections::BTreeMap::new(),
             interactive: false,
         };
-        let err = pull_dataset_data(&mut ctx, &client, "GL_CODES", "gl-codes", &progress)
-            .await
-            .unwrap_err();
+        // The guardrail lives inside `fetch_dataset_rows` now — the error
+        // must come out of the fetch, before any `apply_dataset_rows` call.
+        let err = fetch_dataset_rows(
+            &client,
+            ctx.paths,
+            &[("gl-codes".to_string(), "GL_CODES".to_string())],
+            &progress,
+        )
+        .await
+        .unwrap_err();
         let msg = format!("{err:#}");
         let over = (crate::snapshot::mdh_data::ROW_HARD_LIMIT + 1).to_string();
         assert!(msg.contains(&over), "must state the count: {msg}");
@@ -2221,10 +2208,18 @@ mod tests {
             interactive: false,
         };
 
-        let (changed, conflicts) =
-            pull_dataset_data(&mut ctx, &client, "GL_CODES", "gl-codes", &progress)
-                .await
-                .unwrap();
+        let mut fetched = fetch_dataset_rows(
+            &client,
+            ctx.paths,
+            &[("gl-codes".to_string(), "GL_CODES".to_string())],
+            &progress,
+        )
+        .await
+        .unwrap();
+        let (count, rows) = fetched.remove("gl-codes").unwrap();
+        let (changed, conflicts) = apply_dataset_rows(&mut ctx, "gl-codes", count, rows, &progress)
+            .await
+            .unwrap();
         assert!(!changed, "KeepLocal is not a change");
         assert_eq!(conflicts, 0);
         assert_eq!(
