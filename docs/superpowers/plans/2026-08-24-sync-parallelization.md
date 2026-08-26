@@ -1329,13 +1329,18 @@ queue behind a core slot."
 
 Spec **D6**. With Task 6 in place the MDH arm is free-running, so it can do its whole phase there: list the collections, then immediately fetch the index sets, while the core stream is still working. On a steady-state sync that moves the entire MDH read phase off the critical path.
 
+**Correction to spec D6 — the prefetch is gated on the cycle being read-only.** D6 as written is unsound for `process`, which is stage 3 of the MDH cycle: the pull-back that runs *after* stages 1 and 2 push index changes. Seeding it from a listing-time snapshot would write `indexes.json` from **pre-push** state, so a just-created index would be silently absent from the snapshot and the next cycle would try to create it again — the period-2 churn this codebase has fought before. The pre-existing test `sync_mdh_index_create_counts_as_changed_when_materialized` detects exactly this.
+
+So `mdh::list` prefetches **only when the cycle performs no writes** (`dry_run || no_push`). When the cycle writes, `index_sets` stays empty and `process`'s "fetch the remainder" logic naturally fetches its whole subset fresh — no second code path. Request counts stay identical in all four cases, and the pull-back always sees post-push state.
+
 **Scope refinement vs. the spec.** D6 scopes the prefetch to "collections whose local dataset dir exists". Use the tighter predicate **"whose local `indexes.json` exists"** instead. Both are decidable offline, both are a superset of nothing the run doesn't already need, but the tighter one makes the dry-run request count *exactly* unchanged rather than "unchanged or higher": a dataset dir with no `indexes.json` (a hand-made dir, or one whose file was deleted) is territory the dry-run forecast deliberately skips, and prefetching it would add a request the preview never used to make. `process` still fetches the remainder, so the real sync's total is unchanged either way.
 
 | case | prefetched | fetched in `process` | total vs today |
 |---|---|---|---|
-| steady-state sync | all datasets | 0 | same, now overlapped |
+| steady `--no-push` (read-only) | datasets with `indexes.json` | the remainder, ~0 | same, now overlapped |
+| steady `--dry-run` (read-only) | datasets with `indexes.json` | `process` is never reached | same, now overlapped |
+| a sync that writes | **0 — prefetch gated off** | all of its subset, fresh | same, and correct |
 | first full pull (no local files) | 0 | all | identical |
-| steady-state dry-run | all datasets with `indexes.json` | n/a | identical, now concurrent |
 | new remote collection | 0 for it | its 2 calls | identical |
 
 **Files:**
@@ -1346,7 +1351,8 @@ Spec **D6**. With Task 6 in place the MDH arm is free-running, so it can do its 
 - Consumes: Task 3's `fetch_index_sets`, Task 4's `MdhListed::datasets`, Task 6's free-running MDH arm.
 - Produces:
   - `MdhListed` gains `pub index_sets: BTreeMap<String, IndexSet>` — index sets already fetched at listing time, keyed by dataset slug. Empty on a fresh tree. `MdhListed::new` initialises it empty; the field is filled by `list`.
-  - `mdh::list` signature changes to `pub async fn list(env_cfg: &EnvConfig, token: &str, paths: &crate::paths::Paths, progress: &Arc<Log>) -> Result<MdhListed>`. Its only caller is `list_remote`.
+  - `mdh::list` signature changes to `pub async fn list(env_cfg: &EnvConfig, token: &str, prefetch_for: Option<&crate::paths::Paths>, progress: &Arc<Log>) -> Result<MdhListed>` — `Some(paths)` prefetches, `None` does not. Its only caller is `list_remote`.
+  - `list_remote` gains a `prefetch_mdh_indexes: bool` parameter, passed through as `Some(ctx_ref.paths)` / `None`. Its only caller is `crate::cli::sync::run`, which passes `dry_run || no_push`.
 
 - [ ] **Step 1: Write the failing test**
 
