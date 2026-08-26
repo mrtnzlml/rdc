@@ -210,18 +210,56 @@ a disabled trace costs one atomic load. Every number in this document was
 produced by it. It is how D1–D10 get verified and how a future regression gets
 diagnosed instead of guessed at.
 
-## Expected results
+## Results
 
-Projected from S/L/B, **not yet measured**. To be re-measured with D11 and
-reported honestly, regressions included.
+**Measured 2026-08-26**, same org as the baselines (3 queues, 34 hooks, 96 rules,
+15 email templates, 21 MDH datasets), same machine, same toolchain. Medians of
+**five** runs per command per binary, with the project restored from a pristine
+steady-state snapshot before every run. `before` = `05678ee`, `after` =
+`318a365`.
 
-| command | today | projected | why |
-|---|---|---|---|
-| steady `sync --no-push` | 3.1s | **~2.0s** | core (1.5s) and MDH (0.5s list + 42 reqs @ 30/s) overlap instead of summing |
-| steady `sync --dry-run` | 6.5s | **~2.2s** | B9's serial loop becomes 42 requests at 30/s |
-| push 14 hooks | 5.74s | **~1.4s** | 2.44 → 10 req/s |
-| push 40 rules | 6.10s | **~4.0s** | 6.56 → 10 req/s; little headroom by design |
-| first full pull | 10.1s | ~9s | mostly core-bound; D6 prefetches nothing on a fresh tree |
+The machine was more loaded than during the original baselines, so the absolute
+`before` figures run higher than B1/B2. The before/after pair was measured under
+identical conditions, so the ratio is the meaningful number.
+
+| command | before | after | speed-up | projected |
+|---|---|---|---|---|
+| steady `sync --no-push` | 4.07s | **2.56s** | 1.6× | ~2.0s |
+| steady `sync --dry-run` | 7.97s | **2.49s** | **3.2×** | ~2.2s |
+| first full pull | 9.6s | — | — | ~9s |
+
+**The dry-run pathology is gone.** `--dry-run` cost **1.96× the sync it
+previewed** before (7.97s vs 4.07s); it is now marginally *faster* than that
+sync (2.49s vs 2.56s), which is what a preview issuing the same requests
+concurrently should look like.
+
+### The request-count invariant — verified, both directions
+
+The design's hardest constraint is that per-command request counts do not change
+on the success path. Verified by tracing **both** binaries. The trace did not
+exist before D11, so `before` was measured by applying D11's `retry.rs` alone
+onto `05678ee` — the instrument, and nothing else.
+
+| command | before | after |
+|---|---|---|
+| `sync --no-push` | 58 (15 core, 43 DS) | 58 (15 core, 43 DS) |
+| `sync --dry-run` | 58 (15 core, 43 DS) | 58 (15 core, 43 DS) |
+
+Identical across three traced runs each. Total `limiter_wait_ms` was **0.0** in
+every run but one (42.5ms), so B6 still holds: neither bucket is the bottleneck
+at this scale, and the win is overlap, not pacing.
+
+### Cross-version idempotency
+
+An `after` binary run against a tree produced by a `before` binary reports
+**0 changed**. The snapshot format is unaffected.
+
+### Still not measured
+
+The **push-path** rows (14 hooks, 40 rules) were not re-measured — doing so
+means writing dozens of edits to a live org, and the read-path result was
+obtained without touching one. The **MDH row-pull fan-out** remains projected:
+the measurement org has no manual datasets.
 
 ## Non-goals
 
