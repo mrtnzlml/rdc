@@ -254,12 +254,51 @@ at this scale, and the win is overlap, not pacing.
 An `after` binary run against a tree produced by a `before` binary reports
 **0 changed**. The snapshot format is unaffected.
 
+### Push path — measured
+
+Measured by editing one inert field (`description`) on N objects and pushing,
+then restoring. PATCH phase = first PATCH dispatch to last PATCH completion,
+read off the trace.
+
+| wave | before | after | speed-up |
+|---|---|---|---|
+| 40 rules | 5.03s (7.96 req/s) | **3.10s (12.90 req/s)** | 1.6× |
+| 14 hooks, sample 1 | 2.80s (5.00 req/s) | **2.31s (6.07 req/s)** | 1.2× |
+| 14 hooks, sample 2 | 6.16s (2.27 req/s) | **1.33s (10.52 req/s)** | 4.6× |
+
+Peak in-flight PATCHes went 3 → 6 for rules and 2 → 5/6 for hooks, i.e. the
+fan-out is real and bounded near `PUSH_FANOUT`.
+
+**Rules exceed the nominal 10 req/s because the bucket has burst 10:** 40
+requests in 3.10s is burst-10 plus 30 more at 10/s. The bucket is now the
+governor, which is what D9 predicted.
+
+**The hook figures are dominated by server-side variance, not by rdc.** The
+*before* side alone ranged 2.27–5.00 req/s across two samples, with per-PATCH
+latency of 188ms mean / 245ms max in one and 318ms mean / 1677ms max in the
+other. B5's original 2.44 req/s matches sample 2. So the projected "2.44 → 10
+req/s" is achievable — sample 2 hit 10.52 — but not repeatable on demand.
+
+This also qualifies **L6**. "Concurrency does not inflate write latency" was
+measured on cheap no-op PATCHes and does not generalise to hooks: in sample 1
+the after-side mean rose 188ms → 315ms (max 1046ms) under a fan-out of 5. The
+work still finished sooner, but the per-request cost is not concurrency-neutral
+for expensive kinds.
+
+### Reading a trace: attempts, not logical requests
+
+`RDC_TRACE_HTTP` writes one line per **attempt**. A request that is throttled
+and succeeds on retry appears twice, for the same URL. On an org grown to 17
+queues, both binaries drew occasional `429`s during the 17-wide schema prefetch
+(before: 2, after: 3 in one pair) and retried them successfully. Naive line
+counting therefore varies run to run; count **unique** requests when checking
+the invariant. The 58/15/43 figures above were taken on the 3-queue org, where
+no request was throttled.
+
 ### Still not measured
 
-The **push-path** rows (14 hooks, 40 rules) were not re-measured — doing so
-means writing dozens of edits to a live org, and the read-path result was
-obtained without touching one. The **MDH row-pull fan-out** remains projected:
-the measurement org has no manual datasets.
+The **MDH row-pull fan-out** remains projected: the measurement org has no
+manual datasets.
 
 ## Non-goals
 
