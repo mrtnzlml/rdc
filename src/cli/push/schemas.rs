@@ -48,7 +48,19 @@ pub async fn push(
     // instance of exactly that). So `changes` is still walked in slug order and
     // each MAXIMAL RUN of consecutive updates is fanned out, with a create
     // acting as a barrier.
+    //
+    // A DUPLICATE SCHEMA ID is a barrier too, and only this driver needs one:
+    // two queue slugs can resolve to ONE schema, so both would PATCH
+    // `/schemas/{id}` inside the same fanned-out run — concurrently, leaving the
+    // final server state as whichever request the server happened to apply
+    // last. The sequential loop was deterministic (slug order, last slug wins).
+    // `batch_ids` tracks the ids already accumulated so the second slug closes
+    // the run and starts its own, restoring that ordering by construction. It
+    // is cleared wherever `batch` is drained, and the ids it holds cannot go
+    // stale: the only thing that mutates the lockfile mid-walk is a create,
+    // which flushes first.
     let mut batch: Vec<(&String, &std::path::PathBuf)> = Vec::new();
+    let mut batch_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for (q_slug, schema_path) in changes {
         // Missing lockfile entry → new schema, POST.
         if lockfile
@@ -73,6 +85,7 @@ pub async fn push(
             .await?;
             pushed += batched_pushed;
             skipped += batched_skipped;
+            batch_ids.clear();
 
             // queue_dir is the parent of schema.json
             let queue_dir = schema_path
@@ -123,6 +136,35 @@ pub async fn push(
             progress.event(Action::Post, &format!("schema/{q_slug} id={}", created.id));
             pushed += 1;
             continue;
+        }
+
+        // Duplicate-id barrier (see the note above `batch`). Close the pending
+        // run so this slug's PATCH is strictly AFTER the PATCH of the earlier
+        // slug that shares its schema, exactly as the sequential loop ordered
+        // them. The drift GET is not repeated: `remote_cache` is owned by this
+        // function, so the new run finds the id already cached.
+        let id = lockfile
+            .objects
+            .get("schemas")
+            .and_then(|m| m.get(q_slug.as_str()))
+            .map(|e| e.id)
+            .expect("not a create, so the entry exists");
+        if !batch_ids.insert(id) {
+            let (batched_pushed, batched_skipped) = push_update_batch(
+                paths,
+                client,
+                lockfile,
+                interactive,
+                &mut batch,
+                &mut remote_cache,
+                progress,
+                env,
+            )
+            .await?;
+            pushed += batched_pushed;
+            skipped += batched_skipped;
+            batch_ids.clear();
+            batch_ids.insert(id);
         }
 
         batch.push((q_slug, schema_path));
@@ -820,6 +862,13 @@ mod tests {
     /// pointing at one shared schema paid exactly ONE `GET /schemas/{id}`.
     /// Fanning the GET out inside each item's future would re-fetch that
     /// schema once per slug. Prefetching the DISTINCT ids keeps the count.
+    ///
+    /// It also pins the ORDER of the two PATCHes, which the fan-out would
+    /// otherwise leave to the server: both slugs write the same schema id, so
+    /// the last writer decides the final remote state. The duplicate-id barrier
+    /// makes `q-b` (last in `BTreeMap` order) the last writer deterministically,
+    /// exactly as the sequential loop did. The two local bodies differ by
+    /// `name`, so the received request bodies say which went first.
     #[tokio::test(flavor = "multi_thread")]
     async fn push_schemas_fetches_a_shared_schema_exactly_once() {
         let server = MockServer::start().await;
@@ -828,44 +877,66 @@ mod tests {
         // Both queue slugs resolve to schema 800.
         let (paths, mut lockfile, changes, remotes) =
             seed_schemas(&tmp, &api, &[("q-a", 800), ("q-b", 800)]);
-        mount_get_and_patch(
-            &server,
-            800,
-            remotes[0].clone(),
-            remotes[0].clone(),
-            std::time::Duration::ZERO,
-        )
-        .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/schemas/800"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(remotes[0].clone()))
+            .mount(&server)
+            .await;
+        // A slow PATCH turns "were these serialized?" into wall-clock evidence:
+        // two 200ms PATCHes cost ~400ms back-to-back and ~200ms overlapped.
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/schemas/800"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(remotes[0].clone())
+                    .set_delay(std::time::Duration::from_millis(200)),
+            )
+            .mount(&server)
+            .await;
 
         let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
         let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        let start = std::time::Instant::now();
         let (pushed, skipped) = push(
             &paths, &client, &mut lockfile, false, &changes, &progress, "dev",
         )
         .await
         .expect("push should succeed");
+        let elapsed = start.elapsed();
         assert_eq!((pushed, skipped), (2, 0));
+        assert!(
+            elapsed >= std::time::Duration::from_millis(350),
+            "the two PATCHes to the SAME schema id must not overlap — whichever \
+             the server applied last would decide the remote state; took {elapsed:?}",
+        );
 
+        // Label each PATCH with the `name` it carried, so the stream shows not
+        // just how many requests went out but WHICH body won.
         let seq: Vec<String> = server
             .received_requests()
             .await
             .unwrap()
             .iter()
-            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .map(|r| {
+                let line = format!("{} {}", r.method, r.url.path());
+                if r.method == "PATCH" {
+                    let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+                    format!("{line} name={}", body["name"].as_str().unwrap())
+                } else {
+                    line
+                }
+            })
             .collect();
         assert_eq!(
-            seq.iter()
-                .filter(|r| *r == "GET /api/v1/schemas/800")
-                .count(),
-            1,
-            "a schema shared by two slugs must cost exactly one drift GET: {seq:?}"
-        );
-        assert_eq!(
-            seq.iter()
-                .filter(|r| *r == "PATCH /api/v1/schemas/800")
-                .count(),
-            2,
-            "both slugs still push their own body: {seq:?}"
+            seq,
+            vec![
+                "GET /api/v1/schemas/800".to_string(),
+                "PATCH /api/v1/schemas/800 name=q-a".to_string(),
+                "PATCH /api/v1/schemas/800 name=q-b".to_string(),
+            ],
+            "a schema shared by two slugs must cost exactly one drift GET, and \
+             its two PATCHes must be SERIALIZED in slug order so the last \
+             writer is deterministic: {seq:?}",
         );
     }
 

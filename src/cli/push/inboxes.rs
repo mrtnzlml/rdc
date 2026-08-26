@@ -224,10 +224,14 @@ async fn push_update_batch(
             let remote_art = remote_artifact(&remote_inbox)?;
             if combined_hash(&remote_art.json, &remote_art.sidecars, lf) != base {
                 // Drift. NOT patched here — the sequential stage owns the prompt.
-                bodies
-                    .lock()
-                    .expect("drift-body cache poisoned")
-                    .insert(q_slug.clone(), remote_inbox);
+                // Named binding + explicit `drop`, NOT a one-statement
+                // temporary: `prepare_all` puts no `Send` bound on its future,
+                // so a guard held across an `.await` would COMPILE. With the
+                // guard named, `clippy::await_holding_lock` catches any future
+                // edit that awaits before this drop.
+                let mut guard = bodies.lock().expect("drift-body cache poisoned");
+                guard.insert(q_slug.clone(), remote_inbox);
+                drop(guard);
                 return Ok(Prepared::NeedsPrompt {
                     slug: q_slug.clone(),
                 });
@@ -532,7 +536,6 @@ async fn push_one_drifted(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::codec::combined_hash;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
