@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- **Do not change what a command requests.** Every task must leave the per-command HTTP request count identical on the success path. The one documented exception is Task 9–12's error path (see D10): on a mid-batch failure, requests already dispatched concurrently still complete. Nothing else may add or drop a request.
+- **Do not change what a command requests.** Every task must leave the per-command HTTP request count identical on the success path. The one documented exception is Task 9–12's **error** path: `prepare_all` collects the whole stream, so once a batch starts, a failure on one item does not stop the others — every remaining item in that batch is still prepared and PATCHed, not merely the ones already in flight. The old sequential loop sent nothing after the failing item. This is accepted deliberately: no completed PATCH is ever left unrecorded (D10 still holds exactly), and one malformed local file no longer blocks every other edit in the same push. Nothing else may add or drop a request.
 - **The bucket governs, not the fan-out.** `MDH_FANOUT = 10` and `PUSH_FANOUT = 5` exist only to bound outstanding requests. Do not "tune" them to chase throughput — raise the bucket rate instead, and only with a measurement.
 - Core limiter stays **10 req/s, burst 10** (`RateLimiter::rossum_core_api()`). Spec S2 verified it is correctly calibrated. Do not touch it.
 - Data Storage limiter is **30 req/s, burst 30**. Measured ceiling is far higher (S3: 80 concurrent → 0 × 429; S4: sustained 36–63 req/s → 0 × 429); 30 is a deliberate margin. It is one constant to change if a cluster turns out to be stricter.
