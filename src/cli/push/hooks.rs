@@ -90,14 +90,36 @@ pub async fn push(
     let mut pushed = 0usize;
     let mut skipped = 0usize;
 
-    // Lazily-fetched fresh hook list, used exclusively for the pre-PATCH
-    // drift check below. The orphan check uses `catalog_hooks` (Phase-1
-    // data) instead, so this cache is no longer shared between the
-    // create and update paths.
+    // The pre-PATCH drift list: fetched at most once per push and shared by
+    // every update batch below. Same lazy semantics as the old loop's cache —
+    // the first item that gets PAST the `content_hash` guard pays for it, and
+    // a push whose updates all lack a hash makes no list call at all. It stays
+    // separate from `catalog_hooks` (Phase-1 data, used only for the
+    // store-extension orphan check), so the safety contract's "remote bytes at
+    // the moment of PATCH" guarantee is unchanged.
     let mut drift_hooks: Option<Vec<crate::model::Hook>> = None;
 
+    // Updates fan out (Task 9's two-stage shape); creates stay strictly
+    // sequential. But the two are NOT partitioned into "all creates, then all
+    // updates" the way `push::rules` can afford to be. A hook's refs are
+    // resolved against the lockfile AS IT STANDS when that hook is prepared,
+    // so hoisting a create ahead of an earlier-sorting update would resolve a
+    // ref that used to defer, and change what this command sends: an
+    // already-deployed hook whose `run_after` names a hook created later in
+    // the same pass would collapse the documented push-PATCH + relink-PATCH
+    // pair into a single PATCH. `push::relink` and the integration test
+    // `sync_push_hook_run_after_deferred_relink_on_the_patch_path` both pin
+    // that ordering.
+    //
+    // So `changes` is still walked in slug order, and each MAXIMAL RUN of
+    // consecutive updates is fanned out with a create acting as a barrier.
+    // Within a run the concurrency is invisible: an update's write-back
+    // rewrites only its OWN entry's hashes and its own files, and no sibling's
+    // ref resolution or drift check reads those — ids, which are what refs
+    // resolve through, never change on an update. The common steady-state
+    // push (all updates, no creates) is one run, i.e. exactly Task 9's shape.
+    let mut batch: Vec<(&String, &std::path::PathBuf)> = Vec::new();
     for (slug, local_json_path) in changes {
-
         // Missing lockfile entry = new hook → POST. Local file becomes the
         // create payload; server response (with id/url assigned) overwrites
         // disk; lockfile gets a fresh entry.
@@ -107,13 +129,33 @@ pub async fn push(
             .and_then(|m| m.get(slug.as_str()))
             .is_none()
         {
+            // Close the pending run first: every update sorting BEFORE this
+            // create must be prepared against a lockfile that does not yet
+            // know the id this POST is about to assign.
+            let (batched_pushed, batched_skipped) = push_update_batch(
+                paths,
+                client,
+                lockfile,
+                interactive,
+                &hooks_dir,
+                &mut batch,
+                &mut drift_hooks,
+                &hook_secrets,
+                relink,
+                progress,
+                env,
+            )
+            .await?;
+            pushed += batched_pushed;
+            skipped += batched_skipped;
+
             // Read + portabilize refs once; reused by both paths.
             let mut payload = read_hook_value(&hooks_dir, slug)
                 .with_context(|| format!("reading local hook '{slug}' for create"))?;
             // Two-phase relink: resolve what we can; defer top-level fields whose
             // rdc:// refs target a hook not yet created (e.g. `run_after` pointing
             // at another new hook). The relink pass PATCHes them once all hooks
-            // exist. The patch path below does the same.
+            // exist. `push_update_batch`'s patch path does the same.
             let deferred = crate::snapshot::refs::resolve_value_deferring(&mut payload, lockfile);
 
             // Anomaly guard, then dispatch on extension type.
@@ -282,243 +324,26 @@ pub async fn push(
             pushed += 1;
             continue;
         }
-
-        let entry = lockfile
-            .objects
-            .get("hooks")
-            .and_then(|m| m.get(slug.as_str()))
-            .unwrap();
-        let Some(base) = &entry.content_hash else {
-            progress.event(Action::Skip, &format!("hook/{slug} (no content_hash)"));
-            skipped += 1;
-            continue;
-        };
-        let base = base.clone();
-
-        let id = entry.id;
-
-        // Read raw Value (with the sidecar code spliced in) BEFORE typed
-        // deserialize.
-        let mut payload = read_hook_value(&hooks_dir, slug)
-            .with_context(|| format!("reading local hook '{slug}'"))?;
-        // The on-disk sidecar is whatever the local JSON declared.
-        let local_ext = hook_code_extension_from_value(&payload);
-        // Two-phase relink, same as the create path above and as
-        // `queues`/`engines` do on BOTH of their paths. Hooks are pushed in
-        // slug order, so an already-deployed hook whose `run_after` names one
-        // created later in this same pass is an ordinary forward reference —
-        // resolving eagerly here left an `rdc://` in the body and the
-        // unresolved-ref guard aborted the entire cycle, permanently wedging
-        // any env where a tracked hook points at a not-yet-created one.
-        let mut deferred = crate::snapshot::refs::resolve_value_deferring(&mut payload, lockfile);
-        let payload_hook: crate::model::Hook = serde_json::from_value(payload)
-            .with_context(|| format!("deserializing hook '{slug}'"))?;
-
-        // Drift check: fetch remote, serialize, hash. Compare to base.
-        // The list is cached across iterations within this loop so a batch
-        // of N updates only pays one list call here.
-        if drift_hooks.is_none() {
-            drift_hooks = Some(
-                client
-                    .list_hooks(Some(progress.clone()))
-                    .await
-                    .context("listing hooks to verify no drift before push")?,
-            );
-        }
-        let remote_list = drift_hooks
-            .as_ref()
-            .expect("drift_hooks was just populated above");
-        let Some(remote_hook) = remote_list.iter().find(|h| h.id == id) else {
-            progress.event(
-                Action::Skip,
-                &format!("hook/{slug} (remote id {id} missing)"),
-            );
-            skipped += 1;
-            continue;
-        };
-        let (remote_json, remote_code) = serialize_hook(remote_hook)?;
-        let remote_combined = hook_combined_hash(&remote_json, &remote_code, lockfile);
-        let mut payload_to_send = payload_hook;
-        if remote_combined != base {
-            // Drift detected. The hook is a combined-hash kind (json + py);
-            // the resolver prompt shows json bytes for the diff (most
-            // common case). On Adopt, we write both .json and .py from
-            // the remote so disk + lockfile stay aligned.
-            use crate::cli::resolve::{PushDriftOutcome, resolve_push_drift};
-            match resolve_push_drift(interactive, local_json_path, &remote_json, env)? {
-                PushDriftOutcome::Patch { payload_override } => {
-                    if let Some(bytes) = payload_override {
-                        let mut ov: serde_json::Value = serde_json::from_slice(&bytes)
-                            .with_context(|| format!("re-deserializing edited hook '{slug}'"))?;
-                        // The edited body replaces the one deferral was computed
-                        // from, so recompute it (mirrors `push::queues`).
-                        deferred = crate::snapshot::refs::resolve_value_deferring(&mut ov, lockfile);
-                        payload_to_send = serde_json::from_value(ov)
-                            .with_context(|| format!("re-deserializing edited hook '{slug}'"))?;
-                    }
-                }
-                PushDriftOutcome::Adopt => {
-                    // Portabilize the adopted remote so concrete env URLs never
-                    // land on disk (the hook is lockfile-pinned; self + refs resolve).
-                    let remote_json =
-                        crate::cli::pull::common::portabilize_proposed(&remote_json, lockfile);
-                    write_atomic(local_json_path, &remote_json).with_context(|| {
-                        format!("adopting remote into {}", local_json_path.display())
-                    })?;
-                    // Adopt uses the remote runtime to decide the
-                    // sidecar extension — the remote is now the source
-                    // of truth. Sweep any sidecar of the other
-                    // extension so disk stays canonical.
-                    let remote_ext = hook_code_extension(remote_hook);
-                    if let Some(code) = &remote_code {
-                        write_hook_code(&hooks_dir, slug, code, remote_ext)
-                            .with_context(|| format!("adopting remote hook code for '{slug}'"))?;
-                    } else {
-                        let primary = hooks_dir.join(format!("{slug}.{remote_ext}"));
-                        if primary.exists() {
-                            std::fs::remove_file(&primary)
-                                .with_context(|| format!("removing stale {}", primary.display()))?;
-                        }
-                    }
-                    let other_remote_ext = if remote_ext == "py" { "js" } else { "py" };
-                    let stale = hooks_dir.join(format!("{slug}.{other_remote_ext}"));
-                    if stale.exists() {
-                        std::fs::remove_file(&stale)
-                            .with_context(|| format!("removing stale {}", stale.display()))?;
-                    }
-                    let _ = local_ext; // unused on adopt path; the remote ext drives layout
-                    // Adopt is a content-side reconciliation (remote → local).
-                    // The secrets we last pushed are unaffected; carry the
-                    // previous lockfile `secrets_hash` forward so the next
-                    // sync doesn't think they changed.
-                    let prior_secrets_hash = lockfile
-                        .objects
-                        .get("hooks")
-                        .and_then(|m| m.get(slug.as_str()))
-                        .and_then(|e| e.secrets_hash.clone());
-                    lockfile.upsert(
-                        "hooks",
-                        slug,
-                        ObjectEntry {
-                            id,
-                            modified_at: remote_hook.modified_at().map(|s| s.to_string()),
-                            modified_by: remote_hook.modified_by().map(|s| s.to_string()),
-                            content_hash: Some(remote_combined),
-                            secrets_hash: prior_secrets_hash,
-                        },
-                    );
-                    progress.event(Action::Warn, &format!("hook/{slug} adopted remote (drift)"));
-                    skipped += 1;
-                    continue;
-                }
-                PushDriftOutcome::Skip => {
-                    progress.event(
-                        Action::Skip,
-                        &format!("hook/{slug} (remote changed; rdc sync first)"),
-                    );
-                    skipped += 1;
-                    continue;
-                }
-            }
-        }
-
-        // Build a Value form of the typed payload so secrets (which
-        // have no place on the typed `Hook` model) can ride this PATCH.
-        let mut body = serde_json::to_value(&payload_to_send)
-            .with_context(|| format!("serializing hook '{slug}' for PATCH"))?;
-        // A deferred field must not ride this PATCH at all. Removing the key
-        // from the Value is not enough on its own: `queues` is a MODELED field
-        // on `Hook`, so the typed round-trip re-materializes it as `[]` and the
-        // PATCH would detach the hook from every queue until the relink lands —
-        // permanently if the relink never resolves. Omitting the key leaves the
-        // remote's current value untouched, which is what deferral means.
-        if let Some(obj) = body.as_object_mut() {
-            for (field, _) in &deferred {
-                obj.remove(field);
-            }
-        }
-        // `status` is a read-only server health field that's redacted to the
-        // sentinel on disk; strip it (and the other server fields) so the
-        // PATCH body matches the CREATE contract instead of echoing the
-        // sentinel back. Done before secret injection so secrets survive.
-        strip_for_create(&mut body, "hooks");
-        let updated_secrets_hash = inject_hook_secrets(&mut body, slug, &hook_secrets);
-        let patch_result = client
-            .update_hook_value(id, &body, Some(progress.clone()))
-            .await
-            .with_context(|| format!("PATCH /hooks/{id}"));
-        let updated = patch_result?;
-
-        // Refresh local file with the codec's canonical form (matches
-        // what next pull would write) and update lockfile to match.
-        let (updated_json, updated_code) = serialize_hook(&updated)?;
-        // Re-portabilize the server response so concrete env URLs never land on
-        // disk. The hook is already lockfile-pinned, so its `url` and every
-        // cross-ref resolve back to `rdc://`.
-        let updated_json =
-            crate::cli::pull::common::portabilize_proposed(&updated_json, lockfile);
-        let updated_hash = hook_combined_hash(&updated_json, &updated_code, lockfile);
-        let updated_ext = hook_code_extension(&updated);
-        crate::state::base_cache::write_disk_and_cache(
-            paths,
-            local_json_path,
-            &updated_json,
-        )
-        .with_context(|| format!("writing post-push canonical form for '{slug}'"))?;
-        let code_path = hooks_dir.join(format!("{slug}.{updated_ext}"));
-        if let Some(code) = &updated_code {
-            write_hook_code(&hooks_dir, slug, code, updated_ext)
-                .with_context(|| format!("writing hook code for '{slug}'"))?;
-            // Mirror the code sidecar into the base cache so a later
-            // `BothDiverged` conflict can 3-way-merge the code against a real
-            // base — matching what `pull::hooks` does. Without this the base
-            // cache holds the `.json` but not the `.py`, and the conflict
-            // resolver falls back to a manual prompt (`base_cache::read` → None).
-            crate::state::base_cache::write(paths, &code_path, code.as_bytes())
-                .with_context(|| format!("caching base hook code for '{slug}'"))?;
-        } else {
-            // Post-PATCH the hook has no code (e.g. a function→webhook change):
-            // drop the primary sidecar from disk and the base cache so the
-            // snapshot stays canonical.
-            if code_path.exists() {
-                std::fs::remove_file(&code_path)
-                    .with_context(|| format!("removing stale {}", code_path.display()))?;
-            }
-            crate::state::base_cache::forget(paths, &code_path)?;
-        }
-        // Sweep a stale sidecar if the post-PATCH runtime differs from what the
-        // local disk still carries — from disk AND the base cache mirror.
-        let other_updated_ext = if updated_ext == "py" { "js" } else { "py" };
-        let stale_updated = hooks_dir.join(format!("{slug}.{other_updated_ext}"));
-        if stale_updated.exists() {
-            std::fs::remove_file(&stale_updated)
-                .with_context(|| format!("removing stale {}", stale_updated.display()))?;
-        }
-        crate::state::base_cache::forget(paths, &stale_updated)?;
-        let _ = local_ext; // PATCH path: post-PATCH ext drives layout
-
-        lockfile.upsert(
-            "hooks",
-            slug,
-            ObjectEntry {
-                id: updated.id,
-                modified_at: updated.modified_at().map(|s| s.to_string()),
-                modified_by: updated.modified_by().map(|s| s.to_string()),
-                content_hash: Some(updated_hash),
-                secrets_hash: Some(updated_secrets_hash),
-            },
-        );
-        if !deferred.is_empty() {
-            relink.push(crate::cli::push::relink::DeferredRelink {
-                kind: "hooks".to_string(),
-                slug: slug.clone(),
-                path: local_json_path.clone(),
-                fields: deferred,
-            });
-        }
-        progress.event(Action::Patch, &format!("hook/{slug}"));
-        pushed += 1;
+        batch.push((slug, local_json_path));
     }
+
+    // Flush the trailing run.
+    let (batched_pushed, batched_skipped) = push_update_batch(
+        paths,
+        client,
+        lockfile,
+        interactive,
+        &hooks_dir,
+        &mut batch,
+        &mut drift_hooks,
+        &hook_secrets,
+        relink,
+        progress,
+        env,
+    )
+    .await?;
+    pushed += batched_pushed;
+    skipped += batched_skipped;
 
     // Secrets-only force-push: a user can edit
     // `secrets/<env>.hook-secrets.json` without touching any hook JSON
@@ -595,6 +420,564 @@ pub async fn push(
     }
 
     Ok((pushed + secrets_pushed, skipped))
+}
+
+/// Fan out one maximal run of consecutive hook UPDATES, then apply the results.
+///
+/// Task 9's two-stage shape (`push::rules`), scoped to a run rather than to the
+/// whole push: a concurrent stage that needs only `&Lockfile`, touches neither
+/// the working tree nor the lockfile and never prompts, then a sequential apply
+/// stage in slug order that owns `&mut Lockfile`, the filesystem, `relink` and
+/// every prompt. `batch` is drained.
+///
+/// `drift_hooks` is the caller's one-per-push cache of the fresh hook list, so
+/// several runs still cost a single `GET /hooks` — and a push whose updates all
+/// lack a `content_hash` still costs none.
+#[allow(clippy::too_many_arguments)]
+async fn push_update_batch(
+    paths: &Paths,
+    client: &RossumClient,
+    lockfile: &mut Lockfile,
+    interactive: bool,
+    hooks_dir: &std::path::Path,
+    batch: &mut Vec<(&String, &std::path::PathBuf)>,
+    drift_hooks: &mut Option<Vec<crate::model::Hook>>,
+    hook_secrets: &HookSecrets,
+    relink: &mut Vec<crate::cli::push::relink::DeferredRelink>,
+    progress: &Arc<Log>,
+    env: &str,
+) -> Result<(usize, usize)> {
+    use crate::cli::push::concurrent::{Prepared, prepare_all};
+
+    let updates = std::mem::take(batch);
+    if updates.is_empty() {
+        return Ok((0, 0));
+    }
+    let mut pushed = 0usize;
+    let mut skipped = 0usize;
+
+    // Drift-check list, hoisted to ONE fetch before the batch — but only when
+    // at least one update can actually reach the drift check. The old lazy
+    // cache was populated by the first item that got PAST the `content_hash`
+    // guard, so a run of entries that all lack a hash made no list call at
+    // all; keep that exactly, and keep it caller-owned so several runs share
+    // the single fetch. The list is still FRESH (the fetch just no longer sits
+    // behind the first item's PATCH) and still separate from `catalog_hooks`.
+    let needs_drift_check = updates.iter().any(|(slug, _)| {
+        lockfile
+            .objects
+            .get("hooks")
+            .and_then(|m| m.get(slug.as_str()))
+            .and_then(drift_base)
+            .is_some()
+    });
+    if drift_hooks.is_none() && needs_drift_check {
+        *drift_hooks = Some(
+            client
+                .list_hooks(Some(progress.clone()))
+                .await
+                .context("listing hooks to verify no drift before push")?,
+        );
+    }
+    // Empty only when nothing in this run can consult it: an entry with no
+    // `content_hash` returns `Prepared::Skipped` before the list is ever
+    // touched, and by construction that is then every entry in the run.
+    let remote_hooks: &[crate::model::Hook] = drift_hooks.as_deref().unwrap_or(&[]);
+
+    // === Concurrent stage. Needs only `&Lockfile`; touches neither the
+    //     working tree nor the lockfile, and never prompts.
+    let prepared = {
+        let lf: &Lockfile = &*lockfile;
+        let remote_ref = remote_hooks;
+        let dir_ref = hooks_dir;
+        let secrets_ref = hook_secrets;
+        prepare_all(updates.iter().copied(), |(slug, _path)| async move {
+            let entry = lf
+                .objects
+                .get("hooks")
+                .and_then(|m| m.get(slug.as_str()))
+                .expect("partitioned as an update, so the entry exists");
+            let Some(base) = drift_base(entry) else {
+                return Ok(Prepared::Skipped {
+                    slug: slug.clone(),
+                    event: format!("hook/{slug} (no content_hash)"),
+                });
+            };
+            let id = entry.id;
+
+            // Read raw Value (with the sidecar code spliced in) BEFORE typed
+            // deserialize.
+            let mut payload = read_hook_value(dir_ref, slug)
+                .with_context(|| format!("reading local hook '{slug}'"))?;
+            // The on-disk sidecar extension is whatever the local JSON
+            // declared. Read and deliberately discarded, exactly as the old
+            // loop's `let _ = local_ext` did on this path: the post-PATCH
+            // response's runtime drives the write-back layout, not the local
+            // declaration.
+            let _local_ext = hook_code_extension_from_value(&payload);
+            // Two-phase relink, same as [`push`]'s create path and as
+            // `queues`/`engines` do on BOTH of their paths. Hooks are pushed in
+            // slug order, so an already-deployed hook whose `run_after` names one
+            // created later in this same pass is an ordinary forward reference —
+            // resolving eagerly here left an `rdc://` in the body and the
+            // unresolved-ref guard aborted the entire cycle, permanently wedging
+            // any env where a tracked hook points at a not-yet-created one.
+            let deferred = crate::snapshot::refs::resolve_value_deferring(&mut payload, lf);
+            let payload_to_send: crate::model::Hook = serde_json::from_value(payload)
+                .with_context(|| format!("deserializing hook '{slug}'"))?;
+
+            // Drift check: find the remote in the hoisted list, serialize,
+            // hash, compare to base.
+            let Some(remote_hook) = remote_ref.iter().find(|h| h.id == id) else {
+                return Ok(Prepared::Skipped {
+                    slug: slug.clone(),
+                    event: format!("hook/{slug} (remote id {id} missing)"),
+                });
+            };
+            let (remote_json, remote_code) = serialize_hook(remote_hook)?;
+            if hook_combined_hash(&remote_json, &remote_code, lf) != base {
+                // Drift. NOT patched here — the sequential stage owns the
+                // prompt, so `stdin_coord` stays the single stdin owner.
+                return Ok(Prepared::NeedsPrompt { slug: slug.clone() });
+            }
+
+            let (updated, secrets_hash) = send_patch(
+                client,
+                id,
+                slug,
+                &payload_to_send,
+                &deferred,
+                secrets_ref,
+                progress,
+            )
+            .await?;
+            Ok(Prepared::Patched {
+                slug: slug.clone(),
+                updated: HookPatched {
+                    updated,
+                    deferred,
+                    secrets_hash: Some(secrets_hash),
+                },
+            })
+        })
+        .await
+    };
+
+    // === Sequential apply stage, in the driver's existing slug order. Owns
+    //     `&mut Lockfile`, the filesystem, `relink` and every prompt. Every
+    //     completed PATCH is recorded even if a sibling failed (spec D10),
+    //     then the first error propagates.
+    let mut first_error: Option<anyhow::Error> = None;
+    for (item, (slug_in, local_json_path)) in prepared.into_iter().zip(updates) {
+        // `prepare_all` returns one result per item IN INPUT ORDER; this zip is
+        // what pairs each result with its own file path, so pin that guarantee
+        // where it is relied upon. A reordering primitive would silently write
+        // one hook's response over another hook's file.
+        if let Ok(p) = &item {
+            debug_assert_eq!(p.slug(), slug_in.as_str());
+        }
+        match item {
+            // NOT `?`: by the time the apply stage runs, every clean PATCH in
+            // the batch has already landed server-side. Returning early here
+            // would leave the REMAINING items' completed PATCHes unrecorded —
+            // the exact inconsistency D10 exists to shrink, and worse than the
+            // old sequential loop, which never sent those requests at all.
+            Ok(Prepared::Patched { slug, updated }) => {
+                match write_back(
+                    paths,
+                    hooks_dir,
+                    lockfile,
+                    relink,
+                    &slug,
+                    local_json_path,
+                    updated,
+                ) {
+                    Ok(()) => {
+                        progress.event(Action::Patch, &format!("hook/{slug}"));
+                        pushed += 1;
+                    }
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
+                }
+            }
+            Ok(Prepared::Skipped { event, .. }) => {
+                progress.event(Action::Skip, &event);
+                skipped += 1;
+            }
+            // Deliberate (inherited from `push::rules`): this arm still runs
+            // when an earlier item already failed. Suppressing the prompt once
+            // `first_error` is set would leave a drifted item neither prompted
+            // nor recorded. Also NOT `?`, for the same reason as above.
+            Ok(Prepared::NeedsPrompt { slug }) => {
+                match push_one_drifted(
+                    paths,
+                    client,
+                    lockfile,
+                    interactive,
+                    hooks_dir,
+                    &slug,
+                    local_json_path,
+                    remote_hooks,
+                    hook_secrets,
+                    relink,
+                    progress,
+                    env,
+                )
+                .await
+                {
+                    Ok((p, s)) => {
+                        pushed += p;
+                        skipped += s;
+                    }
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+    }
+    // The old sequential loop propagated with `?`, so a failed hook update
+    // never reached the create that followed it, nor the secrets-only pass.
+    // Keep that: bail out of the whole push, not just this run.
+    if let Some(e) = first_error {
+        return Err(e);
+    }
+
+    Ok((pushed, skipped))
+}
+
+/// What a hook's concurrent stage carries across to its apply stage.
+///
+/// A hook PATCH produces two pieces of state that are NOT recoverable from the
+/// server response, so they ride along rather than being recomputed on the
+/// sequential side (recomputing `deferred` would need the local file re-read
+/// and re-resolved against a lockfile that later items have since mutated).
+struct HookPatched {
+    updated: crate::model::Hook,
+    /// Fields held back from the PATCH by `resolve_value_deferring`; the apply
+    /// stage turns these into `relink::DeferredRelink` entries.
+    deferred: Vec<(String, Value)>,
+    /// From `inject_hook_secrets`, for the lockfile entry. Always `Some` on the
+    /// PATCH path — the injector returns the hash of an empty map when a hook
+    /// has no secrets, which is itself meaningful ("no secrets", as opposed to
+    /// `None`'s "never tried to sync secrets").
+    secrets_hash: Option<String>,
+}
+
+/// Whether this entry can reach the drift check at all — and, if so, the base
+/// the remote is checked against.
+///
+/// A hook entry carries TWO hashes and only `content_hash` gates this check.
+/// `secrets_hash` tracks the separate `secrets/<env>.hook-secrets.json` file
+/// and is what the secrets-only pass at the bottom of [`push`] compares; it
+/// says nothing about whether the hook's snapshot bytes drifted remotely, and
+/// the old sequential loop's guard (`let Some(base) = &entry.content_hash`)
+/// never consulted it.
+///
+/// The hoisted list fetch and the per-item guard inside the concurrent stage
+/// MUST agree on this predicate. If the hoist guard were ever narrower than the
+/// per-item one, an item would consult an empty list and silently take the
+/// "remote id missing" skip instead of a real drift check — no error, just
+/// wrong. One expression, called from both, so they cannot drift apart.
+fn drift_base(entry: &ObjectEntry) -> Option<&str> {
+    entry.content_hash.as_deref()
+}
+
+/// Build the PATCH body for one hook and send it.
+///
+/// Shared by the concurrent stage and [`push_one_drifted`] so the two can never
+/// disagree about what rides a hook PATCH. Lifted verbatim out of the old
+/// update loop's tail, from `let mut body = serde_json::to_value(...)` down to
+/// the `update_hook_value` call. Returns the server's response and the hash of
+/// the injected secrets, for the lockfile entry.
+async fn send_patch(
+    client: &RossumClient,
+    id: u64,
+    slug: &str,
+    payload_to_send: &crate::model::Hook,
+    deferred: &[(String, Value)],
+    hook_secrets: &HookSecrets,
+    progress: &Arc<Log>,
+) -> Result<(crate::model::Hook, String)> {
+    // Build a Value form of the typed payload so secrets (which
+    // have no place on the typed `Hook` model) can ride this PATCH.
+    let mut body = serde_json::to_value(payload_to_send)
+        .with_context(|| format!("serializing hook '{slug}' for PATCH"))?;
+    // A deferred field must not ride this PATCH at all. Removing the key
+    // from the Value is not enough on its own: `queues` is a MODELED field
+    // on `Hook`, so the typed round-trip re-materializes it as `[]` and the
+    // PATCH would detach the hook from every queue until the relink lands —
+    // permanently if the relink never resolves. Omitting the key leaves the
+    // remote's current value untouched, which is what deferral means.
+    if let Some(obj) = body.as_object_mut() {
+        for (field, _) in deferred {
+            obj.remove(field);
+        }
+    }
+    // `status` is a read-only server health field that's redacted to the
+    // sentinel on disk; strip it (and the other server fields) so the
+    // PATCH body matches the CREATE contract instead of echoing the
+    // sentinel back. Done before secret injection so secrets survive.
+    strip_for_create(&mut body, "hooks");
+    let secrets_hash = inject_hook_secrets(&mut body, slug, hook_secrets);
+    let updated = client
+        .update_hook_value(id, &body, Some(progress.clone()))
+        .await
+        .with_context(|| format!("PATCH /hooks/{id}"))?;
+    Ok((updated, secrets_hash))
+}
+
+/// Write one PATCH response back: canonical form to disk and the base cache,
+/// the code sidecar (or its removal) plus the stale other-extension sweep, the
+/// lockfile entry, and the deferred-relink record.
+///
+/// Lifted verbatim out of the old update loop — the block from
+/// `let (updated_json, updated_code) = serialize_hook(&updated)?;` down to and
+/// including the `relink.push(...)`, with the `progress.event(Action::Patch, …)`
+/// line left behind at the call site so the caller controls when it fires. The
+/// `let _ = local_ext;` that used to sit inside this block stayed behind with
+/// its computation at the call sites; it never affected the block, which
+/// derives the sidecar extension from the server's response.
+fn write_back(
+    paths: &Paths,
+    hooks_dir: &std::path::Path,
+    lockfile: &mut Lockfile,
+    relink: &mut Vec<crate::cli::push::relink::DeferredRelink>,
+    slug: &str,
+    local_json_path: &std::path::Path,
+    patched: HookPatched,
+) -> Result<()> {
+    let HookPatched {
+        updated,
+        deferred,
+        secrets_hash,
+    } = patched;
+
+    // Refresh local file with the codec's canonical form (matches
+    // what next pull would write) and update lockfile to match.
+    let (updated_json, updated_code) = serialize_hook(&updated)?;
+    // Re-portabilize the server response so concrete env URLs never land on
+    // disk. The hook is already lockfile-pinned, so its `url` and every
+    // cross-ref resolve back to `rdc://`.
+    let updated_json = crate::cli::pull::common::portabilize_proposed(&updated_json, lockfile);
+    let updated_hash = hook_combined_hash(&updated_json, &updated_code, lockfile);
+    let updated_ext = hook_code_extension(&updated);
+    crate::state::base_cache::write_disk_and_cache(paths, local_json_path, &updated_json)
+        .with_context(|| format!("writing post-push canonical form for '{slug}'"))?;
+    let code_path = hooks_dir.join(format!("{slug}.{updated_ext}"));
+    if let Some(code) = &updated_code {
+        write_hook_code(hooks_dir, slug, code, updated_ext)
+            .with_context(|| format!("writing hook code for '{slug}'"))?;
+        // Mirror the code sidecar into the base cache so a later
+        // `BothDiverged` conflict can 3-way-merge the code against a real
+        // base — matching what `pull::hooks` does. Without this the base
+        // cache holds the `.json` but not the `.py`, and the conflict
+        // resolver falls back to a manual prompt (`base_cache::read` → None).
+        crate::state::base_cache::write(paths, &code_path, code.as_bytes())
+            .with_context(|| format!("caching base hook code for '{slug}'"))?;
+    } else {
+        // Post-PATCH the hook has no code (e.g. a function→webhook change):
+        // drop the primary sidecar from disk and the base cache so the
+        // snapshot stays canonical.
+        if code_path.exists() {
+            std::fs::remove_file(&code_path)
+                .with_context(|| format!("removing stale {}", code_path.display()))?;
+        }
+        crate::state::base_cache::forget(paths, &code_path)?;
+    }
+    // Sweep a stale sidecar if the post-PATCH runtime differs from what the
+    // local disk still carries — from disk AND the base cache mirror.
+    let other_updated_ext = if updated_ext == "py" { "js" } else { "py" };
+    let stale_updated = hooks_dir.join(format!("{slug}.{other_updated_ext}"));
+    if stale_updated.exists() {
+        std::fs::remove_file(&stale_updated)
+            .with_context(|| format!("removing stale {}", stale_updated.display()))?;
+    }
+    crate::state::base_cache::forget(paths, &stale_updated)?;
+
+    lockfile.upsert(
+        "hooks",
+        slug,
+        ObjectEntry {
+            id: updated.id,
+            modified_at: updated.modified_at().map(|s| s.to_string()),
+            modified_by: updated.modified_by().map(|s| s.to_string()),
+            content_hash: Some(updated_hash),
+            secrets_hash,
+        },
+    );
+    if !deferred.is_empty() {
+        relink.push(crate::cli::push::relink::DeferredRelink {
+            kind: "hooks".to_string(),
+            slug: slug.to_string(),
+            path: local_json_path.to_path_buf(),
+            fields: deferred,
+        });
+    }
+    Ok(())
+}
+
+/// Resolve one drifted hook interactively and, on `Patch`, send it.
+///
+/// This is the old update loop's drift branch, moved verbatim: re-read the
+/// local file, `resolve_value_deferring`, `resolve_push_drift`, then either
+/// PATCH (via the same `send_patch` + `write_back`), adopt the remote, or skip.
+/// It runs only on the sequential stage, so `resolve_push_drift`'s prompt can
+/// never interleave with another item's. Returns `(pushed, skipped)` deltas.
+#[allow(clippy::too_many_arguments)]
+async fn push_one_drifted(
+    paths: &Paths,
+    client: &RossumClient,
+    lockfile: &mut Lockfile,
+    interactive: bool,
+    hooks_dir: &std::path::Path,
+    slug: &str,
+    local_json_path: &std::path::Path,
+    remote_hooks: &[crate::model::Hook],
+    hook_secrets: &HookSecrets,
+    relink: &mut Vec<crate::cli::push::relink::DeferredRelink>,
+    progress: &Arc<Log>,
+    env: &str,
+) -> Result<(usize, usize)> {
+    let entry = lockfile
+        .objects
+        .get("hooks")
+        .and_then(|m| m.get(slug))
+        .expect("only reached for an item that was partitioned as an update");
+    let id = entry.id;
+
+    let mut payload = read_hook_value(hooks_dir, slug)
+        .with_context(|| format!("reading local hook '{slug}'"))?;
+    // The on-disk sidecar is whatever the local JSON declared.
+    let local_ext = hook_code_extension_from_value(&payload);
+    let mut deferred = crate::snapshot::refs::resolve_value_deferring(&mut payload, lockfile);
+    let payload_hook: crate::model::Hook = serde_json::from_value(payload)
+        .with_context(|| format!("deserializing hook '{slug}'"))?;
+
+    let Some(remote_hook) = remote_hooks.iter().find(|h| h.id == id) else {
+        progress.event(
+            Action::Skip,
+            &format!("hook/{slug} (remote id {id} missing)"),
+        );
+        return Ok((0, 1));
+    };
+    let (remote_json, remote_code) = serialize_hook(remote_hook)?;
+    let remote_combined = hook_combined_hash(&remote_json, &remote_code, lockfile);
+    let mut payload_to_send = payload_hook;
+
+    // Drift already established by the concurrent stage. The hook is a
+    // combined-hash kind (json + py); the resolver prompt shows json bytes for
+    // the diff (most common case). On Adopt, we write both .json and .py from
+    // the remote so disk + lockfile stay aligned.
+    use crate::cli::resolve::{PushDriftOutcome, resolve_push_drift};
+    match resolve_push_drift(interactive, local_json_path, &remote_json, env)? {
+        PushDriftOutcome::Patch { payload_override } => {
+            if let Some(bytes) = payload_override {
+                let mut ov: serde_json::Value = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("re-deserializing edited hook '{slug}'"))?;
+                // The edited body replaces the one deferral was computed
+                // from, so recompute it (mirrors `push::queues`).
+                deferred = crate::snapshot::refs::resolve_value_deferring(&mut ov, lockfile);
+                payload_to_send = serde_json::from_value(ov)
+                    .with_context(|| format!("re-deserializing edited hook '{slug}'"))?;
+            }
+        }
+        PushDriftOutcome::Adopt => {
+            // Portabilize the adopted remote so concrete env URLs never
+            // land on disk (the hook is lockfile-pinned; self + refs resolve).
+            let remote_json = crate::cli::pull::common::portabilize_proposed(&remote_json, lockfile);
+            write_atomic(local_json_path, &remote_json)
+                .with_context(|| format!("adopting remote into {}", local_json_path.display()))?;
+            // Adopt uses the remote runtime to decide the
+            // sidecar extension — the remote is now the source
+            // of truth. Sweep any sidecar of the other
+            // extension so disk stays canonical.
+            let remote_ext = hook_code_extension(remote_hook);
+            if let Some(code) = &remote_code {
+                write_hook_code(hooks_dir, slug, code, remote_ext)
+                    .with_context(|| format!("adopting remote hook code for '{slug}'"))?;
+            } else {
+                let primary = hooks_dir.join(format!("{slug}.{remote_ext}"));
+                if primary.exists() {
+                    std::fs::remove_file(&primary)
+                        .with_context(|| format!("removing stale {}", primary.display()))?;
+                }
+            }
+            let other_remote_ext = if remote_ext == "py" { "js" } else { "py" };
+            let stale = hooks_dir.join(format!("{slug}.{other_remote_ext}"));
+            if stale.exists() {
+                std::fs::remove_file(&stale)
+                    .with_context(|| format!("removing stale {}", stale.display()))?;
+            }
+            let _ = local_ext; // unused on adopt path; the remote ext drives layout
+            // Adopt is a content-side reconciliation (remote → local).
+            // The secrets we last pushed are unaffected; carry the
+            // previous lockfile `secrets_hash` forward so the next
+            // sync doesn't think they changed.
+            let prior_secrets_hash = lockfile
+                .objects
+                .get("hooks")
+                .and_then(|m| m.get(slug))
+                .and_then(|e| e.secrets_hash.clone());
+            lockfile.upsert(
+                "hooks",
+                slug,
+                ObjectEntry {
+                    id,
+                    modified_at: remote_hook.modified_at().map(|s| s.to_string()),
+                    modified_by: remote_hook.modified_by().map(|s| s.to_string()),
+                    content_hash: Some(remote_combined),
+                    secrets_hash: prior_secrets_hash,
+                },
+            );
+            progress.event(Action::Warn, &format!("hook/{slug} adopted remote (drift)"));
+            return Ok((0, 1));
+        }
+        PushDriftOutcome::Skip => {
+            progress.event(
+                Action::Skip,
+                &format!("hook/{slug} (remote changed; rdc sync first)"),
+            );
+            return Ok((0, 1));
+        }
+    }
+
+    let _ = local_ext; // PATCH path: post-PATCH ext drives layout
+    let (updated, secrets_hash) = send_patch(
+        client,
+        id,
+        slug,
+        &payload_to_send,
+        &deferred,
+        hook_secrets,
+        progress,
+    )
+    .await?;
+    write_back(
+        paths,
+        hooks_dir,
+        lockfile,
+        relink,
+        slug,
+        local_json_path,
+        HookPatched {
+            updated,
+            deferred,
+            secrets_hash: Some(secrets_hash),
+        },
+    )?;
+    progress.event(Action::Patch, &format!("hook/{slug}"));
+    Ok((1, 0))
 }
 
 /// Predict the secrets-only pass for `--dry-run`, network-free. Classifies each
@@ -1274,6 +1657,122 @@ mod tests {
             std::fs::read_to_string(&base_py).unwrap(),
             "x = 2\n",
             "base cached code must match the pushed code"
+        );
+    }
+
+    /// Spec D9/B5: hook PATCHes ran at 2.44 req/s against a 10 req/s bucket —
+    /// the largest headroom on the write path. Four hooks whose PATCHes each
+    /// take 300ms cost ~1.2s in series and ~300-600ms fanned out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn push_hooks_patches_updates_concurrently() {
+        use crate::paths::Paths;
+        use crate::snapshot::hook::serialize_hook;
+        use crate::state::hook_combined_hash;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let api = format!("{}/api/v1", server.uri());
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        let hooks_dir = paths.hooks_dir();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+
+        let slugs = ["h-a", "h-b", "h-c", "h-d"];
+        let mut lockfile = Lockfile {
+            api_base: api.clone(),
+            ..Lockfile::default()
+        };
+        let mut changes = BTreeMap::new();
+        let mut remotes = Vec::new();
+        for (i, slug) in slugs.iter().enumerate() {
+            let id = 900 + i as u64;
+            let local = serde_json::json!({
+                "name": slug,
+                "url": format!("rdc://hooks/{slug}"),
+                "type": "webhook",
+                "queues": [],
+                "events": [],
+                "config": { "url": "https://example.invalid/hook" }
+            });
+            std::fs::write(
+                hooks_dir.join(format!("{slug}.json")),
+                serde_json::to_vec_pretty(&local).unwrap(),
+            )
+            .unwrap();
+            let remote = serde_json::json!({
+                "id": id,
+                "url": format!("{api}/hooks/{id}"),
+                "name": slug,
+                "type": "webhook",
+                "queues": [],
+                "events": [],
+                "config": { "url": "https://example.invalid/hook" }
+            });
+            lockfile.upsert(
+                "hooks",
+                slug,
+                ObjectEntry {
+                    id,
+                    modified_at: None,
+                    modified_by: None,
+                    content_hash: None,
+                    secrets_hash: None,
+                },
+            );
+            let remote_hook: crate::model::Hook = serde_json::from_value(remote.clone()).unwrap();
+            let (rj, rc) = serialize_hook(&remote_hook).unwrap();
+            let base = hook_combined_hash(&rj, &rc, &lockfile);
+            lockfile.upsert(
+                "hooks",
+                slug,
+                ObjectEntry {
+                    id,
+                    modified_at: None,
+                    modified_by: None,
+                    content_hash: Some(base),
+                    secrets_hash: None,
+                },
+            );
+            changes.insert(slug.to_string(), hooks_dir.join(format!("{slug}.json")));
+            remotes.push(remote);
+        }
+        let list = serde_json::json!({ "pagination": { "next": null }, "results": remotes });
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/hooks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(list.clone()))
+            .mount(&server)
+            .await;
+        for i in 0..slugs.len() {
+            let id = 900 + i as u64;
+            Mock::given(method("PATCH"))
+                .and(path(format!("/api/v1/hooks/{id}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(list["results"][i].clone())
+                        .set_delay(std::time::Duration::from_millis(300)),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
+        let progress =
+            std::sync::Arc::new(crate::log::Log::new(crate::cli::resolve::ColorMode::Plain));
+        let mut relink = Vec::new();
+        let start = std::time::Instant::now();
+        let (pushed, skipped) = push(
+            &paths, &client, &mut lockfile, false, &changes, &[], &mut relink, &progress, "dev",
+        )
+        .await
+        .expect("push should succeed");
+        let elapsed = start.elapsed();
+
+        assert_eq!((pushed, skipped), (4, 0));
+        assert!(
+            elapsed < std::time::Duration::from_millis(900),
+            "four 300ms PATCHes must overlap; sequential would be >= 1.2s, took {elapsed:?}",
         );
     }
 }
