@@ -622,35 +622,78 @@ pub(crate) async fn fetch_index_sets(
     Ok(fetched.into_iter().collect())
 }
 
-/// Pull one manual dataset's rows into `data.jsonl`.
+/// Fetch the rows of several manual datasets concurrently.
 ///
-/// Returns `(changed, conflicts)`. Costs two calls (`$count` for the guardrail,
-/// then one `find`) and is invoked ONLY for datasets flagged `"data": "manual"`,
-/// so a metadata-only dataset stays exactly as cheap as it is today.
-pub(crate) async fn pull_dataset_data(
-    ctx: &mut PullCtx<'_>,
+/// `wanted` is `(dataset_slug, collection_name)`; the returned map is keyed by
+/// slug and carries `(row_count, rows)` — the count travels back so the
+/// `ROW_WARN_THRESHOLD` warning can be emitted on the sequential apply path
+/// ([`apply_dataset_rows`]), keeping progress output in slug order rather
+/// than completion order.
+///
+/// The `$count` guardrail stays INSIDE each dataset's future: refusing an
+/// oversized collection BEFORE reading it is the whole point of it, so that
+/// ordering is load-bearing and only the across-dataset scheduling changes.
+/// Two calls per dataset (`$count` then `find`), same as before the split —
+/// `buffer_unordered(MDH_FANOUT)` only overlaps different datasets' requests.
+pub(crate) async fn fetch_dataset_rows(
     client: &DataStorageClient,
-    collection_name: &str,
+    paths: &crate::paths::Paths,
+    wanted: &[(String, String)],
+    progress: &Arc<Log>,
+) -> Result<BTreeMap<String, (usize, Vec<Value>)>> {
+    use crate::snapshot::mdh_data::ROW_HARD_LIMIT;
+
+    if wanted.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let fetched: Vec<(String, (usize, Vec<Value>))> = futures::stream::iter(wanted.iter().cloned())
+        .map(|(slug, name)| {
+            let progress = progress.clone();
+            async move {
+                // Guardrail first: refuse an oversized collection BEFORE
+                // reading it, so a mis-flagged import-fed dataset can never
+                // be dragged into the snapshot.
+                let count = client
+                    .count_documents(&name, Some(progress.clone()))
+                    .await
+                    .with_context(|| format!("counting rows of '{name}'"))?;
+                if count > ROW_HARD_LIMIT {
+                    anyhow::bail!(
+                        "mdh/{slug}: '{name}' holds {count} rows, over rdc's \
+                         {ROW_HARD_LIMIT}-row ceiling for versioned MDH data. Remove the \
+                         \"data\" key from {}/{COLLECTION_MANIFEST} to stop versioning \
+                         this dataset's rows (its name and indexes stay managed).",
+                        paths.dataset_dir(&slug).display(),
+                    );
+                }
+
+                let rows = client
+                    .find_all(&name, Some(progress.clone()))
+                    .await
+                    .with_context(|| format!("reading rows of '{name}'"))?;
+                Ok::<_, anyhow::Error>((slug, (count, rows)))
+            }
+        })
+        .buffer_unordered(MDH_FANOUT)
+        .try_collect()
+        .await?;
+    Ok(fetched.into_iter().collect())
+}
+
+/// The offline half of a manual dataset's row pull: warn, decide, write,
+/// record. Sequential by construction — it mutates `ctx.lockfile` and the
+/// working tree, and its progress lines must land in slug order.
+///
+/// Returns `(changed, conflicts)`.
+pub(crate) async fn apply_dataset_rows(
+    ctx: &mut PullCtx<'_>,
     slug: &str,
+    count: usize,
+    rows: Vec<Value>,
     progress: &Arc<Log>,
 ) -> Result<(bool, usize)> {
-    use crate::snapshot::mdh_data::{ROW_HARD_LIMIT, ROW_WARN_THRESHOLD, to_jsonl};
+    use crate::snapshot::mdh_data::{ROW_WARN_THRESHOLD, to_jsonl};
 
-    // Guardrail first: refuse an oversized collection BEFORE reading it, so a
-    // mis-flagged import-fed dataset can never be dragged into the snapshot.
-    let count = client
-        .count_documents(collection_name, Some(progress.clone()))
-        .await
-        .with_context(|| format!("counting rows of '{collection_name}'"))?;
-    if count > ROW_HARD_LIMIT {
-        anyhow::bail!(
-            "mdh/{slug}: '{collection_name}' holds {count} rows, over rdc's \
-             {ROW_HARD_LIMIT}-row ceiling for versioned MDH data. Remove the \"data\" key \
-             from {}/{COLLECTION_MANIFEST} to stop versioning this dataset's rows \
-             (its name and indexes stay managed).",
-            ctx.paths.dataset_dir(slug).display(),
-        );
-    }
     if count > ROW_WARN_THRESHOLD {
         progress.event(
             Action::Warn,
@@ -660,11 +703,6 @@ pub(crate) async fn pull_dataset_data(
             ),
         );
     }
-
-    let rows = client
-        .find_all(collection_name, Some(progress.clone()))
-        .await
-        .with_context(|| format!("reading rows of '{collection_name}'"))?;
 
     // An import-fed dataset carries the import extension's per-row digest.
     // Versioning it means rdc's authoritative pushes fight that hook for
@@ -728,6 +766,33 @@ pub(crate) async fn pull_dataset_data(
         matches!(action, PullAction::Write | PullAction::Conflict),
         conflicts,
     ))
+}
+
+/// Pull one manual dataset's rows into `data.jsonl`.
+///
+/// Returns `(changed, conflicts)`. Costs two calls (`$count` for the guardrail,
+/// then one `find`) and is invoked ONLY for datasets flagged `"data": "manual"`,
+/// so a metadata-only dataset stays exactly as cheap as it is today. A thin
+/// `fetch` + `apply` wrapper over [`fetch_dataset_rows`] / [`apply_dataset_rows`].
+///
+/// `process` now calls those two directly (fetch batched across datasets,
+/// apply sequentially), so this single-dataset wrapper has no production
+/// caller left — `#[cfg(test)]` keeps it for the three tests below without
+/// tripping the workspace's `dead_code = "deny"` lint on real builds.
+#[cfg(test)]
+pub(crate) async fn pull_dataset_data(
+    ctx: &mut PullCtx<'_>,
+    client: &DataStorageClient,
+    collection_name: &str,
+    slug: &str,
+    progress: &Arc<Log>,
+) -> Result<(bool, usize)> {
+    let wanted = [(slug.to_string(), collection_name.to_string())];
+    let mut fetched = fetch_dataset_rows(client, ctx.paths, &wanted, progress).await?;
+    let (count, rows) = fetched
+        .remove(slug)
+        .expect("fetch_dataset_rows returns every requested slug");
+    apply_dataset_rows(ctx, slug, count, rows, progress).await
 }
 
 /// Opaque listed state for MDH — the client handle plus the collection list.
@@ -966,6 +1031,18 @@ pub async fn process(
     by_slug.extend(fetch_index_sets(&client, &wanted, progress).await?);
     progress.event(Action::Pull, &format!("mdh_indexes ({total} fetched)"));
 
+    // Row data for datasets that opted in. `read_data_mode` is offline, so
+    // deciding the batch costs nothing — but note the `.ok()`: a MALFORMED
+    // `"data"` flag must still surface from the sequential loop below, at the
+    // same point it does today, rather than aborting before anything is
+    // written. A dataset whose flag will not parse is simply not prefetched.
+    let manual: Vec<(String, String)> = dataset_dirs
+        .iter()
+        .filter(|(_, dir, _)| read_data_mode(dir).ok() == Some(DataMode::Manual))
+        .map(|(slug, _, c)| (slug.clone(), c.name.clone()))
+        .collect();
+    let mut rows_by_slug = fetch_dataset_rows(&client, ctx.paths, &manual, progress).await?;
+
     // === Sub-phase C: per-collection indexes.json write decision (sequential
     //            because we mutate ctx.lockfile + counts). The set is
     //            stripped of server-managed fields (the implicit `_id_`
@@ -1032,14 +1109,31 @@ pub async fn process(
         }
 
         // Row data — only for datasets that opted in. `read_data_mode` errors
-        // on a malformed flag, which surfaces here rather than being ignored.
+        // on a malformed flag, which surfaces here rather than being ignored
+        // (the offline prefetch above uses `.ok()` and simply skips such a
+        // dataset, so the error still fires here, at the same point it did
+        // before the split, after earlier datasets have already been written).
         // The collection name comes from `c` (this loop's bound `Collection`,
         // server truth) rather than re-reading the manifest with a
         // directory-name fallback: `slugify` is lossy, so a fallback could
         // silently target a DIFFERENT collection than this dataset represents.
         if read_data_mode(dataset_dir)? == DataMode::Manual {
+            let (count, rows) = match rows_by_slug.remove(slug) {
+                Some(v) => v,
+                // Only reachable if the flag became readable between the
+                // offline scan above and here; fall back to a direct fetch so
+                // behaviour is identical either way.
+                None => {
+                    let one = [(slug.clone(), c.name.clone())];
+                    let mut fetched =
+                        fetch_dataset_rows(&client, ctx.paths, &one, progress).await?;
+                    fetched
+                        .remove(slug)
+                        .expect("single-slug fetch returns its slug")
+                }
+            };
             let (data_changed, data_conflicts) =
-                pull_dataset_data(ctx, &client, &c.name, slug, progress).await?;
+                apply_dataset_rows(ctx, slug, count, rows, progress).await?;
             conflicts += data_conflicts;
             if data_changed {
                 changed.insert(slug.clone());
@@ -2251,6 +2345,88 @@ mod tests {
             server.received_requests().await.unwrap().len(),
             4,
             "an empty batch must issue no requests"
+        );
+    }
+
+    /// Spec D8: rows for several manual datasets are fetched concurrently, but
+    /// the `$count` guardrail still precedes that dataset's `find` — that
+    /// ordering is what stops an oversized collection being read at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetch_dataset_rows_fans_out_but_counts_before_finding() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let slow = |body: serde_json::Value| {
+            ResponseTemplate::new(200)
+                .set_body_json(body)
+                .set_delay(std::time::Duration::from_millis(200))
+        };
+        Mock::given(method("POST"))
+            .and(path("/v1/data/aggregate"))
+            .respond_with(slow(
+                serde_json::json!({ "code": "ok", "result": [ { "n": 2 } ] }),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/find"))
+            .and(body_partial_json(serde_json::json!({ "collectionName": "GL_CODES" })))
+            .respond_with(slow(serde_json::json!({
+                "code": "ok", "result": [ { "code": "1000" }, { "code": "2000" } ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/find"))
+            .and(body_partial_json(serde_json::json!({ "collectionName": "VENDORS" })))
+            .respond_with(slow(
+                serde_json::json!({ "code": "ok", "result": [ { "name": "acme" } ] }),
+            ))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        let client = DataStorageClient::new(server.uri(), "TEST".to_string()).unwrap();
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        let wanted = vec![
+            ("gl-codes".to_string(), "GL_CODES".to_string()),
+            ("vendors".to_string(), "VENDORS".to_string()),
+        ];
+
+        let start = std::time::Instant::now();
+        let rows = fetch_dataset_rows(&client, &paths, &wanted, &progress)
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(rows["gl-codes"].0, 2, "count is carried back for the warn");
+        assert_eq!(rows["gl-codes"].1.len(), 2);
+        assert_eq!(rows["vendors"].1.len(), 1);
+        assert!(
+            elapsed < std::time::Duration::from_millis(700),
+            "the two datasets must overlap; sequential would be ~800ms, took {elapsed:?}",
+        );
+
+        // Within a dataset, its $count must precede its find.
+        let requests = server.received_requests().await.unwrap();
+        let pos = |p: &str, coll: &str| {
+            requests
+                .iter()
+                .position(|r| {
+                    r.url.path() == p
+                        && String::from_utf8_lossy(&r.body).contains(coll)
+                })
+                .unwrap_or_else(|| panic!("no {p} for {coll}"))
+        };
+        assert!(
+            pos("/v1/data/aggregate", "GL_CODES") < pos("/v1/data/find", "GL_CODES"),
+            "the size guardrail must still gate the read"
+        );
+        assert!(
+            pos("/v1/data/aggregate", "VENDORS") < pos("/v1/data/find", "VENDORS"),
+            "the size guardrail must still gate the read"
         );
     }
 
