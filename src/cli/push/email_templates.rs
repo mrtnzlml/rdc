@@ -60,6 +60,10 @@ pub async fn push(
 ) -> Result<(usize, usize)> {
     let mut pushed = 0usize;
     let mut skipped = 0usize;
+    // Fetched at most ONCE for the whole push and SHARED by both branches: the
+    // adoption matcher below and the drift check in [`push_update_batch`] read
+    // the same list, and whichever runs first pays for it. `is_empty()` is the
+    // "not populated yet" sentinel, exactly as before.
     let mut remote_cache: std::collections::HashMap<u64, crate::model::EmailTemplate> =
         std::collections::HashMap::new();
 
@@ -73,6 +77,21 @@ pub async fn push(
         .map(|m| m.values().map(|e| e.id).collect())
         .unwrap_or_default();
 
+    // Updates fan out (the two-stage shape in [`push_update_batch`]); the
+    // adopt-or-create branch below stays strictly sequential and is left
+    // ENTIRELY alone. It is stateful by construction — it threads `claimed` and
+    // `remote_cache` across iterations so `pick_adoption_id` hands each local
+    // sibling a distinct remote id, and it upserts the lockfile mid-branch.
+    //
+    // The two are also NOT partitioned into "all creates, then all updates": a
+    // template's refs are resolved against the lockfile AS IT STANDS when that
+    // template is prepared, so hoisting a create ahead of an earlier-sorting
+    // update would resolve a ref that used to stay unresolved, and change what
+    // this command sends (`push::hooks` carries an observable instance of
+    // exactly that). So `changes` is still walked in slug order and each
+    // MAXIMAL RUN of consecutive updates is fanned out, with an adopt-or-create
+    // acting as a barrier.
+    let mut batch: Vec<(&String, &std::path::PathBuf)> = Vec::new();
     // slug (lockfile_key) = "ws_slug/q_slug/template_slug"
     for (lockfile_key, template_path) in changes {
         // Missing lockfile entry → try to adopt an existing remote template
@@ -86,6 +105,22 @@ pub async fn push(
             .and_then(|m| m.get(lockfile_key.as_str()))
             .is_none()
         {
+            // Close the pending run first: every update sorting BEFORE this
+            // adopt-or-create must be prepared against a lockfile that does not
+            // yet know the id it is about to pin.
+            let (batched_pushed, batched_skipped) = push_update_batch(
+                paths,
+                client,
+                lockfile,
+                interactive,
+                &mut batch,
+                &mut remote_cache,
+                progress,
+                env,
+            )
+            .await?;
+            pushed += batched_pushed;
+            skipped += batched_skipped;
             let disk_bytes = std::fs::read(template_path)
                 .with_context(|| format!("reading {}", template_path.display()))?;
             let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
@@ -252,153 +287,411 @@ pub async fn push(
             continue;
         }
 
-        let disk_bytes = std::fs::read(template_path)
-            .with_context(|| format!("reading {}", template_path.display()))?;
-        let entry = lockfile
+        batch.push((lockfile_key, template_path));
+    }
+
+    // Flush the trailing run.
+    let (batched_pushed, batched_skipped) = push_update_batch(
+        paths,
+        client,
+        lockfile,
+        interactive,
+        &mut batch,
+        &mut remote_cache,
+        progress,
+        env,
+    )
+    .await?;
+    pushed += batched_pushed;
+    skipped += batched_skipped;
+
+    Ok((pushed, skipped))
+}
+
+/// Fan out one maximal run of consecutive email-template UPDATES, then apply
+/// the results.
+///
+/// The two-stage shape established by `push::rules`: a concurrent stage that
+/// needs only `&Lockfile`, touches neither the working tree nor the lockfile and
+/// never prompts, then a sequential apply stage in slug order that owns
+/// `&mut Lockfile`, the filesystem and every prompt. `batch` is drained.
+///
+/// `remote_cache` is the caller's one-per-push template list, SHARED with the
+/// adopt-or-create branch, so several runs plus any number of adoptions still
+/// cost a single `GET /email_templates` — and a push whose updates all lack a
+/// `content_hash` and whose creates all adopt nothing still costs none.
+#[allow(clippy::too_many_arguments)]
+async fn push_update_batch(
+    paths: &Paths,
+    client: &RossumClient,
+    lockfile: &mut Lockfile,
+    interactive: bool,
+    batch: &mut Vec<(&String, &std::path::PathBuf)>,
+    remote_cache: &mut std::collections::HashMap<u64, crate::model::EmailTemplate>,
+    progress: &Arc<Log>,
+    env: &str,
+) -> Result<(usize, usize)> {
+    use crate::cli::push::concurrent::{Prepared, prepare_all};
+
+    let updates = std::mem::take(batch);
+    if updates.is_empty() {
+        return Ok((0, 0));
+    }
+    let mut pushed = 0usize;
+    let mut skipped = 0usize;
+
+    // Drift-check list, hoisted to ONE fetch before the batch — but only when
+    // at least one update can actually reach the drift check. The old lazy fill
+    // happened at the first item that got PAST the `content_hash` guard, so a
+    // run of entries that all lack a hash made no list call at all; keep that
+    // exactly. `remote_cache` is the caller's, so the adopt-or-create branch
+    // and every other run reuse whatever this fetch (or theirs) put there.
+    let needs_drift_check = updates.iter().any(|(key, _)| {
+        lockfile
             .objects
             .get("email_templates")
-            .and_then(|m| m.get(lockfile_key.as_str()))
-            .unwrap();
-        let Some(base) = &entry.content_hash else {
-            progress.event(
-                Action::Skip,
-                &format!("email_template/{lockfile_key} (no content_hash)"),
-            );
-            skipped += 1;
-            continue;
-        };
-        let base = base.clone();
-
-        let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
-            .with_context(|| format!("parsing {}", template_path.display()))?;
-        crate::snapshot::refs::resolve_value(&mut payload, lockfile);
-        let payload_template: crate::model::EmailTemplate = serde_json::from_value(payload)
-            .with_context(|| {
-                format!("deserializing overlay-applied email template '{lockfile_key}'")
-            })?;
-
-        let id = entry.id;
-        if remote_cache.is_empty() {
-            let remotes = client
-                .list_email_templates(Some(progress.clone()))
-                .await
-                .context("listing email templates to verify no drift before push")?;
-            for r in remotes {
-                remote_cache.insert(r.id, r);
-            }
+            .and_then(|m| m.get(key.as_str()))
+            .and_then(drift_base)
+            .is_some()
+    });
+    if remote_cache.is_empty() && needs_drift_check {
+        let remotes = client
+            .list_email_templates(Some(progress.clone()))
+            .await
+            .context("listing email templates to verify no drift before push")?;
+        for r in remotes {
+            remote_cache.insert(r.id, r);
         }
-        let Some(remote_template) = remote_cache.get(&id).cloned() else {
-            progress.event(
-                Action::Skip,
-                &format!("email_template/{lockfile_key} (remote id {id} missing)"),
-            );
-            skipped += 1;
-            continue;
-        };
-        let codec = crate::snapshot::codec::codec("email_templates").unwrap();
-        let remote_art = codec
-            .disk_bytes(
-                &serde_json::to_value(&remote_template)
-                    .context("serializing remote email template for drift check")?,
-            )
-            .context("codec disk_bytes for remote email template")?;
-        let remote_bytes = remote_art.json;
-        let remote_combined = combined_hash(&remote_bytes, &remote_art.sidecars, lockfile);
-        let mut payload_to_send = payload_template;
-        if remote_combined != base {
-            use crate::cli::resolve::{PushDriftOutcome, resolve_push_drift};
-            match resolve_push_drift(interactive, template_path, &remote_bytes, env)? {
-                PushDriftOutcome::Patch { payload_override } => {
-                    if let Some(bytes) = payload_override {
-                        let mut ov: serde_json::Value = serde_json::from_slice(&bytes)
-                            .with_context(|| {
-                                format!("re-deserializing edited email template '{lockfile_key}'")
-                            })?;
-                        crate::snapshot::refs::resolve_value(&mut ov, lockfile);
-                        payload_to_send = serde_json::from_value(ov).with_context(|| {
-                            format!("re-deserializing edited email template '{lockfile_key}'")
-                        })?;
+    }
+
+    // === Concurrent stage. Needs only `&Lockfile`; touches neither the
+    //     working tree nor the lockfile, and never prompts.
+    let prepared = {
+        let lf: &Lockfile = &*lockfile;
+        let remote_ref: &std::collections::HashMap<u64, crate::model::EmailTemplate> =
+            &*remote_cache;
+        prepare_all(
+            updates.iter().copied(),
+            |(lockfile_key, template_path)| async move {
+                // Read BEFORE the `content_hash` guard, exactly as the old
+                // sequential loop did: an unreadable file is an error even for
+                // an entry that would otherwise be skipped.
+                let disk_bytes = std::fs::read(template_path)
+                    .with_context(|| format!("reading {}", template_path.display()))?;
+                let entry = lf
+                    .objects
+                    .get("email_templates")
+                    .and_then(|m| m.get(lockfile_key.as_str()))
+                    .expect("batched as an update, so the entry exists");
+                let Some(base) = drift_base(entry) else {
+                    return Ok(Prepared::Skipped {
+                        slug: lockfile_key.clone(),
+                        event: format!("email_template/{lockfile_key} (no content_hash)"),
+                    });
+                };
+                let id = entry.id;
+
+                let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
+                    .with_context(|| format!("parsing {}", template_path.display()))?;
+                crate::snapshot::refs::resolve_value(&mut payload, lf);
+                let payload_template: crate::model::EmailTemplate =
+                    serde_json::from_value(payload).with_context(|| {
+                        format!("deserializing overlay-applied email template '{lockfile_key}'")
+                    })?;
+
+                let Some(remote_template) = remote_ref.get(&id) else {
+                    return Ok(Prepared::Skipped {
+                        slug: lockfile_key.clone(),
+                        event: format!(
+                            "email_template/{lockfile_key} (remote id {id} missing)"
+                        ),
+                    });
+                };
+                let remote_art = remote_artifact(remote_template)?;
+                if combined_hash(&remote_art.json, &remote_art.sidecars, lf) != base {
+                    // Drift. NOT patched here — the sequential stage owns the
+                    // prompt.
+                    return Ok(Prepared::NeedsPrompt {
+                        slug: lockfile_key.clone(),
+                    });
+                }
+
+                // Strip server-managed fields from `extra` so the PATCH matches
+                // the CREATE contract (e.g. the `triggers` sub-resource refs).
+                let mut payload_to_send = payload_template;
+                strip_patch_extra(&mut payload_to_send.extra, "email_templates", false);
+                let updated = client
+                    .update_email_template(id, &payload_to_send, Some(progress.clone()))
+                    .await
+                    .with_context(|| format!("PATCH /email_templates/{id}"))?;
+                Ok(Prepared::Patched {
+                    slug: lockfile_key.clone(),
+                    updated,
+                })
+            },
+        )
+        .await
+    };
+
+    // === Sequential apply stage, in the driver's existing slug order. Owns
+    //     `&mut Lockfile`, the filesystem and every prompt. Every completed
+    //     PATCH is recorded even if a sibling failed (spec D10), then the
+    //     first error propagates.
+    let mut first_error: Option<anyhow::Error> = None;
+    for (item, (key_in, template_path)) in prepared.into_iter().zip(updates) {
+        // `prepare_all` returns one result per item IN INPUT ORDER; this zip is
+        // what pairs each result with its own file path, so pin that guarantee
+        // where it is relied upon. A reordering primitive would silently write
+        // one template's response over another template's file.
+        if let Ok(p) = &item {
+            debug_assert_eq!(p.slug(), key_in.as_str());
+        }
+        match item {
+            // NOT `?`: by the time the apply stage runs, every clean PATCH in
+            // the batch has already landed server-side. Returning early here
+            // would leave the REMAINING items' completed PATCHes unrecorded —
+            // the exact inconsistency D10 exists to shrink, and worse than the
+            // old sequential loop, which never sent those requests at all.
+            Ok(Prepared::Patched { slug, updated }) => {
+                match write_back(paths, lockfile, &slug, template_path, &updated) {
+                    Ok(()) => {
+                        progress.event(Action::Patch, &format!("email_template/{slug}"));
+                        pushed += 1;
+                    }
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
                     }
                 }
-                PushDriftOutcome::Adopt => {
-                    // Portabilize the adopted remote so concrete env URLs never
-                    // land on disk (the template is lockfile-pinned; refs resolve).
-                    let remote_bytes =
-                        crate::cli::pull::common::portabilize_proposed(&remote_bytes, lockfile);
-                    write_atomic(template_path, &remote_bytes).with_context(|| {
-                        format!("adopting remote into {}", template_path.display())
-                    })?;
-                    lockfile.upsert(
-                        "email_templates",
-                        lockfile_key,
-                        ObjectEntry {
-                            id,
-                            modified_at: remote_template.modified_at().map(|s| s.to_string()),
-                            modified_by: remote_template.modified_by().map(|s| s.to_string()),
-                            content_hash: Some(remote_combined),
-                            secrets_hash: None,
-                        },
-                    );
-                    progress.event(
-                        Action::Warn,
-                        &format!("email_template/{lockfile_key} adopted remote (drift)"),
-                    );
-                    skipped += 1;
-                    continue;
+            }
+            Ok(Prepared::Skipped { event, .. }) => {
+                progress.event(Action::Skip, &event);
+                skipped += 1;
+            }
+            // Deliberate (inherited from `push::rules`): this arm still runs
+            // when an earlier item already failed. Suppressing the prompt once
+            // `first_error` is set would leave a drifted item neither prompted
+            // nor recorded. Also NOT `?`, for the same reason as above.
+            Ok(Prepared::NeedsPrompt { slug }) => {
+                match push_one_drifted(
+                    paths,
+                    client,
+                    lockfile,
+                    interactive,
+                    &slug,
+                    template_path,
+                    remote_cache,
+                    progress,
+                    env,
+                )
+                .await
+                {
+                    Ok((p, s)) => {
+                        pushed += p;
+                        skipped += s;
+                    }
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
                 }
-                PushDriftOutcome::Skip => {
-                    progress.event(
-                        Action::Skip,
-                        &format!("email_template/{lockfile_key} (remote changed; rdc sync first)"),
-                    );
-                    skipped += 1;
-                    continue;
+            }
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e);
                 }
             }
         }
-
-        // Strip server-managed fields from `extra` so the PATCH matches the
-        // CREATE contract (e.g. the `triggers` sub-resource refs).
-        strip_patch_extra(&mut payload_to_send.extra, "email_templates", false);
-        let patch_result = client
-            .update_email_template(id, &payload_to_send, Some(progress.clone()))
-            .await
-            .with_context(|| format!("PATCH /email_templates/{id}"));
-        let updated = patch_result?;
-
-        let codec = crate::snapshot::codec::codec("email_templates").unwrap();
-        let updated_art = codec
-            .disk_bytes(
-                &serde_json::to_value(&updated)
-                    .context("serializing updated email template for disk write")?,
-            )
-            .context("codec disk_bytes for updated email template")?;
-        // Re-portabilize the server response so concrete env URLs never land on
-        // disk (the template is lockfile-pinned, so self + `queue` resolve to rdc://).
-        let updated_bytes =
-            crate::cli::pull::common::portabilize_proposed(&updated_art.json, lockfile);
-        let updated_hash = combined_hash(&updated_bytes, &updated_art.sidecars, lockfile);
-        crate::state::base_cache::write_disk_and_cache(paths, template_path, &updated_bytes)
-            .with_context(|| {
-                format!("writing post-push canonical form for email template '{lockfile_key}'")
-            })?;
-
-        lockfile.upsert(
-            "email_templates",
-            lockfile_key,
-            ObjectEntry {
-                id: updated.id,
-                modified_at: updated.modified_at().map(|s| s.to_string()),
-                modified_by: updated.modified_by().map(|s| s.to_string()),
-                content_hash: Some(updated_hash),
-                secrets_hash: None,
-            },
-        );
-        progress.event(Action::Patch, &format!("email_template/{lockfile_key}"));
-        pushed += 1;
+    }
+    if let Some(e) = first_error {
+        return Err(e);
     }
 
     Ok((pushed, skipped))
+}
+
+/// Whether this entry can reach the drift check at all — and, if so, the base
+/// the remote is checked against.
+///
+/// The hoisted list fetch and the per-item guard inside the concurrent stage
+/// MUST agree on this predicate. If the hoist guard were ever narrower than the
+/// per-item one, an item would consult an empty map and silently take the
+/// "remote id missing" skip instead of a real drift check — no error, just
+/// wrong. One expression, called from both, so they cannot drift apart.
+fn drift_base(entry: &ObjectEntry) -> Option<&str> {
+    entry.content_hash.as_deref()
+}
+
+/// The canonical on-disk artifact for a remote email template, as the drift
+/// check and the drift prompt both need it. Lifted verbatim from the old loop's
+/// `codec.disk_bytes(...)` block.
+fn remote_artifact(
+    remote: &crate::model::EmailTemplate,
+) -> Result<crate::snapshot::codec::DiskArtifact> {
+    let codec = crate::snapshot::codec::codec("email_templates").unwrap();
+    codec
+        .disk_bytes(
+            &serde_json::to_value(remote)
+                .context("serializing remote email template for drift check")?,
+        )
+        .context("codec disk_bytes for remote email template")
+}
+
+/// Write one PATCH response back: canonical form to disk and the base cache,
+/// plus the lockfile entry.
+///
+/// Lifted verbatim out of the old update loop — the block from
+/// `let codec = ...` down to and including the
+/// `lockfile.upsert("email_templates", ...)` call, with `updated` taken by
+/// reference and the `progress.event(Action::Patch, ...)` line left behind at
+/// the call site so the caller controls when it fires.
+fn write_back(
+    paths: &Paths,
+    lockfile: &mut Lockfile,
+    lockfile_key: &str,
+    template_path: &std::path::Path,
+    updated: &crate::model::EmailTemplate,
+) -> Result<()> {
+    let codec = crate::snapshot::codec::codec("email_templates").unwrap();
+    let updated_art = codec
+        .disk_bytes(
+            &serde_json::to_value(updated)
+                .context("serializing updated email template for disk write")?,
+        )
+        .context("codec disk_bytes for updated email template")?;
+    // Re-portabilize the server response so concrete env URLs never land on
+    // disk (the template is lockfile-pinned, so self + `queue` resolve to rdc://).
+    let updated_bytes =
+        crate::cli::pull::common::portabilize_proposed(&updated_art.json, lockfile);
+    let updated_hash = combined_hash(&updated_bytes, &updated_art.sidecars, lockfile);
+    crate::state::base_cache::write_disk_and_cache(paths, template_path, &updated_bytes)
+        .with_context(|| {
+            format!("writing post-push canonical form for email template '{lockfile_key}'")
+        })?;
+
+    lockfile.upsert(
+        "email_templates",
+        lockfile_key,
+        ObjectEntry {
+            id: updated.id,
+            modified_at: updated.modified_at().map(|s| s.to_string()),
+            modified_by: updated.modified_by().map(|s| s.to_string()),
+            content_hash: Some(updated_hash),
+            secrets_hash: None,
+        },
+    );
+    Ok(())
+}
+
+/// Resolve one drifted email template interactively and, on `Patch`, send it.
+///
+/// This is the old update loop's drift branch, moved verbatim: re-read the
+/// local file, `resolve_value`, `resolve_push_drift`, then either PATCH (via the
+/// same `update_email_template` + `write_back`), adopt the remote, or skip. It
+/// runs only on the sequential stage, so `resolve_push_drift`'s prompt can never
+/// interleave with another item's. Returns `(pushed, skipped)` deltas.
+#[allow(clippy::too_many_arguments)]
+async fn push_one_drifted(
+    paths: &Paths,
+    client: &RossumClient,
+    lockfile: &mut Lockfile,
+    interactive: bool,
+    lockfile_key: &str,
+    template_path: &std::path::Path,
+    remote_cache: &std::collections::HashMap<u64, crate::model::EmailTemplate>,
+    progress: &Arc<Log>,
+    env: &str,
+) -> Result<(usize, usize)> {
+    let entry = lockfile
+        .objects
+        .get("email_templates")
+        .and_then(|m| m.get(lockfile_key))
+        .expect("only reached for an item that was batched as an update");
+    let id = entry.id;
+
+    let disk_bytes = std::fs::read(template_path)
+        .with_context(|| format!("reading {}", template_path.display()))?;
+    let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
+        .with_context(|| format!("parsing {}", template_path.display()))?;
+    crate::snapshot::refs::resolve_value(&mut payload, lockfile);
+    let payload_template: crate::model::EmailTemplate = serde_json::from_value(payload)
+        .with_context(|| {
+            format!("deserializing overlay-applied email template '{lockfile_key}'")
+        })?;
+
+    let Some(remote_template) = remote_cache.get(&id).cloned() else {
+        progress.event(
+            Action::Skip,
+            &format!("email_template/{lockfile_key} (remote id {id} missing)"),
+        );
+        return Ok((0, 1));
+    };
+    let remote_art = remote_artifact(&remote_template)?;
+    let remote_bytes = remote_art.json;
+    let remote_combined = combined_hash(&remote_bytes, &remote_art.sidecars, lockfile);
+    let mut payload_to_send = payload_template;
+
+    use crate::cli::resolve::{PushDriftOutcome, resolve_push_drift};
+    match resolve_push_drift(interactive, template_path, &remote_bytes, env)? {
+        PushDriftOutcome::Patch { payload_override } => {
+            if let Some(bytes) = payload_override {
+                let mut ov: serde_json::Value =
+                    serde_json::from_slice(&bytes).with_context(|| {
+                        format!("re-deserializing edited email template '{lockfile_key}'")
+                    })?;
+                crate::snapshot::refs::resolve_value(&mut ov, lockfile);
+                payload_to_send = serde_json::from_value(ov).with_context(|| {
+                    format!("re-deserializing edited email template '{lockfile_key}'")
+                })?;
+            }
+        }
+        PushDriftOutcome::Adopt => {
+            // Portabilize the adopted remote so concrete env URLs never
+            // land on disk (the template is lockfile-pinned; refs resolve).
+            let remote_bytes =
+                crate::cli::pull::common::portabilize_proposed(&remote_bytes, lockfile);
+            write_atomic(template_path, &remote_bytes)
+                .with_context(|| format!("adopting remote into {}", template_path.display()))?;
+            lockfile.upsert(
+                "email_templates",
+                lockfile_key,
+                ObjectEntry {
+                    id,
+                    modified_at: remote_template.modified_at().map(|s| s.to_string()),
+                    modified_by: remote_template.modified_by().map(|s| s.to_string()),
+                    content_hash: Some(remote_combined),
+                    secrets_hash: None,
+                },
+            );
+            progress.event(
+                Action::Warn,
+                &format!("email_template/{lockfile_key} adopted remote (drift)"),
+            );
+            return Ok((0, 1));
+        }
+        PushDriftOutcome::Skip => {
+            progress.event(
+                Action::Skip,
+                &format!("email_template/{lockfile_key} (remote changed; rdc sync first)"),
+            );
+            return Ok((0, 1));
+        }
+    }
+
+    // Strip server-managed fields from `extra` so the PATCH matches the
+    // CREATE contract (e.g. the `triggers` sub-resource refs).
+    strip_patch_extra(&mut payload_to_send.extra, "email_templates", false);
+    let patch_result = client
+        .update_email_template(id, &payload_to_send, Some(progress.clone()))
+        .await
+        .with_context(|| format!("PATCH /email_templates/{id}"));
+    let updated = patch_result?;
+
+    write_back(paths, lockfile, lockfile_key, template_path, &updated)?;
+    progress.event(Action::Patch, &format!("email_template/{lockfile_key}"));
+    Ok((1, 0))
 }
 
 #[cfg(test)]
@@ -501,5 +794,125 @@ mod tests {
         let remotes = cache(vec![tpl(100, "received", "2", "custom")]);
         let got = pick_adoption_id(&remotes, &q, Some("custom"), "received", &HashSet::new());
         assert_eq!(got, None);
+    }
+
+    /// Spec D9: clean email-template updates PATCH concurrently. Four templates
+    /// whose PATCHes each take 200ms cost ~800ms in series and ~200-400ms
+    /// fanned out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn push_email_templates_patches_updates_concurrently() {
+        use crate::snapshot::codec::combined_hash;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let api = format!("{}/api/v1", server.uri());
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        let dir = paths.queue_email_templates_dir("main", "invoices");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut lockfile = Lockfile {
+            api_base: api.clone(),
+            ..Lockfile::default()
+        };
+        // The owning queue must be lockfile-pinned so `rdc://queues/invoices`
+        // resolves on the way out and portabilizes on the way back in.
+        lockfile.upsert(
+            "queues",
+            "invoices",
+            ObjectEntry {
+                id: 42,
+                modified_at: None,
+                modified_by: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+
+        let slugs = ["t-a", "t-b", "t-c", "t-d"];
+        let mut changes = BTreeMap::new();
+        let mut remotes = Vec::new();
+        for (i, slug) in slugs.iter().enumerate() {
+            let id = 300 + i as u64;
+            let key = format!("main/invoices/{slug}");
+            let local = serde_json::json!({
+                "url": format!("rdc://email_templates/{key}"),
+                "name": slug,
+                "subject": "Hello",
+                "queue": "rdc://queues/invoices",
+            });
+            let tpl_path = dir.join(format!("{slug}.json"));
+            std::fs::write(&tpl_path, serde_json::to_vec_pretty(&local).unwrap()).unwrap();
+            let remote = serde_json::json!({
+                "id": id,
+                "url": format!("{api}/email_templates/{id}"),
+                "name": slug,
+                "subject": "Hello",
+                "queue": format!("{api}/queues/42"),
+            });
+            lockfile.upsert(
+                "email_templates",
+                &key,
+                ObjectEntry {
+                    id,
+                    modified_at: None,
+                    modified_by: None,
+                    content_hash: None,
+                    secrets_hash: None,
+                },
+            );
+            let codec = crate::snapshot::codec::codec("email_templates").unwrap();
+            let art = codec.disk_bytes(&remote).unwrap();
+            let base = combined_hash(&art.json, &art.sidecars, &lockfile);
+            lockfile.upsert(
+                "email_templates",
+                &key,
+                ObjectEntry {
+                    id,
+                    modified_at: None,
+                    modified_by: None,
+                    content_hash: Some(base),
+                    secrets_hash: None,
+                },
+            );
+            changes.insert(key, tpl_path);
+            remotes.push(remote);
+        }
+        let list = serde_json::json!({ "pagination": { "next": null }, "results": remotes });
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/email_templates"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(list.clone()))
+            .mount(&server)
+            .await;
+        for i in 0..slugs.len() {
+            let id = 300 + i as u64;
+            Mock::given(method("PATCH"))
+                .and(path(format!("/api/v1/email_templates/{id}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(list["results"][i].clone())
+                        .set_delay(std::time::Duration::from_millis(200)),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
+        let progress = Arc::new(crate::log::Log::new(crate::cli::resolve::ColorMode::Plain));
+        let start = std::time::Instant::now();
+        let (pushed, skipped) = push(
+            &paths, &client, &mut lockfile, false, &changes, &progress, "dev",
+        )
+        .await
+        .expect("push should succeed");
+        let elapsed = start.elapsed();
+
+        assert_eq!((pushed, skipped), (4, 0));
+        assert!(
+            elapsed < std::time::Duration::from_millis(650),
+            "four 200ms PATCHes must overlap; sequential would be >= 800ms, took {elapsed:?}",
+        );
     }
 }
