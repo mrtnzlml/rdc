@@ -17,7 +17,7 @@
 - Core limiter stays **10 req/s, burst 10** (`RateLimiter::rossum_core_api()`). Spec S2 verified it is correctly calibrated. Do not touch it.
 - Data Storage limiter is **30 req/s, burst 30**. Measured ceiling is far higher (S3: 80 concurrent → 0 × 429; S4: sustained 36–63 req/s → 0 × 429); 30 is a deliberate margin. It is one constant to change if a cluster turns out to be stricter.
 - **Sync's four safety layers are untouched.** Classifier (offline), resolver, push-side drift check, defensive last-mile hash compare. Layer 3's per-item drift check stays **per item** — only its scheduling changes. If a task finds itself changing *whether* a check runs, stop: that is out of scope.
-- **Creates stay sequential.** `POST` assigns ids that later items resolve against. Only the update/PATCH path is parallelized.
+- **Creates stay sequential, and they are BARRIERS — do not hoist them.** `POST` assigns ids that later items resolve against. The drivers walk `changes` in one `BTreeMap` pass, interleaving creates and updates in slug order; partitioning into "all creates, then all updates" **reorders** them, so a create that sorts after an update runs before it, registers its id early, and makes that update's ref resolve eagerly instead of deferring to the relink pass — one PATCH instead of two, with a different body. That is a change to what the command sends on the success path. Fan out over **maximal runs of consecutive updates** instead, with creates as barriers: slug order is preserved exactly, the request stream is bit-identical, the drift list is still fetched at most once per push, and the common all-updates push is a single run with the full win.
 - **A drifted item is never PATCHed concurrently.** It returns a needs-prompt marker and is resolved on the sequential pass, so `resolve_push_drift` prompts can never interleave. `stdin_coord` remains the single stdin owner.
 - **Deletes are not parallelized** (`push::deletes::run_deletes` is cascade-ordered; spec N3).
 - **Do not reduce the number of requests.** Spec N1/N2: core listing is already at its ceiling and a change-gate on MDH index fetches would trade away detection of a remote-only index edit. Both are separate, safety-bearing designs.
@@ -2797,7 +2797,7 @@ Expected: FAIL on the elapsed assertion (~800ms sequential).
 
 - [ ] **Step 3: Refactor `labels`**
 
-Apply Task 9's shape verbatim: partition creates/updates on the absence of a `lockfile.objects["labels"]` entry, run creates sequentially, hoist `client.list_labels(...)` to one call, then:
+Apply Task 9's shape verbatim — **as corrected in Task 10**: walk `changes` in slug order, treating creates as barriers and fanning out over maximal runs of consecutive updates (never "all creates, then all updates", which reorders them). Hoist `client.list_labels(...)` to one call, guarded by the same `drift_base`-style predicate both the hoist and the per-item check share, then:
 
 ```rust
     let lf: &Lockfile = &*lockfile;
@@ -3003,7 +3003,7 @@ Expected: FAIL on the elapsed assertion (~1.2s sequential).
 
 - [ ] **Step 3: Refactor `workspaces`**
 
-Task 9's shape, with the per-item `client.get_workspace(id, …)` moving **inside** the concurrent future — it is the drift check, and per C9 the drift check needs only `&Lockfile`:
+Task 9's shape **as corrected in Task 10** (creates are barriers; fan out over maximal runs of consecutive updates), with the per-item `client.get_workspace(id, …)` moving **inside** the concurrent future — it is the drift check, and per C9 the drift check needs only `&Lockfile`:
 
 ```rust
     let lf: &Lockfile = &*lockfile;
