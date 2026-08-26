@@ -96,13 +96,31 @@ pub async fn push(
         return Ok((pushed, skipped));
     }
 
-    // Drift-check list, hoisted to ONE fetch before the batch. Same single
-    // request the lazy `remote_rules` cache used to make — it just no longer
-    // sits behind the first item's PATCH.
-    let remote_rules = client
-        .list_rules(Some(progress.clone()))
-        .await
-        .context("listing rules to verify no drift before push")?;
+    // Drift-check list, hoisted to ONE fetch before the batch — but only when
+    // at least one update can actually reach the drift check. The old lazy
+    // `remote_rules` cache was populated by the first item that got PAST the
+    // `content_hash` guard, so a batch of entries that all lack a hash made no
+    // list call at all; keep that exactly. Otherwise this is the same single
+    // request the lazy cache used to make — it just no longer sits behind the
+    // first item's PATCH.
+    let needs_drift_check = updates.iter().any(|(slug, _)| {
+        lockfile
+            .objects
+            .get("rules")
+            .and_then(|m| m.get(slug.as_str()))
+            .is_some_and(|e| e.content_hash.is_some())
+    });
+    let remote_rules = if needs_drift_check {
+        client
+            .list_rules(Some(progress.clone()))
+            .await
+            .context("listing rules to verify no drift before push")?
+    } else {
+        // Unreachable for any item that would consult it: an entry with no
+        // `content_hash` returns `Prepared::Skipped` before the list is ever
+        // touched, and by construction here every entry is such an entry.
+        Vec::new()
+    };
 
     // === Concurrent stage. Needs only `&Lockfile`; touches neither the
     //     working tree nor the lockfile, and never prompts.
@@ -188,6 +206,12 @@ pub async fn push(
                 progress.event(Action::Skip, &event);
                 skipped += 1;
             }
+            // Deliberate, and inherited by Tasks 10-12: this arm still runs
+            // when an earlier item already failed. Suppressing the prompt once
+            // `first_error` is set would leave a drifted item neither prompted
+            // nor recorded — worse than prompting on a run that will fail
+            // anyway — and would contradict D10's principle that the apply
+            // stage completes all the work it can before propagating.
             Ok(Prepared::NeedsPrompt { slug }) => {
                 let (p, s) = push_one_drifted(
                     paths,
@@ -559,6 +583,49 @@ mod tests {
             "pagination": { "next": null }, "results": remotes
         });
         (paths, lockfile, changes, list)
+    }
+
+    /// Request-count parity: the old lazy `remote_rules` cache was populated
+    /// by the first update that got PAST the `content_hash` guard, so a batch
+    /// in which every entry lacks a hash made NO list call at all. The hoisted
+    /// fetch must keep that exactly — no `content_hash` anywhere means no
+    /// request of any kind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn push_rules_makes_no_request_when_no_update_has_a_content_hash() {
+        let server = MockServer::start().await;
+        let api = format!("{}/api/v1", server.uri());
+        let tmp = tempfile::tempdir().unwrap();
+        let (paths, mut lockfile, changes, _list) = seed_rules(&tmp, &api, &["r-a", "r-b"]);
+        // Strip the recorded base from both entries, keeping their ids: each is
+        // still an UPDATE (it has a lockfile entry), but neither can reach the
+        // drift check. No mocks are mounted, so any request at all would both
+        // fail and show up in `received_requests`.
+        for (i, slug) in ["r-a", "r-b"].iter().enumerate() {
+            lockfile.upsert(
+                "rules",
+                slug,
+                ObjectEntry {
+                    id: 700 + i as u64,
+                    modified_at: None,
+                    modified_by: None,
+                    content_hash: None,
+                    secrets_hash: None,
+                },
+            );
+        }
+
+        let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        let (pushed, skipped) =
+            push(&paths, &client, &mut lockfile, false, &changes, &progress, "dev")
+                .await
+                .expect("push should succeed");
+
+        assert_eq!((pushed, skipped), (0, 2), "both rules are skipped");
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "no update can reach the drift check, so nothing may be requested",
+        );
     }
 
     /// Spec D9: clean updates PATCH concurrently. Four rules whose PATCHes each
