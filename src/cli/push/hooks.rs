@@ -5,8 +5,7 @@ use crate::paths::Paths;
 use crate::secrets::{HookSecrets, load_hook_secrets};
 use crate::snapshot::create::strip_for_create;
 use crate::snapshot::hook::{
-    hook_code_extension, hook_code_extension_from_value, read_hook_value, serialize_hook,
-    write_hook_code,
+    hook_code_extension, read_hook_value, serialize_hook, write_hook_code,
 };
 use crate::snapshot::writer::write_atomic;
 use crate::state::{Lockfile, ObjectEntry, hook_combined_hash, hook_secrets_hash};
@@ -509,12 +508,6 @@ async fn push_update_batch(
             // deserialize.
             let mut payload = read_hook_value(dir_ref, slug)
                 .with_context(|| format!("reading local hook '{slug}'"))?;
-            // The on-disk sidecar extension is whatever the local JSON
-            // declared. Read and deliberately discarded, exactly as the old
-            // loop's `let _ = local_ext` did on this path: the post-PATCH
-            // response's runtime drives the write-back layout, not the local
-            // declaration.
-            let _local_ext = hook_code_extension_from_value(&payload);
             // Two-phase relink, same as [`push`]'s create path and as
             // `queues`/`engines` do on BOTH of their paths. Hooks are pushed in
             // slug order, so an already-deployed hook whose `run_after` names one
@@ -745,9 +738,8 @@ async fn send_patch(
 /// `let (updated_json, updated_code) = serialize_hook(&updated)?;` down to and
 /// including the `relink.push(...)`, with the `progress.event(Action::Patch, …)`
 /// line left behind at the call site so the caller controls when it fires. The
-/// `let _ = local_ext;` that used to sit inside this block stayed behind with
-/// its computation at the call sites; it never affected the block, which
-/// derives the sidecar extension from the server's response.
+/// sidecar extension comes from the server's response, never from what the
+/// local JSON declared.
 fn write_back(
     paths: &Paths,
     hooks_dir: &std::path::Path,
@@ -858,8 +850,6 @@ async fn push_one_drifted(
 
     let mut payload = read_hook_value(hooks_dir, slug)
         .with_context(|| format!("reading local hook '{slug}'"))?;
-    // The on-disk sidecar is whatever the local JSON declared.
-    let local_ext = hook_code_extension_from_value(&payload);
     let mut deferred = crate::snapshot::refs::resolve_value_deferring(&mut payload, lockfile);
     let payload_hook: crate::model::Hook = serde_json::from_value(payload)
         .with_context(|| format!("deserializing hook '{slug}'"))?;
@@ -919,7 +909,6 @@ async fn push_one_drifted(
                 std::fs::remove_file(&stale)
                     .with_context(|| format!("removing stale {}", stale.display()))?;
             }
-            let _ = local_ext; // unused on adopt path; the remote ext drives layout
             // Adopt is a content-side reconciliation (remote → local).
             // The secrets we last pushed are unaffected; carry the
             // previous lockfile `secrets_hash` forward so the next
@@ -952,7 +941,6 @@ async fn push_one_drifted(
         }
     }
 
-    let _ = local_ext; // PATCH path: post-PATCH ext drives layout
     let (updated, secrets_hash) = send_patch(
         client,
         id,
@@ -1773,6 +1761,166 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_millis(900),
             "four 300ms PATCHes must overlap; sequential would be >= 1.2s, took {elapsed:?}",
+        );
+    }
+
+    /// The create barrier and the caller-owned drift cache, pinned together.
+    ///
+    /// `changes` interleaves update / create / update in slug order, so the
+    /// push splits into two runs with a POST between them. Two properties
+    /// matter and neither is exercised by the all-updates concurrency test
+    /// above:
+    ///
+    ///   1. The create is a BARRIER. `a-update` is prepared (and PATCHed)
+    ///      before the POST, and `z-update` only afterwards — exactly the
+    ///      order the old sequential loop used. Hoisting every create ahead of
+    ///      every update would resolve refs that must still defer (see
+    ///      `sync_push_hook_run_after_deferred_relink_on_the_patch_path`).
+    ///   2. N runs still cost ONE `GET /hooks`. That is the entire reason the
+    ///      drift list is threaded through as `&mut Option<Vec<Hook>>` rather
+    ///      than being a local of the batch function; a per-run fetch would be
+    ///      an extra request the old loop never made.
+    #[tokio::test]
+    async fn push_hooks_barriers_on_a_create_and_lists_only_once() {
+        use crate::paths::Paths;
+        use crate::snapshot::hook::serialize_hook;
+        use crate::state::hook_combined_hash;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let api = format!("{}/api/v1", server.uri());
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        let hooks_dir = paths.hooks_dir();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+
+        let hook_json = |slug: &str, id: Option<u64>| {
+            let url = match id {
+                Some(id) => format!("{api}/hooks/{id}"),
+                None => format!("rdc://hooks/{slug}"),
+            };
+            let mut v = serde_json::json!({
+                "url": url,
+                "name": slug,
+                "type": "webhook",
+                "queues": [],
+                "events": [],
+                "config": { "url": "https://example.invalid/hook" }
+            });
+            if let Some(id) = id {
+                v["id"] = serde_json::json!(id);
+            }
+            v
+        };
+
+        let mut lockfile = Lockfile {
+            api_base: api.clone(),
+            ..Lockfile::default()
+        };
+        let mut changes = BTreeMap::new();
+        // Two tracked hooks (PATCH path) with a NEW hook sorting between them.
+        for (slug, id) in [("a-update", 910u64), ("z-update", 912u64)] {
+            std::fs::write(
+                hooks_dir.join(format!("{slug}.json")),
+                serde_json::to_vec_pretty(&hook_json(slug, None)).unwrap(),
+            )
+            .unwrap();
+            lockfile.upsert(
+                "hooks",
+                slug,
+                ObjectEntry {
+                    id,
+                    modified_at: None,
+                    modified_by: None,
+                    content_hash: None,
+                    secrets_hash: None,
+                },
+            );
+            let remote: crate::model::Hook =
+                serde_json::from_value(hook_json(slug, Some(id))).unwrap();
+            let (rj, rc) = serialize_hook(&remote).unwrap();
+            let base = hook_combined_hash(&rj, &rc, &lockfile);
+            lockfile.upsert(
+                "hooks",
+                slug,
+                ObjectEntry {
+                    id,
+                    modified_at: None,
+                    modified_by: None,
+                    content_hash: Some(base),
+                    secrets_hash: None,
+                },
+            );
+            changes.insert(slug.to_string(), hooks_dir.join(format!("{slug}.json")));
+        }
+        // No lockfile entry -> create. Sorts between the two updates.
+        std::fs::write(
+            hooks_dir.join("m-create.json"),
+            serde_json::to_vec_pretty(&hook_json("m-create", None)).unwrap(),
+        )
+        .unwrap();
+        changes.insert("m-create".to_string(), hooks_dir.join("m-create.json"));
+
+        // The drift list never contains the hook created mid-push — same as
+        // the old loop, whose cache was also filled before the POST.
+        Mock::given(method("GET"))
+            .and(path("/api/v1/hooks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pagination": { "next": null },
+                "results": [hook_json("a-update", Some(910)), hook_json("z-update", Some(912))]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/hooks"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(hook_json("m-create", Some(911))),
+            )
+            .mount(&server)
+            .await;
+        for (slug, id) in [("a-update", 910u64), ("z-update", 912u64)] {
+            Mock::given(method("PATCH"))
+                .and(path(format!("/api/v1/hooks/{id}")))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(hook_json(slug, Some(id))),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
+        let progress =
+            std::sync::Arc::new(crate::log::Log::new(crate::cli::resolve::ColorMode::Plain));
+        let mut relink = Vec::new();
+        let (pushed, skipped) = push(
+            &paths, &client, &mut lockfile, false, &changes, &[], &mut relink, &progress, "dev",
+        )
+        .await
+        .expect("push should succeed");
+        assert_eq!((pushed, skipped), (3, 0));
+
+        let reqs = server.received_requests().await.unwrap_or_default();
+        let stream: Vec<String> = reqs
+            .iter()
+            .filter(|r| r.url.path().starts_with("/api/v1/hooks"))
+            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .collect();
+        assert_eq!(
+            stream,
+            vec![
+                "GET /api/v1/hooks".to_string(),
+                "PATCH /api/v1/hooks/910".to_string(),
+                "POST /api/v1/hooks".to_string(),
+                "PATCH /api/v1/hooks/912".to_string(),
+            ],
+            "the create must sit BETWEEN the two updates, and the drift list \
+             must be fetched exactly once for both runs",
+        );
+        assert_eq!(
+            stream.iter().filter(|r| *r == "GET /api/v1/hooks").count(),
+            1,
+            "a second run must reuse the caller-owned drift list, not refetch it",
         );
     }
 }

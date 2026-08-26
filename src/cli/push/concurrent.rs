@@ -57,11 +57,22 @@ impl<T> Prepared<T> {
 /// write — keeps the driver's existing slug order. Nothing in the push
 /// transcript reorders.
 ///
-/// Every item is polled to completion even after one fails, so a mid-batch
-/// error never strands a PATCH the server already applied: the caller applies
-/// every `Ok` and then propagates the first `Err`. That makes the
-/// inconsistency window on failure SMALLER than the sequential loop's, which
-/// aborted with the failing item's effects unrecorded.
+/// A failure does not stop the batch. `.buffered(N).collect()` drives the whole
+/// stream, so once an item fails the REMAINING items are still prepared and
+/// still dispatched — not merely the ones already in flight when it failed.
+/// The old sequential loop sent nothing at all after the failing item, so this
+/// is a real behaviour change on the error path, and a deliberate one:
+///
+/// - D10 holds exactly. No PATCH the server already applied is stranded
+///   unrecorded: every item is returned, the caller applies every `Ok`, and
+///   only then propagates the first `Err`. The sequential loop, by contrast,
+///   aborted with the failing item's own effects unrecorded.
+/// - One bad item no longer blocks the rest of the push. A single malformed
+///   local file used to hold back every other edit in the batch; now those
+///   edits land and the error still surfaces.
+///
+/// What it is NOT is a way to cancel a batch mid-flight. If that is ever
+/// wanted, it has to be built here — the callers cannot opt out.
 pub async fn prepare_all<I, T, F, Fut>(items: I, prepare: F) -> Vec<Result<Prepared<T>>>
 where
     I: IntoIterator,
