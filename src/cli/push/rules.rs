@@ -108,7 +108,8 @@ pub async fn push(
             .objects
             .get("rules")
             .and_then(|m| m.get(slug.as_str()))
-            .is_some_and(|e| e.content_hash.is_some())
+            .and_then(drift_base)
+            .is_some()
     });
     let remote_rules = if needs_drift_check {
         client
@@ -134,7 +135,7 @@ pub async fn push(
                 .get("rules")
                 .and_then(|m| m.get(slug.as_str()))
                 .expect("partitioned as an update, so the entry exists");
-            let Some(base) = entry.content_hash.clone() else {
+            let Some(base) = drift_base(entry) else {
                 return Ok(Prepared::Skipped {
                     slug: slug.clone(),
                     event: format!("rule/{slug} (no content_hash)"),
@@ -190,17 +191,30 @@ pub async fn push(
             debug_assert_eq!(p.slug(), slug_in.as_str());
         }
         match item {
+            // NOT `?`: by the time the apply stage runs, every clean PATCH in
+            // the batch has already landed server-side. Returning early here
+            // would leave the REMAINING items' completed PATCHes unrecorded —
+            // the exact inconsistency D10 exists to shrink, and worse than the
+            // old sequential loop, which never sent those requests at all.
             Ok(Prepared::Patched { slug, updated }) => {
-                write_back(
+                match write_back(
                     paths,
                     &rules_dir,
                     lockfile,
                     &slug,
                     local_json_path,
                     &updated,
-                )?;
-                progress.event(Action::Patch, &format!("rule/{slug}"));
-                pushed += 1;
+                ) {
+                    Ok(()) => {
+                        progress.event(Action::Patch, &format!("rule/{slug}"));
+                        pushed += 1;
+                    }
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
+                }
             }
             Ok(Prepared::Skipped { event, .. }) => {
                 progress.event(Action::Skip, &event);
@@ -212,8 +226,9 @@ pub async fn push(
             // nor recorded — worse than prompting on a run that will fail
             // anyway — and would contradict D10's principle that the apply
             // stage completes all the work it can before propagating.
+            // Also NOT `?`, for the same reason as the `Patched` arm above.
             Ok(Prepared::NeedsPrompt { slug }) => {
-                let (p, s) = push_one_drifted(
+                match push_one_drifted(
                     paths,
                     client,
                     lockfile,
@@ -225,9 +240,18 @@ pub async fn push(
                     progress,
                     env,
                 )
-                .await?;
-                pushed += p;
-                skipped += s;
+                .await
+                {
+                    Ok((p, s)) => {
+                        pushed += p;
+                        skipped += s;
+                    }
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
+                }
             }
             Err(e) => {
                 if first_error.is_none() {
@@ -241,6 +265,18 @@ pub async fn push(
     }
 
     Ok((pushed, skipped))
+}
+
+/// Whether this entry can reach the drift check at all — and, if so, the base
+/// the remote is checked against.
+///
+/// The hoisted list fetch and the per-item guard inside the concurrent stage
+/// MUST agree on this predicate. If the hoist guard were ever narrower than the
+/// per-item one, an item would consult an empty list and silently take the
+/// "remote id missing" skip instead of a real drift check — no error, just
+/// wrong. One expression, called from both, so they cannot drift apart.
+fn drift_base(entry: &ObjectEntry) -> Option<&str> {
+    entry.content_hash.as_deref()
 }
 
 /// Write one PATCH response back: canonical form to disk and the base cache,
@@ -626,6 +662,75 @@ mod tests {
             server.received_requests().await.unwrap().is_empty(),
             "no update can reach the drift check, so nothing may be requested",
         );
+    }
+
+    /// Spec D10, apply stage: an error raised while APPLYING one item must not
+    /// strand the completed PATCHes of the items AFTER it. By the time the
+    /// apply stage runs, every clean PATCH in the batch has already landed
+    /// server-side, so returning early would leave r-c's `content_hash` stale
+    /// for a change the server has accepted — worse than the old sequential
+    /// loop, which never sent r-c's request at all.
+    ///
+    /// r-b's write-back is what fails: its recorded path is outside the env
+    /// tree, which `base_cache::write` refuses. Its PATCH still succeeds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn push_rules_records_a_later_patch_when_an_earlier_apply_fails() {
+        let server = MockServer::start().await;
+        let api = format!("{}/api/v1", server.uri());
+        let tmp = tempfile::tempdir().unwrap();
+        let (paths, mut lockfile, mut changes, list) =
+            seed_rules(&tmp, &api, &["r-a", "r-b", "r-c"]);
+        let before: Vec<Option<String>> = ["r-a", "r-b", "r-c"]
+            .iter()
+            .map(|s| lockfile.objects["rules"][*s].content_hash.clone())
+            .collect();
+        // The concurrent stage reads the local file out of `rules_dir`, so r-b
+        // is still read and PATCHed normally; only the write-back consults this
+        // path, and `base_cache::write` bails on anything outside `env_root`.
+        changes.insert(
+            "r-b".to_string(),
+            tmp.path().join("outside-env-tree").join("r-b.json"),
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/rules"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(list.clone()))
+            .mount(&server)
+            .await;
+        for i in 0..3usize {
+            let id = 700 + i as u64;
+            // Echo a changed name so a recorded write-back is observable (see
+            // `push_rules_records_completed_patches_when_one_fails`).
+            let mut body = list["results"][i].clone();
+            body["name"] =
+                serde_json::json!(format!("{} pushed", body["name"].as_str().unwrap()));
+            Mock::given(method("PATCH"))
+                .and(path(format!("/api/v1/rules/{id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+        }
+
+        let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        let err = push(&paths, &client, &mut lockfile, false, &changes, &progress, "dev")
+            .await
+            .expect_err("the failed write-back must propagate");
+        assert!(
+            format!("{err:#}").contains("env_root"),
+            "error names the write-back failure: {err:#}"
+        );
+
+        let after: Vec<Option<String>> = ["r-a", "r-b", "r-c"]
+            .iter()
+            .map(|s| lockfile.objects["rules"][*s].content_hash.clone())
+            .collect();
+        assert_ne!(after[0], before[0], "the earlier item stays recorded");
+        assert_ne!(
+            after[2], before[2],
+            "the LATER item's completed PATCH must still be recorded"
+        );
+        assert_eq!(after[1], before[1], "the un-applied item's base must not move");
     }
 
     /// Spec D9: clean updates PATCH concurrently. Four rules whose PATCHes each

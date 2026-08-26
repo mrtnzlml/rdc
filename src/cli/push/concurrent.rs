@@ -142,6 +142,11 @@ mod tests {
         .await;
         assert_eq!(out.len(), 40);
         assert!(
+            peak.load(Ordering::SeqCst) >= 2,
+            "the primitive must actually overlap work — `buffered(1)` would \
+             satisfy every other assertion in this module",
+        );
+        assert!(
             peak.load(Ordering::SeqCst) <= PUSH_FANOUT,
             "at most PUSH_FANOUT may be in flight, saw {}",
             peak.load(Ordering::SeqCst),
