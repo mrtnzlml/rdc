@@ -19,90 +19,174 @@ pub async fn push(
     progress: &Arc<Log>,
     env: &str,
 ) -> Result<(usize, usize)> {
-    use crate::cli::push::concurrent::{Prepared, prepare_all};
-
     let rules_dir = paths.rules_dir();
     let mut pushed = 0usize;
     let mut skipped = 0usize;
 
-    // CREATEs stay strictly sequential: POST assigns ids that later items
-    // resolve against, so that ordering is load-bearing.
-    let mut creates: Vec<(&String, &std::path::PathBuf)> = Vec::new();
-    let mut updates: Vec<(&String, &std::path::PathBuf)> = Vec::new();
-    for (slug, path) in changes {
+    // Drift-check list, fetched at most ONCE for the whole push and owned here
+    // so every run shares the single request. Populated lazily by the first run
+    // that actually has an item able to reach the drift check, so a push whose
+    // updates all lack a `content_hash` still makes no list call at all — see
+    // [`push_update_batch`].
+    let mut drift_rules: Option<Vec<crate::model::Rule>> = None;
+
+    // Updates fan out (the two-stage shape in [`push_update_batch`]); creates
+    // stay strictly sequential because POST assigns ids that later items
+    // resolve against. But the two are NOT partitioned into "all creates, then
+    // all updates": a rule's refs are resolved against the lockfile AS IT
+    // STANDS when that rule is prepared, so hoisting a create ahead of an
+    // earlier-sorting update would resolve a ref that used to defer, and change
+    // what this command sends. `push::hooks` carries an observable instance of
+    // exactly that (a `run_after` forward reference collapsing its documented
+    // push-PATCH + relink-PATCH pair into a single PATCH); a rule's refs
+    // normally point at queues and labels rather than other rules, but
+    // `resolve_value` walks every string, so an `rdc://rules/<slug>` ref in a
+    // rule body hits it too.
+    //
+    // So `changes` is still walked in slug order, and each MAXIMAL RUN of
+    // consecutive updates is fanned out with a create acting as a barrier.
+    // Within a run the concurrency is invisible: an update's write-back
+    // rewrites only its OWN entry's hashes and its own files, and no sibling's
+    // ref resolution or drift check reads those — ids, which are what refs
+    // resolve through, never change on an update. The common steady-state push
+    // (all updates, no creates) is a single run, so the full win is unchanged.
+    let mut batch: Vec<(&String, &std::path::PathBuf)> = Vec::new();
+    for (slug, local_json_path) in changes {
+        // CREATE — no lockfile entry yet.
         if lockfile
             .objects
             .get("rules")
             .and_then(|m| m.get(slug.as_str()))
             .is_none()
         {
-            creates.push((slug, path));
-        } else {
-            updates.push((slug, path));
+            // Close the pending run first: every update sorting BEFORE this
+            // create must be prepared against a lockfile that does not yet
+            // know the id this POST is about to assign.
+            let (batched_pushed, batched_skipped) = push_update_batch(
+                paths,
+                client,
+                lockfile,
+                interactive,
+                &rules_dir,
+                &mut batch,
+                &mut drift_rules,
+                progress,
+                env,
+            )
+            .await?;
+            pushed += batched_pushed;
+            skipped += batched_skipped;
+
+            let mut payload = read_rule_value(&rules_dir, slug)
+                .with_context(|| format!("reading local rule '{slug}' for create"))?;
+            crate::snapshot::refs::resolve_value(&mut payload, lockfile);
+            strip_for_create(&mut payload, "rules");
+            let create_result = client
+                .create_rule(&payload, Some(progress.clone()))
+                .await
+                .with_context(|| format!("POST /rules (creating '{slug}')"));
+            let created = create_result?;
+            let (created_json, created_code) = serialize_rule(&created)?;
+            // Register the new rule's id NOW so its own `url` (and any ref to an
+            // already-created object) portabilizes to `rdc://`. Concrete env URLs
+            // must never touch disk, even transiently (an interrupted sync whose
+            // portabilize post-pass never runs would freeze them into the snapshot).
+            lockfile.upsert(
+                "rules",
+                slug,
+                ObjectEntry {
+                    id: created.id,
+                    modified_at: created.modified_at().map(|s| s.to_string()),
+                    modified_by: created.modified_by().map(|s| s.to_string()),
+                    content_hash: None,
+                    secrets_hash: None,
+                },
+            );
+            let created_json =
+                crate::cli::pull::common::portabilize_proposed(&created_json, lockfile);
+            let created_hash = rule_combined_hash(&created_json, &created_code, lockfile);
+            write_atomic(local_json_path, &created_json)
+                .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
+            if let Some(code) = &created_code {
+                write_rule_code(&rules_dir, slug, code)
+                    .with_context(|| format!("writing rule code for '{slug}'"))?;
+            }
+            lockfile.upsert(
+                "rules",
+                slug,
+                ObjectEntry {
+                    id: created.id,
+                    modified_at: created.modified_at().map(|s| s.to_string()),
+                    modified_by: created.modified_by().map(|s| s.to_string()),
+                    content_hash: Some(created_hash),
+                    secrets_hash: None,
+                },
+            );
+            progress.event(Action::Post, &format!("rule/{slug} id={}", created.id));
+            pushed += 1;
+            continue;
         }
+        batch.push((slug, local_json_path));
     }
 
-    for (slug, local_json_path) in creates {
-        // CREATE — no lockfile entry yet.
-        let mut payload = read_rule_value(&rules_dir, slug)
-            .with_context(|| format!("reading local rule '{slug}' for create"))?;
-        crate::snapshot::refs::resolve_value(&mut payload, lockfile);
-        strip_for_create(&mut payload, "rules");
-        let create_result = client
-            .create_rule(&payload, Some(progress.clone()))
-            .await
-            .with_context(|| format!("POST /rules (creating '{slug}')"));
-        let created = create_result?;
-        let (created_json, created_code) = serialize_rule(&created)?;
-        // Register the new rule's id NOW so its own `url` (and any ref to an
-        // already-created object) portabilizes to `rdc://`. Concrete env URLs
-        // must never touch disk, even transiently (an interrupted sync whose
-        // portabilize post-pass never runs would freeze them into the snapshot).
-        lockfile.upsert(
-            "rules",
-            slug,
-            ObjectEntry {
-                id: created.id,
-                modified_at: created.modified_at().map(|s| s.to_string()),
-                modified_by: created.modified_by().map(|s| s.to_string()),
-                content_hash: None,
-                secrets_hash: None,
-            },
-        );
-        let created_json = crate::cli::pull::common::portabilize_proposed(&created_json, lockfile);
-        let created_hash = rule_combined_hash(&created_json, &created_code, lockfile);
-        write_atomic(local_json_path, &created_json)
-            .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
-        if let Some(code) = &created_code {
-            write_rule_code(&rules_dir, slug, code)
-                .with_context(|| format!("writing rule code for '{slug}'"))?;
-        }
-        lockfile.upsert(
-            "rules",
-            slug,
-            ObjectEntry {
-                id: created.id,
-                modified_at: created.modified_at().map(|s| s.to_string()),
-                modified_by: created.modified_by().map(|s| s.to_string()),
-                content_hash: Some(created_hash),
-                secrets_hash: None,
-            },
-        );
-        progress.event(Action::Post, &format!("rule/{slug} id={}", created.id));
-        pushed += 1;
-    }
+    // Flush the trailing run.
+    let (batched_pushed, batched_skipped) = push_update_batch(
+        paths,
+        client,
+        lockfile,
+        interactive,
+        &rules_dir,
+        &mut batch,
+        &mut drift_rules,
+        progress,
+        env,
+    )
+    .await?;
+    pushed += batched_pushed;
+    skipped += batched_skipped;
 
+    Ok((pushed, skipped))
+}
+
+/// Fan out one maximal run of consecutive rule UPDATES, then apply the results.
+///
+/// The two-stage shape: a concurrent stage that needs only `&Lockfile`, touches
+/// neither the working tree nor the lockfile and never prompts, then a
+/// sequential apply stage in slug order that owns `&mut Lockfile`, the
+/// filesystem and every prompt. `batch` is drained.
+///
+/// `drift_rules` is the caller's one-per-push cache of the fresh rule list, so
+/// several runs still cost a single `GET /rules` — and a push whose updates all
+/// lack a `content_hash` still costs none.
+#[allow(clippy::too_many_arguments)]
+async fn push_update_batch(
+    paths: &Paths,
+    client: &RossumClient,
+    lockfile: &mut Lockfile,
+    interactive: bool,
+    rules_dir: &std::path::Path,
+    batch: &mut Vec<(&String, &std::path::PathBuf)>,
+    drift_rules: &mut Option<Vec<crate::model::Rule>>,
+    progress: &Arc<Log>,
+    env: &str,
+) -> Result<(usize, usize)> {
+    use crate::cli::push::concurrent::{Prepared, prepare_all};
+
+    let updates = std::mem::take(batch);
     if updates.is_empty() {
-        return Ok((pushed, skipped));
+        return Ok((0, 0));
     }
+    let mut pushed = 0usize;
+    let mut skipped = 0usize;
 
     // Drift-check list, hoisted to ONE fetch before the batch — but only when
     // at least one update can actually reach the drift check. The old lazy
     // `remote_rules` cache was populated by the first item that got PAST the
-    // `content_hash` guard, so a batch of entries that all lack a hash made no
-    // list call at all; keep that exactly. Otherwise this is the same single
-    // request the lazy cache used to make — it just no longer sits behind the
-    // first item's PATCH.
+    // `content_hash` guard, so a run of entries that all lack a hash made no
+    // list call at all; keep that exactly, and keep it caller-owned so several
+    // runs share the single fetch. Otherwise this is the same single request
+    // the lazy cache used to make — it just no longer sits behind the first
+    // item's PATCH.
     let needs_drift_check = updates.iter().any(|(slug, _)| {
         lockfile
             .objects
@@ -111,30 +195,31 @@ pub async fn push(
             .and_then(drift_base)
             .is_some()
     });
-    let remote_rules = if needs_drift_check {
-        client
-            .list_rules(Some(progress.clone()))
-            .await
-            .context("listing rules to verify no drift before push")?
-    } else {
-        // Unreachable for any item that would consult it: an entry with no
-        // `content_hash` returns `Prepared::Skipped` before the list is ever
-        // touched, and by construction here every entry is such an entry.
-        Vec::new()
-    };
+    if drift_rules.is_none() && needs_drift_check {
+        *drift_rules = Some(
+            client
+                .list_rules(Some(progress.clone()))
+                .await
+                .context("listing rules to verify no drift before push")?,
+        );
+    }
+    // Empty only when nothing in this run can consult it: an entry with no
+    // `content_hash` returns `Prepared::Skipped` before the list is ever
+    // touched, and by construction that is then every entry in the run.
+    let remote_rules: &[crate::model::Rule] = drift_rules.as_deref().unwrap_or(&[]);
 
     // === Concurrent stage. Needs only `&Lockfile`; touches neither the
     //     working tree nor the lockfile, and never prompts.
     let prepared = {
         let lf: &Lockfile = &*lockfile;
-        let remote_ref = &remote_rules;
-        let dir_ref = &rules_dir;
+        let remote_ref = remote_rules;
+        let dir_ref = rules_dir;
         prepare_all(updates.iter().copied(), |(slug, _path)| async move {
             let entry = lf
                 .objects
                 .get("rules")
                 .and_then(|m| m.get(slug.as_str()))
-                .expect("partitioned as an update, so the entry exists");
+                .expect("batched as an update, so the entry exists");
             let Some(base) = drift_base(entry) else {
                 return Ok(Prepared::Skipped {
                     slug: slug.clone(),
@@ -197,14 +282,7 @@ pub async fn push(
             // the exact inconsistency D10 exists to shrink, and worse than the
             // old sequential loop, which never sent those requests at all.
             Ok(Prepared::Patched { slug, updated }) => {
-                match write_back(
-                    paths,
-                    &rules_dir,
-                    lockfile,
-                    &slug,
-                    local_json_path,
-                    &updated,
-                ) {
+                match write_back(paths, rules_dir, lockfile, &slug, local_json_path, &updated) {
                     Ok(()) => {
                         progress.event(Action::Patch, &format!("rule/{slug}"));
                         pushed += 1;
@@ -233,10 +311,10 @@ pub async fn push(
                     client,
                     lockfile,
                     interactive,
-                    &rules_dir,
+                    rules_dir,
                     &slug,
                     local_json_path,
-                    &remote_rules,
+                    remote_rules,
                     progress,
                     env,
                 )
@@ -621,6 +699,52 @@ mod tests {
         (paths, lockfile, changes, list)
     }
 
+    /// Write a local rule with NO lockfile entry, so the driver treats it as a
+    /// CREATE, and register it in `changes`.
+    fn seed_create(
+        paths: &Paths,
+        changes: &mut BTreeMap<String, std::path::PathBuf>,
+        slug: &str,
+    ) {
+        let rules_dir = paths.rules_dir();
+        let body = serde_json::json!({
+            "name": slug,
+            "url": format!("rdc://rules/{slug}"),
+            "queues": [],
+            "trigger": "annotation_content",
+            "rule_actions": []
+        });
+        std::fs::write(
+            rules_dir.join(format!("{slug}.json")),
+            serde_json::to_vec_pretty(&body).unwrap(),
+        )
+        .unwrap();
+        changes.insert(slug.to_string(), rules_dir.join(format!("{slug}.json")));
+    }
+
+    async fn mount_rules_list(server: &MockServer, list: &serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/rules"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(list.clone()))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_rule_create(server: &MockServer, api: &str, slug: &str, id: u64) {
+        Mock::given(method("POST"))
+            .and(path("/api/v1/rules"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": id,
+                "url": format!("{api}/rules/{id}"),
+                "name": slug,
+                "queues": [],
+                "trigger": "annotation_content",
+                "rule_actions": []
+            })))
+            .mount(server)
+            .await;
+    }
+
     /// Request-count parity: the old lazy `remote_rules` cache was populated
     /// by the first update that got PAST the `content_hash` guard, so a batch
     /// in which every entry lacks a hash made NO list call at all. The hoisted
@@ -731,6 +855,116 @@ mod tests {
             "the LATER item's completed PATCH must still be recorded"
         );
         assert_eq!(after[1], before[1], "the un-applied item's base must not move");
+    }
+
+    /// Ordering: `changes` is walked in slug order with creates acting as
+    /// barriers, NOT partitioned into "all creates, then all updates". `r-a`
+    /// (an update) sorts before `r-z` (a create), so its PATCH must go out
+    /// BEFORE the POST — exactly the request stream the pre-refactor
+    /// sequential loop produced.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn push_rules_keeps_slug_order_across_a_create_barrier() {
+        let server = MockServer::start().await;
+        let api = format!("{}/api/v1", server.uri());
+        let tmp = tempfile::tempdir().unwrap();
+        let (paths, mut lockfile, mut changes, list) = seed_rules(&tmp, &api, &["r-a"]);
+        seed_create(&paths, &mut changes, "r-z");
+        mount_rules_list(&server, &list).await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/rules/700"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(list["results"][0].clone()))
+            .mount(&server)
+            .await;
+        mount_rule_create(&server, &api, "r-z", 799).await;
+
+        let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        let (pushed, skipped) =
+            push(&paths, &client, &mut lockfile, false, &changes, &progress, "dev")
+                .await
+                .expect("push should succeed");
+        assert_eq!((pushed, skipped), (2, 0));
+
+        let seq: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .collect();
+        assert_eq!(
+            seq,
+            vec![
+                "GET /api/v1/rules".to_string(),
+                "PATCH /api/v1/rules/700".to_string(),
+                "POST /api/v1/rules".to_string(),
+            ],
+            "the update must be sent before the create that sorts after it",
+        );
+    }
+
+    /// The reason the ordering above is load-bearing and not cosmetic: refs are
+    /// resolved against the lockfile AS IT STANDS when an item is prepared.
+    ///
+    /// Rules DO make this observable, contrary to the assumption that they only
+    /// reference queues and labels — `resolve_value` walks every string, so an
+    /// `rdc://rules/r-z` ref in `r-a`'s body resolves through the same path.
+    /// Prepared before the POST (correct, and what the sequential loop did),
+    /// `r-z` is absent from the lockfile, the ref cannot resolve, and the
+    /// client's pre-flight unresolved-ref guard refuses to send — so no PATCH
+    /// and no POST reach the server. Prepared after the POST registered `r-z`'s
+    /// id, the very same push would instead succeed and ship a concrete env
+    /// URL. That difference is precisely what partitioning would have hidden.
+    ///
+    /// (Rules resolve eagerly; `push::hooks` defers such a field instead. That
+    /// asymmetry is pre-existing behaviour, untouched here.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn push_rules_resolves_an_update_against_the_pre_create_lockfile() {
+        let server = MockServer::start().await;
+        let api = format!("{}/api/v1", server.uri());
+        let tmp = tempfile::tempdir().unwrap();
+        let (paths, mut lockfile, mut changes, list) = seed_rules(&tmp, &api, &["r-a"]);
+        let rules_dir = paths.rules_dir();
+        seed_create(&paths, &mut changes, "r-z");
+
+        // r-a names the rule that r-z is about to create, and sorts first.
+        let mut local: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(rules_dir.join("r-a.json")).unwrap()).unwrap();
+        local["description"] = serde_json::json!("rdc://rules/r-z");
+        std::fs::write(
+            rules_dir.join("r-a.json"),
+            serde_json::to_vec_pretty(&local).unwrap(),
+        )
+        .unwrap();
+
+        mount_rules_list(&server, &list).await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/rules/700"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(list["results"][0].clone()))
+            .mount(&server)
+            .await;
+        mount_rule_create(&server, &api, "r-z", 799).await;
+
+        let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        let err = push(&paths, &client, &mut lockfile, false, &changes, &progress, "dev")
+            .await
+            .expect_err("the ref cannot resolve yet, so the guard must refuse");
+        assert!(
+            format!("{err:#}").contains("rdc://rules/r-z"),
+            "the guard must name the unresolved ref: {err:#}"
+        );
+        let methods: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.method.to_string())
+            .collect();
+        assert!(
+            !methods.iter().any(|m| m == "POST"),
+            "r-z must not have been created before r-a was prepared, saw {methods:?}"
+        );
     }
 
     /// Spec D9: clean updates PATCH concurrently. Four rules whose PATCHes each
