@@ -1014,6 +1014,21 @@ pub async fn process(
         .filter(|(_, dir, _)| read_data_mode(dir).ok() == Some(DataMode::Manual))
         .map(|(slug, _, c)| (slug.clone(), c.name.clone()))
         .collect();
+    // All-or-nothing by design, and deliberately so: one oversized manual
+    // dataset's `$count` guardrail now aborts the whole `?` here, before
+    // sub-phase C writes ANYTHING — including the indexes.json / data.jsonl
+    // of datasets earlier in `dataset_dirs` order. That is a WIDER failure
+    // blast radius than the old sequential-apply loop, which had already
+    // written those earlier datasets by the time it reached the offender.
+    // Do not "fix" this by narrowing the abort back to a per-dataset one:
+    // which datasets survived a partial write used to depend on slug sort
+    // order, which is arbitrary, whereas aborting before any write is
+    // deterministic — and on the PULL side, leaving the working tree
+    // untouched is the safer failure mode. This is the mirror image of the
+    // push path's rule, where a mid-batch failure still records every PATCH
+    // that already completed: a push's writes landed on the SERVER and
+    // can't be undone, so the lockfile must not lie about them; a pull's
+    // writes are local files that can simply be left unwritten.
     let mut rows_by_slug = fetch_dataset_rows(&client, ctx.paths, &manual, progress).await?;
 
     // === Sub-phase C: per-collection indexes.json write decision (sequential
@@ -2001,6 +2016,122 @@ mod tests {
             "a non-manual dataset must get no data.jsonl"
         );
         assert!(!lockfile.objects.contains_key("mdh_data"));
+    }
+
+    /// Spec D8's glue: `process`'s offline manual-dataset scan, the
+    /// `rows_by_slug` map it prefetches, and each loop iteration's
+    /// `rows_by_slug.remove(slug)` must pair every dataset with ITS OWN rows —
+    /// never another dataset's. Two manual datasets, fetched concurrently
+    /// then applied sequentially, with `"vendors"` listed FIRST (collection
+    /// order) while `"gl-codes"` sorts first as a map key (`BTreeMap` key
+    /// order) — the two orders disagree, so a mapping that silently keyed off
+    /// position instead of slug would swap the two datasets' rows and this
+    /// test would catch it (each dataset's row content is distinguishable).
+    /// Also covers `changed`/`conflicts` aggregating correctly across a batch.
+    #[tokio::test]
+    async fn process_pulls_each_manual_datasets_rows_into_its_own_file() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/indexes/list"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "code": "ok", "result": [] })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search_indexes/list"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "code": "ok", "result": [] })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/aggregate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "code": "ok", "result": [{ "n": 1 }] }),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/find"))
+            .and(body_partial_json(serde_json::json!({ "collectionName": "VENDORS" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "ok",
+                "result": [ { "_id": { "$oid": "v1" }, "name": "Acme Corp" } ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/find"))
+            .and(body_partial_json(serde_json::json!({ "collectionName": "GL_CODES" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "ok",
+                "result": [ { "_id": { "$oid": "g1" }, "code": "4000", "label": "COGS" } ]
+            })))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        for (slug, name) in [("vendors", "VENDORS"), ("gl-codes", "GL_CODES")] {
+            let dir = paths.dataset_dir(slug);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(COLLECTION_MANIFEST),
+                format!("{{\n  \"name\": \"{name}\",\n  \"data\": \"manual\"\n}}\n"),
+            )
+            .unwrap();
+        }
+
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        let rossum = crate::api::RossumClient::new(
+            "https://unused.invalid/api/v1".to_string(),
+            "t".to_string(),
+        )
+        .unwrap();
+        let mut lockfile = crate::state::Lockfile::default();
+        let subset: BTreeSet<(String, String)> = [
+            ("mdh".to_string(), "vendors".to_string()),
+            ("mdh".to_string(), "gl-codes".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        // Listing order: "vendors" first, "gl-codes" second — the opposite of
+        // their `BTreeMap` key order (`rows_by_slug` is keyed by slug).
+        let listed = MdhListed::new(
+            DataStorageClient::new(server.uri(), "t".to_string()).unwrap(),
+            vec![
+                Collection { name: "VENDORS".to_string(), extra: Default::default() },
+                Collection { name: "GL_CODES".to_string(), extra: Default::default() },
+            ],
+            true,
+        );
+        let mut ctx = PullCtx {
+            paths: &paths,
+            client: &rossum,
+            lockfile: &mut lockfile,
+            queue_locations: std::collections::BTreeMap::new(),
+            interactive: false,
+        };
+        let (changed, conflicts) = process(&mut ctx, listed, &subset, &progress).await.unwrap();
+
+        assert_eq!(conflicts, 0);
+        assert_eq!(changed, 2, "both manual datasets wrote a file on this first pull");
+        assert_eq!(
+            std::fs::read_to_string(paths.dataset_data("vendors")).unwrap(),
+            "{\"name\":\"Acme Corp\"}\n",
+            "vendors must get its OWN rows, not gl-codes'"
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.dataset_data("gl-codes")).unwrap(),
+            "{\"code\":\"4000\",\"label\":\"COGS\"}\n",
+            "gl-codes must get its OWN rows, not vendors'"
+        );
     }
 
     /// A manual dataset's rows land in canonical form, and the lockfile +
