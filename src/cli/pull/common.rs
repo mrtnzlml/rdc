@@ -117,11 +117,28 @@ pub struct RemoteCatalog {
 /// production (a no-op on a runtime that already cooperates over real
 /// network I/O) and load-bearing for the test suite's watch-mode
 /// timing assertions.
+///
+/// # `prefetch_mdh_indexes` — pass `true` ONLY for a cycle that writes nothing
+///
+/// When `true`, the MDH arm also fetches the index sets of every dataset that
+/// already has a local `indexes.json`, so a steady-state read-only sync moves
+/// its whole MDH read phase off the critical path. Same requests, earlier.
+///
+/// It MUST stay off for a cycle that pushes. `mdh::process` is **stage 3** of
+/// the MDH cycle — the pull-back that runs *after* stages 1 and 2 have pushed
+/// index changes to the env. Seeding it from a listing-time snapshot would
+/// write `indexes.json` from **pre-push** state: an index this very cycle
+/// created would be missing from the snapshot, and the next cycle would create
+/// it again — the period-2 churn this codebase has fought before, guarded by
+/// `sync_mdh_index_create_counts_as_changed_when_materialized`. With the gate
+/// off, `index_sets` stays empty and stage 3 fetches post-push state itself,
+/// so the request count is unchanged there too. Do not "optimise" this on.
 pub async fn list_remote(
     ctx: &mut PullCtx<'_>,
     env_cfg: &crate::config::EnvConfig,
     env: &str,
     token: &str,
+    prefetch_mdh_indexes: bool,
     progress: &Arc<Log>,
 ) -> Result<RemoteCatalog> {
     use futures::stream::{StreamExt, TryStreamExt};
@@ -184,8 +201,8 @@ pub async fn list_remote(
     // The core kinds share one bounded stream against the core API's 10 req/s
     // bucket. MDH talks to a DIFFERENT service with its OWN bucket (spec S5:
     // the two throttle independently on the same token), so it runs as a
-    // sibling rather than competing for a core slot — and, from the task that
-    // adds the index-set prefetch, so the whole MDH phase overlaps core
+    // sibling rather than competing for a core slot — and, when
+    // `prefetch_mdh_indexes` is on, so the whole MDH read phase overlaps core
     // listing instead of following it.
     let core = futures::stream::iter(kinds.iter().copied())
         .map(|kind| {
@@ -296,7 +313,8 @@ pub async fn list_remote(
         .try_collect::<Vec<Listed>>();
 
     let mdh_arm = async {
-        let r = crate::cli::pull::mdh::list(env_cfg, token, progress)
+        let prefetch_for = prefetch_mdh_indexes.then_some(ctx_ref.paths);
+        let r = crate::cli::pull::mdh::list(env_cfg, token, prefetch_for, progress)
             .await
             .with_context(|| format!("listing MDH datasets for env '{env}'"))?;
         progress.event(

@@ -298,7 +298,16 @@ pub(crate) async fn run_cycle(
             queue_locations: std::collections::BTreeMap::new(),
             interactive,
         };
-        crate::cli::pull::common::list_remote(&mut ctx, env_cfg, env, &token, &progress).await?
+        // Prefetch the MDH index sets during listing only on a cycle that
+        // writes nothing. A pushing cycle must let stage 3 (`mdh::process`)
+        // read the env back AFTER stages 1–2 have pushed, or `indexes.json`
+        // would be written from pre-push state and the next cycle would
+        // re-create what this one just created. See `list_remote`'s doc.
+        let read_only = dry_run || no_push;
+        crate::cli::pull::common::list_remote(
+            &mut ctx, env_cfg, env, &token, read_only, &progress,
+        )
+        .await?
     };
 
     // Surface queue-slug collisions: two queue dirs sharing a slug across

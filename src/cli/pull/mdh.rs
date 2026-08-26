@@ -386,16 +386,25 @@ pub(crate) async fn plan_mdh_index_edits(
         .map(|(slug, c)| (slug.to_string(), c.name.clone()))
         .collect();
 
-    // One batched fetch, shared with the real pull's sub-phase B so the
-    // preview can never schedule differently from the run it previews.
-    let sets = fetch_index_sets(&listed.client, &wanted, progress).await?;
+    // This forecast runs only under `--dry-run`, which is read-only, so the
+    // listing prefetch was on and covered exactly this scope: `missing` is
+    // empty in the steady state and non-empty only if a dataset's local file
+    // appeared between listing and now.
+    let missing: Vec<(String, String)> = wanted
+        .iter()
+        .filter(|(slug, _)| !listed.index_sets.contains_key(slug))
+        .cloned()
+        .collect();
+    let fetched = fetch_index_sets(&listed.client, &missing, progress).await?;
 
     // Sequential compare pass, in dataset listing order.
     for (slug, name) in &wanted {
         let ix_path = paths.dataset_dir(slug).join("indexes.json");
-        let set = sets
+        let set = listed
+            .index_sets
             .get(slug)
-            .expect("fetch_index_sets returns an entry for every requested slug");
+            .or_else(|| fetched.get(slug))
+            .expect("every wanted slug is either prefetched or fetched above");
         let proposed = proposed_index_bytes(set)?;
         let base = lockfile
             .objects
@@ -737,6 +746,20 @@ pub struct MdhListed {
     /// byte-for-byte or a fetch silently targets the wrong collection — so the
     /// walk happens exactly once and everyone reads the result.
     pub slugs: Vec<String>,
+    /// Index sets already fetched at listing time, keyed by dataset slug.
+    ///
+    /// Scoped to datasets that already have a local `indexes.json`, which is
+    /// decidable offline and sits exactly between the two consumers' needs:
+    /// the dry-run forecast wants precisely this set, and a real pull wants
+    /// this set plus any brand-new collection (which `process` fetches as the
+    /// remainder). So neither command's request count changes — they just
+    /// happen earlier, overlapped with core listing.
+    ///
+    /// **Empty on a fresh tree, and empty on any cycle that writes** — the
+    /// prefetch is gated read-only (see `list_remote`'s
+    /// `prefetch_mdh_indexes`). Every consumer must therefore treat this as a
+    /// cache that may be absent and fetch whatever it is missing.
+    pub index_sets: BTreeMap<String, IndexSet>,
     /// Whether MDH is provisioned on this env. `true` when the collection
     /// listing succeeded (even with zero collections); `false` when the
     /// Data Storage endpoint 404s (MDH not enabled on the cluster). A 404
@@ -759,7 +782,7 @@ impl MdhListed {
                 slug
             })
             .collect();
-        Self { client, collections, slugs, available }
+        Self { client, collections, slugs, index_sets: BTreeMap::new(), available }
     }
 
     /// `(dataset_slug, collection)` in listing order.
@@ -773,7 +796,19 @@ impl MdhListed {
 
 /// Phase 1: list MDH collections (or return an empty list if MDH is not
 /// enabled on this cluster — 404 → quiet skip matching the 403 pattern).
-pub async fn list(env_cfg: &EnvConfig, token: &str, progress: &Arc<Log>) -> Result<MdhListed> {
+///
+/// `prefetch_for` is `Some(paths)` only on a cycle that performs **no
+/// writes**, and that gate is load-bearing — see the caller-side doc on
+/// `list_remote`'s `prefetch_mdh_indexes` and the field doc on
+/// [`MdhListed::index_sets`]. With `None` the index sets stay empty and every
+/// consumer fetches its own subset fresh, exactly as before this prefetch
+/// existed.
+pub async fn list(
+    env_cfg: &EnvConfig,
+    token: &str,
+    prefetch_for: Option<&crate::paths::Paths>,
+    progress: &Arc<Log>,
+) -> Result<MdhListed> {
     let base = env_cfg.data_storage_base();
     let client = DataStorageClient::new(base, token.to_string())
         .context("constructing Data Storage client")?;
@@ -789,7 +824,25 @@ pub async fn list(env_cfg: &EnvConfig, token: &str, progress: &Arc<Log>) -> Resu
         Err(e) => return Err(e.context("listing MDH collections")),
     };
 
-    Ok(MdhListed::new(client, collections, available))
+    let mut listed = MdhListed::new(client, collections, available);
+
+    // Prefetch this env's index sets while the core list stream is still
+    // running. Scope: datasets that already have a local `indexes.json`. See
+    // the field doc on `MdhListed::index_sets` for why that predicate, and
+    // why it leaves every command's request count unchanged.
+    //
+    // `None` (a writing cycle) skips the prefetch entirely — NOT an
+    // optimisation to relax; see the gate's rationale on `list_remote`.
+    if let Some(paths) = prefetch_for {
+        let wanted: Vec<(String, String)> = listed
+            .datasets()
+            .filter(|(slug, _)| paths.dataset_dir(slug).join("indexes.json").is_file())
+            .map(|(slug, c)| (slug.to_string(), c.name.clone()))
+            .collect();
+        listed.index_sets = fetch_index_sets(&listed.client, &wanted, progress).await?;
+    }
+
+    Ok(listed)
 }
 
 /// Phase 2: write listed collections + indexes to disk.
@@ -812,6 +865,7 @@ pub async fn process(
         client,
         collections,
         slugs,
+        index_sets,
         available: _,
     } = listed;
 
@@ -898,11 +952,18 @@ pub async fn process(
     if total == 0 {
         return Ok((0, conflicts));
     }
+    // Datasets whose index set listing already prefetched are free; fetch only
+    // the remainder (normally just brand-new collections). On a cycle that
+    // pushes, the prefetch is gated off and `index_sets` is empty — so this
+    // stage-3 pull-back fetches its whole subset fresh, i.e. POST-push state,
+    // which is the only state it may write to `indexes.json`.
     let wanted: Vec<(String, String)> = dataset_dirs
         .iter()
+        .filter(|(slug, _, _)| !index_sets.contains_key(slug))
         .map(|(slug, _, c)| (slug.clone(), c.name.clone()))
         .collect();
-    let by_slug = fetch_index_sets(&client, &wanted, progress).await?;
+    let mut by_slug = index_sets;
+    by_slug.extend(fetch_index_sets(&client, &wanted, progress).await?);
     progress.event(Action::Pull, &format!("mdh_indexes ({total} fetched)"));
 
     // === Sub-phase C: per-collection indexes.json write decision (sequential
@@ -2227,6 +2288,127 @@ mod tests {
                 ("vendors", "vendors"),
             ],
             "datasets() must pair each slug with ITS collection, positionally"
+        );
+    }
+
+    /// Spec D6: on a read-only cycle (`prefetch_for = Some`), listing
+    /// prefetches the index sets of datasets that already have a local
+    /// `indexes.json`, so a steady-state sync's whole MDH read phase overlaps
+    /// core listing. A collection with no local file is NOT prefetched — it is
+    /// a new dataset, and `process` fetches it there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_prefetches_index_sets_for_datasets_with_a_local_file() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // `list` builds its own client from `env_cfg.data_storage_base()`, which
+        // turns `<uri>/api/v1` into `<uri>/svc/data-storage/api` — so the mocks
+        // must sit under that prefix, unlike the tests that hand a client a bare
+        // `server.uri()`.
+        let ds = "/svc/data-storage/api/v1";
+        Mock::given(method("POST"))
+            .and(path(format!("{ds}/collections/list")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "ok",
+                "result": [ { "name": "gl-codes" }, { "name": "vendors" } ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("{ds}/indexes/list")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "code": "ok", "result": [ { "name": "acct" } ] }),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("{ds}/search_indexes/list")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "code": "ok", "result": [] })),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        // Only `gl-codes` has a local snapshot.
+        let dir = paths.dataset_dir("gl-codes");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("indexes.json"), b"{\n  \"regular\": [],\n  \"search\": []\n}\n")
+            .unwrap();
+
+        let env_cfg = crate::config::EnvConfig {
+            api_base: format!("{}/api/v1", server.uri()),
+            org_id: 1,
+        };
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        let listed = list(&env_cfg, "TEST", Some(&paths), &progress)
+            .await
+            .unwrap();
+
+        assert!(listed.available);
+        assert_eq!(listed.slugs, vec!["gl-codes", "vendors"]);
+        assert_eq!(
+            listed.index_sets.keys().collect::<Vec<_>>(),
+            vec!["gl-codes"],
+            "only the dataset with a local indexes.json is prefetched"
+        );
+        assert_eq!(listed.index_sets["gl-codes"].regular.len(), 1);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            3,
+            "1 collections/list + 2 index calls for the one local dataset"
+        );
+    }
+
+    /// The prefetch is gated on the cycle writing nothing: a pushing cycle
+    /// passes `None`, `index_sets` stays empty, and `process` (stage 3, the
+    /// pull-back that runs AFTER the index push) fetches post-push state
+    /// itself. Same local file as the test above — only the gate differs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_skips_the_prefetch_entirely_on_a_writing_cycle() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let ds = "/svc/data-storage/api/v1";
+        Mock::given(method("POST"))
+            .and(path(format!("{ds}/collections/list")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "ok",
+                "result": [ { "name": "gl-codes" } ]
+            })))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        let dir = paths.dataset_dir("gl-codes");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("indexes.json"), b"{\n  \"regular\": [],\n  \"search\": []\n}\n")
+            .unwrap();
+
+        let env_cfg = crate::config::EnvConfig {
+            api_base: format!("{}/api/v1", server.uri()),
+            org_id: 1,
+        };
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        let listed = list(&env_cfg, "TEST", None, &progress).await.unwrap();
+
+        assert!(listed.available);
+        assert_eq!(listed.slugs, vec!["gl-codes"]);
+        assert!(
+            listed.index_sets.is_empty(),
+            "a writing cycle must not seed index sets from pre-push state"
+        );
+        // No index mocks are mounted at all: any prefetch request would 404
+        // and fail the call above. The count pins it to the listing alone.
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "collections/list only — no index calls at listing time"
         );
     }
 }
