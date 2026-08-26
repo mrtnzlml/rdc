@@ -23,6 +23,17 @@ pub async fn push(
     let mut pushed = 0usize;
     let mut skipped = 0usize;
 
+    // Updates fan out (the two-stage shape in [`push_update_batch`]); creates
+    // stay strictly sequential because POST assigns ids that later items
+    // resolve against. The two are NOT partitioned into "all creates, then all
+    // updates": an inbox's refs are resolved against the lockfile AS IT STANDS
+    // when that inbox is prepared, so hoisting a create ahead of an
+    // earlier-sorting update would resolve a ref that used to stay unresolved,
+    // and change what this command sends (`push::hooks` carries an observable
+    // instance of exactly that). So `changes` is still walked in slug order and
+    // each MAXIMAL RUN of consecutive updates is fanned out, with a create
+    // acting as a barrier.
+    let mut batch: Vec<(&String, &std::path::PathBuf)> = Vec::new();
     for (q_slug, inbox_path) in changes {
 
         // Missing lockfile entry → new inbox, POST.
@@ -32,6 +43,22 @@ pub async fn push(
             .and_then(|m| m.get(q_slug.as_str()))
             .is_none()
         {
+            // Close the pending run first: every update sorting BEFORE this
+            // create must be prepared against a lockfile that does not yet
+            // know the id this POST is about to assign.
+            let (batched_pushed, batched_skipped) = push_update_batch(
+                paths,
+                client,
+                lockfile,
+                interactive,
+                &mut batch,
+                progress,
+                env,
+            )
+            .await?;
+            pushed += batched_pushed;
+            skipped += batched_skipped;
+
             let disk_bytes = std::fs::read(inbox_path)
                 .with_context(|| format!("reading {}", inbox_path.display()))?;
             let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
@@ -84,144 +111,781 @@ pub async fn push(
             continue;
         }
 
-        let disk_bytes = std::fs::read(inbox_path)
-            .with_context(|| format!("reading {}", inbox_path.display()))?;
-        let entry = lockfile
-            .objects
-            .get("inboxes")
-            .and_then(|m| m.get(q_slug.as_str()))
-            .unwrap();
-        let Some(base) = &entry.content_hash else {
-            progress.event(Action::Skip, &format!("inbox/{q_slug} (no content_hash)"));
-            skipped += 1;
-            continue;
-        };
-        let base = base.clone();
+        batch.push((q_slug, inbox_path));
+    }
 
-        let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
-            .with_context(|| format!("parsing {}", inbox_path.display()))?;
-        crate::snapshot::refs::resolve_value(&mut payload, lockfile);
-        let payload_inbox: crate::model::Inbox = serde_json::from_value(payload)
-            .with_context(|| format!("deserializing overlay-applied inbox '{q_slug}'"))?;
+    // Flush the trailing run.
+    let (batched_pushed, batched_skipped) = push_update_batch(
+        paths,
+        client,
+        lockfile,
+        interactive,
+        &mut batch,
+        progress,
+        env,
+    )
+    .await?;
+    pushed += batched_pushed;
+    skipped += batched_skipped;
 
-        let id = entry.id;
-        let remote_inbox = client
-            .get_inbox(id, Some(progress.clone()))
-            .await
-            .with_context(|| format!("fetching inbox {id} to verify drift before push"))?;
-        let codec = crate::snapshot::codec::codec("inboxes").unwrap();
-        let remote_art = codec
-            .disk_bytes(
-                &serde_json::to_value(&remote_inbox)
-                    .context("serializing remote inbox for drift check")?,
-            )
-            .context("codec disk_bytes for remote inbox")?;
-        let remote_bytes = remote_art.json;
-        let remote_combined = combined_hash(&remote_bytes, &remote_art.sidecars, lockfile);
-        let mut payload_to_send = payload_inbox;
-        if remote_combined != base {
-            use crate::cli::resolve::{PushDriftOutcome, resolve_push_drift};
-            match resolve_push_drift(interactive, inbox_path, &remote_bytes, env)? {
-                PushDriftOutcome::Patch { payload_override } => {
-                    if let Some(bytes) = payload_override {
-                        let mut ov: serde_json::Value = serde_json::from_slice(&bytes)
-                            .with_context(|| format!("re-deserializing edited inbox '{q_slug}'"))?;
-                        crate::snapshot::refs::resolve_value(&mut ov, lockfile);
-                        payload_to_send = serde_json::from_value(ov)
-                            .with_context(|| format!("re-deserializing edited inbox '{q_slug}'"))?;
+    Ok((pushed, skipped))
+}
+
+/// What one inbox's concurrent stage carries across to its apply stage.
+struct InboxPatched {
+    /// The GET-derived body, not the PATCH response. The PATCH response omits
+    /// fields the GET includes (e.g. `bounce_email_to: null`), and recording
+    /// the PATCH-derived shape makes the next sync's classifier see a spurious
+    /// `RemoteEdit` and re-pull the queue bundle. The re-fetch lives in the
+    /// CONCURRENT stage, next to the PATCH that made it necessary — leaving it
+    /// on the apply path would put a round trip back into the sequential half
+    /// and undo half the win.
+    refetched: crate::model::Inbox,
+}
+
+/// Fan out one maximal run of consecutive inbox UPDATES, then apply the results.
+///
+/// The two-stage shape established by `push::rules`: a concurrent stage that
+/// needs only `&Lockfile`, touches neither the working tree nor the lockfile and
+/// never prompts, then a sequential apply stage in slug order that owns
+/// `&mut Lockfile`, the filesystem and every prompt. `batch` is drained.
+///
+/// Unlike the list-backed drivers there is no whole-kind fetch to hoist: the
+/// drift check is a `GET /inboxes/{id}` per item, and one id per slug by
+/// construction means there is nothing to dedup. An inbox update is therefore
+/// THREE round trips — drift GET, PATCH, re-baseline GET — and all three live
+/// inside the per-item future, where they overlap with their siblings'.
+async fn push_update_batch(
+    paths: &Paths,
+    client: &RossumClient,
+    lockfile: &mut Lockfile,
+    interactive: bool,
+    batch: &mut Vec<(&String, &std::path::PathBuf)>,
+    progress: &Arc<Log>,
+    env: &str,
+) -> Result<(usize, usize)> {
+    use crate::cli::push::concurrent::{Prepared, prepare_all};
+
+    let updates = std::mem::take(batch);
+    if updates.is_empty() {
+        return Ok((0, 0));
+    }
+    let mut pushed = 0usize;
+    let mut skipped = 0usize;
+
+    // The drift GET's body, parked for the sequential stage.
+    //
+    // `Prepared::NeedsPrompt` carries only a slug, but `resolve_push_drift`
+    // needs the very body the drift check compared against — and re-fetching it
+    // on the apply path would add a SECOND `GET /inboxes/{id}` that this
+    // command never used to make. The list-backed drivers hand
+    // `push_one_drifted` their hoisted list for exactly this reason; a
+    // per-item-GET driver has no list, so each future parks its own body here
+    // instead. Only a drifted item ever inserts. The lock is taken around the
+    // insert alone and never held across an `.await`.
+    let drift_bodies: std::sync::Mutex<std::collections::HashMap<String, crate::model::Inbox>> =
+        std::sync::Mutex::new(std::collections::HashMap::new());
+
+    // === Concurrent stage. Needs only `&Lockfile`; touches neither the
+    //     working tree nor the lockfile, and never prompts.
+    let prepared = {
+        let lf: &Lockfile = &*lockfile;
+        let bodies = &drift_bodies;
+        prepare_all(updates.iter().copied(), |(q_slug, inbox_path)| async move {
+            // Read BEFORE the `content_hash` guard, exactly as the old
+            // sequential loop did: an unreadable file is an error even for an
+            // entry that would otherwise be skipped.
+            let disk_bytes = std::fs::read(inbox_path)
+                .with_context(|| format!("reading {}", inbox_path.display()))?;
+            let entry = lf
+                .objects
+                .get("inboxes")
+                .and_then(|m| m.get(q_slug.as_str()))
+                .expect("batched as an update, so the entry exists");
+            let Some(base) = drift_base(entry) else {
+                return Ok(Prepared::Skipped {
+                    slug: q_slug.clone(),
+                    event: format!("inbox/{q_slug} (no content_hash)"),
+                });
+            };
+
+            let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
+                .with_context(|| format!("parsing {}", inbox_path.display()))?;
+            crate::snapshot::refs::resolve_value(&mut payload, lf);
+            let payload_inbox: crate::model::Inbox = serde_json::from_value(payload)
+                .with_context(|| format!("deserializing overlay-applied inbox '{q_slug}'"))?;
+
+            let id = entry.id;
+            // Drift check — one GET per item, overlapped with its siblings'.
+            let remote_inbox = client
+                .get_inbox(id, Some(progress.clone()))
+                .await
+                .with_context(|| format!("fetching inbox {id} to verify drift before push"))?;
+            let remote_art = remote_artifact(&remote_inbox)?;
+            if combined_hash(&remote_art.json, &remote_art.sidecars, lf) != base {
+                // Drift. NOT patched here — the sequential stage owns the prompt.
+                bodies
+                    .lock()
+                    .expect("drift-body cache poisoned")
+                    .insert(q_slug.clone(), remote_inbox);
+                return Ok(Prepared::NeedsPrompt {
+                    slug: q_slug.clone(),
+                });
+            }
+
+            // Strip server-managed fields from `extra` so the PATCH matches the
+            // CREATE contract (`email` is server-assigned).
+            let mut payload_to_send = payload_inbox;
+            strip_patch_extra(&mut payload_to_send.extra, "inboxes", false);
+            let refetched = send_patch(client, id, &payload_to_send, progress).await?;
+            Ok(Prepared::Patched {
+                slug: q_slug.clone(),
+                updated: InboxPatched { refetched },
+            })
+        })
+        .await
+    };
+    let drift_bodies = drift_bodies.into_inner().expect("drift-body cache poisoned");
+
+    // === Sequential apply stage, in the driver's existing slug order. Owns
+    //     `&mut Lockfile`, the filesystem and every prompt. Every completed
+    //     PATCH is recorded even if a sibling failed (spec D10), then the
+    //     first error propagates.
+    let mut first_error: Option<anyhow::Error> = None;
+    for (item, (slug_in, inbox_path)) in prepared.into_iter().zip(updates) {
+        // `prepare_all` returns one result per item IN INPUT ORDER; this zip is
+        // what pairs each result with its own file path, so pin that guarantee
+        // where it is relied upon. A reordering primitive would silently write
+        // one inbox's response over another inbox's file.
+        if let Ok(p) = &item {
+            debug_assert_eq!(p.slug(), slug_in.as_str());
+        }
+        match item {
+            // NOT `?`: by the time the apply stage runs, every clean PATCH in
+            // the batch has already landed server-side. Returning early here
+            // would leave the REMAINING items' completed PATCHes unrecorded —
+            // the exact inconsistency D10 exists to shrink, and worse than the
+            // old sequential loop, which never sent those requests at all.
+            Ok(Prepared::Patched { slug, updated }) => {
+                match write_back(paths, lockfile, &slug, inbox_path, &updated.refetched) {
+                    Ok(()) => {
+                        progress.event(Action::Patch, &format!("inbox/{slug}"));
+                        pushed += 1;
+                    }
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
                     }
                 }
-                PushDriftOutcome::Adopt => {
-                    // Portabilize the adopted remote so concrete env URLs never
-                    // land on disk (the inbox is lockfile-pinned; refs resolve).
-                    let remote_bytes =
-                        crate::cli::pull::common::portabilize_proposed(&remote_bytes, lockfile);
-                    write_atomic(inbox_path, &remote_bytes).with_context(|| {
-                        format!("adopting remote into {}", inbox_path.display())
-                    })?;
-                    lockfile.upsert(
-                        "inboxes",
-                        q_slug,
-                        ObjectEntry {
-                            id,
-                            modified_at: remote_inbox.modified_at().map(|s| s.to_string()),
-                            modified_by: remote_inbox.modified_by().map(|s| s.to_string()),
-                            content_hash: Some(remote_combined),
-                            secrets_hash: None,
-                        },
-                    );
-                    progress.event(
-                        Action::Warn,
-                        &format!("inbox/{q_slug} adopted remote (drift)"),
-                    );
-                    skipped += 1;
-                    continue;
+            }
+            Ok(Prepared::Skipped { event, .. }) => {
+                progress.event(Action::Skip, &event);
+                skipped += 1;
+            }
+            // Deliberate (inherited from `push::rules`): this arm still runs
+            // when an earlier item already failed. Suppressing the prompt once
+            // `first_error` is set would leave a drifted item neither prompted
+            // nor recorded. Also NOT `?`, for the same reason as above.
+            Ok(Prepared::NeedsPrompt { slug }) => {
+                let remote_inbox = drift_bodies
+                    .get(slug.as_str())
+                    .expect("the concurrent stage parks a body before returning NeedsPrompt");
+                match push_one_drifted(
+                    paths,
+                    client,
+                    lockfile,
+                    interactive,
+                    &slug,
+                    inbox_path,
+                    remote_inbox,
+                    progress,
+                    env,
+                )
+                .await
+                {
+                    Ok((p, s)) => {
+                        pushed += p;
+                        skipped += s;
+                    }
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
                 }
-                PushDriftOutcome::Skip => {
-                    progress.event(
-                        Action::Skip,
-                        &format!("inbox/{q_slug} (remote changed; rdc sync first)"),
-                    );
-                    skipped += 1;
-                    continue;
+            }
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e);
                 }
             }
         }
-
-        // Strip server-managed fields from `extra` so the PATCH matches the
-        // CREATE contract (`email` is server-assigned).
-        strip_patch_extra(&mut payload_to_send.extra, "inboxes", false);
-        let patch_result = client
-            .update_inbox(id, &payload_to_send, Some(progress.clone()))
-            .await
-            .with_context(|| format!("PATCH /inboxes/{id}"));
-        // Propagate any PATCH error; the response body itself is discarded in
-        // favor of a fresh GET (see below) for re-baselining.
-        let _patched = patch_result?;
-
-        // Re-baseline from a fresh GET, not the PATCH response. The Rossum
-        // inbox PATCH response OMITS fields the GET response includes (e.g.
-        // `bounce_email_to: null`), and those land in the untyped `extra`
-        // passthrough. Recording the base from the PATCH-derived bytes would
-        // make the recorded shape (key absent) differ from what the next
-        // sync's classifier reads off the GET/list (key present, null) →
-        // a spurious RemoteEdit → a one-cycle re-pull of the queue bundle.
-        // GET-derived bytes match the classifier's input shape exactly, so
-        // the next sync settles to Clean. See BUG2 / push/inboxes.rs.
-        let refetched = client
-            .get_inbox(id, Some(progress.clone()))
-            .await
-            .with_context(|| format!("GET /inboxes/{id} to re-baseline after push"))?;
-
-        let codec = crate::snapshot::codec::codec("inboxes").unwrap();
-        let updated_art = codec
-            .disk_bytes(
-                &serde_json::to_value(&refetched)
-                    .context("serializing re-fetched inbox for disk write")?,
-            )
-            .context("codec disk_bytes for re-fetched inbox")?;
-        // Re-portabilize the server response so concrete env URLs never land on
-        // disk (the inbox is lockfile-pinned, so self + `queues` resolve to rdc://).
-        let updated_bytes =
-            crate::cli::pull::common::portabilize_proposed(&updated_art.json, lockfile);
-        let updated_hash = combined_hash(&updated_bytes, &updated_art.sidecars, lockfile);
-        crate::state::base_cache::write_disk_and_cache(paths, inbox_path, &updated_bytes)
-            .with_context(|| format!("writing post-push canonical form for inbox '{q_slug}'"))?;
-
-        lockfile.upsert(
-            "inboxes",
-            q_slug,
-            ObjectEntry {
-                id: refetched.id,
-                modified_at: refetched.modified_at().map(|s| s.to_string()),
-                modified_by: refetched.modified_by().map(|s| s.to_string()),
-                content_hash: Some(updated_hash),
-                secrets_hash: None,
-            },
-        );
-        progress.event(Action::Patch, &format!("inbox/{q_slug}"));
-        pushed += 1;
+    }
+    if let Some(e) = first_error {
+        return Err(e);
     }
 
     Ok((pushed, skipped))
+}
+
+/// Whether this entry can reach the drift check at all — and, if so, the base
+/// the remote is checked against.
+///
+/// There is no hoisted list here for it to keep in step with, but the other
+/// fanned-out drivers all read their base through this one expression and the
+/// comparability is what makes them diff-able by eye.
+fn drift_base(entry: &ObjectEntry) -> Option<&str> {
+    entry.content_hash.as_deref()
+}
+
+/// The canonical on-disk artifact for a remote inbox, as the drift check, the
+/// drift prompt and the write-back all need it. Lifted verbatim from the old
+/// loop's `codec.disk_bytes(...)` block.
+fn remote_artifact(remote: &crate::model::Inbox) -> Result<crate::snapshot::codec::DiskArtifact> {
+    let codec = crate::snapshot::codec::codec("inboxes").unwrap();
+    codec
+        .disk_bytes(
+            &serde_json::to_value(remote).context("serializing remote inbox for drift check")?,
+        )
+        .context("codec disk_bytes for remote inbox")
+}
+
+/// PATCH one inbox and re-baseline it from a fresh GET.
+///
+/// Shared by the concurrent stage and [`push_one_drifted`] so the two can never
+/// disagree about what an inbox push sends. Lifted verbatim out of the old
+/// update loop's tail, from `let patch_result = ...` down to the `get_inbox`
+/// call. Returns the RE-FETCHED body, which is what the caller records.
+async fn send_patch(
+    client: &RossumClient,
+    id: u64,
+    payload_to_send: &crate::model::Inbox,
+    progress: &Arc<Log>,
+) -> Result<crate::model::Inbox> {
+    let patch_result = client
+        .update_inbox(id, payload_to_send, Some(progress.clone()))
+        .await
+        .with_context(|| format!("PATCH /inboxes/{id}"));
+    // Propagate any PATCH error; the response body itself is discarded in
+    // favor of a fresh GET (see below) for re-baselining.
+    let _patched = patch_result?;
+
+    // Re-baseline from a fresh GET, not the PATCH response. The Rossum
+    // inbox PATCH response OMITS fields the GET response includes (e.g.
+    // `bounce_email_to: null`), and those land in the untyped `extra`
+    // passthrough. Recording the base from the PATCH-derived bytes would
+    // make the recorded shape (key absent) differ from what the next
+    // sync's classifier reads off the GET/list (key present, null) →
+    // a spurious RemoteEdit → a one-cycle re-pull of the queue bundle.
+    // GET-derived bytes match the classifier's input shape exactly, so
+    // the next sync settles to Clean. See BUG2 / push/inboxes.rs.
+    //
+    // It sits HERE, immediately after the PATCH and inside whatever stage
+    // called us, so on the concurrent path it overlaps with the siblings'
+    // round trips instead of serializing on the apply stage.
+    client
+        .get_inbox(id, Some(progress.clone()))
+        .await
+        .with_context(|| format!("GET /inboxes/{id} to re-baseline after push"))
+}
+
+/// Write one re-fetched inbox back: canonical form to disk and the base cache,
+/// plus the lockfile entry.
+///
+/// Lifted verbatim out of the old update loop — the block from
+/// `let codec = ...` down to and including the `lockfile.upsert("inboxes", ...)`
+/// call, with `refetched` taken by reference and the
+/// `progress.event(Action::Patch, ...)` line left behind at the call site so the
+/// caller controls when it fires.
+fn write_back(
+    paths: &Paths,
+    lockfile: &mut Lockfile,
+    q_slug: &str,
+    inbox_path: &std::path::Path,
+    refetched: &crate::model::Inbox,
+) -> Result<()> {
+    let codec = crate::snapshot::codec::codec("inboxes").unwrap();
+    let updated_art = codec
+        .disk_bytes(
+            &serde_json::to_value(refetched)
+                .context("serializing re-fetched inbox for disk write")?,
+        )
+        .context("codec disk_bytes for re-fetched inbox")?;
+    // Re-portabilize the server response so concrete env URLs never land on
+    // disk (the inbox is lockfile-pinned, so self + `queues` resolve to rdc://).
+    let updated_bytes =
+        crate::cli::pull::common::portabilize_proposed(&updated_art.json, lockfile);
+    let updated_hash = combined_hash(&updated_bytes, &updated_art.sidecars, lockfile);
+    crate::state::base_cache::write_disk_and_cache(paths, inbox_path, &updated_bytes)
+        .with_context(|| format!("writing post-push canonical form for inbox '{q_slug}'"))?;
+
+    lockfile.upsert(
+        "inboxes",
+        q_slug,
+        ObjectEntry {
+            id: refetched.id,
+            modified_at: refetched.modified_at().map(|s| s.to_string()),
+            modified_by: refetched.modified_by().map(|s| s.to_string()),
+            content_hash: Some(updated_hash),
+            secrets_hash: None,
+        },
+    );
+    Ok(())
+}
+
+/// Resolve one drifted inbox interactively and, on `Patch`, send it.
+///
+/// This is the old update loop's drift branch, moved verbatim: re-read the
+/// local file, `resolve_value`, `resolve_push_drift`, then either PATCH (via the
+/// same `send_patch` + `write_back`), adopt the remote, or skip. It runs only on
+/// the sequential stage, so `resolve_push_drift`'s prompt can never interleave
+/// with another item's. `remote_inbox` is the body the concurrent stage already
+/// fetched, so this path costs no extra request. Returns `(pushed, skipped)`
+/// deltas.
+#[allow(clippy::too_many_arguments)]
+async fn push_one_drifted(
+    paths: &Paths,
+    client: &RossumClient,
+    lockfile: &mut Lockfile,
+    interactive: bool,
+    q_slug: &str,
+    inbox_path: &std::path::Path,
+    remote_inbox: &crate::model::Inbox,
+    progress: &Arc<Log>,
+    env: &str,
+) -> Result<(usize, usize)> {
+    let entry = lockfile
+        .objects
+        .get("inboxes")
+        .and_then(|m| m.get(q_slug))
+        .expect("only reached for an item that was batched as an update");
+    let id = entry.id;
+
+    let disk_bytes =
+        std::fs::read(inbox_path).with_context(|| format!("reading {}", inbox_path.display()))?;
+    let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
+        .with_context(|| format!("parsing {}", inbox_path.display()))?;
+    crate::snapshot::refs::resolve_value(&mut payload, lockfile);
+    let payload_inbox: crate::model::Inbox = serde_json::from_value(payload)
+        .with_context(|| format!("deserializing overlay-applied inbox '{q_slug}'"))?;
+
+    let remote_art = remote_artifact(remote_inbox)?;
+    let remote_bytes = remote_art.json;
+    let remote_combined = combined_hash(&remote_bytes, &remote_art.sidecars, lockfile);
+    let mut payload_to_send = payload_inbox;
+
+    use crate::cli::resolve::{PushDriftOutcome, resolve_push_drift};
+    match resolve_push_drift(interactive, inbox_path, &remote_bytes, env)? {
+        PushDriftOutcome::Patch { payload_override } => {
+            if let Some(bytes) = payload_override {
+                let mut ov: serde_json::Value = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("re-deserializing edited inbox '{q_slug}'"))?;
+                crate::snapshot::refs::resolve_value(&mut ov, lockfile);
+                payload_to_send = serde_json::from_value(ov)
+                    .with_context(|| format!("re-deserializing edited inbox '{q_slug}'"))?;
+            }
+        }
+        PushDriftOutcome::Adopt => {
+            // Portabilize the adopted remote so concrete env URLs never
+            // land on disk (the inbox is lockfile-pinned; refs resolve).
+            let remote_bytes =
+                crate::cli::pull::common::portabilize_proposed(&remote_bytes, lockfile);
+            write_atomic(inbox_path, &remote_bytes)
+                .with_context(|| format!("adopting remote into {}", inbox_path.display()))?;
+            lockfile.upsert(
+                "inboxes",
+                q_slug,
+                ObjectEntry {
+                    id,
+                    modified_at: remote_inbox.modified_at().map(|s| s.to_string()),
+                    modified_by: remote_inbox.modified_by().map(|s| s.to_string()),
+                    content_hash: Some(remote_combined),
+                    secrets_hash: None,
+                },
+            );
+            progress.event(
+                Action::Warn,
+                &format!("inbox/{q_slug} adopted remote (drift)"),
+            );
+            return Ok((0, 1));
+        }
+        PushDriftOutcome::Skip => {
+            progress.event(
+                Action::Skip,
+                &format!("inbox/{q_slug} (remote changed; rdc sync first)"),
+            );
+            return Ok((0, 1));
+        }
+    }
+
+    // Strip server-managed fields from `extra` so the PATCH matches the
+    // CREATE contract (`email` is server-assigned).
+    strip_patch_extra(&mut payload_to_send.extra, "inboxes", false);
+    let refetched = send_patch(client, id, &payload_to_send, progress).await?;
+
+    write_back(paths, lockfile, q_slug, inbox_path, &refetched)?;
+    progress.event(Action::Patch, &format!("inbox/{q_slug}"));
+    Ok((1, 0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::codec::combined_hash;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Seed `n` inboxes that are UPDATES: local file, lockfile entry and a
+    /// recorded base computed from the remote body the server will hand back.
+    /// Inboxes are keyed by their owning queue's slug, exactly as the
+    /// classifier keys them.
+    fn seed_inboxes(
+        tmp: &tempfile::TempDir,
+        api: &str,
+        slugs: &[&str],
+    ) -> (
+        Paths,
+        Lockfile,
+        BTreeMap<String, std::path::PathBuf>,
+        Vec<serde_json::Value>,
+    ) {
+        let paths = Paths::for_env(tmp.path(), "dev");
+        let mut lockfile = Lockfile {
+            api_base: api.to_string(),
+            ..Lockfile::default()
+        };
+        let mut changes = BTreeMap::new();
+        let mut remotes = Vec::new();
+        for (i, slug) in slugs.iter().enumerate() {
+            let id = 500 + i as u64;
+            let queue_dir = paths.queue_dir("w", slug);
+            std::fs::create_dir_all(&queue_dir).unwrap();
+            let inbox_path = queue_dir.join("inbox.json");
+            let local = serde_json::json!({
+                "name": slug,
+                "url": format!("rdc://inboxes/{slug}"),
+                "queues": []
+            });
+            std::fs::write(&inbox_path, serde_json::to_vec_pretty(&local).unwrap()).unwrap();
+            let remote = serde_json::json!({
+                "id": id,
+                "url": format!("{api}/inboxes/{id}"),
+                "name": slug,
+                "email": format!("{slug}@example.invalid"),
+                "queues": []
+            });
+            // Register the id BEFORE hashing so the self-url portabilizes.
+            lockfile.upsert(
+                "inboxes",
+                slug,
+                ObjectEntry {
+                    id,
+                    modified_at: None,
+                    modified_by: None,
+                    content_hash: None,
+                    secrets_hash: None,
+                },
+            );
+            let codec = crate::snapshot::codec::codec("inboxes").unwrap();
+            let art = codec.disk_bytes(&remote).unwrap();
+            let base = combined_hash(&art.json, &art.sidecars, &lockfile);
+            lockfile.upsert(
+                "inboxes",
+                slug,
+                ObjectEntry {
+                    id,
+                    modified_at: None,
+                    modified_by: None,
+                    content_hash: Some(base),
+                    secrets_hash: None,
+                },
+            );
+            changes.insert(slug.to_string(), inbox_path);
+            remotes.push(remote);
+        }
+        (paths, lockfile, changes, remotes)
+    }
+
+    /// Write a local inbox with NO lockfile entry, so the driver treats it as a
+    /// CREATE, and register it in `changes`.
+    fn seed_create(
+        paths: &Paths,
+        changes: &mut BTreeMap<String, std::path::PathBuf>,
+        slug: &str,
+    ) {
+        let queue_dir = paths.queue_dir("w", slug);
+        std::fs::create_dir_all(&queue_dir).unwrap();
+        let inbox_path = queue_dir.join("inbox.json");
+        let body = serde_json::json!({
+            "name": slug,
+            "url": format!("rdc://inboxes/{slug}"),
+            "queues": []
+        });
+        std::fs::write(&inbox_path, serde_json::to_vec_pretty(&body).unwrap()).unwrap();
+        changes.insert(slug.to_string(), inbox_path);
+    }
+
+    async fn mount_get_and_patch(
+        server: &MockServer,
+        id: u64,
+        get_body: serde_json::Value,
+        patch_body: serde_json::Value,
+        delay: std::time::Duration,
+    ) {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/inboxes/{id}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(get_body)
+                    .set_delay(delay),
+            )
+            .mount(server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/api/v1/inboxes/{id}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(patch_body)
+                    .set_delay(delay),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// Spec D9: an inbox update is THREE round trips — the per-item drift GET,
+    /// the PATCH, and the post-PATCH re-baseline GET. Four inboxes at 150ms
+    /// per call cost ~1.8s in series; fanned out they cost roughly one slug's
+    /// worth. The re-baseline GET only overlaps if it moved into the
+    /// concurrent stage with its PATCH.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn push_inboxes_overlaps_the_drift_get_patch_and_rebaseline_get() {
+        let server = MockServer::start().await;
+        let api = format!("{}/api/v1", server.uri());
+        let tmp = tempfile::tempdir().unwrap();
+        let (paths, mut lockfile, changes, remotes) =
+            seed_inboxes(&tmp, &api, &["q-a", "q-b", "q-c", "q-d"]);
+        for (i, remote) in remotes.iter().enumerate() {
+            mount_get_and_patch(
+                &server,
+                500 + i as u64,
+                remote.clone(),
+                remote.clone(),
+                std::time::Duration::from_millis(150),
+            )
+            .await;
+        }
+
+        let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        let start = std::time::Instant::now();
+        let (pushed, skipped) =
+            push(&paths, &client, &mut lockfile, false, &changes, &progress, "dev")
+                .await
+                .expect("push should succeed");
+        let elapsed = start.elapsed();
+
+        assert_eq!((pushed, skipped), (4, 0));
+        assert!(
+            elapsed < std::time::Duration::from_millis(1200),
+            "the four GET+PATCH+GET triples must overlap; sequential would be \
+             >= 1.8s, took {elapsed:?}",
+        );
+    }
+
+    /// The post-PATCH re-baseline must record the GET-derived body, never the
+    /// PATCH response. The Rossum inbox PATCH response OMITS fields the GET
+    /// includes (`bounce_email_to: null` here); recording the PATCH-derived
+    /// shape makes the next sync's classifier see a spurious `RemoteEdit` and
+    /// re-pull the queue bundle. Moving the re-fetch into the concurrent stage
+    /// must not change which body wins.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn push_inboxes_records_the_refetched_body_not_the_patch_response() {
+        let server = MockServer::start().await;
+        let api = format!("{}/api/v1", server.uri());
+        let tmp = tempfile::tempdir().unwrap();
+        let (paths, mut lockfile, changes, remotes) = seed_inboxes(&tmp, &api, &["q-a"]);
+
+        // The drift GET hands back the recorded base, so the item is clean.
+        Mock::given(method("GET"))
+            .and(path("/api/v1/inboxes/500"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(remotes[0].clone()))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        // The PATCH response omits `bounce_email_to` entirely.
+        let mut patch_body = remotes[0].clone();
+        patch_body["name"] = serde_json::json!("renamed");
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/inboxes/500"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(patch_body))
+            .mount(&server)
+            .await;
+        // The re-baseline GET includes it, as the real API's GET does.
+        let mut refetched = remotes[0].clone();
+        refetched["name"] = serde_json::json!("renamed");
+        refetched["bounce_email_to"] = serde_json::Value::Null;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/inboxes/500"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(refetched.clone()))
+            .mount(&server)
+            .await;
+
+        let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        let (pushed, _) =
+            push(&paths, &client, &mut lockfile, false, &changes, &progress, "dev")
+                .await
+                .expect("push should succeed");
+        assert_eq!(pushed, 1);
+
+        let on_disk: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(paths.queue_dir("w", "q-a").join("inbox.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            on_disk.get("bounce_email_to").is_some(),
+            "the GET-derived body must be what lands on disk, got {on_disk}"
+        );
+
+        let codec = crate::snapshot::codec::codec("inboxes").unwrap();
+        let art = codec.disk_bytes(&refetched).unwrap();
+        let expected = combined_hash(
+            &crate::cli::pull::common::portabilize_proposed(&art.json, &lockfile),
+            &art.sidecars,
+            &lockfile,
+        );
+        assert_eq!(
+            lockfile.objects["inboxes"]["q-a"].content_hash.as_deref(),
+            Some(expected.as_str()),
+            "the recorded base must be the GET-derived one"
+        );
+    }
+
+    /// Ordering: `changes` is walked in slug order with creates acting as
+    /// barriers, NOT partitioned into "all creates, then all updates". `q-a`
+    /// (an update) sorts before `q-b` (a create), so its PATCH must go out
+    /// BEFORE the POST. `q-m` sorts AFTER the create, so it lands in the
+    /// TRAILING run: drop the unconditional flush after the loop and its PATCH
+    /// vanishes with no request and no error at all.
+    ///
+    /// Both runs hold exactly one item, so the whole stream stays deterministic
+    /// even though each run is fanned out — and it shows the re-baseline GET
+    /// riding along with its own PATCH.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn push_inboxes_keeps_slug_order_across_a_create_barrier() {
+        let server = MockServer::start().await;
+        let api = format!("{}/api/v1", server.uri());
+        let tmp = tempfile::tempdir().unwrap();
+        let (paths, mut lockfile, mut changes, remotes) = seed_inboxes(&tmp, &api, &["q-a", "q-m"]);
+        seed_create(&paths, &mut changes, "q-b");
+        for (i, remote) in remotes.iter().enumerate() {
+            mount_get_and_patch(
+                &server,
+                500 + i as u64,
+                remote.clone(),
+                remote.clone(),
+                std::time::Duration::ZERO,
+            )
+            .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/api/v1/inboxes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 599,
+                "url": format!("{api}/inboxes/599"),
+                "name": "q-b",
+                "email": "q-b@example.invalid",
+                "queues": []
+            })))
+            .mount(&server)
+            .await;
+
+        let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        let (pushed, skipped) =
+            push(&paths, &client, &mut lockfile, false, &changes, &progress, "dev")
+                .await
+                .expect("push should succeed");
+        assert_eq!((pushed, skipped), (3, 0));
+
+        let seq: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .collect();
+        assert_eq!(
+            seq,
+            vec![
+                "GET /api/v1/inboxes/500".to_string(),
+                "PATCH /api/v1/inboxes/500".to_string(),
+                "GET /api/v1/inboxes/500".to_string(),
+                "POST /api/v1/inboxes".to_string(),
+                "GET /api/v1/inboxes/501".to_string(),
+                "PATCH /api/v1/inboxes/501".to_string(),
+                "GET /api/v1/inboxes/501".to_string(),
+            ],
+            "the update sorting before the create must be sent before the POST, \
+             and the one sorting after it must still be sent",
+        );
+    }
+
+    /// Spec D9: a drifted item is never PATCHed on the concurrent path, and the
+    /// sequential drift pass reuses the body the concurrent stage already
+    /// fetched — so a drifted inbox still costs exactly ONE `GET /inboxes/{id}`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn push_inboxes_never_patches_a_drifted_item_concurrently() {
+        let server = MockServer::start().await;
+        let api = format!("{}/api/v1", server.uri());
+        let tmp = tempfile::tempdir().unwrap();
+        let (paths, mut lockfile, changes, remotes) =
+            seed_inboxes(&tmp, &api, &["q-a", "q-b", "q-c"]);
+        for (i, remote) in remotes.iter().enumerate() {
+            let id = 500 + i as u64;
+            let get_body = if i == 1 {
+                let mut drifted = remote.clone();
+                drifted["name"] = serde_json::json!("changed remotely");
+                drifted
+            } else {
+                remote.clone()
+            };
+            mount_get_and_patch(
+                &server,
+                id,
+                get_body,
+                remote.clone(),
+                std::time::Duration::ZERO,
+            )
+            .await;
+        }
+
+        let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        let (pushed, skipped) =
+            push(&paths, &client, &mut lockfile, false, &changes, &progress, "dev")
+                .await
+                .expect("push should succeed");
+        assert_eq!((pushed, skipped), (2, 1), "the drifted inbox is skipped");
+
+        let seq: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .collect();
+        assert!(
+            !seq.contains(&"PATCH /api/v1/inboxes/501".to_string()),
+            "the drifted inbox must never be PATCHed, saw {seq:?}"
+        );
+        assert_eq!(
+            seq.iter().filter(|r| *r == "GET /api/v1/inboxes/501").count(),
+            1,
+            "the drift prompt must reuse the body the concurrent stage fetched, \
+             not re-fetch it: {seq:?}"
+        );
+    }
 }
