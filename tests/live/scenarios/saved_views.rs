@@ -36,7 +36,11 @@ async fn live_saved_views_round_trip() {
     // deliberately omitted here.
     let shared_name = run_id.prefix("shared-view");
     let private_name = run_id.prefix("private-view");
-    let query = serde_json::json!({ "$and": [] });
+    // `{"$and": []}` is NOT a valid "match everything" query -- the server
+    // rejects an empty `$and` with 400 `{"query":{"$and":["This list may not
+    // be empty."]}}` (verified live 2026-08-27). Use a real, non-empty
+    // condition instead.
+    let query = serde_json::json!({ "$and": [ { "status": { "$in": ["to_review"] } } ] });
 
     let (shared_id, _) = client
         .create(
