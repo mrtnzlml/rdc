@@ -46,10 +46,32 @@ Project-specific instructions for working in this repo.
   because a formula returning a field hands back a proxy whose `.value` is the
   datapoint's raw string. Its self-tests ship on purpose: `pytest -q` with
   nothing collected exits 5 and turns the pipeline's test job red.
-- The **committed default must stay a pinned tag** — keep `RDC_VERSION` set to
-  the newest release tag, and bump it whenever a new release ships. The deploy
-  job runs `rdc sync --allow-deletes --yes` unattended, so a floating default
-  would let a new rdc change what a destructive sync does with nobody watching.
+- The **committed default must stay a pinned tag** — `RDC_VERSION` names the
+  newest release tag. The deploy job runs `rdc sync --allow-deletes --yes`
+  unattended, so a floating default would let a new rdc change what a
+  destructive sync does with nobody watching. **You no longer bump this by
+  hand**: `.github/workflows/weekly-release.yaml` rewrites it in the same commit
+  as `Cargo.toml`, and `committed_template_pins_this_crates_version`
+  (`src/cli/gitlab_ci.rs`) fails the build if the two ever drift.
+- Because a script rewrites that line, the **full version literal must appear
+  exactly once** in `templates/gitlab-ci.yml` — on the `RDC_VERSION` line, at a
+  two-space indent. Everything else says `<version>`, `vX.Y.Z` or `vX.Y`.
+  `the_version_pin_is_the_only_line_a_bumper_could_match` enforces both halves.
+  Note `pre-0.7` in the `RDC_ASSET_SUFFIX` comment is a *historical* statement
+  about releases that already shipped and must never be bumped; it survives
+  because it is not the full literal.
+- Releases are cut by **`.github/workflows/weekly-release.yaml`** (Monday 06:17
+  UTC, plus `workflow_dispatch`), not by hand. It releases only when a commit
+  since the last tag touched `src/`, `templates/`, `desktop/`, `Cargo.toml` or
+  `Cargo.lock`; the level is derived from commit types (any `feat`, any
+  `type!:`, or `BREAKING CHANGE:` → minor, else patch), which is what keeps the
+  template's documented `vX.Y` series pin — *"picks up fixes, never a new
+  feature"* — honest. The decision and the bump are plain `sh` scripts in
+  `.github/scripts/`, unit-tested by `tests/release_plan.rs` and
+  `tests/bump_version.rs`. It calls `release.yaml` through `workflow_call`
+  rather than pushing a tag, because a tag pushed with the default
+  `GITHUB_TOKEN` does not start `on: push: tags` workflows. A manual
+  `git push origin vX.Y.Z` still works unchanged.
 - The install script *also* accepts `latest` (newest release) and a series
   prefix like `v0.6` (newest patch in that line), resolved through
   `api.github.com`. Those are **deliberate opt-ins for our own CI** — don't
