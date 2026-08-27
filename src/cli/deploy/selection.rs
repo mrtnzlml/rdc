@@ -28,6 +28,7 @@ pub(crate) const DEPLOYABLE_KINDS: &[&str] = &[
     "hooks",
     "rules",
     "labels",
+    "saved_views",
     "engines",
     "engine_fields",
     "mdh",
@@ -216,7 +217,7 @@ pub(crate) fn list_slugs(paths: &Paths, kind: &str) -> Result<Vec<String>> {
         "workspaces" => list_workspace_slugs(paths),
         "schemas" | "queues" | "inboxes" => list_queue_nested(paths, kind),
         "email_templates" => list_email_template_keys(paths),
-        "hooks" | "rules" | "labels" => list_flat_kind(paths, kind),
+        "hooks" | "rules" | "labels" | "saved_views" => list_flat_kind(paths, kind),
         "engines" => list_engine_slugs(paths),
         "engine_fields" => list_engine_field_slugs(paths),
         "mdh" => list_mdh_slugs(paths),
@@ -359,6 +360,9 @@ fn list_flat_kind(paths: &Paths, kind: &str) -> Result<Vec<String>> {
         "hooks" => paths.hooks_dir(),
         "rules" => paths.rules_dir(),
         "labels" => paths.labels_dir(),
+        // The kind string is underscored while the directory is hyphenated, so
+        // the dir comes from `Paths`, never from `kind` itself.
+        "saved_views" => paths.saved_views_dir(),
         _ => return Ok(Vec::new()),
     };
     if !dir.exists() {
@@ -704,6 +708,29 @@ mod selection_tests {
     #[test]
     fn mdh_is_an_accepted_only_kind() {
         assert!(DEPLOYABLE_KINDS.contains(&"mdh"));
+    }
+
+    /// A kind in `DEPLOYABLE_KINDS` that `list_slugs` cannot enumerate is a
+    /// selector the grammar accepts but that can only ever report "matched 0
+    /// objects". The kind string is underscored, the directory hyphenated.
+    #[test]
+    fn list_slugs_lists_saved_views_from_the_hyphenated_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        std::fs::create_dir_all(paths.saved_views_dir()).unwrap();
+        for slug in ["awaiting-approval", "high-value"] {
+            std::fs::write(
+                paths.saved_views_dir().join(format!("{slug}.json")),
+                b"{}",
+            )
+            .unwrap();
+        }
+
+        assert!(DEPLOYABLE_KINDS.contains(&"saved_views"));
+        assert_eq!(
+            list_slugs(&paths, "saved_views").unwrap(),
+            vec!["awaiting-approval".to_string(), "high-value".to_string()]
+        );
     }
 }
 

@@ -21,6 +21,7 @@ use crate::mapping::{GenericMapping, Mapping};
 use crate::overlay::{Overlay, apply_overrides};
 use crate::snapshot::refs::{RDC_SCHEME, walk_strings_mut};
 use anyhow::{Context, Result};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -256,6 +257,12 @@ pub(crate) fn classify(rel: &Path) -> Option<(&'static str, String)> {
         Some("labels") if comps.len() == 2 => leaf
             .strip_suffix(".json")
             .map(|s| ("labels", s.to_string())),
+        // The directory is hyphenated (`saved-views/`) while the kind string
+        // is underscored (`saved_views`), matching the lockfile/mapping/overlay
+        // key convention.
+        Some("saved-views") if comps.len() == 2 => leaf
+            .strip_suffix(".json")
+            .map(|s| ("saved_views", s.to_string())),
         Some("rules") if comps.len() == 2 => {
             leaf.strip_suffix(".json").map(|s| ("rules", s.to_string()))
         }
@@ -480,6 +487,170 @@ pub(crate) fn format_dangling_overlay_error(
     )
 }
 
+/// Why a saved view's reference cannot cross into the target env.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SavedViewRefReason {
+    /// A raw API URL that survived portabilization — it names a kind rdc does
+    /// not snapshot (users are the common case), so there is nothing to remap
+    /// it to. The server validates refs inside `query` as hyperlinks, so
+    /// promoting it would 400.
+    NonPortable,
+    /// A well-formed `rdc://<kind>/<slug>` naming an object the target snapshot
+    /// does not contain.
+    Unresolvable,
+}
+
+/// One reference in a saved view that blocks promotion.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SavedViewRefProblem {
+    pub slug: String,
+    /// A JSON path into the view body, e.g. `queues_filter[0]` or
+    /// `query.$and[1].modifier.$in[0]`.
+    pub location: String,
+    pub reference: String,
+    pub reason: SavedViewRefReason,
+}
+
+/// Walk every string leaf of `value`, tracking a JSON path.
+///
+/// `walk_strings_mut` in `snapshot::refs` deliberately carries no path (it is a
+/// blind rewriter), and the error messages here are only useful if they can say
+/// WHERE the bad ref is — so this is a separate, path-aware walk. Object keys
+/// are not visited, which is exactly why `field.<schema_id>` keys are out of
+/// scope.
+fn walk_strings_with_path(value: &Value, path: &str, f: &mut dyn FnMut(&str, &str)) {
+    match value {
+        Value::String(s) => f(path, s),
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                walk_strings_with_path(item, &format!("{path}[{i}]"), f);
+            }
+        }
+        Value::Object(map) => {
+            for (k, v) in map {
+                let child = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                };
+                walk_strings_with_path(v, &child, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Validate a migrated saved view's references against what the target snapshot
+/// actually contains.
+///
+/// `known` is the set of `(kind, slug)` pairs the migration produced, derived by
+/// running [`classify`] over the enumerated target files.
+///
+/// Saved views are checked strictly rather than deferred. `resolve_value_deferring`
+/// would drop a top-level field still holding `rdc://` refs and PATCH it later,
+/// which for this kind is unsafe twice over: an empty `queues_filter` makes a
+/// shared view visible to the WHOLE organization, and `query` is required on
+/// POST so deferring it fails the create.
+///
+/// Only **deployable content** is checked — the same scope
+/// [`strip_source_host_env_refs`] uses, and derived the same way: the top-level
+/// keys `cross_env_body` keeps. The env fields it strips carry raw API URLs by
+/// design, and walking them flagged every promoted view: `organization` is a
+/// plain `…/api/v1/organizations/<id>` URL that [`reconcile_target_identity`]
+/// sets from the TARGET's `rdc.toml` (`is_portable_kind` deliberately never
+/// portabilizes it), and a matched target's `url` comes back from the target
+/// file. Both are correct values, not refs that "cannot cross". Deriving the
+/// set from the codec also means a ref-bearing field Rossum adds later is
+/// covered automatically, while a new env field is excluded automatically.
+pub(crate) fn check_saved_view_refs(
+    slug: &str,
+    value: &Value,
+    known: &BTreeSet<(String, String)>,
+) -> Vec<SavedViewRefProblem> {
+    let mut out = Vec::new();
+    let Some(obj) = value.as_object() else {
+        return out;
+    };
+    let deployable: BTreeSet<String> = match crate::snapshot::codec::codec("saved_views") {
+        Some(codec) => {
+            // Probe on a clone so `value` is untouched.
+            let mut probe = value.clone();
+            codec.cross_env_body(&mut probe);
+            probe
+                .as_object()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default()
+        }
+        // The kind is registered at compile time, so this is unreachable in
+        // practice. Fall back to the two fields that actually carry refs rather
+        // than silently checking nothing.
+        None => ["queues_filter", "query"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+    };
+    for (key, sub) in obj {
+        if !deployable.contains(key) {
+            continue;
+        }
+        walk_strings_with_path(sub, key, &mut |location, s| {
+            if let Some((kind, target)) = crate::snapshot::refs::parse_rdc_ref(s) {
+                if !known.contains(&(kind.to_string(), target.to_string())) {
+                    out.push(SavedViewRefProblem {
+                        slug: slug.to_string(),
+                        location: location.to_string(),
+                        reference: s.to_string(),
+                        reason: SavedViewRefReason::Unresolvable,
+                    });
+                }
+            } else if s.contains("/api/v1/") && s.starts_with("http") {
+                out.push(SavedViewRefProblem {
+                    slug: slug.to_string(),
+                    location: location.to_string(),
+                    reference: s.to_string(),
+                    reason: SavedViewRefReason::NonPortable,
+                });
+            }
+        });
+    }
+    out.sort_by(|a, b| a.location.cmp(&b.location));
+    out
+}
+
+/// Build the hard-error message for [`check_saved_view_refs`] offenders. Names
+/// each view, the JSON path inside it and the offending ref, then says what the
+/// two ways out are.
+///
+/// The whole listing lives in the returned error rather than in `eprintln!`s
+/// beside it, because [`run_at`] is also the desktop app's promote seam: an
+/// error written straight to stderr never reaches a GUI, which would then show
+/// a count with nothing to act on.
+pub(crate) fn format_saved_view_ref_error(problems: &[SavedViewRefProblem], tgt: &str) -> String {
+    let mut body = String::new();
+    for p in problems {
+        let why = match p.reason {
+            SavedViewRefReason::NonPortable => {
+                "not a portable reference — a raw API URL rdc cannot remap \
+                 (a user ref, or a foreign host)"
+            }
+            SavedViewRefReason::Unresolvable => "no such object in the target snapshot",
+        };
+        body.push_str(&format!(
+            "  - saved-views/{}: {} → {} ({why})\n",
+            p.slug, p.location, p.reference
+        ));
+    }
+    format!(
+        "{} saved-view reference(s) cannot cross into '{tgt}':\n\
+         {body}\
+         Fix the source view, or override `query` / `queues_filter` for this env in \
+         envs/{tgt}/overlay.toml. rdc refuses rather than dropping the clause, because an empty \
+         queues_filter would make a shared view visible to the whole organization and a \
+         dropped query filter would silently change what the view shows.",
+        problems.len()
+    )
+}
+
 fn classify_workspace(comps: &[String]) -> Option<(&'static str, String)> {
     let ws = comps.get(1)?;
     let leaf = comps.last()?;
@@ -542,6 +713,7 @@ fn overlay_slug<'a>(
         "hooks" => overlay.hook(slug),
         "rules" => overlay.rule(slug),
         "labels" => overlay.label(slug),
+        "saved_views" => overlay.saved_view(slug),
         "schemas" => overlay.schema(slug),
         "queues" => overlay.queue(slug),
         "inboxes" => overlay.inbox(slug),
@@ -1987,6 +2159,7 @@ const MANAGED_DIRS: &[&str] = &[
     "workspaces",
     "rules",
     "labels",
+    "saved-views",
     "engines",
     "workflows",
     "mdh",
@@ -2466,6 +2639,10 @@ pub fn run_at(
     let mut id_hits: Vec<(String, u64, u64)> = Vec::new();
     let mut carried_prefixes: Vec<(String, String)> = Vec::new();
     let mut missing_schema_ids: Vec<String> = Vec::new();
+    // `(target slug, target-relative path)` for every saved view this run
+    // actually promoted — collected here, post-`--only`, post-skip, so the
+    // ref check below covers exactly what was written and nothing else.
+    let mut promoted_saved_views: Vec<(String, PathBuf)> = Vec::new();
 
     for rel in &files {
         // Un-creatable duplicate unique-typed email templates (see above).
@@ -2586,6 +2763,9 @@ pub fn run_at(
                 ),
             );
         }
+        if let Some(("saved_views", slug)) = classify(&dst_rel) {
+            promoted_saved_views.push((slug, dst_rel.clone()));
+        }
         record_object_status(&mut obj_status, &dst_rel, outcome);
     }
 
@@ -2668,6 +2848,59 @@ pub fn run_at(
         }
     }
 
+    // Saved views resolve strictly — see `check_saved_view_refs`.
+    //
+    // Scoped to the views this run PROMOTED, never to every saved view the
+    // target tree holds. A target-native view is allowed to carry a raw user
+    // URL in its `query` (it is valid in its own env, and push says so), so
+    // checking the whole tree turned one such view into a hard error on every
+    // migrate — including runs whose source has no saved views at all.
+    //
+    // `known` IS built from the whole target tree as it stands right now
+    // (post-write, and — for `--mirror` — post-prune): the overlay escape hatch
+    // may legitimately point `query`/`queues_filter` at a target-only object
+    // this migration never touches, and only a real read of the target tree
+    // sees that. Enumerated lazily, so a project with no saved views pays
+    // nothing for a second walk of its target tree.
+    if !promoted_saved_views.is_empty() {
+        if dry_run {
+            // Nothing was written, so the file at each target path is either
+            // absent (a new view) or still the target's OWN pre-run content —
+            // whose `query` is not the one being promoted. Validating that
+            // would forecast the wrong thing in both directions, so say so
+            // instead of guessing.
+            log.event(
+                crate::log::Action::Info,
+                &format!(
+                    "{} saved view(s) not ref-validated under --dry-run (the promoted body is \
+                     never written to disk); the real run checks them",
+                    promoted_saved_views.len()
+                ),
+            );
+        } else {
+            let known: BTreeSet<(String, String)> = enumerate_files(&tgt_root, tgt)?
+                .iter()
+                .filter_map(|rel| classify(rel).map(|(k, s)| (k.to_string(), s)))
+                .collect();
+            let mut ref_problems: Vec<SavedViewRefProblem> = Vec::new();
+            for (slug, rel) in &promoted_saved_views {
+                // An overlay that replaces `query` for this env is the
+                // documented escape hatch, and the overlay was applied before
+                // the file was written, so reading it back covers that case for
+                // free.
+                let path = tgt_root.join(rel);
+                let bytes =
+                    std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+                let v: Value = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parsing JSON {}", path.display()))?;
+                ref_problems.extend(check_saved_view_refs(slug, &v, &known));
+            }
+            if !ref_problems.is_empty() {
+                anyhow::bail!(format_saved_view_ref_error(&ref_problems, tgt));
+            }
+        }
+    }
+
     let verb = if dry_run { "would migrate" } else { "migrated" };
     log.event(
         crate::log::Action::Done,
@@ -2727,6 +2960,7 @@ pub fn remap_relative(rel: &Path, mapping: &Mapping) -> PathBuf {
     match comps[0].as_str() {
         "hooks" if comps.len() == 2 => remap_flat_leaf(&comps, "hooks", mapping),
         "labels" if comps.len() == 2 => remap_flat_leaf(&comps, "labels", mapping),
+        "saved-views" if comps.len() == 2 => remap_flat_leaf(&comps, "saved_views", mapping),
         "rules" if comps.len() == 2 => remap_flat_leaf(&comps, "rules", mapping),
         "engines" => remap_engine(&comps, mapping),
         "workspaces" => remap_workspace(&comps, mapping),
@@ -5053,6 +5287,241 @@ mod tests {
             out["content"][0]["score_threshold"],
             serde_json::json!(0.9),
             "default must preserve the TARGET's tuned threshold"
+        );
+    }
+
+    fn known_pairs(pairs: &[(&str, &str)]) -> BTreeSet<(String, String)> {
+        pairs.iter().map(|(k, s)| (k.to_string(), s.to_string())).collect()
+    }
+
+    #[test]
+    fn saved_view_with_only_resolvable_refs_is_clean() {
+        let v = serde_json::json!({
+            "name": "Awaiting approval",
+            "shared": true,
+            "queues_filter": ["rdc://queues/invoices"],
+            "query": { "$and": [ { "queue": { "$in": ["rdc://queues/invoices"] } } ] }
+        });
+        let known = known_pairs(&[("queues", "invoices")]);
+        assert!(check_saved_view_refs("awaiting-approval", &v, &known).is_empty());
+    }
+
+    /// A user ref survives portabilization as a raw URL because users are not a
+    /// snapshotted kind. Promoting it would 400 -- the server validates refs
+    /// inside `query` as hyperlinks -- so migrate refuses instead.
+    #[test]
+    fn saved_view_with_a_non_portable_user_ref_is_refused() {
+        let v = serde_json::json!({
+            "name": "Mine",
+            "shared": true,
+            "queues_filter": [],
+            "query": { "$and": [
+                { "modifier": { "$in": ["https://acme.rossum.app/api/v1/users/7"] } }
+            ] }
+        });
+        let problems = check_saved_view_refs("mine", &v, &BTreeSet::new());
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].reason, SavedViewRefReason::NonPortable);
+        assert!(problems[0].reference.contains("/users/7"));
+        assert!(
+            problems[0].location.contains("query"),
+            "the location must point into query, got {}",
+            problems[0].location
+        );
+    }
+
+    /// An unresolvable queues_filter ref must NOT be deferred: an empty
+    /// queues_filter makes a shared view visible to the entire organization.
+    #[test]
+    fn saved_view_with_an_unresolvable_queue_ref_is_refused() {
+        let v = serde_json::json!({
+            "name": "Scoped",
+            "shared": true,
+            "queues_filter": ["rdc://queues/not-in-target"],
+            "query": { "$and": [] }
+        });
+        let problems = check_saved_view_refs("scoped", &v, &known_pairs(&[("queues", "invoices")]));
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].reason, SavedViewRefReason::Unresolvable);
+        assert_eq!(problems[0].location, "queues_filter[0]");
+        assert!(problems[0].reference.contains("not-in-target"));
+    }
+
+    /// `field.<schema_id>` keys are object KEYS, not string leaves. They are
+    /// deliberately NOT checked -- documented in the design doc, not guarded.
+    #[test]
+    fn schema_field_keys_are_not_checked() {
+        let v = serde_json::json!({
+            "name": "By field",
+            "shared": true,
+            "queues_filter": [],
+            "query": { "$and": [ { "field.document_id.string": { "$eq": "x" } } ] }
+        });
+        assert!(check_saved_view_refs("by-field", &v, &BTreeSet::new()).is_empty());
+    }
+
+    /// The ENV fields of a promoted view carry raw API URLs by design and must
+    /// never be mistaken for refs that cannot cross: `organization` is set from
+    /// the TARGET's `rdc.toml` by `reconcile_target_identity` and is never
+    /// portabilized (`is_portable_kind` excludes it), and a matched target's
+    /// `url` comes straight back from the target file. Walking the whole body
+    /// flagged both, which made migrate refuse EVERY promoted saved view.
+    #[test]
+    fn saved_view_env_fields_are_not_checked() {
+        let v = serde_json::json!({
+            "id": 42,
+            "url": "https://acme.rossum.app/api/v1/saved_views/42",
+            "name": "Awaiting approval",
+            "shared": true,
+            "queues_filter": ["rdc://queues/invoices"],
+            "query": { "$and": [ { "status": { "$in": ["to_review"] } } ] },
+            "organization": "https://acme.rossum.app/api/v1/organizations/2"
+        });
+        let problems = check_saved_view_refs(
+            "awaiting-approval",
+            &v,
+            &known_pairs(&[("queues", "invoices")]),
+        );
+        assert!(problems.is_empty(), "env fields must be out of scope: {problems:?}");
+    }
+
+    /// Two-env project (`dev` -> `prod`) in a tempdir, ready for `run_at`.
+    fn saved_view_project() -> tempfile::TempDir {
+        let project = tempfile::TempDir::new().unwrap();
+        let mut envs = BTreeMap::new();
+        for (env, org_id) in [("dev", 1u64), ("prod", 2u64)] {
+            envs.insert(
+                env.to_string(),
+                crate::config::EnvConfig {
+                    api_base: format!("https://{env}.example/api/v1"),
+                    org_id,
+                },
+            );
+        }
+        crate::config::ProjectConfig { envs }
+            .save(&project.path().join("rdc.toml"))
+            .unwrap();
+        project
+    }
+
+    fn write_snapshot_json(path: &Path, v: &Value) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_vec_pretty(v).unwrap()).unwrap();
+    }
+
+    /// One queue for a saved view's refs to point at.
+    fn write_source_queue(root: &Path) {
+        write_snapshot_json(
+            &root.join("envs/dev/workspaces/main/workspace.json"),
+            &serde_json::json!({ "name": "Main" }),
+        );
+        write_snapshot_json(
+            &root.join("envs/dev/workspaces/main/queues/invoices/queue.json"),
+            &serde_json::json!({ "name": "Invoices", "workspace": "rdc://workspaces/main" }),
+        );
+    }
+
+    /// End-to-end: the kind is wired into `classify` / `MANAGED_DIRS` /
+    /// `remap_relative`, lands in `saved-views/` (hyphenated) in the target, and
+    /// the ref check is reached and PASSES on a view whose refs all resolve.
+    #[test]
+    fn run_at_promotes_a_saved_view_whose_refs_resolve() {
+        let project = saved_view_project();
+        let root = project.path();
+        write_source_queue(root);
+        write_snapshot_json(
+            &root.join("envs/dev/saved-views/awaiting-approval.json"),
+            &serde_json::json!({
+                "id": 42,
+                "url": "rdc://saved_views/awaiting-approval",
+                "name": "Awaiting approval",
+                "shared": true,
+                "queues_filter": ["rdc://queues/invoices"],
+                "query": { "$and": [ { "queue": { "$in": ["rdc://queues/invoices"] } } ] },
+                "organization": "https://dev.example/api/v1/organizations/1"
+            }),
+        );
+
+        run_at(root, "dev", "prod", false, false, vec![], false, false)
+            .expect("a saved view whose refs all resolve must promote");
+
+        let promoted: Value = serde_json::from_slice(
+            &std::fs::read(root.join("envs/prod/saved-views/awaiting-approval.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(promoted["queues_filter"][0], "rdc://queues/invoices");
+        assert_eq!(
+            promoted["query"]["$and"][0]["queue"]["$in"][0],
+            "rdc://queues/invoices"
+        );
+        // The env field the whole-body walk used to flag: retargeted at the
+        // TARGET org, and not treated as a ref that cannot cross.
+        assert_eq!(
+            promoted["organization"],
+            "https://prod.example/api/v1/organizations/2"
+        );
+    }
+
+    /// The refusal is reached on a real run, and the error names the view, the
+    /// JSON path and the target env.
+    #[test]
+    fn run_at_refuses_a_saved_view_ref_missing_from_the_target() {
+        let project = saved_view_project();
+        let root = project.path();
+        write_source_queue(root);
+        write_snapshot_json(
+            &root.join("envs/dev/saved-views/scoped.json"),
+            &serde_json::json!({
+                "name": "Scoped",
+                "shared": true,
+                "queues_filter": ["rdc://queues/not-in-target"],
+                "query": { "$and": [] },
+                "organization": "https://dev.example/api/v1/organizations/1"
+            }),
+        );
+
+        let err = run_at(root, "dev", "prod", false, false, vec![], false, false)
+            .expect_err("an unresolvable queues_filter ref must refuse, never defer");
+        let msg = format!("{err:#}");
+        for want in [
+            "saved-views/scoped",
+            "queues_filter[0]",
+            "not-in-target",
+            "cannot cross into 'prod'",
+        ] {
+            assert!(msg.contains(want), "error must mention {want}, got: {msg}");
+        }
+    }
+
+    /// A view the target env owns and this run never promoted must not gate the
+    /// migration: a raw user URL in its `query` is VALID in its own env (push
+    /// accepts it), so the check is scoped to what was promoted.
+    #[test]
+    fn run_at_ignores_a_target_only_saved_view_with_a_user_ref() {
+        let project = saved_view_project();
+        let root = project.path();
+        write_source_queue(root);
+        let target_only = root.join("envs/prod/saved-views/theirs.json");
+        write_snapshot_json(
+            &target_only,
+            &serde_json::json!({
+                "name": "Mine",
+                "shared": true,
+                "queues_filter": [],
+                "query": { "$and": [
+                    { "modifier": { "$in": ["https://prod.example/api/v1/users/7"] } }
+                ] }
+            }),
+        );
+        let before = std::fs::read(&target_only).unwrap();
+
+        run_at(root, "dev", "prod", false, false, vec![], false, false)
+            .expect("a target-native saved view must not block a migration that skips it");
+
+        assert_eq!(
+            std::fs::read(&target_only).unwrap(),
+            before,
+            "the target-only view must be left byte-untouched"
         );
     }
 }
