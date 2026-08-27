@@ -73,30 +73,14 @@ pub async fn push(
                 .with_context(|| format!("parsing {}", path.display()))?;
             crate::snapshot::refs::resolve_value(&mut payload, lockfile);
             strip_for_create(&mut payload, "saved_views");
-            // Saved views do NOT participate in deferred relink. Dropping
-            // `queues_filter` to `[]` would silently widen a view scoped to a
-            // few queues into one visible to the WHOLE organization (that is
-            // the API's own semantics for an empty filter), and `query` is
-            // required on POST so deferring it fails the create outright. So an
-            // unresolved ref stops the push with a message naming it, rather
-            // than sending a body that is quietly wrong.
-            //
             // Checked AFTER `strip_for_create`, not before: a brand-new
             // object's own `url` is conventionally a self-referential
             // `rdc://saved_views/<own-slug>` (what `rdc migrate` and a
             // hand-scaffolded new-object file both write) and can never
             // resolve before the POST that creates it — but `url` is a
             // universal server field `strip_for_create` removes regardless,
-            // so it must never trip this guard.
-            let residual = crate::snapshot::refs::residual_rdc_refs(&payload);
-            if !residual.is_empty() {
-                anyhow::bail!(
-                    "saved view '{slug}' references objects that do not exist in this env: {}. \
-                     Create them first, or override `query`/`queues_filter` for this env in \
-                     overlay.toml.",
-                    residual.join(", ")
-                );
-            }
+            // so it must never trip this guard. See `ensure_no_residual_refs`.
+            ensure_no_residual_refs(slug, &payload)?;
             let result = client
                 .create_saved_view(&payload, Some(progress.clone()))
                 .await
@@ -247,22 +231,6 @@ async fn push_update_batch(
             let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
                 .with_context(|| format!("parsing {}", path.display()))?;
             crate::snapshot::refs::resolve_value(&mut payload, lf);
-            // Saved views do NOT participate in deferred relink. Dropping
-            // `queues_filter` to `[]` would silently widen a view scoped to a
-            // few queues into one visible to the WHOLE organization (that is
-            // the API's own semantics for an empty filter), and `query` is
-            // required on POST so deferring it fails the create outright. So an
-            // unresolved ref stops the push with a message naming it, rather
-            // than sending a body that is quietly wrong.
-            let residual = crate::snapshot::refs::residual_rdc_refs(&payload);
-            if !residual.is_empty() {
-                anyhow::bail!(
-                    "saved view '{slug}' references objects that do not exist in this env: {}. \
-                     Create them first, or override `query`/`queues_filter` for this env in \
-                     overlay.toml.",
-                    residual.join(", ")
-                );
-            }
             let payload_view: crate::model::SavedView = serde_json::from_value(payload)
                 .with_context(|| format!("deserializing overlay-applied saved view '{slug}'"))?;
 
@@ -275,6 +243,12 @@ async fn push_update_batch(
             let remote_art = remote_artifact(remote_view)?;
             if combined_hash(&remote_art.json, &remote_art.sidecars, lf) != base {
                 // Drift. NOT patched here — the sequential stage owns the prompt.
+                // Deliberately NOT residual-ref-checked on this branch: a
+                // drifted item is about to be handed to `push_one_drifted`,
+                // which re-reads and re-resolves the file from scratch and may
+                // resolve to Adopt/Skip, which never sends this (or any)
+                // payload at all. Checking here would bail the whole push on
+                // an item the interactive resolver might never have sent.
                 return Ok(Prepared::NeedsPrompt { slug: slug.clone() });
             }
 
@@ -282,6 +256,13 @@ async fn push_update_batch(
             // CREATE contract.
             let mut payload_to_send = payload_view;
             strip_patch_extra(&mut payload_to_send.extra, "saved_views", false);
+            // This IS the final payload for a clean (non-drifted) update — the
+            // only branch of this closure that reaches an actual PATCH — so
+            // the residual-ref guard is checked here, right before it is sent.
+            // See `ensure_no_residual_refs`.
+            let payload_value = serde_json::to_value(&payload_to_send)
+                .context("serializing saved view for residual-ref check")?;
+            ensure_no_residual_refs(slug, &payload_value)?;
             let updated = client
                 .update_saved_view(id, &payload_to_send, Some(progress.clone()))
                 .await
@@ -371,6 +352,34 @@ async fn push_update_batch(
     }
 
     Ok((pushed, skipped))
+}
+
+/// Saved views do NOT participate in deferred relink. Dropping `queues_filter`
+/// to `[]` would silently widen a view scoped to a few queues into one visible
+/// to the WHOLE organization (that is the API's own semantics for an empty
+/// filter), and `query` is required on POST so deferring it fails the create
+/// outright. So every payload this driver actually sends is checked here,
+/// after `resolve_value` (and after any subsequent stripping — the same
+/// ordering `push` and `push_one_drifted` each apply before calling this): an
+/// unresolved `rdc://` ref stops the push with a message naming it, rather
+/// than sending a body that is quietly wrong, or (on the drift-resolution
+/// path) than letting the server reject it with an opaque "Invalid hyperlink"
+/// `400`.
+///
+/// One shared helper rather than the check pasted at each of this driver's
+/// three call sites (the create path, the clean-update concurrent stage, and
+/// the drift-resolution PATCH), so the message can never drift between them.
+fn ensure_no_residual_refs(slug: &str, payload: &serde_json::Value) -> Result<()> {
+    let residual = crate::snapshot::refs::residual_rdc_refs(payload);
+    if !residual.is_empty() {
+        anyhow::bail!(
+            "saved view '{slug}' references objects that do not exist in this env: {}. \
+             Create them first, or override `query`/`queues_filter` for this env in \
+             overlay.toml.",
+            residual.join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// Whether this entry can reach the drift check at all — and, if so, the base
@@ -535,6 +544,18 @@ async fn push_one_drifted(
     // Strip server-managed fields from `extra` so the PATCH matches the
     // CREATE contract.
     strip_patch_extra(&mut payload_to_send.extra, "saved_views", false);
+    // Both `resolve_value` calls above (the initial read, and — only if the
+    // user edited the file interactively — the re-read override) each
+    // resolve their OWN draft of `payload_to_send`; only one draft is ever
+    // the one reaching this point, since `Adopt`/`Skip` both return above
+    // without using `payload_to_send` at all. So the residual-ref guard is
+    // checked once, here, on whichever draft won — not right after either
+    // individual `resolve_value` call, which would incorrectly bail before
+    // the user ever saw the drift prompt on a push that was going to Adopt
+    // or Skip and never send this payload. See `ensure_no_residual_refs`.
+    let payload_value = serde_json::to_value(&payload_to_send)
+        .context("serializing saved view for residual-ref check")?;
+    ensure_no_residual_refs(slug, &payload_value)?;
     let result = client
         .update_saved_view(id, &payload_to_send, Some(progress.clone()))
         .await
@@ -886,5 +907,149 @@ mod tests {
             server.received_requests().await.unwrap().is_empty(),
             "no update can reach the drift check, so nothing may be requested",
         );
+    }
+
+    #[test]
+    fn ensure_no_residual_refs_bails_on_a_dangling_ref() {
+        let payload = serde_json::json!({
+            "name": "mine",
+            "queues_filter": ["rdc://queues/does-not-exist"],
+        });
+        let err = ensure_no_residual_refs("mine", &payload)
+            .expect_err("a dangling ref must stop the push");
+        let msg = err.to_string();
+        assert!(msg.contains("mine"), "{msg}");
+        assert!(msg.contains("rdc://queues/does-not-exist"), "{msg}");
+    }
+
+    #[test]
+    fn ensure_no_residual_refs_passes_a_fully_resolved_payload() {
+        let payload = serde_json::json!({
+            "name": "mine",
+            "queues_filter": ["https://acme.rossum.app/api/v1/queues/1"],
+        });
+        ensure_no_residual_refs("mine", &payload)
+            .expect("a fully-resolved payload must pass");
+    }
+
+    /// The guard in `push_one_drifted` is checked ONCE, on whichever draft of
+    /// `payload_to_send` survives the drift-resolution match — not right
+    /// after either individual `resolve_value` call. Pin that placement: a
+    /// drifted item whose local file ALSO carries a dangling ref must still
+    /// just Skip (the ordinary non-interactive drift outcome) rather than
+    /// bailing the whole push, because a non-interactive drift resolution is
+    /// always `Skip` and never reaches `payload_to_send` at all. Placing the
+    /// guard right after the first `resolve_value` instead would regress
+    /// this: it would bail before the user (on a TTY) ever saw the drift
+    /// prompt, even though `Adopt`/`Skip` never send that payload.
+    #[tokio::test]
+    async fn push_saved_views_skips_a_drifted_item_with_a_dangling_ref_without_bailing() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let api = format!("{}/api/v1", server.uri());
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        let saved_views_dir = paths.saved_views_dir();
+        std::fs::create_dir_all(&saved_views_dir).unwrap();
+
+        let slug = "drifted-with-ref";
+        let id = 530u64;
+        // The dangling ref would fail `ensure_no_residual_refs` if it were
+        // ever checked for this item — which non-interactively it must not
+        // be, since the drift resolves to Skip before `payload_to_send` is
+        // ever built from this file.
+        let local = serde_json::json!({
+            "url": format!("rdc://saved_views/{slug}"),
+            "name": slug,
+            "shared": true,
+            "queues_filter": ["rdc://queues/does-not-exist"],
+            "query": { "$and": [] },
+            "organization": format!("{api}/organizations/1"),
+        });
+        std::fs::write(
+            saved_views_dir.join(format!("{slug}.json")),
+            serde_json::to_vec_pretty(&local).unwrap(),
+        )
+        .unwrap();
+
+        let mut lockfile = Lockfile {
+            api_base: api.clone(),
+            ..Lockfile::default()
+        };
+        // Base recorded from the object's PRE-drift remote shape.
+        let base_remote = serde_json::json!({
+            "id": id,
+            "url": format!("{api}/saved_views/{id}"),
+            "name": slug,
+            "shared": true,
+            "queues_filter": [],
+            "query": { "$and": [] },
+            "organization": format!("{api}/organizations/1"),
+        });
+        lockfile.upsert(
+            "saved_views",
+            slug,
+            ObjectEntry {
+                id,
+                modified_at: None,
+                modified_by: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        let codec = crate::snapshot::codec::codec("saved_views").unwrap();
+        let art = codec.disk_bytes(&base_remote).unwrap();
+        let base = combined_hash(&art.json, &art.sidecars, &lockfile);
+        lockfile.upsert(
+            "saved_views",
+            slug,
+            ObjectEntry {
+                id,
+                modified_at: None,
+                modified_by: None,
+                content_hash: Some(base),
+                secrets_hash: None,
+            },
+        );
+        let mut changes = BTreeMap::new();
+        changes.insert(slug.to_string(), saved_views_dir.join(format!("{slug}.json")));
+
+        // The remote returned at push time has since changed (drift): a
+        // different `name` than the one `base` was computed from.
+        let mut drifted_remote = base_remote.clone();
+        drifted_remote["name"] = serde_json::json!("renamed on the server");
+        let list = serde_json::json!({
+            "pagination": { "next": null },
+            "results": [drifted_remote],
+        });
+        Mock::given(method("GET"))
+            .and(path("/api/v1/saved_views"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(list))
+            .mount(&server)
+            .await;
+        // No PATCH mock: a non-interactive Skip must never send one. Any
+        // PATCH request at all would fail (no mock registered for it) and
+        // be recorded below regardless.
+
+        let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
+        let progress = Arc::new(crate::log::Log::new(crate::cli::resolve::ColorMode::Plain));
+        let (pushed, skipped) = push(
+            &paths, &client, &mut lockfile, false, &changes, &progress, "dev",
+        )
+        .await
+        .expect("a non-interactive drift must Skip, never bail on the dangling ref");
+
+        assert_eq!((pushed, skipped), (0, 1));
+        let patched: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method == http::Method::PATCH)
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert!(patched.is_empty(), "the drifted item must never be PATCHed, saw {patched:?}");
     }
 }

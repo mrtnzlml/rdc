@@ -561,6 +561,21 @@ pub(crate) async fn run_cycle(
             progress.block(&body);
         }
 
+        if !unshared_views.is_empty() {
+            progress.event(Action::Plan, "unshared saved views");
+            let mut body = String::new();
+            use std::fmt::Write as _;
+            for v in &unshared_views {
+                let _ = writeln!(
+                    body,
+                    "- saved-views/{} -- {}: `shared` is not true",
+                    v.slug,
+                    v.path.display(),
+                );
+            }
+            progress.block(&body);
+        }
+
         if !renderer_was_supplied {
             let parse_suffix = if parse_errors.is_empty() {
                 String::new()
@@ -598,8 +613,18 @@ pub(crate) async fn run_cycle(
                     if settings_problems.len() == 1 { "" } else { "s" }
                 )
             };
-            let parse_suffix =
-                format!("{parse_suffix}{limit_suffix}{missing_suffix}{settings_suffix}");
+            let unshared_suffix = if unshared_views.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", {} unshared saved view{}",
+                    unshared_views.len(),
+                    if unshared_views.len() == 1 { "" } else { "s" }
+                )
+            };
+            let parse_suffix = format!(
+                "{parse_suffix}{limit_suffix}{missing_suffix}{settings_suffix}{unshared_suffix}"
+            );
             progress.event(
                 Action::Done,
                 &format!(
