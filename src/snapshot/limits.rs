@@ -305,6 +305,28 @@ pub fn check_organization_settings(body: &Value) -> Vec<SettingsProblem> {
     out
 }
 
+/// A local saved-view file rdc refuses to push because it is not shared.
+#[derive(Debug, PartialEq, Eq)]
+pub struct UnsharedSavedView {
+    pub slug: String,
+    pub path: std::path::PathBuf,
+}
+
+/// True when a saved-view body is one rdc manages — i.e. `shared` is exactly
+/// `true`.
+///
+/// Pushing an unshared view would create an object the pull side immediately
+/// filters back out (`cli::pull::saved_views::list` keeps only shared views), so
+/// it would be re-created on every sync and never recorded in the lockfile: a
+/// create-then-vanish loop with no diagnostic. Refusing offline turns that into
+/// one clear message before the first remote write.
+///
+/// A missing key and a non-boolean both count as unmanaged rather than being
+/// coerced — guessing here would push the very object we mean to refuse.
+pub fn check_saved_view_shared(body: &serde_json::Value) -> bool {
+    body.get("shared").and_then(|s| s.as_bool()) == Some(true)
+}
+
 /// Declared `max_length` for each kind's top-level string fields.
 ///
 /// Kinds absent from this match (and fields absent from a kind's slice)
@@ -338,6 +360,9 @@ pub fn field_limits(kind: &str) -> &'static [(&'static str, usize)] {
             ("pre_trained_field_id", 50),
             ("subtype", 50),
         ],
+        // Only `name` is capped. `query` has no declared `max_length` (it is a
+        // JSON blob), and `shared` / `queues_filter` are not strings.
+        "saved_views" => &[("name", 255)],
         _ => &[],
     }
 }
@@ -620,6 +645,7 @@ mod tests {
             "labels",
             "inboxes",
             "engine_fields",
+            "saved_views",
         ] {
             assert!(
                 !field_limits(kind).is_empty(),
@@ -932,5 +958,53 @@ mod tests {
         let problems = check_organization_settings(&v);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].location.starts_with("settings.request_dashboard_table"), "{problems:?}");
+    }
+
+    #[test]
+    fn saved_views_have_a_name_limit() {
+        assert_eq!(field_limits("saved_views"), &[("name", 255)]);
+    }
+
+    #[test]
+    fn saved_view_over_length_name_is_a_violation() {
+        let body = serde_json::json!({
+            "name": "n".repeat(256),
+            "shared": true,
+            "query": { "$and": [] }
+        });
+        let v = check_field_limits("saved_views", &body);
+        assert_eq!(v.len(), 1, "a 256-char name must violate the 255 limit");
+        assert_eq!(v[0].field, "name");
+    }
+
+    #[test]
+    fn saved_view_name_at_the_limit_is_accepted() {
+        let body = serde_json::json!({
+            "name": "n".repeat(255),
+            "shared": true,
+            "query": { "$and": [] }
+        });
+        assert!(check_field_limits("saved_views", &body).is_empty());
+    }
+
+    #[test]
+    fn shared_true_is_managed() {
+        let body = serde_json::json!({ "name": "v", "shared": true, "query": {} });
+        assert!(check_saved_view_shared(&body));
+    }
+
+    #[test]
+    fn shared_false_and_absent_are_both_unmanaged() {
+        for body in [
+            serde_json::json!({ "name": "v", "shared": false, "query": {} }),
+            serde_json::json!({ "name": "v", "query": {} }),
+            // A non-boolean is not `true`, so it is refused rather than coerced.
+            serde_json::json!({ "name": "v", "shared": "yes", "query": {} }),
+        ] {
+            assert!(
+                !check_saved_view_shared(&body),
+                "must be refused: {body}"
+            );
+        }
     }
 }
