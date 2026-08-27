@@ -1066,7 +1066,7 @@ MSG
 **Files:**
 - Create: `src/cli/push/saved_views.rs`
 - Modify: `src/cli/push/mod.rs` (tally the new driver)
-- Modify: `src/cli/push/scan.rs` (`ChangeList` field + `total` + `json_parse_errors` + `field_limit_violations`; `Tombstones` field + `total`; `scan`; `detect_tombstones`; the `unshared_saved_views` method)
+- Modify: `src/cli/push/scan.rs` (`ChangeList` field + `total` + `json_parse_errors` + `field_limit_violations`; `Tombstones` field + `total`; `scan`; `detect_tombstones`; the `unshared_saved_views` method; **and `change_list_from_classified` — see ruling R15; omitting this arm makes every ordinary local edit silently no-op**)
 - Modify: `src/cli/push/deletes.rs` (`DeleteCounts` field, `reverse_dep_order_iter`, `apply_outcome`, and the two per-kind drift-fetch arms)
 - Modify: `src/cli/sync/mod.rs` (surface the new refusal in `refuse_on_offline_defects`)
 - Modify: `src/cli/doctor/mod.rs` (only if the doctor tuple needs the new list — check whether it compiles first)
@@ -2209,7 +2209,33 @@ async fn sync_pulls_shared_saved_views_and_ignores_private_ones() {
 Run: `cargo test --test cli_sync sync_pulls_shared_saved_views`
 Expected: PASS.
 
-- [ ] **Step 5: Add the unshared-refusal integration test**
+- [ ] **Step 5: Add the local-edit-pushes integration test (ruling R15)**
+
+This is the end-to-end pin for the gap R15 fixed. Without it, the push side of
+this kind can regress to a silent no-op again and nothing turns red.
+
+```rust
+/// A local edit to a tracked saved view must actually reach the API.
+///
+/// Regression pin for ruling R15: `change_list_from_classified` originally had
+/// no `saved_views` arm, so an edited view classified correctly as `LocalEdit`
+/// and was then silently dropped before the push phase — no error, no warning,
+/// no request.
+#[tokio::test]
+async fn sync_local_edit_patches_a_saved_view() {
+    // Mock GET /saved_views returning one shared view; init a project, sync to
+    // establish the lockfile baseline, edit `name` in the local JSON, sync
+    // again, and assert a PATCH /api/v1/saved_views/<id> was received carrying
+    // the edited name. Model the shape on the existing
+    // `sync_local_edit_only_patches_remote_label` test in this file.
+}
+```
+
+Fill the body from `sync_local_edit_only_patches_remote_label`, which is the
+same scenario for the labels kind. Assert on the request body, not just that a
+PATCH arrived.
+
+- [ ] **Step 6: Add the unshared-refusal integration test**
 
 ```rust
 /// A hand-authored view without `shared: true` is refused offline — before the
@@ -2273,12 +2299,12 @@ If `predicates` is not already imported in this file, use the assertion style th
 neighbouring tests use (`String::from_utf8_lossy` over `output.stderr` plus
 `assert!(… .contains(…))`) rather than adding a dependency.
 
-- [ ] **Step 6: Run the sync integration suite**
+- [ ] **Step 7: Run the sync integration suite**
 
 Run: `cargo test --test cli_sync`
 Expected: PASS. Do not start any rebuild while this runs.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add README.md tests/cli_sync.rs tests/cli_doctor.rs
