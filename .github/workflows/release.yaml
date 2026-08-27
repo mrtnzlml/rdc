@@ -145,6 +145,13 @@ jobs:
     # mrtnzlml/tap/rdc` resolves to this tag. Requires a repo secret
     # `HOMEBREW_TAP_TOKEN` -- a fine-grained PAT with contents:write on the
     # tap repo only.
+    #
+    # NOTE: the API-backed download below makes this JOB green and the formula
+    # accurate; it does NOT make `brew install mrtnzlml/tap/rdc` work while this
+    # repo is private. Homebrew fetches the `url` fields with no token, and that
+    # URL 404s (verified directly). Fixing the install needs either a public
+    # repo or dropping Homebrew -- a separate decision. The urls stay on the
+    # browser path because that is the only form Homebrew understands.
     name: Bump Homebrew tap formula
     needs: release
     runs-on: ubuntu-latest
@@ -160,14 +167,27 @@ jobs:
         shell: bash
         env:
           TAG: ${{ inputs.tag || github.ref_name }}
+          # Two different tokens address two different repos and must not be
+          # confused: GH_TOKEN reads assets from THIS repo, HOMEBREW_TAP_TOKEN
+          # (used by the checkout step above) writes to the tap repo.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           version="${TAG#v}"
           base="https://github.com/mrtnzlml/rdc/releases/download/${TAG}"
-          sha_of() { curl -fsSL "$1" | sha256sum | awk '{ print $1 }'; }
-          darwin_arm_sha=$(sha_of "$base/rdc-${version}-aarch64-apple-darwin.tar.gz")
-          darwin_x86_sha=$(sha_of "$base/rdc-${version}-x86_64-apple-darwin.tar.gz")
-          linux_x86_sha=$(sha_of "$base/rdc-${version}-x86_64-unknown-linux-gnu.tar.gz")
+          # This repo is private, so the releases/download/... browser URL 404s
+          # even with a token -- that is what failed the last four releases.
+          # `gh release download` resolves the numeric asset id through the API,
+          # which is the only way in.
+          mkdir -p assets
+          gh release download "$TAG" --repo mrtnzlml/rdc --dir assets --clobber \
+            --pattern 'rdc-*-aarch64-apple-darwin.tar.gz' \
+            --pattern 'rdc-*-x86_64-apple-darwin.tar.gz' \
+            --pattern 'rdc-*-x86_64-unknown-linux-gnu.tar.gz'
+          sha_of() { sha256sum "assets/$1" | awk '{ print $1 }'; }
+          darwin_arm_sha=$(sha_of "rdc-${version}-aarch64-apple-darwin.tar.gz")
+          darwin_x86_sha=$(sha_of "rdc-${version}-x86_64-apple-darwin.tar.gz")
+          linux_x86_sha=$(sha_of "rdc-${version}-x86_64-unknown-linux-gnu.tar.gz")
 
           mkdir -p tap/Formula
           cat > tap/Formula/rdc.rb <<RUBY
