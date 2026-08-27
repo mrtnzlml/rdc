@@ -2047,13 +2047,31 @@ The kind→files table above it lists only kinds with code sidecars, so saved vi
 
 - [ ] **Step 2: Confirm Task 4's endpoint registration is still complete**
 
-Task 4 registered `/api/v1/saved_views` in every mock array (ruling R2 — it has to
+Task 4 registered `/api/v1/saved_views` in the mock arrays (ruling R2 — it has to
 happen there, because Task 4 is what makes rdc list the endpoint on every sync).
-Re-verify nothing regressed since:
 
-Run: `grep -rn '"/api/v1/email_templates",' tests/cli_sync.rs tests/cli_doctor.rs | wc -l`
-Run: `grep -rn '"/api/v1/saved_views",' tests/cli_sync.rs tests/cli_doctor.rs | wc -l`
-Expected: the two counts are equal.
+**Do NOT compare counts against `email_templates`.** Ruling R4: the arrays that
+mention `email_templates` are two structurally different things, and only one of
+them wants a `saved_views` entry:
+
+- **mock-all arrays** — the `CORE_LIST_ENDPOINTS` const plus the per-test arrays
+  that enumerate every endpoint to be answered with an empty page. These DO need
+  `saved_views`.
+- **override/skip arguments** — the `&[…]` second argument to
+  `mock_empty_lists_except(server, override_paths)`, which names endpoints the
+  test mocks *itself* and the helper must therefore NOT mock. Adding
+  `saved_views` to one of these tells the helper to leave the endpoint unmocked,
+  and the test 404s.
+
+Re-verify by shape, not by count:
+
+Run: `grep -n '"/api/v1/saved_views"' tests/cli_sync.rs tests/cli_doctor.rs`
+Expected: 4 hits — `tests/cli_sync.rs` in `CORE_LIST_ENDPOINTS` and in two
+mock-all arrays, plus one in `tests/cli_doctor.rs`. Every hit must sit in a
+mock-all array, never in a `mock_empty_lists_except(…)` argument list.
+
+Run: `cargo test --test cli_sync`
+Expected: PASS — that is the real proof, and it is what caught the original error.
 
 - [ ] **Step 3: Write the failing integration test**
 
