@@ -1135,8 +1135,9 @@ fn scan_organization(
 ///
 /// The classified items carry only `(kind, slug)`, so for each push-side
 /// item this helper computes the on-disk path via the same layout the
-/// `scan` walkers use. For flat kinds (`hooks`, `rules`, `labels`, etc.)
-/// the path is built directly from the slug; for queue-nested kinds
+/// `scan` walkers use. For flat kinds (`hooks`, `rules`, `labels`,
+/// `saved_views`, etc.) the path is built directly from the slug; for
+/// queue-nested kinds
 /// (`queues`, `schemas`, `inboxes`) the lockfile keys items by queue slug
 /// alone, so we sweep `workspaces/*/queues/<slug>/<file>` to find the
 /// owning workspace. For `email_templates` the slug is already the
@@ -1179,6 +1180,12 @@ pub fn change_list_from_classified(
                 cl.labels.insert(
                     it.slug.clone(),
                     paths.labels_dir().join(format!("{}.json", it.slug)),
+                );
+            }
+            "saved_views" => {
+                cl.saved_views.insert(
+                    it.slug.clone(),
+                    paths.saved_views_dir().join(format!("{}.json", it.slug)),
                 );
             }
             "engines" => {
@@ -1668,6 +1675,70 @@ mod tests {
         assert_eq!(cl.labels.len(), 1);
         assert!(cl.labels.contains_key("l1"));
         assert!(cl.queues.is_empty());
+    }
+
+    /// The gap a later reviewer found: `saved_views` had no arm in this
+    /// match, so a locally-edited or newly-created saved view was silently
+    /// dropped from the push-side `ChangeList` -- no error, no PATCH, no
+    /// POST, and none of `push::saved_views`' own tests could ever catch it
+    /// since they all drive the driver directly with a hand-built
+    /// `BTreeMap`, never through this classifier. Pinned here, at the level
+    /// where the omission actually lived.
+    #[test]
+    fn change_list_from_classified_includes_saved_views_for_edit_and_create() {
+        use crate::cli::sync::classify::{ClassifiedItem, SyncClass};
+        use crate::paths::Paths;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+
+        let items = vec![
+            ClassifiedItem {
+                kind: "saved_views".into(),
+                slug: "awaiting-approval".into(),
+                class: SyncClass::LocalEdit,
+                local_hash: Some("h".into()),
+                remote_hash: Some("h".into()),
+                base_hash: Some("h".into()),
+            },
+            ClassifiedItem {
+                kind: "saved_views".into(),
+                slug: "team-dashboard".into(),
+                class: SyncClass::LocalCreate,
+                local_hash: Some("h".into()),
+                remote_hash: None,
+                base_hash: None,
+            },
+            ClassifiedItem {
+                kind: "saved_views".into(),
+                slug: "ignored".into(),
+                // Not a push-side class -- must be ignored, same as every
+                // other kind.
+                class: SyncClass::RemoteEdit,
+                local_hash: Some("h".into()),
+                remote_hash: Some("h2".into()),
+                base_hash: Some("h".into()),
+            },
+        ];
+
+        let cl = change_list_from_classified(&paths, &items);
+        assert_eq!(
+            cl.saved_views.len(),
+            2,
+            "expected the LocalEdit and the LocalCreate, not the RemoteEdit: {:?}",
+            cl.saved_views
+        );
+        assert_eq!(
+            cl.saved_views.get("awaiting-approval"),
+            Some(&paths.saved_views_dir().join("awaiting-approval.json")),
+        );
+        assert_eq!(
+            cl.saved_views.get("team-dashboard"),
+            Some(&paths.saved_views_dir().join("team-dashboard.json")),
+        );
+        assert!(
+            !cl.saved_views.contains_key("ignored"),
+            "a RemoteEdit item must never land in the push-side ChangeList"
+        );
     }
 
     /// `trigger_condition` lives in `<slug>.py`, never in the rule JSON
