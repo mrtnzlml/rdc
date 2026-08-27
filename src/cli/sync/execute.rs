@@ -1942,12 +1942,14 @@ fn deleted_marker_path(paths: &crate::paths::Paths, local_path: &Path) -> PathBu
 /// For most kinds the remote object really is gone. A saved view usually is
 /// not: it left rdc's filtered listing because someone unshared it, and it
 /// still exists in the organization. Claiming a remote deletion there would be
-/// false, so the wording is kind-specific.
-fn remote_delete_detail(kind: &str, slug: &str) -> String {
+/// false, so the wording is kind-specific. Every other kind keeps the exact
+/// `"{kind}/{slug} (deleted on {env})"` text this call site always emitted —
+/// the wording split must not regress the twelve kinds it isn't about.
+fn remote_delete_detail(kind: &str, slug: &str, env: &str) -> String {
     if kind == "saved_views" {
-        format!("saved_views/{slug} (no longer shared \u{2014} not managed by rdc)")
+        format!("saved_views/{slug} (no longer shared on {env} \u{2014} not managed by rdc)")
     } else {
-        format!("{kind}/{slug}")
+        format!("{kind}/{slug} (deleted on {env})")
     }
 }
 
@@ -3105,7 +3107,10 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                         recorded_base.is_some() && local_disk_hash(&refs) == recorded_base;
                     if still_clean {
                         delete_local_object(ctx, it, &refs)?;
-                        progress.event(Action::Delete, &remote_delete_detail(&it.kind, &it.slug));
+                        progress.event(
+                            Action::Delete,
+                            &remote_delete_detail(&it.kind, &it.slug, &env),
+                        );
                         continue;
                     }
                 }
@@ -4368,14 +4373,19 @@ mod tests {
 
     /// The clean-`RemoteDelete` event line must not claim a remote deletion for
     /// this kind: a saved view that left rdc's filtered listing has usually
-    /// just been unshared, and still exists in the org.
+    /// just been unshared, and still exists in the org. Every other kind must
+    /// keep its original `"{kind}/{slug} (deleted on {env})"` text byte-for-
+    /// byte — this pins that regression guard.
     #[test]
     fn remote_delete_detail_is_kind_specific_for_saved_views() {
         assert_eq!(
-            remote_delete_detail("saved_views", "awaiting-approval"),
-            "saved_views/awaiting-approval (no longer shared \u{2014} not managed by rdc)"
+            remote_delete_detail("labels", "urgent", "dev"),
+            "labels/urgent (deleted on dev)"
         );
-        assert_eq!(remote_delete_detail("labels", "urgent"), "labels/urgent");
+        assert_eq!(
+            remote_delete_detail("saved_views", "awaiting-approval", "dev"),
+            "saved_views/awaiting-approval (no longer shared on dev \u{2014} not managed by rdc)"
+        );
     }
 
     /// Build an empty RemoteCatalog with `labels` populated by the caller.
