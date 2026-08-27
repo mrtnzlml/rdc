@@ -21,6 +21,7 @@ pub struct ChangeList {
     pub hooks: BTreeMap<String, std::path::PathBuf>,
     pub rules: BTreeMap<String, std::path::PathBuf>,
     pub labels: BTreeMap<String, std::path::PathBuf>,
+    pub saved_views: BTreeMap<String, std::path::PathBuf>,
     pub queues: BTreeMap<String, std::path::PathBuf>,
     pub schemas: BTreeMap<String, std::path::PathBuf>,
     pub inboxes: BTreeMap<String, std::path::PathBuf>,
@@ -40,6 +41,7 @@ impl ChangeList {
             + self.hooks.len()
             + self.rules.len()
             + self.labels.len()
+            + self.saved_views.len()
             + self.queues.len()
             + self.schemas.len()
             + self.inboxes.len()
@@ -87,6 +89,7 @@ impl ChangeList {
         check("hooks", &self.hooks);
         check("rules", &self.rules);
         check("labels", &self.labels);
+        check("saved_views", &self.saved_views);
         check("queues", &self.queues);
         check("schemas", &self.schemas);
         check("inboxes", &self.inboxes);
@@ -155,6 +158,7 @@ impl ChangeList {
         check("hooks", &self.hooks);
         check("rules", &self.rules);
         check("labels", &self.labels);
+        check("saved_views", &self.saved_views);
         check("queues", &self.queues);
         check("schemas", &self.schemas);
         check("inboxes", &self.inboxes);
@@ -309,6 +313,29 @@ impl ChangeList {
             .map(|p| (path.clone(), p))
             .collect()
     }
+
+    /// Local saved-view files rdc refuses to push because they are not shared.
+    ///
+    /// See `snapshot::limits::check_saved_view_shared` for why this is refused
+    /// offline rather than pushed and reconciled.
+    pub fn unshared_saved_views(&self) -> Vec<crate::snapshot::limits::UnsharedSavedView> {
+        let mut out = Vec::new();
+        for (slug, path) in &self.saved_views {
+            let Ok(bytes) = std::fs::read(path) else {
+                continue; // unreadable != unshared; push surfaces I/O errors
+            };
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue; // unparseable is already reported by json_parse_errors
+            };
+            if !crate::snapshot::limits::check_saved_view_shared(&v) {
+                out.push(crate::snapshot::limits::UnsharedSavedView {
+                    slug: slug.clone(),
+                    path: path.clone(),
+                });
+            }
+        }
+        out
+    }
 }
 
 /// Build a [`FieldLimitViolation`] from a [`crate::snapshot::limits::LimitViolation`],
@@ -381,6 +408,7 @@ pub struct Tombstones {
     pub hooks: BTreeMap<String, u64>,
     pub rules: BTreeMap<String, u64>,
     pub labels: BTreeMap<String, u64>,
+    pub saved_views: BTreeMap<String, u64>,
     pub queues: BTreeMap<String, u64>,
     pub schemas: BTreeMap<String, u64>,
     pub inboxes: BTreeMap<String, u64>,
@@ -395,6 +423,7 @@ impl Tombstones {
             + self.hooks.len()
             + self.rules.len()
             + self.labels.len()
+            + self.saved_views.len()
             + self.queues.len()
             + self.schemas.len()
             + self.inboxes.len()
@@ -425,6 +454,13 @@ pub fn scan(paths: &Paths, lockfile: &Lockfile) -> Result<(usize, ChangeList, To
         "labels",
         paths.labels_dir(),
         &mut changes.labels,
+    )?;
+    scanned += scan_flat_kind(
+        paths,
+        lockfile,
+        "saved_views",
+        paths.saved_views_dir(),
+        &mut changes.saved_views,
     )?;
     scanned +=
         scan_queue_nested_json(paths, lockfile, "queues", "queue.json", &mut changes.queues)?;
@@ -465,6 +501,7 @@ pub fn detect_tombstones(paths: &Paths, lockfile: &Lockfile) -> Tombstones {
     detect_flat(lockfile, "hooks", &paths.hooks_dir(), &mut t.hooks);
     detect_flat(lockfile, "rules", &paths.rules_dir(), &mut t.rules);
     detect_flat(lockfile, "labels", &paths.labels_dir(), &mut t.labels);
+    detect_flat(lockfile, "saved_views", &paths.saved_views_dir(), &mut t.saved_views);
 
     // --- workspaces: workspaces/<slug>/workspace.json ---------------
     if let Some(map) = lockfile.objects.get("workspaces") {
@@ -1855,5 +1892,73 @@ mod tests {
         // Nested values live directly in the JSON, so the reported path is
         // the rule's .json file itself, not a sidecar.
         assert_eq!(v[0].path, rules_dir.join("my-rule.json"));
+    }
+
+    #[test]
+    fn scan_finds_a_new_saved_view_as_a_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        std::fs::create_dir_all(paths.saved_views_dir()).unwrap();
+        std::fs::write(
+            paths.saved_views_dir().join("awaiting-approval.json"),
+            br#"{"name":"Awaiting approval","shared":true,"query":{"$and":[]}}"#,
+        )
+        .unwrap();
+
+        let lockfile = Lockfile::default();
+        let (_n, changes, tombstones) = scan(&paths, &lockfile).unwrap();
+
+        assert!(changes.saved_views.contains_key("awaiting-approval"));
+        assert!(tombstones.saved_views.is_empty());
+    }
+
+    #[test]
+    fn a_missing_saved_view_file_is_a_tombstone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        let mut lockfile = Lockfile::default();
+        lockfile.upsert(
+            "saved_views",
+            "gone",
+            crate::state::ObjectEntry {
+                id: 77,
+                modified_at: None,
+                modified_by: None,
+                content_hash: Some("h".into()),
+                secrets_hash: None,
+            },
+        );
+
+        let t = detect_tombstones(&paths, &lockfile);
+        assert_eq!(t.saved_views.get("gone"), Some(&77));
+    }
+
+    #[test]
+    fn unshared_saved_view_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        std::fs::create_dir_all(paths.saved_views_dir()).unwrap();
+        let path = paths.saved_views_dir().join("mine.json");
+        std::fs::write(&path, br#"{"name":"Mine","shared":false,"query":{"$and":[]}}"#).unwrap();
+
+        let mut changes = ChangeList::default();
+        changes.saved_views.insert("mine".to_string(), path.clone());
+
+        let refused = changes.unshared_saved_views();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].slug, "mine");
+    }
+
+    #[test]
+    fn shared_saved_view_is_not_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        std::fs::create_dir_all(paths.saved_views_dir()).unwrap();
+        let path = paths.saved_views_dir().join("ok.json");
+        std::fs::write(&path, br#"{"name":"Ok","shared":true,"query":{"$and":[]}}"#).unwrap();
+
+        let mut changes = ChangeList::default();
+        changes.saved_views.insert("ok".to_string(), path);
+        assert!(changes.unshared_saved_views().is_empty());
     }
 }

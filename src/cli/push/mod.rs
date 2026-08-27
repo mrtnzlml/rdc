@@ -22,6 +22,7 @@ pub mod mdh_data;
 mod organization;
 mod queues;
 mod rules;
+mod saved_views;
 pub mod scan;
 mod schemas;
 mod workspaces;
@@ -129,6 +130,13 @@ pub(crate) async fn push_classified(
     if !changes.labels.is_empty() {
         tally(labels::push(paths, client, lockfile, interactive, &changes.labels, progress, env).await
             .with_context(|| format!("pushing labels for env '{env}'"))?);
+    }
+    // A saved view's `queues_filter` can reference a queue, already pushed
+    // above; unlike labels/rules it does not itself participate in another
+    // kind's create-time ref resolution, so its ordering here is otherwise free.
+    if !changes.saved_views.is_empty() {
+        tally(saved_views::push(paths, client, lockfile, interactive, &changes.saved_views, progress, env).await
+            .with_context(|| format!("pushing saved views for env '{env}'"))?);
     }
     if !changes.rules.is_empty() {
         tally(rules::push(paths, client, lockfile, interactive, &changes.rules, progress, env).await

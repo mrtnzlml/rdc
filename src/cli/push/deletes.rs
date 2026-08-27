@@ -13,8 +13,9 @@
 //!      to destroy remote state.
 //!
 //! 2. **Cascade order.** Children before parents, reverse of the create
-//!    order: `engine_fields → engines → labels → rules → hooks →
-//!    email_templates → inboxes → queues → schemas → workspaces`.
+//!    order: `engine_fields → engines → labels → saved_views → rules → hooks →
+//!    email_templates → inboxes → queues → schemas → workspaces`. Nothing
+//!    references a saved view, so its position among the leaves is free.
 //!
 //! 3. **Idempotent DELETE.** `delete_path` already treats 404 as success,
 //!    so an object that's already gone remotely just gets its lockfile
@@ -49,6 +50,7 @@ pub struct DeleteCounts {
     pub hooks: usize,
     pub rules: usize,
     pub labels: usize,
+    pub saved_views: usize,
     pub queues: usize,
     pub schemas: usize,
     pub inboxes: usize,
@@ -68,6 +70,7 @@ impl DeleteCounts {
             + self.hooks
             + self.rules
             + self.labels
+            + self.saved_views
             + self.queues
             + self.schemas
             + self.inboxes
@@ -133,6 +136,7 @@ fn reverse_dep_order_iter(t: &Tombstones) -> Vec<(&'static str, &BTreeMap<String
         ("engine_fields", &t.engine_fields),
         ("engines", &t.engines),
         ("labels", &t.labels),
+        ("saved_views", &t.saved_views),
         ("rules", &t.rules),
         ("hooks", &t.hooks),
         ("email_templates", &t.email_templates),
@@ -323,6 +327,7 @@ fn apply_outcome(counts: &mut DeleteCounts, kind: &str, outcome: DeleteOutcome) 
             "hooks" => counts.hooks += 1,
             "rules" => counts.rules += 1,
             "labels" => counts.labels += 1,
+            "saved_views" => counts.saved_views += 1,
             "queues" => counts.queues += 1,
             "schemas" => counts.schemas += 1,
             "inboxes" => counts.inboxes += 1,
@@ -417,6 +422,12 @@ async fn fetch_remote_modified_at(
             .into_iter()
             .find(|x| x.id == id)
             .map(|x| x.modified_at().map(|s| s.to_string())),
+        "saved_views" => client
+            .list_saved_views(None)
+            .await?
+            .into_iter()
+            .find(|x| x.id == id)
+            .map(|x| x.modified_at().map(|s| s.to_string())),
         "rules" => client
             .list_rules(None)
             .await?
@@ -481,6 +492,13 @@ async fn fetch_remote_body(client: &RossumClient, kind: &str, id: u64) -> Result
         },
         "labels" => client
             .list_labels(None)
+            .await?
+            .into_iter()
+            .find(|x| x.id == id)
+            .map(|x| serde_json::to_value(&x))
+            .transpose()?,
+        "saved_views" => client
+            .list_saved_views(None)
             .await?
             .into_iter()
             .find(|x| x.id == id)

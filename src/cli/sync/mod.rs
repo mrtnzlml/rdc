@@ -267,6 +267,7 @@ pub(crate) async fn run_cycle(
     let limit_violations = changes.field_limit_violations();
     let missing_create_fields = changes.missing_create_fields(&lockfile);
     let settings_problems = changes.organization_settings_problems();
+    let unshared_views = changes.unshared_saved_views();
 
     // `--no-push` is an audit mode: there is nothing to half-apply, so it
     // proceeds and merely reports. `--dry-run` proceeds too — its job is
@@ -278,6 +279,7 @@ pub(crate) async fn run_cycle(
             &limit_violations,
             &missing_create_fields,
             &settings_problems,
+            &unshared_views,
         )?;
     }
 
@@ -1537,18 +1539,21 @@ pub fn from_catalog_scan_lockfile(
 
 /// Refuse a push over defects that are knowable from local bytes alone.
 ///
-/// All four classes are *permanent*: an unparseable file, an over-length
-/// field, a create missing a field the API demands, and a structural problem
-/// in an organization's `settings` can never be accepted by the server, so
-/// attempting the push aborts the cycle before the pull phase on every single
-/// run — wedging the project until a human notices, and (for the create case)
-/// after earlier kinds are already written. Raising them here keeps the
-/// remote untouched and names exactly what to fix.
+/// All five classes are *permanent*: an unparseable file, an over-length
+/// field, a create missing a field the API demands, a structural problem
+/// in an organization's `settings`, and a local saved view that isn't shared
+/// can never be accepted by the server (or, for the last, would just be
+/// re-created and never recorded — see `snapshot::limits::check_saved_view_shared`),
+/// so attempting the push aborts the cycle before the pull phase on every
+/// single run — wedging the project until a human notices, and (for the
+/// create case) after earlier kinds are already written. Raising them here
+/// keeps the remote untouched and names exactly what to fix.
 fn refuse_on_offline_defects(
     parse_errors: &[crate::cli::push::scan::JsonParseError],
     limit_violations: &[crate::cli::push::scan::FieldLimitViolation],
     missing_create_fields: &[crate::cli::push::scan::MissingCreateField],
     settings_problems: &[(std::path::PathBuf, crate::snapshot::limits::SettingsProblem)],
+    unshared_views: &[crate::snapshot::limits::UnsharedSavedView],
 ) -> Result<()> {
     use std::fmt::Write as _;
 
@@ -1628,6 +1633,23 @@ fn refuse_on_offline_defects(
         );
         for (path, p) in settings_problems {
             let _ = write!(msg, "\n  - {}: {} -- {}", path.display(), p.location, p.problem);
+        }
+        anyhow::bail!("{msg}");
+    }
+
+    if !unshared_views.is_empty() {
+        let mut msg = format!(
+            "{} local saved view(s) have `shared` set to something other than `true`; rdc \
+             manages shared saved views only; refusing to push before any remote write:",
+            unshared_views.len()
+        );
+        for v in unshared_views {
+            let _ = write!(
+                msg,
+                "\n  - saved-views/{} -- {}: `shared` is not true",
+                v.slug,
+                v.path.display(),
+            );
         }
         anyhow::bail!("{msg}");
     }
@@ -2211,7 +2233,7 @@ mod tests {
             path: std::path::PathBuf::from("envs/prod/workspaces/main/queues/invoices/inbox.json"),
             field: "email_prefix",
         }];
-        let err = refuse_on_offline_defects(&[], &[], &missing, &[])
+        let err = refuse_on_offline_defects(&[], &[], &missing, &[], &[])
             .expect_err("a doomed create must refuse the push");
         let msg = err.to_string();
         assert!(msg.contains("inboxes/invoices"), "{msg}");
@@ -2222,6 +2244,22 @@ mod tests {
     /// ...and must stay silent when there is nothing to refuse.
     #[test]
     fn refuse_on_offline_defects_passes_a_clean_change_list() {
-        refuse_on_offline_defects(&[], &[], &[], &[]).expect("a clean scan must not refuse");
+        refuse_on_offline_defects(&[], &[], &[], &[], &[]).expect("a clean scan must not refuse");
+    }
+
+    /// An unshared saved view is the fifth permanent-defect class: refuse
+    /// before any remote write, the same as the other four, and name the
+    /// slug so the user knows which file to fix.
+    #[test]
+    fn refuse_on_offline_defects_bails_on_an_unshared_saved_view() {
+        let unshared = vec![crate::snapshot::limits::UnsharedSavedView {
+            slug: "mine".to_string(),
+            path: std::path::PathBuf::from("envs/prod/saved-views/mine.json"),
+        }];
+        let err = refuse_on_offline_defects(&[], &[], &[], &[], &unshared)
+            .expect_err("an unshared saved view must refuse the push");
+        let msg = err.to_string();
+        assert!(msg.contains("saved-views/mine"), "{msg}");
+        assert!(msg.contains("shared"), "{msg}");
     }
 }
