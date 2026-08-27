@@ -273,4 +273,64 @@ mod tests {
         assert_eq!(kept.len(), 2);
         assert!(kept.iter().all(|v| v.shared));
     }
+
+    /// This is the safety boundary's actual enforcement site, not just the
+    /// pure `retain_shared` helper: a real listing response containing both
+    /// a shared and a private view must come back through `list()` with the
+    /// private one already gone. `filter_keeps_only_shared` above tests the
+    /// helper in isolation and would keep passing even if `list()` stopped
+    /// calling it — this test would not.
+    #[tokio::test]
+    async fn list_filters_out_private_views_over_the_wire() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "pagination": { "next": null },
+            "results": [
+                {
+                    "id": 1,
+                    "url": format!("{}/api/v1/saved_views/1", server.uri()),
+                    "name": "Team dashboard",
+                    "shared": true,
+                    "queues_filter": [],
+                    "query": { "$and": [] }
+                },
+                {
+                    "id": 2,
+                    "url": format!("{}/api/v1/saved_views/2", server.uri()),
+                    "name": "My private filter",
+                    "shared": false,
+                    "queues_filter": [],
+                    "query": { "$and": [] }
+                }
+            ]
+        });
+        Mock::given(method("GET"))
+            .and(path("/api/v1/saved_views"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        let client =
+            RossumClient::new(format!("{}/api/v1", server.uri()), "TEST".to_string()).unwrap();
+        let mut lockfile = Lockfile::default();
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        let ctx = PullCtx {
+            paths: &paths,
+            client: &client,
+            lockfile: &mut lockfile,
+            queue_locations: std::collections::BTreeMap::new(),
+            interactive: false,
+        };
+
+        let views = list(&ctx, &progress).await.unwrap();
+
+        assert_eq!(views.len(), 1, "the private view must not survive list()");
+        assert_eq!(views[0].id, 1);
+        assert_eq!(views[0].name, "Team dashboard");
+    }
 }

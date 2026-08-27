@@ -382,6 +382,7 @@ pub async fn list_remote(
     let workflows = workflows.expect("workflows listed");
     let workflow_steps = workflow_steps.expect("workflow_steps listed");
     let email_templates = email_templates.expect("email_templates listed");
+    let saved_views = saved_views.expect("saved_views listed");
     let inboxes_by_queue_id = inboxes_by_queue(inboxes);
 
     // Per-queue schema prefetch. The `/schemas` list omits `content`, so
@@ -410,7 +411,7 @@ pub async fn list_remote(
         workflows,
         workflow_steps,
         email_templates,
-        saved_views: saved_views.unwrap_or_default(),
+        saved_views,
         mdh,
     })
 }
