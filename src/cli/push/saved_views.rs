@@ -1052,4 +1052,189 @@ mod tests {
             .collect();
         assert!(patched.is_empty(), "the drifted item must never be PATCHed, saw {patched:?}");
     }
+
+    /// Pins the concurrent-stage (clean, non-drifted update) guard call site.
+    /// A tracked saved view whose local `queues_filter` holds a ref to a
+    /// queue that does not exist in this env's lockfile must stop the push --
+    /// naming the ref -- rather than PATCHing a body that would silently
+    /// widen the view to the WHOLE organization (the API's own semantics for
+    /// an empty `queues_filter`). Deleting or relocating the
+    /// `ensure_no_residual_refs` call this driver makes right before
+    /// `update_saved_view` would let this test pass with a real PATCH sent;
+    /// asserting on both halves -- the error naming the ref, AND the absence
+    /// of any PATCH request -- catches that an inverted or relocated guard
+    /// cannot slip through on the error check alone.
+    #[tokio::test]
+    async fn push_saved_views_bails_on_a_dangling_ref_in_a_clean_update() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let api = format!("{}/api/v1", server.uri());
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        let saved_views_dir = paths.saved_views_dir();
+        std::fs::create_dir_all(&saved_views_dir).unwrap();
+
+        let slug = "mine";
+        let id = 540u64;
+        // No "queues" entry for this slug exists in the lockfile, so
+        // `resolve_value` cannot rewrite the ref and it survives to the final
+        // payload as a literal `rdc://` string.
+        let local = serde_json::json!({
+            "url": format!("rdc://saved_views/{slug}"),
+            "name": slug,
+            "shared": true,
+            "queues_filter": ["rdc://queues/does-not-exist"],
+            "query": { "$and": [] },
+            "organization": format!("{api}/organizations/1"),
+        });
+        std::fs::write(
+            saved_views_dir.join(format!("{slug}.json")),
+            serde_json::to_vec_pretty(&local).unwrap(),
+        )
+        .unwrap();
+
+        let mut lockfile = Lockfile {
+            api_base: api.clone(),
+            ..Lockfile::default()
+        };
+        // Remote is CLEAN (no drift): its shape matches exactly what `base`
+        // is computed from below, so the item reaches the ordinary "clean
+        // update" tail of the concurrent closure -- never the drift /
+        // `NeedsPrompt` path (which a DIFFERENT test already pins).
+        let remote = serde_json::json!({
+            "id": id,
+            "url": format!("{api}/saved_views/{id}"),
+            "name": slug,
+            "shared": true,
+            "queues_filter": [],
+            "query": { "$and": [] },
+            "organization": format!("{api}/organizations/1"),
+        });
+        lockfile.upsert(
+            "saved_views",
+            slug,
+            ObjectEntry {
+                id,
+                modified_at: None,
+                modified_by: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        let codec = crate::snapshot::codec::codec("saved_views").unwrap();
+        let art = codec.disk_bytes(&remote).unwrap();
+        let base = combined_hash(&art.json, &art.sidecars, &lockfile);
+        lockfile.upsert(
+            "saved_views",
+            slug,
+            ObjectEntry {
+                id,
+                modified_at: None,
+                modified_by: None,
+                content_hash: Some(base),
+                secrets_hash: None,
+            },
+        );
+        let mut changes = BTreeMap::new();
+        changes.insert(slug.to_string(), saved_views_dir.join(format!("{slug}.json")));
+
+        let list = serde_json::json!({ "pagination": { "next": null }, "results": [remote] });
+        Mock::given(method("GET"))
+            .and(path("/api/v1/saved_views"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(list))
+            .mount(&server)
+            .await;
+        // No PATCH mock: the guard must stop the push before any PATCH -- one
+        // sent regardless would fail (no mock registered) and be recorded
+        // below either way.
+
+        let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
+        let progress = Arc::new(crate::log::Log::new(crate::cli::resolve::ColorMode::Plain));
+        let err = push(
+            &paths, &client, &mut lockfile, false, &changes, &progress, "dev",
+        )
+        .await
+        .expect_err("a dangling ref in a clean update must stop the push");
+        let msg = err.to_string();
+        assert!(msg.contains(slug), "{msg}");
+        assert!(msg.contains("rdc://queues/does-not-exist"), "{msg}");
+
+        let patched: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method == http::Method::PATCH)
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert!(patched.is_empty(), "no PATCH may be sent, saw {patched:?}");
+    }
+
+    /// Pins the create-path guard call site (mirrors the clean-update test
+    /// above). A brand-new saved view whose `queues_filter` holds a ref to a
+    /// queue that does not exist in this env's lockfile must stop the push
+    /// rather than POST a body that would silently widen the view to the
+    /// WHOLE organization.
+    #[tokio::test]
+    async fn push_saved_views_bails_on_a_dangling_ref_in_a_create() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let api = format!("{}/api/v1", server.uri());
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        let saved_views_dir = paths.saved_views_dir();
+        std::fs::create_dir_all(&saved_views_dir).unwrap();
+
+        let slug = "mine";
+        let local = serde_json::json!({
+            "url": format!("rdc://saved_views/{slug}"),
+            "name": slug,
+            "shared": true,
+            "queues_filter": ["rdc://queues/does-not-exist"],
+            "query": { "$and": [] },
+            "organization": format!("{api}/organizations/1"),
+        });
+        std::fs::write(
+            saved_views_dir.join(format!("{slug}.json")),
+            serde_json::to_vec_pretty(&local).unwrap(),
+        )
+        .unwrap();
+
+        // No lockfile entry -> create. No mocks are mounted at all: the
+        // guard must stop the push before any request, POST included.
+        let mut lockfile = Lockfile {
+            api_base: api.clone(),
+            ..Lockfile::default()
+        };
+        let mut changes = BTreeMap::new();
+        changes.insert(slug.to_string(), saved_views_dir.join(format!("{slug}.json")));
+
+        let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
+        let progress = Arc::new(crate::log::Log::new(crate::cli::resolve::ColorMode::Plain));
+        let err = push(
+            &paths, &client, &mut lockfile, false, &changes, &progress, "dev",
+        )
+        .await
+        .expect_err("a dangling ref in a create must stop the push");
+        let msg = err.to_string();
+        assert!(msg.contains(slug), "{msg}");
+        assert!(msg.contains("rdc://queues/does-not-exist"), "{msg}");
+
+        let posted: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method == http::Method::POST)
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert!(posted.is_empty(), "no POST may be sent, saw {posted:?}");
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "no request of any kind may be sent before the guard runs",
+        );
+    }
 }

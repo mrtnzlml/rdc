@@ -540,12 +540,11 @@ pub(crate) async fn run_cycle(
             for m in &missing_create_fields {
                 let _ = writeln!(
                     body,
-                    "- {}/{} -- {}: `{}` is missing; POST /{} would be rejected",
+                    "- {}/{} -- {}: `{}` is missing; the Rossum API requires it",
                     m.kind,
                     m.slug,
                     m.path.display(),
                     m.field,
-                    m.kind,
                 );
             }
             progress.block(&body);
@@ -1565,14 +1564,18 @@ pub fn from_catalog_scan_lockfile(
 /// Refuse a push over defects that are knowable from local bytes alone.
 ///
 /// All five classes are *permanent*: an unparseable file, an over-length
-/// field, a create missing a field the API demands, a structural problem
-/// in an organization's `settings`, and a local saved view that isn't shared
-/// can never be accepted by the server (or, for the last, would just be
-/// re-created and never recorded — see `snapshot::limits::check_saved_view_shared`),
-/// so attempting the push aborts the cycle before the pull phase on every
-/// single run — wedging the project until a human notices, and (for the
-/// create case) after earlier kinds are already written. Raising them here
-/// keeps the remote untouched and names exactly what to fix.
+/// field, an object missing a field the API demands (always checked on
+/// create; also on update for a kind whose PATCH body is the fully-typed
+/// model re-serialized rather than a partial diff — see
+/// `snapshot::limits::required_for_create_also_applies_to_update`), a
+/// structural problem in an organization's `settings`, and a local saved view
+/// that isn't shared can never be accepted by the server (or, for the last,
+/// would just be re-created and never recorded — see
+/// `snapshot::limits::check_saved_view_shared`), so attempting the push
+/// aborts the cycle before the pull phase on every single run — wedging the
+/// project until a human notices, and (for a create) after earlier kinds are
+/// already written. Raising them here keeps the remote untouched and names
+/// exactly what to fix.
 fn refuse_on_offline_defects(
     parse_errors: &[crate::cli::push::scan::JsonParseError],
     limit_violations: &[crate::cli::push::scan::FieldLimitViolation],
@@ -1625,19 +1628,18 @@ fn refuse_on_offline_defects(
 
     if !missing_create_fields.is_empty() {
         let mut msg = format!(
-            "{} object(s) would be created without a field the Rossum API requires; \
+            "{} object(s) are missing a field the Rossum API requires; \
              refusing to push before any remote write:",
             missing_create_fields.len()
         );
         for m in missing_create_fields {
             let _ = write!(
                 msg,
-                "\n  - {}/{} -- {}: `{}` is missing (POST /{} rejects it)",
+                "\n  - {}/{} -- {}: `{}` is missing (the Rossum API requires it)",
                 m.kind,
                 m.slug,
                 m.path.display(),
                 m.field,
-                m.kind,
             );
         }
         // The overlay is the supported place to declare a per-env value, and

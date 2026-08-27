@@ -232,9 +232,8 @@ impl ChangeList {
         out
     }
 
-    /// Validate every changed local file the push would CREATE against the
-    /// fields the API requires on create (see
-    /// [`crate::snapshot::limits::required_for_create`]).
+    /// Validate every changed local file against the fields the API requires
+    /// (see [`crate::snapshot::limits::required_for_create`]).
     ///
     /// Same permanence argument as [`ChangeList::field_limit_violations`]: the
     /// server's `400` can never be satisfied by retrying, and because the push
@@ -243,24 +242,31 @@ impl ChangeList {
     /// `migrate` into an empty env pushed its workspaces, schemas and queues,
     /// then died on the first `POST /inboxes`).
     ///
-    /// Scoped to creates by the lockfile: an object with an entry is PATCHed,
-    /// and a PATCH that omits the key leaves the remote's value alone. Each
-    /// file is stripped with `strip_for_create` first, so the check sees the
-    /// bytes that actually reach the wire (an `email` key in the file, for
-    /// instance, is gone by then and cannot mask a missing prefix).
+    /// Scoped to creates by the lockfile for most kinds: an object with an
+    /// entry is PATCHed, and a PATCH that omits the key leaves the remote's
+    /// value alone. That premise is false for a kind
+    /// [`crate::snapshot::limits::required_for_create_also_applies_to_update`]
+    /// names — there, the outgoing PATCH is the fully-typed model
+    /// re-serialized, so an absent local field still reaches the wire as an
+    /// explicit `null`/empty value, and an already-tracked object is checked
+    /// too. Each file is stripped with `strip_for_create` first, so the check
+    /// sees the bytes that actually reach the wire (an `email` key in the
+    /// file, for instance, is gone by then and cannot mask a missing prefix).
     pub fn missing_create_fields(&self, lockfile: &Lockfile) -> Vec<MissingCreateField> {
         let mut out = Vec::new();
         let mut check = |kind: &'static str, map: &BTreeMap<String, std::path::PathBuf>| {
             if crate::snapshot::limits::required_for_create(kind).is_empty() {
                 return;
             }
+            let also_on_update =
+                crate::snapshot::limits::required_for_create_also_applies_to_update(kind);
             for (slug, path) in map {
                 let tracked = lockfile
                     .objects
                     .get(kind)
                     .and_then(|m| m.get(slug.as_str()))
                     .is_some();
-                if tracked {
+                if tracked && !also_on_update {
                     continue; // a PATCH, not a POST
                 }
                 let Ok(bytes) = std::fs::read(path) else {
@@ -284,6 +290,7 @@ impl ChangeList {
         check("hooks", &self.hooks);
         check("rules", &self.rules);
         check("labels", &self.labels);
+        check("saved_views", &self.saved_views);
         check("queues", &self.queues);
         check("schemas", &self.schemas);
         check("inboxes", &self.inboxes);
@@ -1404,6 +1411,111 @@ mod tests {
         let v = cl.missing_create_fields(&Lockfile::default());
         assert_eq!(v.len(), 1, "strip_for_create drops `email`: {v:?}");
         assert_eq!(v[0].field, "email_prefix");
+    }
+
+    /// Helper: a ChangeList holding one saved-view file with the given body.
+    fn saved_view_change(
+        dir: &std::path::Path,
+        body: serde_json::Value,
+    ) -> (ChangeList, std::path::PathBuf) {
+        let p = dir.join("mine.json");
+        std::fs::write(&p, serde_json::to_vec(&body).unwrap()).unwrap();
+        let mut cl = ChangeList::default();
+        cl.saved_views.insert("mine".to_string(), p.clone());
+        (cl, p)
+    }
+
+    /// The failure this check exists for: `POST /saved_views` requires
+    /// `query`, and a hand-authored file that never sets it must be refused
+    /// offline rather than sent.
+    #[test]
+    fn missing_create_fields_reports_new_saved_view_without_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cl, p) =
+            saved_view_change(tmp.path(), serde_json::json!({ "name": "Mine", "shared": true }));
+
+        let v = cl.missing_create_fields(&Lockfile::default());
+        assert_eq!(v.len(), 1, "expected exactly one missing field: {v:?}");
+        assert_eq!(v[0].kind, "saved_views");
+        assert_eq!(v[0].slug, "mine");
+        assert_eq!(v[0].path, p);
+        assert_eq!(v[0].field, "query");
+    }
+
+    #[test]
+    fn missing_create_fields_reports_new_saved_view_without_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cl, _) = saved_view_change(
+            tmp.path(),
+            serde_json::json!({ "shared": true, "query": { "$and": [] } }),
+        );
+        let v = cl.missing_create_fields(&Lockfile::default());
+        assert_eq!(v.len(), 1, "expected exactly one missing field: {v:?}");
+        assert_eq!(v[0].field, "name");
+    }
+
+    #[test]
+    fn missing_create_fields_ignores_new_saved_view_with_name_and_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cl, _) = saved_view_change(
+            tmp.path(),
+            serde_json::json!({ "name": "Mine", "shared": true, "query": { "$and": [] } }),
+        );
+        assert!(cl.missing_create_fields(&Lockfile::default()).is_empty());
+    }
+
+    /// The distinctive case this per-kind toggle exists for: unlike every
+    /// other kind (see `missing_create_fields_ignores_a_tracked_inbox`), an
+    /// already-TRACKED saved view is still checked. Its outgoing PATCH is the
+    /// fully-typed `SavedView` model re-serialized, so a local file that never
+    /// sets `query` still sends `"query": null` on update — omitting the key
+    /// locally does not omit it on the wire.
+    #[test]
+    fn missing_create_fields_reports_a_tracked_saved_view_missing_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cl, _) =
+            saved_view_change(tmp.path(), serde_json::json!({ "name": "Mine", "shared": true }));
+        let mut lf = Lockfile::default();
+        lf.upsert(
+            "saved_views",
+            "mine",
+            crate::state::ObjectEntry {
+                id: 9,
+                modified_at: None,
+                modified_by: None,
+                content_hash: Some("h".into()),
+                secrets_hash: None,
+            },
+        );
+        let v = cl.missing_create_fields(&lf);
+        assert_eq!(
+            v.len(),
+            1,
+            "a tracked saved view missing `query` must still be refused: {v:?}"
+        );
+        assert_eq!(v[0].field, "query");
+    }
+
+    #[test]
+    fn missing_create_fields_ignores_a_tracked_saved_view_with_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cl, _) = saved_view_change(
+            tmp.path(),
+            serde_json::json!({ "name": "Mine", "shared": true, "query": { "$and": [] } }),
+        );
+        let mut lf = Lockfile::default();
+        lf.upsert(
+            "saved_views",
+            "mine",
+            crate::state::ObjectEntry {
+                id: 9,
+                modified_at: None,
+                modified_by: None,
+                content_hash: Some("h".into()),
+                secrets_hash: None,
+            },
+        );
+        assert!(cl.missing_create_fields(&lf).is_empty());
     }
 
     /// An oversized field in a changed local file must be reported with

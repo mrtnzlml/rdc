@@ -429,14 +429,38 @@ pub fn check_text(field: impl Into<String>, limit: usize, text: &str) -> Option<
 ///   because it is server-derived (`<email_prefix>-<hash>@<host>`), so a
 ///   hand-written `email` never reaches the wire either. That leaves
 ///   `email_prefix` as the operative requirement.
+/// - **`saved_views` → `name`, `query`.** Both are required by the API on
+///   `POST /saved_views`; `name` has no local default so an absent one fails
+///   deserialization outright, and `query` is `#[serde(default)] pub query:
+///   Value` on [`crate::model::SavedView`] with no `skip_serializing_if`, so
+///   an absent local `query` defaults to `Value::Null` and is what actually
+///   reaches the wire. See [`required_for_create_also_applies_to_update`] —
+///   unlike every other kind here, this one is not create-only.
 ///
-/// Checked only for objects the push will POST; a PATCH that omits a key
-/// leaves the remote's value alone and needs nothing from this table.
+/// Checked for objects the push will POST; a PATCH that omits a key usually
+/// leaves the remote's value alone and needs nothing from this table — EXCEPT
+/// for a kind where [`required_for_create_also_applies_to_update`] says
+/// otherwise.
 pub fn required_for_create(kind: &str) -> &'static [&'static str] {
     match kind {
         "inboxes" => &["email_prefix"],
+        "saved_views" => &["name", "query"],
         _ => &[],
     }
+}
+
+/// True for a kind whose PATCH body is the fully-typed model re-serialized,
+/// rather than a partial diff of only the keys the local file actually sets —
+/// so a [`required_for_create`] field left absent/null locally still reaches
+/// the wire on an UPDATE too, as an explicit `null` (or empty string), not
+/// simply omitted the way most kinds' PATCH bodies leave an unset key alone.
+///
+/// `saved_views` is the only such kind today (see the `query` note on
+/// [`required_for_create`]). Callers that skip already-tracked (PATCH)
+/// objects when sweeping for missing create-required fields must NOT skip
+/// them for a kind this returns `true` for.
+pub fn required_for_create_also_applies_to_update(kind: &str) -> bool {
+    matches!(kind, "saved_views")
 }
 
 /// The [`required_for_create`] fields missing from one create payload.
@@ -489,6 +513,46 @@ mod tests {
                 missing_required_for_create("inboxes", &body),
                 vec!["email_prefix"],
                 "expected {v} to count as missing"
+            );
+        }
+    }
+
+    #[test]
+    fn new_saved_view_missing_name_or_query_is_reported() {
+        assert_eq!(
+            missing_required_for_create("saved_views", &json!({ "query": { "$and": [] } })),
+            vec!["name"],
+        );
+        assert_eq!(
+            missing_required_for_create("saved_views", &json!({ "name": "Mine" })),
+            vec!["query"],
+        );
+        // Absent `query` deserializes to `Value::Null` on `SavedView` (no
+        // `skip_serializing_if`), so a literal `null` must be caught
+        // identically to an absent key.
+        assert_eq!(
+            missing_required_for_create(
+                "saved_views",
+                &json!({ "name": "Mine", "query": null })
+            ),
+            vec!["query"],
+        );
+    }
+
+    #[test]
+    fn new_saved_view_with_name_and_query_passes() {
+        let body = json!({ "name": "Mine", "query": { "$and": [] } });
+        assert!(missing_required_for_create("saved_views", &body).is_empty());
+    }
+
+    #[test]
+    fn saved_views_is_the_only_kind_required_on_update_too() {
+        assert!(required_for_create_also_applies_to_update("saved_views"));
+        for kind in ["inboxes", "hooks", "queues", "schemas", "workspaces", "rules", "labels"] {
+            assert!(
+                !required_for_create_also_applies_to_update(kind),
+                "{kind} must stay create-only: a PATCH that omits a key leaves \
+                 the remote's value alone for every kind but saved_views"
             );
         }
     }
