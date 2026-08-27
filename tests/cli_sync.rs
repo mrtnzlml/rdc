@@ -12869,3 +12869,377 @@ async fn mdh_listing_is_dispatched_alongside_the_core_list_stream() {
         requests.len(),
     );
 }
+
+/// Pull-side RemoteCreate for a saved view, and the shared-only filter.
+///
+/// The env exposes one shared and one private view. Only the shared one may
+/// reach the snapshot — the filter is the safety boundary for this kind, and no
+/// mock can prove it any other way because the server ignores `?shared=true`.
+#[tokio::test]
+async fn sync_pulls_shared_saved_views_and_ignores_private_ones() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let views_body = serde_json::json!({
+        "pagination": { "total": 2, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 11,
+                "url": format!("{}/api/v1/saved_views/11", server.uri()),
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "name": "Awaiting approval",
+                "shared": true,
+                "queues_filter": [],
+                "query": { "$and": [ { "status": { "$in": ["to_review"] } } ] },
+                "created_by": format!("{}/api/v1/users/7", server.uri()),
+                "created_at": "2026-08-01T08:00:00Z",
+                "modified_at": "2026-08-02T09:00:00Z"
+            },
+            {
+                "id": 12,
+                "url": format!("{}/api/v1/saved_views/12", server.uri()),
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "name": "Just mine",
+                "shared": false,
+                "queues_filter": [],
+                "query": { "$and": [] },
+                "created_by": format!("{}/api/v1/users/8", server.uri()),
+                "created_at": "2026-08-01T08:00:00Z",
+                "modified_at": "2026-08-02T09:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/saved_views"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(views_body))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/saved_views"]).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+    result.expect("sync should succeed");
+
+    // Pull-side only: no mutations.
+    for req in server.received_requests().await.unwrap_or_default() {
+        let p = req.url.path();
+        if p.contains("/svc/data-storage/") {
+            continue;
+        }
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "unexpected mutating request: {} {}",
+            req.method,
+            p
+        );
+    }
+
+    let dir = project.path().join("envs/dev/saved-views");
+    let shared_path = dir.join("awaiting-approval.json");
+    assert!(shared_path.exists(), "shared view must be written");
+
+    let files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        files,
+        vec!["awaiting-approval.json".to_string()],
+        "the private view must NOT be snapshotted; got {files:?}"
+    );
+
+    // Server-owned fields must not be on disk.
+    let body = std::fs::read_to_string(&shared_path).unwrap();
+    for gone in ["created_by", "created_at", "modified_at", "modified_by"] {
+        assert!(!body.contains(gone), "{gone} must be stripped; got:\n{body}");
+    }
+    assert!(body.contains("Awaiting approval"), "content: {body}");
+
+    let lf = std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    assert!(lf.contains("saved_views"), "lockfile must record the kind: {lf}");
+    assert!(lf.contains("awaiting-approval"), "lockfile must record the slug: {lf}");
+    assert!(
+        !lf.contains("just-mine"),
+        "the private view must not be in the lockfile: {lf}"
+    );
+}
+
+/// A local edit to a tracked saved view must actually reach the API.
+///
+/// Regression pin for ruling R15: `change_list_from_classified` originally had
+/// no `saved_views` arm, so an edited view classified correctly as `LocalEdit`
+/// and was then silently dropped before the push phase — no error, no warning,
+/// no request.
+#[tokio::test]
+async fn sync_local_edit_patches_a_saved_view() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    // The saved view remote serves throughout the test (both the initial pull
+    // that seeds the lockfile and the subsequent sync's listing). The sync's
+    // push driver also re-lists saved views for drift detection — the body
+    // it sees here must hash to the base recorded by pull.
+    let base_view = serde_json::json!({
+        "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+        "results": [
+            {
+                "id": 21,
+                "url": format!("{}/api/v1/saved_views/21", server.uri()),
+                "organization": format!("{}/api/v1/organizations/1", server.uri()),
+                "name": "Awaiting approval",
+                "shared": true,
+                "queues_filter": [],
+                "query": { "$and": [ { "status": { "$in": ["to_review"] } } ] },
+                "created_by": format!("{}/api/v1/users/7", server.uri()),
+                "created_at": "2026-08-01T08:00:00Z",
+                "modified_at": "2026-08-02T09:00:00Z"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/saved_views"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&base_view))
+        .mount(&server)
+        .await;
+
+    mock_empty_lists_except(&server, &["/api/v1/saved_views"]).await;
+
+    // PATCH /saved_views/21: server confirms the edit. `.expect(1)` enforces
+    // that exactly one PATCH call lands during the second sync.
+    let patched_name = "Awaiting manager approval";
+    let patch_response = serde_json::json!({
+        "id": 21,
+        "url": format!("{}/api/v1/saved_views/21", server.uri()),
+        "organization": format!("{}/api/v1/organizations/1", server.uri()),
+        "name": patched_name,
+        "shared": true,
+        "queues_filter": [],
+        "query": { "$and": [ { "status": { "$in": ["to_review"] } } ] },
+        "modified_at": "2026-08-02T10:00:00Z"
+    });
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/saved_views/21"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&patch_response))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // First sync: pulls the saved view and populates the lockfile with the
+    // base content hash. Pull-side branch handles this.
+    rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
+    )
+    .await
+    .expect("first sync should succeed");
+
+    // Edit the local saved view file — this triggers the push-side LocalEdit
+    // class on the second sync. The remote still serves the pre-edit body,
+    // so `remote_hash == base_hash` and `local_hash != base_hash`.
+    let view_path = project.path().join("envs/dev/saved-views/awaiting-approval.json");
+    assert!(
+        view_path.exists(),
+        "first sync should have written the saved view"
+    );
+    let raw = std::fs::read_to_string(&view_path).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    v["name"] = serde_json::Value::String(patched_name.to_string());
+    std::fs::write(
+        &view_path,
+        format!("{}\n", serde_json::to_string_pretty(&v).unwrap()),
+    )
+    .unwrap();
+
+    // Snapshot lockfile hash before second sync so we can assert it changes.
+    let lf_before =
+        std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+
+    // Second sync: classifier sees LocalEdit; executor must PATCH.
+    let result = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    result.expect("second sync should succeed and PATCH the remote saved view");
+
+    // This is the regression pin for ruling R15: `change_list_from_classified`
+    // originally had no `saved_views` arm, so this LocalEdit was silently
+    // dropped before the push phase and no request ever left the process.
+    // Assert on the request BODY, not merely that a PATCH arrived.
+    let patch_reqs: Vec<_> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.method == http::Method::PATCH && r.url.path() == "/api/v1/saved_views/21")
+        .collect();
+    assert_eq!(
+        patch_reqs.len(),
+        1,
+        "exactly one PATCH /saved_views/21 expected, saw {}",
+        patch_reqs.len()
+    );
+    let patch_body: serde_json::Value = serde_json::from_slice(&patch_reqs[0].body).unwrap();
+    assert_eq!(
+        patch_body.get("name").and_then(|v| v.as_str()),
+        Some(patched_name),
+        "the PATCH body must carry the edited name: {patch_body}"
+    );
+
+    // The local file is rewritten to the server's post-PATCH canonical form,
+    // so the edited name survives.
+    let body_on_disk = std::fs::read_to_string(&view_path).unwrap();
+    assert!(
+        body_on_disk.contains(patched_name),
+        "local file should retain the edited name after PATCH: {body_on_disk}"
+    );
+
+    // Lockfile hash for saved-views/awaiting-approval must have changed: it
+    // now records the post-PATCH canonical form, not the pre-edit base.
+    let lf_after =
+        std::fs::read_to_string(project.path().join(".rdc/state/dev.lock.json")).unwrap();
+    assert_ne!(
+        lf_before, lf_after,
+        "lockfile must update after a successful PATCH"
+    );
+    assert!(
+        lf_after.contains("awaiting-approval"),
+        "lockfile keeps the slug: {lf_after}"
+    );
+}
+
+/// A hand-authored view without `shared: true` is refused offline — before the
+/// first remote write, so a permanent failure cannot wedge the project.
+#[tokio::test]
+async fn sync_refuses_an_unshared_saved_view() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &[]).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let dir = project.path().join("envs/dev/saved-views");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("mine.json"),
+        br#"{"name":"Mine","shared":false,"query":{"$and":[]}}"#,
+    )
+    .unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("saved-views/mine"))
+        .stderr(predicates::str::contains("shared"));
+
+    // Refused BEFORE the first write: no mutating request reached the server.
+    for req in server.received_requests().await.unwrap_or_default() {
+        assert!(
+            !matches!(
+                req.method,
+                http::Method::POST | http::Method::PATCH | http::Method::DELETE
+            ),
+            "refusal must precede every remote write; saw {} {}",
+            req.method,
+            req.url.path()
+        );
+    }
+
+    // `--dry-run` gained a preview section for unshared saved views in an
+    // earlier task and nothing else in this suite exercises it. Unlike a real
+    // push, a preview must not refuse -- it succeeds and reports the defect
+    // instead of silently ignoring it, so a hand-authored file is visible in
+    // the plan before anyone runs the real sync that would refuse it.
+    let dry = assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["sync", "dev", "--dry-run"])
+        .output()
+        .unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&dry.stdout),
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    assert!(dry.status.success(), "dry-run must succeed: {all}");
+    assert!(
+        all.contains("saved-views/mine"),
+        "dry-run must report the unshared view: {all}"
+    );
+    assert!(
+        all.contains("unshared saved view"),
+        "dry-run summary should mention the unshared-view count: {all}"
+    );
+}
