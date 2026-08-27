@@ -15,7 +15,7 @@ async fn live_janitor_sweep() {
     let client = LiveClient::connect(&cfg).expect("connect");
     teardown_by_prefix(&client, RunId::marker()).await.expect("janitor sweep");
     // Synchronously-deletable kinds MUST be fully gone after the sweep.
-    for kind in ["workspace", "hook", "label", "rule", "inbox"] {
+    for kind in ["workspace", "hook", "label", "rule", "inbox", "saved_view"] {
         let left = client.list_ids_by_name_prefix(kind, RunId::marker()).await.unwrap_or_default();
         assert!(left.is_empty(), "janitor left {kind} objects: {left:?}");
     }

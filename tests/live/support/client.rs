@@ -77,6 +77,10 @@ impl LiveClient {
                 let t = self.inner.create_email_template(body, None).await?;
                 (t.id, t.url)
             }
+            "saved_view" => {
+                let v = self.inner.create_saved_view(body, None).await?;
+                (v.id, v.url)
+            }
             other => return Err(anyhow!("create: unsupported kind '{other}'")),
         };
         Ok((id, url))
@@ -92,6 +96,10 @@ impl LiveClient {
             "label" => self.inner.delete_label(id, None).await,
             "rule" => self.inner.delete_rule(id, None).await,
             "email_template" => self.inner.delete_email_template(id, None).await,
+            // No `delete_saved_view` on `RossumClient` — `rdc` itself deletes
+            // saved views through the generic `delete_path`, and this test
+            // client does the same rather than adding a one-off wrapper.
+            "saved_view" => self.inner.delete_path(&format!("/saved_views/{id}"), None).await,
             other => Err(anyhow!("delete: unsupported kind '{other}'")),
         }
     }
@@ -111,6 +119,12 @@ impl LiveClient {
             "rule" => to_values(self.inner.list_rules(None).await?)?,
             "inbox" => to_values(self.inner.list_inboxes(None).await?)?,
             "email_template" => to_values(self.inner.list_email_templates(None).await?)?,
+            // Raw listing, unfiltered: unlike `pull::saved_views::list`, this
+            // includes private views too — needed so teardown can find and
+            // delete the private view a scenario creates alongside a shared
+            // one (rdc itself never manages the private one, so it never
+            // reaches the lockfile-driven cleanup any other kind gets).
+            "saved_view" => to_values(self.inner.list_saved_views(None).await?)?,
             other => return Err(anyhow!("list: unsupported kind '{other}'")),
         };
         let mut out = Vec::new();
@@ -251,6 +265,16 @@ impl LiveClient {
             "workspace" => self
                 .inner
                 .list_workspaces(None)
+                .await?
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<Result<_, _>>()?,
+            // No GET-by-id for saved views (same as "label"/"queue" above);
+            // list + find is the only way to check whether one still exists,
+            // i.e. this IS the "GET -> 404" check for this kind.
+            "saved_view" => self
+                .inner
+                .list_saved_views(None)
                 .await?
                 .into_iter()
                 .map(serde_json::to_value)

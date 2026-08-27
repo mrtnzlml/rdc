@@ -6,4 +6,5 @@ pub mod janitor;
 pub mod mdh;
 pub mod organization;
 pub mod round_trip;
+pub mod saved_views;
 pub mod sidecars;

@@ -22,7 +22,7 @@ async fn embed_sync_no_push_pulls_into_tempdir() {
     for kind in [
         "workspaces", "queues", "schemas", "inboxes", "hooks", "rules",
         "labels", "engines", "engine_fields", "workflows", "workflow_steps",
-        "email_templates",
+        "email_templates", "saved_views",
     ] {
         Mock::given(method("GET"))
             .and(path(format!("/{}", kind)))

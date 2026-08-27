@@ -226,8 +226,10 @@ mod tests {
     #[test]
     fn nested_query_queue_ref_round_trips_through_portabilize() {
         use crate::snapshot::refs::{portabilize_value, resolve_value};
-        let mut lockfile = Lockfile::default();
-        lockfile.api_base = "https://acme.rossum.app/api/v1".to_string();
+        let mut lockfile = Lockfile {
+            api_base: "https://acme.rossum.app/api/v1".to_string(),
+            ..Default::default()
+        };
         lockfile.upsert(
             "queues",
             "invoices",

@@ -52,6 +52,20 @@ pub async fn teardown_by_prefix(client: &LiveClient, prefix: &str) -> Result<()>
             }
         }
     }
+
+    // Saved views: flat, org-scoped, and referenced by nothing else this
+    // sweep deletes, so their position is free (same reasoning as
+    // `push::deletes`' cascade-order comment). Listed WITHOUT the
+    // shared-only filter `rdc` itself applies, so a private view a scenario
+    // created alongside a shared one — never reachable through the
+    // lockfile-driven cleanup any other kind gets — is still swept here.
+    if let Ok(found) = client.list_ids_by_name_prefix("saved_view", prefix).await {
+        for (id, name) in found {
+            if let Err(e) = client.delete("saved_view", id).await {
+                eprintln!("teardown: delete saved_view {id} ({name}) failed (continuing): {e:#}");
+            }
+        }
+    }
     Ok(())
 }
 
