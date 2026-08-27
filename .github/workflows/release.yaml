@@ -4,9 +4,31 @@ on:
   push:
     tags:
       - 'v*'
+  # Called directly by weekly-release.yaml. A tag pushed with the default
+  # GITHUB_TOKEN does NOT start the `push` trigger above -- GitHub suppresses
+  # events raised by that token to prevent recursion -- so the scheduled release
+  # has to call this workflow rather than rely on the tag it just wrote.
+  # `workflow_call` is not a trigger, so the restriction never applies.
+  workflow_call:
+    inputs:
+      tag:
+        description: >-
+          The release tag to build and publish, e.g. "v0.8.0". Set only by a
+          caller; on the tag-push path it is absent and every use below falls
+          back to github.ref_name. GitHub's expression docs are explicit that
+          dereferencing a nonexistent property yields an empty string, so the
+          fallback is exact rather than lucky.
+        required: true
+        type: string
 
 permissions:
   contents: write
+
+# Serialised against weekly-release.yaml's `prepare` job, which holds the same
+# group while it decides and tags. No cancel-in-progress: a release must never
+# be killed halfway through publishing.
+concurrency:
+  group: rdc-release
 
 jobs:
   build:
@@ -26,6 +48,11 @@ jobs:
             os: windows-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # On the call path the run's ref is the caller's (main); pin to the
+          # tag so this builds what the tag names. On the tag-push path
+          # github.ref is already refs/tags/vX.Y.Z, so this is a no-op.
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -47,7 +74,7 @@ jobs:
       - name: Package
         shell: bash
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           # Asset names carry the version so a downloaded tarball identifies
           # itself. templates/gitlab-ci.yml matches on the trailing platform
@@ -76,7 +103,7 @@ jobs:
     uses: ./.github/workflows/desktop-build.yml
     secrets: inherit
     with:
-      version_label: ${{ github.ref_name }}
+      version_label: ${{ inputs.tag || github.ref_name }}
 
   release:
     name: Publish release
@@ -88,6 +115,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # On the call path the run's ref is the caller's (main); pin to the
+          # tag so this builds what the tag names. On the tag-push path
+          # github.ref is already refs/tags/vX.Y.Z, so this is a no-op.
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Download artifacts
         uses: actions/download-artifact@v8
@@ -127,7 +159,7 @@ jobs:
       - name: Regenerate formula
         shell: bash
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
           version="${TAG#v}"
@@ -195,4 +227,4 @@ jobs:
           git commit -m "rdc ${TAG}"
           git push
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
