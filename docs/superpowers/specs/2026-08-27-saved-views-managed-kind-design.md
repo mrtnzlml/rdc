@@ -37,6 +37,7 @@ drives most of the decisions below.
 | `query` with a bare integer queue id | **400** `Incorrect type. Expected URL string, received int.` |
 | `query` with a stringified integer queue id | **400** `Invalid hyperlink - No URL match.` |
 | `query` with an unknown filter key | **400** `At least one definition of a field required.` |
+| `query` = `{"$and": []}` (empty `$and`) | **400** `{"query":{"$and":["This list may not be empty."]}}` — an empty `$and` is NOT a valid "match everything" query (found by the live scenario, 2026-08-27; the spike had only ever probed non-empty `$and`) |
 | `query` with `labels: [bogus label URL]` | **400** hyperlink error — label refs ARE validated |
 | `query` with `modifier: [real active org user URL]` | **201** — user refs are valid and hyperlink-validated |
 | `query` with `field.<nonexistent_schema_id>.string` | **201 — NOT validated.** Field-id keys are unchecked |
