@@ -9,6 +9,15 @@ on:
   # events raised by that token to prevent recursion -- so the scheduled release
   # has to call this workflow rather than rely on the tag it just wrote.
   # `workflow_call` is not a trigger, so the restriction never applies.
+  # Re-drive a release onto a tag that already exists -- the recovery path when
+  # the builds succeed but publishing does not, which would otherwise leave a
+  # tag with no release behind.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and publish, e.g. "v0.8.0".'
+        required: true
+        type: string
   workflow_call:
     inputs:
       tag:
@@ -133,6 +142,11 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:
+          # MUST be explicit. The action otherwise infers the tag from
+          # github.ref, which is a tag ref only on the push path -- on the
+          # workflow_call and workflow_dispatch paths it is refs/heads/main and
+          # the action fails with "GitHub Releases requires a tag".
+          tag_name: ${{ inputs.tag || github.ref_name }}
           # Widened from *.tar.gz to also pick up the desktop .dmg and .zip.
           # The glob still matches the CLI tarballs when the desktop jobs
           # failed, so fail_on_unmatched_files keeps the strength it had.
