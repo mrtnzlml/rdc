@@ -9,7 +9,7 @@ pub use rate_limit::RateLimiter;
 
 use crate::model::{
     EmailTemplate, Engine, EngineField, Hook, HookTemplate, Inbox, Label, Organization, Queue,
-    Rule, Schema, User, Workflow, WorkflowStep, Workspace,
+    Rule, SavedView, Schema, User, Workflow, WorkflowStep, Workspace,
 };
 use crate::api::retry::ProgressHandle;
 use anyhow::{Context, Result};
@@ -148,6 +148,10 @@ impl RossumClient {
         self.list_paginated("/labels", progress).await
     }
 
+    pub async fn list_saved_views(&self, progress: ProgressHandle) -> Result<Vec<SavedView>> {
+        self.list_paginated("/saved_views", progress).await
+    }
+
     pub async fn list_engines(&self, progress: ProgressHandle) -> Result<Vec<Engine>> {
         self.list_paginated("/engines", progress).await
     }
@@ -258,6 +262,10 @@ impl RossumClient {
         self.post_json("/labels", body, progress).await
     }
 
+    pub async fn create_saved_view(&self, body: &serde_json::Value, progress: ProgressHandle) -> Result<SavedView> {
+        self.post_json("/saved_views", body, progress).await
+    }
+
     pub async fn create_rule(&self, body: &serde_json::Value, progress: ProgressHandle) -> Result<Rule> {
         self.post_json("/rules", body, progress).await
     }
@@ -325,6 +333,15 @@ impl RossumClient {
 
     pub async fn update_label(&self, id: u64, label: &Label, progress: ProgressHandle) -> Result<Label> {
         self.patch_json(&format!("/labels/{id}"), label, progress).await
+    }
+
+    /// `PATCH /saved_views/{id}`.
+    ///
+    /// There is no `delete_saved_view`: `push::deletes` issues DELETE through
+    /// the generic `delete_path("/{kind}/{id}")`, and the kind string
+    /// `saved_views` is already the correct path segment.
+    pub async fn update_saved_view(&self, id: u64, view: &SavedView, progress: ProgressHandle) -> Result<SavedView> {
+        self.patch_json(&format!("/saved_views/{id}"), view, progress).await
     }
 
     /// `PATCH /organizations/{id}`.
