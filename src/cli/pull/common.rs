@@ -311,8 +311,11 @@ pub async fn list_remote(
                         anyhow::Ok(Listed::EmailTemplates(r))
                     }
                     Kind::SavedViews => {
-                        let r = crate::cli::pull::saved_views::list(ctx_ref, progress).await;
-                        r.map(Listed::SavedViews)
+                        let r = crate::cli::pull::saved_views::list(ctx_ref, progress)
+                            .await
+                            .with_context(|| format!("listing saved views for env '{env}'"))?;
+                        progress.event(Action::List, &format!("saved_views ({})", r.len()));
+                        anyhow::Ok(Listed::SavedViews(r))
                     }
                 }
             }
