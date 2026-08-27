@@ -145,7 +145,7 @@ impl Overlay {
     /// caller iterate the whole overlay uniformly — e.g. to validate that each
     /// key targets an object the migration actually produces.
     #[allow(clippy::type_complexity)]
-    pub fn kind_maps(&self) -> [(&'static str, &BTreeMap<String, BTreeMap<String, Value>>); 9] {
+    pub fn kind_maps(&self) -> [(&'static str, &BTreeMap<String, BTreeMap<String, Value>>); 10] {
         [
             ("hooks", &self.hooks),
             ("rules", &self.rules),
@@ -156,6 +156,7 @@ impl Overlay {
             ("email_templates", &self.email_templates),
             ("engines", &self.engines),
             ("engine_fields", &self.engine_fields),
+            ("saved_views", &self.saved_views),
         ]
     }
 }
@@ -373,7 +374,7 @@ columns = [
         // `kind_maps` drives migrate's dangling-key check, which validates every
         // key against a real slug. The org has no slugs, so it must stay out.
         let ov: Overlay = toml::from_str("version = 1\n").unwrap();
-        assert_eq!(ov.kind_maps().len(), 9);
+        assert_eq!(ov.kind_maps().len(), 10);
         assert!(ov.kind_maps().iter().all(|(k, _)| *k != "organization"));
     }
 
@@ -400,5 +401,17 @@ columns = [ { visible = true, column_type = "meta", width = 1.0, meta_name = "st
         assert_eq!(cols.len(), 1, "arrays replace wholesale, they do not merge: {value}");
         assert_eq!(cols[0]["meta_name"], serde_json::json!("status"));
         assert_eq!(value["name"], serde_json::json!("Acme"), "untouched keys survive");
+    }
+
+    #[test]
+    fn kind_maps_includes_saved_views() {
+        let o = Overlay::default();
+        assert!(o.kind_maps().iter().any(|(k, _)| *k == "saved_views"));
+    }
+
+    #[test]
+    fn an_overlay_without_saved_views_still_parses() {
+        let o: Overlay = toml::from_str("version = 1\n").unwrap();
+        assert!(o.saved_views.is_empty());
     }
 }

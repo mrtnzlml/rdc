@@ -89,6 +89,10 @@ pub enum PendingRename {
         old: String,
         new: String,
     },
+    SavedView {
+        old: String,
+        new: String,
+    },
 }
 
 impl PendingRename {
@@ -107,6 +111,7 @@ impl PendingRename {
             PendingRename::EngineField { old, new } => format!("engine_fields/{old} -> {new}"),
             PendingRename::Workflow { old, new } => format!("workflows/{old} -> {new}"),
             PendingRename::WorkflowStep { old, new } => format!("workflow_steps/{old} -> {new}"),
+            PendingRename::SavedView { old, new } => format!("saved_views/{old} -> {new}"),
         }
     }
 }
@@ -171,6 +176,9 @@ pub fn detect(paths: &Paths, lockfile: &Lockfile) -> Vec<PendingRename> {
     });
     detect_flat_kind(lockfile, "labels", paths.labels_dir(), &mut out, |o, n| {
         PendingRename::Label { old: o, new: n }
+    });
+    detect_flat_kind(lockfile, "saved_views", paths.saved_views_dir(), &mut out, |o, n| {
+        PendingRename::SavedView { old: o, new: n }
     });
     detect_engines(paths, lockfile, &mut out);
     detect_engine_fields(paths, lockfile, &mut out);
@@ -635,11 +643,12 @@ fn base_sidecars(kind: &str, base_json_path: &std::path::Path) -> Vec<(String, V
 /// single applied rename implies. Emitted for every kind that other objects
 /// reference by a whole-token `rdc://<kind>/<slug>` value: workspaces, queues
 /// (which also drag their schema/inbox — those share the queue slug), hooks,
-/// rules, labels, engines, and workflows (queues' `workflows[]` and steps'
-/// `workflow` field point at them). This also rewrites the renamed object's
-/// own `url`. The compound-keyed leaf kinds nothing references by a whole
-/// token (engine_fields / email_templates / workflow_steps) instead get a
-/// prefix rewrite of their own compound url via `compound_prefix_pairs`.
+/// rules, labels, engines, workflows (queues' `workflows[]` and steps'
+/// `workflow` field point at them), and saved views. This also rewrites the
+/// renamed object's own `url`. The compound-keyed leaf kinds nothing
+/// references by a whole token (engine_fields / email_templates /
+/// workflow_steps) instead get a prefix rewrite of their own compound url
+/// via `compound_prefix_pairs`.
 fn ref_subst_pairs(p: &PendingRename) -> Vec<(String, String)> {
     let pair = |kind: &str, old: &str, new: &str| {
         (
@@ -659,6 +668,7 @@ fn ref_subst_pairs(p: &PendingRename) -> Vec<(String, String)> {
         PendingRename::Label { old, new } => vec![pair("labels", old, new)],
         PendingRename::Engine { old, new } => vec![pair("engines", old, new)],
         PendingRename::Workflow { old, new } => vec![pair("workflows", old, new)],
+        PendingRename::SavedView { old, new } => vec![pair("saved_views", old, new)],
         PendingRename::EngineField { .. }
         | PendingRename::WorkflowStep { .. }
         | PendingRename::EmailTemplate { .. } => Vec::new(),
@@ -844,6 +854,15 @@ fn apply_one(paths: &Paths, lockfile: &mut Lockfile, p: &PendingRename) -> Resul
             )?;
             rename_lockfile_key(lockfile, "labels", old, new);
             collect_orphans(paths, "labels", old, &mut orphans);
+        }
+        PendingRename::SavedView { old, new } => {
+            move_file(
+                paths,
+                &paths.saved_views_dir().join(format!("{old}.json")),
+                &paths.saved_views_dir().join(format!("{new}.json")),
+            )?;
+            rename_lockfile_key(lockfile, "saved_views", old, new);
+            collect_orphans(paths, "saved_views", old, &mut orphans);
         }
         PendingRename::Engine { old, new } => {
             // Engines own a dir (engine.json + fields/); a rename moves
@@ -1072,6 +1091,7 @@ fn overlay_rewrites_for(p: &PendingRename) -> Vec<OverlayRewrite> {
         PendingRename::Hook { old, new } => vec![whole("hooks", old, new)],
         PendingRename::Rule { old, new } => vec![whole("rules", old, new)],
         PendingRename::Label { old, new } => vec![whole("labels", old, new)],
+        PendingRename::SavedView { old, new } => vec![whole("saved_views", old, new)],
         PendingRename::EngineField { old, new } => vec![whole("engine_fields", old, new)],
         PendingRename::EmailTemplate { ws, q, old, new } => vec![whole(
             "email_templates",
@@ -1093,7 +1113,7 @@ fn overlay_rewrites_for(p: &PendingRename) -> Vec<OverlayRewrite> {
 }
 
 /// The overlay kinds, matching [`crate::overlay::Overlay::kind_maps`].
-const OVERLAY_KINDS: [&str; 9] = [
+const OVERLAY_KINDS: [&str; 10] = [
     "hooks",
     "rules",
     "labels",
@@ -1103,6 +1123,7 @@ const OVERLAY_KINDS: [&str; 9] = [
     "email_templates",
     "engines",
     "engine_fields",
+    "saved_views",
 ];
 
 /// Enumerate the keys present under each overlay kind table. Best-effort: a

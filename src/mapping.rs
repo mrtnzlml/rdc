@@ -44,6 +44,9 @@ pub struct Mapping {
     /// Engine field slug → engine field slug.
     #[serde(default)]
     pub engine_fields: BTreeMap<String, String>,
+    /// Saved-view slug → saved-view slug.
+    #[serde(default)]
+    pub saved_views: BTreeMap<String, String>,
 }
 
 impl Default for Mapping {
@@ -60,6 +63,7 @@ impl Default for Mapping {
             email_templates: BTreeMap::new(),
             engines: BTreeMap::new(),
             engine_fields: BTreeMap::new(),
+            saved_views: BTreeMap::new(),
         }
     }
 }
@@ -126,6 +130,7 @@ impl Mapping {
             "email_templates" => &self.email_templates,
             "engines" => &self.engines,
             "engine_fields" => &self.engine_fields,
+            "saved_views" => &self.saved_views,
             _ => return None,
         })
     }
@@ -145,6 +150,7 @@ impl Mapping {
             "email_templates" => &mut self.email_templates,
             "engines" => &mut self.engines,
             "engine_fields" => &mut self.engine_fields,
+            "saved_views" => &mut self.saved_views,
             _ => return None,
         })
     }
@@ -184,6 +190,8 @@ pub struct GenericMapping {
     pub engines: Vec<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub engine_fields: Vec<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub saved_views: Vec<BTreeMap<String, String>>,
 }
 
 impl Default for GenericMapping {
@@ -200,14 +208,16 @@ impl Default for GenericMapping {
             email_templates: Vec::new(),
             engines: Vec::new(),
             engine_fields: Vec::new(),
+            saved_views: Vec::new(),
         }
     }
 }
 
 impl GenericMapping {
-    pub const KINDS: [&'static str; 10] = [
+    pub const KINDS: [&'static str; 11] = [
         "workspaces", "hooks", "rules", "labels", "schemas",
         "queues", "inboxes", "email_templates", "engines", "engine_fields",
+        "saved_views",
     ];
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -249,6 +259,7 @@ impl GenericMapping {
             "email_templates" => &self.email_templates,
             "engines" => &self.engines,
             "engine_fields" => &self.engine_fields,
+            "saved_views" => &self.saved_views,
             _ => return None,
         })
     }
@@ -265,6 +276,7 @@ impl GenericMapping {
             "email_templates" => &mut self.email_templates,
             "engines" => &mut self.engines,
             "engine_fields" => &mut self.engine_fields,
+            "saved_views" => &mut self.saved_views,
             _ => return None,
         })
     }
@@ -749,6 +761,7 @@ version = 1
             email_templates: vec![row()],
             engines: vec![row()],
             engine_fields: vec![row()],
+            saved_views: vec![row()],
         };
 
         let value = serde_json::to_value(&full).expect("serialize GenericMapping");
@@ -777,5 +790,22 @@ version = 1
                 "kind_rows_mut has no arm for KINDS entry '{kind}'"
             );
         }
+    }
+
+    #[test]
+    fn saved_views_is_a_mapping_kind() {
+        assert!(GenericMapping::KINDS.contains(&"saved_views"));
+        let g = GenericMapping::default();
+        assert!(g.kind_rows("saved_views").is_some());
+        let m = Mapping::default();
+        assert!(m.kind_map("saved_views").is_some());
+    }
+
+    #[test]
+    fn a_mapping_toml_without_saved_views_still_parses() {
+        // Backward compatibility: an existing project's mapping file predates
+        // the kind and must load unchanged.
+        let g: GenericMapping = toml::from_str("version = 2\n").unwrap();
+        assert!(g.kind_rows("saved_views").unwrap().is_empty());
     }
 }

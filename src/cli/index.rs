@@ -63,6 +63,7 @@ pub fn generate(paths: &Paths, lockfile: &Lockfile) -> Result<()> {
     emit_hooks(&mut md, &ctx);
     emit_rules(&mut md, &ctx);
     emit_labels(&mut md, &ctx);
+    emit_saved_views(&mut md, &ctx);
     emit_engines(&mut md, &ctx);
     emit_engine_fields(&mut md, &ctx);
     emit_workflows(&mut md, &ctx);
@@ -90,6 +91,7 @@ const RICH_KINDS: &[&str] = &[
     "hooks",
     "rules",
     "labels",
+    "saved_views",
     "engines",
     "engine_fields",
     "workflows",
@@ -555,6 +557,24 @@ fn emit_labels(md: &mut String, ctx: &IndexCtx<'_>) {
         write_header(md, slug, entry.id);
         write_name(md, v.as_ref());
         md.push_str(&format!("  - path: labels/{slug}.json\n"));
+    }
+    md.push('\n');
+}
+
+fn emit_saved_views(md: &mut String, ctx: &IndexCtx<'_>) {
+    let Some(entries) = ctx.lockfile.objects.get("saved_views") else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
+    md.push_str("## saved views\n\n");
+    for (slug, entry) in entries.iter() {
+        let path = ctx.paths.saved_views_dir().join(format!("{slug}.json"));
+        let v = read_json(&path);
+        write_header(md, slug, entry.id);
+        write_name(md, v.as_ref());
+        md.push_str(&format!("  - path: saved-views/{slug}.json\n"));
     }
     md.push('\n');
 }
