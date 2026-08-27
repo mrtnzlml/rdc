@@ -658,7 +658,41 @@ The shared-only filter lives here. This is the task that decides what rdc can ev
 - Consumes: `SavedView` (Task 1), `codec("saved_views")` and `Paths::saved_views_dir()` (Task 2).
 - Produces: `pull::saved_views::list(&PullCtx, &Arc<Log>) -> Result<Vec<SavedView>>` (already filtered to shared) and `pull::saved_views::process(&mut PullCtx, Vec<SavedView>, &BTreeSet<(String,String)>, &Arc<Log>) -> Result<(usize, usize)>`; `RemoteCatalog.saved_views: Vec<SavedView>`. Tasks 5 and 6 consume both.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Register the new list endpoint in EVERY mock array — do this FIRST**
+
+This step lives here rather than in Task 9 (ruling R2): Task 4 is what makes rdc
+issue `GET /saved_views` on every sync, so registering the mock route any later
+would leave `cargo test --test cli_sync` red across Tasks 4-8 and break the
+plan's own "each task independently testable" contract.
+
+`rdc` now issues `GET /saved_views` on every sync. Any test whose mock server
+does not answer that path gets a wiremock 404 and fails. There are **11** such
+arrays, and they are not all one constant:
+
+Run: `grep -rn '"/api/v1/email_templates",' tests/cli_sync.rs tests/cli_doctor.rs`
+
+That prints one line per array (`email_templates` is a reliable proxy — every
+array contains it). Add `"/api/v1/saved_views",` to each. Expect hits at roughly
+`tests/cli_sync.rs:109`, `:209`, `:3783`, `:4121`, `:4195`, `:4347`, `:7582`,
+`:10528`, `:11485`, `:11653` and `tests/cli_doctor.rs:25`.
+
+`tests/cli_sync.rs:198` is the shared const and its length annotation must grow:
+
+```rust
+const CORE_LIST_ENDPOINTS: [&str; 12] = [
+```
+
+with `"/api/v1/saved_views",` added to the body. The compiler catches the length
+mismatch; it cannot catch a missed inline array, so work from the grep output and
+re-run it afterwards to confirm every line has a saved-views sibling.
+
+Registering the route is additive and safe to do before the driver exists: rdc
+does not call it yet, so the suite must stay green.
+
+Run: `cargo test --test cli_sync`
+Expected: PASS (unchanged behaviour — this is pure harness preparation).
+
+- [ ] **Step 2: Write the failing test**
 
 Create `src/cli/pull/saved_views.rs` with the tests only:
 
@@ -805,12 +839,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [ ] **Step 3: Run it to verify it fails**
 
 Run: `cargo test --lib pull::saved_views`
 Expected: FAIL — `process` / `retain_shared` not found.
 
-- [ ] **Step 3: Implement the driver**
+- [ ] **Step 4: Implement the driver**
 
 Prepend to `src/cli/pull/saved_views.rs`. This mirrors `pull/labels.rs` step for step; the only addition is `retain_shared`.
 
@@ -958,7 +992,7 @@ Add to `src/cli/pull/mod.rs`:
 pub mod saved_views;
 ```
 
-- [ ] **Step 4: Wire the catalog**
+- [ ] **Step 5: Wire the catalog**
 
 In `src/cli/pull/common.rs` make five edits, each mirroring the `Labels` / `labels` one immediately beside it:
 
@@ -981,7 +1015,7 @@ Find the exact sites with:
 
 Run: `grep -n "Labels\|labels" src/cli/pull/common.rs`
 
-- [ ] **Step 5: Wire the portabilize post-pass**
+- [ ] **Step 6: Wire the portabilize post-pass**
 
 In `src/cli/pull/portabilize.rs`, add the arm to `locate_json_path`:
 
@@ -991,7 +1025,7 @@ In `src/cli/pull/portabilize.rs`, add the arm to `locate_json_path`:
 
 Find the function with: `grep -n "fn locate_json_path" -A 25 src/cli/pull/portabilize.rs`
 
-- [ ] **Step 6: Run the tests**
+- [ ] **Step 7: Run the tests**
 
 Run: `cargo test --lib pull::saved_views`
 Expected: PASS (3 tests).
@@ -999,10 +1033,14 @@ Expected: PASS (3 tests).
 Run: `cargo test --lib pull::`
 Expected: PASS — the catalog change must not break existing pull tests. Any `RemoteCatalog { … }` literal in a test that now misses the field will fail to compile; add `saved_views: vec![],` to each.
 
-- [ ] **Step 7: Commit**
+Run: `cargo test --test cli_sync`
+Expected: PASS. rdc now really lists `/saved_views`, so this is where Step 1's
+registration proves itself. A 404 here means an array was missed.
+
+- [ ] **Step 8: Commit**
 
 ```bash
-git add src/cli/pull/saved_views.rs src/cli/pull/mod.rs src/cli/pull/common.rs src/cli/pull/portabilize.rs
+git add src/cli/pull/saved_views.rs src/cli/pull/mod.rs src/cli/pull/common.rs src/cli/pull/portabilize.rs tests/cli_sync.rs tests/cli_doctor.rs
 git commit -m "$(cat <<'MSG'
 feat(saved-views): pull driver with the shared-only filter
 
@@ -1304,18 +1342,6 @@ MSG
 Append to `src/cli/sync/execute.rs`'s test module, modelled on the existing labels tests:
 
 ```rust
-    fn mk_saved_view(id: u64, name: &str) -> crate::model::SavedView {
-        crate::model::SavedView {
-            id,
-            url: format!("https://x.invalid/api/v1/saved_views/{id}"),
-            name: name.to_string(),
-            shared: true,
-            queues_filter: Vec::new(),
-            query: serde_json::json!({ "$and": [] }),
-            extra: indexmap::IndexMap::new(),
-        }
-    }
-
     /// The clean-`RemoteDelete` event line must not claim a remote deletion for
     /// this kind: a saved view that left rdc's filtered listing has usually
     /// just been unshared, and still exists in the org.
@@ -1329,9 +1355,10 @@ Append to `src/cli/sync/execute.rs`'s test module, modelled on the existing labe
     }
 ```
 
-The `mk_saved_view` helper above is used by the wiremock coverage in Task 9 and by
-any executor test you add later; keep it even though this task's unit test does
-not need it.
+Do NOT add an unused `SavedView` test-fixture helper here (ruling R3): Task 10
+gates on `cargo clippy --all-targets -- -D warnings`, and an unused helper is a
+`dead_code` warning that would fail that gate. Task 9's integration coverage
+lives in a separate test binary and builds its fixtures inline.
 
 
 - [ ] **Step 2: Run it**
@@ -2018,36 +2045,17 @@ In the `envs/test/` diagram, add the directory after `labels/`:
 
 The kind→files table above it lists only kinds with code sidecars, so saved views need no row there.
 
-- [ ] **Step 2: Register the new list endpoint in EVERY mock array — do this first**
+- [ ] **Step 2: Confirm Task 4's endpoint registration is still complete**
 
-`rdc` now issues `GET /saved_views` on every sync. Any test whose mock server
-does not answer that path gets a wiremock 404 and fails. There are **11** such
-arrays, and they are not all one constant:
+Task 4 registered `/api/v1/saved_views` in every mock array (ruling R2 — it has to
+happen there, because Task 4 is what makes rdc list the endpoint on every sync).
+Re-verify nothing regressed since:
 
-Run: `grep -rn '"/api/v1/email_templates",' tests/cli_sync.rs tests/cli_doctor.rs`
+Run: `grep -rn '"/api/v1/email_templates",' tests/cli_sync.rs tests/cli_doctor.rs | wc -l`
+Run: `grep -rn '"/api/v1/saved_views",' tests/cli_sync.rs tests/cli_doctor.rs | wc -l`
+Expected: the two counts are equal.
 
-That prints one line per array (`email_templates` is a reliable proxy — every
-array contains it). Add `"/api/v1/saved_views",` to each. Expect hits at roughly
-`tests/cli_sync.rs:109`, `:209`, `:3783`, `:4121`, `:4195`, `:4347`, `:7582`,
-`:10528`, `:11485`, `:11653` and `tests/cli_doctor.rs:25`.
-
-`tests/cli_sync.rs:198` is the shared const and its length annotation must grow:
-
-```rust
-const CORE_LIST_ENDPOINTS: [&str; 12] = [
-```
-
-with `"/api/v1/saved_views",` added to the body. The compiler catches the length
-mismatch; it cannot catch a missed inline array, so work from the grep output and
-re-run it afterwards to confirm every line has a saved-views sibling.
-
-- [ ] **Step 3: Verify the existing suite still passes before adding anything**
-
-Run: `cargo test --test cli_sync`
-Expected: PASS — this proves the endpoint registration is complete. If tests fail
-with a 404 on `/saved_views`, an array was missed.
-
-- [ ] **Step 4: Write the failing integration test**
+- [ ] **Step 3: Write the failing integration test**
 
 Append to `tests/cli_sync.rs`, modelled on `sync_remote_create_writes_local_label`:
 
@@ -2178,12 +2186,12 @@ async fn sync_pulls_shared_saved_views_and_ignores_private_ones() {
 }
 ```
 
-- [ ] **Step 5: Run it**
+- [ ] **Step 4: Run it**
 
 Run: `cargo test --test cli_sync sync_pulls_shared_saved_views`
 Expected: PASS.
 
-- [ ] **Step 6: Add the unshared-refusal integration test**
+- [ ] **Step 5: Add the unshared-refusal integration test**
 
 ```rust
 /// A hand-authored view without `shared: true` is refused offline — before the
@@ -2247,12 +2255,12 @@ If `predicates` is not already imported in this file, use the assertion style th
 neighbouring tests use (`String::from_utf8_lossy` over `output.stderr` plus
 `assert!(… .contains(…))`) rather than adding a dependency.
 
-- [ ] **Step 7: Run the sync integration suite**
+- [ ] **Step 6: Run the sync integration suite**
 
 Run: `cargo test --test cli_sync`
 Expected: PASS. Do not start any rebuild while this runs.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add README.md tests/cli_sync.rs tests/cli_doctor.rs
