@@ -107,6 +107,7 @@ async fn sync_clean_env_does_no_writes() {
         "/api/v1/workflows",
         "/api/v1/workflow_steps",
         "/api/v1/email_templates",
+        "/api/v1/saved_views",
     ] {
         Mock::given(method("GET"))
             .and(path(ep))
@@ -195,7 +196,7 @@ async fn sync_clean_env_does_no_writes() {
 
 /// The core list endpoints `list_remote` fans out over. Shared so a new core
 /// kind is added in one place rather than remembered in several.
-const CORE_LIST_ENDPOINTS: [&str; 11] = [
+const CORE_LIST_ENDPOINTS: [&str; 12] = [
     "/api/v1/hooks",
     "/api/v1/workspaces",
     "/api/v1/queues",
@@ -207,6 +208,7 @@ const CORE_LIST_ENDPOINTS: [&str; 11] = [
     "/api/v1/workflows",
     "/api/v1/workflow_steps",
     "/api/v1/email_templates",
+    "/api/v1/saved_views",
 ];
 
 /// Helper: mock every Rossum listing endpoint with an empty body. The
@@ -7580,6 +7582,7 @@ async fn mount_minimal_pull(server: &MockServer) {
         "/api/v1/workflows",
         "/api/v1/workflow_steps",
         "/api/v1/email_templates",
+        "/api/v1/saved_views",
     ] {
         Mock::given(method("GET"))
             .and(path(ep))

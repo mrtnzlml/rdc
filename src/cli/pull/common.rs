@@ -86,6 +86,7 @@ pub struct RemoteCatalog {
     pub workflows: Vec<crate::model::Workflow>,
     pub workflow_steps: Vec<crate::model::WorkflowStep>,
     pub email_templates: Vec<crate::model::EmailTemplate>,
+    pub saved_views: Vec<crate::model::SavedView>,
     pub mdh: crate::cli::pull::mdh::MdhListed,
 }
 
@@ -164,6 +165,7 @@ pub async fn list_remote(
         Workflows(Vec<crate::model::Workflow>),
         WorkflowSteps(Vec<crate::model::WorkflowStep>),
         EmailTemplates(Vec<crate::model::EmailTemplate>),
+        SavedViews(Vec<crate::model::SavedView>),
     }
 
     #[derive(Clone, Copy)]
@@ -180,6 +182,7 @@ pub async fn list_remote(
         Workflows,
         WorkflowSteps,
         EmailTemplates,
+        SavedViews,
     }
 
     let kinds = [
@@ -195,6 +198,7 @@ pub async fn list_remote(
         Kind::Workflows,
         Kind::WorkflowSteps,
         Kind::EmailTemplates,
+        Kind::SavedViews,
     ];
 
     progress.start_phase(Action::List, "listing", 0);
@@ -306,6 +310,10 @@ pub async fn list_remote(
                         progress.event(Action::List, &format!("email_templates ({})", r.len()));
                         anyhow::Ok(Listed::EmailTemplates(r))
                     }
+                    Kind::SavedViews => {
+                        let r = crate::cli::pull::saved_views::list(ctx_ref, progress).await;
+                        r.map(Listed::SavedViews)
+                    }
                 }
             }
         })
@@ -341,6 +349,7 @@ pub async fn list_remote(
     let mut workflows: Option<Vec<crate::model::Workflow>> = None;
     let mut workflow_steps: Option<Vec<crate::model::WorkflowStep>> = None;
     let mut email_templates: Option<Vec<crate::model::EmailTemplate>> = None;
+    let mut saved_views: Option<Vec<crate::model::SavedView>> = None;
     for r in results {
         match r {
             Listed::Organization(v) => organization = Some(v),
@@ -355,6 +364,7 @@ pub async fn list_remote(
             Listed::Workflows(v) => workflows = Some(v),
             Listed::WorkflowSteps(v) => workflow_steps = Some(v),
             Listed::EmailTemplates(v) => email_templates = Some(v),
+            Listed::SavedViews(v) => saved_views = Some(v),
         }
     }
     let organization = organization.expect("organization listed");
@@ -397,6 +407,7 @@ pub async fn list_remote(
         workflows,
         workflow_steps,
         email_templates,
+        saved_views: saved_views.unwrap_or_default(),
         mdh,
     })
 }

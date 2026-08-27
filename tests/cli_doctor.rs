@@ -23,6 +23,7 @@ async fn mount_minimal_pull(server: &MockServer) {
         "/api/v1/hooks", "/api/v1/rules", "/api/v1/labels",
         "/api/v1/engines", "/api/v1/engine_fields",
         "/api/v1/workflows", "/api/v1/workflow_steps", "/api/v1/email_templates",
+        "/api/v1/saved_views",
     ] {
         Mock::given(method("GET"))
             .and(path(ep))
