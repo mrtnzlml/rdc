@@ -271,7 +271,7 @@ change disguised as a cleanup, and `strip_source_host_env_refs` already
 establishes that migrate does not rewrite deployable content.
 
 Escape hatch: `[saved_views."<slug>"] query = { … }` in the target env's
-`overlay.toml`. Overlay object overrides replace wholesale, so this substitutes a
+`overlay.toml`. Note the precise semantics, corrected after implementation: `overlay::merge_field` recurses only when BOTH sides are objects, so a `query` override deep-merges key by key — each key you name wins over the promoted value, and keys you omit survive from the source. Arrays and scalars DO replace wholesale, so for the common `{"$and": [...]}` shape naming `$and` replaces the whole clause list. This substitutes a
 target-appropriate query outright. When the overlay supplies `query` for a view,
 the check is satisfied for that view.
 
