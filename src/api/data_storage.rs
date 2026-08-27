@@ -39,7 +39,10 @@ pub struct DataStorageClient {
     http: Client,
     /// Shared across clones so one logical client keeps one bucket, matching
     /// the server's per-token scope (see [`RateLimiter::rossum_data_storage`]).
-    limiter: Arc<RateLimiter>,
+    ///
+    /// `None` when [`crate::api::is_loopback_base`] says this client talks to
+    /// a local mock, which enforces no policy to respect.
+    limiter: Option<Arc<RateLimiter>>,
 }
 
 /// Generic envelope wrapping every Data Storage response. Write
@@ -81,12 +84,30 @@ struct ReplaceResult {
 impl DataStorageClient {
     pub fn new(base_url: String, token: String) -> Result<Self> {
         let http = crate::api::build_http_client()?;
-        Ok(Self {
-            base_url,
-            token,
-            http,
-            limiter: Arc::new(RateLimiter::rossum_data_storage()),
-        })
+        let limiter = (!crate::api::is_loopback_base(&base_url))
+            .then(|| Arc::new(RateLimiter::rossum_data_storage()));
+        Ok(Self { base_url, token, http, limiter })
+    }
+
+    /// True when this client talks to a loopback mock rather than the real
+    /// Data Storage service. `push::mdh` reads it to compress the waits that
+    /// model the service's asynchronous index builds.
+    ///
+    /// Derived from the base URL rather than from `limiter.is_none()`: those
+    /// two answer different questions, and `paced_for_test` deliberately puts
+    /// a bucket back on a mock-backed client.
+    pub(crate) fn is_loopback(&self) -> bool {
+        crate::api::is_loopback_base(&self.base_url)
+    }
+
+    /// Restore the production bucket on a client built against a loopback
+    /// mock. Only the pacing-guard test needs this: it asserts the limiter is
+    /// threaded through `send_envelope` by timing real requests, which
+    /// requires a bucket that actually paces.
+    #[cfg(test)]
+    pub(crate) fn paced_for_test(mut self) -> Self {
+        self.limiter = Some(Arc::new(RateLimiter::rossum_data_storage()));
+        self
     }
 
     /// `POST /v1/collections/list` with `{nameOnly: false}` returns full
@@ -416,7 +437,7 @@ impl DataStorageClient {
                 .json(&body),
             &format!("POST {url}"),
             progress,
-            Some(&self.limiter),
+            self.limiter.as_ref(),
         ).await?;
         let status = resp.status();
         if !status.is_success() {
@@ -740,7 +761,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = DataStorageClient::new(server.uri(), "TEST".to_string()).unwrap();
+        // `paced_for_test`: the client's base URL is a loopback mock, which
+        // is unpaced by default (see `crate::api::is_loopback_base`). This
+        // test is specifically about the bucket being wired in, so it asks
+        // for the production bucket back.
+        let client = DataStorageClient::new(server.uri(), "TEST".to_string())
+            .unwrap()
+            .paced_for_test();
         let start = std::time::Instant::now();
         // Clone per task: a clone must share the bucket, not get a fresh one.
         let results: Vec<Result<Vec<Value>>> = futures::stream::iter(0..40)

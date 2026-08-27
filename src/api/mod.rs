@@ -35,7 +35,10 @@ pub struct RossumClient {
     /// burst 10). `Arc` so all in-flight calls share one bucket; two
     /// clients (e.g. deploy's src + tgt) get independent buckets which
     /// matches the server's per-token scope.
-    limiter: Arc<RateLimiter>,
+    ///
+    /// `None` when [`is_loopback_base`] says this client talks to a local
+    /// mock, which enforces no policy to respect.
+    limiter: Option<Arc<RateLimiter>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +65,33 @@ const LIST_PAGE_SIZE: u64 = 100;
 /// bounds how many page requests are outstanding at once.
 const LIST_PAGE_FANOUT: usize = 5;
 
+/// True when `base_url`'s host is a loopback address (or `localhost`) —
+/// i.e. a `wiremock` server owned by a test, not a Rossum cluster.
+///
+/// Every wall-clock cost rdc pays on the wire models one specific remote
+/// behavior: the core API's 10 req/s policy, Data Storage's 30 req/s, and
+/// Data Storage's asynchronous index builds. A local mock has none of
+/// them, so paying those costs against one buys nothing and just makes
+/// the suite sleep — measured on `tests/cli_sync.rs`, pacing alone cost
+/// 37 s of its 70 s and the materialization ceilings another 18 s.
+///
+/// Gating on the URL rather than an env var is deliberate: Rossum is never
+/// on loopback, so this cannot relax pacing against a real cluster no
+/// matter how rdc is invoked, and it adds no knob a deploy could set by
+/// mistake. The tests that assert pacing *is* wired in opt back into a
+/// real bucket explicitly (see `DataStorageClient::paced_for_test`).
+pub(crate) fn is_loopback_base(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url).ok().and_then(|u| u.host_str().map(str::to_string)).is_some_and(
+        |h| {
+            // `host_str` brackets IPv6 literals (`[::1]`), which `IpAddr`
+            // will not parse; strip them before asking.
+            let bare = h.strip_prefix('[').and_then(|b| b.strip_suffix(']')).unwrap_or(&h);
+            bare == "localhost"
+                || bare.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        },
+    )
+}
+
 /// Construct the shared reqwest Client used by every rdc HTTP path.
 ///
 /// Single source of truth so a future change (timeout, user-agent, TLS
@@ -81,13 +111,9 @@ pub(crate) fn build_http_client() -> Result<Client> {
 impl RossumClient {
     pub fn new(base_url: String, token: String) -> Result<Self> {
         let http = build_http_client()?;
-        Ok(Self {
-            base_url,
-            token,
-            http,
-            env: None,
-            limiter: Arc::new(RateLimiter::rossum_core_api()),
-        })
+        let limiter =
+            (!is_loopback_base(&base_url)).then(|| Arc::new(RateLimiter::rossum_core_api()));
+        Ok(Self { base_url, token, http, env: None, limiter })
     }
 
     /// Attach an env label so any non-2xx error this client produces
@@ -349,7 +375,7 @@ impl RossumClient {
                 .header("Authorization", format!("token {}", self.token)),
             &format!("DELETE {url}"),
             progress,
-            Some(&self.limiter),
+            self.limiter.as_ref(),
         ).await?;
         let status = resp.status();
         if status.is_success() || status.as_u16() == 404 {
@@ -475,7 +501,7 @@ impl RossumClient {
             || self.http.get(url).header("Authorization", format!("token {}", self.token)),
             &format!("GET {url}"),
             progress,
-            Some(&self.limiter),
+            self.limiter.as_ref(),
         ).await?;
 
         let status = resp.status();
@@ -521,7 +547,7 @@ impl RossumClient {
                 .json(&body_value),
             &format!("PATCH {url}"),
             progress,
-            Some(&self.limiter),
+            self.limiter.as_ref(),
         ).await?;
         let status = resp.status();
         if !status.is_success() {
@@ -550,7 +576,7 @@ impl RossumClient {
                 .json(body),
             &format!("POST {url}"),
             progress,
-            Some(&self.limiter),
+            self.limiter.as_ref(),
         ).await?;
         let status = resp.status();
         if !status.is_success() {
@@ -794,5 +820,42 @@ mod tests {
             msg.contains("rdc://engines/1-intake-triage"),
             "PATCH guard must name the ref from extra: {msg}"
         );
+    }
+
+    /// The pacing bypass must key on "this is a local mock" and nothing
+    /// else. A real Rossum host — or a base URL we cannot parse — has to
+    /// stay paced: guessing wrong in that direction means hammering a
+    /// customer's org until the server starts 429ing, so the predicate
+    /// fails safe.
+    #[test]
+    fn only_loopback_bases_skip_the_rate_limiter() {
+        for paced in [
+            "https://api.elis.rossum.ai/v1",
+            "https://acme.rossum.app/api/v1",
+            "http://rossum.internal:8080/v1",
+            "https://127.0.0.1.evil.example/v1",
+            "not a url",
+            "",
+        ] {
+            assert!(!is_loopback_base(paced), "{paced:?} must stay paced");
+        }
+        for mock in [
+            "http://127.0.0.1:61916",
+            "http://127.7.7.7/v1",
+            "http://localhost:8080/api/v1",
+            "http://[::1]:9000/v1",
+        ] {
+            assert!(is_loopback_base(mock), "{mock:?} is a local mock");
+        }
+    }
+
+    /// Guards the wiring, not just the predicate: a client aimed at a real
+    /// cluster keeps its bucket, one aimed at a mock has none.
+    #[test]
+    fn client_pacing_follows_the_base_url() {
+        let real = RossumClient::new("https://api.elis.rossum.ai/v1".into(), "t".into()).unwrap();
+        assert!(real.limiter.is_some(), "a real cluster must be paced");
+        let mock = RossumClient::new("http://127.0.0.1:1234".into(), "t".into()).unwrap();
+        assert!(mock.limiter.is_none(), "a loopback mock must not be paced");
     }
 }

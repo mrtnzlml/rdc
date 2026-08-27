@@ -57,6 +57,24 @@ const SEARCH_DROP_TIMEOUT: Duration = Duration::from_secs(60);
 /// build failure.
 const CREATE_MATERIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Divisor applied to every wall-clock wait in this module when the client
+/// talks to a loopback mock (see [`crate::api::is_loopback_base`]). The
+/// waits above model the Data Storage service building an index
+/// asynchronously; a mock answers instantly and either has the index or
+/// never will, so against one the ceilings are pure sleep — 2 x
+/// `CREATE_MATERIALIZE_TIMEOUT` was 20 s of `tests/cli_sync.rs`'s 70 s.
+///
+/// A divisor, not a separate set of constants, so the *ratio* between poll
+/// interval and ceiling is preserved: a mock-backed wait still polls ~20
+/// times before expiring, exercising the same loop and the same
+/// timeout-expiry branch as production.
+const LOCAL_MOCK_SPEEDUP: u32 = 40;
+
+/// Scale a production wait for the client it will be spent against.
+fn scaled(client: &DataStorageClient, d: Duration) -> Duration {
+    if client.is_loopback() { d / LOCAL_MOCK_SPEEDUP } else { d }
+}
+
 /// Push local index edits for one MDH dataset to the remote. Drops
 /// first (avoiding name collisions when a definition has changed),
 /// then creates. On any API failure the function returns the error and
@@ -189,7 +207,7 @@ pub async fn push_dataset(
         collection_name,
         slug,
         &plan,
-        CREATE_MATERIALIZE_TIMEOUT,
+        scaled(client, CREATE_MATERIALIZE_TIMEOUT),
         progress,
     )
     .await?;
@@ -420,7 +438,7 @@ pub(crate) async fn verify_creates_materialized(
             }
             return Ok(missing_regular.len() + missing_search.len());
         }
-        tokio::time::sleep(DROP_POLL_INTERVAL).await;
+        tokio::time::sleep(scaled(client, DROP_POLL_INTERVAL)).await;
     }
 }
 
@@ -548,6 +566,7 @@ async fn wait_for_regular_drop(
     index_name: &str,
     progress: &Arc<Log>,
 ) -> Result<()> {
+    let timeout = scaled(client, REGULAR_DROP_TIMEOUT);
     let start = Instant::now();
     loop {
         let list = client
@@ -560,15 +579,15 @@ async fn wait_for_regular_drop(
         if !still_there {
             return Ok(());
         }
-        if start.elapsed() >= REGULAR_DROP_TIMEOUT {
+        if start.elapsed() >= timeout {
             return Err(anyhow!(
                 "timed out after {:?} waiting for regular index '{}' on '{}' to drop",
-                REGULAR_DROP_TIMEOUT,
+                timeout,
                 index_name,
                 collection
             ));
         }
-        tokio::time::sleep(DROP_POLL_INTERVAL).await;
+        tokio::time::sleep(scaled(client, DROP_POLL_INTERVAL)).await;
     }
 }
 
@@ -583,6 +602,7 @@ async fn wait_for_search_drop(
     index_name: &str,
     progress: &Arc<Log>,
 ) -> Result<()> {
+    let timeout = scaled(client, SEARCH_DROP_TIMEOUT);
     let start = Instant::now();
     loop {
         let list = client
@@ -595,15 +615,15 @@ async fn wait_for_search_drop(
         if !still_there {
             return Ok(());
         }
-        if start.elapsed() >= SEARCH_DROP_TIMEOUT {
+        if start.elapsed() >= timeout {
             return Err(anyhow!(
                 "timed out after {:?} waiting for search index '{}' on '{}' to drop",
-                SEARCH_DROP_TIMEOUT,
+                timeout,
                 index_name,
                 collection
             ));
         }
-        tokio::time::sleep(DROP_POLL_INTERVAL).await;
+        tokio::time::sleep(scaled(client, DROP_POLL_INTERVAL)).await;
     }
 }
 
