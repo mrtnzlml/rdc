@@ -64,6 +64,12 @@ pub struct Overlay {
     /// Engine field overrides keyed by engine field slug.
     #[serde(default)]
     pub engine_fields: BTreeMap<String, BTreeMap<String, Value>>,
+    /// Saved-view overrides keyed by saved-view slug. The common use is a
+    /// per-env `query`: an override replaces the whole object, which is the
+    /// documented escape hatch when a source `query` carries a ref that cannot
+    /// cross into this env (see `migrate`'s saved-view ref validation).
+    #[serde(default)]
+    pub saved_views: BTreeMap<String, BTreeMap<String, Value>>,
     /// Organization overrides. The organization is a per-env SINGLETON, so this
     /// is a flat field → value map with no slug layer: `[organization]` in
     /// TOML, or a nested table such as
@@ -124,6 +130,10 @@ impl Overlay {
         self.engine_fields.get(slug)
     }
 
+    pub fn saved_view(&self, slug: &str) -> Option<&BTreeMap<String, Value>> {
+        self.saved_views.get(slug)
+    }
+
     /// The organization overrides, or `None` when the section is absent or
     /// empty — so a bare `[organization]` header is the same as no header.
     pub fn organization(&self) -> Option<&BTreeMap<String, Value>> {
@@ -163,6 +173,7 @@ impl Default for Overlay {
             email_templates: BTreeMap::new(),
             engines: BTreeMap::new(),
             engine_fields: BTreeMap::new(),
+            saved_views: BTreeMap::new(),
             organization: BTreeMap::new(),
         }
     }

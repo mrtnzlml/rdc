@@ -182,6 +182,13 @@ impl Paths {
         self.env_root().join("labels")
     }
 
+    /// `<root>/envs/<env>/saved-views/`. Flat, one file per view: a saved view
+    /// is org-scoped, and its `queues_filter` is a 0..n list, so there is no
+    /// single owning queue to nest under.
+    pub fn saved_views_dir(&self) -> PathBuf {
+        self.env_root().join("saved-views")
+    }
+
     /// `<root>/envs/<env>/engines/`
     pub fn engines_dir(&self) -> PathBuf {
         self.env_root().join("engines")
@@ -419,6 +426,11 @@ mod tests {
     #[test]
     fn labels_dir_path() {
         assert_eq!(p().labels_dir(), Path::new("/proj/envs/dev/labels"));
+    }
+
+    #[test]
+    fn saved_views_dir_path() {
+        assert_eq!(p().saved_views_dir(), Path::new("/proj/envs/dev/saved-views"));
     }
 
     #[test]

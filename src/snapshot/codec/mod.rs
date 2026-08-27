@@ -23,6 +23,7 @@ pub(crate) use mdh::normalize_search_index;
 mod organization;
 mod queues;
 mod rules;
+mod saved_views;
 mod schemas;
 mod workflow_steps;
 mod workflows;
@@ -170,6 +171,7 @@ pub fn codec(kind: &str) -> Option<&'static dyn KindCodec> {
         "organization" => Some(&organization::Organization),
         "queues" => Some(&queues::Queues),
         "rules" => Some(&rules::Rules),
+        "saved_views" => Some(&saved_views::SavedViews),
         "schemas" => Some(&schemas::Schemas),
         "workflow_steps" => Some(&workflow_steps::WorkflowSteps),
         "workflows" => Some(&workflows::Workflows),

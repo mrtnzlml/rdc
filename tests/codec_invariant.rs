@@ -98,6 +98,20 @@ fn sample_schema() -> serde_json::Value {
     })
 }
 
+fn sample_saved_view() -> serde_json::Value {
+    json!({
+        "id": 42,
+        "url": "https://x/api/v1/saved_views/42",
+        "name": "Awaiting approval",
+        "shared": true,
+        "queues_filter": [],
+        "query": { "$and": [ { "status": { "$in": ["to_review"] } } ] },
+        "created_by": "https://x/api/v1/users/7",
+        "created_at": "2026-08-01T08:00:00Z",
+        "modified_at": "2026-08-02T09:00:00Z"
+    })
+}
+
 fn sample_inbox() -> serde_json::Value {
     json!({
         "id": 40,
@@ -230,6 +244,7 @@ fn codec_cases() -> Vec<(&'static str, serde_json::Value)> {
         ("organization", sample_organization()),
         ("queues", sample_queue()),
         ("rules", sample_rule()),
+        ("saved_views", sample_saved_view()),
         ("schemas", sample_schema()),
         ("workflow_steps", sample_workflow_step()),
         ("workflows", sample_workflow()),
@@ -871,6 +886,7 @@ fn every_known_kind_has_a_codec() {
         "email_templates",
         "organization",
         "mdh",
+        "saved_views",
     ];
     for kind in &known_kinds {
         assert!(
