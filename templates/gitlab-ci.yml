@@ -40,17 +40,17 @@ default:
   interruptible: true
 
 variables:
-  # Exact tag (v0.7.0) is reproducible and is what this file ships with.
-  # "v0.7" tracks the newest patch in that line; "latest" tracks the newest
+  # An exact tag is reproducible and is what this file ships with. A series
+  # prefix tracks the newest patch in that line; "latest" tracks the newest
   # release. Think before floating: the deploy job below runs
   # `rdc sync --allow-deletes --yes`, so a version bump changes what an
   # unattended, destructive sync does.
   RDC_VERSION: "v0.7.0"
   RDC_REPO: "mrtnzlml/rdc"
   # Matched against the END of the asset name, because release assets carry the
-  # version (rdc-0.7.0-x86_64-unknown-linux-gnu.tar.gz). A suffix also matches
-  # the pre-0.7 unversioned names, so this pipeline works against old and new
-  # releases alike. Swap the platform here to install a different build.
+  # version (rdc-<version>-x86_64-unknown-linux-gnu.tar.gz). A suffix also
+  # matches the pre-0.7 unversioned names, so this pipeline works against old
+  # and new releases alike. Swap the platform here to install a different build.
   RDC_ASSET_SUFFIX: "-x86_64-unknown-linux-gnu.tar.gz"
   # Commit-back author and committer. GitLab push rules can require these to
   # match a pattern; if yours does, use an address that satisfies it.
@@ -65,8 +65,8 @@ variables:
   auth="Authorization: Bearer $RDC_GITHUB_TOKEN"
   api="https://api.github.com/repos/$RDC_REPO"
   # Three accepted forms, resolved to one release object:
-  #   v0.7.0  exact tag           reproducible; what this file ships with
-  #   v0.7    newest patch in 0.7 picks up fixes, never a new feature
+  #   vX.Y.Z  exact tag           reproducible; what this file ships with
+  #   vX.Y    newest patch in X.Y picks up fixes, never a new feature
   #   latest  newest release      always current, never reproducible
   case "$RDC_VERSION" in
     latest)
