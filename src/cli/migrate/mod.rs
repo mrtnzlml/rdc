@@ -540,6 +540,56 @@ fn walk_strings_with_path(value: &Value, path: &str, f: &mut dyn FnMut(&str, &st
     }
 }
 
+/// Order two JSON-path locations the way a reader expects, with runs of digits
+/// compared by VALUE rather than byte by byte.
+///
+/// The listing these locations end up in ([`format_saved_view_ref_error`]) is a
+/// report a human walks top to bottom against the file, so plain `str::cmp` —
+/// which puts `queues_filter[10]` before `queues_filter[2]` — reads as a bug in
+/// the report. Locations are built by [`walk_strings_with_path`] out of JSON
+/// object keys and `[<index>]` segments, so the non-digit half is compared
+/// bytewise (keys can hold any UTF-8; byte order on UTF-8 matches code-point
+/// order, and only *stability* matters there, not collation).
+///
+/// Digit runs compare by trimmed length, then bytes, then raw length, so two
+/// runs of equal value but different spelling (`[07]` vs `[7]`) still order
+/// deterministically rather than comparing `Equal` — belt-and-braces, since an
+/// index `walk_strings_with_path` produced never carries a leading zero.
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    fn without_leading_zeros(d: &[u8]) -> &[u8] {
+        let first = d.iter().position(|&c| c != b'0').unwrap_or(d.len());
+        &d[first..]
+    }
+    let (mut x, mut y) = (a.as_bytes(), b.as_bytes());
+    loop {
+        let (Some(&ca), Some(&cb)) = (x.first(), y.first()) else {
+            // One side ran out: the shorter string is the prefix, so it sorts
+            // first (and equal lengths mean equal strings).
+            return x.len().cmp(&y.len());
+        };
+        let ord = if ca.is_ascii_digit() && cb.is_ascii_digit() {
+            let na = x.iter().take_while(|c| c.is_ascii_digit()).count();
+            let nb = y.iter().take_while(|c| c.is_ascii_digit()).count();
+            let (da, db) = (&x[..na], &y[..nb]);
+            let (ta, tb) = (without_leading_zeros(da), without_leading_zeros(db));
+            x = &x[na..];
+            y = &y[nb..];
+            ta.len()
+                .cmp(&tb.len())
+                .then_with(|| ta.cmp(tb))
+                .then_with(|| da.len().cmp(&db.len()))
+        } else {
+            x = &x[1..];
+            y = &y[1..];
+            ca.cmp(&cb)
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+}
+
 /// Validate a migrated saved view's references against what the target snapshot
 /// actually contains.
 ///
@@ -625,7 +675,7 @@ pub(crate) fn check_saved_view_refs(
             }
         });
     }
-    out.sort_by(|a, b| a.location.cmp(&b.location));
+    out.sort_by(|a, b| natural_cmp(&a.location, &b.location));
     out
 }
 
@@ -5464,6 +5514,45 @@ mod tests {
             None,
         );
         assert!(problems.is_empty(), "env fields must be out of scope: {problems:?}");
+    }
+
+    /// The offender listing is read against the file top to bottom, so array
+    /// indices must be ordered by value: a lexicographic sort put
+    /// `queues_filter[10]` ahead of `queues_filter[2]`.
+    #[test]
+    fn saved_view_ref_problems_are_ordered_naturally() {
+        let refs: Vec<serde_json::Value> = (0..12)
+            .map(|i| serde_json::json!(format!("rdc://queues/missing-{i}")))
+            .collect();
+        let v = serde_json::json!({
+            "name": "Wide filter",
+            "shared": true,
+            "queues_filter": refs,
+        });
+        let problems = check_saved_view_refs("wide-filter", &v, &BTreeSet::new(), None);
+        let locations: Vec<&str> = problems.iter().map(|p| p.location.as_str()).collect();
+        let expected: Vec<String> = (0..12).map(|i| format!("queues_filter[{i}]")).collect();
+        assert_eq!(locations, expected.iter().map(String::as_str).collect::<Vec<_>>());
+    }
+
+    /// `natural_cmp` on its own, including the shapes the JSON walker cannot
+    /// produce but a total order still has to handle.
+    #[test]
+    fn natural_cmp_orders_digit_runs_by_value() {
+        use std::cmp::Ordering;
+        assert_eq!(natural_cmp("a[2]", "a[10]"), Ordering::Less);
+        assert_eq!(natural_cmp("a[10]", "a[2]"), Ordering::Greater);
+        assert_eq!(natural_cmp("a[2]", "a[2]"), Ordering::Equal);
+        // Deeper path, same prefix: the second run decides.
+        assert_eq!(natural_cmp("q.$and[2].x[9]", "q.$and[2].x[11]"), Ordering::Less);
+        // The first run decides even when the second says otherwise.
+        assert_eq!(natural_cmp("q.$and[9].x[11]", "q.$and[11].x[2]"), Ordering::Less);
+        // Non-digit runs stay bytewise, and a prefix sorts first.
+        assert_eq!(natural_cmp("query", "queues_filter"), Ordering::Less);
+        assert_eq!(natural_cmp("a[2]", "a[2].b"), Ordering::Less);
+        // Leading zeros: same value, so never Equal but stably ordered.
+        assert_eq!(natural_cmp("a[07]", "a[7]"), Ordering::Greater);
+        assert_eq!(natural_cmp("a[7]", "a[07]"), Ordering::Less);
     }
 
     /// Two-env project (`dev` -> `prod`) in a tempdir, ready for `run_at`.

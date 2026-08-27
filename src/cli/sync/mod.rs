@@ -271,7 +271,7 @@ pub(crate) async fn run_cycle(
 
     // `--no-push` is an audit mode: there is nothing to half-apply, so it
     // proceeds and merely reports. `--dry-run` proceeds too — its job is
-    // to print the COMPLETE plan, and it already surfaces all four classes
+    // to print the COMPLETE plan, and it already surfaces all five classes
     // in dedicated sections further down.
     if !no_push && !dry_run {
         refuse_on_offline_defects(

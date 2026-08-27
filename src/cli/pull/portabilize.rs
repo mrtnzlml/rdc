@@ -149,7 +149,6 @@ fn locate_json_path(paths: &Paths, kind: &str, slug: &str) -> Option<std::path::
             let queue_dir = crate::cli::deploy::create::locate_queue_dir(paths, slug)?;
             Some(queue_dir.join("inbox.json"))
         }
-        "saved_views" => Some(paths.saved_views_dir().join(format!("{slug}.json"))),
         _ => {
             let codec = crate::snapshot::codec::codec(kind)?;
             Some(codec.path(paths, slug))

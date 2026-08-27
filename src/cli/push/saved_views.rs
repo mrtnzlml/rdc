@@ -19,7 +19,6 @@ pub async fn push(
     progress: &Arc<Log>,
     env: &str,
 ) -> Result<(usize, usize)> {
-
     let mut pushed = 0usize;
     let mut skipped = 0usize;
 
@@ -42,7 +41,6 @@ pub async fn push(
     // acting as a barrier.
     let mut batch: Vec<(&String, &std::path::PathBuf)> = Vec::new();
     for (slug, path) in changes {
-
         // Missing lockfile entry → new saved view, POST.
         if lockfile
             .objects
@@ -178,11 +176,11 @@ async fn push_update_batch(
     let mut skipped = 0usize;
 
     // Drift-check list, hoisted to ONE fetch before the batch — but only when
-    // at least one update can actually reach the drift check. The old lazy
-    // `remote_saved_views` cache was populated by the first item that got PAST the
-    // `content_hash` guard, so a run of entries that all lack a hash made no
-    // list call at all; keep that exactly, and keep it caller-owned so several
-    // runs share the single fetch.
+    // at least one update can actually reach the drift check. The invariant:
+    // the list is fetched if and only if some item gets PAST the
+    // `content_hash` guard, so a run whose entries all lack a hash issues no
+    // list call at all. It stays caller-owned so several runs of this function
+    // share the single fetch.
     let needs_drift_check = updates.iter().any(|(slug, _)| {
         lockfile
             .objects
@@ -234,7 +232,7 @@ async fn push_update_batch(
             let payload_view: crate::model::SavedView = serde_json::from_value(payload)
                 .with_context(|| format!("deserializing overlay-applied saved view '{slug}'"))?;
 
-            let Some(remote_view) = remote_ref.iter().find(|l| l.id == id) else {
+            let Some(remote_view) = remote_ref.iter().find(|v| v.id == id) else {
                 return Ok(Prepared::Skipped {
                     slug: slug.clone(),
                     event: format!("saved_view/{slug} (remote id {id} missing)"),
@@ -292,8 +290,8 @@ async fn push_update_batch(
             // NOT `?`: by the time the apply stage runs, every clean PATCH in
             // the batch has already landed server-side. Returning early here
             // would leave the REMAINING items' completed PATCHes unrecorded —
-            // the exact inconsistency D10 exists to shrink, and worse than the
-            // old sequential loop, which never sent those requests at all.
+            // the exact inconsistency D10 exists to shrink. So the loop always
+            // runs to the end and the first error is returned afterwards.
             Ok(Prepared::Patched { slug, updated }) => {
                 match write_back(paths, lockfile, &slug, path, &updated) {
                     Ok(()) => {
@@ -394,9 +392,11 @@ fn drift_base(entry: &ObjectEntry) -> Option<&str> {
     entry.content_hash.as_deref()
 }
 
-/// The canonical on-disk artifact for a remote saved view, as the drift check and
-/// the drift prompt both need it. Lifted verbatim from the old loop's
-/// `codec.disk_bytes(...)` block.
+/// The canonical on-disk artifact for a remote saved view, as the drift check
+/// and the drift prompt both need it. One function so the bytes the concurrent
+/// stage hashes and the bytes the prompt shows are the same bytes — a second
+/// `codec.disk_bytes(...)` call site could diverge and make the prompt describe
+/// a drift the check did not find.
 fn remote_artifact(remote: &crate::model::SavedView) -> Result<crate::snapshot::codec::DiskArtifact> {
     let codec = crate::snapshot::codec::codec("saved_views").unwrap();
     codec
@@ -409,11 +409,11 @@ fn remote_artifact(remote: &crate::model::SavedView) -> Result<crate::snapshot::
 /// Write one PATCH response back: canonical form to disk and the base cache,
 /// plus the lockfile entry.
 ///
-/// Lifted verbatim out of the old update loop — the block from
-/// `let codec = ...` down to and including the `lockfile.upsert("saved_views", ...)`
-/// call, with `updated` taken by reference and the
-/// `progress.event(Action::Patch, ...)` line left behind at the call site so the
-/// caller controls when it fires.
+/// The single write-back path for this kind, shared by the clean PATCH and the
+/// drift-prompt PATCH, so disk / base cache / lockfile can only ever advance
+/// together. It deliberately does NOT emit the `Action::Patch` event: that is
+/// left to each call site, which knows whether it is reporting a clean push or
+/// a resolved drift.
 fn write_back(
     paths: &Paths,
     lockfile: &mut Lockfile,
@@ -451,11 +451,12 @@ fn write_back(
 
 /// Resolve one drifted saved view interactively and, on `Patch`, send it.
 ///
-/// This is the old update loop's drift branch, moved verbatim: re-read the
-/// local file, `resolve_value`, `resolve_push_drift`, then either PATCH (via the
-/// same `update_saved_view` + `write_back`), adopt the remote, or skip. It runs only
-/// on the sequential stage, so `resolve_push_drift`'s prompt can never
-/// interleave with another item's. Returns `(pushed, skipped)` deltas.
+/// Re-reads the local file, `resolve_value`, `resolve_push_drift`, then either
+/// PATCHes (through the same `update_saved_view` + `write_back` as the clean
+/// path), adopts the remote, or skips. It is called ONLY from the sequential
+/// stage — that is the invariant that matters: `resolve_push_drift` blocks on
+/// stdin, so a concurrent call site would interleave two prompts on one
+/// terminal. Returns `(pushed, skipped)` deltas.
 #[allow(clippy::too_many_arguments)]
 async fn push_one_drifted(
     paths: &Paths,
@@ -482,7 +483,7 @@ async fn push_one_drifted(
     let payload_view: crate::model::SavedView = serde_json::from_value(payload)
         .with_context(|| format!("deserializing overlay-applied saved view '{slug}'"))?;
 
-    let Some(remote_view) = remote_saved_views.iter().find(|l| l.id == id) else {
+    let Some(remote_view) = remote_saved_views.iter().find(|v| v.id == id) else {
         progress.event(
             Action::Skip,
             &format!("saved_view/{slug} (remote id {id} missing)"),
@@ -585,7 +586,7 @@ mod tests {
         let saved_views_dir = paths.saved_views_dir();
         std::fs::create_dir_all(&saved_views_dir).unwrap();
 
-        let slugs = ["l-a", "l-b", "l-c", "l-d"];
+        let slugs = ["v-a", "v-b", "v-c", "v-d"];
         let mut lockfile = Lockfile {
             api_base: api.clone(),
             ..Lockfile::default()
@@ -697,14 +698,15 @@ mod tests {
     /// above:
     ///
     ///   1. The create is a BARRIER. `a-update` is prepared (and PATCHed)
-    ///      before the POST, and `z-update` only afterwards — exactly the
-    ///      order the old sequential loop used. Hoisting every create ahead of
-    ///      every update would resolve refs that must still defer (see
-    ///      `push::hooks`, where that is observable).
-    ///   2. N runs still cost ONE `GET /saved_views`. That is the entire reason the
-    ///      drift list is threaded through as `&mut Option<Vec<SavedView>>` rather
-    ///      than being a local of the batch function; a per-run fetch would be
-    ///      an extra request the old loop never made.
+    ///      before the POST, and `z-update` only afterwards — slug order is
+    ///      preserved across the whole `changes` map, not just within a run.
+    ///      Hoisting every create ahead of every update would resolve refs
+    ///      that must still defer (see `push::hooks`, where that is
+    ///      observable).
+    ///   2. N runs still cost ONE `GET /saved_views`. That is the entire reason
+    ///      the drift list is threaded through as `&mut Option<Vec<SavedView>>`
+    ///      rather than being a local of the batch function; a per-run fetch
+    ///      would issue one request per barrier instead of one per push.
     #[tokio::test]
     async fn push_saved_views_barriers_on_a_create_and_lists_only_once() {
         use wiremock::matchers::{method, path};
@@ -789,8 +791,9 @@ mod tests {
         .unwrap();
         changes.insert("m-create".to_string(), saved_views_dir.join("m-create.json"));
 
-        // The drift list never contains the saved view created mid-push — same as
-        // the old loop, whose cache was also filled before the POST.
+        // The drift list never contains the saved view created mid-push: it is
+        // fetched once, before the POST, and a created object has no
+        // `content_hash` to drift against anyway.
         Mock::given(method("GET"))
             .and(path("/api/v1/saved_views"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -842,14 +845,12 @@ mod tests {
         );
     }
 
-    /// Request-count parity for the OTHER end of the hoist: the old lazy
-    /// `remote_saved_views` cache was populated by the first update that got PAST
-    /// the `content_hash` guard, so a push in which every entry lacks a hash
-    /// made NO list call at all. Hoisting the fetch above the fan-out must keep
-    /// that exactly — `needs_drift_check` is what makes the hoist guard and the
-    /// per-item guard (`drift_base`) the same predicate. If the hoist were
-    /// unconditional this push would issue a `GET /saved_views` the old loop never
-    /// made.
+    /// The OTHER end of the hoisted fetch: a push in which no update carries a
+    /// `content_hash` must issue NO list call at all, because no item can reach
+    /// the drift check. `needs_drift_check` is what keeps the hoist guard and
+    /// the per-item guard (`drift_base`) the same predicate; were the hoist
+    /// unconditional, this push would spend a `GET /saved_views` on a list
+    /// nothing reads.
     #[tokio::test]
     async fn push_saved_views_makes_no_request_when_no_update_has_a_content_hash() {
         use wiremock::MockServer;
@@ -869,7 +870,7 @@ mod tests {
         // Both are UPDATES (each has a lockfile entry) but neither carries a
         // `content_hash`, so neither can reach the drift check. No mocks are
         // mounted, so any request at all would both fail and be recorded.
-        for (i, slug) in ["l-a", "l-b"].iter().enumerate() {
+        for (i, slug) in ["v-a", "v-b"].iter().enumerate() {
             let local = serde_json::json!({
                 "url": format!("rdc://saved_views/{slug}"),
                 "name": slug,

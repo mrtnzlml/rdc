@@ -235,6 +235,36 @@ Select just the org with [`--only`](#selective-migrate): `--only
 organization/self` (its one slug — `organization` alone is not valid, every
 selector needs a `/`).
 
+### Saved views
+
+`envs/<env>/saved-views/<slug>.json` is a saved annotation-dashboard filter.
+rdc manages **shared** views only, and `rdc sync` reports how many private ones
+it skipped. That is a boundary, not a shortcut: a private view belongs to one
+person, its `query` holds that person's own filter values, and `created_by` is
+read-only server-side, so rdc could never restore such a view to its owner. A
+local file whose `shared` is not `true` is therefore refused **offline**,
+before any request — pushing it would create an object the next pull filters
+straight back out. Delete the file rather than editing it (deleting is also how
+you remove a view); to stop managing one without removing it, unshare it in the
+UI. Unsharing takes the view out of rdc's world, so the next sync drops the
+local file, no prompt — `git restore` plus a sync re-creates it, and re-sharing
+in the UI brings the file back on its own.
+
+`rdc migrate` hard-errors when a promoted view's `query` or `queues_filter`
+holds a reference that cannot cross envs — a user URL, or a queue the target
+env does not have — rather than dropping the clause, because an empty
+`queues_filter` would show the view to the whole organization and a dropped
+filter would silently change what the view shows. The escape hatch is an
+overlay entry for the target env, applied before the check runs, where each key
+you name wins over the promoted value:
+
+```toml
+# envs/prod/overlay.toml
+[saved_views.awaiting-approval]
+queues_filter = ["rdc://queues/cost-invoices"]
+query = { "$and" = [ { "status" = { "$in" = ["to_review"] } } ] }
+```
+
 ## `rdc sync`
 
 Reconciles the local snapshot with the remote env in one pass — pulls remote changes, sends local edits, creates objects from new files, and deletes objects whose local files you removed (with confirmation).

@@ -2610,6 +2610,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                         | "schemas"
                         | "inboxes"
                         | "email_templates"
+                        | "saved_views"
                 ) {
                     drop_lockfile_entry(ctx, &it.kind, &it.slug);
                 } else {
@@ -6455,6 +6456,110 @@ mod tests {
         assert!(
             !marker.exists(),
             "BothDeleted must not write a deleted-marker"
+        );
+    }
+
+    /// `saved_views` is push-capable, so it takes the same silent-drop path as
+    /// every other push-capable kind. It is asserted separately because the
+    /// dispatch is a hand-written `matches!` list: a kind missing from it falls
+    /// into the `else` arm, which only warns. Nothing else clears the entry
+    /// either — the tombstone loop filters on `LocalDelete` — so the warning
+    /// would repeat on EVERY sync, with a lockfile entry (and an `_index.md`
+    /// row, which is generated from the lockfile) naming an object that exists
+    /// on neither side. Hence the no-warning half of the assertion: it is what
+    /// distinguishes "handled" from "skipped".
+    #[tokio::test]
+    async fn both_deleted_drops_a_saved_view_lockfile_entry_without_warning() {
+        /// Log sink shared with the assertion below.
+        #[derive(Clone, Default)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        std::fs::create_dir_all(paths.saved_views_dir()).unwrap();
+
+        // Both sides are already gone: no local file (the user deleted it) and
+        // no entry in the catalog (someone unshared the view afterwards). Only
+        // the lockfile still claims the object.
+        let mut lockfile = Lockfile::default();
+        lockfile.upsert(
+            "saved_views",
+            "awaiting-approval",
+            ObjectEntry {
+                id: 42,
+                modified_at: None,
+                modified_by: None,
+                content_hash: Some("base".to_string()),
+                secrets_hash: None,
+            },
+        );
+
+        let client = RossumClient::new(
+            "https://unused.invalid/api/v1".to_string(),
+            "TEST".to_string(),
+        )
+        .unwrap();
+        let catalog = catalog_with_labels(vec![]);
+        let classified = vec![ClassifiedItem {
+            kind: "saved_views".to_string(),
+            slug: "awaiting-approval".to_string(),
+            class: SyncClass::BothDeleted,
+            local_hash: None,
+            remote_hash: None,
+            base_hash: Some("base".to_string()),
+        }];
+
+        let sink = Sink::default();
+        let progress = Log::for_sink(
+            crate::cli::resolve::ColorMode::Plain,
+            Box::new(sink.clone()),
+        );
+
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &paths,
+                client: &client,
+                lockfile: &mut lockfile,
+                queue_locations: BTreeMap::new(),
+                interactive: true,
+            };
+            // Empty stdin — BothDeleted must not prompt.
+            resolve_remote_deletes(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b""),
+                true,
+                &progress,
+                &mut None,
+            )
+            .await
+            .expect("BothDeleted resolver must succeed without reading stdin")
+        };
+
+        assert!(outcome.promoted_to_push.is_empty());
+        assert!(
+            lockfile
+                .objects
+                .get("saved_views")
+                .and_then(|m| m.get("awaiting-approval"))
+                .is_none(),
+            "BothDeleted must drop the saved-view lockfile entry"
+        );
+
+        let logged = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.is_empty(),
+            "BothDeleted converges silently — no warn, no event at all; got:\n{logged}"
         );
     }
 
