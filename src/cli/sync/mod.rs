@@ -888,6 +888,52 @@ pub fn from_catalog_scan_lockfile(
         }
     }
 
+    // --- saved views ---------------------------------------------------
+    let saved_views_codec =
+        crate::snapshot::codec::codec("saved_views").expect("saved_views codec must exist");
+    let mut used_saved_view_slugs: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for v in &catalog.saved_views {
+        let slug = match lockfile.slug_for_id("saved_views", v.id) {
+            Some(existing) => existing.to_string(),
+            None => crate::slug::slugify_unique(&v.name, &used_saved_view_slugs),
+        };
+        used_saved_view_slugs.insert(slug.clone());
+
+        let value = match serde_json::to_value(v) {
+            Ok(x) => x,
+            Err(_) => continue,
+        };
+        let art = match saved_views_codec.disk_bytes(&value) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        let json = crate::cli::pull::common::portabilize_proposed(&art.json, lockfile);
+        let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
+        remote_hashes.insert(("saved_views".to_string(), slug), hash);
+    }
+
+    for (slug, path) in &changes.saved_views {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let hash = crate::state::content_hash(&bytes, &crate::state::Lockfile::default());
+        scan_changes.insert(("saved_views".to_string(), slug.clone()), hash);
+    }
+
+    for slug in tombstones.saved_views.keys() {
+        scan_tombstones.insert(("saved_views".to_string(), slug.clone()));
+    }
+
+    if let Some(map) = lockfile.objects.get("saved_views") {
+        for (slug, entry) in map {
+            if let Some(h) = &entry.content_hash {
+                locked.insert(("saved_views".to_string(), slug.clone()), h.clone());
+            }
+        }
+    }
+
     // --- organization (pull-only singleton) ---------------------------
     // The org is a singleton — slug is always "self". Route through the
     // KindCodec so the adapter hash matches the pull baseline (the codec

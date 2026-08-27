@@ -16,7 +16,7 @@ pub(crate) mod organization;
 pub(crate) mod portabilize;
 pub(crate) mod queues;
 pub(crate) mod rules;
-pub mod saved_views;
+pub(crate) mod saved_views;
 pub(crate) mod workflow_steps;
 pub(crate) mod workflows;
 pub(crate) mod workspaces;

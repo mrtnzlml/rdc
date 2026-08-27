@@ -155,6 +155,21 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
         }
     }
 
+    // Same shape as `label_by_slug`: rdc's filtered (shared-only) saved-view
+    // listing, slugged the same way `pull::saved_views::process` does.
+    let mut saved_view_by_slug: BTreeMap<String, &crate::model::SavedView> = BTreeMap::new();
+    {
+        let mut used: HashSet<String> = HashSet::new();
+        for v in &catalog.saved_views {
+            let slug = match ctx.lockfile.slug_for_id("saved_views", v.id) {
+                Some(existing) => existing.to_string(),
+                None => slugify_unique(&v.name, &used),
+            };
+            used.insert(slug.clone());
+            saved_view_by_slug.insert(slug, v);
+        }
+    }
+
     // Build slug → object indexes for the kinds the resolver knows
     // about. Each kind mirrors the slug derivation rule its pull driver
     // uses. The maps stay scoped to this function; downstream resolution
@@ -601,6 +616,22 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
                         })
                     })
             }
+            "saved_views" => saved_view_by_slug.get(it.slug.as_str()).copied().and_then(|v| {
+                let codec = crate::snapshot::codec::codec("saved_views")?;
+                let value = serde_json::to_value(v).ok()?;
+                let art = codec.disk_bytes(&value).ok()?;
+                let local_path = ctx.paths.saved_views_dir().join(format!("{}.json", it.slug));
+                Some(ConflictRefs {
+                    remote_bytes: art.json,
+                    remote_code: None,
+                    remote_formulas: Vec::new(),
+                    local_path,
+                    id: v.id,
+                    modified_at: v.modified_at().map(|s| s.to_string()),
+                    modified_by: v.modified_by().map(|s| s.to_string()),
+                    hash_strategy: HashStrategy::Flat,
+                })
+            }),
             other => {
                 progress.event(
                     Action::Warn,
@@ -1906,6 +1937,20 @@ fn deleted_marker_path(paths: &crate::paths::Paths, local_path: &Path) -> PathBu
     PathBuf::from(s)
 }
 
+/// Event detail for a clean `RemoteDelete`.
+///
+/// For most kinds the remote object really is gone. A saved view usually is
+/// not: it left rdc's filtered listing because someone unshared it, and it
+/// still exists in the organization. Claiming a remote deletion there would be
+/// false, so the wording is kind-specific.
+fn remote_delete_detail(kind: &str, slug: &str) -> String {
+    if kind == "saved_views" {
+        format!("saved_views/{slug} (no longer shared \u{2014} not managed by rdc)")
+    } else {
+        format!("{kind}/{slug}")
+    }
+}
+
 /// Sweep stale conflict artifacts for a file whose conflict has just been
 /// RESOLVED: the conflict shadow (left by an earlier non-TTY run or an
 /// explicit `[s]kip`) and the `-deleted` marker, both under
@@ -2388,6 +2433,18 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
             };
             used.insert(slug.clone());
             label_by_slug.insert(slug, l);
+        }
+    }
+    let mut saved_view_by_slug: BTreeMap<String, &crate::model::SavedView> = BTreeMap::new();
+    {
+        let mut used: HashSet<String> = HashSet::new();
+        for v in &catalog.saved_views {
+            let slug = match ctx.lockfile.slug_for_id("saved_views", v.id) {
+                Some(existing) => existing.to_string(),
+                None => slugify_unique(&v.name, &used),
+            };
+            used.insert(slug.clone());
+            saved_view_by_slug.insert(slug, v);
         }
     }
     let mut workspace_by_slug: BTreeMap<String, &crate::model::Workspace> = BTreeMap::new();
@@ -2932,6 +2989,27 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                             hash_strategy: HashStrategy::Flat,
                         })
                     }
+                    "saved_views" => {
+                        let local_path = ctx.paths.saved_views_dir().join(format!("{}.json", it.slug));
+                        let body = saved_view_by_slug.get(it.slug.as_str()).copied();
+                        let restore = body.and_then(|v| {
+                            let codec = crate::snapshot::codec::codec("saved_views")?;
+                            let value = serde_json::to_value(v).ok()?;
+                            let art = codec.disk_bytes(&value).ok()?;
+                            let bytes = art.json;
+                            Some(bytes)
+                        });
+                        Some(RemoteDeleteRefs {
+                            local_path,
+                            restore_bytes: restore,
+                            restore_code: None,
+                            restore_formulas: Vec::new(),
+                            id: body.map(|v| v.id),
+                            modified_at: body.and_then(|v| v.modified_at().map(|s| s.to_string())),
+                            modified_by: body.and_then(|v| v.modified_by().map(|s| s.to_string())),
+                            hash_strategy: HashStrategy::Flat,
+                        })
+                    }
                     other => {
                         progress.event(Action::Warn, &format!(
                             "remote-delete dispatch not yet wired for kind '{}' (slug '{}'); skipping",
@@ -3027,10 +3105,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                         recorded_base.is_some() && local_disk_hash(&refs) == recorded_base;
                     if still_clean {
                         delete_local_object(ctx, it, &refs)?;
-                        progress.event(
-                            Action::Delete,
-                            &format!("{}/{} (deleted on {env})", it.kind, it.slug),
-                        );
+                        progress.event(Action::Delete, &remote_delete_detail(&it.kind, &it.slug));
                         continue;
                     }
                 }
@@ -3472,6 +3547,9 @@ pub async fn run(
                 "engine_fields" => {
                     tombstones.engine_fields.insert(it.slug.clone(), id);
                 }
+                "saved_views" => {
+                    tombstones.saved_views.insert(it.slug.clone(), id);
+                }
                 other => {
                     progress.event(Action::Warn, &format!(
                         "{other}/{} classified as LocalDelete but kind is not deletable via rdc sync; skipping",
@@ -3577,6 +3655,9 @@ pub async fn run(
                 "email_templates" => {
                     change_list.email_templates.insert(slug, path);
                 }
+                "saved_views" => {
+                    change_list.saved_views.insert(slug, path);
+                }
                 "organization" => {
                     // Singleton: no slug lookup needed, the path is fixed.
                     change_list.organization = Some(path);
@@ -3658,6 +3739,18 @@ pub async fn run(
         if let Some(subset) = subsets.get("labels") {
             crate::cli::pull::labels::process(ctx, catalog.labels.clone(), subset, progress)
                 .await?;
+        }
+
+        // saved_views: flat slug, no nested files, filtered to shared-only
+        // upstream in `pull::saved_views::list`. Same shape as labels.
+        if let Some(subset) = subsets.get("saved_views") {
+            crate::cli::pull::saved_views::process(
+                ctx,
+                catalog.saved_views.clone(),
+                subset,
+                progress,
+            )
+            .await?;
         }
 
         // The organization singleton has a push side too (the `settings`
@@ -4271,6 +4364,18 @@ mod tests {
         assert!(b.keep_local_summary.contains("39 local file(s) kept and pushed to prod"));
         assert!(b.keep_local_summary.contains("rdc push --allow-deletes prod"));
         assert!(!b.use_remote_summary.contains("rdc push --allow-deletes"), "allow-deletes note belongs only to keep-local: {}", b.use_remote_summary);
+    }
+
+    /// The clean-`RemoteDelete` event line must not claim a remote deletion for
+    /// this kind: a saved view that left rdc's filtered listing has usually
+    /// just been unshared, and still exists in the org.
+    #[test]
+    fn remote_delete_detail_is_kind_specific_for_saved_views() {
+        assert_eq!(
+            remote_delete_detail("saved_views", "awaiting-approval"),
+            "saved_views/awaiting-approval (no longer shared \u{2014} not managed by rdc)"
+        );
+        assert_eq!(remote_delete_detail("labels", "urgent"), "labels/urgent");
     }
 
     /// Build an empty RemoteCatalog with `labels` populated by the caller.
