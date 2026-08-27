@@ -562,10 +562,20 @@ fn walk_strings_with_path(value: &Value, path: &str, f: &mut dyn FnMut(&str, &st
 /// file. Both are correct values, not refs that "cannot cross". Deriving the
 /// set from the codec also means a ref-bearing field Rossum adds later is
 /// covered automatically, while a new env field is excluded automatically.
+///
+/// `src_host` is the bare host of the SOURCE env's `api_base` (via [`url_host`]),
+/// and it is what makes the non-portable half work on BOTH api_base shapes rdc
+/// supports. `https://<org>.rossum.app/api/v1` yields refs carrying `/api/v1/`,
+/// but `https://api.elis.rossum.ai/v1` does not — on that family a
+/// `…/v1/users/7` ref matched neither branch and promoted verbatim, so this half
+/// of the validation silently did nothing. Nothing downstream catches it either:
+/// push's `residual_rdc_refs` only looks for surviving `rdc://`. `None` (no
+/// lockfile, no `rdc.toml` entry) falls back to the `/api/v1/` shape alone.
 pub(crate) fn check_saved_view_refs(
     slug: &str,
     value: &Value,
     known: &BTreeSet<(String, String)>,
+    src_host: Option<&str>,
 ) -> Vec<SavedViewRefProblem> {
     let mut out = Vec::new();
     let Some(obj) = value.as_object() else {
@@ -603,7 +613,9 @@ pub(crate) fn check_saved_view_refs(
                         reason: SavedViewRefReason::Unresolvable,
                     });
                 }
-            } else if s.contains("/api/v1/") && s.starts_with("http") {
+            } else if s.starts_with("http")
+                && (s.contains("/api/v1/") || src_host.is_some_and(|h| s.contains(h)))
+            {
                 out.push(SavedViewRefProblem {
                     slug: slug.to_string(),
                     location: location.to_string(),
@@ -2882,6 +2894,12 @@ pub fn run_at(
                 .iter()
                 .filter_map(|rel| classify(rel).map(|(k, s)| (k.to_string(), s)))
                 .collect();
+            // The SOURCE env's host, so a ref carrying it is recognized on an
+            // api_base with no `/api/v1/` segment (see `check_saved_view_refs`).
+            // The lockfile is authoritative when present; `rdc.toml` covers a
+            // source snapshot that has never been synced (no lockfile on disk).
+            let src_host = url_host(&src_lockfile.api_base)
+                .or_else(|| project_cfg.envs.get(src).and_then(|c| url_host(&c.api_base)));
             let mut ref_problems: Vec<SavedViewRefProblem> = Vec::new();
             for (slug, rel) in &promoted_saved_views {
                 // An overlay that replaces `query` for this env is the
@@ -2893,7 +2911,12 @@ pub fn run_at(
                     std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
                 let v: Value = serde_json::from_slice(&bytes)
                     .with_context(|| format!("parsing JSON {}", path.display()))?;
-                ref_problems.extend(check_saved_view_refs(slug, &v, &known));
+                ref_problems.extend(check_saved_view_refs(
+                    slug,
+                    &v,
+                    &known,
+                    src_host.as_deref(),
+                ));
             }
             if !ref_problems.is_empty() {
                 anyhow::bail!(format_saved_view_ref_error(&ref_problems, tgt));
@@ -5303,7 +5326,7 @@ mod tests {
             "query": { "$and": [ { "queue": { "$in": ["rdc://queues/invoices"] } } ] }
         });
         let known = known_pairs(&[("queues", "invoices")]);
-        assert!(check_saved_view_refs("awaiting-approval", &v, &known).is_empty());
+        assert!(check_saved_view_refs("awaiting-approval", &v, &known, None).is_empty());
     }
 
     /// A user ref survives portabilization as a raw URL because users are not a
@@ -5319,7 +5342,7 @@ mod tests {
                 { "modifier": { "$in": ["https://acme.rossum.app/api/v1/users/7"] } }
             ] }
         });
-        let problems = check_saved_view_refs("mine", &v, &BTreeSet::new());
+        let problems = check_saved_view_refs("mine", &v, &BTreeSet::new(), None);
         assert_eq!(problems.len(), 1);
         assert_eq!(problems[0].reason, SavedViewRefReason::NonPortable);
         assert!(problems[0].reference.contains("/users/7"));
@@ -5340,7 +5363,8 @@ mod tests {
             "queues_filter": ["rdc://queues/not-in-target"],
             "query": { "$and": [] }
         });
-        let problems = check_saved_view_refs("scoped", &v, &known_pairs(&[("queues", "invoices")]));
+        let problems =
+            check_saved_view_refs("scoped", &v, &known_pairs(&[("queues", "invoices")]), None);
         assert_eq!(problems.len(), 1);
         assert_eq!(problems[0].reason, SavedViewRefReason::Unresolvable);
         assert_eq!(problems[0].location, "queues_filter[0]");
@@ -5357,7 +5381,63 @@ mod tests {
             "queues_filter": [],
             "query": { "$and": [ { "field.document_id.string": { "$eq": "x" } } ] }
         });
-        assert!(check_saved_view_refs("by-field", &v, &BTreeSet::new()).is_empty());
+        assert!(check_saved_view_refs("by-field", &v, &BTreeSet::new(), None).is_empty());
+    }
+
+    /// rdc supports two api_base shapes and treats both as first-class:
+    /// `https://<org>.rossum.app/api/v1` and `https://api.elis.rossum.ai/v1`
+    /// (`config::EnvConfig` documents both; `rdc init` offers the second as its
+    /// prompt example). On the second there is no `/api/v1/` segment, so a user
+    /// ref matched NEITHER branch and promoted verbatim — on a shared cluster
+    /// that hands the target org a hyperlink to a SOURCE-org user. Knowing the
+    /// source host is what closes it.
+    #[test]
+    fn saved_view_user_ref_on_a_v1_api_base_is_refused() {
+        let v = serde_json::json!({
+            "name": "Mine",
+            "shared": true,
+            "queues_filter": [],
+            "query": { "$and": [
+                { "modifier": { "$in": ["https://api.elis.rossum.ai/v1/users/7"] } }
+            ] }
+        });
+        let problems = check_saved_view_refs(
+            "mine",
+            &v,
+            &BTreeSet::new(),
+            Some("api.elis.rossum.ai"),
+        );
+        assert_eq!(problems.len(), 1, "got {problems:?}");
+        assert_eq!(problems[0].reason, SavedViewRefReason::NonPortable);
+        assert!(problems[0].reference.contains("/v1/users/7"));
+        assert_eq!(problems[0].location, "query.$and[0].modifier.$in[0]");
+
+        // Pinning the residual blind spot rather than papering over it: with no
+        // host to compare against (no lockfile AND no `rdc.toml` entry for the
+        // source env) this shape carries nothing the predicate can recognize.
+        // `run_at` always has one of the two, which is why it is threaded in.
+        assert!(check_saved_view_refs("mine", &v, &BTreeSet::new(), None).is_empty());
+    }
+
+    /// The source host must not swallow a ref that DOES resolve: a portable
+    /// `rdc://` ref never reaches the non-portable branch.
+    #[test]
+    fn source_host_does_not_flag_resolvable_portable_refs() {
+        let v = serde_json::json!({
+            "name": "Awaiting approval",
+            "shared": true,
+            "queues_filter": ["rdc://queues/invoices"],
+            "query": { "$and": [ { "queue": { "$in": ["rdc://queues/invoices"] } } ] }
+        });
+        assert!(
+            check_saved_view_refs(
+                "awaiting-approval",
+                &v,
+                &known_pairs(&[("queues", "invoices")]),
+                Some("api.elis.rossum.ai"),
+            )
+            .is_empty()
+        );
     }
 
     /// The ENV fields of a promoted view carry raw API URLs by design and must
@@ -5381,19 +5461,27 @@ mod tests {
             "awaiting-approval",
             &v,
             &known_pairs(&[("queues", "invoices")]),
+            None,
         );
         assert!(problems.is_empty(), "env fields must be out of scope: {problems:?}");
     }
 
     /// Two-env project (`dev` -> `prod`) in a tempdir, ready for `run_at`.
     fn saved_view_project() -> tempfile::TempDir {
+        saved_view_project_with_bases("https://dev.example/api/v1", "https://prod.example/api/v1")
+    }
+
+    /// Same, with the `api_base` of each env chosen by the caller — rdc supports
+    /// both `https://<org>.rossum.app/api/v1` and `https://api.elis.rossum.ai/v1`
+    /// and the ref check has to work on both.
+    fn saved_view_project_with_bases(dev_base: &str, prod_base: &str) -> tempfile::TempDir {
         let project = tempfile::TempDir::new().unwrap();
         let mut envs = BTreeMap::new();
-        for (env, org_id) in [("dev", 1u64), ("prod", 2u64)] {
+        for (env, base, org_id) in [("dev", dev_base, 1u64), ("prod", prod_base, 2u64)] {
             envs.insert(
                 env.to_string(),
                 crate::config::EnvConfig {
-                    api_base: format!("https://{env}.example/api/v1"),
+                    api_base: base.to_string(),
                     org_id,
                 },
             );
@@ -5487,6 +5575,43 @@ mod tests {
             "saved-views/scoped",
             "queues_filter[0]",
             "not-in-target",
+            "cannot cross into 'prod'",
+        ] {
+            assert!(msg.contains(want), "error must mention {want}, got: {msg}");
+        }
+    }
+
+    /// End-to-end on the `…/v1` api_base shape (no `/api/v1/` segment): the run
+    /// must still refuse. Proves the source host actually reaches the checker —
+    /// here from `rdc.toml`, since a hand-authored snapshot has no lockfile.
+    #[test]
+    fn run_at_refuses_a_user_ref_on_a_v1_api_base() {
+        let project = saved_view_project_with_bases(
+            "https://api.dev.example/v1",
+            "https://api.prod.example/v1",
+        );
+        let root = project.path();
+        write_source_queue(root);
+        write_snapshot_json(
+            &root.join("envs/dev/saved-views/mine.json"),
+            &serde_json::json!({
+                "name": "Mine",
+                "shared": true,
+                "queues_filter": ["rdc://queues/invoices"],
+                "query": { "$and": [
+                    { "modifier": { "$in": ["https://api.dev.example/v1/users/7"] } }
+                ] },
+                "organization": "https://api.dev.example/v1/organizations/1"
+            }),
+        );
+
+        let err = run_at(root, "dev", "prod", false, false, vec![], false, false)
+            .expect_err("a user ref must refuse on an api_base with no /api/v1/ segment");
+        let msg = format!("{err:#}");
+        for want in [
+            "saved-views/mine",
+            "query.$and[0].modifier.$in[0]",
+            "https://api.dev.example/v1/users/7",
             "cannot cross into 'prod'",
         ] {
             assert!(msg.contains(want), "error must mention {want}, got: {msg}");
