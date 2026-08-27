@@ -892,11 +892,11 @@ pub fn from_catalog_scan_lockfile(
         // There is deliberately no tombstone counterpart here — rdc cannot
         // delete an organization, so a missing file means nothing to push, not
         // a delete request; the pull half of the same sync restores it.
-        if let Some(path) = &changes.organization {
-            if let Ok(bytes) = std::fs::read(path) {
-                let hash = crate::state::content_hash(&bytes, &crate::state::Lockfile::default());
-                scan_changes.insert(("organization".to_string(), "self".to_string()), hash);
-            }
+        if let Some(path) = &changes.organization
+            && let Ok(bytes) = std::fs::read(path)
+        {
+            let hash = crate::state::content_hash(&bytes, &crate::state::Lockfile::default());
+            scan_changes.insert(("organization".to_string(), "self".to_string()), hash);
         }
     }
 

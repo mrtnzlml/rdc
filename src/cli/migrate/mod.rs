@@ -3552,8 +3552,8 @@ mod tests {
         let subst = build_subst(&m);
         let rel = Path::new("workspaces/main/workspace.json");
 
-        let mut src_lf = crate::state::Lockfile::default();
-        src_lf.api_base = HOST.into();
+        let src_lf =
+            crate::state::Lockfile { api_base: HOST.into(), ..Default::default() };
 
         // `tgt_seed`: what already sits at the target path — None for a brand-new
         // object, Some(bytes) for a matched one.
@@ -3695,8 +3695,8 @@ mod tests {
         let run = |src_api_base: &str, tgt_seed: Option<serde_json::Value>| -> serde_json::Value {
             let src = tempfile::TempDir::new().unwrap();
             let tgt = tempfile::TempDir::new().unwrap();
-            let mut src_lf = crate::state::Lockfile::default();
-            src_lf.api_base = src_api_base.into();
+            let src_lf =
+                crate::state::Lockfile { api_base: src_api_base.into(), ..Default::default() };
             let src_file = src.path().join(rel);
             fs::create_dir_all(src_file.parent().unwrap()).unwrap();
             fs::write(
