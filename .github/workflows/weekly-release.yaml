@@ -1,0 +1,176 @@
+name: Weekly release
+
+# Cuts a release once a week, but only when something shippable landed since the
+# last tag. Verifies the tree BEFORE writing a single byte, then bumps, commits,
+# tags, and calls release.yaml directly.
+#
+# It calls release.yaml rather than pushing a tag and walking away because a tag
+# pushed with the default GITHUB_TOKEN does not start `on: push: tags`
+# workflows. `workflow_call` is not a trigger, so that restriction never
+# applies.
+#
+# The decision and the bump live in .github/scripts/, unit-tested by
+# tests/release_plan.rs and tests/bump_version.rs -- neither needs a repository,
+# a tag, or a network.
+
+on:
+  schedule:
+    # Monday morning UTC, deliberately off the top of the hour: GitHub warns
+    # that scheduled runs are delayed or dropped under load, and that "high load
+    # times include the start of every hour".
+    - cron: "17 6 * * 1"
+  # So a release can be forced without waiting for Monday.
+  workflow_dispatch:
+
+permissions:
+  # Push the bump commit and the tag.
+  contents: write
+
+jobs:
+  prepare:
+    name: Gate and tag
+    runs-on: ubuntu-latest
+    # Shared with release.yaml, so a scheduled run and a manual
+    # `git push origin vX.Y.Z` can never interleave. Held only for as long as
+    # this job runs; by the time `release` calls release.yaml (which declares
+    # the same group) this job has finished and released it, so there is no
+    # self-deadlock. No cancel-in-progress -- never kill a release halfway.
+    concurrency:
+      group: rdc-release
+    outputs:
+      released: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Every decision below is a range against the previous tag, which a
+          # depth-1 checkout cannot see.
+          fetch-depth: 0
+
+      - name: Decide whether to release
+        id: plan
+        run: |
+          set -euo pipefail
+          prev=$(git describe --tags --abbrev=0 --match 'v*')
+          count=$(git rev-list --count "$prev"..HEAD)
+          echo "Previous release: $prev ($count commits since)"
+
+          git diff --name-only "$prev"..HEAD > "$RUNNER_TEMP/changed-paths"
+          git log --format='%s%n%b' "$prev"..HEAD > "$RUNNER_TEMP/log"
+
+          # Read the version from Cargo.toml rather than from the tag, so a
+          # hand-edited version can never be silently reverted.
+          current=$(awk '/^version = "/ { gsub(/"/, "", $3); print $3; exit }' Cargo.toml)
+          echo "Current version: $current"
+
+          .github/scripts/release-plan.sh \
+            "$current" "$RUNNER_TEMP/changed-paths" "$RUNNER_TEMP/log" \
+            | tee -a "$GITHUB_OUTPUT"
+
+          echo "COMMIT_COUNT=$count" >> "$GITHUB_ENV"
+
+      - name: Nothing to release
+        if: steps.plan.outputs.release != 'true'
+        # A quiet week is a success, not a failure. It must not page anyone.
+        run: |
+          echo "::notice::${COMMIT_COUNT} commit(s) since the last tag, none of them shippable. No release this week."
+
+      # ---- Everything below runs only when there is something to ship. ----
+
+      - name: Install Rust
+        if: steps.plan.outputs.release == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        if: steps.plan.outputs.release == 'true'
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-weekly-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-weekly-
+
+      - name: Test
+        if: steps.plan.outputs.release == 'true'
+        # tests/live.rs is #[ignore] by default, so this never touches the API.
+        run: cargo test --locked
+
+      - name: Clippy
+        if: steps.plan.outputs.release == 'true'
+        # v0.6.0 shipped with six clippy errors on main because the tag went out
+        # while clippy was still running.
+        #
+        # `cargo fmt` is deliberately absent: this tree is not fmt-clean under
+        # the local rustfmt and never has been, so adding it would make every
+        # week red for a reason unrelated to the release.
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Bump version
+        if: steps.plan.outputs.release == 'true'
+        run: .github/scripts/bump-version.sh "${{ steps.plan.outputs.version }}"
+
+      - name: Verify the bump
+        if: steps.plan.outputs.release == 'true'
+        run: |
+          set -euo pipefail
+          # --locked fails if the lockfile no longer matches the manifest, so a
+          # green release build proves the tag cannot be created against a tree
+          # that will not produce a release binary. The profile is lto = "fat",
+          # codegen-units = 1, so budget for it.
+          cargo build --release --locked
+          # Cargokit does not build the desktop bridge with --locked, so a bad
+          # edit to desktop/rust/Cargo.lock would otherwise surface as a dirty
+          # tree on some future build instead of as a failure here.
+          cargo metadata --locked --format-version 1 \
+            --manifest-path desktop/rust/Cargo.toml > /dev/null
+          # Re-run AFTER the bump: a pre-bump run passes even when the bumper
+          # then updates Cargo.toml and forgets templates/gitlab-ci.yml.
+          cargo test --locked --lib cli::gitlab_ci
+
+      - name: Confirm exactly the four expected files changed
+        if: steps.plan.outputs.release == 'true'
+        run: |
+          set -euo pipefail
+          expected="Cargo.lock,Cargo.toml,desktop/rust/Cargo.lock,templates/gitlab-ci.yml"
+          actual=$(git diff --name-only | sort | paste -sd, -)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::the bump changed an unexpected set of files: $actual"
+            exit 1
+          fi
+
+      - name: Commit and tag
+        if: steps.plan.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock desktop/rust/Cargo.lock templates/gitlab-ci.yml
+          git commit -m "chore(release): v${VERSION}"
+          # Annotated, body `rdc vX.Y.Z` -- the shape every existing tag has.
+          git tag -a "$TAG" -m "rdc v${VERSION}"
+          # --atomic so a rejected branch push cannot leave a dangling tag.
+          #
+          # If main moved since the gate ran, this push is REJECTED and the run
+          # fails. That is deliberate: rebasing would put commits inside the tag
+          # that the gate never tested.
+          git push --atomic origin HEAD:main "$TAG"
+
+  release:
+    name: Release
+    needs: prepare
+    if: needs.prepare.outputs.released == 'true'
+    # No trigger is involved, so the GITHUB_TOKEN event restriction that stops a
+    # pushed tag from starting release.yaml never applies here.
+    uses: ./.github/workflows/release.yaml
+    # The tap job needs HOMEBREW_TAP_TOKEN.
+    secrets: inherit
+    with:
+      tag: ${{ needs.prepare.outputs.tag }}
