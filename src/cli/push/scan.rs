@@ -343,6 +343,52 @@ impl ChangeList {
         }
         out
     }
+
+    /// Does this struct have a slot for `kind` at all?
+    ///
+    /// Distinguishes "a kind rdc does not push" from "a kind rdc pushes that
+    /// happens to have no changes right now" — [`Self::contains`] answers
+    /// `false` for both.
+    pub fn tracks(&self, kind: &str) -> bool {
+        matches!(
+            kind,
+            "workspaces"
+                | "queues"
+                | "schemas"
+                | "inboxes"
+                | "email_templates"
+                | "hooks"
+                | "rules"
+                | "labels"
+                | "saved_views"
+                | "engines"
+                | "engine_fields"
+                | "organization"
+        )
+    }
+
+    /// Is `(kind, slug)` in this change list?
+    ///
+    /// `organization` is a singleton keyed by the reserved slug `"self"` and
+    /// stored as an `Option` rather than a map, so it answers through this same
+    /// call rather than forcing every caller to special-case it.
+    pub fn contains(&self, kind: &str, slug: &str) -> bool {
+        match kind {
+            "workspaces" => self.workspaces.contains_key(slug),
+            "queues" => self.queues.contains_key(slug),
+            "schemas" => self.schemas.contains_key(slug),
+            "inboxes" => self.inboxes.contains_key(slug),
+            "email_templates" => self.email_templates.contains_key(slug),
+            "hooks" => self.hooks.contains_key(slug),
+            "rules" => self.rules.contains_key(slug),
+            "labels" => self.labels.contains_key(slug),
+            "saved_views" => self.saved_views.contains_key(slug),
+            "engines" => self.engines.contains_key(slug),
+            "engine_fields" => self.engine_fields.contains_key(slug),
+            "organization" => slug == "self" && self.organization.is_some(),
+            _ => false,
+        }
+    }
 }
 
 /// Build a [`FieldLimitViolation`] from a [`crate::snapshot::limits::LimitViolation`],
@@ -441,6 +487,44 @@ impl Tombstones {
 
     pub fn is_empty(&self) -> bool {
         self.total() == 0
+    }
+
+    /// Does this struct have a slot for `kind` at all?
+    ///
+    /// `organization` is absent on purpose: rdc cannot delete an organization.
+    pub fn tracks(&self, kind: &str) -> bool {
+        matches!(
+            kind,
+            "workspaces"
+                | "queues"
+                | "schemas"
+                | "inboxes"
+                | "email_templates"
+                | "hooks"
+                | "rules"
+                | "labels"
+                | "saved_views"
+                | "engines"
+                | "engine_fields"
+        )
+    }
+
+    /// Is `(kind, slug)` tombstoned?
+    pub fn contains(&self, kind: &str, slug: &str) -> bool {
+        match kind {
+            "workspaces" => self.workspaces.contains_key(slug),
+            "queues" => self.queues.contains_key(slug),
+            "schemas" => self.schemas.contains_key(slug),
+            "inboxes" => self.inboxes.contains_key(slug),
+            "email_templates" => self.email_templates.contains_key(slug),
+            "hooks" => self.hooks.contains_key(slug),
+            "rules" => self.rules.contains_key(slug),
+            "labels" => self.labels.contains_key(slug),
+            "saved_views" => self.saved_views.contains_key(slug),
+            "engines" => self.engines.contains_key(slug),
+            "engine_fields" => self.engine_fields.contains_key(slug),
+            _ => false,
+        }
     }
 }
 
@@ -2143,5 +2227,185 @@ mod tests {
         let mut changes = ChangeList::default();
         changes.saved_views.insert("ok".to_string(), path);
         assert!(changes.unshared_saved_views().is_empty());
+    }
+
+    /// Per push-capable kind: the slug to classify, and the files that must
+    /// exist on disk for the change-list arm to find it.
+    ///
+    /// Several arms only insert when a real file is found — `queues`,
+    /// `schemas`, `inboxes` sweep `workspaces/*/queues/<slug>/`, and
+    /// `engine_fields` resolves a `<engine>/<field>` composite key — so a
+    /// synthetic item alone would silently not be inserted and the test would
+    /// pass for the wrong reason.
+    fn push_capable_fixture() -> Vec<(&'static str, &'static str, Vec<&'static str>)> {
+        vec![
+            ("workspaces", "main", vec!["workspaces/main/workspace.json"]),
+            ("queues", "invoices", vec!["workspaces/main/queues/invoices/queue.json"]),
+            ("schemas", "invoices", vec!["workspaces/main/queues/invoices/schema.json"]),
+            ("inboxes", "invoices", vec!["workspaces/main/queues/invoices/inbox.json"]),
+            (
+                "email_templates",
+                "main/invoices/ack",
+                vec!["workspaces/main/queues/invoices/email-templates/ack.json"],
+            ),
+            ("hooks", "validator", vec!["hooks/validator.json"]),
+            ("rules", "totals", vec!["rules/totals.json"]),
+            ("labels", "urgent", vec!["labels/urgent.json"]),
+            ("saved_views", "awaiting", vec!["saved-views/awaiting.json"]),
+            ("engines", "extractor", vec!["engines/extractor/engine.json"]),
+            ("engine_fields", "extractor/amount", vec!["engines/extractor/fields/amount.json"]),
+            ("organization", "self", vec!["organization.json"]),
+        ]
+    }
+
+    /// The fixture must cover PUSH_CAPABLE exactly. Without this, adding a kind
+    /// to PUSH_CAPABLE and forgetting the fixture would make the enforcement
+    /// test below quietly skip it — the same silent-omission failure this whole
+    /// change exists to prevent.
+    #[test]
+    fn push_capable_fixture_covers_every_push_capable_kind() {
+        let mut fixture: Vec<&str> = push_capable_fixture().iter().map(|(k, _, _)| *k).collect();
+        let mut expected: Vec<&str> = crate::kinds::PUSH_CAPABLE.to_vec();
+        fixture.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(fixture, expected);
+    }
+
+    #[test]
+    fn every_push_capable_kind_has_a_change_list_slot() {
+        let cl = ChangeList::default();
+        for kind in crate::kinds::PUSH_CAPABLE {
+            assert!(cl.tracks(kind), "ChangeList has no slot for '{kind}'");
+        }
+    }
+
+    #[test]
+    fn every_deletable_kind_has_a_tombstones_slot() {
+        let t = Tombstones::default();
+        for kind in crate::kinds::DELETABLE {
+            assert!(t.tracks(kind), "Tombstones has no slot for '{kind}'");
+        }
+        assert!(
+            !t.tracks("organization"),
+            "an organization can never be deleted, so it must have no tombstone slot",
+        );
+    }
+
+    /// The regression guard for the worst bug on the saved-views branch:
+    /// `change_list_from_classified` silently dropped a kind with no arm, so
+    /// every ordinary local edit of it made no request at all.
+    #[test]
+    fn every_push_capable_kind_reaches_the_change_list() {
+        use crate::cli::sync::classify::{ClassifiedItem, SyncClass};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        let root = paths.env_root();
+
+        let fixture = push_capable_fixture();
+        for (_, _, files) in &fixture {
+            for rel in files {
+                let p = root.join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, b"{}").unwrap();
+            }
+        }
+
+        let items: Vec<ClassifiedItem> = fixture
+            .iter()
+            .map(|(kind, slug, _)| ClassifiedItem {
+                kind: (*kind).to_string(),
+                slug: (*slug).to_string(),
+                class: SyncClass::LocalEdit,
+                local_hash: None,
+                remote_hash: None,
+                base_hash: None,
+            })
+            .collect();
+
+        let cl = change_list_from_classified(&paths, &items);
+
+        for (kind, slug, _) in &fixture {
+            assert!(
+                cl.contains(kind, slug),
+                "'{kind}' is push-capable but change_list_from_classified dropped it",
+            );
+        }
+    }
+
+    /// A class that is not a local change must never reach the change list.
+    #[test]
+    fn a_non_local_class_does_not_reach_the_change_list() {
+        use crate::cli::sync::classify::{ClassifiedItem, SyncClass};
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        std::fs::create_dir_all(paths.labels_dir()).unwrap();
+        std::fs::write(paths.labels_dir().join("urgent.json"), b"{}").unwrap();
+
+        let items = vec![ClassifiedItem {
+            kind: "labels".to_string(),
+            slug: "urgent".to_string(),
+            class: SyncClass::RemoteEdit,
+            local_hash: None,
+            remote_hash: None,
+            base_hash: None,
+        }];
+        let cl = change_list_from_classified(&paths, &items);
+        assert!(!cl.contains("labels", "urgent"));
+    }
+
+    /// The scan-side counterpart: `detect_tombstones` dispatches per kind too,
+    /// and a deletable kind missing from it would mean a deleted local file
+    /// never becomes a remote delete — the object would linger in the env
+    /// forever with no diagnostic.
+    ///
+    /// Seeded with lockfile entries and an EMPTY tree, so every entry is
+    /// file-less and must therefore be tombstoned.
+    #[test]
+    fn every_deletable_kind_reaches_the_tombstones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+
+        // Compound-key kinds need a well-formed key: `detect_tombstones` splits
+        // email_templates on '/' expecting `<ws>/<queue>/<template>`, and
+        // engine_fields expecting `<engine>/<field>`.
+        let slug_for = |kind: &str| -> &'static str {
+            match kind {
+                "email_templates" => "main/invoices/ack",
+                "engine_fields" => "extractor/amount",
+                _ => "thing",
+            }
+        };
+
+        let mut lockfile = Lockfile::default();
+        for kind in crate::kinds::DELETABLE {
+            lockfile.upsert(
+                kind,
+                slug_for(kind),
+                crate::state::ObjectEntry {
+                    id: 1,
+                    modified_at: None,
+                    modified_by: None,
+                    content_hash: Some("h".to_string()),
+                    secrets_hash: None,
+                },
+            );
+        }
+
+        let t = detect_tombstones(&paths, &lockfile);
+        for kind in crate::kinds::DELETABLE {
+            assert!(
+                t.contains(kind, slug_for(kind)),
+                "'{kind}' is deletable but detect_tombstones did not tombstone it",
+            );
+        }
+    }
+
+    #[test]
+    fn contains_is_false_for_an_untracked_kind() {
+        let cl = ChangeList::default();
+        assert!(!cl.tracks("mdh"));
+        assert!(!cl.contains("mdh", "anything"));
+        assert!(!cl.tracks("workflows"));
     }
 }
