@@ -590,6 +590,33 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
+/// The `(kind, slug)` set the target tree WILL contain once this run finishes:
+/// what is there now, plus what the run writes, minus what `--mirror` prunes.
+///
+/// Used by both modes. For a real run this is equivalent to enumerating the
+/// target tree after the writes — `existing` already covers the target-only
+/// objects an overlay may legitimately point at, and `would_write` covers what
+/// this run creates. For `--dry-run` it is the only correct answer: nothing has
+/// been written, so a disk-only read would miss every object the run would
+/// create and call each of its refs unresolvable.
+fn projected_known(
+    existing: &[PathBuf],
+    would_write: &[PathBuf],
+    pruned: &[PathBuf],
+) -> BTreeSet<(String, String)> {
+    let mut out: BTreeSet<(String, String)> = existing
+        .iter()
+        .chain(would_write.iter())
+        .filter_map(|rel| classify(rel).map(|(k, s)| (k.to_string(), s)))
+        .collect();
+    for rel in pruned {
+        if let Some((k, s)) = classify(rel) {
+            out.remove(&(k.to_string(), s));
+        }
+    }
+    out
+}
+
 /// Validate a migrated saved view's references against what the target snapshot
 /// actually contains.
 ///
@@ -826,6 +853,7 @@ fn transform_file(
     carried_prefixes: &mut Vec<(String, String)>,
     tgt_env: &str,
     missing_schema_ids: &mut Vec<String>,
+    promoted_views: &mut Vec<(String, serde_json::Value)>,
 ) -> Result<FileOutcome> {
     let src_path = src_root.join(rel);
     let dst_rel = remap_relative(rel, mapping);
@@ -1150,6 +1178,15 @@ fn transform_file(
     // normalization the pull post-pass (`portabilize_refs`) applies, so a
     // migrated snapshot is byte-identical to one freshly pulled from the target.
     crate::snapshot::noise::sort_url_arrays(&mut value);
+
+    // Collect the POST-OVERLAY body so both modes validate the same value the
+    // real run would write. Collecting here rather than reading the file back
+    // afterwards is what lets `--dry-run` validate at all — and collecting
+    // after the overlay is what keeps the documented `overlay.toml` escape
+    // hatch working.
+    if let Some(("saved_views", slug)) = classify(&dst_rel) {
+        promoted_views.push((slug, value.clone()));
+    }
 
     let mut json = serde_json::to_vec_pretty(&value)?;
     json.push(b'\n');
@@ -2701,10 +2738,17 @@ pub fn run_at(
     let mut id_hits: Vec<(String, u64, u64)> = Vec::new();
     let mut carried_prefixes: Vec<(String, String)> = Vec::new();
     let mut missing_schema_ids: Vec<String> = Vec::new();
-    // `(target slug, target-relative path)` for every saved view this run
+    // `(target slug, post-overlay body)` for every saved view this run
     // actually promoted — collected here, post-`--only`, post-skip, so the
     // ref check below covers exactly what was written and nothing else.
-    let mut promoted_saved_views: Vec<(String, PathBuf)> = Vec::new();
+    // `transform_file` pushes the value itself (post-overlay), so both
+    // `--dry-run` and a real run validate the same body without reading
+    // anything back off disk.
+    let mut promoted_saved_views: Vec<(String, serde_json::Value)> = Vec::new();
+    // Every path this run writes, needed by `projected_known`. Collected for
+    // EVERY file, not only changed ones: an unchanged target file is still part
+    // of what the target tree contains.
+    let mut would_write: Vec<PathBuf> = Vec::new();
 
     for rel in &files {
         // Un-creatable duplicate unique-typed email templates (see above).
@@ -2770,6 +2814,7 @@ pub fn run_at(
         }
 
         let dst_rel = remap_relative(rel, &mapping);
+        would_write.push(dst_rel.clone());
         if &dst_rel != rel {
             renamed += 1;
         }
@@ -2803,6 +2848,7 @@ pub fn run_at(
             &mut carried_prefixes,
             tgt,
             &mut missing_schema_ids,
+            &mut promoted_saved_views,
         )
         .with_context(|| format!("migrating {}", rel.display()))?;
         if outcome != FileOutcome::Unchanged {
@@ -2824,9 +2870,6 @@ pub fn run_at(
                     listing.join("\n"),
                 ),
             );
-        }
-        if let Some(("saved_views", slug)) = classify(&dst_rel) {
-            promoted_saved_views.push((slug, dst_rel.clone()));
         }
         record_object_status(&mut obj_status, &dst_rel, outcome);
     }
@@ -2870,9 +2913,13 @@ pub fn run_at(
 
     // `--mirror`: prune target-only objects.
     let mut pruned = 0usize;
+    // Hoisted out of the `if mirror` block below so the saved-view validation
+    // can subtract it from `known` regardless of whether `--mirror` ran.
+    let mut pruned_rels: Vec<PathBuf> = Vec::new();
     if mirror {
         let prune =
             mirror_prune_paths(&src_root, src, &tgt_root, tgt, &mapping, &unique_tpl_skips)?;
+        pruned_rels = prune.clone();
         for rel in &prune {
             pruned += 1;
             if dry_run {
@@ -2918,59 +2965,35 @@ pub fn run_at(
     // checking the whole tree turned one such view into a hard error on every
     // migrate — including runs whose source has no saved views at all.
     //
-    // `known` IS built from the whole target tree as it stands right now
-    // (post-write, and — for `--mirror` — post-prune): the overlay escape hatch
-    // may legitimately point `query`/`queues_filter` at a target-only object
-    // this migration never touches, and only a real read of the target tree
-    // sees that. Enumerated lazily, so a project with no saved views pays
-    // nothing for a second walk of its target tree.
+    // ONE path for both modes, over a PROJECTED target set: what the target
+    // tree already has, plus what this run writes, minus what `--mirror`
+    // prunes. For a real run this is equivalent to enumerating the target tree
+    // after the writes; for `--dry-run` (which writes nothing) it is the only
+    // correct answer — a disk-only `known` would miss every object this run
+    // would create and call each of its refs unresolvable. `transform_file`
+    // pushed the POST-OVERLAY body above, so there is nothing to read back
+    // either: the overlay escape hatch is covered for free.
+    //
+    // The SOURCE env's host, so a ref carrying it is recognized on an
+    // api_base with no `/api/v1/` segment (see `check_saved_view_refs`). The
+    // lockfile is authoritative when present; `rdc.toml` covers a source
+    // snapshot that has never been synced (no lockfile on disk).
+    let src_host = url_host(&src_lockfile.api_base)
+        .or_else(|| project_cfg.envs.get(src).and_then(|c| url_host(&c.api_base)));
     if !promoted_saved_views.is_empty() {
-        if dry_run {
-            // Nothing was written, so the file at each target path is either
-            // absent (a new view) or still the target's OWN pre-run content —
-            // whose `query` is not the one being promoted. Validating that
-            // would forecast the wrong thing in both directions, so say so
-            // instead of guessing.
-            log.event(
-                crate::log::Action::Info,
-                &format!(
-                    "{} saved view(s) not ref-validated under --dry-run (the promoted body is \
-                     never written to disk); the real run checks them",
-                    promoted_saved_views.len()
-                ),
-            );
-        } else {
-            let known: BTreeSet<(String, String)> = enumerate_files(&tgt_root, tgt)?
-                .iter()
-                .filter_map(|rel| classify(rel).map(|(k, s)| (k.to_string(), s)))
-                .collect();
-            // The SOURCE env's host, so a ref carrying it is recognized on an
-            // api_base with no `/api/v1/` segment (see `check_saved_view_refs`).
-            // The lockfile is authoritative when present; `rdc.toml` covers a
-            // source snapshot that has never been synced (no lockfile on disk).
-            let src_host = url_host(&src_lockfile.api_base)
-                .or_else(|| project_cfg.envs.get(src).and_then(|c| url_host(&c.api_base)));
-            let mut ref_problems: Vec<SavedViewRefProblem> = Vec::new();
-            for (slug, rel) in &promoted_saved_views {
-                // An overlay that replaces `query` for this env is the
-                // documented escape hatch, and the overlay was applied before
-                // the file was written, so reading it back covers that case for
-                // free.
-                let path = tgt_root.join(rel);
-                let bytes =
-                    std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-                let v: Value = serde_json::from_slice(&bytes)
-                    .with_context(|| format!("parsing JSON {}", path.display()))?;
-                ref_problems.extend(check_saved_view_refs(
-                    slug,
-                    &v,
-                    &known,
-                    src_host.as_deref(),
-                ));
-            }
-            if !ref_problems.is_empty() {
-                anyhow::bail!(format_saved_view_ref_error(&ref_problems, tgt));
-            }
+        let existing = enumerate_files(&tgt_root, tgt)?;
+        let known = projected_known(&existing, &would_write, &pruned_rels);
+        let mut problems: Vec<SavedViewRefProblem> = Vec::new();
+        for (slug, value) in &promoted_saved_views {
+            problems.extend(check_saved_view_refs(
+                slug,
+                value,
+                &known,
+                src_host.as_deref(),
+            ));
+        }
+        if !problems.is_empty() {
+            anyhow::bail!(format_saved_view_ref_error(&problems, tgt));
         }
     }
 
@@ -3666,6 +3689,7 @@ mod tests {
             &mut Vec::new(),
             "tgt",
             &mut Vec::new(),
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -3905,6 +3929,7 @@ mod tests {
                 &mut Vec::new(),
                 "tgt",
                 &mut Vec::new(),
+                &mut Vec::new(),
             )
             .unwrap();
             serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap()
@@ -4044,6 +4069,7 @@ mod tests {
                 &mut Vec::new(),
                 "tgt",
                 &mut Vec::new(),
+                &mut Vec::new(),
             )
             .unwrap();
             serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap()
@@ -4159,6 +4185,7 @@ mod tests {
                 &mut Vec::new(),
                 "tgt",
                 &mut Vec::new(),
+                &mut Vec::new(),
             )
             .unwrap();
             (outcome, fs::read(&dst).unwrap())
@@ -4216,7 +4243,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new(), &mut Vec::new()).unwrap();
 
         // File landed at the remapped path.
         let dst = tgt
@@ -4293,6 +4320,7 @@ mod tests {
             &mut Vec::new(),
             "tgt",
             &mut Vec::new(),
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -4336,7 +4364,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new(), &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("hooks/extractor-prod.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -4378,7 +4406,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new(), &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("hooks/any-hook.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -4426,7 +4454,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new(), &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("hooks/special-hook.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -4467,7 +4495,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new(), &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("rules/some-rule.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -4550,6 +4578,7 @@ mod tests {
             &mut Vec::new(),
             "tgt",
             &mut Vec::new(),
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -4598,7 +4627,7 @@ mod tests {
         fs::write(&src_file, code).unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new(), &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("hooks/extractor-prod.py");
         assert_eq!(
@@ -5096,6 +5125,7 @@ mod tests {
             &mut carries,
             "tgt",
             &mut Vec::new(),
+            &mut Vec::new(),
         )
         .unwrap();
         carries
@@ -5292,6 +5322,7 @@ mod tests {
             &mut Vec::new(),
             "tgt",
             &mut Vec::new(),
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -5350,6 +5381,7 @@ mod tests {
             &mut Vec::new(),
             &mut Vec::new(),
             "tgt",
+            &mut Vec::new(),
             &mut Vec::new(),
         )
         .unwrap();
@@ -5737,5 +5769,127 @@ mod tests {
             before,
             "the target-only view must be left byte-untouched"
         );
+    }
+
+    /// Unit test of the projection itself: writes are added, prunes subtracted.
+    #[test]
+    fn projected_known_adds_writes_and_subtracts_prunes() {
+        let existing = vec![PathBuf::from("labels/kept.json")];
+        let would_write = vec![PathBuf::from("workspaces/main/queues/invoices/queue.json")];
+        let pruned = vec![PathBuf::from("labels/kept.json")];
+
+        let got = projected_known(&existing, &would_write, &pruned);
+        assert!(
+            got.contains(&("queues".to_string(), "invoices".to_string())),
+            "a queue this run would write must be known: {got:?}",
+        );
+        assert!(
+            !got.contains(&("labels".to_string(), "kept".to_string())),
+            "a pruned object must not be known: {got:?}",
+        );
+    }
+
+    /// `--dry-run` must forecast the refusal rather than printing an info line.
+    /// Fails before this change: dry-run skipped validation and returned Ok.
+    #[test]
+    fn dry_run_refuses_a_saved_view_ref_missing_from_the_target() {
+        let project = saved_view_project();
+        let root = project.path();
+        write_source_queue(root);
+        write_snapshot_json(
+            &root.join("envs/dev/saved-views/scoped.json"),
+            &serde_json::json!({
+                "name": "Scoped",
+                "shared": true,
+                "queues_filter": ["rdc://queues/not-in-target"],
+                "query": { "$and": [ { "status": { "$in": ["to_review"] } } ] },
+                "organization": "https://dev.example/api/v1/organizations/1"
+            }),
+        );
+
+        // 5th positional arg is `dry_run`.
+        let err = run_at(root, "dev", "prod", false, true, vec![], false, false)
+            .expect_err("--dry-run must forecast the refusal");
+        let msg = format!("{err:#}");
+        for want in ["saved-views/scoped", "queues_filter[0]", "not-in-target"] {
+            assert!(msg.contains(want), "error must mention {want}, got: {msg}");
+        }
+        assert!(
+            !root.join("envs/prod/saved-views/scoped.json").exists(),
+            "--dry-run must still write nothing",
+        );
+    }
+
+    /// The other direction, and the reason a disk-only `known` is wrong: the
+    /// target starts EMPTY, so the queue this view points at exists only in the
+    /// source. A dry run must NOT call that unresolvable.
+    #[test]
+    fn dry_run_accepts_a_ref_to_a_queue_this_run_would_create() {
+        let project = saved_view_project();
+        let root = project.path();
+        write_source_queue(root); // creates queue `invoices` in the SOURCE only
+        write_snapshot_json(
+            &root.join("envs/dev/saved-views/scoped.json"),
+            &serde_json::json!({
+                "name": "Scoped",
+                "shared": true,
+                "queues_filter": ["rdc://queues/invoices"],
+                "query": { "$and": [ { "status": { "$in": ["to_review"] } } ] },
+                "organization": "https://dev.example/api/v1/organizations/1"
+            }),
+        );
+
+        run_at(root, "dev", "prod", false, true, vec![], false, false)
+            .expect("a ref to a queue this run would create must not be refused");
+    }
+
+    /// The equivalence pin. Collapsing the two modes onto one path is only safe
+    /// if they agree, so assert they reach the SAME verdict over the same
+    /// fixture — both Ok when refs resolve, both Err naming the same ref when
+    /// they do not.
+    #[test]
+    fn dry_run_and_real_run_reach_the_same_saved_view_verdict() {
+        // Resolvable: both modes accept.
+        for dry in [true, false] {
+            let project = saved_view_project();
+            let root = project.path();
+            write_source_queue(root);
+            write_snapshot_json(
+                &root.join("envs/dev/saved-views/ok.json"),
+                &serde_json::json!({
+                    "name": "Ok",
+                    "shared": true,
+                    "queues_filter": ["rdc://queues/invoices"],
+                    "query": { "$and": [ { "status": { "$in": ["to_review"] } } ] },
+                    "organization": "https://dev.example/api/v1/organizations/1"
+                }),
+            );
+            run_at(root, "dev", "prod", false, dry, vec![], false, false)
+                .unwrap_or_else(|e| panic!("dry_run={dry} must accept, got: {e:#}"));
+        }
+
+        // Unresolvable: both modes refuse, naming the same ref.
+        for dry in [true, false] {
+            let project = saved_view_project();
+            let root = project.path();
+            write_source_queue(root);
+            write_snapshot_json(
+                &root.join("envs/dev/saved-views/bad.json"),
+                &serde_json::json!({
+                    "name": "Bad",
+                    "shared": true,
+                    "queues_filter": ["rdc://queues/not-in-target"],
+                    "query": { "$and": [ { "status": { "$in": ["to_review"] } } ] },
+                    "organization": "https://dev.example/api/v1/organizations/1"
+                }),
+            );
+            let err = run_at(root, "dev", "prod", false, dry, vec![], false, false)
+                .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("not-in-target"),
+                "dry_run={dry} must name the offending ref, got: {msg}",
+            );
+        }
     }
 }
