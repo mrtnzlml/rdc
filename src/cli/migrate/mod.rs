@@ -612,11 +612,8 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 /// run that writes the new one: subtracting `pruned` after the union would
 /// drop that object from `known` even though it demonstrably exists on disk,
 /// and diverge from what a post-write enumeration of the real run would show.
-fn projected_known(
-    existing: &[PathBuf],
-    would_write: &[PathBuf],
-    pruned: &[PathBuf],
-) -> BTreeSet<(String, String)> {
+fn projected_known(paths: ProjectedPaths<'_>) -> BTreeSet<(String, String)> {
+    let ProjectedPaths { existing, would_write, pruned } = paths;
     let mut out: BTreeSet<(String, String)> = existing
         .iter()
         .filter_map(|rel| classify(rel).map(|(k, s)| (k.to_string(), s)))
@@ -632,6 +629,21 @@ fn projected_known(
             .filter_map(|rel| classify(rel).map(|(k, s)| (k.to_string(), s))),
     );
     out
+}
+
+/// The three path lists [`projected_known`] combines, named rather than
+/// positional. All three are `&[PathBuf]` of env-relative paths, so as bare
+/// parameters they were freely interchangeable at every call site: swapping
+/// `pruned` with either of the others compiled and silently produced a wrong
+/// `known` set — which for saved views means a false refusal (or a missed one).
+/// Named fields make the mix-up unrepresentable.
+struct ProjectedPaths<'a> {
+    /// Env-relative paths the target tree holds right now.
+    existing: &'a [PathBuf],
+    /// Env-relative paths this run writes.
+    would_write: &'a [PathBuf],
+    /// Env-relative paths `--mirror` prunes.
+    pruned: &'a [PathBuf],
 }
 
 /// Validate a migrated saved view's references against what the target snapshot
@@ -2999,7 +3011,11 @@ pub fn run_at(
         .or_else(|| project_cfg.envs.get(src).and_then(|c| url_host(&c.api_base)));
     if !promoted_saved_views.is_empty() {
         let existing = enumerate_files(&tgt_root, tgt)?;
-        let known = projected_known(&existing, &would_write, &pruned_rels);
+        let known = projected_known(ProjectedPaths {
+            existing: &existing,
+            would_write: &would_write,
+            pruned: &pruned_rels,
+        });
         let mut problems: Vec<SavedViewRefProblem> = Vec::new();
         for (slug, value) in &promoted_saved_views {
             problems.extend(check_saved_view_refs(
@@ -5795,7 +5811,11 @@ mod tests {
         let would_write = vec![PathBuf::from("workspaces/main/queues/invoices/queue.json")];
         let pruned = vec![PathBuf::from("labels/kept.json")];
 
-        let got = projected_known(&existing, &would_write, &pruned);
+        let got = projected_known(ProjectedPaths {
+            existing: &existing,
+            would_write: &would_write,
+            pruned: &pruned,
+        });
         assert!(
             got.contains(&("queues".to_string(), "invoices".to_string())),
             "a queue this run would write must be known: {got:?}",
@@ -5819,7 +5839,11 @@ mod tests {
         let would_write = vec![PathBuf::from("workspaces/new/queues/invoices/queue.json")];
         let pruned = vec![PathBuf::from("workspaces/old/queues/invoices/queue.json")];
 
-        let got = projected_known(&existing, &would_write, &pruned);
+        let got = projected_known(ProjectedPaths {
+            existing: &existing,
+            would_write: &would_write,
+            pruned: &pruned,
+        });
         assert!(
             got.contains(&("queues".to_string(), "invoices".to_string())),
             "a queue this run writes at a new path must stay known even though the \

@@ -253,8 +253,26 @@ fn detect_flat_kind(
     // — a perpetual churn that never settles despite the slug *set* staying
     // identical. Treating `dup-7` (etc.) as stable in its own right closes
     // that gap.
+    //
+    // Pass 1 deliberately does NOT reserve the slug of an object that is being
+    // renamed away — that slug is about to be free, so a duplicate-name
+    // collision with it should not earn a `-N` suffix. But it is not free
+    // *yet*, and proposals are applied in `priority` order (see the `sort_by_key`
+    // in `detect_pending_renames`) with no dependency sort, while `move_file`
+    // bails when the destination exists. So a proposal landing on a slug whose
+    // occupant is itself moving is withheld and re-proposed on the next run,
+    // once the occupant has actually moved — the same defer-until-next-run the
+    // pre-rewrite `!by_slug.contains_key(&proposed)` guard gave. Without it a
+    // plain rename CHAIN (`apple` named "Banana", `banana` named "Cherry", no
+    // duplicate names anywhere) fails with "destination … already exists" every
+    // run, forever, and `rdc doctor` mutates by default.
     let mut names: Vec<(&String, Option<String>)> = Vec::new();
     let mut reserved: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Slugs still held on disk by an object pass 2 will propose to rename AWAY.
+    // Distinct from `reserved`: a collision with a *stable* or unreadable
+    // occupant still gets a suffix, a collision with a live-but-moving one is
+    // deferred.
+    let mut renaming_away: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for slug in by_slug.keys() {
         let name = read_name(&dir.join(format!("{slug}.json")));
@@ -270,6 +288,11 @@ fn detect_flat_kind(
             // Unreadable or missing file: nothing to propose, but the slug is
             // still taken.
             reserved.insert(slug.clone());
+        } else {
+            // Readable and not stable, so pass 2 will propose a rename away
+            // from this slug. Not reserved (it frees up), but not yet vacant
+            // either.
+            renaming_away.insert(slug.clone());
         }
         names.push((slug, name));
     }
@@ -277,6 +300,11 @@ fn detect_flat_kind(
     for (slug, name) in names {
         let Some(name) = name else { continue };
         let proposed = crate::slug::slugify_unique(&name, &reserved);
+        if renaming_away.contains(&proposed) {
+            // The target is still occupied by an object that is itself moving
+            // this run. Defer: applying this would hit the occupant's file.
+            continue;
+        }
         reserved.insert(proposed.clone());
         if proposed != *slug {
             out.push(make(slug.clone(), proposed));
@@ -2882,5 +2910,82 @@ mod tests {
         });
         assert!(out2.is_empty(), "second pass must be a fixed point, got {out2:?}");
         drop(tmp2);
+    }
+
+    /// Collect `(old, new)` label proposals for a flat fixture, sorted.
+    fn flat_label_pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        let slugs: Vec<&str> = entries.iter().map(|(s, _)| *s).collect();
+        let (tmp, paths) = flat_fixture(entries);
+        let lockfile = flat_lockfile("labels", &slugs);
+        let mut out = Vec::new();
+        detect_flat_kind(&lockfile, "labels", paths.labels_dir(), &mut out, |o, n| {
+            PendingRename::Label { old: o, new: n }
+        });
+        let mut pairs: Vec<(String, String)> = out
+            .iter()
+            .map(|r| match r {
+                PendingRename::Label { old, new } => (old.clone(), new.clone()),
+                other => panic!("unexpected variant {other:?}"),
+            })
+            .collect();
+        pairs.sort();
+        drop(tmp);
+        pairs
+    }
+
+    /// A rename CHAIN — no duplicate names anywhere. `apple` is renamed to
+    /// "Banana" and `banana` to "Cherry", so `apple`'s target is a slug the
+    /// still-present `banana.json` holds. Proposals are applied in `priority`
+    /// order with no dependency sort and `move_file` refuses an existing
+    /// destination, so proposing both would fail with "destination
+    /// .../hooks/banana.json already exists" on the first one, every run. Only
+    /// the tail of the chain may be proposed this run; the head waits for the
+    /// next.
+    #[test]
+    fn a_rename_chain_defers_the_link_whose_target_is_still_occupied() {
+        let pairs = flat_label_pairs(&[("apple", "Banana"), ("banana", "Cherry")]);
+        assert_eq!(pairs, vec![("banana".to_string(), "cherry".to_string())], "{pairs:?}");
+
+        // Convergence: once `banana` has become `cherry` on disk, the deferred
+        // link is proposed. Nothing else has to happen for the chain to finish.
+        let pairs2 = flat_label_pairs(&[("apple", "Banana"), ("cherry", "Cherry")]);
+        assert_eq!(pairs2, vec![("apple".to_string(), "banana".to_string())], "{pairs2:?}");
+
+        // And the run after that is a fixed point.
+        let pairs3 = flat_label_pairs(&[("banana", "Banana"), ("cherry", "Cherry")]);
+        assert!(pairs3.is_empty(), "{pairs3:?}");
+    }
+
+    /// A true SWAP is a cycle: `a` is named "B" and `b` is named "A", so each
+    /// one's target is the other's live slug. Neither may be proposed — before
+    /// the deferral both were, and both then failed with "destination already
+    /// exists" on every single run. Deferring leaves the tree untouched and
+    /// quiet, which is what the pre-rewrite guard did.
+    #[test]
+    fn a_name_swap_proposes_nothing_rather_than_two_failing_renames() {
+        let pairs = flat_label_pairs(&[("a", "B"), ("b", "A")]);
+        assert!(pairs.is_empty(), "a swap must propose nothing, got {pairs:?}");
+    }
+
+    /// The deferral must not swallow the duplicate-name case the two-pass
+    /// rewrite exists for: two objects whose names slugify alike target a slug
+    /// no lockfile entry holds, so suffixing still applies even while a third
+    /// object is being renamed away.
+    #[test]
+    fn the_deferral_does_not_swallow_duplicate_name_suffixing() {
+        let pairs = flat_label_pairs(&[
+            ("old-a", "New name"),
+            ("old-b", "New name"),
+            ("mover", "Something else"),
+        ]);
+        assert_eq!(
+            pairs,
+            vec![
+                ("mover".to_string(), "something-else".to_string()),
+                ("old-a".to_string(), "new-name".to_string()),
+                ("old-b".to_string(), "new-name-2".to_string()),
+            ],
+            "{pairs:?}"
+        );
     }
 }

@@ -61,8 +61,30 @@ pub(crate) async fn push_classified(
         pushed += counts.0;
         skipped += counts.1;
     };
-    if !changes.workspaces.is_empty() {
-        tally(workspaces::push(paths, client, lockfile, interactive, &changes.workspaces, progress, env).await
+    // Destructured exhaustively — NO `..` rest pattern, on purpose. This
+    // function is the CONSUMER end of `scan::change_list_from_classified`: a
+    // kind added to `ChangeList` and to the producer but forgotten here has a
+    // dead push half, and every enforcement test in this design still passes,
+    // because they all check the producer. Naming every field turns that
+    // omission into a compile error instead. If a field ever genuinely has no
+    // consumer here, prefix its binding with `_` and say why — do not reach for
+    // `..`.
+    let scan::ChangeList {
+        workspaces,
+        queues,
+        schemas,
+        inboxes,
+        email_templates,
+        hooks,
+        rules,
+        labels,
+        saved_views,
+        engines,
+        engine_fields,
+        organization,
+    } = changes;
+    if !workspaces.is_empty() {
+        tally(workspaces::push(paths, client, lockfile, interactive, workspaces, progress, env).await
             .with_context(|| format!("pushing workspaces for env '{env}'"))?);
     }
     // Engines and their fields before schemas and queues. Unlike every other
@@ -89,28 +111,28 @@ pub(crate) async fn push_classified(
     // `relink::undeferrable`, where `engines` protects only `url`), so it is
     // postponed to the relink pass exactly as a hook's `run_after` is. Engine
     // fields reference only their engine, which is why they stay behind it.
-    if !changes.engines.is_empty() {
-        tally(engines::push(paths, client, lockfile, interactive, &changes.engines, relink, progress, env).await
+    if !engines.is_empty() {
+        tally(engines::push(paths, client, lockfile, interactive, engines, relink, progress, env).await
             .with_context(|| format!("pushing engines for env '{env}'"))?);
     }
-    if !changes.engine_fields.is_empty() {
-        tally(engine_fields::push(paths, client, lockfile, interactive, &changes.engine_fields, progress, env).await
+    if !engine_fields.is_empty() {
+        tally(engine_fields::push(paths, client, lockfile, interactive, engine_fields, progress, env).await
             .with_context(|| format!("pushing engine fields for env '{env}'"))?);
     }
-    if !changes.schemas.is_empty() {
-        tally(schemas::push(paths, client, lockfile, interactive, &changes.schemas, progress, env).await
+    if !schemas.is_empty() {
+        tally(schemas::push(paths, client, lockfile, interactive, schemas, progress, env).await
             .with_context(|| format!("pushing schemas for env '{env}'"))?);
     }
-    if !changes.queues.is_empty() {
-        tally(queues::push(paths, client, lockfile, interactive, &changes.queues, relink, progress, env).await
+    if !queues.is_empty() {
+        tally(queues::push(paths, client, lockfile, interactive, queues, relink, progress, env).await
             .with_context(|| format!("pushing queues for env '{env}'"))?);
     }
-    if !changes.inboxes.is_empty() {
-        tally(inboxes::push(paths, client, lockfile, interactive, &changes.inboxes, progress, env).await
+    if !inboxes.is_empty() {
+        tally(inboxes::push(paths, client, lockfile, interactive, inboxes, progress, env).await
             .with_context(|| format!("pushing inboxes for env '{env}'"))?);
     }
-    if !changes.email_templates.is_empty() {
-        tally(email_templates::push(paths, client, lockfile, interactive, &changes.email_templates, progress, env).await
+    if !email_templates.is_empty() {
+        tally(email_templates::push(paths, client, lockfile, interactive, email_templates, progress, env).await
             .with_context(|| format!("pushing email templates for env '{env}'"))?);
     }
     // Hooks always go through `push` (no early-skip on empty `changes`)
@@ -118,7 +140,7 @@ pub(crate) async fn push_classified(
     // `secrets/<env>.hook-secrets.json` that aren't accompanied by a
     // hook JSON/code edit. The function returns (0, 0) when neither
     // content nor secrets have drifted.
-    tally(hooks::push(paths, client, lockfile, interactive, &changes.hooks, catalog_hooks, relink, progress, env)
+    tally(hooks::push(paths, client, lockfile, interactive, hooks, catalog_hooks, relink, progress, env)
         .await
         .with_context(|| format!("pushing hooks for env '{env}'"))?);
     // Labels before rules: a rule's `actions` can reference a label
@@ -127,24 +149,24 @@ pub(crate) async fn push_classified(
     // organization), so creating them first lets the rule's label refs
     // resolve against the lockfile instead of failing with "Invalid
     // hyperlink - No URL match".
-    if !changes.labels.is_empty() {
-        tally(labels::push(paths, client, lockfile, interactive, &changes.labels, progress, env).await
+    if !labels.is_empty() {
+        tally(labels::push(paths, client, lockfile, interactive, labels, progress, env).await
             .with_context(|| format!("pushing labels for env '{env}'"))?);
     }
     // A saved view's `queues_filter` can reference a queue, already pushed
     // above; unlike labels/rules it does not itself participate in another
     // kind's create-time ref resolution, so its ordering here is otherwise free.
-    if !changes.saved_views.is_empty() {
-        tally(saved_views::push(paths, client, lockfile, interactive, &changes.saved_views, progress, env).await
+    if !saved_views.is_empty() {
+        tally(saved_views::push(paths, client, lockfile, interactive, saved_views, progress, env).await
             .with_context(|| format!("pushing saved views for env '{env}'"))?);
     }
-    if !changes.rules.is_empty() {
-        tally(rules::push(paths, client, lockfile, interactive, &changes.rules, progress, env).await
+    if !rules.is_empty() {
+        tally(rules::push(paths, client, lockfile, interactive, rules, progress, env).await
             .with_context(|| format!("pushing rules for env '{env}'"))?);
     }
     // Last: the organization singleton references nothing and nothing
     // references it, so its ordering relative to every other kind is free.
-    if let Some(path) = &changes.organization {
+    if let Some(path) = organization {
         tally(
             organization::push(paths, client, lockfile, path, progress, env)
                 .await

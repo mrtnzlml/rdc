@@ -2331,6 +2331,18 @@ mod tests {
                 "'{kind}' is push-capable but change_list_from_classified dropped it",
             );
         }
+
+        // `total()` is its own hand-written sum, and `is_empty()` is defined on
+        // it: a kind that reaches the change list but is missing from `total()`
+        // makes an otherwise-nonempty list look empty and skips the WHOLE push
+        // phase. `contains` above reads the field directly and would not notice.
+        // One item per push-capable kind went in, so the sum must be exactly
+        // that many.
+        assert_eq!(
+            cl.total(),
+            crate::kinds::PUSH_CAPABLE.len(),
+            "ChangeList::total() does not count every push-capable kind",
+        );
     }
 
     /// A class that is not a local change must never reach the change list.
