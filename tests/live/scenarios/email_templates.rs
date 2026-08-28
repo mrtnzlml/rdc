@@ -215,18 +215,28 @@ async fn live_email_templates_round_trip() {
         "after re-adoption the three local templates must still own three \
          DISTINCT remote ids"
     );
-    // KNOWN DEFECT — same root cause as the fresh-env deploy lag in
-    // `deploy_flow`: the create/adopt write-back does not run the
-    // normalization the PULL path runs. Concretely, adoption writes each
-    // template's base-cache copy straight from the server response, so its
-    // `url` stays the concrete `https://…/email_templates/<id>` instead of the
-    // portable `rdc://email_templates/<ws>/<q>/<slug>` form, and the lockfile
-    // entry lands with `content_hash: null`. The next cycle rewrites both.
+    // KNOWN DEFECT (narrowed, still open): the BASE CACHE keeps concrete env
+    // URLs after an adoption, and the lockfile entry keeps no `content_hash`.
     //
-    // Nothing is lost — but until that cycle runs, the 3-way merge base for
-    // these objects is in the wrong form. Pinned as CURRENT BEHAVIOUR: delete
-    // this settle cycle once the write-back portabilizes on the adopt path,
-    // and the assertion below will keep passing.
+    // Established by dumping the real post-adoption state:
+    //   env file   url = "rdc://email_templates/<ws>/<q>/<slug>"   <- correct
+    //   base cache url = "https://<host>/v1/email_templates/<id>"  <- stale form
+    //   lockfile   { id, modified_at: null, content_hash: null }
+    //
+    // The env file is right because the post-pass (`pull::portabilize`)
+    // rewrites it — but that pass walks the ENV TREE only and never mirrors to
+    // the base cache, so the base keeps whatever the writer put there. The
+    // writer could not do better: at portabilize time the lockfile has no
+    // entry for the template, so its own `url` has no id->slug mapping to
+    // resolve against. (The push drivers solve exactly this by registering the
+    // id BEFORE portabilizing — see the "register the adopted id NOW" comment
+    // in `push::email_templates`. The pull driver has no equivalent.)
+    //
+    // Cost: one extra cycle, self-healing, no data loss — but until it runs,
+    // the 3-way merge base for these templates is in the wrong form.
+    // Deliberately NOT fixed blind: the candidate fix touches
+    // `refresh_lockfile_hashes` / the portabilize post-pass, whose own docs
+    // warn that getting it wrong produces a "both diverged" prompt storm.
     let settle = project.run_rdc(&["sync", "test"]);
     assert!(settle.status.success(), "settling sync failed: {}", combined(&settle));
 

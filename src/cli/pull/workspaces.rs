@@ -1,4 +1,7 @@
-use super::common::{PullCtx, record_object, skip_on_permission_denied};
+use super::common::{
+    PullAction, PullCtx, apply_pull_action, decide_pull_action, portabilize_proposed,
+    record_object, skip_on_permission_denied,
+};
 use crate::log::{Action, Log};
 use crate::model::Workspace;
 use crate::slug::slugify_unique;
@@ -98,4 +101,93 @@ pub async fn process(
     }
 
     Ok(count)
+}
+
+/// Same-pass workspace back-ref refresh (idempotency).
+///
+/// Creating or deleting a queue makes the server update the OTHER side of the
+/// link: the owning workspace's server-derived `queues` collection. rdc strips
+/// that from every outbound body and never authors it, and the Phase-1 catalog
+/// the pull phase consumed predates the push — so on a fresh-env deploy the
+/// workspace lands on disk with `"queues": []` and stays that way until the
+/// NEXT sync. That makes a single `sync` non-idempotent, which matters most
+/// exactly where it is least watched: the unattended CI deploy job.
+///
+/// `eligible` holds workspace slugs whose on-disk state this cycle is known to
+/// equal their recorded base — Clean, or created by this very cycle. The
+/// three-way [`decide_pull_action`] is still consulted and anything other than
+/// `Write` is skipped, so a local edit can never be clobbered here.
+///
+/// Returns the number of `workspace.json` files actually rewritten.
+pub async fn refresh_backrefs(
+    ctx: &mut PullCtx<'_>,
+    eligible: &BTreeSet<String>,
+    progress: &Arc<Log>,
+) -> Result<usize> {
+    if eligible.is_empty() {
+        return Ok(0);
+    }
+    let workspaces = list(ctx, progress).await?;
+    let mut refreshed = 0usize;
+    for ws in &workspaces {
+        let Some(slug) = ctx.lockfile.slug_for_id(KIND, ws.id).map(|s| s.to_string()) else {
+            continue;
+        };
+        if !eligible.contains(&slug) {
+            continue;
+        }
+        let ws_path = ctx.paths.workspace_dir(&slug).join("workspace.json");
+        if !ws_path.exists() {
+            continue;
+        }
+
+        let value = serde_json::to_value(ws)?;
+        let art = crate::snapshot::codec::codec(KIND)
+            .unwrap()
+            .disk_bytes(&value)
+            .with_context(|| format!("serializing workspace '{slug}' for back-ref refresh"))?;
+        let proposed = portabilize_proposed(&art.json, &*ctx.lockfile);
+
+        let base = ctx
+            .lockfile
+            .objects
+            .get(KIND)
+            .and_then(|m| m.get(&slug))
+            .and_then(|e| e.content_hash.clone());
+        let (action, remote_hash) = decide_pull_action(&ws_path, base.as_deref(), &proposed)?;
+        if action != PullAction::Write {
+            continue;
+        }
+        let recorded = apply_pull_action(
+            action,
+            &ws_path,
+            &proposed,
+            remote_hash,
+            ctx.interactive,
+            progress,
+            ctx.paths.env(),
+            base.as_deref(),
+            Some(ctx.paths),
+        )?;
+        record_object(
+            ctx.lockfile,
+            KIND,
+            &slug,
+            ws.id,
+            ws.modified_at().map(|s| s.to_string()),
+            ws.modified_by().map(|s| s.to_string()),
+            Some(recorded),
+        );
+        refreshed += 1;
+    }
+    if refreshed > 0 {
+        progress.event(
+            Action::Pull,
+            &format!(
+                "workspaces ({refreshed} back-ref{} refreshed)",
+                if refreshed == 1 { "" } else { "s" }
+            ),
+        );
+    }
+    Ok(refreshed)
 }

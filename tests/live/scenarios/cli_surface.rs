@@ -163,19 +163,17 @@ async fn live_doctor_realign_after_a_remote_rename() {
         "queue.schema still names the pre-realign slug '{old_slug}': {schema_ref}"
     );
 
-    // (5) KNOWN DEFECT — the third instance of one systemic problem (see
-    // `deploy_flow` and `email_templates` for the other two): a write path that
-    // is not the PULL path skips the pull path's canonicalization. Here, the
-    // realign rewrites the queue's cross-refs but writes the base-cache copy
-    // WITHOUT re-applying the canonical sort of the queue's `hooks` array, and
-    // leaves the moved schema's lockfile `content_hash` stale. Both self-heal
-    // on the next cycle.
+    // (5) KNOWN DEFECT (still open): the realign leaves the renamed queue's
+    // BASE-CACHE copy with an unsorted `hooks` array and the moved schema's
+    // lockfile `content_hash` stale, so the next cycle re-pulls the schema
+    // once. `realign::refresh_lockfile_hashes` recomputes hashes from the
+    // BASE bytes, which are the pre-portabilize, pre-sort form — the env tree
+    // gets canonicalized by the portabilize post-pass, the base never does.
     //
-    // Pinned as CURRENT BEHAVIOUR, and deliberately followed by a full
-    // convergence assertion: that proves this is a one-cycle LAG and not an
-    // oscillation, which is the difference between a papercut and the
-    // period-2 churn class this project has fought before. Delete the settle
-    // cycle once realign canonicalizes, and the assertion keeps passing.
+    // One cycle, self-healing, no data loss. Not fixed blind: that function's
+    // own doc explains that a wrong hash here is what produces the
+    // "both diverged" prompt storm across every object referencing the
+    // renamed one.
     let settle = project.run_rdc(&["sync", "test"]);
     assert!(settle.status.success(), "settling sync failed: {}", combined(&settle));
 

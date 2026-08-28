@@ -154,35 +154,19 @@ async fn live_deploy_flow() {
             )
         });
 
-    // --- KNOWN DEFECT: a fresh-env deploy needs a SECOND cycle to settle ---
+    // --- convergence: a fresh-env deploy settles in ONE cycle ---
     //
-    // Creating a child makes the server fill in the other side of the link, and
-    // the create-push writes back the POST response, which predates the child.
-    // So after the first `sync prod` the snapshot is one cycle stale in exactly
-    // three places, all server-derived:
-    //
-    //   workspace.json  "queues": []   (the queues it just gained)
-    //   schema.json     "queues": []   (the queue that points at it)
-    //   queue.json      no "inbox"     (the inbox created after it)
-    //
-    // `execute.rs`'s same-pass back-ref refresh does not cover them: its
-    // `eligible` set is queues classified **Clean** this cycle, and a
-    // just-created queue is `LocalCreate`, not Clean — and `workspaces` /
-    // `schemas` have no such refresh at all. The create path also does not
-    // populate the base cache, so `.rdc/state/prod.base/` only appears on the
-    // second cycle (the deferred half of the push base-cache lockstep work).
-    //
-    // Nothing is lost and the second cycle is correct, so this is pinned as
-    // CURRENT BEHAVIOUR rather than papered over: the extra sync below is the
-    // defect, and `assert_converged` immediately after it is the guarantee.
-    // When the refresh is extended to cover creates, delete this line — the
-    // assertion that follows will keep passing and the deploy becomes
-    // single-cycle. If the lag ever grows past one cycle, that assertion fails.
-    let settle = project.run_rdc(&["sync", "prod"]);
-    assert!(settle.status.success(), "settling sync prod failed: {}", combined(&settle));
-
-    // --- convergence: the deploy settled, and it didn't disturb the source ---
-    assert_converged(&project, "prod", &prefix, "after the deploy settled");
+    // It did not always. Creating a child makes the server fill in the other
+    // side of the link, and the create-push writes back the POST response,
+    // which predates the child — so the first `sync prod` used to leave
+    // `workspace.queues` / `schema.queues` empty and `queue.inbox` absent, and
+    // the deploy needed a second cycle to settle. Both halves are fixed now:
+    // the same-pass back-ref refresh covers objects this cycle CREATED (it had
+    // been restricted to `Clean` ones, which excluded exactly the queue that
+    // needed it) and reaches workspaces and schemas, and the create/adopt
+    // write-backs mirror to the base cache like the PATCH paths already did.
+    // This assertion is what keeps it that way.
+    assert_converged(&project, "prod", &prefix, "after a single sync prod (creates)");
     assert_converged(&project, "test", &prefix, "after deploying test -> prod");
 
     // --- chain stability: migrate && sync, a second time, moves no bytes ---

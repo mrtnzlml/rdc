@@ -4,7 +4,6 @@ use crate::paths::Paths;
 
 use crate::snapshot::create::{strip_for_create, strip_patch_extra};
 use crate::snapshot::rule::{read_rule_value, serialize_rule, write_rule_code};
-use crate::snapshot::writer::write_atomic;
 use crate::state::{Lockfile, ObjectEntry, rule_combined_hash};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
@@ -105,11 +104,18 @@ pub async fn push(
             let created_json =
                 crate::cli::pull::common::portabilize_proposed(&created_json, lockfile);
             let created_hash = rule_combined_hash(&created_json, &created_code, lockfile);
-            write_atomic(local_json_path, &created_json)
+            crate::state::base_cache::write_disk_and_cache(paths, local_json_path, &created_json)
                 .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
+            let created_py_path = rules_dir.join(format!("{slug}.py"));
             if let Some(code) = &created_code {
                 write_rule_code(&rules_dir, slug, code)
                     .with_context(|| format!("writing rule code for '{slug}'"))?;
+                // Mirror the sidecar into the base cache, as the PATCH path
+                // does — otherwise a later code conflict has no merge base.
+                crate::state::base_cache::write(paths, &created_py_path, code.as_bytes())
+                    .with_context(|| format!("caching base rule code for '{slug}'"))?;
+            } else {
+                crate::state::base_cache::forget(paths, &created_py_path)?;
             }
             lockfile.upsert(
                 "rules",
@@ -477,14 +483,19 @@ async fn push_one_drifted(
             // Portabilize the adopted remote so concrete env URLs never
             // land on disk (the rule is lockfile-pinned; refs resolve).
             let remote_json = crate::cli::pull::common::portabilize_proposed(&remote_json, lockfile);
-            write_atomic(local_json_path, &remote_json)
+            crate::state::base_cache::write_disk_and_cache(paths, local_json_path, &remote_json)
                 .with_context(|| format!("adopting remote into {}", local_json_path.display()))?;
             if let Some(code) = &remote_code {
                 write_rule_code(rules_dir, slug, code)
                     .with_context(|| format!("adopting remote rule code for '{slug}'"))?;
-            } else if local_py_path.exists() {
-                std::fs::remove_file(&local_py_path)
-                    .with_context(|| format!("removing stale {}", local_py_path.display()))?;
+                crate::state::base_cache::write(paths, &local_py_path, code.as_bytes())
+                    .with_context(|| format!("caching base rule code for '{slug}'"))?;
+            } else {
+                if local_py_path.exists() {
+                    std::fs::remove_file(&local_py_path)
+                        .with_context(|| format!("removing stale {}", local_py_path.display()))?;
+                }
+                crate::state::base_cache::forget(paths, &local_py_path)?;
             }
             lockfile.upsert(
                 "rules",

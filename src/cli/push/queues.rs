@@ -4,7 +4,6 @@ use crate::paths::Paths;
 
 use crate::snapshot::codec::combined_hash;
 use crate::snapshot::create::{strip_for_create, strip_patch_extra};
-use crate::snapshot::writer::write_atomic;
 use crate::state::{Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
@@ -111,7 +110,7 @@ pub async fn push(
             let created_bytes =
                 crate::cli::pull::common::portabilize_proposed(&created_art.json, lockfile);
             let created_hash = combined_hash(&created_bytes, &created_art.sidecars, lockfile);
-            write_atomic(queue_path, &created_bytes)
+            crate::state::base_cache::write_disk_and_cache(paths, queue_path, &created_bytes)
                 .with_context(|| format!("writing post-create canonical form for '{q_slug}'"))?;
             lockfile.upsert(
                 "queues",
@@ -522,7 +521,7 @@ async fn push_one_drifted(
             // land on disk (the queue is lockfile-pinned; refs resolve).
             let remote_bytes =
                 crate::cli::pull::common::portabilize_proposed(&remote_bytes, lockfile);
-            write_atomic(queue_path, &remote_bytes)
+            crate::state::base_cache::write_disk_and_cache(paths, queue_path, &remote_bytes)
                 .with_context(|| format!("adopting remote into {}", queue_path.display()))?;
             lockfile.upsert(
                 "queues",

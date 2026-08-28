@@ -7,7 +7,6 @@ use crate::snapshot::create::strip_for_create;
 use crate::snapshot::hook::{
     hook_code_extension, read_hook_value, serialize_hook, write_hook_code,
 };
-use crate::snapshot::writer::write_atomic;
 use crate::state::{Lockfile, ObjectEntry, hook_combined_hash, hook_secrets_hash};
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -286,20 +285,29 @@ pub async fn push(
                 crate::cli::pull::common::portabilize_proposed(&created_json, lockfile);
             let created_hash = hook_combined_hash(&created_json, &created_code, lockfile);
             let created_ext = hook_code_extension(&created);
-            write_atomic(local_json_path, &created_json)
+            crate::state::base_cache::write_disk_and_cache(paths, local_json_path, &created_json)
                 .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
+            let created_code_path = hooks_dir.join(format!("{slug}.{created_ext}"));
             if let Some(code) = &created_code {
                 write_hook_code(&hooks_dir, slug, code, created_ext)
                     .with_context(|| format!("writing hook code for '{slug}'"))?;
+                // Mirror the code sidecar into the base cache, exactly as the
+                // PATCH path does. Without it the cache holds the `.json` but
+                // not the `.py`, so the first `BothDiverged` on this hook has
+                // no base to 3-way-merge the code against.
+                crate::state::base_cache::write(paths, &created_code_path, code.as_bytes())
+                    .with_context(|| format!("caching base hook code for '{slug}'"))?;
             }
             // Sweep any stale sidecar with the *other* extension that may
-            // have been left over from a previous runtime.
+            // have been left over from a previous runtime — from disk AND the
+            // cache mirror.
             let other_created_ext = if created_ext == "py" { "js" } else { "py" };
             let stale_created = hooks_dir.join(format!("{slug}.{other_created_ext}"));
             if stale_created.exists() {
                 std::fs::remove_file(&stale_created)
                     .with_context(|| format!("removing stale {}", stale_created.display()))?;
             }
+            crate::state::base_cache::forget(paths, &stale_created)?;
             lockfile.upsert(
                 "hooks",
                 slug,
@@ -886,22 +894,28 @@ async fn push_one_drifted(
             // Portabilize the adopted remote so concrete env URLs never
             // land on disk (the hook is lockfile-pinned; self + refs resolve).
             let remote_json = crate::cli::pull::common::portabilize_proposed(&remote_json, lockfile);
-            write_atomic(local_json_path, &remote_json)
+            crate::state::base_cache::write_disk_and_cache(paths, local_json_path, &remote_json)
                 .with_context(|| format!("adopting remote into {}", local_json_path.display()))?;
             // Adopt uses the remote runtime to decide the
             // sidecar extension — the remote is now the source
             // of truth. Sweep any sidecar of the other
             // extension so disk stays canonical.
             let remote_ext = hook_code_extension(remote_hook);
+            let remote_code_path = hooks_dir.join(format!("{slug}.{remote_ext}"));
             if let Some(code) = &remote_code {
                 write_hook_code(hooks_dir, slug, code, remote_ext)
                     .with_context(|| format!("adopting remote hook code for '{slug}'"))?;
+                // Adopting makes the remote the base; mirror the sidecar so the
+                // next conflict has one (same reason as the PATCH path).
+                crate::state::base_cache::write(paths, &remote_code_path, code.as_bytes())
+                    .with_context(|| format!("caching base hook code for '{slug}'"))?;
             } else {
-                let primary = hooks_dir.join(format!("{slug}.{remote_ext}"));
-                if primary.exists() {
-                    std::fs::remove_file(&primary)
-                        .with_context(|| format!("removing stale {}", primary.display()))?;
+                if remote_code_path.exists() {
+                    std::fs::remove_file(&remote_code_path).with_context(|| {
+                        format!("removing stale {}", remote_code_path.display())
+                    })?;
                 }
+                crate::state::base_cache::forget(paths, &remote_code_path)?;
             }
             let other_remote_ext = if remote_ext == "py" { "js" } else { "py" };
             let stale = hooks_dir.join(format!("{slug}.{other_remote_ext}"));

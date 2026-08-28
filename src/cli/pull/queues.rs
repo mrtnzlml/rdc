@@ -340,13 +340,23 @@ pub async fn process(
 /// back-ref change) or `NoChange` — never a surprising conflict that could
 /// clobber a local edit.
 ///
-/// Returns the number of `queue.json` files actually rewritten.
+/// `eligible_schemas` is the same idea for each queue's `schema.json`, whose
+/// server-derived `queues` array gains an entry when the queue is created. It
+/// is a SEPARATE set because the schema is re-fetched fresh (post-push) rather
+/// than read from the pre-push Phase-1 catalog — re-pulling a schema from that
+/// stale catalog is precisely what would revert a schema PATCHed earlier in
+/// this same cycle, which is why the caveat above says schemas are left
+/// untouched. A fresh GET carries the push's own result, so there is nothing
+/// to revert.
+///
+/// Returns the number of files actually rewritten (queues + schemas).
 pub async fn refresh_backrefs(
     ctx: &mut PullCtx<'_>,
     eligible: &BTreeSet<String>,
+    eligible_schemas: &BTreeSet<String>,
     progress: &Arc<Log>,
 ) -> Result<usize> {
-    if eligible.is_empty() {
+    if eligible.is_empty() && eligible_schemas.is_empty() {
         return Ok(0);
     }
     let queues = list(ctx, progress).await?;
@@ -360,7 +370,7 @@ pub async fn refresh_backrefs(
         else {
             continue;
         };
-        if !eligible.contains(&q_slug) {
+        if !eligible.contains(&q_slug) && !eligible_schemas.contains(&q_slug) {
             continue;
         }
         let Some(ws_url) = &q.workspace else {
@@ -373,7 +383,21 @@ pub async fn refresh_backrefs(
         else {
             continue;
         };
-        let queue_path = ctx.paths.queue_dir(&ws_slug, &q_slug).join("queue.json");
+        let queue_dir = ctx.paths.queue_dir(&ws_slug, &q_slug);
+
+        // Schema back-ref: `schema.queues` gains this queue when the queue is
+        // created. Fetched FRESH so it reflects post-push state.
+        if eligible_schemas.contains(&q_slug)
+            && let Some(schema_url) = q.schema.as_deref()
+            && let Ok(schema_id) = crate::cli::pull::common::parse_id_from_url(schema_url)
+        {
+            refreshed += refresh_one_schema(ctx, schema_id, &q_slug, &queue_dir, progress).await?;
+        }
+
+        if !eligible.contains(&q_slug) {
+            continue;
+        }
+        let queue_path = queue_dir.join("queue.json");
 
         // Canonical bytes exactly as the pull driver would write them
         // (redact counts, strip modified_at, then portabilize refs).
@@ -431,6 +455,79 @@ pub async fn refresh_backrefs(
         );
     }
     Ok(refreshed)
+}
+
+/// Refresh one queue's `schema.json` from a FRESH remote fetch, writing only
+/// when the three-way decision is an unambiguous `Write` (server-only change
+/// on top of an unedited local). Returns 1 if it wrote, 0 otherwise.
+///
+/// Mirrors `write_schema_for_queue`'s canonicalization exactly — same
+/// `serialize_schema`, same portabilize, same `schema_combined_hash` over
+/// (json + formulas) — so the recorded baseline stays consistent with what a
+/// normal pull would have written.
+async fn refresh_one_schema(
+    ctx: &mut PullCtx<'_>,
+    schema_id: u64,
+    q_slug: &str,
+    queue_dir: &std::path::Path,
+    progress: &Arc<Log>,
+) -> Result<usize> {
+    let schema_path = queue_dir.join("schema.json");
+    if !schema_path.exists() {
+        return Ok(0);
+    }
+    let schema = ctx
+        .client
+        .get_schema(schema_id, Some(progress.clone()))
+        .await
+        .with_context(|| format!("fetching schema {schema_id} for back-ref refresh"))?;
+
+    let (remote_json, remote_formulas) = crate::snapshot::schema::serialize_schema(&schema)?;
+    let remote_json =
+        crate::cli::pull::common::portabilize_proposed(&remote_json, &*ctx.lockfile);
+    let remote_combined =
+        crate::state::schema_combined_hash(&remote_json, &remote_formulas, ctx.lockfile);
+
+    let base = ctx
+        .lockfile
+        .objects
+        .get(KIND_SCHEMAS)
+        .and_then(|m| m.get(q_slug))
+        .and_then(|e| e.content_hash.clone());
+    let local_json = std::fs::read(&schema_path)
+        .with_context(|| format!("reading {}", schema_path.display()))?;
+    let local_formulas = crate::snapshot::schema::read_local_formulas(queue_dir)?;
+    let local_combined =
+        crate::state::schema_combined_hash(&local_json, &local_formulas, ctx.lockfile);
+
+    // Anything but a clean `Write` means the classifier and this refresh
+    // disagree about local state; skip rather than risk clobbering an edit.
+    if super::common::classify_combined_pull(
+        base.as_deref(),
+        Some(local_combined.as_str()),
+        &remote_combined,
+    ) != PullAction::Write
+    {
+        return Ok(0);
+    }
+
+    crate::snapshot::schema::write_schema_bytes_with_cache(
+        queue_dir,
+        &remote_json,
+        &remote_formulas,
+        Some(ctx.paths),
+    )
+    .with_context(|| format!("writing schema for '{q_slug}' during back-ref refresh"))?;
+    record_object(
+        ctx.lockfile,
+        KIND_SCHEMAS,
+        q_slug,
+        schema.id,
+        schema.modified_at().map(|s| s.to_string()),
+        schema.modified_by().map(|s| s.to_string()),
+        Some(remote_combined),
+    );
+    Ok(1)
 }
 
 fn write_schema_for_queue(

@@ -10382,6 +10382,281 @@ async fn push_create_dependency_ordered_workspace_schema_queue() {
     }
 }
 
+/// Idempotency regression: creating a QUEUE mutates its owning workspace's
+/// server-derived `queues` back-reference (and its schema's), exactly as
+/// creating a rule mutates the queue's `rules`. rdc strips those from every
+/// outbound body and never authors them, and the Phase-1 catalog predates the
+/// POST — so the workspace's on-disk snapshot used to catch up only on the
+/// NEXT sync.
+///
+/// The same-pass refresh existed but was restricted to objects classified
+/// `Clean`, and it covered queues only. A freshly created queue is
+/// `LocalCreate`, and workspaces had no refresh at all — so on a fresh-env
+/// deploy, which is nothing BUT creates, every workspace landed with
+/// `"queues": []` and the whole deploy needed a second cycle. That is the
+/// unattended CI path (`rdc sync --allow-deletes --yes`), which would leave
+/// the repo dirty on every run.
+///
+/// The discriminating fixture is the STATEFUL workspace below: its POST
+/// response carries `"queues": []` (the queue does not exist yet, which is
+/// what a real server returns), and only a later GET reflects the queue. A
+/// test whose POST response already contained the back-ref would pass without
+/// the refresh and prove nothing.
+#[tokio::test]
+async fn push_create_queue_refreshes_workspace_backref_same_pass() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let ws_id = 6100u64;
+    let schema_id = 6200u64;
+    let queue_id = 6300u64;
+    let ws_url = format!("{}/api/v1/workspaces/{ws_id}", server.uri());
+    let schema_url = format!("{}/api/v1/schemas/{schema_id}", server.uri());
+    let queue_url = format!("{}/api/v1/queues/{queue_id}", server.uri());
+    let org_url = format!("{}/api/v1/organizations/1", server.uri());
+
+    // Flipped by POST /queues; read by GET /workspaces, /queues and
+    // /schemas/<id> so all three back-refs appear only once the queue exists.
+    let queue_created = Arc::new(AtomicUsize::new(0));
+
+    // POST /workspaces answers with NO queues — the queue does not exist yet.
+    let created_ws_no_queues = serde_json::json!({
+        "id": ws_id,
+        "url": ws_url,
+        "name": "Invoices AP",
+        "organization": org_url,
+        "queues": [],
+        "modified_at": "2026-05-01T08:00:00Z"
+    });
+    let created_schema_no_queues = serde_json::json!({
+        "id": schema_id,
+        "url": schema_url,
+        "name": "Cost Invoices Schema",
+        "queues": [],
+        "content": [
+            { "category": "section", "id": "header", "label": "Header", "children": [
+                { "category": "datapoint", "id": "invoice_id", "type": "string" }
+            ]}
+        ],
+        "modified_at": "2026-05-01T08:00:00Z"
+    });
+    let created_queue = serde_json::json!({
+        "id": queue_id,
+        "url": queue_url,
+        "name": "Cost Invoices",
+        "workspace": ws_url,
+        "schema": schema_url,
+        "modified_at": "2026-05-01T08:00:00Z"
+    });
+
+    // Stateful GET /workspaces: gains the queue back-ref after the queue POST.
+    {
+        let flag = queue_created.clone();
+        let (ws_url, queue_url, org_url) = (ws_url.clone(), queue_url.clone(), org_url.clone());
+        Mock::given(method("GET"))
+            .and(path("/api/v1/workspaces"))
+            .respond_with(move |_req: &Request| {
+                // Empty until the queue exists — mirrors the pre-push listing
+                // (nothing created yet) and then the post-push one, where the
+                // workspace carries its new `queues` back-ref.
+                let results = if flag.load(Ordering::SeqCst) > 0 {
+                    serde_json::json!([{
+                        "id": ws_id,
+                        "url": ws_url.clone(),
+                        "name": "Invoices AP",
+                        "organization": org_url.clone(),
+                        "queues": [queue_url.clone()],
+                        "modified_at": "2026-05-01T08:00:00Z"
+                    }])
+                } else {
+                    serde_json::json!([])
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+                    "results": results
+                }))
+            })
+            .mount(&server)
+            .await;
+    }
+
+    // Stateful GET /queues: empty before the create, the queue after.
+    {
+        let flag = queue_created.clone();
+        let created = created_queue.clone();
+        Mock::given(method("GET"))
+            .and(path("/api/v1/queues"))
+            .respond_with(move |_req: &Request| {
+                let results = if flag.load(Ordering::SeqCst) > 0 {
+                    serde_json::json!([created.clone()])
+                } else {
+                    serde_json::json!([])
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+                    "results": results
+                }))
+            })
+            .mount(&server)
+            .await;
+    }
+
+    // Stateful GET /schemas/<id>: gains its `queues` back-ref the same way.
+    {
+        let flag = queue_created.clone();
+        let (schema_url, queue_url) = (schema_url.clone(), queue_url.clone());
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/schemas/{schema_id}")))
+            .respond_with(move |_req: &Request| {
+                let queues = if flag.load(Ordering::SeqCst) > 0 {
+                    serde_json::json!([queue_url.clone()])
+                } else {
+                    serde_json::json!([])
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": schema_id,
+                    "url": schema_url.clone(),
+                    "name": "Cost Invoices Schema",
+                    "queues": queues,
+                    "content": [
+                        { "category": "section", "id": "header", "label": "Header", "children": [
+                            { "category": "datapoint", "id": "invoice_id", "type": "string" }
+                        ]}
+                    ],
+                    "modified_at": "2026-05-01T08:00:00Z"
+                }))
+            })
+            .mount(&server)
+            .await;
+    }
+
+    mock_empty_lists_except(&server, &["/api/v1/workspaces", "/api/v1/queues"]).await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(&created_ws_no_queues))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/schemas"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(&created_schema_no_queues))
+        .expect(1)
+        .mount(&server)
+        .await;
+    {
+        let flag = queue_created.clone();
+        let created = created_queue.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/v1/queues"))
+            .respond_with(move |_req: &Request| {
+                flag.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(201).set_body_json(created.clone())
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let ws_dir = project.path().join("envs/dev/workspaces/invoices-ap");
+    let q_dir = ws_dir.join("queues/cost-invoices");
+    std::fs::create_dir_all(&q_dir).unwrap();
+
+    let write_pretty = |p: &std::path::Path, v: &serde_json::Value| {
+        let mut b = serde_json::to_vec_pretty(v).unwrap();
+        b.push(b'\n');
+        std::fs::write(p, &b).unwrap();
+    };
+    write_pretty(
+        &ws_dir.join("workspace.json"),
+        &serde_json::json!({
+            "id": 0, "url": "", "name": "Invoices AP",
+            "organization": org_url, "queues": []
+        }),
+    );
+    write_pretty(
+        &q_dir.join("schema.json"),
+        &serde_json::json!({
+            "id": 0, "url": "", "name": "Cost Invoices Schema", "queues": [],
+            "content": [
+                { "category": "section", "id": "header", "label": "Header", "children": [
+                    { "category": "datapoint", "id": "invoice_id", "type": "string" }
+                ]}
+            ]
+        }),
+    );
+    write_pretty(
+        &q_dir.join("queue.json"),
+        &serde_json::json!({
+            "id": 0, "url": "", "name": "Cost Invoices",
+            "workspace": "rdc://workspaces/invoices-ap",
+            "schema": "rdc://schemas/cost-invoices"
+        }),
+    );
+
+    let ws_json_path = ws_dir.join("workspace.json");
+    let schema_json_path = q_dir.join("schema.json");
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    // Sync #1: creates workspace + schema + queue, and must refresh the
+    // back-refs in the SAME pass.
+    let r1 = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
+    // Read RIGHT AFTER the creating sync — before any re-sync could paper over
+    // a stale snapshot. This is the discriminating read.
+    let ws_after_create = std::fs::read_to_string(&ws_json_path).unwrap();
+    let schema_after_create = std::fs::read_to_string(&schema_json_path).unwrap();
+
+    // Sync #2: must be a clean, byte-stable no-op.
+    let r2 = rdc::cli::sync::run("dev", false, false, false, false, false, None).await;
+    let ws_after_resync = std::fs::read_to_string(&ws_json_path).unwrap();
+    let schema_after_resync = std::fs::read_to_string(&schema_json_path).unwrap();
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    r1.expect("create sync should succeed");
+    r2.expect("re-sync should succeed and be idempotent");
+
+    assert!(
+        ws_after_create.contains("rdc://queues/cost-invoices"),
+        "workspace.json must carry the created queue's portable back-ref after \
+         the CREATING sync (same pass): {ws_after_create}"
+    );
+    assert!(
+        schema_after_create.contains("rdc://queues/cost-invoices"),
+        "schema.json must carry the created queue's portable back-ref after the \
+         CREATING sync (same pass): {schema_after_create}"
+    );
+    assert_eq!(
+        ws_after_create, ws_after_resync,
+        "workspace.json must be byte-stable across the idempotent re-sync"
+    );
+    assert_eq!(
+        schema_after_create, schema_after_resync,
+        "schema.json must be byte-stable across the idempotent re-sync"
+    );
+}
+
+
 /// Push-side LocalCreate for an inbox + email template, both queue-nested.
 /// The owning workspace/queue/schema already exist (seeded in the lockfile +
 /// remote listing as Clean), so only the new inbox and email template are

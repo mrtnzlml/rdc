@@ -4,7 +4,6 @@ use crate::paths::Paths;
 
 use crate::snapshot::codec::combined_hash;
 use crate::snapshot::create::{strip_for_create, strip_patch_extra};
-use crate::snapshot::writer::write_atomic;
 use crate::state::{Lockfile, ObjectEntry};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashSet};
@@ -252,7 +251,7 @@ pub async fn push(
                         crate::cli::pull::common::portabilize_proposed(&created_art.json, lockfile);
                     let created_hash =
                         combined_hash(&created_bytes, &created_art.sidecars, lockfile);
-                    write_atomic(template_path, &created_bytes).with_context(|| {
+                    crate::state::base_cache::write_disk_and_cache(paths, template_path, &created_bytes).with_context(|| {
                         format!("writing post-create canonical form for '{lockfile_key}'")
                     })?;
                     lockfile.upsert(
@@ -652,7 +651,7 @@ async fn push_one_drifted(
             // land on disk (the template is lockfile-pinned; refs resolve).
             let remote_bytes =
                 crate::cli::pull::common::portabilize_proposed(&remote_bytes, lockfile);
-            write_atomic(template_path, &remote_bytes)
+            crate::state::base_cache::write_disk_and_cache(paths, template_path, &remote_bytes)
                 .with_context(|| format!("adopting remote into {}", template_path.display()))?;
             lockfile.upsert(
                 "email_templates",

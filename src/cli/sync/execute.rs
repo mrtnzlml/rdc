@@ -4152,17 +4152,38 @@ pub async fn run(
             }
         }
 
-        // Same-pass queue back-ref refresh (idempotency). Creating, deleting,
-        // or re-queueing a child (rule / hook / inbox) makes the server
-        // update the *other* side of the link: each affected queue's
-        // server-derived `rules` / `hooks` / `webhooks` collection. rdc
-        // strips those from every outbound body and never authors them, and
-        // the Phase-1 catalog the pull phase above consumed predates the
-        // push, so the affected queues would otherwise stay stale on disk
-        // until the NEXT sync — making a single `sync` that touches a child
-        // non-idempotent. Re-fetch and refresh queue.json (only) for the
-        // queues that were Clean this cycle so the back-ref lands in this
-        // same pass. See `pull::queues::refresh_backrefs`.
+        // Same-pass back-ref refresh (idempotency). Creating, deleting, or
+        // re-queueing an object makes the server update the *other* side of
+        // the link, and rdc strips those server-derived collections from every
+        // outbound body and never authors them:
+        //
+        //   child (rule/hook/inbox) created  -> queue.rules / .hooks / .webhooks
+        //   inbox created                    -> queue.inbox
+        //   queue created                    -> workspace.queues, schema.queues
+        //
+        // The Phase-1 catalog the pull phase consumed predates the push, so
+        // without this step every one of those stays stale on disk until the
+        // NEXT sync — a single `sync` that creates anything is not idempotent.
+        // On a fresh-env deploy that is the common case, not an edge case, and
+        // it matters most where nobody is watching: the CI deploy job runs
+        // `rdc sync --allow-deletes --yes` unattended and would otherwise
+        // leave the repo dirty every time.
+        //
+        // ELIGIBILITY. An object is refreshable when its on-disk state is
+        // known to equal its recorded base, so the three-way decision below
+        // can only come out `Write` (a server-only back-ref change) or
+        // `NoChange`. That is true of `Clean` objects AND of objects this very
+        // cycle CREATED: the create path writes the file, the base cache and
+        // the lockfile hash from one set of bytes. (Restricting this to
+        // `Clean` was the original bug — a just-created queue is `LocalCreate`,
+        // so the queue that most needed its `inbox` back-ref was the one
+        // object excluded from the refresh.) Anything else — a real local
+        // edit, an unresolved conflict — is left alone, and the
+        // `decide_pull_action` guard inside each refresh is a second line of
+        // defence rather than the only one.
+        let settled = |it: &crate::cli::sync::classify::ClassifiedItem| {
+            matches!(it.class, SyncClass::Clean | SyncClass::LocalCreate)
+        };
         let child_membership_pushed = !no_push
             && classified.iter().any(|it| {
                 matches!(it.kind.as_str(), "rules" | "hooks" | "inboxes")
@@ -4176,14 +4197,54 @@ pub async fn run(
                             | SyncClass::LocalDeleteRemoteEdit
                     )
             });
-        if child_membership_pushed {
-            let eligible: BTreeSet<String> = classified
+        // A created or deleted QUEUE moves `workspace.queues` and
+        // `schema.queues`; it also gains its own `inbox` back-ref once the
+        // inbox lands, which the child trigger above already covers.
+        let queue_membership_pushed = !no_push
+            && classified.iter().any(|it| {
+                it.kind == "queues"
+                    && matches!(it.class, SyncClass::LocalCreate | SyncClass::LocalDelete)
+            });
+
+        if child_membership_pushed || queue_membership_pushed {
+            let eligible_queues: BTreeSet<String> = classified
                 .iter()
-                .filter(|it| it.kind == "queues" && matches!(it.class, SyncClass::Clean))
+                .filter(|it| it.kind == "queues" && settled(it))
                 .map(|it| it.slug.clone())
                 .collect();
-            outcome.items_pulled +=
-                crate::cli::pull::queues::refresh_backrefs(ctx, &eligible, progress).await?;
+            // Schemas are keyed by their queue's slug. Only bother when a
+            // queue actually moved: a rule or hook does not touch
+            // `schema.queues`, and each schema costs a GET.
+            let eligible_schemas: BTreeSet<String> = if queue_membership_pushed {
+                classified
+                    .iter()
+                    .filter(|it| it.kind == "schemas" && settled(it))
+                    .map(|it| it.slug.clone())
+                    .collect()
+            } else {
+                BTreeSet::new()
+            };
+            outcome.items_pulled += crate::cli::pull::queues::refresh_backrefs(
+                ctx,
+                &eligible_queues,
+                &eligible_schemas,
+                progress,
+            )
+            .await?;
+
+            if queue_membership_pushed {
+                let eligible_workspaces: BTreeSet<String> = classified
+                    .iter()
+                    .filter(|it| it.kind == "workspaces" && settled(it))
+                    .map(|it| it.slug.clone())
+                    .collect();
+                outcome.items_pulled += crate::cli::pull::workspaces::refresh_backrefs(
+                    ctx,
+                    &eligible_workspaces,
+                    progress,
+                )
+                .await?;
+            }
         }
 
         // Post-pass: rewrite portable-kind URLs in every snapshotted file to

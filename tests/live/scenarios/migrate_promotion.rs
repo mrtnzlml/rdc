@@ -152,12 +152,9 @@ async fn live_migrate_overlay_and_mirror() {
         "the overlay value did not reach the prod remote: {remote_q:?}"
     );
 
-    // The fresh-env create lag pinned in `deploy_flow` applies here too: the
-    // first `sync prod` creates the objects and leaves server-derived back-refs
-    // (`workspace.queues`, `schema.queues`, `queue.inbox`) and the base cache
-    // one cycle behind. Settle, then require real convergence.
-    let settle = project.run_rdc(&["sync", "prod"]);
-    assert!(settle.status.success(), "settling sync prod failed: {}", combined(&settle));
+    // A single cycle must settle: the same-pass back-ref refresh now covers
+    // objects this cycle created, so `workspace.queues` / `schema.queues` /
+    // `queue.inbox` land in this pass rather than the next one.
     assert_converged(&project, "prod", &prefix, "after pushing the overlaid queue");
     // Across orgs this IS assertable: promoting must not disturb the source.
     assert_converged(&project, "test", &prefix, "after deploying test -> prod");
