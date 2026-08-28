@@ -258,13 +258,13 @@ fn detect_flat_kind(
 
     for slug in by_slug.keys() {
         let name = read_name(&dir.join(format!("{slug}.json")));
-        if let Some(name) = &name {
-            if is_stable_slug(slug, &slugify(name)) {
-                // Stable: keep this slug and take it out of circulation.
-                reserved.insert(slug.clone());
-                names.push((slug, None));
-                continue;
-            }
+        if let Some(name) = &name
+            && is_stable_slug(slug, &slugify(name))
+        {
+            // Stable: keep this slug and take it out of circulation.
+            reserved.insert(slug.clone());
+            names.push((slug, None));
+            continue;
         }
         if name.is_none() {
             // Unreadable or missing file: nothing to propose, but the slug is
