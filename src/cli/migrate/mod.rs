@@ -599,6 +599,19 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 /// this run creates. For `--dry-run` it is the only correct answer: nothing has
 /// been written, so a disk-only read would miss every object the run would
 /// create and call each of its refs unresolvable.
+///
+/// The ORDER of operations is load-bearing, not incidental: `pruned` is
+/// subtracted from `existing` FIRST, and `would_write` is unioned in AFTER —
+/// never the other way around. A slug is known if it will exist at ANY path
+/// once the run finishes, and a write always beats a prune of the same slug.
+/// This matters because `classify` derives a queue/schema/inbox's `(kind,
+/// slug)` from the queue path component alone (see `classify_workspace`), not
+/// the workspace it lives under — so an object that moves workspace between
+/// envs (a renamed workspace, a reparented queue) classifies identically at
+/// its OLD and NEW path. `--mirror` then prunes the old path in the very same
+/// run that writes the new one: subtracting `pruned` after the union would
+/// drop that object from `known` even though it demonstrably exists on disk,
+/// and diverge from what a post-write enumeration of the real run would show.
 fn projected_known(
     existing: &[PathBuf],
     would_write: &[PathBuf],
@@ -606,7 +619,6 @@ fn projected_known(
 ) -> BTreeSet<(String, String)> {
     let mut out: BTreeSet<(String, String)> = existing
         .iter()
-        .chain(would_write.iter())
         .filter_map(|rel| classify(rel).map(|(k, s)| (k.to_string(), s)))
         .collect();
     for rel in pruned {
@@ -614,6 +626,11 @@ fn projected_known(
             out.remove(&(k.to_string(), s));
         }
     }
+    out.extend(
+        would_write
+            .iter()
+            .filter_map(|rel| classify(rel).map(|(k, s)| (k.to_string(), s))),
+    );
     out
 }
 
@@ -5786,6 +5803,27 @@ mod tests {
         assert!(
             !got.contains(&("labels".to_string(), "kept".to_string())),
             "a pruned object must not be known: {got:?}",
+        );
+    }
+
+    /// A write always beats a prune of the SAME `(kind, slug)`. `classify_workspace`
+    /// derives a queue/schema/inbox's slug from the queue path component, not the
+    /// workspace one, so a queue that moves workspace between envs (a renamed
+    /// workspace, a reparented queue) classifies identically at its old and new
+    /// path: the run writes it at the new path and `--mirror` prunes the old one
+    /// in the SAME run. Ordering the subtraction before the union — never the
+    /// reverse — is what keeps that object known.
+    #[test]
+    fn projected_known_a_write_beats_a_prune_of_the_same_slug() {
+        let existing = vec![PathBuf::from("workspaces/old/queues/invoices/queue.json")];
+        let would_write = vec![PathBuf::from("workspaces/new/queues/invoices/queue.json")];
+        let pruned = vec![PathBuf::from("workspaces/old/queues/invoices/queue.json")];
+
+        let got = projected_known(&existing, &would_write, &pruned);
+        assert!(
+            got.contains(&("queues".to_string(), "invoices".to_string())),
+            "a queue this run writes at a new path must stay known even though the \
+             same-slug object at its old path is pruned in the same run: {got:?}",
         );
     }
 

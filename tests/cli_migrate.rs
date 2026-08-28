@@ -2172,6 +2172,84 @@ fn migrate_mirror_never_prunes_the_organization() {
     );
 }
 
+/// Real-run behavioural pin for `projected_known`'s write-beats-prune ordering.
+///
+/// A queue's `(kind, slug)` comes from the QUEUE path component alone
+/// (`classify_workspace`), not the workspace above it — so a queue that moves
+/// workspace between envs classifies identically at its OLD and NEW path.
+/// Here `main` is renamed to `main-v2` (queue `invoices` keeps its slug), and
+/// the target already holds the queue at the OLD `main` path from a prior
+/// migrate: `--mirror` prunes `workspaces/main/queues/invoices/queue.json`
+/// in the SAME run that writes `workspaces/main-v2/queues/invoices/queue.json`.
+/// A saved view whose `queues_filter` names that queue must NOT be refused —
+/// the object plainly exists in the target once the run finishes, just at a
+/// different path. Subtracting `pruned` before unioning `would_write` (rather
+/// than after) is what a post-write enumeration of this exact run would show.
+#[test]
+fn migrate_mirror_accepts_a_saved_view_ref_to_a_queue_whose_workspace_moved() {
+    let project = init_two_env_project();
+    let root = project.path();
+
+    std::fs::create_dir_all(root.join(".rdc")).unwrap();
+    std::fs::write(
+        root.join(".rdc/mapping.toml"),
+        "version = 2\n\n[[workspaces]]\ntest = \"main\"\nprod = \"main-v2\"\n",
+    )
+    .unwrap();
+
+    // Source: workspace `main` (renamed to `main-v2` in prod) holding queue
+    // `invoices` (NOT renamed) and a saved view scoped to it.
+    write(
+        &root.join("envs/test/workspaces/main/workspace.json"),
+        &serde_json::json!({ "name": "Main" }),
+    );
+    write(
+        &root.join("envs/test/workspaces/main/queues/invoices/queue.json"),
+        &serde_json::json!({ "name": "Invoices", "workspace": "rdc://workspaces/main" }),
+    );
+    write(
+        &root.join("envs/test/saved-views/scoped.json"),
+        &serde_json::json!({
+            "name": "Scoped",
+            "shared": true,
+            "queues_filter": ["rdc://queues/invoices"],
+            "query": { "$and": [] },
+            "organization": "https://test.example/api/v1/organizations/1"
+        }),
+    );
+
+    // Target: the queue already exists at the OLD (`main`) workspace path —
+    // exactly what a prior migrate (before the workspace was renamed) would
+    // have left on disk. `--mirror` must prune this in the same run that
+    // writes the new `main-v2` path.
+    write(
+        &root.join("envs/prod/workspaces/main/workspace.json"),
+        &serde_json::json!({ "name": "Main" }),
+    );
+    write(
+        &root.join("envs/prod/workspaces/main/queues/invoices/queue.json"),
+        &serde_json::json!({ "name": "Invoices", "workspace": "rdc://workspaces/main" }),
+    );
+
+    // `migrate_stderr` asserts `.success()` — a false "cannot cross into
+    // 'prod'" refusal (the pre-fix ordering) would fail this test right here.
+    let stderr = migrate_stderr(root, &["test", "prod", "--mirror"]);
+
+    assert!(
+        !root.join("envs/prod/workspaces/main/queues/invoices/queue.json").exists(),
+        "the OLD workspace path must be pruned: {stderr}"
+    );
+    assert!(
+        root.join("envs/prod/workspaces/main-v2/queues/invoices/queue.json").exists(),
+        "the queue must land at the NEW workspace path: {stderr}"
+    );
+    let promoted = read_json(&root.join("envs/prod/saved-views/scoped.json"));
+    assert_eq!(
+        promoted["queues_filter"][0], "rdc://queues/invoices",
+        "the ref must survive un-dropped: {stderr}"
+    );
+}
+
 /// An `[organization]` overlay entry beats the promoted value.
 #[test]
 fn migrate_organization_overlay_wins() {
