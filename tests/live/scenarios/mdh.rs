@@ -1,6 +1,7 @@
 use crate::support::assert_local::{load_lockfile, lockfile_keys};
 use crate::support::client::LiveClient;
 use crate::support::config::LiveConfig;
+use crate::support::converge::assert_converged;
 use crate::support::mdh::{mdh_collection_name, MdhRaw};
 use crate::support::project::ProjectFixture;
 use crate::support::run_id::RunId;
@@ -194,6 +195,13 @@ async fn live_mdh_index_lifecycle() {
         assert!(search_names.contains(&"sx_a".to_string()), "sx_a must survive: {search_names:?}");
     }
 
+    // Whole-tree convergence, not just "the indexes are still there": MDH is
+    // where this project's worst oscillation lived (a period-2 index reorder
+    // that each cycle undid), and only a byte-level check across a full extra
+    // cycle can see that. Matched on the bare run id — MDH slugs use
+    // underscores, so the usual `rdc-it-<id>-` form would match nothing.
+    assert_converged(&project, "test", run_id.as_str(), "after the full MDH index lifecycle");
+
     drop(teardown);
 }
 
@@ -341,6 +349,10 @@ async fn live_mdh_manual_data_lifecycle() {
         2,
         "an idempotent re-sync must not touch the rows"
     );
+    // The two assertions above check the row artifact specifically; this one
+    // checks that NOTHING else in the dataset's tree moved either — the
+    // manifest, the indexes and the lockfile rows included.
+    assert_converged(&project, "test", run_id.as_str(), "after the manual-data lifecycle");
 
     drop(teardown);
 }
@@ -425,6 +437,10 @@ async fn live_mdh_creates_collection_when_absent() {
         remote_regular_names(&raw, &coll).await.contains(&"ix_new".to_string()),
         "ix_new must persist after idempotent re-sync"
     );
+    // Creating a dataset from scratch must also leave the local tree settled —
+    // the create path is the one that skips the pull path's normalization
+    // everywhere else, so it is worth checking here too.
+    assert_converged(&project, "test", run_id.as_str(), "after creating an MDH dataset");
 
     drop(teardown);
 }

@@ -1,6 +1,7 @@
 use crate::support::assert_local::{load_lockfile, lockfile_keys, queue_file_path};
 use crate::support::client::LiveClient;
 use crate::support::config::LiveConfig;
+use crate::support::converge::assert_converged;
 use crate::support::expected::{load_or_compare, CapturedState};
 use crate::support::project::ProjectFixture;
 use crate::support::run_id::RunId;
@@ -110,6 +111,11 @@ async fn live_cross_refs() {
             .expect("queue.workspace string")
             .replace(&prefix, "<id>"),
     );
+
+    // A pure pull must settle: portabilizing every cross-ref is a WRITE, and a
+    // write that does not reproduce what the next pull computes is the phantom
+    // -drift class this whole harness exists to catch.
+    assert_converged(&project, "test", &prefix, "after pulling the cross-ref graph");
 
     let golden = static_dir().join("expected/cross_refs.toml");
     load_or_compare(&golden, &captured).expect("cross-ref state matches golden");

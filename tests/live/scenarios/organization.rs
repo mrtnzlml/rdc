@@ -1,5 +1,6 @@
 use crate::support::client::LiveClient;
 use crate::support::config::LiveConfig;
+use crate::support::converge::assert_unprefixed_object_stable;
 use crate::support::project::ProjectFixture;
 
 /// The org's `settings` is a permanent, live singleton — never a throwaway
@@ -141,6 +142,19 @@ async fn live_organization_settings_push() {
         after_push.get("annotation_list_table").and_then(|t| t.get("columns")),
         Some(&pushed_columns),
         "pushed column did not persist remotely: {after_push}"
+    );
+
+    // The push must have converged. The organization's write-back is
+    // deliberately settings-only (the PATCH response is not shaped like the GET
+    // response), which is exactly the sort of partial write-back that leaves
+    // the rest of the file a cycle behind — so prove a second cycle is a
+    // byte-for-byte no-op rather than assuming it.
+    assert_unprefixed_object_stable(
+        &project,
+        "test",
+        "envs/test/organization.json",
+        "organization",
+        "after pushing the organization settings",
     );
 
     // Restore now (join the background thread synchronously) rather than

@@ -241,6 +241,14 @@ pub fn planned_successfully(output: &str) -> bool {
 /// is included in every failure message, because a scenario calls this more
 /// than once.
 ///
+/// `prefix` is a plain SUBSTRING match against paths, plan lines and lockfile
+/// slugs — usually `RunId::list_prefix()` (`rdc-it-<id>-`). Pass the bare
+/// `RunId::as_str()` when a kind slugs itself differently: MDH collection
+/// names must be Mongo-safe, so they carry underscores (`rdc_it_<id>_mdh`)
+/// and the dash form would match nothing, silently capturing an empty tree.
+/// (The emptiness guard below turns that mistake into a failure rather than a
+/// vacuous pass.)
+///
 /// # Panics
 /// With a message naming the offending counts or the exact files that moved.
 #[allow(dead_code)]
@@ -307,6 +315,76 @@ pub fn assert_converged(project: &ProjectFixture, env: &str, prefix: &str, ctx: 
 
 /// stdout + stderr as one string. `rdc` prints its event lines to stderr and
 /// some payloads to stdout; scenarios care about neither distinction.
+/// Assert that a re-sync leaves ONE named file (and its lockfile row)
+/// byte-identical.
+///
+/// [`assert_converged`] filters everything by the run's `rdc-it-<id>-` prefix,
+/// which is what makes it usable on a shared org — but it means an object
+/// whose path carries no run id is invisible to it, and the emptiness guard
+/// would fire rather than pass vacuously. The organization is the only such
+/// object: a per-env singleton rdc PATCHes but never creates, living at
+/// `envs/<env>/organization.json`.
+///
+/// That object is worth checking precisely because its push is the awkward
+/// shape — the PATCH response is NOT the GET response, so the write-back is
+/// deliberately settings-only, and "settings-only" is exactly the kind of
+/// partial write-back that leaves the rest of the file a cycle behind.
+#[allow(dead_code)]
+pub fn assert_unprefixed_object_stable(
+    project: &ProjectFixture,
+    env: &str,
+    rel: &str,
+    kind: &str,
+    ctx: &str,
+) {
+    let read = || -> (Option<Vec<u8>>, String) {
+        let bytes = std::fs::read(project.path().join(rel)).ok();
+        let lock = std::fs::read_to_string(
+            project.path().join(format!(".rdc/state/{env}.lock.json")),
+        )
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("objects").and_then(|o| o.get(kind)).cloned())
+        .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())
+        .unwrap_or_default();
+        (bytes, lock)
+    };
+
+    let (before_bytes, before_lock) = read();
+    assert!(
+        before_bytes.is_some(),
+        "assert_unprefixed_object_stable({ctx}): {rel} does not exist, so this \
+         would pass vacuously"
+    );
+
+    let out = project.run_rdc(&["sync", env]);
+    let combined_out = combined(&out);
+    assert!(
+        out.status.success(),
+        "assert_unprefixed_object_stable({ctx}): re-sync failed:\n{combined_out}"
+    );
+
+    let (after_bytes, after_lock) = read();
+    if before_bytes != after_bytes {
+        let show = |b: &Option<Vec<u8>>| {
+            b.as_deref()
+                .map(|x| String::from_utf8_lossy(x).to_string())
+                .unwrap_or_else(|| "<missing>".into())
+        };
+        panic!(
+            "assert_unprefixed_object_stable({ctx}): a re-sync REWROTE {rel} — the \
+             previous cycle did not converge.\n--- before ---\n{}\n--- after ---\n{}",
+            show(&before_bytes),
+            show(&after_bytes)
+        );
+    }
+    assert_eq!(
+        before_lock, after_lock,
+        "assert_unprefixed_object_stable({ctx}): a re-sync changed the lockfile \
+         rows for '{kind}'"
+    );
+}
+
 #[allow(dead_code)]
 pub fn combined(out: &std::process::Output) -> String {
     format!(
