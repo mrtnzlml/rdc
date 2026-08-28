@@ -6,6 +6,7 @@
 pub mod api;
 pub mod cli;
 pub mod config;
+pub mod kinds;
 pub mod log;
 pub mod mapping;
 pub mod merge;

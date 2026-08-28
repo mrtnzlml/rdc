@@ -732,6 +732,31 @@ mod selection_tests {
             vec!["awaiting-approval".to_string(), "high-value".to_string()]
         );
     }
+
+    /// Everything rdc can push must also be promotable, or `rdc migrate` would
+    /// silently skip a kind `rdc sync` manages.
+    #[test]
+    fn deployable_kinds_covers_every_push_capable_kind() {
+        for kind in crate::kinds::PUSH_CAPABLE {
+            assert!(
+                DEPLOYABLE_KINDS.contains(kind),
+                "{kind} is push-capable but not in DEPLOYABLE_KINDS",
+            );
+        }
+    }
+
+    /// The two extras are deliberate: `mdh` is promotable but bypasses the sync
+    /// classifier, and both it and `organization` have no create-order
+    /// dependency. Naming them keeps the difference intentional.
+    #[test]
+    fn deployable_kinds_extras_are_only_mdh() {
+        let extras: Vec<&str> = DEPLOYABLE_KINDS
+            .iter()
+            .copied()
+            .filter(|k| !crate::kinds::PUSH_CAPABLE.contains(k))
+            .collect();
+        assert_eq!(extras, vec!["mdh"]);
+    }
 }
 
 #[cfg(test)]
