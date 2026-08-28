@@ -757,6 +757,22 @@ mod selection_tests {
             .collect();
         assert_eq!(extras, vec!["mdh"]);
     }
+
+    /// `list_slugs` has a catch-all, so a kind in DEPLOYABLE_KINDS with no arm
+    /// makes `--only <kind>/<slug>` report "matched 0 objects" instead of
+    /// erroring — which is how the saved-views kind was briefly unselectable.
+    #[test]
+    fn every_deployable_kind_is_listable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        for kind in DEPLOYABLE_KINDS {
+            let got = list_slugs(&paths, kind);
+            assert!(
+                got.is_ok(),
+                "list_slugs has no handling for deployable kind '{kind}': {got:?}",
+            );
+        }
+    }
 }
 
 #[cfg(test)]

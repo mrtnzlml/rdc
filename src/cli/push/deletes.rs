@@ -551,3 +551,45 @@ async fn fetch_remote_body(client: &RossumClient, kind: &str, id: u64) -> Result
 // in mod.rs; the import here just keeps that surface obvious.
 #[allow(unused_imports)]
 use IsTerminal as _;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `apply_outcome` has a `_ => {}` catch-all, so a deletable kind missing an
+    /// arm would delete remotely and then not be counted — the summary would
+    /// under-report a destructive action.
+    #[test]
+    fn every_deletable_kind_is_counted_by_apply_outcome() {
+        for kind in crate::kinds::DELETABLE {
+            let mut counts = DeleteCounts::default();
+            apply_outcome(&mut counts, kind, DeleteOutcome::Deleted);
+            assert_eq!(
+                counts.total_deleted(),
+                1,
+                "apply_outcome did not count a delete for '{kind}'",
+            );
+        }
+    }
+
+    /// `AlreadyGone` counts as deleted (the remote object is gone either way);
+    /// `Skipped` must not.
+    #[test]
+    fn apply_outcome_counts_already_gone_but_not_skipped() {
+        let mut counts = DeleteCounts::default();
+        apply_outcome(&mut counts, "labels", DeleteOutcome::AlreadyGone);
+        assert_eq!(counts.total_deleted(), 1);
+
+        let mut counts = DeleteCounts::default();
+        apply_outcome(&mut counts, "labels", DeleteOutcome::Skipped);
+        assert_eq!(counts.total_deleted(), 0);
+    }
+
+    /// An organization has no delete path at all, so it must never be counted.
+    #[test]
+    fn apply_outcome_does_not_count_an_organization() {
+        let mut counts = DeleteCounts::default();
+        apply_outcome(&mut counts, "organization", DeleteOutcome::Deleted);
+        assert_eq!(counts.total_deleted(), 0);
+    }
+}
