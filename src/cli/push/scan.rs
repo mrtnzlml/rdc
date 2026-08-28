@@ -349,6 +349,15 @@ impl ChangeList {
     /// Distinguishes "a kind rdc does not push" from "a kind rdc pushes that
     /// happens to have no changes right now" — [`Self::contains`] answers
     /// `false` for both.
+    ///
+    /// The arm list is written out by hand rather than delegating to
+    /// `crate::kinds::PUSH_CAPABLE`, and that duplication is load-bearing:
+    /// this answers "does this STRUCT have a slot for `kind`", which is a
+    /// different question from "is `kind` push-capable". They must coincide,
+    /// and `every_push_capable_kind_has_a_change_list_slot` is what pins that
+    /// they do. Delegating would make that test assert
+    /// `PUSH_CAPABLE.contains(k)` for every `k` in `PUSH_CAPABLE` —
+    /// tautological, and the guard would be gone.
     pub fn tracks(&self, kind: &str) -> bool {
         matches!(
             kind,
@@ -492,6 +501,9 @@ impl Tombstones {
     /// Does this struct have a slot for `kind` at all?
     ///
     /// `organization` is absent on purpose: rdc cannot delete an organization.
+    /// The hand-written arm list is deliberate for the same reason as
+    /// [`ChangeList::tracks`] — delegating to `crate::kinds::DELETABLE` would
+    /// make `every_deletable_kind_has_a_tombstones_slot` tautological.
     pub fn tracks(&self, kind: &str) -> bool {
         matches!(
             kind,
