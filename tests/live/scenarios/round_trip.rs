@@ -1,6 +1,7 @@
 use crate::support::assert_local::{field, load_lockfile, lockfile_keys, queue_file_path};
 use crate::support::client::LiveClient;
 use crate::support::config::LiveConfig;
+use crate::support::converge::assert_converged;
 use crate::support::expected::{load_or_compare, CapturedState};
 use crate::support::project::ProjectFixture;
 use crate::support::run_id::RunId;
@@ -42,6 +43,14 @@ async fn live_round_trip_core() {
         "sync --no-push failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+
+    let prefix = run_id.list_prefix();
+
+    // A pure pull must already have settled: nothing to push back, nothing to
+    // re-pull. A pull that doesn't converge here is the first-run spurious
+    // conflict class (the schema/rule/hook drivers each dropping the
+    // local==remote short-circuit).
+    assert_converged(&project, "test", &prefix, "after the initial pull");
 
     // --- assert local: lockfile recorded all seeded kinds ---
     let lf = load_lockfile(project.path(), "test").expect("lockfile");
@@ -120,6 +129,12 @@ async fn live_round_trip_core() {
         Some(&serde_json::Value::String("#00ff00".into())),
         "pushed label color mismatch: got {got_color:?}",
     );
+
+    // The push must have converged: the write-back put on disk exactly what a
+    // fresh pull would produce. Writing the raw server response here (concrete
+    // env URLs instead of portable `rdc://` refs) is invisible to a one-shot
+    // assertion and shows up only on the next cycle.
+    assert_converged(&project, "test", &prefix, "after pushing the label edit");
 
     drop(teardown); // explicit: delete everything now (also runs on panic)
 }

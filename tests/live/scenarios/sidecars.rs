@@ -1,6 +1,7 @@
 use crate::support::assert_local::{load_lockfile, lockfile_keys, queue_file_path, strip_volatile};
 use crate::support::client::LiveClient;
 use crate::support::config::LiveConfig;
+use crate::support::converge::assert_converged;
 use crate::support::project::ProjectFixture;
 use crate::support::run_id::RunId;
 use crate::support::seeder::seed;
@@ -109,6 +110,12 @@ async fn live_sidecars_redaction() {
         "content_hash changed on second pull — sidecar round-trip is NOT stable (redaction \
          bug): hook {hslug}"
     );
+
+    // Hash stability is necessary but not sufficient: a sidecar can be
+    // rewritten (gaining or losing a trailing newline) while the hash — which
+    // is deliberately EOF-newline-insensitive — stays put. Convergence checks
+    // the bytes.
+    assert_converged(&project, "test", &prefix, "after two pull-only syncs");
 
     let _ = strip_volatile; // keep the import live; used by other scenarios
     drop(teardown);

@@ -14,6 +14,25 @@ async fn live_janitor_sweep() {
     };
     let client = LiveClient::connect(&cfg).expect("connect");
     teardown_by_prefix(&client, RunId::marker()).await.expect("janitor sweep");
+
+    // Sweep the TARGET org too when one is configured: the promotion scenarios
+    // create objects there, and a crashed run leaves them behind exactly the
+    // same way. Its assertions are the source org's, below — this sweep is
+    // best-effort, because a janitor that hard-failed on the second org would
+    // stop it cleaning the first.
+    if let Some(tgt) = cfg.target.clone() {
+        let tgt_client = LiveClient::connect_creds(&tgt).expect("connect (target)");
+        teardown_by_prefix(&tgt_client, RunId::marker())
+            .await
+            .expect("janitor sweep (target org)");
+        for kind in ["workspace", "hook", "label", "rule", "inbox", "email_template"] {
+            let left = tgt_client
+                .list_ids_by_name_prefix(kind, RunId::marker())
+                .await
+                .unwrap_or_default();
+            assert!(left.is_empty(), "janitor left {kind} objects in the target org: {left:?}");
+        }
+    }
     // Synchronously-deletable kinds MUST be fully gone after the sweep.
     for kind in ["workspace", "hook", "label", "rule", "inbox", "saved_view"] {
         let left = client.list_ids_by_name_prefix(kind, RunId::marker()).await.unwrap_or_default();

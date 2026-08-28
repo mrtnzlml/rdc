@@ -1,7 +1,15 @@
 {
   "name": "Validator",
   "type": "function",
-  "events": ["annotation_content"],
-  "queues": ["@queue/queue-invoices-main"],
-  "config": { "runtime": "python3.12", "code_file": "bodies/hooks/validator.py" }
+  "events": [
+    "annotation_content"
+  ],
+  "queues": [
+    "@queue/queue-invoices-main"
+  ],
+  "config": {
+    "runtime": "python3.12",
+    "code_file": "bodies/hooks/validator.py"
+  },
+  "description": "Validates extracted invoice totals. Seeded by the rdc live integration harness."
 }

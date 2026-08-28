@@ -33,9 +33,17 @@ pub async fn teardown_by_prefix(client: &LiveClient, prefix: &str) -> Result<()>
         }
     }
 
-    // Schemas: delete by derived id, now that their queues are gone (avoids 409).
+    // Schemas: delete by derived id, now that their queues are gone.
+    //
+    // A queue DELETE is ASYNC — it returns 202 `deletion_requested` and the
+    // queue lingers for a while — so a schema delete issued immediately after
+    // races it and gets `409 Cannot delete schema because it is referenced
+    // from queue '<id>'`. Observed on the live sandbox on the very first run of
+    // the expanded suite, and the cost is real: an undeleted schema cannot be
+    // listed (there is no schema list endpoint), so nothing — not even the
+    // janitor — can ever find it again. Retry with a short backoff instead.
     for id in schema_ids {
-        if let Err(e) = client.delete("schema", id).await {
+        if let Err(e) = delete_schema_with_retry(client, id).await {
             eprintln!("teardown: delete schema {id} failed (continuing): {e:#}");
         }
     }
@@ -67,6 +75,31 @@ pub async fn teardown_by_prefix(client: &LiveClient, prefix: &str) -> Result<()>
         }
     }
     Ok(())
+}
+
+/// Delete a schema, retrying while the queue that references it is still
+/// finishing its asynchronous delete. Gives up after ~15s.
+#[allow(dead_code)]
+async fn delete_schema_with_retry(client: &LiveClient, id: u64) -> Result<()> {
+    const ATTEMPTS: usize = 10;
+    let mut last: Option<anyhow::Error> = None;
+    for attempt in 0..ATTEMPTS {
+        match client.delete("schema", id).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // Only a still-referenced schema is worth waiting out; anything
+                // else (404 already gone, 403) will not improve with time.
+                if !format!("{e:#}").contains("conflict_referenced") {
+                    return Err(e);
+                }
+                last = Some(e);
+                if attempt + 1 < ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("schema {id} still referenced after retries")))
 }
 
 /// Drop every MDH collection whose name starts with `marker` (the throwaway

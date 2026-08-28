@@ -16,6 +16,44 @@
           "type": "number",
           "formula": "amount_due + amount_tax",
           "ui_configuration": { "type": "formula", "edit": "disabled" }
+        },
+        {
+          "category": "datapoint",
+          "id": "amount_grand_total",
+          "label": "Grand Total",
+          "type": "number",
+          "formula": "subtotal = amount_due\nsubtotal + amount_tax\n",
+          "ui_configuration": { "type": "formula", "edit": "disabled" }
+        }
+      ]
+    },
+    {
+      "category": "section",
+      "id": "line_items_section",
+      "label": "Line Items",
+      "children": [
+        {
+          "category": "multivalue",
+          "id": "line_items",
+          "label": "Line Items",
+          "children": {
+            "category": "tuple",
+            "id": "line_item",
+            "label": "Line Item",
+            "children": [
+              { "category": "datapoint", "id": "item_description", "label": "Description", "type": "string" },
+              { "category": "datapoint", "id": "item_quantity", "label": "Quantity", "type": "number" },
+              { "category": "datapoint", "id": "item_amount", "label": "Unit Price", "type": "number" },
+              {
+                "category": "datapoint",
+                "id": "item_total",
+                "label": "Line Total",
+                "type": "number",
+                "formula": "item_quantity * item_amount",
+                "ui_configuration": { "type": "formula", "edit": "disabled" }
+              }
+            ]
+          }
         }
       ]
     }

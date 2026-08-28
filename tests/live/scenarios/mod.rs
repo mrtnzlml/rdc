@@ -1,10 +1,14 @@
+pub mod cli_surface;
 pub mod collisions;
 pub mod conflicts_deletes;
 pub mod cross_refs;
 pub mod deploy_flow;
+pub mod email_templates;
 pub mod janitor;
 pub mod mdh;
+pub mod migrate_promotion;
 pub mod organization;
 pub mod round_trip;
 pub mod saved_views;
+pub mod server_truth;
 pub mod sidecars;

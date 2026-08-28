@@ -1,6 +1,7 @@
 use crate::support::assert_local::{load_lockfile, lockfile_keys, queue_file_path};
 use crate::support::client::LiveClient;
 use crate::support::config::LiveConfig;
+use crate::support::converge::assert_converged;
 use crate::support::expected::{load_or_compare, CapturedState};
 use crate::support::project::ProjectFixture;
 use crate::support::run_id::RunId;
@@ -78,6 +79,10 @@ async fn live_collisions_identity() {
         slugs_after, captured.lockfile_keys["queues"],
         "queue slugs must be stable across a remote rename (id-pinned identity)"
     );
+
+    // A remote rename must leave the snapshot settled, not churning: the
+    // id-pinned slug stays put, so a following cycle has nothing to do.
+    assert_converged(&project, "test", &prefix, "after a remote rename was re-pulled");
 
     let golden = static_dir().join("expected/collisions.toml");
     load_or_compare(&golden, &captured).expect("collision state matches golden");

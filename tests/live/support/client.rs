@@ -1,4 +1,4 @@
-use crate::support::config::LiveConfig;
+use crate::support::config::{EnvCreds, LiveConfig};
 use anyhow::{anyhow, Result};
 use rdc::api::RossumClient;
 
@@ -11,8 +11,17 @@ pub struct LiveClient {
 #[allow(dead_code)]
 impl LiveClient {
     pub fn connect(cfg: &LiveConfig) -> Result<LiveClient> {
-        let inner = RossumClient::new(cfg.api_base.clone(), cfg.token.clone())?;
-        let org_url = format!("{}/organizations/{}", cfg.api_base.trim_end_matches('/'), cfg.org_id);
+        Self::connect_creds(&cfg.source())
+    }
+
+    /// Connect to an arbitrary env — the source org or the target one.
+    pub fn connect_creds(creds: &EnvCreds) -> Result<LiveClient> {
+        let inner = RossumClient::new(creds.api_base.clone(), creds.token.clone())?;
+        let org_url = format!(
+            "{}/organizations/{}",
+            creds.api_base.trim_end_matches('/'),
+            creds.org_id
+        );
         Ok(LiveClient { inner, org_url })
     }
 
@@ -265,6 +274,13 @@ impl LiveClient {
             "workspace" => self
                 .inner
                 .list_workspaces(None)
+                .await?
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<Result<_, _>>()?,
+            "email_template" => self
+                .inner
+                .list_email_templates(None)
                 .await?
                 .into_iter()
                 .map(serde_json::to_value)

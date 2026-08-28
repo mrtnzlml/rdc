@@ -7,6 +7,7 @@
 use crate::support::assert_local::{load_lockfile, lockfile_keys};
 use crate::support::client::LiveClient;
 use crate::support::config::LiveConfig;
+use crate::support::converge::assert_converged;
 use crate::support::project::ProjectFixture;
 use crate::support::run_id::RunId;
 use crate::support::teardown::Teardown;
@@ -143,6 +144,11 @@ async fn live_saved_views_round_trip() {
         "pushed saved view name mismatch: {remote_after_push:?}"
     );
 
+    // The push wrote back; a second cycle must be a no-op. `saved_views` is
+    // the newest managed kind and shipped twice-broken through exactly the
+    // silent-dispatch gaps this pins.
+    assert_converged(&project, "test", &prefix, "after pushing the saved-view rename");
+
     // --- delete the local file, sync --allow-deletes, remote is gone ---
     std::fs::remove_file(project.path().join(&rel)).expect("removing local saved view file");
     let del = project.run_rdc(&["sync", "test", "--allow-deletes"]);
@@ -162,6 +168,8 @@ async fn live_saved_views_round_trip() {
         after_delete.is_none(),
         "shared saved view must be deleted on the remote after --allow-deletes"
     );
+
+    assert_converged(&project, "test", &prefix, "after deleting the saved view");
 
     drop(teardown); // explicit: delete everything now (also runs on panic)
 }

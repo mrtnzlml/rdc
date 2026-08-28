@@ -1,9 +1,11 @@
 pub mod config;
 pub mod run_id;
 pub mod manifest;
+pub mod mapping;
 pub mod refs;
 pub mod project;
 pub mod client;
+pub mod converge;
 pub mod seeder;
 pub mod teardown;
 pub mod assert_local;

@@ -2,6 +2,8 @@ use crate::support::assert_local::{load_lockfile, lockfile_keys};
 use crate::support::assert_remote::assert_remote_ref_resolved;
 use crate::support::client::LiveClient;
 use crate::support::config::LiveConfig;
+use crate::support::converge::{assert_converged, combined, TreeSnapshot};
+use crate::support::mapping::{rename_mapping, write_mapping};
 use crate::support::project::ProjectFixture;
 use crate::support::run_id::RunId;
 use crate::support::seeder::seed;
@@ -12,8 +14,32 @@ use crate::support::teardown::Teardown;
 /// an explicit mapping so prod objects don't collide with test in the shared
 /// org), `rdc sync prod` to push, then assert the prod lockfile recorded
 /// `-prod` slugs and that the pushed queue's schema ref resolved to a real URL
-/// on the remote. Teardown cleans BOTH test and prod objects (same run-id
-/// prefix; display names are identical — only slugs differ).
+/// on the remote.
+///
+/// `test` and `prod` live in SEPARATE organizations (`RDC_LIVE_TGT_*`), which
+/// is what a promotion actually is; the scenario skips without a second org.
+/// The renames are therefore not strictly necessary across orgs — they are
+/// kept deliberately, because rewriting every slug and every `rdc://` ref
+/// through an explicit mapping is the part of `migrate` most worth exercising.
+///
+/// The mapping is written in the CURRENT `.rdc/mapping.toml` N-way format —
+/// the one every project uses today. (The legacy per-pair
+/// `.rdc/map/<a>-to-<b>.toml` conversion has its own hermetic coverage in
+/// `tests/cli_migrate.rs`; feeding it here would mean the live suite never
+/// exercised the format real users actually commit.)
+///
+/// Two convergence properties are pinned on top of the one-shot flow, because
+/// both have regressed in production before and neither is visible to the mock
+/// suite:
+///
+/// * **Post-push convergence** — after `sync prod` lands the creates, a
+///   second cycle must be a byte-for-byte no-op. Push write-back writing raw
+///   server URLs to disk and the base cache not mirroring code sidecars both
+///   showed up exactly here.
+/// * **Chain stability** — running the whole `migrate && sync` chain a second
+///   time must not move a single byte. This is the mirror-chain oscillation
+///   class (stale-map prune, unique-typed template skip, MDH KeepLocal base
+///   preservation), which by construction needs two full chains to detect.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live: needs RDC_LIVE_* env"]
 async fn live_deploy_flow() {
@@ -21,19 +47,27 @@ async fn live_deploy_flow() {
         eprintln!("{}", LiveConfig::skip_reason());
         return;
     };
+    let Some(tgt) = cfg.target.clone() else {
+        eprintln!("{}", LiveConfig::skip_reason_target());
+        return;
+    };
     let run_id = RunId::new();
-    let client = LiveClient::connect(&cfg).expect("connect");
-    // Teardown guard FIRST — cleans up on panic. One guard covers both test
-    // AND prod because both carry the same `rdc-it-<id>-` name prefix.
-    let teardown = Teardown::new(LiveClient::connect(&cfg).unwrap(), run_id.clone());
+    let client = LiveClient::connect(&cfg).expect("connect (source)");
+    let tgt_client = LiveClient::connect_creds(&tgt).expect("connect (target)");
+    // One teardown guard PER ORG — the run creates objects in both, and each
+    // org's sweep only sees its own.
+    let teardown_src = Teardown::new(LiveClient::connect(&cfg).unwrap(), run_id.clone());
+    let teardown_tgt =
+        Teardown::new(LiveClient::connect_creds(&tgt).unwrap(), run_id.clone());
 
     let manifest = load_manifest().expect("manifest");
     let _ = seed(&client, &run_id, &static_dir(), &manifest)
         .await
         .expect("seed");
 
-    // Init project with both envs, then pull test only.
-    let project = ProjectFixture::init(&cfg, &["test", "prod"]).expect("init");
+    // Init project with each env pointing at its OWN org — a real promotion.
+    let project =
+        ProjectFixture::init_envs(&[("test", &cfg.source()), ("prod", &tgt)]).expect("init");
     let pull = project.run_rdc(&["sync", "test", "--no-push"]);
     assert!(
         pull.status.success(),
@@ -41,45 +75,39 @@ async fn live_deploy_flow() {
         String::from_utf8_lossy(&pull.stderr)
     );
 
-    // Build test->prod rename mapping from the pulled test lockfile.
+    let prefix = run_id.list_prefix();
+
+    // A pure pull must already have converged: nothing to push back, nothing
+    // to re-pull, no phantom drift. A pull that doesn't settle here is the
+    // first-run-spurious-conflict class (74af7eb).
+    assert_converged(&project, "test", &prefix, "after the initial pull of test");
+
+    // Build the test->prod rename mapping from the pulled test lockfile, in
+    // the generic N-way format: one `[[<kind>]]` row per object, naming this
+    // object's slug in each env it exists in.
+    //
     // Keys are flat leaf slugs (verified: flat workspace slug, flat queue-leaf
     // slug for queues/schemas/inboxes, flat slug for hooks/rules/labels).
     let lf_test = load_lockfile(project.path(), "test").expect("test lockfile");
-    let mut map = String::from("version = 1\n\n");
-
-    // Map every object to a `-prod` rename, building each section from the
-    // ACTUAL run-scoped lockfile slugs for that kind. All these kinds use flat
-    // slugs in the mapping (workspaces, queues, schemas==queue-slug,
-    // inboxes==queue-slug, hooks, rules, labels). We map from the real slugs
-    // (not derived from queues) so we never reference a non-existent source —
-    // e.g. only queues that actually have an inbox appear under [inboxes].
-    // email_templates are server-managed defaults (auto-created per queue) and
-    // are intentionally NOT mapped here.
     let prefix = run_id.list_prefix();
-    for (section, kind) in [
-        ("workspaces", "workspaces"),
-        ("queues", "queues"),
-        ("schemas", "schemas"),
-        ("inboxes", "inboxes"),
-        ("hooks", "hooks"),
-        ("rules", "rules"),
-        ("labels", "labels"),
-    ] {
-        map.push_str(&format!("[{section}]\n"));
-        for s in lockfile_keys(&lf_test, kind)
-            .into_iter()
-            .filter(|s| s.starts_with(&prefix))
-        {
-            map.push_str(&format!("\"{s}\" = \"{s}-prod\"\n"));
-        }
-        map.push('\n');
-    }
+    write_mapping(
+        project.path(),
+        &rename_mapping(&lf_test, &prefix, "test", "prod", "-prod"),
+    );
 
-    std::fs::create_dir_all(project.path().join(".rdc/map")).unwrap();
-    std::fs::write(project.path().join(".rdc/map/test-to-prod.toml"), &map).unwrap();
+    // Scope every migrate to the objects THIS RUN owns.
+    //
+    // The sandbox is a live org: other people's MDH datasets change while the
+    // suite runs, and a whole-snapshot migrate copies their `indexes.json` into
+    // the target too. When the remote has since gained an index, the next
+    // `sync` sees a deletion it was never asked to make and refuses without
+    // `--allow-deletes` — a failure with nothing to do with the thing under
+    // test, and one that must NEVER be "fixed" by passing that flag here.
+    // `*` matches any kind and the slug pattern anchors on the run prefix.
+    let only = format!("*/{prefix}*");
 
     // migrate (pure local rename) then sync prod (push to remote).
-    let mg = project.run_rdc(&["migrate", "test", "prod"]);
+    let mg = project.run_rdc(&["migrate", "test", "prod", "--only", &only]);
     assert!(
         mg.status.success(),
         "migrate failed: {}",
@@ -93,9 +121,9 @@ async fn live_deploy_flow() {
         String::from_utf8_lossy(&sp.stderr)
     );
 
-    // CORRECTED assertion: verify via prod lockfile + remote ref resolution.
-    // migrate renames SLUGS, not display names, so remote objects still carry
-    // the original `rdc-it-<id>-` names. Assertions:
+    // Verify via prod lockfile + remote ref resolution. migrate renames SLUGS,
+    // not display names, so remote objects still carry the original
+    // `rdc-it-<id>-` names. Assertions:
     //   1. Prod lockfile has at least one queue slug containing "-prod".
     //   2. That queue's schema cross-ref resolved to a real HTTP URL remotely.
     let lf_prod = load_lockfile(project.path(), "prod").expect("prod lockfile");
@@ -118,7 +146,7 @@ async fn live_deploy_flow() {
         .unwrap_or_else(|| panic!("prod lockfile missing entry for queue slug '{prod_slug}'"))
         .id;
 
-    assert_remote_ref_resolved(&client, "queue", prod_queue_id, "schema")
+    assert_remote_ref_resolved(&tgt_client, "queue", prod_queue_id, "schema")
         .await
         .unwrap_or_else(|e| {
             panic!(
@@ -126,5 +154,64 @@ async fn live_deploy_flow() {
             )
         });
 
-    drop(teardown); // explicit: delete test + prod objects (shared prefix)
+    // --- KNOWN DEFECT: a fresh-env deploy needs a SECOND cycle to settle ---
+    //
+    // Creating a child makes the server fill in the other side of the link, and
+    // the create-push writes back the POST response, which predates the child.
+    // So after the first `sync prod` the snapshot is one cycle stale in exactly
+    // three places, all server-derived:
+    //
+    //   workspace.json  "queues": []   (the queues it just gained)
+    //   schema.json     "queues": []   (the queue that points at it)
+    //   queue.json      no "inbox"     (the inbox created after it)
+    //
+    // `execute.rs`'s same-pass back-ref refresh does not cover them: its
+    // `eligible` set is queues classified **Clean** this cycle, and a
+    // just-created queue is `LocalCreate`, not Clean — and `workspaces` /
+    // `schemas` have no such refresh at all. The create path also does not
+    // populate the base cache, so `.rdc/state/prod.base/` only appears on the
+    // second cycle (the deferred half of the push base-cache lockstep work).
+    //
+    // Nothing is lost and the second cycle is correct, so this is pinned as
+    // CURRENT BEHAVIOUR rather than papered over: the extra sync below is the
+    // defect, and `assert_converged` immediately after it is the guarantee.
+    // When the refresh is extended to cover creates, delete this line — the
+    // assertion that follows will keep passing and the deploy becomes
+    // single-cycle. If the lag ever grows past one cycle, that assertion fails.
+    let settle = project.run_rdc(&["sync", "prod"]);
+    assert!(settle.status.success(), "settling sync prod failed: {}", combined(&settle));
+
+    // --- convergence: the deploy settled, and it didn't disturb the source ---
+    assert_converged(&project, "prod", &prefix, "after the deploy settled");
+    assert_converged(&project, "test", &prefix, "after deploying test -> prod");
+
+    // --- chain stability: migrate && sync, a second time, moves no bytes ---
+    let prod_before = TreeSnapshot::capture(project.path(), "prod", &prefix);
+    let mg2 = project.run_rdc(&["migrate", "test", "prod", "--only", &only]);
+    assert!(
+        mg2.status.success(),
+        "second migrate failed: {}",
+        combined(&mg2)
+    );
+    let prod_after_migrate = TreeSnapshot::capture(project.path(), "prod", &prefix);
+    if let Some(d) = prod_before.diff(&prod_after_migrate) {
+        panic!(
+            "re-running `migrate test prod` on an already-migrated tree changed files — \
+             migrate is not idempotent:\n{d}"
+        );
+    }
+
+    let sp2 = project.run_rdc(&["sync", "prod"]);
+    assert!(sp2.status.success(), "second sync prod failed: {}", combined(&sp2));
+    let prod_after_chain = TreeSnapshot::capture(project.path(), "prod", &prefix);
+    if let Some(d) = prod_before.diff(&prod_after_chain) {
+        panic!(
+            "a second `migrate && sync` chain rewrote the prod snapshot — the chain \
+             oscillates rather than converging:\n{d}"
+        );
+    }
+    assert_converged(&project, "prod", &prefix, "after a second migrate && sync chain");
+
+    drop(teardown_tgt);
+    drop(teardown_src);
 }

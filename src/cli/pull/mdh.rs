@@ -400,11 +400,12 @@ pub(crate) async fn plan_mdh_index_edits(
     // Sequential compare pass, in dataset listing order.
     for (slug, name) in &wanted {
         let ix_path = paths.dataset_dir(slug).join("indexes.json");
-        let set = listed
-            .index_sets
-            .get(slug)
-            .or_else(|| fetched.get(slug))
-            .expect("every wanted slug is either prefetched or fetched above");
+        // Absent means the collection vanished between listing and fetch (see
+        // `fetch_index_sets`); there is nothing to compare it against, and the
+        // orphan prune removes its local files on a later cycle.
+        let Some(set) = listed.index_sets.get(slug).or_else(|| fetched.get(slug)) else {
+            continue;
+        };
         let proposed = proposed_index_bytes(set)?;
         let base = lockfile
             .objects
@@ -597,7 +598,10 @@ pub(crate) const MDH_FANOUT: usize = 10;
 /// `buffer_unordered(MDH_FANOUT)` ACROSS datasets.
 ///
 /// `wanted` is `(dataset_slug, collection_name)` and the returned map is keyed
-/// by **dataset slug**, carrying an entry for every requested slug. This helper
+/// by **dataset slug**, carrying an entry for every requested slug that still
+/// EXISTS — a collection that 404s (dropped between the listing and this
+/// fetch) is skipped, so callers must treat an absent slug as "not this
+/// cycle" rather than assuming one entry per request. This helper
 /// deliberately does not decide WHICH datasets to fetch — each caller keeps its
 /// own scope, so request counts per command stay exactly what they were.
 pub(crate) async fn fetch_index_sets(
@@ -608,18 +612,37 @@ pub(crate) async fn fetch_index_sets(
     if wanted.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let fetched: Vec<(String, IndexSet)> = futures::stream::iter(wanted.iter().cloned())
+    let fetched: Vec<Option<(String, IndexSet)>> = futures::stream::iter(wanted.iter().cloned())
         .map(|(slug, name)| {
             let progress = progress.clone();
             async move {
-                let set = fetch_index_set(client, &name, &progress).await?;
-                Ok::<_, anyhow::Error>((slug, set))
+                match fetch_index_set(client, &name, &progress).await {
+                    Ok(set) => Ok::<_, anyhow::Error>(Some((slug, set))),
+                    // A collection listed a moment ago can be GONE by the time
+                    // its indexes are fetched — orgs running imports churn
+                    // `__tmp_*` collections constantly, and the listing is a
+                    // separate round trip. A 404 here means exactly that, and
+                    // it is not this sync's problem: skip the dataset rather
+                    // than aborting the whole run over somebody else's
+                    // temporary table. (Observed live: a `__tmp_*` dataset
+                    // dropped between listing and fetch failed the entire
+                    // sync, which would take the unattended CI deploy with
+                    // it.) Every other status still propagates.
+                    Err(e) if crate::api::anyhow_has_status(&e, 404) => {
+                        progress.event(
+                            Action::Skip,
+                            &format!("mdh dataset '{slug}' vanished during the sync"),
+                        );
+                        Ok(None)
+                    }
+                    Err(e) => Err(e),
+                }
             }
         })
         .buffer_unordered(MDH_FANOUT)
         .try_collect()
         .await?;
-    Ok(fetched.into_iter().collect())
+    Ok(fetched.into_iter().flatten().collect())
 }
 
 /// Fetch the rows of several manual datasets concurrently.
@@ -2425,6 +2448,66 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_millis(350),
             "the two listings must overlap; sequential would be ~400ms, took {elapsed:?}",
+        );
+    }
+
+    /// A collection can be dropped between the listing that named it and the
+    /// index fetch that follows — orgs running imports churn `__tmp_*`
+    /// collections constantly. Observed live: one such dataset 404'd mid-sync
+    /// and failed the ENTIRE run, which would take an unattended CI deploy
+    /// with it. The vanished dataset must be skipped and its siblings must
+    /// still come back.
+    #[tokio::test]
+    async fn fetch_index_sets_skips_a_collection_that_vanished_mid_sync() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // The doomed collection 404s on both listings.
+        for p in ["/v1/indexes/list", "/v1/search_indexes/list"] {
+            Mock::given(method("POST"))
+                .and(path(p))
+                .and(body_string_contains("__tmp_gone"))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "message": "Dataset '__tmp_gone' not found",
+                    "type": "error"
+                })))
+                .mount(&server)
+                .await;
+        }
+        // Its healthy sibling answers normally.
+        Mock::given(method("POST"))
+            .and(path("/v1/indexes/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "code": "ok", "result": [ { "name": "acct" } ] }),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search_indexes/list"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "code": "ok", "result": [] })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = DataStorageClient::new(server.uri(), "TEST".to_string()).unwrap();
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        let wanted = vec![
+            ("gone".to_string(), "__tmp_gone".to_string()),
+            ("kept".to_string(), "gl_codes".to_string()),
+        ];
+
+        let got = fetch_index_sets(&client, &wanted, &progress)
+            .await
+            .expect("a vanished collection must not fail the whole fetch");
+
+        assert!(!got.contains_key("gone"), "the vanished dataset must be skipped");
+        assert_eq!(
+            got.get("kept").map(|s| s.regular.len()),
+            Some(1),
+            "the surviving dataset must still be fetched: {got:?}"
         );
     }
 

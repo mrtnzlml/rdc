@@ -1,0 +1,7 @@
+[lockfile_keys]
+
+[refs]
+"email_template.message.trailing_spaces" = "trimmed"
+"email_template.subject.trailing_spaces" = "trimmed"
+"hook.description.trailing_spaces" = "trimmed"
+"label.name.at_limit_plus_newline" = "accepted"

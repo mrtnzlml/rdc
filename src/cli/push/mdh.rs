@@ -83,6 +83,16 @@ fn scaled(client: &DataStorageClient, d: Duration) -> Duration {
 ///
 /// Returns the number of API write operations performed (drops +
 /// creates) for the caller's summary line.
+/// Turn a 404 ("collection not found") into an empty listing, leaving every
+/// other error alone. See the call sites in [`push_dataset`] for why.
+fn empty_if_absent(res: Result<Vec<Value>>) -> Result<Vec<Value>> {
+    match res {
+        Ok(v) => Ok(v),
+        Err(e) if crate::api::anyhow_has_status(&e, 404) => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
 pub async fn push_dataset(
     client: &DataStorageClient,
     lockfile: &mut Lockfile,
@@ -110,14 +120,27 @@ pub async fn push_dataset(
 
     // Fetch the live remote state directly so an admin's UI-added indexes are
     // visible to the diff (and, being absent from base, preserved).
-    let remote_regular = client
-        .list_indexes(collection_name, Some(progress.clone()))
-        .await
-        .with_context(|| format!("listing regular indexes for '{collection_name}'"))?;
-    let remote_search = client
-        .list_search_indexes(collection_name, Some(progress.clone()))
-        .await
-        .with_context(|| format!("listing search indexes for '{collection_name}'"))?;
+    //
+    // A collection that does not exist YET has no indexes, and saying so is the
+    // only sensible answer here — this function is also the create-when-absent
+    // path, so it is reached precisely when there is nothing to list. Data
+    // Storage is asymmetric about it: listing REGULAR indexes on a missing
+    // collection returns an empty list, while listing SEARCH indexes 404s. Left
+    // unhandled, that 404 aborts the push before a single index is created,
+    // which broke creating a dataset from scratch outright. `create_index`
+    // auto-creates the collection, so an empty remote set is exactly right.
+    let remote_regular = empty_if_absent(
+        client
+            .list_indexes(collection_name, Some(progress.clone()))
+            .await
+            .with_context(|| format!("listing regular indexes for '{collection_name}'")),
+    )?;
+    let remote_search = empty_if_absent(
+        client
+            .list_search_indexes(collection_name, Some(progress.clone()))
+            .await
+            .with_context(|| format!("listing search indexes for '{collection_name}'")),
+    )?;
 
     // Reshape the raw remote search-index list entries to the same canonical
     // {name, mappings, analyzers?} form the pull writes locally, so the diff
@@ -848,6 +871,90 @@ fn def_options_only(def: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+
+    /// Creating a dataset from scratch: Data Storage answers a REGULAR index
+    /// listing on a missing collection with an empty list but 404s the SEARCH
+    /// one. Unhandled, that 404 aborted the push before anything was created,
+    /// so `sync` could not create an MDH dataset at all. Verified live.
+    #[tokio::test]
+    async fn push_dataset_treats_a_missing_collection_as_having_no_indexes() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // First listing: the collection does not exist yet, so it is empty.
+        // Later listings: rdc verifies the index actually materialized after
+        // the async create, so it must find it there.
+        Mock::given(method("POST"))
+            .and(path("/v1/indexes/list"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "code": "ok", "result": [] })),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/indexes/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "ok",
+                "result": [ { "name": "ix_a", "key": { "a": 1 } } ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search_indexes/list"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "message": "Dataset 'brand_new' not found",
+                "type": "error"
+            })))
+            .mount(&server)
+            .await;
+        // Index creation auto-creates the collection.
+        Mock::given(method("POST"))
+            .and(path("/v1/indexes/create"))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .set_body_json(serde_json::json!({ "code": "ok", "result": {} })),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let indexes_path = root.join("envs/test/mdh/brand-new/indexes.json");
+        std::fs::create_dir_all(indexes_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &indexes_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "regular": [ { "name": "ix_a", "key": { "a": 1 } } ],
+                "search": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let client = DataStorageClient::new(server.uri(), "TEST".to_string()).unwrap();
+        let mut lockfile = Lockfile::default();
+        let paths = crate::paths::Paths::for_env(root, "test");
+        let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+
+        let pushed = push_dataset(
+            &client,
+            &mut lockfile,
+            "brand_new",
+            "brand-new",
+            &indexes_path,
+            &paths,
+            false,
+            false,
+            &progress,
+        )
+        .await
+        .expect("a 404 from the search-index listing must not abort the create path");
+
+        assert_eq!(pushed, 1, "the one local index must have been created");
+    }
     use super::*;
     use serde_json::json;
 
