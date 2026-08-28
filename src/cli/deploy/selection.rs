@@ -758,18 +758,98 @@ mod selection_tests {
         assert_eq!(extras, vec!["mdh"]);
     }
 
+    /// Per deployable kind: the slug `list_slugs` must return, and the
+    /// file(s) that must exist on disk for its arm to find it. Mirrors
+    /// `scan::push_capable_fixture`'s shape byte-for-byte for the 12 kinds
+    /// the two lists share (`workspaces` nesting, the `email_templates`
+    /// compound key, the `engine_fields` composite key), plus `mdh` — the
+    /// one kind DEPLOYABLE_KINDS adds beyond PUSH_CAPABLE.
+    ///
+    /// A synthetic slug with no matching file would let every arm return an
+    /// empty vec — indistinguishable from falling through the catch-all —
+    /// so each entry seeds a real file each arm's own directory walk needs.
+    fn deployable_kind_fixture() -> Vec<(&'static str, &'static str, Vec<&'static str>)> {
+        vec![
+            ("workspaces", "main", vec!["workspaces/main/workspace.json"]),
+            (
+                "queues",
+                "invoices",
+                vec!["workspaces/main/queues/invoices/queue.json"],
+            ),
+            (
+                "schemas",
+                "invoices",
+                vec!["workspaces/main/queues/invoices/schema.json"],
+            ),
+            (
+                "inboxes",
+                "invoices",
+                vec!["workspaces/main/queues/invoices/inbox.json"],
+            ),
+            (
+                "email_templates",
+                "main/invoices/ack",
+                vec!["workspaces/main/queues/invoices/email-templates/ack.json"],
+            ),
+            ("hooks", "validator", vec!["hooks/validator.json"]),
+            ("rules", "totals", vec!["rules/totals.json"]),
+            ("labels", "urgent", vec!["labels/urgent.json"]),
+            ("saved_views", "awaiting", vec!["saved-views/awaiting.json"]),
+            ("engines", "extractor", vec!["engines/extractor/engine.json"]),
+            (
+                "engine_fields",
+                "extractor/amount",
+                vec!["engines/extractor/fields/amount.json"],
+            ),
+            ("mdh", "gl-codes", vec!["mdh/gl-codes/indexes.json"]),
+            ("organization", "self", vec!["organization.json"]),
+        ]
+    }
+
+    /// The fixture must cover DEPLOYABLE_KINDS exactly. Without this, adding a
+    /// 14th deployable kind and forgetting the fixture would make the
+    /// enforcement test below quietly skip it — the same silent-omission
+    /// failure this whole change exists to prevent.
+    #[test]
+    fn deployable_kind_fixture_covers_every_deployable_kind() {
+        let mut fixture: Vec<&str> = deployable_kind_fixture()
+            .iter()
+            .map(|(k, _, _)| *k)
+            .collect();
+        let mut expected: Vec<&str> = DEPLOYABLE_KINDS.to_vec();
+        fixture.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(fixture, expected);
+    }
+
     /// `list_slugs` has a catch-all, so a kind in DEPLOYABLE_KINDS with no arm
     /// makes `--only <kind>/<slug>` report "matched 0 objects" instead of
     /// erroring — which is how the saved-views kind was briefly unselectable.
+    /// Seeds one real object per kind so a kind that falls through the
+    /// catch-all comes back empty and the assertion fails; an `is_ok()`-only
+    /// check can't tell "handled, happens to be empty" from "silently
+    /// skipped" since both return `Ok(Vec::new())`.
     #[test]
     fn every_deployable_kind_is_listable() {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
-        for kind in DEPLOYABLE_KINDS {
-            let got = list_slugs(&paths, kind);
+        let root = paths.env_root();
+
+        let fixture = deployable_kind_fixture();
+        for (_, _, files) in &fixture {
+            for rel in files {
+                let p = root.join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, b"{}").unwrap();
+            }
+        }
+
+        for (kind, slug, _) in &fixture {
+            let got = list_slugs(&paths, kind).unwrap();
             assert!(
-                got.is_ok(),
-                "list_slugs has no handling for deployable kind '{kind}': {got:?}",
+                got.contains(&slug.to_string()),
+                "list_slugs has no handling for deployable kind '{kind}' \
+                 (expected '{slug}' among {got:?})",
             );
         }
     }
