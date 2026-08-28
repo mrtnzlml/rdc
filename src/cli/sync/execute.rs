@@ -2595,23 +2595,16 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
     for it in classified {
         match &it.class {
             SyncClass::BothDeleted => {
-                // Silent convergence — both sides removed the object, so
-                // the lockfile entry is the only thing left. Drop it.
-                // All push-capable kinds use the same drop semantics.
-                if matches!(
-                    it.kind.as_str(),
-                    "labels"
-                        | "workspaces"
-                        | "engines"
-                        | "engine_fields"
-                        | "hooks"
-                        | "rules"
-                        | "queues"
-                        | "schemas"
-                        | "inboxes"
-                        | "email_templates"
-                        | "saved_views"
-                ) {
+                // Silent convergence — both sides removed the object, so the
+                // lockfile entry is the only thing left. Drop it.
+                //
+                // Membership comes from `kinds::DELETABLE` rather than a literal
+                // list repeated here: this site had no `saved_views` arm for a
+                // while, and because nothing else clears a `BothDeleted` item
+                // (the tombstone loop filters on `LocalDelete` only) the `else`
+                // branch below warned on every sync forever and left an
+                // unclearable lockfile entry.
+                if crate::kinds::DELETABLE.contains(&it.kind.as_str()) {
                     drop_lockfile_entry(ctx, &it.kind, &it.slug);
                 } else {
                     progress.event(
