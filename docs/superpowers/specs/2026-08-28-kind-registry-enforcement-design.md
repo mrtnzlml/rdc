@@ -157,22 +157,35 @@ the site *handles* every member. That needs one small new API, mirroring
 
 ```rust
 impl ChangeList {
-    /// The per-kind map for `kind`, or `None` for a kind this struct does not track.
-    pub fn kind_map(&self, kind: &str) -> Option<&BTreeMap<String, PathBuf>>;
+    /// Is `(kind, slug)` present? `organization` is a singleton keyed by the
+    /// reserved slug `"self"`, so it answers through this same call.
+    /// `false` for a kind this struct does not track — use `tracks` to tell
+    /// "untracked kind" from "tracked kind, absent slug".
+    pub fn contains(&self, kind: &str, slug: &str) -> bool;
+    /// Does this struct have a slot for `kind` at all?
+    pub fn tracks(&self, kind: &str) -> bool;
 }
 impl Tombstones {
-    pub fn kind_map(&self, kind: &str) -> Option<&BTreeMap<String, u64>>;
+    pub fn contains(&self, kind: &str, slug: &str) -> bool;
+    pub fn tracks(&self, kind: &str) -> bool;
 }
 ```
+
+**Corrected during planning:** an earlier draft of this section proposed
+`kind_map(kind) -> Option<&BTreeMap<..>>`. That cannot work —
+`ChangeList.organization` is an `Option<PathBuf>` singleton, not a map, because
+rdc PATCHes exactly one org per env. A boolean `contains` covers the maps and the
+singleton uniformly, and it is all the enforcement tests need, so there is no
+reason to expose the maps at all.
 
 Both are `match kind { … }` over the existing fields — themselves compile-checked
 by the struct definition. Tests:
 
 | Test | Asserts |
 | --- | --- |
-| `every_push_capable_kind_reaches_the_change_list` | for each `PUSH_CAPABLE` kind, a `LocalEdit` item lands in `ChangeList::kind_map(kind)`. **The R15 bug.** |
-| `every_push_capable_kind_has_a_change_list_map` | `ChangeList::kind_map` returns `Some` for each — so the accessor cannot silently miss a field |
-| `every_deletable_kind_reaches_the_tombstones` | for each `DELETABLE` kind, a `LocalDelete` item lands in `Tombstones::kind_map(kind)` |
+| `every_push_capable_kind_reaches_the_change_list` | for each `PUSH_CAPABLE` kind, a `LocalEdit` item is reported by `ChangeList::contains(kind, slug)`. **The R15 bug.** |
+| `every_push_capable_kind_has_a_change_list_slot` | `ChangeList::tracks` is true for each — so the accessor cannot silently miss a field |
+| `every_deletable_kind_reaches_the_tombstones` | for each `DELETABLE` kind, a `LocalDelete` item is reported by `Tombstones::contains(kind, slug)` |
 | `every_deletable_kind_is_counted_by_apply_outcome` | for each, a `Deleted` outcome raises `total_deleted()` by one |
 | `every_deployable_kind_is_listable` | `list_slugs` resolves for each `DEPLOYABLE_KINDS` entry |
 | `deployable_kinds_covers_push_capable` | `DEPLOYABLE_KINDS ⊇ PUSH_CAPABLE` |
@@ -271,7 +284,7 @@ Full suite plus `cargo clippy --all-targets -- -D warnings` once, at the end.
 | Situation | Behaviour |
 | --- | --- |
 | A future kind is added to `ChangeList` but not to `change_list_from_classified` | `every_push_capable_kind_reaches_the_change_list` fails |
-| …added to `PUSH_CAPABLE` but no `ChangeList` field | `ChangeList::kind_map` returns `None`; `every_push_capable_kind_has_a_change_list_map` fails |
+| …added to `PUSH_CAPABLE` but no `ChangeList` field | `ChangeList::tracks` is false; `every_push_capable_kind_has_a_change_list_slot` fails |
 | …added to `DELETABLE` but not to the tombstone arm or `apply_outcome` | the corresponding test fails |
 | A kind is added to `DEPLOYABLE_KINDS` but not `list_slugs` | `every_deployable_kind_is_listable` fails |
 | Someone makes `organization` deletable | `organization_is_push_capable_but_not_deletable` fails, forcing the argument into the open |
