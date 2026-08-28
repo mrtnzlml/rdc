@@ -300,7 +300,7 @@ Full suite plus `cargo clippy --all-targets -- -D warnings` once, at the end.
 | Two objects' names collide under `doctor` | both rename, suffixed, deterministically |
 | Three or more collide | `x`, `x-2`, `x-3`, … |
 | `migrate --dry-run` on a view whose ref cannot cross | same refusal the real run gives |
-| A dry-run projection disagrees with the real enumeration | `projected_known_matches_the_post_write_enumeration` fails |
+| A dry-run projection disagrees with the real enumeration | Backed by three tests, none named `projected_known_matches_the_post_write_enumeration` — that test was specified here but replaced during planning and never written. What actually backs the row: `projected_known_a_write_beats_a_prune_of_the_same_slug` (the unit collision case), `migrate_mirror_accepts_a_saved_view_ref_to_a_queue_whose_workspace_moved` (a real `--mirror` run where an object moves path, driving the compiled binary), and `dry_run_and_real_run_reach_the_same_saved_view_verdict` (outcome equivalence across modes). Corrected after Task 7's failure-mode walk flagged the mismatch. |
 
 ## Out of scope
 
