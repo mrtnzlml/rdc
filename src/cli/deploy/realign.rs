@@ -243,13 +243,23 @@ fn detect_flat_kind(
     // lowest-sorting duplicate keeps the bare slug. Deterministic across runs,
     // and convergent: a second pass over the renamed tree finds every object
     // stable.
+    //
+    // Stability must recognise an ALREADY-suffixed slug too (`is_stable_slug`),
+    // not just the bare one. Recognising only the bare slug looked convergent
+    // for small counts, but `BTreeMap`'s lexicographic key order breaks that
+    // past nine duplicates: `"dup-10"` sorts before `"dup-2"`, so on the next
+    // run only bare `dup` would be seen as stable, and pass 2 would reassign
+    // the other nine every time (`dup-10` -> `dup-2`, `dup-2` -> `dup-3`, ...)
+    // — a perpetual churn that never settles despite the slug *set* staying
+    // identical. Treating `dup-7` (etc.) as stable in its own right closes
+    // that gap.
     let mut names: Vec<(&String, Option<String>)> = Vec::new();
     let mut reserved: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for slug in by_slug.keys() {
         let name = read_name(&dir.join(format!("{slug}.json")));
         if let Some(name) = &name {
-            if slugify(name) == *slug {
+            if is_stable_slug(slug, &slugify(name)) {
                 // Stable: keep this slug and take it out of circulation.
                 reserved.insert(slug.clone());
                 names.push((slug, None));
@@ -272,6 +282,27 @@ fn detect_flat_kind(
             out.push(make(slug.clone(), proposed));
         }
     }
+}
+
+/// True when `slug` is exactly `base`, or `base` followed by `-N` where `N`
+/// is an all-ASCII-digit integer >= 2 — i.e. `slug` is a value
+/// `crate::slug::slugify_unique(_, _)` could have produced for `base`
+/// (`slugify_unique` starts suffixing at `-2`; it never emits `-0` or `-1`,
+/// and it never emits a non-digit or empty suffix). An object already
+/// sitting at such a slug is therefore already correctly suffixed and must
+/// count as stable — see the long comment in `detect_flat_kind` for why
+/// recognising only the bare slug is not convergent.
+fn is_stable_slug(slug: &str, base: &str) -> bool {
+    if slug == base {
+        return true;
+    }
+    let Some(rest) = slug.strip_prefix(base).and_then(|r| r.strip_prefix('-')) else {
+        return false;
+    };
+    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    rest.parse::<u64>().is_ok_and(|n| n >= 2)
 }
 
 /// Read a JSON file and return its top-level `name` field as a String.
@@ -2747,5 +2778,109 @@ mod tests {
             }
         }
         drop(tmp);
+    }
+
+    /// Direct coverage of `is_stable_slug`'s suffix parse, per the exact edge
+    /// cases that make it correct: only a bare match or `-N` with N an
+    /// all-digit integer >= 2 counts. `slugify_unique` never emits `-0` or
+    /// `-1`, a non-digit tail, or an empty tail, so none of those may count
+    /// as stable either.
+    #[test]
+    fn is_stable_slug_edge_cases() {
+        assert!(is_stable_slug("dup", "dup"));
+        assert!(is_stable_slug("dup-2", "dup"));
+        assert!(is_stable_slug("dup-9", "dup"));
+        assert!(is_stable_slug("dup-10", "dup"));
+        assert!(!is_stable_slug("dup-0", "dup"));
+        assert!(!is_stable_slug("dup-1", "dup"));
+        assert!(!is_stable_slug("dup-2x", "dup"));
+        assert!(!is_stable_slug("dup-", "dup"));
+        assert!(!is_stable_slug("dupe", "dup"));
+        assert!(!is_stable_slug("dup-2-3", "dup"));
+    }
+
+    /// A direct regression guard for the lexicographic edge that broke
+    /// convergence: `"dup-10"` sorts before `"dup-2"`..`"dup-9"` in a
+    /// `BTreeMap`, so if pass 1 recognised only the bare slug as stable, an
+    /// object already sitting at `dup-10` would look unstable next to a
+    /// bare `dup` and get reassigned. It must not.
+    #[test]
+    fn an_object_already_suffixed_to_dash_ten_is_stable() {
+        let (tmp, paths) = flat_fixture(&[("dup", "Dup"), ("dup-10", "Dup")]);
+        let lockfile = flat_lockfile("labels", &["dup", "dup-10"]);
+        let mut out = Vec::new();
+        detect_flat_kind(&lockfile, "labels", paths.labels_dir(), &mut out, |o, n| {
+            PendingRename::Label { old: o, new: n }
+        });
+        assert!(out.is_empty(), "expected no renames, got {out:?}");
+        drop(tmp);
+    }
+
+    /// Ten objects sharing a name must not just get suffixed correctly on the
+    /// first pass — the assignment must be a FIXED POINT. Before pass 1's
+    /// stability test recognised an already-suffixed slug, `BTreeMap`'s
+    /// lexicographic order (`"dup-10" < "dup-2"`) made a second run see only
+    /// bare `dup` as stable and reshuffle the other nine every time, even
+    /// though the resulting slug *set* never changed. This is the test that
+    /// would have caught that: it checks run 1's output, then feeds that
+    /// output back in as run 2's input and asserts nothing more is proposed.
+    #[test]
+    fn ten_duplicate_names_converge_after_the_first_pass() {
+        let entries: Vec<(&str, &str)> = vec![
+            ("old-a", "Dup"),
+            ("old-b", "Dup"),
+            ("old-c", "Dup"),
+            ("old-d", "Dup"),
+            ("old-e", "Dup"),
+            ("old-f", "Dup"),
+            ("old-g", "Dup"),
+            ("old-h", "Dup"),
+            ("old-i", "Dup"),
+            ("old-j", "Dup"),
+        ];
+        let slugs: Vec<&str> = entries.iter().map(|(s, _)| *s).collect();
+        let (tmp, paths) = flat_fixture(&entries);
+        let lockfile = flat_lockfile("labels", &slugs);
+        let mut out = Vec::new();
+        detect_flat_kind(&lockfile, "labels", paths.labels_dir(), &mut out, |o, n| {
+            PendingRename::Label { old: o, new: n }
+        });
+
+        let mut pairs: Vec<(String, String)> = out
+            .iter()
+            .map(|r| match r {
+                PendingRename::Label { old, new } => (old.clone(), new.clone()),
+                other => panic!("unexpected variant {other:?}"),
+            })
+            .collect();
+        pairs.sort();
+        let expected: Vec<(String, String)> = vec![
+            ("old-a".into(), "dup".into()),
+            ("old-b".into(), "dup-2".into()),
+            ("old-c".into(), "dup-3".into()),
+            ("old-d".into(), "dup-4".into()),
+            ("old-e".into(), "dup-5".into()),
+            ("old-f".into(), "dup-6".into()),
+            ("old-g".into(), "dup-7".into()),
+            ("old-h".into(), "dup-8".into()),
+            ("old-i".into(), "dup-9".into()),
+            ("old-j".into(), "dup-10".into()),
+        ];
+        assert_eq!(pairs, expected, "run 1 result");
+        drop(tmp);
+
+        // Run 2: apply run 1's result on disk (same names, new slugs) and
+        // confirm detect_flat_kind proposes NOTHING. This is the convergence
+        // property the two-pass rewrite promises.
+        let new_slugs: Vec<&str> = expected.iter().map(|(_, s)| s.as_str()).collect();
+        let new_entries: Vec<(&str, &str)> = new_slugs.iter().map(|s| (*s, "Dup")).collect();
+        let (tmp2, paths2) = flat_fixture(&new_entries);
+        let lockfile2 = flat_lockfile("labels", &new_slugs);
+        let mut out2 = Vec::new();
+        detect_flat_kind(&lockfile2, "labels", paths2.labels_dir(), &mut out2, |o, n| {
+            PendingRename::Label { old: o, new: n }
+        });
+        assert!(out2.is_empty(), "second pass must be a fixed point, got {out2:?}");
+        drop(tmp2);
     }
 }
