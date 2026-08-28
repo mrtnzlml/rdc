@@ -61,8 +61,14 @@ blindness once (the MDH preview).
 | `realign::compound_prefix_pairs` | 4 named + `_ => Vec::new()` | yes, but correct for a flat kind |
 | pull-subset dispatch | 12 | yes — but `schemas`/`inboxes` are absent BY DESIGN (written by `pull::queues::process`) |
 
-**There are no current gaps.** Every site is internally consistent, and the two
-exclusion rules that make it look otherwise are deliberate:
+| `push::push_classified` (ten `if !changes.<field>.is_empty()` blocks) | 11 + org | **YES — and this is the CONSUMER of `change_list_from_classified`. A kind wired into `ChangeList` and into the producer but forgotten here has a dead push half — the R15 bug exactly — while the producer's enforcement test passes.** |
+| `ChangeList::total` / `is_empty` | 12 | **YES — a missing kind makes `is_empty()` true and the whole push phase is skipped** |
+| `ChangeList::json_parse_errors` / `field_limit_violations` | 12 | **YES — a missing kind silently loses the parse and field-limit pre-flights, the latter being the wedge-prevention feature** |
+| `deletes::fetch_remote_modified_at` | 11 | **YES, and most destructive of all: `_ => None` is read by `delete_one` as "already gone on the remote" — it drops the lockfile entry, reports `AlreadyGone` (which `apply_outcome` counts as deleted), and never issues the DELETE. rdc reports a successful delete while the object lives on in the env forever.** |
+| `deletes::fetch_remote_body` | 11 | yes — a missing kind loses the dry-run delete preview |
+
+**No gaps in the sites listed above.** Every one is internally consistent today, and
+the two exclusion rules that make it look otherwise are deliberate:
 
 - `organization` is push-capable (PATCH only — rdc never creates or deletes an
   org), so it is present in `change_list_from_classified` and absent from both
@@ -74,6 +80,15 @@ exclusion rules that make it look otherwise are deliberate:
 So this work **locks in correct state rather than repairing it**. That is a
 correction to the saved-views branch's own risk note, which predicted gaps in
 other kinds.
+
+**This table is a survey, not a proof of exhaustiveness.** An earlier revision
+listed only the first thirteen rows and asserted "there are no current gaps",
+which read as a completeness claim it had not earned — the final whole-branch
+review found five more silent sites, including the `push_classified` consumer
+and the `fetch_remote_modified_at` mis-read above. Anyone adding kind #15 should
+re-derive this list rather than trust it. The structural answer is in the
+Recommendations: exhaustive destructuring turns a silent site into a compile
+error, which no test in this design can match.
 
 The capability sets are already mirrored exactly by two struct definitions:
 `ChangeList`'s 12 fields are the push-capable set, and `Tombstones`' 11 are the
@@ -243,7 +258,9 @@ set covers objects this run creates — and it is *correct* for dry-run, where a
 disk read would miss everything the run would create and produce false
 "unresolvable" errors.
 
-It also removes the second walk of the target tree.
+Note it does NOT remove a walk of the target tree, contrary to an earlier draft
+of this section: `existing` still needs `enumerate_files`, and under `--mirror`
+`mirror_prune_paths` enumerates the tree regardless.
 
 Because that equivalence is the whole risk, it is pinned rather than assumed:
 `projected_known_matches_the_post_write_enumeration` runs a real (non-dry)
@@ -262,6 +279,14 @@ same refusal a real run does.
   both duplicate-name:
   - Two objects both renamed to the same new name: previously a half-applied
     rename plus an error, now two renames (`new-name`, `new-name-2`).
+  - **A lone suffixed object is now left alone.** An object at `hook-2` named
+    "Hook" with no `hook` present used to be realigned to `hook`; it is now
+    treated as already stable and never renamed. This is a NON-duplicate-name
+    behaviour change, so the "single-name cases are byte-identical" sentence
+    above is not strictly true — reachable by pulling two same-named hooks and
+    later deleting the first. Harmless in effect (the slug still matches the
+    name), and the accepted consequence of the `is_stable_slug` predicate that
+    fixes convergence.
   - One object renamed onto a name a *stable* object already owns: previously
     skipped **permanently** — `doctor` would never realign it, so the slug stayed
     mismatched forever — now suffixed (`<taken>-2`). This is the more consistent
