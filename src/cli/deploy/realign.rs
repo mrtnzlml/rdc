@@ -225,13 +225,50 @@ fn detect_flat_kind(
     let Some(by_slug) = lockfile.objects.get(kind) else {
         return;
     };
+
+    // Two passes, and the split is load-bearing.
+    //
+    // Pass 1 reserves the slug of every object whose name ALREADY matches it.
+    // Doing this in one pass — seeding the used-set with every lockfile slug up
+    // front — would find a stable object's own slug in the set and propose `-2`
+    // for it, inventing a rename where none is due.
+    //
+    // Pass 2 then assigns each remaining object the first free slug for its
+    // name. Two objects whose names slugify alike therefore become `x` and
+    // `x-2` rather than both proposing `x` — which used to leave the first
+    // `move_file` succeeding and the second failing with "destination already
+    // exists", i.e. a half-applied rename plus an error.
+    //
+    // `by_slug` is a BTreeMap, so iteration is slug-sorted and the
+    // lowest-sorting duplicate keeps the bare slug. Deterministic across runs,
+    // and convergent: a second pass over the renamed tree finds every object
+    // stable.
+    let mut names: Vec<(&String, Option<String>)> = Vec::new();
+    let mut reserved: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for slug in by_slug.keys() {
-        let file = dir.join(format!("{slug}.json"));
-        let Some(name) = read_name(&file) else {
-            continue;
-        };
-        let proposed = slugify(&name);
-        if proposed != *slug && !by_slug.contains_key(&proposed) {
+        let name = read_name(&dir.join(format!("{slug}.json")));
+        if let Some(name) = &name {
+            if slugify(name) == *slug {
+                // Stable: keep this slug and take it out of circulation.
+                reserved.insert(slug.clone());
+                names.push((slug, None));
+                continue;
+            }
+        }
+        if name.is_none() {
+            // Unreadable or missing file: nothing to propose, but the slug is
+            // still taken.
+            reserved.insert(slug.clone());
+        }
+        names.push((slug, name));
+    }
+
+    for (slug, name) in names {
+        let Some(name) = name else { continue };
+        let proposed = crate::slug::slugify_unique(&name, &reserved);
+        reserved.insert(proposed.clone());
+        if proposed != *slug {
             out.push(make(slug.clone(), proposed));
         }
     }
@@ -1885,8 +1922,16 @@ mod tests {
         assert!(et_keys.contains(&&"ws1/ap-invoices/rejected".to_string()));
     }
 
+    /// `hook-b` already owns the slug that `hook-a`'s new name would slugify
+    /// to. Before the two-pass rewrite this was a dead end: the guard only
+    /// compared against `by_slug`, saw the target taken, and skipped —
+    /// leaving `hook-a`'s on-disk name permanently mismatched with its slug,
+    /// which a second `doctor` run could never converge on its own. The
+    /// two-pass version treats this the same as any other name collision:
+    /// `hook-b` is stable (its name already matches its slug) so it reserves
+    /// `hook-b` in pass 1, and `hook-a` gets the next free slug in pass 2.
     #[test]
-    fn detect_skips_when_proposed_slug_already_taken() {
+    fn detect_suffixes_when_proposed_slug_collides_with_a_stable_object() {
         use crate::state::ObjectEntry;
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = Paths::for_env(tmp.path(), "dev");
@@ -1896,7 +1941,8 @@ mod tests {
             r#"{"id":1,"name":"Hook B","queues":[]}"#,
         )
         .unwrap();
-        // hook-b already exists in the lockfile (some other hook).
+        // hook-b already exists in the lockfile (some other hook) and its
+        // name already matches its slug, so it is stable.
         std::fs::write(
             paths.hooks_dir().join("hook-b.json"),
             r#"{"id":2,"name":"Hook B","queues":[]}"#,
@@ -1926,9 +1972,13 @@ mod tests {
             },
         );
         let pending = detect(&paths, &lockfile);
-        assert!(
-            pending.is_empty(),
-            "expected no rename (would collide), got {pending:?}"
+        assert_eq!(
+            pending,
+            vec![PendingRename::Hook {
+                old: "hook-a".into(),
+                new: "hook-b-2".into(),
+            }],
+            "expected hook-a suffixed rather than skipped, got {pending:?}"
         );
     }
 
@@ -2574,5 +2624,128 @@ mod tests {
         assert_eq!(orphans.len(), 1, "{orphans:?}");
         assert!(orphans[0].contains("mapping.toml"), "{orphans:?}");
         assert!(orphans[0].contains("hooks/old-hook"), "{orphans:?}");
+    }
+
+    /// A temp env whose `labels/` dir holds one `<slug>.json` per entry, each
+    /// carrying the given `name`.
+    fn flat_fixture(entries: &[(&str, &str)]) -> (tempfile::TempDir, crate::paths::Paths) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = crate::paths::Paths::for_env(tmp.path(), "dev");
+        std::fs::create_dir_all(paths.labels_dir()).unwrap();
+        for (slug, name) in entries {
+            std::fs::write(
+                paths.labels_dir().join(format!("{slug}.json")),
+                serde_json::to_vec(&serde_json::json!({ "name": name })).unwrap(),
+            )
+            .unwrap();
+        }
+        (tmp, paths)
+    }
+
+    /// A lockfile with one entry per slug for `kind`.
+    fn flat_lockfile(kind: &str, slugs: &[&str]) -> Lockfile {
+        let mut lf = Lockfile::default();
+        for (i, slug) in slugs.iter().enumerate() {
+            lf.upsert(
+                kind,
+                slug,
+                crate::state::ObjectEntry {
+                    id: (i as u64) + 1,
+                    modified_at: None,
+                    modified_by: None,
+                    content_hash: None,
+                    secrets_hash: None,
+                },
+            );
+        }
+        lf
+    }
+
+    /// An object whose name already matches its slug must never be proposed for
+    /// a rename. This is what the two-pass structure protects: a single pass
+    /// seeded with every lockfile slug would find this object's own slug in the
+    /// used-set and propose `-2` for it.
+    #[test]
+    fn a_stable_object_is_not_renamed() {
+        let (tmp, paths) = flat_fixture(&[("urgent", "Urgent")]);
+        let lockfile = flat_lockfile("labels", &["urgent"]);
+        let mut out = Vec::new();
+        detect_flat_kind(&lockfile, "labels", paths.labels_dir(), &mut out, |o, n| {
+            PendingRename::Label { old: o, new: n }
+        });
+        assert!(out.is_empty(), "expected no renames, got {out:?}");
+        drop(tmp);
+    }
+
+    /// Two objects whose names slugify to the same slug both rename, suffixed —
+    /// matching what a fresh `pull` produces for duplicate names.
+    #[test]
+    fn two_duplicate_names_both_rename_with_a_suffix() {
+        let (tmp, paths) = flat_fixture(&[("old-a", "New name"), ("old-b", "New name")]);
+        let lockfile = flat_lockfile("labels", &["old-a", "old-b"]);
+        let mut out = Vec::new();
+        detect_flat_kind(&lockfile, "labels", paths.labels_dir(), &mut out, |o, n| {
+            PendingRename::Label { old: o, new: n }
+        });
+
+        let mut pairs: Vec<(String, String)> = out
+            .iter()
+            .map(|r| match r {
+                PendingRename::Label { old, new } => (old.clone(), new.clone()),
+                other => panic!("unexpected variant {other:?}"),
+            })
+            .collect();
+        pairs.sort();
+        // BTreeMap order decides who keeps the bare slug: `old-a` sorts first.
+        assert_eq!(
+            pairs,
+            vec![
+                ("old-a".to_string(), "new-name".to_string()),
+                ("old-b".to_string(), "new-name-2".to_string()),
+            ]
+        );
+        drop(tmp);
+    }
+
+    /// The reservation accumulates, so a third duplicate gets `-3`.
+    #[test]
+    fn three_duplicate_names_get_incrementing_suffixes() {
+        let (tmp, paths) =
+            flat_fixture(&[("old-a", "New name"), ("old-b", "New name"), ("old-c", "New name")]);
+        let lockfile = flat_lockfile("labels", &["old-a", "old-b", "old-c"]);
+        let mut out = Vec::new();
+        detect_flat_kind(&lockfile, "labels", paths.labels_dir(), &mut out, |o, n| {
+            PendingRename::Label { old: o, new: n }
+        });
+        let mut news: Vec<String> = out
+            .iter()
+            .map(|r| match r {
+                PendingRename::Label { new, .. } => new.clone(),
+                other => panic!("unexpected variant {other:?}"),
+            })
+            .collect();
+        news.sort();
+        assert_eq!(news, vec!["new-name", "new-name-2", "new-name-3"]);
+        drop(tmp);
+    }
+
+    /// A proposal must never collide with an EXISTING slug that is staying put —
+    /// the behaviour the original `!by_slug.contains_key` guard provided.
+    #[test]
+    fn a_proposal_does_not_steal_a_stable_objects_slug() {
+        // `keep` is already named "Keep" so it stays; `mover` is renamed to
+        // "Keep" in the UI and must not propose `keep`.
+        let (tmp, paths) = flat_fixture(&[("keep", "Keep"), ("mover", "Keep")]);
+        let lockfile = flat_lockfile("labels", &["keep", "mover"]);
+        let mut out = Vec::new();
+        detect_flat_kind(&lockfile, "labels", paths.labels_dir(), &mut out, |o, n| {
+            PendingRename::Label { old: o, new: n }
+        });
+        for r in &out {
+            if let PendingRename::Label { old, new } = r {
+                assert_ne!(new, "keep", "'{old}' tried to steal a stable slug");
+            }
+        }
+        drop(tmp);
     }
 }
