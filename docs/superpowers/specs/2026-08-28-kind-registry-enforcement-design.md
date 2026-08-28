@@ -258,8 +258,17 @@ same refusal a real run does.
 - No `LOCKFILE_VERSION` bump, no `rdc.toml` key, no CLI flag, no new dependency.
 - `src/kinds.rs` is additive.
 - `detect_flat_kind`'s behaviour changes **only** where two objects' names
-  slugify to the same slug: previously a half-applied rename plus an error, now
-  two renames (`new-name`, `new-name-2`). Single-name cases are byte-identical.
+  slugify to the same slug. Single-name cases are byte-identical. Two sub-cases,
+  both duplicate-name:
+  - Two objects both renamed to the same new name: previously a half-applied
+    rename plus an error, now two renames (`new-name`, `new-name-2`).
+  - One object renamed onto a name a *stable* object already owns: previously
+    skipped **permanently** — `doctor` would never realign it, so the slug stayed
+    mismatched forever — now suffixed (`<taken>-2`). This is the more consistent
+    outcome: it is what a fresh `pull` produces for duplicate names, and it
+    converges, whereas the old skip did not. Found during implementation, where
+    it changed one pre-existing test from `assert!(pending.is_empty())` to an
+    exact `assert_eq!` on the suffixed rename.
 - `migrate --dry-run` gains output it did not previously emit (a refusal where
   it used to print an info line). Any test asserting exact dry-run text must be
   re-checked — the implementation plan calls this out explicitly.
