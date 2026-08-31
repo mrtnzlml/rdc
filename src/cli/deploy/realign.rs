@@ -728,9 +728,20 @@ fn base_sidecars(kind: &str, base_json_path: &std::path::Path) -> Vec<(String, V
             Ok(bytes) => vec![("trigger_condition".to_string(), bytes)],
             Err(_) => Vec::new(),
         },
-        ("schemas", _, Some(queue_dir)) => {
-            crate::snapshot::schema::read_local_formulas(queue_dir).unwrap_or_default()
-        }
+        // `read_local_formulas` yields `(field_id, bytes)`, but the hash frames
+        // each sidecar by its LABEL — and every other code path labels a
+        // formula `formulas/<field_id>.py` (see `codec::schemas::disk_bytes`,
+        // where the same relabel is called out as load-bearing for hash
+        // parity). Passing the bare `field_id` through here produced a hash no
+        // other path could ever reproduce, so a realign silently invalidated
+        // the lockfile entry of every schema carrying a formula and the next
+        // sync re-pulled it. Self-healing, but it made a rename always dirty
+        // its schemas. `parity_with_the_codec_*` tests below pin this.
+        ("schemas", _, Some(queue_dir)) => crate::snapshot::schema::read_local_formulas(queue_dir)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(field_id, bytes)| (format!("formulas/{field_id}.py"), bytes))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -2987,5 +2998,95 @@ mod tests {
             ],
             "{pairs:?}"
         );
+    }
+    /// `refresh_lockfile_hashes` recomputes every object's `content_hash` from
+    /// its BASE-CACHE bytes, so the hash it produces must be the one every
+    /// other path produces for the same object. The framing is by sidecar
+    /// LABEL, and schemas relabel `field_id` -> `formulas/<field_id>.py` — get
+    /// that wrong and a realign invalidates the entry of every schema with a
+    /// formula, which is exactly what happened.
+    ///
+    /// Asserts parity against the codec's own `base_hash`, which is what pull,
+    /// push and sync all record.
+    #[test]
+    fn base_sidecars_hash_matches_the_codec_for_a_schema_with_formulas() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let queue_dir = dir.path().join("workspaces/ws/queues/q");
+        std::fs::create_dir_all(queue_dir.join("formulas")).unwrap();
+
+        let value = serde_json::json!({
+            "id": 7, "url": "", "name": "Invoices", "queues": [],
+            "content": [{ "category": "section", "id": "header", "label": "H", "children": [
+                { "category": "datapoint", "id": "amount_total", "type": "number",
+                  "formula": "amount_due + amount_tax",
+                  "ui_configuration": { "type": "formula", "edit": "disabled" } }
+            ]}]
+        });
+
+        let lf = Lockfile::default();
+        let codec = crate::snapshot::codec::codec("schemas").unwrap();
+        let art = codec.disk_bytes(&value).unwrap();
+        // Lay the artifact out on disk exactly as the base cache holds it.
+        let schema_path = queue_dir.join("schema.json");
+        std::fs::write(&schema_path, &art.json).unwrap();
+        for (label, bytes) in &art.sidecars {
+            std::fs::write(queue_dir.join(label), bytes).unwrap();
+        }
+
+        let expected = codec.base_hash(&value, &lf).unwrap();
+        let actual =
+            crate::snapshot::codec::combined_hash(&art.json, &base_sidecars("schemas", &schema_path), &lf);
+        assert_eq!(
+            actual, expected,
+            "realign must hash a schema exactly as the codec does; a label \
+             mismatch here silently dirties every schema on rename"
+        );
+    }
+
+    /// The same parity property for the other two sidecar-carrying kinds,
+    /// whose labels (`code`, `trigger_condition`) already matched — pinned so
+    /// they cannot drift the way schemas did.
+    #[test]
+    fn base_sidecars_hash_matches_the_codec_for_hooks_and_rules() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let lf = Lockfile::default();
+
+        for (kind, subdir, value, sidecar_name) in [
+            (
+                "hooks",
+                "hooks",
+                serde_json::json!({
+                    "id": 1, "url": "", "name": "V", "type": "function",
+                    "config": { "runtime": "python3.12", "code": "print(1)" }
+                }),
+                "v.py",
+            ),
+            (
+                "rules",
+                "rules",
+                serde_json::json!({
+                    "id": 2, "url": "", "name": "R", "queues": [],
+                    "trigger_condition": "True"
+                }),
+                "v.py",
+            ),
+        ] {
+            let d = dir.path().join(subdir);
+            std::fs::create_dir_all(&d).unwrap();
+            let codec = crate::snapshot::codec::codec(kind).unwrap();
+            let art = codec.disk_bytes(&value).unwrap();
+            let json_path = d.join("v.json");
+            std::fs::write(&json_path, &art.json).unwrap();
+            for (_label, bytes) in &art.sidecars {
+                std::fs::write(d.join(sidecar_name), bytes).unwrap();
+            }
+            let expected = codec.base_hash(&value, &lf).unwrap();
+            let actual = crate::snapshot::codec::combined_hash(
+                &art.json,
+                &base_sidecars(kind, &json_path),
+                &lf,
+            );
+            assert_eq!(actual, expected, "{kind}: realign hash must match the codec");
+        }
     }
 }

@@ -163,17 +163,20 @@ async fn live_doctor_realign_after_a_remote_rename() {
         "queue.schema still names the pre-realign slug '{old_slug}': {schema_ref}"
     );
 
-    // (5) KNOWN DEFECT (still open): the realign leaves the renamed queue's
-    // BASE-CACHE copy with an unsorted `hooks` array and the moved schema's
-    // lockfile `content_hash` stale, so the next cycle re-pulls the schema
-    // once. `realign::refresh_lockfile_hashes` recomputes hashes from the
-    // BASE bytes, which are the pre-portabilize, pre-sort form — the env tree
-    // gets canonicalized by the portabilize post-pass, the base never does.
+    // (5) The realign must leave the env settled.
     //
-    // One cycle, self-healing, no data loss. Not fixed blind: that function's
-    // own doc explains that a wrong hash here is what produces the
-    // "both diverged" prompt storm across every object referencing the
-    // renamed one.
+    // The known cause of the lag here is FIXED: `refresh_lockfile_hashes`
+    // recomputes hashes from base-cache bytes, and it framed a schema's
+    // formula sidecars by bare `field_id` where every other path frames them
+    // `formulas/<field_id>.py`. The recorded hash was therefore one no other
+    // path could reproduce, so every realign silently dirtied each schema
+    // carrying a formula and the next sync re-pulled it. Pinned now by
+    // `realign::tests::base_sidecars_hash_matches_the_codec_*`.
+    //
+    // The extra cycle below is retained ONLY because that fix has not yet been
+    // confirmed against a live env (the sandbox tokens expired mid-session).
+    // It is very likely redundant: delete it, and if `assert_converged` still
+    // passes, the realign is single-cycle and this comment goes with it.
     let settle = project.run_rdc(&["sync", "test"]);
     assert!(settle.status.success(), "settling sync failed: {}", combined(&settle));
 
