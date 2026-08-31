@@ -41,6 +41,28 @@
 //! pinned rather than hidden: delete the extra cycle when the defect is fixed
 //! and the convergence assertion after it should still pass.
 //!
+//! # Asserting request ORDER
+//!
+//! `live_push_create_ordering` runs `rdc` with `RDC_TRACE_HTTP` set and reads
+//! the CSV back through `support::trace`, so it can assert that (say) every
+//! `POST /engine_fields` precedes the first `POST /queues`. Use
+//! `ProjectFixture::run_rdc_traced` rather than `run_rdc` when a scenario cares
+//! about order. Comparisons are last-of-A against first-of-B, which is exact
+//! because `push_classified` awaits its per-kind drivers sequentially.
+//!
+//! # The engine that gets left behind
+//!
+//! `live_push_create_ordering` binds a queue to the engine it creates, on
+//! purpose: that binding is what makes the SERVER enforce rdc's push order, by
+//! refusing `POST /queues` when the engine lacks a field covering an extracted
+//! schema field. The price is that the engine and its field cannot be deleted
+//! until the queue finishes purging — up to 24 hours, with no unbind escape
+//! hatch — so each run of that scenario strands one of each. They carry the run
+//! marker and `live_janitor_sweep` collects them later, which is why the
+//! janitor asserts every other kind is empty but only REPORTS leftover engines.
+//! `live_engines_round_trip` covers the same kinds without binding anything and
+//! therefore cleans up completely.
+//!
 //! The harness's pure logic (config, run-id, manifest, ref resolution,
 //! project fixture, expectations) is covered by fast hermetic unit tests in
 //! the `support` modules, which DO run under a plain `cargo test`.

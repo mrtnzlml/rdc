@@ -194,5 +194,151 @@ async fn live_push_create_ordering() {
     // is real rdc behaviour, not a test bug.
     assert_converged(&project, "test", &prefix, "after creating the whole graph in one sync");
 
+    // -------------------------------------------------------------------------
+    // Deletes: the cascade order, and skip-and-continue against a REAL refusal.
+    // -------------------------------------------------------------------------
+    //
+    // Tombstone THIS RUN'S objects — and only this run's.
+    //
+    // Every path below is prefix-scoped, and that is not tidiness: the `sync`
+    // above pulled the WHOLE sandbox org into this tree (a couple of hundred
+    // objects, including real workspaces, hooks, rules and the org's four real
+    // engines). Removing `envs/test/hooks` wholesale would tombstone all of
+    // them, and the `--allow-deletes` below would then delete real content off
+    // a shared org. Never widen these paths.
+    //
+    // The engine is deliberately left IN the tombstone set even though the
+    // server will refuse it: that refusal is the point of the second assertion
+    // below.
+    for dir in [
+        format!("envs/test/workspaces/{prefix}ws"),
+        format!("envs/test/engines/{prefix}engine"),
+    ] {
+        std::fs::remove_dir_all(project.path().join(&dir))
+            .unwrap_or_else(|e| panic!("removing {dir}: {e}"));
+    }
+    for file in [
+        format!("envs/test/hooks/{prefix}validator.json"),
+        format!("envs/test/hooks/{prefix}validator.py"),
+        format!("envs/test/hooks/{prefix}post-validator.json"),
+        format!("envs/test/hooks/{prefix}post-validator.py"),
+        format!("envs/test/rules/{prefix}totals.json"),
+        format!("envs/test/labels/{prefix}priority.json"),
+        format!("envs/test/saved-views/{prefix}view.json"),
+    ] {
+        std::fs::remove_file(project.path().join(&file))
+            .unwrap_or_else(|e| panic!("removing {file}: {e}"));
+    }
+
+    // Belt and braces: nothing outside this run may have been tombstoned. A
+    // widened path above would show up here as a lockfile entry with no file,
+    // BEFORE `--allow-deletes` turns it into a DELETE.
+    // The check is a substring test: `TreeSnapshot::capture` keeps files whose
+    // PATH contains the slug, so a lockfile entry with no matching file means
+    // its file is gone — i.e. it has become a tombstone.
+    //
+    // Only kinds whose slug appears VERBATIM in their on-disk path can be
+    // checked this way. Two are skipped because their slugs are compound and
+    // the path interleaves extra segments, so the substring test would report
+    // every one of them as missing:
+    //
+    //   email_templates  slug `<ws>/<queue>/<tpl>`
+    //                    path `workspaces/<ws>/queues/<queue>/email-templates/<tpl>.json`
+    //   engine_fields    slug `<engine>/<field>`
+    //                    path `engines/<engine>/fields/<field>.json`
+    //
+    // Skipping them costs nothing: both live UNDER a parent this loop does
+    // check (a workspace, an engine), so the realistic widening — removing a
+    // whole top-level directory — is still caught via the parent.
+    // `organization`, `mdh_*` and `workflow_*` are skipped for the same reason.
+    let lf_before_del = load_lockfile(project.path(), "test").expect("lockfile before deletes");
+    for (kind, entries) in &lf_before_del.objects {
+        if matches!(kind.as_str(), "email_templates" | "engine_fields" | "organization")
+            || kind.starts_with("mdh")
+            || kind.starts_with("workflow")
+        {
+            continue;
+        }
+        for slug in entries.keys() {
+            if slug.starts_with("rdc-it-") {
+                continue;
+            }
+            let tracked =
+                crate::support::converge::TreeSnapshot::capture(project.path(), "test", slug);
+            assert!(
+                !tracked.is_empty(),
+                "about to delete something this run does not own: {kind}/{slug} has a lockfile entry but no file on disk — a tombstone path was widened"
+            );
+        }
+    }
+
+    let (del, dtr) = project.run_rdc_traced(&["sync", "test", "--allow-deletes"]);
+    assert!(del.status.success(), "the delete pass failed: {}", combined(&del));
+
+    // Children before parents. `saved_views` is NOT asserted: nothing
+    // references a saved view, so `push::deletes` documents its position among
+    // the leaves as free, and pinning it would freeze an arbitrary choice.
+    for child in ["rules", "hooks", "email_templates", "inboxes"] {
+        dtr.assert_before(
+            ("DELETE", child),
+            ("DELETE", "queues"),
+            "a queue's children must be deleted before the queue",
+        );
+    }
+    dtr.assert_before(
+        ("DELETE", "queues"),
+        ("DELETE", "schemas"),
+        "a schema cannot be deleted while a queue references it (409 conflict_referenced)",
+    );
+    dtr.assert_before(
+        ("DELETE", "schemas"),
+        ("DELETE", "workspaces"),
+        "children before parents",
+    );
+
+    // Skip-and-continue, against a refusal that is REAL and TEMPORARY.
+    //
+    // `run_deletes` is documented as never propagating a per-object DELETE
+    // failure: it warns, tallies `DeleteCounts::failed`, LEAVES THE LOCKFILE
+    // ENTRY so a later sync retries, and keeps going so every sibling and
+    // parent still gets deleted. The suite's only other coverage of that
+    // contract is a unique-typed email template, which is refused PERMANENTLY;
+    // a bound engine is refused only until its queue finishes purging, which is
+    // the case that actually needs the lockfile entry kept.
+    //
+    // This is not a defect pin. rdc's cascade puts engines before queues, which
+    // looks wrong, but no ordering could help: the server's rule is "after the
+    // queue is deleted, up to 24 hours", and `DELETE /queues` only returns `202
+    // deletion_requested`.
+    let engine_slug = format!("{prefix}engine");
+    let stderr = combined(&del);
+    assert!(
+        stderr.contains(&engine_slug) && stderr.contains("delete failed (skipped)"),
+        "the refused engine delete must be warned about by slug, not swallowed:\n{stderr}"
+    );
+
+    let lf_after = load_lockfile(project.path(), "test").expect("lockfile after deletes");
+    assert!(
+        lf_after.objects.get("engines").is_some_and(|m| m.contains_key(&engine_slug)),
+        "a refused delete must KEEP its lockfile entry so a later sync retries it"
+    );
+
+    // Everything that could go, went.
+    assert!(
+        client.find_listed_value("queue", queue_id).await.expect("list queues").is_none()
+            || client
+                .get_value("queue", queue_id)
+                .await
+                .map(|v| v["status"] == "deletion_requested")
+                .unwrap_or(false),
+        "the queue must be deleted or draining"
+    );
+    for (kind, id) in [("hook", validator_id), ("hook", post_id), ("rule", rule_id), ("label", label_id)] {
+        assert!(
+            client.find_listed_value(kind, id).await.expect("list").is_none(),
+            "{kind} {id} must be gone after the delete pass"
+        );
+    }
+
     drop(teardown);
 }
