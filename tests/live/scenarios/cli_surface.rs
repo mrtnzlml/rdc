@@ -173,13 +173,6 @@ async fn live_doctor_realign_after_a_remote_rename() {
     // carrying a formula and the next sync re-pulled it. Pinned now by
     // `realign::tests::base_sidecars_hash_matches_the_codec_*`.
     //
-    // The extra cycle below is retained ONLY because that fix has not yet been
-    // confirmed against a live env (the sandbox tokens expired mid-session).
-    // It is very likely redundant: delete it, and if `assert_converged` still
-    // passes, the realign is single-cycle and this comment goes with it.
-    let settle = project.run_rdc(&["sync", "test"]);
-    assert!(settle.status.success(), "settling sync failed: {}", combined(&settle));
-
     // The realign moved the base cache and refreshed the lockfile hashes
     // correctly — otherwise the next cycle re-pulls or re-pushes forever.
     assert_converged(&project, "test", &prefix, "after doctor realigned the renamed queue");
