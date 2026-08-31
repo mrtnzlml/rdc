@@ -174,8 +174,24 @@ async fn live_push_create_ordering() {
         "the rule action's label ref must have resolved to the created label; got {labels:?}"
     );
 
-    // A hand-written snapshot must deploy in ONE cycle — no second pass to
-    // settle back-refs the server filled in behind the creates.
+    // A hand-written snapshot must deploy in ONE cycle — GIVEN that every
+    // object the server auto-provisions behind a create is itself declared
+    // in the snapshot. Creating this queue makes Rossum synchronously spawn
+    // five system-managed default email templates (see the fixture files
+    // under `email-templates/` named `annotation-status-change-*`,
+    // `default-rejection-template` and `email-with-no-processable-attachments`
+    // — LOAD-BEARING, not sample noise: see the comment in
+    // `support/snapshot.rs` next to the fixture-file-count test). Because
+    // `src/cli/sync/mod.rs` lists the remote catalog ONCE, before pushing,
+    // rdc never discovers those five on its own within this cycle — it only
+    // settles them because `push/email_templates.rs`'s adopt-or-create path
+    // (`pick_adoption_id`) re-lists email templates mid-push, AFTER the
+    // queue already exists, and finds a local file to match each one by
+    // name (the three `custom`-typed ones) or by `type` (the other two) and
+    // PATCHes our content into them then and there. Omit any one of the
+    // five from the fixture and this assertion still fails — correctly:
+    // that object would then take a genuine second cycle to surface, which
+    // is real rdc behaviour, not a test bug.
     assert_converged(&project, "test", &prefix, "after creating the whole graph in one sync");
 
     drop(teardown);

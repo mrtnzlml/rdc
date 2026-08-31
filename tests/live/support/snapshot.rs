@@ -81,6 +81,21 @@ mod tests {
     /// The fixture must stay parseable and fully substituted — a stray
     /// placeholder would reach the API verbatim and fail with something far
     /// less legible than this assertion.
+    ///
+    /// Five of the 19 files are NOT sample noise, even though nothing else
+    /// in the fixture references them: the queue's `email-templates/`
+    /// directory carries `annotation-status-change-{confirmed,exported,
+    /// received}.json`, `default-rejection-template.json` and
+    /// `email-with-no-processable-attachments.json`, matching the exact
+    /// names/types Rossum synchronously auto-provisions for ANY newly
+    /// created queue. Without them, `scenarios::ordering::
+    /// live_push_create_ordering`'s final `assert_converged` fails — not
+    /// because of a test bug, but because those five server-provisioned
+    /// objects would then take a genuine second sync cycle to surface
+    /// (rdc lists its remote catalog once, before pushing, and only settles
+    /// them same-cycle via `push/email_templates.rs`'s adopt-or-create path,
+    /// which needs a local file to match against). Do not prune these as
+    /// redundant.
     #[test]
     fn every_fixture_file_parses_after_substitution() {
         let mut seen = 0;
