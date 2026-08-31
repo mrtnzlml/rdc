@@ -1,0 +1,10 @@
+{
+  "id": 0,
+  "url": "",
+  "name": "Email with no processable attachments",
+  "queue": "rdc://queues/rdc-it-{{RUN}}-invoices",
+  "type": "email_with_no_processable_attachments",
+  "subject": "No processable documents",
+  "message": "<p>No processable documents were found in this email.</p>",
+  "automate": false
+}

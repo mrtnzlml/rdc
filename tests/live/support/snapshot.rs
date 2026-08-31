@@ -98,7 +98,7 @@ mod tests {
             }
             seen += 1;
         });
-        assert_eq!(seen, 14, "fixture file count changed — update this test deliberately");
+        assert_eq!(seen, 19, "fixture file count changed — update this test deliberately");
     }
 
     /// The queue MUST bind the engine. Without that binding the server never

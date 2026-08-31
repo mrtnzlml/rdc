@@ -1,0 +1,10 @@
+{
+  "id": 0,
+  "url": "",
+  "name": "Default rejection template",
+  "queue": "rdc://queues/rdc-it-{{RUN}}-invoices",
+  "type": "rejection_default",
+  "subject": "Document rejected",
+  "message": "<p>Your document has been rejected.</p>",
+  "automate": false
+}

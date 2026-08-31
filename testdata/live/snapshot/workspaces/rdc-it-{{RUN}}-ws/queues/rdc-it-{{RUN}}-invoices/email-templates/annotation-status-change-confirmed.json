@@ -1,0 +1,10 @@
+{
+  "id": 0,
+  "url": "",
+  "name": "Annotation status change - confirmed",
+  "queue": "rdc://queues/rdc-it-{{RUN}}-invoices",
+  "type": "custom",
+  "subject": "Document confirmed",
+  "message": "<p>Your document has been confirmed.</p>",
+  "automate": false
+}
