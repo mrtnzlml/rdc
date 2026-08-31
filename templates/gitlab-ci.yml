@@ -45,7 +45,7 @@ variables:
   # release. Think before floating: the deploy job below runs
   # `rdc sync --allow-deletes --yes`, so a version bump changes what an
   # unattended, destructive sync does.
-  RDC_VERSION: "v0.8.0"
+  RDC_VERSION: "v0.9.0"
   RDC_REPO: "mrtnzlml/rdc"
   # Matched against the END of the asset name, because release assets carry the
   # version (rdc-<version>-x86_64-unknown-linux-gnu.tar.gz). A suffix also
