@@ -13,3 +13,4 @@ pub mod assert_remote;
 pub mod expected;
 pub mod staticdir;
 pub mod mdh;
+pub mod trace;
