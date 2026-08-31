@@ -1,11 +1,14 @@
 use crate::support::config::{EnvCreds, LiveConfig};
+use crate::support::trace::Trace;
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Output;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tempfile::TempDir;
 
 pub struct ProjectFixture {
     dir: TempDir,
+    runs: AtomicU32,
 }
 
 impl ProjectFixture {
@@ -49,7 +52,7 @@ impl ProjectFixture {
             )
             .with_context(|| format!("writing secrets for {env}"))?;
         }
-        Ok(ProjectFixture { dir })
+        Ok(ProjectFixture { dir, runs: AtomicU32::new(0) })
     }
 
     #[allow(dead_code)]
@@ -65,6 +68,30 @@ impl ProjectFixture {
             .args(args)
             .output()
             .expect("spawning rdc")
+    }
+
+    /// `run_rdc`, with `RDC_TRACE_HTTP` pointed at a fresh file so the caller
+    /// can assert the ORDER of the requests this invocation made.
+    ///
+    /// The trace lands at the PROJECT ROOT, deliberately outside every root
+    /// `converge::tracked_roots` captures (`envs/<env>`, `.rdc/state/<env>.base`,
+    /// `.rdc/conflicts/<env>`), so tracing a run can never itself perturb a
+    /// convergence assertion. One file per invocation, because the sink in
+    /// `api::retry` is a process-wide `OnceLock` initialised from the
+    /// environment on the first request — a second `rdc` process needs a second
+    /// path, and appending both runs to one file would make indices meaningless.
+    #[allow(dead_code)]
+    pub fn run_rdc_traced(&self, args: &[&str]) -> (Output, Trace) {
+        let n = self.runs.fetch_add(1, Ordering::SeqCst);
+        let trace_path = self.dir.path().join(format!(".rdc-trace-{n}.csv"));
+        let out = assert_cmd::Command::cargo_bin("rdc")
+            .unwrap()
+            .current_dir(self.dir.path())
+            .env("RDC_TRACE_HTTP", &trace_path)
+            .args(args)
+            .output()
+            .expect("spawning rdc");
+        (out, Trace::read(&trace_path))
     }
 
     #[allow(dead_code)]
@@ -131,5 +158,22 @@ mod tests {
         assert!(toml.contains("org_id = 222"), "{toml}");
         assert_eq!(p.read_json("secrets/test.secrets.json")["api_token"], "tok-a");
         assert_eq!(p.read_json("secrets/prod.secrets.json")["api_token"], "tok-b");
+    }
+
+    /// Hermetic: `--help` makes no HTTP request, so the trace is empty — which
+    /// is exactly what proves the env-var plumbing does not break an ordinary
+    /// invocation. The real exercise is in the live ordering scenario.
+    #[test]
+    fn run_rdc_traced_returns_output_and_an_empty_trace_for_a_networkless_command() {
+        let cfg = LiveConfig {
+            api_base: "https://example.rossum.app/api/v1".into(),
+            org_id: 999,
+            token: "tok".into(),
+            target: None,
+        };
+        let p = ProjectFixture::init(&cfg, &["test"]).unwrap();
+        let (out, trace) = p.run_rdc_traced(&["--help"]);
+        assert!(out.status.success(), "rdc --help failed");
+        assert!(trace.is_empty(), "a networkless command must trace nothing: {trace:?}");
     }
 }
