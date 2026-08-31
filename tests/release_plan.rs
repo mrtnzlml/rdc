@@ -11,21 +11,29 @@ use tempfile::TempDir;
 
 const SCRIPT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/.github/scripts/release-plan.sh");
 
-/// Runs the script over the given changed-paths and commit-log text.
+/// Runs the script over the given changed-paths and commit-log text, the way
+/// the week's first tick and every `workflow_dispatch` call it: no age, so no
+/// cooldown.
 /// Returns `(exited zero, stdout)`.
 fn plan(version: &str, paths: &str, log: &str) -> (bool, String) {
+    plan_aged(version, paths, log, None)
+}
+
+/// As `plan`, but passing the fourth argument a retry tick supplies: whole
+/// hours since the previous release. `Some("")` is the empty string the
+/// workflow passes when it has no age to report.
+fn plan_aged(version: &str, paths: &str, log: &str, hours: Option<&str>) -> (bool, String) {
     let dir = TempDir::new().unwrap();
     let paths_file = dir.path().join("paths");
     let log_file = dir.path().join("log");
     fs::write(&paths_file, paths).unwrap();
     fs::write(&log_file, log).unwrap();
-    let out = Command::new("sh")
-        .arg(SCRIPT)
-        .arg(version)
-        .arg(&paths_file)
-        .arg(&log_file)
-        .output()
-        .expect("sh is available");
+    let mut cmd = Command::new("sh");
+    cmd.arg(SCRIPT).arg(version).arg(&paths_file).arg(&log_file);
+    if let Some(hours) = hours {
+        cmd.arg(hours);
+    }
+    let out = cmd.output().expect("sh is available");
     (out.status.success(), String::from_utf8(out.stdout).unwrap())
 }
 
@@ -37,14 +45,14 @@ fn a_docs_only_week_releases_nothing() {
         "docs: explain the thing\ntest: cover the thing\n",
     );
     assert!(ok);
-    assert_eq!(out, "release=false\n");
+    assert_eq!(out, "release=false\nreason=nothing-shippable\n");
 }
 
 #[test]
 fn an_empty_range_releases_nothing() {
     let (ok, out) = plan("0.7.0", "", "");
     assert!(ok);
-    assert_eq!(out, "release=false\n");
+    assert_eq!(out, "release=false\nreason=nothing-shippable\n");
 }
 
 #[test]
@@ -118,7 +126,7 @@ fn a_nested_cargo_manifest_does_not_trip_the_gate() {
         "test: add a fixture\n",
     );
     assert!(ok);
-    assert_eq!(out, "release=false\n");
+    assert_eq!(out, "release=false\nreason=nothing-shippable\n");
 }
 
 #[test]
@@ -132,5 +140,94 @@ fn a_minor_bump_resets_the_patch_component() {
 fn a_non_semver_current_version_is_an_error() {
     let (ok, out) = plan("0.7", "src/lib.rs\n", "feat: x\n");
     assert!(!ok, "an unparseable version must fail loudly, not guess");
+    assert_eq!(out, "");
+}
+
+// ---- Retry-tick cooldown ------------------------------------------------
+//
+// weekly-release.yaml fires three times a Monday because GitHub documents that
+// a scheduled run may be delayed or dropped -- which is exactly what happened
+// to the 2026-08-31 06:17 UTC tick. Only the two later ticks pass an age, and
+// the cooldown is what stops one of them cutting a second release on top of the
+// first tick's.
+
+#[test]
+fn a_retry_tick_stays_quiet_once_the_week_has_released() {
+    // The 06:17 tick released four hours ago and shippable commits have landed
+    // since, so the ship gate alone would say yes -- and a second release the
+    // same Monday is exactly what the retries must never cause.
+    let (ok, out) = plan_aged("0.8.0", "src/cli/sync.rs\n", "feat: a flag\n", Some("4"));
+    assert!(ok, "a suppressed retry is a quiet success, not a red run");
+    assert_eq!(out, "release=false\nreason=cooldown\n");
+}
+
+#[test]
+fn a_retry_tick_releases_when_the_first_tick_never_ran() {
+    // The whole point of the retries: a week-old tag means the 06:17 tick was
+    // dropped, and this run has to do its job.
+    let (ok, out) = plan_aged("0.8.0", "src/cli/sync.rs\n", "feat: a flag\n", Some("168"));
+    assert!(ok);
+    assert_eq!(out, "release=true\nbump=minor\nversion=0.9.0\ntag=v0.9.0\n");
+}
+
+#[test]
+fn a_hand_cut_release_days_earlier_does_not_suppress_a_retry() {
+    // The case a week-wide cooldown would have got wrong. v0.8.0 was cut by
+    // hand on a Thursday; the Monday tick four days later was dropped, and the
+    // retry standing in for it still has a release to make.
+    let (ok, out) = plan_aged("0.8.0", "src/lib.rs\n", "fix: a fix\n", Some("96"));
+    assert!(ok);
+    assert_eq!(out, "release=true\nbump=patch\nversion=0.8.1\ntag=v0.8.1\n");
+}
+
+#[test]
+fn the_cooldown_clears_at_a_day() {
+    // A day, not a week: the three ticks are within eight hours of each other,
+    // so anything a day old belongs to an earlier release, not to this week's.
+    let (ok, out) = plan_aged("0.8.0", "src/lib.rs\n", "fix: a fix\n", Some("24"));
+    assert!(ok);
+    assert_eq!(out, "release=true\nbump=patch\nversion=0.8.1\ntag=v0.8.1\n");
+
+    // Eight hours is the widest gap between the first tick and a retry, so it
+    // has to still be inside the window.
+    let (ok, out) = plan_aged("0.8.0", "src/lib.rs\n", "fix: a fix\n", Some("8"));
+    assert!(ok);
+    assert_eq!(out, "release=false\nreason=cooldown\n");
+}
+
+#[test]
+fn an_empty_age_applies_no_cooldown() {
+    // What the workflow passes on the week's first tick and on every
+    // workflow_dispatch: the argument is always present, and empty means the
+    // gate must behave exactly as it did before the retries existed.
+    let (ok, out) = plan_aged("0.8.0", "src/lib.rs\n", "fix: a fix\n", Some(""));
+    assert!(ok);
+    assert_eq!(out, "release=true\nbump=patch\nversion=0.8.1\ntag=v0.8.1\n");
+}
+
+#[test]
+fn the_cooldown_outranks_the_ship_gate() {
+    // Both reasons are true during a cooldown -- the retry reports the one that
+    // says the schedule worked, so a suppressed retry is never mistaken for a
+    // week in which nothing shippable landed.
+    let (ok, out) = plan_aged("0.8.0", "README.md\n", "docs: a doc\n", Some("4"));
+    assert!(ok);
+    assert_eq!(out, "release=false\nreason=cooldown\n");
+}
+
+#[test]
+fn a_non_numeric_age_is_an_error() {
+    // Same philosophy as the version check: refuse to guess. A `date` that
+    // returned junk must not silently read as "no cooldown" and double-release.
+    let (ok, out) = plan_aged("0.8.0", "src/lib.rs\n", "fix: a fix\n", Some("soon"));
+    assert!(!ok, "an unparseable age must fail loudly, not guess");
+    assert_eq!(out, "");
+}
+
+#[test]
+fn a_negative_age_is_an_error() {
+    // A clock skew that puts the tag in the future must be loud, not a release.
+    let (ok, out) = plan_aged("0.8.0", "src/lib.rs\n", "fix: a fix\n", Some("-1"));
+    assert!(!ok);
     assert_eq!(out, "");
 }

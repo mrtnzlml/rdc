@@ -66,7 +66,20 @@ Project-specific instructions for working in this repo.
   `Cargo.lock`; the level is derived from commit types (any `feat`, any
   `type!:`, or `BREAKING CHANGE:` → minor, else patch), which is what keeps the
   template's documented `vX.Y` series pin — *"picks up fixes, never a new
-  feature"* — honest. The decision and the bump are plain `sh` scripts in
+  feature"* — honest.
+- It fires **three times** that Monday (06:17, 10:17, 14:17 UTC), because
+  GitHub's docs say a scheduled run "can be delayed" and that "some queued jobs
+  may be dropped" — and that is not theoretical: the very first tick,
+  2026-08-31 06:17 UTC, never arrived, with no run, no red X and no
+  notification. The later two are **retries**: only they pass `release-plan.sh`
+  a fourth argument, the previous tag's age **in hours**, and under 24 it
+  answers `release=false` / `reason=cooldown` and the retry goes quiet. So a
+  dropped tick still ships, a delivered one is never released twice, and the
+  06:17 tick's behaviour is unchanged. A day rather than a week on purpose: the
+  ticks are within eight hours of each other, and a week-wide window would
+  suppress a legitimate retry for days after any hand-cut release. Adding a
+  cron means adding it to the retry set — a tick that is *not* `17 6 * * 1`
+  inherits the cooldown, which is the safe default. The decision and the bump are plain `sh` scripts in
   `.github/scripts/`, unit-tested by `tests/release_plan.rs` and
   `tests/bump_version.rs`. It calls `release.yaml` through `workflow_call`
   rather than pushing a tag, because a tag pushed with the default

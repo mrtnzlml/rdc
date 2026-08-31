@@ -19,6 +19,16 @@ on:
     # that scheduled runs are delayed or dropped under load, and that "high load
     # times include the start of every hour".
     - cron: "17 6 * * 1"
+    # Two retries for the same Monday. Off-the-hour was not enough: the very
+    # first scheduled tick, 2026-08-31 06:17 UTC, never arrived -- no run, no
+    # red X, no notification, and a week with no release. GitHub's own docs say
+    # a scheduled run "can be delayed" and that "some queued jobs may be
+    # dropped", so a schedule with exactly one tick a week has no tolerance for
+    # the platform's documented behaviour. A retry that finds the week already
+    # released is a no-op: only these later ticks carry the cooldown in the gate
+    # below, so the 06:17 tick releases on exactly the terms it always has.
+    - cron: "17 10 * * 1"
+    - cron: "17 14 * * 1"
   # So a release can be forced without waiting for Monday.
   workflow_dispatch:
 
@@ -50,6 +60,15 @@ jobs:
 
       - name: Decide whether to release
         id: plan
+        env:
+          # Which of the three crons fired, verbatim as written above. Empty on
+          # workflow_dispatch. Comparing against the first tick is what keeps
+          # the primary schedule's behaviour identical to before the retries
+          # existed -- and it fails safe: if this literal ever stops matching,
+          # the 06:17 tick is merely treated as a retry, and a week-old tag
+          # clears the cooldown anyway.
+          FIRED: ${{ github.event.schedule }}
+          PRIMARY_TICK: "17 6 * * 1"
         run: |
           set -euo pipefail
           prev=$(git describe --tags --abbrev=0 --match 'v*')
@@ -64,8 +83,20 @@ jobs:
           current=$(awk '/^version = "/ { gsub(/"/, "", $3); print $3; exit }' Cargo.toml)
           echo "Current version: $current"
 
+          # Whole hours since the previous release, but only on a retry tick.
+          # Left empty on the first tick and on workflow_dispatch, and the gate
+          # then applies no cooldown at all. The release tags are annotated, so
+          # creatordate is when the release was cut rather than when the commit
+          # underneath it was authored.
+          hours=
+          if [ -n "$FIRED" ] && [ "$FIRED" != "$PRIMARY_TICK" ]; then
+            cut_at=$(git tag -l --format='%(creatordate:unix)' "$prev")
+            hours=$(( ( $(date -u +%s) - cut_at ) / 3600 ))
+            echo "Retry tick ('$FIRED'): $prev was cut $hours hour(s) ago"
+          fi
+
           .github/scripts/release-plan.sh \
-            "$current" "$RUNNER_TEMP/changed-paths" "$RUNNER_TEMP/log" \
+            "$current" "$RUNNER_TEMP/changed-paths" "$RUNNER_TEMP/log" "$hours" \
             | tee -a "$GITHUB_OUTPUT"
 
           echo "COMMIT_COUNT=$count" >> "$GITHUB_ENV"
@@ -73,8 +104,17 @@ jobs:
       - name: Nothing to release
         if: steps.plan.outputs.release != 'true'
         # A quiet week is a success, not a failure. It must not page anyone.
+        # Which kind of quiet it was still has to be legible, though: a retry
+        # tick going quiet means the schedule worked, and reporting that as
+        # "nothing shippable" would hide the difference.
+        env:
+          REASON: ${{ steps.plan.outputs.reason }}
         run: |
-          echo "::notice::${COMMIT_COUNT} commit(s) since the last tag, none of them shippable. No release this week."
+          if [ "$REASON" = cooldown ]; then
+            echo "::notice::This week's release has already gone out. Retry tick, nothing to do."
+          else
+            echo "::notice::${COMMIT_COUNT} commit(s) since the last tag, none of them shippable. No release this week."
+          fi
 
       # ---- Everything below runs only when there is something to ship. ----
 
