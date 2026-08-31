@@ -101,6 +101,21 @@ impl ProjectFixture {
         serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parsing {rel}: {e}"))
     }
 
+    /// Write pretty JSON with a trailing newline — the exact byte shape rdc's
+    /// codec writes, so a hand-authored file does not read as drift the moment
+    /// it lands.
+    #[allow(dead_code)]
+    pub fn write_json(&self, rel: &str, v: &serde_json::Value) {
+        let path = self.dir.path().join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .unwrap_or_else(|e| panic!("creating {}: {e}", parent.display()));
+        }
+        let mut bytes = serde_json::to_vec_pretty(v).expect("serialising json");
+        bytes.push(b'\n');
+        std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("writing {rel}: {e}"));
+    }
+
     #[allow(dead_code)]
     pub fn read_to_string(&self, rel: &str) -> Option<String> {
         std::fs::read_to_string(self.dir.path().join(rel)).ok()

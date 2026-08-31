@@ -211,6 +211,20 @@ impl LiveClient {
                 .find_listed_value("queue", id)
                 .await?
                 .ok_or_else(|| anyhow!("get_value: queue {id} not found")),
+            // "engine", "engine_field" and "rule" have no GET-by-id endpoint
+            // on `RossumClient` either; same list-based fallback as "queue".
+            "engine" => self
+                .find_listed_value("engine", id)
+                .await?
+                .ok_or_else(|| anyhow!("get_value: engine {id} not found")),
+            "engine_field" => self
+                .find_listed_value("engine_field", id)
+                .await?
+                .ok_or_else(|| anyhow!("get_value: engine_field {id} not found")),
+            "rule" => self
+                .find_listed_value("rule", id)
+                .await?
+                .ok_or_else(|| anyhow!("get_value: rule {id} not found")),
             other => Err(anyhow!("get_value: unsupported kind '{other}'")),
         }
     }
@@ -307,6 +321,20 @@ impl LiveClient {
             "saved_view" => self
                 .inner
                 .list_saved_views(None)
+                .await?
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<Result<_, _>>()?,
+            "engine" => self
+                .inner
+                .list_engines(None)
+                .await?
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<Result<_, _>>()?,
+            "engine_field" => self
+                .inner
+                .list_engine_fields(None)
                 .await?
                 .into_iter()
                 .map(serde_json::to_value)
