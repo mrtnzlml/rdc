@@ -1564,21 +1564,41 @@ with the delete phase:
     // Belt and braces: nothing outside this run may have been tombstoned. A
     // widened path above would show up here as a lockfile entry with no file,
     // BEFORE `--allow-deletes` turns it into a DELETE.
+    // The check is a substring test: `TreeSnapshot::capture` keeps files whose
+    // PATH contains the slug, so a lockfile entry with no matching file means
+    // its file is gone — i.e. it has become a tombstone.
+    //
+    // Only kinds whose slug appears VERBATIM in their on-disk path can be
+    // checked this way. Two are skipped because their slugs are compound and
+    // the path interleaves extra segments, so the substring test would report
+    // every one of them as missing:
+    //
+    //   email_templates  slug `<ws>/<queue>/<tpl>`
+    //                    path `workspaces/<ws>/queues/<queue>/email-templates/<tpl>.json`
+    //   engine_fields    slug `<engine>/<field>`
+    //                    path `engines/<engine>/fields/<field>.json`
+    //
+    // Skipping them costs nothing: both live UNDER a parent this loop does
+    // check (a workspace, an engine), so the realistic widening — removing a
+    // whole top-level directory — is still caught via the parent.
+    // `organization`, `mdh_*` and `workflow_*` are skipped for the same reason.
     let lf_before_del = load_lockfile(project.path(), "test").expect("lockfile before deletes");
     for (kind, entries) in &lf_before_del.objects {
+        if matches!(kind.as_str(), "email_templates" | "engine_fields" | "organization")
+            || kind.starts_with("mdh")
+            || kind.starts_with("workflow")
+        {
+            continue;
+        }
         for slug in entries.keys() {
-            if slug.starts_with("rdc-it-") || slug.contains("/rdc-it-") {
+            if slug.starts_with("rdc-it-") {
                 continue;
             }
-            let tracked = crate::support::converge::TreeSnapshot::capture(
-                project.path(),
-                "test",
-                slug,
-            );
+            let tracked =
+                crate::support::converge::TreeSnapshot::capture(project.path(), "test", slug);
             assert!(
-                !tracked.is_empty() || kind == "organization" || kind.starts_with("mdh")
-                    || kind.starts_with("workflow"),
-                "about to delete something this run does not own: {kind}/{slug} has a                  lockfile entry but no file on disk — a tombstone path was widened"
+                !tracked.is_empty(),
+                "about to delete something this run does not own: {kind}/{slug} has a lockfile entry but no file on disk — a tombstone path was widened"
             );
         }
     }
