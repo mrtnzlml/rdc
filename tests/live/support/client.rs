@@ -90,6 +90,14 @@ impl LiveClient {
                 let v = self.inner.create_saved_view(body, None).await?;
                 (v.id, v.url)
             }
+            "engine" => {
+                let e = self.inner.create_engine(body, None).await?;
+                (e.id, e.url)
+            }
+            "engine_field" => {
+                let f = self.inner.create_engine_field(body, None).await?;
+                (f.id, f.url)
+            }
             other => return Err(anyhow!("create: unsupported kind '{other}'")),
         };
         Ok((id, url))
@@ -109,6 +117,8 @@ impl LiveClient {
             // saved views through the generic `delete_path`, and this test
             // client does the same rather than adding a one-off wrapper.
             "saved_view" => self.inner.delete_path(&format!("/saved_views/{id}"), None).await,
+            "engine" => self.inner.delete_engine(id, None).await,
+            "engine_field" => self.inner.delete_engine_field(id, None).await,
             other => Err(anyhow!("delete: unsupported kind '{other}'")),
         }
     }
@@ -134,6 +144,12 @@ impl LiveClient {
             // one (rdc itself never manages the private one, so it never
             // reaches the lockfile-driven cleanup any other kind gets).
             "saved_view" => to_values(self.inner.list_saved_views(None).await?)?,
+            "engine" => to_values(self.inner.list_engines(None).await?)?,
+            // Engine field `name` must equal the schema datapoint id it covers.
+            // Hyphens are legal there (verified against the API), so a field
+            // this harness creates carries the run marker in its own name and
+            // is prefix-matchable exactly like every other kind.
+            "engine_field" => to_values(self.inner.list_engine_fields(None).await?)?,
             other => return Err(anyhow!("list: unsupported kind '{other}'")),
         };
         let mut out = Vec::new();

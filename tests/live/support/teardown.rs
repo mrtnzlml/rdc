@@ -48,6 +48,35 @@ pub async fn teardown_by_prefix(client: &LiveClient, prefix: &str) -> Result<()>
         }
     }
 
+    // Engine fields, then engines — after queues and schemas, and the two
+    // halves are here for different reasons.
+    //
+    // The FIELD sweep genuinely benefits from the position: `DELETE
+    // /engine_fields/<id>` answers `409 conflict_referenced` ("Cannot delete
+    // engine field used in a schema") while the schema that its name covers is
+    // still around, and that clears once the schema above is gone.
+    //
+    // The ENGINE sweep cannot be helped by any ordering. An engine that was
+    // ever bound to a queue is refused with `400
+    // engine_attached_to_active_queues` while the queue lives, and then with
+    // `400 engine_attached_to_queues_waiting_for_deletion` — "after up to 24
+    // hours" — for as long as the queue is draining. `DELETE /queues` returns
+    // `202 deletion_requested`, so the queue is never actually gone by the time
+    // this runs. Best-effort on purpose: log and leave it, and a later run's
+    // janitor collects it. There is no retry loop because the window is a day,
+    // not the fifteen seconds `delete_schema_with_retry` waits out.
+    for kind in ["engine_field", "engine"] {
+        let found = match client.list_ids_by_name_prefix(kind, prefix).await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        for (id, name) in found {
+            if let Err(e) = client.delete(kind, id).await {
+                eprintln!("teardown: delete {kind} {id} ({name}) failed (continuing): {e:#}");
+            }
+        }
+    }
+
     // Parents last.
     for kind in ["workspace", "label"] {
         let found = match client.list_ids_by_name_prefix(kind, prefix).await {

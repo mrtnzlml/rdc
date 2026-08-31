@@ -38,6 +38,24 @@ async fn live_janitor_sweep() {
         let left = client.list_ids_by_name_prefix(kind, RunId::marker()).await.unwrap_or_default();
         assert!(left.is_empty(), "janitor left {kind} objects: {left:?}");
     }
+
+    // Engines are deliberately NOT asserted empty. One that was bound to a
+    // queue is undeletable until that queue finishes purging — up to 24 hours —
+    // so a sweep run soon after `live_push_create_ordering` legitimately leaves
+    // one behind, and it goes on the next run. Report the backlog instead, so a
+    // number that keeps climbing is visible rather than silent.
+    let engines_left = client
+        .list_ids_by_name_prefix("engine", RunId::marker())
+        .await
+        .unwrap_or_default();
+    if !engines_left.is_empty() {
+        eprintln!(
+            "janitor: {} harness engine(s) still pending their queues' purge (expected; \
+             they go on a later run): {:?}",
+            engines_left.len(),
+            engines_left
+        );
+    }
     // Soft-deleted queues (status `deletion_requested` / workspace null) are
     // treated as deleted and excluded from the listing, so the sweep must leave
     // no live queues behind either.
