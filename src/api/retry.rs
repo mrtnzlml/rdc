@@ -14,14 +14,15 @@
 //! - Caps at 60s per sleep to avoid worst-case stalls.
 //! - Stderr line per retry so users see the tool isn't hung.
 //!
+//! - CONNECT failures (DNS resolution, connection refused/reset before the
+//!   request is on the wire) get the same exponential backoff. See
+//!   [`is_retriable_transport`] for why only connect-class errors qualify.
+//!
 //! Status codes NOT retried (returned to caller as-is):
 //! - 4xx other than 429: auth/permission/not-found/method — retrying
 //!   won't help.
 //! - 500: usually a real server bug; retrying papers over it. The caller
 //!   surfaces a useful error.
-//! - Network errors before a response arrives: surfaced via `?` from
-//!   `.send()`. Reqwest's own connect retry is not exposed; if needed in
-//!   the future, layer it on the `build()` closure side.
 
 use anyhow::{Context, Result};
 
@@ -118,16 +119,26 @@ pub async fn send_with_retry(
     // taking a fresh token before the re-send keeps the proactive cap
     // accurate even when several requests are mid-retry.
     for attempt in 0..MAX_ATTEMPTS - 1 {
-        let resp = send_once(&mut build, desc, limiter, attempt + 1).await?;
-        let Some(reason) = retriable_reason(resp.status()) else {
-            return Ok(resp);
-        };
-        // Retries are an internal concern: a terminal failure after
-        // MAX_ATTEMPTS surfaces as an error from the final `build().send()`
-        // call below. No user-facing retry chatter.
-        let _ = (reason, &progress);
-        let wait = retry_after(&resp).unwrap_or_else(|| backoff(attempt));
-        tokio::time::sleep(wait).await;
+        match send_once(&mut build, desc, limiter, attempt + 1).await {
+            Ok(resp) => {
+                let Some(reason) = retriable_reason(resp.status()) else {
+                    return Ok(resp);
+                };
+                // Retries are an internal concern: a terminal failure after
+                // MAX_ATTEMPTS surfaces as an error from the final
+                // `build().send()` call below. No user-facing retry chatter.
+                let _ = (reason, &progress);
+                let wait = retry_after(&resp).unwrap_or_else(|| backoff(attempt));
+                tokio::time::sleep(wait).await;
+            }
+            // A connect-class failure never reached the server, so it is
+            // retriable for any method — including POST. Everything else is
+            // returned as-is.
+            Err(e) if is_retriable_transport(&e) => {
+                tokio::time::sleep(backoff(attempt)).await;
+            }
+            Err(e) => return Err(e),
+        }
     }
     send_once(&mut build, desc, limiter, MAX_ATTEMPTS).await
 }
@@ -185,6 +196,30 @@ fn retry_after(resp: &Response) -> Option<Duration> {
     Some(Duration::from_secs(secs.min(MAX_SLEEP_SECS)))
 }
 
+/// Whether a transport failure (no HTTP response at all) is worth retrying.
+///
+/// **Connect-class only, deliberately.** `is_connect()` means the connection
+/// was never established — DNS did not resolve, the peer refused, the socket
+/// reset during the handshake — so the server never saw the request and
+/// re-sending it cannot duplicate anything. That makes it safe for POST as
+/// well as for reads.
+///
+/// A read TIMEOUT is excluded for exactly that reason: the request may well
+/// have arrived and been applied, with only the response lost. Retrying a
+/// POST there would create the object twice, which is a far worse outcome
+/// than the error it would paper over.
+///
+/// Why this exists: a single DNS blip used to abort an entire `sync`. Observed
+/// three times in one session against the Data Storage host, whose 30 req/s
+/// bucket makes it the most resolver-intensive thing rdc talks to — and it is
+/// the unattended CI deploy (`rdc sync --allow-deletes --yes`) that pays for
+/// it, since nobody is there to re-run.
+fn is_retriable_transport(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|c| c.downcast_ref::<reqwest::Error>())
+        .any(|e| e.is_connect())
+}
+
 fn backoff(attempt: u32) -> Duration {
     // 1s, 2s, 4s, 8s, 16s — capped at 60s.
     let secs = 1u64.checked_shl(attempt).unwrap_or(MAX_SLEEP_SECS);
@@ -220,5 +255,88 @@ mod tests {
         assert_eq!(retriable_reason(StatusCode::METHOD_NOT_ALLOWED), None);
         // 500 is intentionally NOT retried — usually a real server bug.
         assert_eq!(retriable_reason(StatusCode::INTERNAL_SERVER_ERROR), None);
+    }
+    /// A real connect failure — nothing is listening on port 1 — must
+    /// classify as retriable. Constructed rather than mocked so the test
+    /// exercises the actual `reqwest::Error` variant the runtime produces.
+    #[tokio::test]
+    async fn connect_failures_are_retriable() {
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/nothing-here")
+            .send()
+            .await
+            .expect_err("connecting to a closed port must fail");
+        assert!(err.is_connect(), "precondition: this is a connect error");
+        let wrapped = anyhow::Error::new(err).context("listing indexes for 'x'");
+        assert!(
+            is_retriable_transport(&wrapped),
+            "a connect failure must be retriable even through added context"
+        );
+    }
+
+    /// A read timeout must NOT be retried: the request may already have been
+    /// applied server-side with only the response lost, so re-sending a POST
+    /// would create the object twice.
+    #[tokio::test]
+    async fn read_timeouts_are_not_retriable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept the connection but never answer, so the client times out
+        // AFTER the request is on the wire.
+        std::thread::spawn(move || {
+            let _keep = listener.accept();
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        });
+        let err = reqwest::Client::new()
+            .post(format!("http://{addr}/"))
+            .timeout(Duration::from_millis(250))
+            .send()
+            .await
+            .expect_err("the server never responds");
+        assert!(err.is_timeout(), "precondition: this is a timeout, not a connect error");
+        assert!(
+            !is_retriable_transport(&anyhow::Error::new(err)),
+            "a timeout must NOT be retried — the write may already have landed"
+        );
+    }
+
+    /// A non-transport error carries no `reqwest::Error` at all.
+    #[test]
+    fn unrelated_errors_are_not_retriable() {
+        assert!(!is_retriable_transport(&anyhow::anyhow!("parsing lockfile")));
+    }
+    /// The predicate above is only half the fix — this proves the LOOP is
+    /// wired to it: a connect failure must be re-sent, not returned on the
+    /// first try. Counted through the `build` closure, which
+    /// [`send_with_retry`] invokes once per attempt.
+    ///
+    /// `start_paused` lets tokio auto-advance the 1s/2s/4s/8s backoff, so the
+    /// full retry ladder runs instantly instead of taking 15 seconds.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_failure_is_retried_up_to_max_attempts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let client = reqwest::Client::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+
+        let result = send_with_retry(
+            || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                client.get("http://127.0.0.1:1/nothing-here")
+            },
+            "probe",
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "every attempt fails, so the call must error");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            MAX_ATTEMPTS as usize,
+            "a connect failure must be retried the full ladder, not surfaced \
+             on the first attempt"
+        );
     }
 }
