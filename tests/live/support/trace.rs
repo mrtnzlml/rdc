@@ -107,6 +107,9 @@ impl Trace {
     /// Render the trace rows in `lo..=hi` (clamped), one per line, for a
     /// failure message that says what actually ran.
     fn window(&self, lo: usize, hi: usize) -> String {
+        if self.lines.is_empty() {
+            return "  (no requests traced)".to_string();
+        }
         let lo = lo.saturating_sub(2);
         let hi = (hi + 2).min(self.lines.len().saturating_sub(1));
         self.lines[lo..=hi]
@@ -235,5 +238,20 @@ mod tests {
     #[test]
     fn a_missing_file_is_an_empty_trace() {
         assert!(Trace::read(std::path::Path::new("/nonexistent/trace.csv")).is_empty());
+    }
+
+    /// With zero lines, `window`'s old `hi = (0 + 2).min(len.saturating_sub(1))`
+    /// evaluated to 0, and `self.lines[0..=0]` indexed an empty slice — so an
+    /// empty trace panicked with an index-out-of-bounds instead of the
+    /// descriptive "no `METHOD /endpoint`" message, in exactly the case that
+    /// message exists to explain.
+    #[test]
+    #[should_panic(expected = "no `POST /labels`")]
+    fn assert_before_on_an_empty_trace_names_the_missing_request() {
+        Trace::default().assert_before(
+            ("POST", "labels"),
+            ("POST", "rules"),
+            "an empty trace must still report which request was missing",
+        );
     }
 }

@@ -125,6 +125,20 @@ impl TreeSnapshot {
     }
 }
 
+/// How many files under `envs/<env>` have `slug` in their path.
+///
+/// Deliberately NOT `TreeSnapshot::capture`: that also walks the base cache
+/// (`.rdc/state/<env>.base`) and then adds a synthetic entry per matching
+/// LOCKFILE slug, so asking it "does this lockfile slug still have a file?"
+/// is answered by the question itself and can never be false. Tombstone
+/// detection needs the env tree alone.
+#[allow(dead_code)]
+pub fn env_files_matching(root: &Path, env: &str, slug: &str) -> usize {
+    let mut files = BTreeMap::new();
+    collect_into(&mut files, root, &root.join(format!("envs/{env}")));
+    files.keys().filter(|path| path.contains(slug)).count()
+}
+
 /// Add one synthetic entry per lockfile row whose slug carries `prefix`, keyed
 /// `lockfile:<kind>/<slug>`. Rows belonging to other runs (or to the org's own
 /// pre-existing content) are skipped.
@@ -467,6 +481,33 @@ mod tests {
     fn capture_of_a_missing_project_is_empty() {
         let dir = TempDir::new().unwrap();
         assert!(TreeSnapshot::capture(dir.path(), "test", PFX).is_empty());
+    }
+
+    /// The regression `assert_converged`'s emptiness guard is prone to and
+    /// `env_files_matching` exists to avoid: a lockfile row and a base-cache
+    /// file for a slug both survive a tombstone that only touched the env
+    /// tree. `TreeSnapshot::capture` would still report a "file" for that
+    /// slug (via the base cache) and would ALSO synthesize a
+    /// `lockfile:<kind>/<slug>` entry from the very row being asked about —
+    /// so the tombstone would be invisible to it. `env_files_matching` looks
+    /// at the env tree alone and must come back 0.
+    #[test]
+    fn env_files_matching_ignores_base_cache_and_lockfile_survivors() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write(root, ".rdc/state/test.base/labels/rdc-it-abc-a.json", "{}");
+        write(
+            root,
+            ".rdc/state/test.lock.json",
+            r#"{"version":3,"objects":{"labels":{"rdc-it-abc-a":{"id":1}}}}"#,
+        );
+
+        // No file under envs/test — this is the tombstoned state.
+        assert_eq!(env_files_matching(root, "test", "rdc-it-abc-a"), 0);
+
+        // Once a file exists under envs/test, it is found.
+        write(root, "envs/test/labels/rdc-it-abc-a.json", "{}");
+        assert_eq!(env_files_matching(root, "test", "rdc-it-abc-a"), 1);
     }
 
     #[test]

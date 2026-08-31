@@ -233,14 +233,23 @@ async fn live_push_create_ordering() {
     // Belt and braces: nothing outside this run may have been tombstoned. A
     // widened path above would show up here as a lockfile entry with no file,
     // BEFORE `--allow-deletes` turns it into a DELETE.
-    // The check is a substring test: `TreeSnapshot::capture` keeps files whose
-    // PATH contains the slug, so a lockfile entry with no matching file means
-    // its file is gone — i.e. it has become a tombstone.
+    //
+    // The check is a substring test against the env tree ONLY
+    // (`env_files_matching`, not `TreeSnapshot::capture`): a lockfile entry
+    // with no matching file under `envs/test` means its file is gone — i.e.
+    // it has become a tombstone. `TreeSnapshot::capture` cannot be used here:
+    // it also walks the base cache (`.rdc/state/test.base`, which the
+    // tombstone loop above never touches, so a "file" would still be found
+    // there for anything just deleted from the env tree) and then adds a
+    // synthetic `lockfile:<kind>/<slug>` entry for every matching lockfile
+    // slug — the very slug this loop is asking about — so the question "does
+    // this lockfile slug still have a file?" would be answered by the
+    // question itself and could never come back empty.
     //
     // Only kinds whose slug appears VERBATIM in their on-disk path can be
     // checked this way. Two are skipped because their slugs are compound and
-    // the path interleaves extra segments, so the substring test would report
-    // every one of them as missing:
+    // the path interleaves extra segments, so under this real (non-vacuous)
+    // substring test they would now false-FAIL every one of them as missing:
     //
     //   email_templates  slug `<ws>/<queue>/<tpl>`
     //                    path `workspaces/<ws>/queues/<queue>/email-templates/<tpl>.json`
@@ -263,10 +272,10 @@ async fn live_push_create_ordering() {
             if slug.starts_with("rdc-it-") {
                 continue;
             }
-            let tracked =
-                crate::support::converge::TreeSnapshot::capture(project.path(), "test", slug);
+            let matches =
+                crate::support::converge::env_files_matching(project.path(), "test", slug);
             assert!(
-                !tracked.is_empty(),
+                matches > 0,
                 "about to delete something this run does not own: {kind}/{slug} has a lockfile entry but no file on disk — a tombstone path was widened"
             );
         }
@@ -312,8 +321,15 @@ async fn live_push_create_ordering() {
     // deletion_requested`.
     let engine_slug = format!("{prefix}engine");
     let stderr = combined(&del);
+    // Match the exact warning `push::deletes::run_deletes` emits for the
+    // engine itself (`"{kind}/{slug} delete failed (skipped): {e:#}"` with
+    // `kind == "engines"`). A plain `stderr.contains(&engine_slug)` is also
+    // satisfied by the engine FIELD's own refusal warning, because the
+    // field's slug (`<engine_slug>/<field_slug>`) contains the engine's slug
+    // as a substring.
+    let expected_warning = format!("engines/{engine_slug} delete failed (skipped)");
     assert!(
-        stderr.contains(&engine_slug) && stderr.contains("delete failed (skipped)"),
+        stderr.contains(&expected_warning),
         "the refused engine delete must be warned about by slug, not swallowed:\n{stderr}"
     );
 

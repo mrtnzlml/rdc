@@ -39,22 +39,25 @@ async fn live_janitor_sweep() {
         assert!(left.is_empty(), "janitor left {kind} objects: {left:?}");
     }
 
-    // Engines are deliberately NOT asserted empty. One that was bound to a
-    // queue is undeletable until that queue finishes purging — up to 24 hours —
-    // so a sweep run soon after `live_push_create_ordering` legitimately leaves
-    // one behind, and it goes on the next run. Report the backlog instead, so a
-    // number that keeps climbing is visible rather than silent.
-    let engines_left = client
-        .list_ids_by_name_prefix("engine", RunId::marker())
-        .await
-        .unwrap_or_default();
-    if !engines_left.is_empty() {
-        eprintln!(
-            "janitor: {} harness engine(s) still pending their queues' purge (expected; \
-             they go on a later run): {:?}",
-            engines_left.len(),
-            engines_left
-        );
+    // Engines (and their fields) are deliberately NOT asserted empty. An
+    // engine that was bound to a queue is undeletable until that queue
+    // finishes purging — up to 24 hours — so a sweep run soon after
+    // `live_push_create_ordering` legitimately leaves one behind, and it goes
+    // on the next run. A field can strand for even longer: teardown's field
+    // sweep 409s while its schema still exists, and that schema can become
+    // uncollectible once its queue soft-deletes. Report the backlog instead
+    // of asserting on it, so a number that keeps climbing is visible rather
+    // than silent — for either kind.
+    for kind in ["engine", "engine_field"] {
+        let left = client.list_ids_by_name_prefix(kind, RunId::marker()).await.unwrap_or_default();
+        if !left.is_empty() {
+            eprintln!(
+                "janitor: {} harness {kind}(s) still pending cleanup (expected; they go on \
+                 a later run): {:?}",
+                left.len(),
+                left
+            );
+        }
     }
     // Soft-deleted queues (status `deletion_requested` / workspace null) are
     // treated as deleted and excluded from the listing, so the sweep must leave
