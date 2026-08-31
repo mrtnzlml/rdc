@@ -1,0 +1,10 @@
+{
+  "id": 0,
+  "url": "",
+  "name": "rdc-it-{{RUN}}-notice",
+  "queue": "rdc://queues/rdc-it-{{RUN}}-invoices",
+  "type": "custom",
+  "subject": "Document received",
+  "message": "<p>Please review the attached document.</p>",
+  "automate": false
+}

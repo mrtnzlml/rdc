@@ -1,0 +1,7 @@
+{
+  "id": 0,
+  "url": "",
+  "name": "rdc-it-{{RUN}}-ws",
+  "organization": "{{ORG_URL}}",
+  "queues": []
+}

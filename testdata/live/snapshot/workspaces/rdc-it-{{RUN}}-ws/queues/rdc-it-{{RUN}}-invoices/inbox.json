@@ -1,0 +1,7 @@
+{
+  "id": 0,
+  "url": "",
+  "name": "rdc-it-{{RUN}}-invoices",
+  "queues": ["rdc://queues/rdc-it-{{RUN}}-invoices"],
+  "email_prefix": "rdc-it-{{RUN}}-invoices"
+}

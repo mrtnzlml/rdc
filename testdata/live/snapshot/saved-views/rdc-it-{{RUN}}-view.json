@@ -1,0 +1,8 @@
+{
+  "id": 0,
+  "url": "",
+  "name": "rdc-it-{{RUN}}-view",
+  "shared": true,
+  "query": { "$and": [{ "status": { "$in": ["to_review"] } }] },
+  "queues_filter": ["rdc://queues/rdc-it-{{RUN}}-invoices"]
+}

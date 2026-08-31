@@ -1,0 +1,10 @@
+{
+  "id": 0,
+  "url": "",
+  "name": "rdc-it-{{RUN}}-validator",
+  "type": "function",
+  "events": ["annotation_content"],
+  "queues": ["rdc://queues/rdc-it-{{RUN}}-invoices"],
+  "active": true,
+  "config": { "runtime": "python3.12" }
+}

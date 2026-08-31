@@ -1,0 +1,21 @@
+{
+  "id": 0,
+  "url": "",
+  "name": "rdc-it-{{RUN}}-invoices",
+  "queues": [],
+  "content": [
+    {
+      "category": "section",
+      "id": "header",
+      "label": "Header",
+      "children": [
+        {
+          "category": "datapoint",
+          "id": "rdc-it-{{RUN}}-probe_field",
+          "label": "Probe Field",
+          "type": "string"
+        }
+      ]
+    }
+  ]
+}

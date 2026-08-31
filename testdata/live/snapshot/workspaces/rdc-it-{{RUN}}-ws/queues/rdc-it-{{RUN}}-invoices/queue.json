@@ -1,0 +1,13 @@
+{
+  "id": 0,
+  "url": "",
+  "name": "rdc-it-{{RUN}}-invoices",
+  "workspace": "rdc://workspaces/rdc-it-{{RUN}}-ws",
+  "schema": "rdc://schemas/rdc-it-{{RUN}}-invoices",
+  "engine": "rdc://engines/rdc-it-{{RUN}}-engine",
+  "hooks": [],
+  "rules": [],
+  "webhooks": [],
+  "users": [],
+  "locale": "en_GB"
+}

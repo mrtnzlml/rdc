@@ -1,0 +1,12 @@
+{
+  "id": 0,
+  "url": "",
+  "name": "rdc-it-{{RUN}}-probe_field",
+  "engine": "rdc://engines/rdc-it-{{RUN}}-engine",
+  "label": "Probe Field",
+  "type": "string",
+  "subtype": "alphanumeric",
+  "pre_trained_field_id": null,
+  "tabular": false,
+  "multiline": "false"
+}

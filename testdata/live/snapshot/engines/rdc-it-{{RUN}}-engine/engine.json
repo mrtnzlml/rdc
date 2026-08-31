@@ -1,0 +1,9 @@
+{
+  "id": 0,
+  "url": "",
+  "name": "rdc-it-{{RUN}}-engine",
+  "type": "extractor",
+  "learning_enabled": false,
+  "description": "",
+  "settings": {}
+}

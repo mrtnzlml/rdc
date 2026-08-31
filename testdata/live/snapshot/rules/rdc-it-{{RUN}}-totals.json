@@ -1,0 +1,18 @@
+{
+  "id": 0,
+  "url": "",
+  "name": "rdc-it-{{RUN}}-totals",
+  "queues": ["rdc://queues/rdc-it-{{RUN}}-invoices"],
+  "description": "",
+  "enabled": true,
+  "trigger_condition": "True",
+  "actions": [
+    {
+      "id": "rdc-it-{{RUN}}-a1",
+      "enabled": true,
+      "type": "add_label",
+      "event": "validation",
+      "payload": { "labels": ["rdc://labels/rdc-it-{{RUN}}-priority"] }
+    }
+  ]
+}
