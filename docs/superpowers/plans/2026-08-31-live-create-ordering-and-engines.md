@@ -1283,7 +1283,7 @@ Create `tests/live/scenarios/ordering.rs`:
 
 ```rust
 use crate::support::assert_local::load_lockfile;
-use crate::support::assert_remote::{assert_remote_field, assert_remote_ref_resolved};
+use crate::support::assert_remote::assert_remote_ref_resolved;
 use crate::support::client::LiveClient;
 use crate::support::config::LiveConfig;
 use crate::support::converge::{assert_converged, combined};
@@ -1462,8 +1462,6 @@ async fn live_push_create_ordering() {
     // settle back-refs the server filled in behind the creates.
     assert_converged(&project, "test", &prefix, "after creating the whole graph in one sync");
 
-    // Silence the unused warning: Task 7 replaces this with the delete phase.
-    let _ = assert_remote_field;
     drop(teardown);
 }
 ```
@@ -1520,8 +1518,6 @@ git commit -m "test(live): assert the order rdc creates a fresh object graph in"
 In `tests/live/scenarios/ordering.rs`, replace:
 
 ```rust
-    // Silence the unused warning: Task 7 replaces this with the delete phase.
-    let _ = assert_remote_field;
     drop(teardown);
 }
 ```
@@ -1533,20 +1529,58 @@ with the delete phase:
     // Deletes: the cascade order, and skip-and-continue against a REAL refusal.
     // -------------------------------------------------------------------------
     //
-    // Tombstone everything by removing the files, then delete in one pass. The
-    // engine is deliberately left in the tombstone set even though the server
-    // will refuse it: that refusal is the point of the second assertion below.
-    std::fs::remove_dir_all(project.path().join("envs/test/workspaces"))
-        .expect("removing the workspace tree");
-    for rel in [
-        "envs/test/hooks",
-        "envs/test/rules",
-        "envs/test/labels",
-        "envs/test/saved-views",
-        "envs/test/engines",
+    // Tombstone THIS RUN'S objects — and only this run's.
+    //
+    // Every path below is prefix-scoped, and that is not tidiness: the `sync`
+    // above pulled the WHOLE sandbox org into this tree (a couple of hundred
+    // objects, including real workspaces, hooks, rules and the org's four real
+    // engines). Removing `envs/test/hooks` wholesale would tombstone all of
+    // them, and the `--allow-deletes` below would then delete real content off
+    // a shared org. Never widen these paths.
+    //
+    // The engine is deliberately left IN the tombstone set even though the
+    // server will refuse it: that refusal is the point of the second assertion
+    // below.
+    for dir in [
+        format!("envs/test/workspaces/{prefix}ws"),
+        format!("envs/test/engines/{prefix}engine"),
     ] {
-        std::fs::remove_dir_all(project.path().join(rel))
-            .unwrap_or_else(|e| panic!("removing {rel}: {e}"));
+        std::fs::remove_dir_all(project.path().join(&dir))
+            .unwrap_or_else(|e| panic!("removing {dir}: {e}"));
+    }
+    for file in [
+        format!("envs/test/hooks/{prefix}validator.json"),
+        format!("envs/test/hooks/{prefix}validator.py"),
+        format!("envs/test/hooks/{prefix}post-validator.json"),
+        format!("envs/test/hooks/{prefix}post-validator.py"),
+        format!("envs/test/rules/{prefix}totals.json"),
+        format!("envs/test/labels/{prefix}priority.json"),
+        format!("envs/test/saved-views/{prefix}view.json"),
+    ] {
+        std::fs::remove_file(project.path().join(&file))
+            .unwrap_or_else(|e| panic!("removing {file}: {e}"));
+    }
+
+    // Belt and braces: nothing outside this run may have been tombstoned. A
+    // widened path above would show up here as a lockfile entry with no file,
+    // BEFORE `--allow-deletes` turns it into a DELETE.
+    let lf_before_del = load_lockfile(project.path(), "test").expect("lockfile before deletes");
+    for (kind, entries) in &lf_before_del.objects {
+        for slug in entries.keys() {
+            if slug.starts_with("rdc-it-") || slug.contains("/rdc-it-") {
+                continue;
+            }
+            let tracked = crate::support::converge::TreeSnapshot::capture(
+                project.path(),
+                "test",
+                slug,
+            );
+            assert!(
+                !tracked.is_empty() || kind == "organization" || kind.starts_with("mdh")
+                    || kind.starts_with("workflow"),
+                "about to delete something this run does not own: {kind}/{slug} has a                  lockfile entry but no file on disk — a tombstone path was widened"
+            );
+        }
     }
 
     let (del, dtr) = project.run_rdc_traced(&["sync", "test", "--allow-deletes"]);
@@ -1621,13 +1655,9 @@ with the delete phase:
 }
 ```
 
-Then drop the now-unused import at the top of the file:
-
-```rust
-use crate::support::assert_remote::assert_remote_ref_resolved;
-```
-
-(that is, remove `assert_remote_field` from the `assert_remote` import list).
+The import line at the top of the file already reads
+`use crate::support::assert_remote::assert_remote_ref_resolved;` and needs no
+change — Task 6 never imported `assert_remote_field`.
 
 - [ ] **Step 2: Document the two new mechanisms in the harness header**
 
