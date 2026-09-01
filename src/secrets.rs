@@ -321,6 +321,41 @@ pub async fn resolve_token(project_root: &Path, env: &str, api_base: &str) -> Re
     }
 }
 
+/// Re-authenticate an env whose cached token was rejected (401), ignoring
+/// the cache entirely.
+///
+/// [`resolve_token`] cannot do this: it returns the cached token whenever
+/// `expires_at` is absent or still in the future, which is exactly the
+/// state a revoked-but-unexpired token is in. And
+/// `cli::auth::refresh_token_for_401` reads only `RDC_USER_<ENV>` /
+/// `RDC_PASS_<ENV>`, never the credentials the desktop app persists in
+/// `secrets/<env>.secrets.json`.
+///
+/// Token-auth projects have no credentials to re-login with, so this fails
+/// with a message that tells the user what to do about it.
+pub async fn force_relogin(project_root: &Path, env: &str, api_base: &str) -> Result<String> {
+    let file = read_secrets_file(project_root, env)?;
+    let (Some(username), Some(password)) = (file.username.as_deref(), file.password.as_deref())
+    else {
+        return Err(anyhow!(
+            "the API token for env '{env}' was rejected (401), and this env has no saved \
+             username/password to sign in with again. Update its token and retry."
+        ));
+    };
+    if username.is_empty() || password.is_empty() {
+        return Err(anyhow!(
+            "the API token for env '{env}' was rejected (401), and this env's saved \
+             credentials are incomplete. Update them and retry."
+        ));
+    }
+    let token = crate::api::login(api_base, username, password)
+        .await
+        .with_context(|| format!("re-signing in to env '{env}' after a 401"))?;
+    let expires_at = now_unix_secs().saturating_add(LOGIN_TOKEN_LIFETIME_SECS);
+    write_secrets_file(project_root, env, &token, Some(expires_at))?;
+    Ok(token)
+}
+
 /// Write a token (and optional expiry) to `secrets/<env>.secrets.json`
 /// atomically, mode 0600 on Unix. Preserves any `username` / `password`
 /// fields already in the file — the desktop app persists those for
@@ -1139,6 +1174,23 @@ mod tests {
         assert!(
             s.contains("no token set"),
             "Debug should keep error message: {s}"
+        );
+    }
+
+    #[test]
+    fn force_relogin_refuses_without_persisted_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_secrets_file(tmp.path(), "dev", "a-token", None).unwrap();
+        let err = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(force_relogin(tmp.path(), "dev", "https://acme.test/api/v1"))
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("token") && msg.contains("dev"),
+            "error must name the env and say the token was rejected: {msg}"
         );
     }
 }
