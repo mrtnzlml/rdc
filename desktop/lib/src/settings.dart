@@ -11,6 +11,16 @@ class Settings {
   String? parentFolder;
   List<String> externalPaths;
 
+  /// Per-env watch options, keyed like `AppState.envKey` — folder and env
+  /// joined by a NUL byte, since a folder path may itself contain a space.
+  /// Only `pollSecs` today; an absent entry means the 60s default.
+  Map<String, dynamic> watch;
+
+  /// Projects whose owner has seen the one-time notice that Sync now writes
+  /// to Rossum. Per project, not per env — the surprise is about the app,
+  /// not about any one connection.
+  List<String> ackTwoWay;
+
   /// Every key in the on-disk JSON this build does not recognise, kept
   /// verbatim so a save never destroys them. That covers `promoteDefaults`
   /// (written by builds that still had the Promote panel — downgrading must
@@ -18,7 +28,10 @@ class Settings {
   final Map<String, dynamic> extra;
 
   /// Keys this build owns. Anything else lands in [extra].
-  static const _known = {'parentFolder', 'externalPaths'};
+  static const _known = {'parentFolder', 'externalPaths', 'watch', 'ackTwoWay'};
+
+  /// Same NUL-separated key shape as `AppState.envKey`.
+  static String _watchKey(String folder, String env) => '$folder\u0000$env';
 
   /// Overrides the on-disk file used by the instance method [save] below.
   /// `null` (the production default) means "use the real per-user file" (see
@@ -32,9 +45,13 @@ class Settings {
   Settings({
     this.parentFolder,
     List<String>? externalPaths,
+    Map<String, dynamic>? watch,
+    List<String>? ackTwoWay,
     Map<String, dynamic>? extra,
     File? file,
   })  : externalPaths = externalPaths ?? [],
+        watch = watch ?? {},
+        ackTwoWay = ackTwoWay ?? [],
         extra = extra ?? {},
         _overrideFile = file;
 
@@ -67,6 +84,9 @@ class Settings {
         parentFolder: m['parentFolder'] as String?,
         externalPaths:
             (m['externalPaths'] as List?)?.map((e) => e as String).toList() ?? [],
+        watch: (m['watch'] as Map?)?.cast<String, dynamic>() ?? {},
+        ackTwoWay:
+            (m['ackTwoWay'] as List?)?.map((e) => e as String).toList() ?? [],
         extra: {
           for (final e in m.entries)
             if (!_known.contains(e.key)) e.key: e.value,
@@ -80,6 +100,8 @@ class Settings {
         ...extra,
         'parentFolder': parentFolder,
         'externalPaths': externalPaths,
+        'watch': watch,
+        'ackTwoWay': ackTwoWay,
       };
 
   static Settings load() {
@@ -100,6 +122,36 @@ class Settings {
       );
     } catch (_) {
       // Settings are best-effort; a write failure must not crash the app.
+    }
+  }
+
+  /// The saved poll interval for `env` under `folder`, or `null` when this
+  /// project has never had one set (the caller then falls back to 60s).
+  int? pollSecsFor(String folder, String env) {
+    final v = watch[_watchKey(folder, env)];
+    return v is Map ? v['pollSecs'] as int? : null;
+  }
+
+  /// Sets (or, with `null`, clears) the poll interval for `env` under
+  /// `folder`. Persists immediately.
+  void setPollSecs(String folder, String env, int? secs) {
+    final k = _watchKey(folder, env);
+    if (secs == null) {
+      watch.remove(k);
+    } else {
+      watch[k] = {'pollSecs': secs};
+    }
+    save();
+  }
+
+  bool hasAckedTwoWay(String folder) => ackTwoWay.contains(folder);
+
+  /// Records that `folder`'s owner has seen the one-time two-way notice.
+  /// Persists immediately; a no-op (no redundant write) if already recorded.
+  void ackTwoWayFor(String folder) {
+    if (!ackTwoWay.contains(folder)) {
+      ackTwoWay.add(folder);
+      save();
     }
   }
 }

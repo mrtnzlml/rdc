@@ -85,6 +85,42 @@ String _fmtSize(int b) {
   return '${mb.toStringAsFixed(mb < 10 ? 1 : 0)} MB';
 }
 
+/// In-flight two-way confirmations, keyed by folder. A project's per-row
+/// "Sync all envs" button calls the (gated) per-env sync callback once per
+/// env in a tight synchronous loop -- every call fires before any dialog
+/// result comes back. Without this cache, each of those calls would
+/// independently see `needsTwoWayNotice` still true and pop its own copy of
+/// the notice dialog; with it, everyone racing for the same unacknowledged
+/// folder awaits the one dialog already on screen.
+final Map<String, Future<bool>> _twoWayConfirmsInFlight = {};
+
+/// Shows the one-time notice that Sync now writes to Rossum, if `item`'s
+/// project hasn't seen it yet, and records the acknowledgement if the user
+/// proceeds. Returns true when the caller should go ahead with the sync or
+/// watch it was about to start.
+///
+/// Shared by every call site that starts a two-way cycle -- the top-level
+/// Sync/Sync-all wiring in [_HomePageState] and the direct `watchEnvItem`
+/// calls in [_ConnBar] and [_EnvTableRow] -- so the notice is asked (and
+/// acknowledged) exactly once regardless of which button triggered it.
+Future<bool> _confirmTwoWay(BuildContext context, AppState state, ProjectItem item) {
+  final folder = item.summary.folder;
+  if (!state.needsTwoWayNotice(folder)) return Future.value(true);
+  return _twoWayConfirmsInFlight[folder] ??= () async {
+    try {
+      final ok = await showDialog<bool>(
+            context: context,
+            builder: (_) => TwoWayNoticeDialog(projectName: item.summary.name),
+          ) ??
+          false;
+      if (ok) state.ackTwoWay(folder);
+      return ok;
+    } finally {
+      _twoWayConfirmsInFlight.remove(folder);
+    }
+  }();
+}
+
 // ------------------------------------------------------------ page
 
 class HomePage extends StatefulWidget {
@@ -167,7 +203,7 @@ class _HomePageState extends State<HomePage> {
     if (ok == true) await _run(() => state.removeEnvEntry(i, e));
   }
 
-  void _syncAll() {
+  Future<void> _syncAll() async {
     for (final p in state.projects) {
       for (final e in p.summary.envs) {
         // Skip envs a watch owns (watching or mid-stop): a one-shot Sync
@@ -175,7 +211,7 @@ class _HomePageState extends State<HomePage> {
         // and row gates exist to prevent. Sync the rest; don't refuse the
         // whole bulk action for one watched env.
         if (_syncBlocked(state, p.summary.folder, e.name)) continue;
-        state.syncEnvItem(p, e);
+        if (await _confirmTwoWay(context, state, p)) state.syncEnvItem(p, e);
       }
     }
   }
@@ -243,7 +279,9 @@ class _HomePageState extends State<HomePage> {
             onSelectSettings: () => setState(() => _view = NavView.settings),
             onAdd: _addConnection,
             onOpen: _openExisting,
-            onSync: (p, e) => state.syncEnvItem(p, e),
+            onSync: (p, e) async {
+              if (await _confirmTwoWay(context, state, p)) state.syncEnvItem(p, e);
+            },
             onSyncAll: _syncAll,
             onEdit: _editConnection,
             onReveal: _reveal,
@@ -786,7 +824,17 @@ class _ConnBar extends StatelessWidget {
             label: watching ? 'Stop' : 'Watch',
             onTap: watching
                 ? () => state.stopWatchItem(item, env)
-                : (stopping ? null : () => state.watchEnvItem(item, env)),
+                : (stopping
+                    ? null
+                    : () async {
+                        // A watch's first action is a full two-way reconcile,
+                        // so this needs the same gate Sync has -- otherwise
+                        // starting a watch on a never-synced-by-this-build
+                        // project would push without the notice ever showing.
+                        if (await _confirmTwoWay(context, state, item)) {
+                          state.watchEnvItem(item, env);
+                        }
+                      }),
           ),
         ),
         MdhBtn(label: 'Edit', onTap: () => onEdit(item)),
@@ -1211,7 +1259,14 @@ class _EnvTableRow extends StatelessWidget {
                 tooltip: watching ? 'Stop watching' : (stopping ? 'Stopping…' : 'Watch'),
                 onTap: watching
                     ? () => state.stopWatchItem(item, env)
-                    : (stopping ? null : () => state.watchEnvItem(item, env)),
+                    : (stopping
+                        ? null
+                        : () async {
+                            // Same two-way gate as _ConnBar's Watch button.
+                            if (await _confirmTwoWay(context, state, item)) {
+                              state.watchEnvItem(item, env);
+                            }
+                          }),
               ),
               _RowIconBtn(icon: Icons.edit_outlined, tooltip: 'Edit', onTap: () => onEdit(item, env)),
               _RowIconBtn(icon: Icons.delete_outline, tooltip: 'Remove', danger: true, onTap: () => onRemove(item, env)),

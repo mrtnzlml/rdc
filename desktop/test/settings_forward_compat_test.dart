@@ -27,6 +27,10 @@ void main() {
     final s = Settings.fromJson({
       'parentFolder': '/tmp/acme',
       'externalPaths': ['/tmp/beta'],
+      'watch': {
+        '/tmp/acme dev': {'pollSecs': 120},
+      },
+      'ackTwoWay': ['/tmp/acme'],
       'promoteDefaults': {
         '/tmp/acme': {'src': 'dev', 'tgt': 'prod', 'mirror': true, 'policy': 'keepTarget'},
       },
@@ -42,6 +46,10 @@ void main() {
     expect(tmpFile.existsSync(), isTrue);
     final written = jsonDecode(tmpFile.readAsStringSync()) as Map<String, dynamic>;
     expect(written['parentFolder'], '/tmp/acme-renamed');
+    expect(written['watch'], {
+      '/tmp/acme dev': {'pollSecs': 120},
+    });
+    expect(written['ackTwoWay'], ['/tmp/acme']);
     expect(written['promoteDefaults'], isNotNull,
         reason: 'an older build must still find its promote defaults after this build saves');
     expect((written['promoteDefaults'] as Map)['/tmp/acme']['src'], 'dev');
@@ -87,5 +95,66 @@ void main() {
     // would flip this assertion — which is the point.
     final s = Settings(parentFolder: '/tmp/live', extra: {'parentFolder': '/tmp/stale'});
     expect(s.toJson()['parentFolder'], '/tmp/live');
+  });
+
+  test('pollSecs round-trips per env and defaults to null', () {
+    // setPollSecs calls save(), so this is sandboxed to a temp file (same
+    // pattern as the first test above) rather than reading/writing the
+    // developer's real ~/.rdc-desktop/settings.json.
+    final tmpDir = Directory.systemTemp.createTempSync('rdc-desktop-settings-test-');
+    addTearDown(() {
+      if (tmpDir.existsSync()) tmpDir.deleteSync(recursive: true);
+    });
+    final tmpFile = File('${tmpDir.path}${Platform.pathSeparator}settings.json');
+    final s = Settings.fromJson({}, file: tmpFile);
+
+    expect(s.pollSecsFor('/tmp/acme', 'dev'), isNull);
+    s.setPollSecs('/tmp/acme', 'dev', 300);
+    expect(s.pollSecsFor('/tmp/acme', 'dev'), 300);
+    expect(s.pollSecsFor('/tmp/acme', 'prod'), isNull);
+  });
+
+  test('ackTwoWay defaults to unacknowledged and hasAckedTwoWay reflects it', () {
+    final s = Settings.fromJson({});
+    expect(s.hasAckedTwoWay('/tmp/acme'), isFalse);
+    s.ackTwoWay.add('/tmp/acme');
+    expect(s.hasAckedTwoWay('/tmp/acme'), isTrue);
+    expect(s.hasAckedTwoWay('/tmp/beta'), isFalse);
+  });
+
+  test('setPollSecs and ackTwoWayFor persist to disk (sandboxed to a temp file)', () {
+    // setPollSecs/ackTwoWayFor both call save(), so this must never be able
+    // to reach the developer's real ~/.rdc-desktop/settings.json — same
+    // sandboxing as the first test above.
+    final tmpDir = Directory.systemTemp.createTempSync('rdc-desktop-settings-test-');
+    addTearDown(() {
+      if (tmpDir.existsSync()) tmpDir.deleteSync(recursive: true);
+    });
+    final tmpFile = File('${tmpDir.path}${Platform.pathSeparator}settings.json');
+    final s = Settings.fromJson({}, file: tmpFile);
+
+    s.setPollSecs('/tmp/acme', 'dev', 45);
+    expect(s.pollSecsFor('/tmp/acme', 'dev'), 45);
+
+    expect(s.hasAckedTwoWay('/tmp/acme'), isFalse);
+    s.ackTwoWayFor('/tmp/acme');
+    expect(s.hasAckedTwoWay('/tmp/acme'), isTrue);
+    // Calling it again must not duplicate the entry.
+    s.ackTwoWayFor('/tmp/acme');
+    expect(s.ackTwoWay.where((f) => f == '/tmp/acme').length, 1);
+
+    // Assert on shape, not on the internal key encoding: the exact
+    // `folder`/`env` join character is Settings' own business, not this
+    // test's.
+    final written = jsonDecode(tmpFile.readAsStringSync()) as Map<String, dynamic>;
+    final writtenWatch = written['watch'] as Map;
+    expect(writtenWatch.length, 1);
+    expect(writtenWatch.values.single, {'pollSecs': 45});
+    expect(written['ackTwoWay'], ['/tmp/acme']);
+
+    s.setPollSecs('/tmp/acme', 'dev', null);
+    expect(s.pollSecsFor('/tmp/acme', 'dev'), isNull);
+    final writtenAfterClear = jsonDecode(tmpFile.readAsStringSync()) as Map<String, dynamic>;
+    expect(writtenAfterClear['watch'], <String, dynamic>{});
   });
 }

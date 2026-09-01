@@ -57,6 +57,16 @@ class AppState extends ChangeNotifier {
 
   String envKey(String folder, String env) => '$folder\u0000$env';
 
+  /// True when this project's owner has not yet been told that Sync writes
+  /// to Rossum. The app was pull-only (`--no-push`) until this release.
+  bool needsTwoWayNotice(String folder) => !_settings.hasAckedTwoWay(folder);
+
+  /// Records that `folder`'s owner has seen the one-time two-way notice.
+  void ackTwoWay(String folder) {
+    _settings.ackTwoWayFor(folder);
+    notifyListeners();
+  }
+
   ProjectItem? get selected {
     final folder = selectedFolder;
     if (folder == null) return null;
@@ -321,8 +331,7 @@ class AppState extends ChangeNotifier {
       env: env.name,
       apiBase: env.apiBase,
       orgId: env.orgId,
-      // TODO(task 15): replace with the per-env poll-interval setting.
-      pollSecs: BigInt.from(60),
+      pollSecs: BigInt.from(_settings.pollSecsFor(folder, env.name) ?? 60),
     ).listen(
       (phase) => applyWatchPhase(folder, env.name, phase),
       onError: (Object e) {

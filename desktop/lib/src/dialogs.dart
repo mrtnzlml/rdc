@@ -484,6 +484,33 @@ class RemoveEnvDialog extends StatelessWidget {
   }
 }
 
+// ------------------------------------------------------------ two-way notice
+
+/// Shown once per project, the first time it is synced by a build whose Sync
+/// writes. Every earlier build's Sync was `--no-push`, so a project used as a
+/// read-only archive would otherwise start pushing to Rossum with no warning
+/// at all.
+class TwoWayNoticeDialog extends StatelessWidget {
+  const TwoWayNoticeDialog({super.key, required this.projectName});
+  final String projectName;
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    return _Frame(
+      title: 'Sync now writes to Rossum',
+      primaryLabel: 'Sync',
+      onPrimary: () => Navigator.of(context).pop(true),
+      child: Text(
+        'Syncing "$projectName" sends your local changes under envs/ to the '
+        'Rossum organization, and pulls its changes back. Earlier versions of '
+        'this app only pulled.\n\n'
+        'Deletions and conflicts still stop and ask first.',
+        style: TextStyle(color: c.textPrimary, fontSize: 13, height: 1.5),
+      ),
+    );
+  }
+}
+
 // ------------------------------------------------------------ blocked prompt
 
 /// A blocked cycle, rendered. The body is the tail of the sync log — which
