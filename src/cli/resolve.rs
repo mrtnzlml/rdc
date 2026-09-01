@@ -28,6 +28,7 @@ use anyhow::{Context, Result};
 use crate::cli::change_view::{
     ChangeRow, RowVerb, RowWidths, count_changes, render_connector, render_diff_body, render_row,
 };
+use crate::cli::stdin_coord::{Prompt, PromptKey, PromptKind};
 use similar::{Algorithm, TextDiff};
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
@@ -258,6 +259,11 @@ fn confirm_bulk<R: BufRead, W: Write>(
     mode: ColorMode,
 ) -> Result<Option<Resolution>> {
     writeln!(output, "{summary}")?;
+    crate::cli::stdin_coord::announce(Prompt {
+        kind: PromptKind::BulkConfirm,
+        question: "Continue? [y/N] > ".into(),
+        keys: vec![PromptKey::new('y', "yes"), PromptKey::new('n', "no")],
+    });
     write!(output, "{}", colorize_prompt("Continue? [y/N] > ", mode))?;
     output.flush().ok();
     let mut c = String::new();
@@ -375,6 +381,25 @@ pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
                 colorize_prompt(&format!("[K] keep ALL local  [R] use {env} for ALL"), mode)
             )?;
         }
+        let mut keys = vec![
+            PromptKey::new('k', "keep local"),
+            PromptKey::new('r', &format!("use {env}")),
+            PromptKey::new('e', "edit"),
+        ];
+        if hunk_count >= 2 {
+            keys.push(PromptKey::new('h', "hunk-by-hunk"));
+        }
+        keys.push(PromptKey::new('s', "skip (shadow file)"));
+        keys.push(PromptKey::new('a', "abort"));
+        if bulk.is_some() {
+            keys.push(PromptKey::new('K', "keep ALL local"));
+            keys.push(PromptKey::new('R', &format!("use {env} for ALL")));
+        }
+        crate::cli::stdin_coord::announce(Prompt {
+            kind: PromptKind::Conflict,
+            question: prompt_text.clone(),
+            keys,
+        });
         write!(output, "{}", colorize_prompt(&prompt_text, mode))?;
         output.flush().ok();
         let mut line = String::new();
@@ -564,6 +589,21 @@ pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
                 colorize_prompt(&format!("[K] keep ALL local  [R] use {env} for ALL"), mode)
             )?;
         }
+        let mut keys = vec![
+            PromptKey::new('k', &format!("keep local (restore on {env})")),
+            PromptKey::new('r', &format!("use {env} (delete local)")),
+            PromptKey::new('s', "skip"),
+            PromptKey::new('a', "abort"),
+        ];
+        if bulk.is_some() {
+            keys.push(PromptKey::new('K', "keep ALL local"));
+            keys.push(PromptKey::new('R', &format!("use {env} for ALL")));
+        }
+        crate::cli::stdin_coord::announce(Prompt {
+            kind: PromptKind::RemoteDelete,
+            question: prompt_text.clone(),
+            keys,
+        });
         write!(output, "{}", colorize_prompt(&prompt_text, mode))?;
         output.flush().ok();
         let mut line = String::new();
@@ -1024,6 +1064,18 @@ fn prompt_single_hunk<R: BufRead, W: Write>(
     loop {
         let prompt_text =
             format!("[k] keep local  [r] use {env}  [e] edit  [b] both  [s] skip  [a] abort > ");
+        crate::cli::stdin_coord::announce(Prompt {
+            kind: PromptKind::Conflict,
+            question: prompt_text.clone(),
+            keys: vec![
+                PromptKey::new('k', "keep local"),
+                PromptKey::new('r', &format!("use {env}")),
+                PromptKey::new('e', "edit"),
+                PromptKey::new('b', "both"),
+                PromptKey::new('s', "skip"),
+                PromptKey::new('a', "abort"),
+            ],
+        });
         write!(output, "{}", colorize_prompt(&prompt_text, mode))?;
         output.flush().ok();
         let mut line = String::new();
@@ -1239,8 +1291,7 @@ pub fn resolve_combined_file(
     if !interactive {
         let conflict_path = paths.conflict_shadow_path(local_path);
         write_atomic(&conflict_path, remote_bytes)?;
-        let log = crate::log::Log::new(detect_color_mode());
-        log.event(
+        progress.event(
             crate::log::Action::Warn,
             &format!(
                 "{} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",
@@ -1307,8 +1358,7 @@ pub fn resolve_combined_file(
         Resolution::Skip => {
             let conflict_path = paths.conflict_shadow_path(local_path);
             write_atomic(&conflict_path, remote_bytes)?;
-            let log = crate::log::Log::new(detect_color_mode());
-            log.event(
+            progress.event(
                 crate::log::Action::Warn,
                 &format!(
                     "{} conflict: local preserved, remote at {} (lockfile base preserved; re-run to resolve)",

@@ -146,6 +146,14 @@ pub fn confirm_or_refuse(
     // Log event: it must sit on the cursor's line for the answer to be typed
     // after it, which a timestamped event line cannot do. Under `Log::new`
     // the renderer's sink is stderr, so the terminal sees the same bytes.
+    crate::cli::stdin_coord::announce(crate::cli::stdin_coord::Prompt {
+        kind: crate::cli::stdin_coord::PromptKind::DeleteGate,
+        question: "Proceed with deletion? [y/N] ".into(),
+        keys: vec![
+            crate::cli::stdin_coord::PromptKey::new('y', "delete them"),
+            crate::cli::stdin_coord::PromptKey::new('n', "cancel"),
+        ],
+    });
     let mut q = progress.writer();
     write!(q, "Proceed with deletion? [y/N] ").ok();
     q.flush().ok();
@@ -372,6 +380,16 @@ fn resolve_delete_drift(
         );
         return Ok(DeleteDriftChoice::Skip);
     }
+    crate::cli::stdin_coord::announce(crate::cli::stdin_coord::Prompt {
+        kind: crate::cli::stdin_coord::PromptKind::DeleteDrift,
+        question: "[k]eep delete  [r]estore  [s]kip  [a]bort > ".into(),
+        keys: vec![
+            crate::cli::stdin_coord::PromptKey::new('k', "keep delete"),
+            crate::cli::stdin_coord::PromptKey::new('r', "restore"),
+            crate::cli::stdin_coord::PromptKey::new('s', "skip"),
+            crate::cli::stdin_coord::PromptKey::new('a', "abort"),
+        ],
+    });
     let mut q = progress.writer();
     writeln!(q).ok();
     writeln!(
@@ -583,5 +601,99 @@ mod tests {
         let mut counts = DeleteCounts::default();
         apply_outcome(&mut counts, "organization", DeleteOutcome::Deleted);
         assert_eq!(counts.total_deleted(), 0);
+    }
+
+    /// Records every `Prompt` handed to it and answers with a canned string,
+    /// standing in for a non-terminal consumer (the desktop route) that
+    /// answers a gate without ever touching a real terminal.
+    struct Recorder {
+        answer: String,
+        seen: std::sync::Mutex<Vec<crate::cli::stdin_coord::Prompt>>,
+    }
+    impl crate::cli::stdin_coord::PromptRoute for Recorder {
+        fn ask(&self, prompt: &crate::cli::stdin_coord::Prompt) -> Option<String> {
+            self.seen.lock().unwrap().push(prompt.clone());
+            Some(self.answer.clone())
+        }
+    }
+
+    /// Genuine coverage for the object-delete gate's `announce`, replacing
+    /// the tautological capture test Task 3 removed (it never called
+    /// `confirm_or_refuse` at all). Drives the gate for real through an
+    /// installed route and asserts both halves: the question text still
+    /// reaches the log sink, and the announced `Prompt` carries the `kind`
+    /// and `keys` a non-terminal consumer needs to render its own dialog.
+    #[test]
+    fn delete_gate_announces_and_writes_the_question() {
+        let buf = Buf::default();
+        let log = crate::log::Log::for_sink(
+            crate::cli::resolve::ColorMode::Plain,
+            Box::new(buf.clone()),
+        );
+        let route = std::sync::Arc::new(Recorder {
+            answer: "y".into(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let _guard = crate::cli::stdin_coord::install_route(route.clone());
+
+        let mut t = Tombstones::default();
+        t.hooks.insert("legacy-export".to_string(), 9137);
+        let out = confirm_or_refuse(&t, true, false, &log).unwrap();
+        assert!(matches!(out, ConfirmOutcome::Proceed));
+
+        let text = buf.text();
+        assert!(
+            text.contains("Proceed with deletion? [y/N] "),
+            "question missing from the sink: {text:?}"
+        );
+
+        let seen = route.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "expected exactly one announce: {seen:?}");
+        assert_eq!(seen[0].kind, crate::cli::stdin_coord::PromptKind::DeleteGate);
+        assert_eq!(seen[0].question, "Proceed with deletion? [y/N] ");
+        assert_eq!(
+            seen[0].keys,
+            vec![
+                crate::cli::stdin_coord::PromptKey::new('y', "delete them"),
+                crate::cli::stdin_coord::PromptKey::new('n', "cancel"),
+            ]
+        );
+    }
+
+    /// Same genuine-coverage shape for the delete-drift resolver.
+    #[test]
+    fn delete_drift_announces_and_writes_the_question() {
+        let buf = Buf::default();
+        let log = crate::log::Log::for_sink(
+            crate::cli::resolve::ColorMode::Plain,
+            Box::new(buf.clone()),
+        );
+        let route = std::sync::Arc::new(Recorder {
+            answer: "k".into(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let _guard = crate::cli::stdin_coord::install_route(route.clone());
+
+        let choice = resolve_delete_drift(&log, true, "hooks", "legacy-export").unwrap();
+        assert!(matches!(choice, DeleteDriftChoice::KeepDelete));
+
+        let text = buf.text();
+        assert!(
+            text.contains("[k]eep delete  [r]estore  [s]kip  [a]bort > "),
+            "question missing from the sink: {text:?}"
+        );
+
+        let seen = route.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "expected exactly one announce: {seen:?}");
+        assert_eq!(seen[0].kind, crate::cli::stdin_coord::PromptKind::DeleteDrift);
+        assert_eq!(
+            seen[0].keys,
+            vec![
+                crate::cli::stdin_coord::PromptKey::new('k', "keep delete"),
+                crate::cli::stdin_coord::PromptKey::new('r', "restore"),
+                crate::cli::stdin_coord::PromptKey::new('s', "skip"),
+                crate::cli::stdin_coord::PromptKey::new('a', "abort"),
+            ]
+        );
     }
 }

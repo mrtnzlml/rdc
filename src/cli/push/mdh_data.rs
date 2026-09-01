@@ -327,6 +327,14 @@ fn prompt_confirm_row_deletes(
     );
     progress.with_prompt(|| -> Result<bool> {
         use std::io::Write;
+        crate::cli::stdin_coord::announce(crate::cli::stdin_coord::Prompt {
+            kind: crate::cli::stdin_coord::PromptKind::MdhRowDelete,
+            question: "Proceed with the deletion(s)? [y/N] ".into(),
+            keys: vec![
+                crate::cli::stdin_coord::PromptKey::new('y', "delete them"),
+                crate::cli::stdin_coord::PromptKey::new('n', "cancel"),
+            ],
+        });
         let mut q = progress.writer();
         write!(q, "Proceed with the deletion(s)? [y/N] ").ok();
         q.flush().ok();
@@ -769,5 +777,78 @@ mod tests {
         let one = diff_rows(&[a.clone(), b.clone()], &[]);
         let two = diff_rows(&[b.clone(), a.clone()], &[]);
         assert_eq!(one, two, "op order must not depend on input order");
+    }
+
+    /// In-memory `Log` sink, standing in for an embedder (the desktop app
+    /// consumes rdc through `Log::for_sink`).
+    #[derive(Clone, Default)]
+    struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Buf {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    /// Records every `Prompt` handed to it and answers with a canned string,
+    /// standing in for a non-terminal consumer (the desktop route) that
+    /// answers a gate without ever touching a real terminal.
+    struct Recorder {
+        answer: String,
+        seen: std::sync::Mutex<Vec<crate::cli::stdin_coord::Prompt>>,
+    }
+    impl crate::cli::stdin_coord::PromptRoute for Recorder {
+        fn ask(&self, prompt: &crate::cli::stdin_coord::Prompt) -> Option<String> {
+            self.seen.lock().unwrap().push(prompt.clone());
+            Some(self.answer.clone())
+        }
+    }
+
+    /// Genuine coverage for the MDH row-delete gate's `announce`: drives
+    /// `prompt_confirm_row_deletes` for real through an installed route and
+    /// asserts both that the question text reaches the log sink and that
+    /// the announced `Prompt` carries the `kind` and `keys` a non-terminal
+    /// consumer needs.
+    #[test]
+    fn row_delete_gate_announces_and_writes_the_question() {
+        let buf = Buf::default();
+        let log = crate::log::Log::for_sink(
+            crate::cli::resolve::ColorMode::Plain,
+            Box::new(buf.clone()),
+        );
+        let route = std::sync::Arc::new(Recorder {
+            answer: "y".into(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let _guard = crate::cli::stdin_coord::install_route(route.clone());
+
+        let proceed = prompt_confirm_row_deletes(&log, "gl-codes", 3).unwrap();
+        assert!(proceed);
+
+        let text = buf.text();
+        assert!(
+            text.contains("Proceed with the deletion(s)? [y/N] "),
+            "question missing from the sink: {text:?}"
+        );
+
+        let seen = route.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "expected exactly one announce: {seen:?}");
+        assert_eq!(seen[0].kind, crate::cli::stdin_coord::PromptKind::MdhRowDelete);
+        assert_eq!(seen[0].question, "Proceed with the deletion(s)? [y/N] ");
+        assert_eq!(
+            seen[0].keys,
+            vec![
+                crate::cli::stdin_coord::PromptKey::new('y', "delete them"),
+                crate::cli::stdin_coord::PromptKey::new('n', "cancel"),
+            ]
+        );
     }
 }

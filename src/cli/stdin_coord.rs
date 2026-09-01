@@ -33,10 +33,6 @@ pub struct PromptKey {
 }
 
 impl PromptKey {
-    // Only every prompt SITE (wired in the next task of this plan) builds
-    // `keys` with this; nothing in this task's production code calls it,
-    // and the workspace denies unused-item warnings outright.
-    #[allow(dead_code)]
     pub fn new(key: char, label: &str) -> Self {
         Self {
             key,
@@ -50,15 +46,16 @@ impl PromptKey {
 ///
 /// `Unknown` is the only variant this task's own code constructs
 /// (`Prompt::unknown`, the fallback for a read whose site never
-/// announced); the other eight are named ahead of the prompt sites that
-/// will construct them (`announce` call sites land in the next task of
-/// this plan). `dead_code` is denied workspace-wide, hence the explicit
-/// allow rather than leaving this route half-typed.
-#[allow(dead_code)]
+/// announced). `PushDrift` is named ahead of its site: the push-drift
+/// prompts (`resolve_push_drift`, and the mid-cycle drift check in
+/// `pull/common.rs`) both route through the shared conflict resolver and
+/// are announced as `Conflict` — same decision, same keys — so nothing
+/// constructs `PushDrift` yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
     Conflict,
     RemoteDelete,
+    #[allow(dead_code)]
     PushDrift,
     BulkConfirm,
     DeleteGate,
@@ -149,11 +146,6 @@ impl Drop for RouteGuard {
 /// Declare what the next coordinated read is asking. Call immediately
 /// before writing the question. A no-op when no route is installed, which
 /// is every CLI invocation.
-///
-/// No production call site exists yet — every prompt site gains its
-/// `announce` call in the next task of this plan. Explicit allow for the
-/// same reason as [`install_route`].
-#[allow(dead_code)]
 pub fn announce(p: Prompt) {
     if ROUTE.with(|r| r.borrow().is_some()) {
         PENDING.with(|slot| *slot.borrow_mut() = Some(p));

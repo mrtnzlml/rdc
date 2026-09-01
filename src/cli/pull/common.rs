@@ -950,6 +950,10 @@ fn resolve_conflict_interactive(
     // deadlock. Outside watch the coordinator reads stdin directly. This
     // path is normally pre-handled by the sync conflict resolver, but a
     // mid-cycle drift can still surface it.
+    //
+    // Announced as PromptKind::Conflict by the shared resolver — this is the
+    // same decision with the same keys, reached mid-cycle rather than in the
+    // classify phase.
     let resolution = prompt_resolve(
         crate::cli::stdin_coord::CoordinatorStdin::new(),
         progress.writer(),

@@ -764,6 +764,14 @@ fn prompt_confirm_index_drops(
     report_pending_index_drops(progress, collection_name, pending_regular, pending_search);
     progress.with_prompt(|| -> Result<bool> {
         use std::io::Write;
+        crate::cli::stdin_coord::announce(crate::cli::stdin_coord::Prompt {
+            kind: crate::cli::stdin_coord::PromptKind::MdhIndexDrop,
+            question: "Proceed with the drop(s)? [y/N] ".into(),
+            keys: vec![
+                crate::cli::stdin_coord::PromptKey::new('y', "drop them"),
+                crate::cli::stdin_coord::PromptKey::new('n', "cancel"),
+            ],
+        });
         let mut q = progress.writer();
         write!(q, "Proceed with the drop(s)? [y/N] ").ok();
         q.flush().ok();
@@ -1563,6 +1571,66 @@ mod tests {
         assert!(
             server.received_requests().await.unwrap_or_default().is_empty(),
             "no creates → no verification requests"
+        );
+    }
+
+    /// Records every `Prompt` handed to it and answers with a canned string,
+    /// standing in for a non-terminal consumer (the desktop route) that
+    /// answers a gate without ever touching a real terminal.
+    struct Recorder {
+        answer: String,
+        seen: std::sync::Mutex<Vec<crate::cli::stdin_coord::Prompt>>,
+    }
+    impl crate::cli::stdin_coord::PromptRoute for Recorder {
+        fn ask(&self, prompt: &crate::cli::stdin_coord::Prompt) -> Option<String> {
+            self.seen.lock().unwrap().push(prompt.clone());
+            Some(self.answer.clone())
+        }
+    }
+
+    /// Genuine coverage for the MDH index-drop gate's `announce`: drives
+    /// `prompt_confirm_index_drops` for real through an installed route and
+    /// asserts both that the question text reaches the log sink and that
+    /// the announced `Prompt` carries the `kind` and `keys` a non-terminal
+    /// consumer needs.
+    #[test]
+    fn index_drop_gate_announces_and_writes_the_question() {
+        let buf = Buf::default();
+        let log = crate::log::Log::for_sink(
+            crate::cli::resolve::ColorMode::Plain,
+            Box::new(buf.clone()),
+        );
+        let route = std::sync::Arc::new(Recorder {
+            answer: "y".into(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let _guard = crate::cli::stdin_coord::install_route(route.clone());
+
+        let proceed = prompt_confirm_index_drops(
+            &log,
+            "vendors",
+            &["idx_vendor_no".to_string()],
+            &[],
+        )
+        .unwrap();
+        assert!(proceed);
+
+        let text = buf.text();
+        assert!(
+            text.contains("Proceed with the drop(s)? [y/N] "),
+            "question missing from the sink: {text:?}"
+        );
+
+        let seen = route.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "expected exactly one announce: {seen:?}");
+        assert_eq!(seen[0].kind, crate::cli::stdin_coord::PromptKind::MdhIndexDrop);
+        assert_eq!(seen[0].question, "Proceed with the drop(s)? [y/N] ");
+        assert_eq!(
+            seen[0].keys,
+            vec![
+                crate::cli::stdin_coord::PromptKey::new('y', "drop them"),
+                crate::cli::stdin_coord::PromptKey::new('n', "cancel"),
+            ]
         );
     }
 }
