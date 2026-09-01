@@ -38,10 +38,12 @@ void main() {
     final s = AppState(Settings(parentFolder: '/tmp'));
     final k = s.envKey('/tmp/acme', 'dev');
     s.pendingPrompts[k] = _prompt('/tmp/acme', 'dev', 7);
-    // Simulating the guard in the SyncPhase_PromptResolved arm.
-    if (s.pendingPrompts[k]?.id == BigInt.from(6)) s.pendingPrompts.remove(k);
+    // Both SyncPhase_PromptResolved arms call this directly, so driving it
+    // here (rather than reimplementing the guard inline) actually exercises
+    // the production code path.
+    s.resolvePrompt(k, BigInt.from(6));
     expect(s.pendingPrompts[k], isNotNull);
-    if (s.pendingPrompts[k]?.id == BigInt.from(7)) s.pendingPrompts.remove(k);
+    s.resolvePrompt(k, BigInt.from(7));
     expect(s.pendingPrompts[k], isNull);
   });
 

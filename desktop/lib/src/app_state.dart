@@ -277,7 +277,7 @@ class AppState extends ChangeNotifier {
               env: env.name,
             );
           case SyncPhase_PromptResolved(:final id):
-            if (pendingPrompts[k]?.id == id) pendingPrompts.remove(k);
+            resolvePrompt(k, id);
           case SyncPhase_Done(:final fileCount):
             syncState[k] = SyncState.done;
             syncMessage[k] = 'Synced · $fileCount files';
@@ -294,10 +294,18 @@ class AppState extends ChangeNotifier {
       },
       onError: (Object e) {
         syncState[k] = SyncState.error;
+        pendingPrompts.remove(k);
         syncMessage[k] = errorText(e);
         notifyListeners();
       },
     );
+  }
+
+  /// Clear the pending prompt for `k`, but only if it is the one being
+  /// resolved. A watch and a displaced predecessor can both be unwinding at
+  /// once, so a late resolve must not clear a newer prompt.
+  void resolvePrompt(String k, BigInt id) {
+    if (pendingPrompts[k]?.id == id) pendingPrompts.remove(k);
   }
 
   void watchEnvItem(ProjectItem item, EnvSummary env) {
@@ -335,7 +343,7 @@ class AppState extends ChangeNotifier {
               env: env.name,
             );
           case SyncPhase_PromptResolved(:final id):
-            if (pendingPrompts[k]?.id == id) pendingPrompts.remove(k);
+            resolvePrompt(k, id);
           case SyncPhase_Idle(:final nextPollSecs):
             w.nextPollSecs = nextPollSecs?.toInt();
           case SyncPhase_Done():
@@ -354,6 +362,7 @@ class AppState extends ChangeNotifier {
       onError: (Object e) {
         watch.remove(k);
         syncState[k] = SyncState.error;
+        pendingPrompts.remove(k);
         syncMessage[k] = errorText(e);
         notifyListeners();
       },
