@@ -55,14 +55,18 @@ extension SyncPhasePatterns on SyncPhase {
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeMap<TResult extends Object?>({TResult Function( SyncPhase_Started value)?  started,TResult Function( SyncPhase_Log value)?  log,TResult Function( SyncPhase_Done value)?  done,TResult Function( SyncPhase_Error value)?  error,required TResult orElse(),}){
+@optionalTypeArgs TResult maybeMap<TResult extends Object?>({TResult Function( SyncPhase_Started value)?  started,TResult Function( SyncPhase_Log value)?  log,TResult Function( SyncPhase_Prompt value)?  prompt,TResult Function( SyncPhase_PromptResolved value)?  promptResolved,TResult Function( SyncPhase_Idle value)?  idle,TResult Function( SyncPhase_Done value)?  done,TResult Function( SyncPhase_Error value)?  error,TResult Function( SyncPhase_Stopped value)?  stopped,required TResult orElse(),}){
 final _that = this;
 switch (_that) {
 case SyncPhase_Started() when started != null:
 return started(_that);case SyncPhase_Log() when log != null:
-return log(_that);case SyncPhase_Done() when done != null:
+return log(_that);case SyncPhase_Prompt() when prompt != null:
+return prompt(_that);case SyncPhase_PromptResolved() when promptResolved != null:
+return promptResolved(_that);case SyncPhase_Idle() when idle != null:
+return idle(_that);case SyncPhase_Done() when done != null:
 return done(_that);case SyncPhase_Error() when error != null:
-return error(_that);case _:
+return error(_that);case SyncPhase_Stopped() when stopped != null:
+return stopped(_that);case _:
   return orElse();
 
 }
@@ -80,14 +84,18 @@ return error(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult map<TResult extends Object?>({required TResult Function( SyncPhase_Started value)  started,required TResult Function( SyncPhase_Log value)  log,required TResult Function( SyncPhase_Done value)  done,required TResult Function( SyncPhase_Error value)  error,}){
+@optionalTypeArgs TResult map<TResult extends Object?>({required TResult Function( SyncPhase_Started value)  started,required TResult Function( SyncPhase_Log value)  log,required TResult Function( SyncPhase_Prompt value)  prompt,required TResult Function( SyncPhase_PromptResolved value)  promptResolved,required TResult Function( SyncPhase_Idle value)  idle,required TResult Function( SyncPhase_Done value)  done,required TResult Function( SyncPhase_Error value)  error,required TResult Function( SyncPhase_Stopped value)  stopped,}){
 final _that = this;
 switch (_that) {
 case SyncPhase_Started():
 return started(_that);case SyncPhase_Log():
-return log(_that);case SyncPhase_Done():
+return log(_that);case SyncPhase_Prompt():
+return prompt(_that);case SyncPhase_PromptResolved():
+return promptResolved(_that);case SyncPhase_Idle():
+return idle(_that);case SyncPhase_Done():
 return done(_that);case SyncPhase_Error():
-return error(_that);}
+return error(_that);case SyncPhase_Stopped():
+return stopped(_that);}
 }
 /// A variant of `map` that fallback to returning `null`.
 ///
@@ -101,14 +109,18 @@ return error(_that);}
 /// }
 /// ```
 
-@optionalTypeArgs TResult? mapOrNull<TResult extends Object?>({TResult? Function( SyncPhase_Started value)?  started,TResult? Function( SyncPhase_Log value)?  log,TResult? Function( SyncPhase_Done value)?  done,TResult? Function( SyncPhase_Error value)?  error,}){
+@optionalTypeArgs TResult? mapOrNull<TResult extends Object?>({TResult? Function( SyncPhase_Started value)?  started,TResult? Function( SyncPhase_Log value)?  log,TResult? Function( SyncPhase_Prompt value)?  prompt,TResult? Function( SyncPhase_PromptResolved value)?  promptResolved,TResult? Function( SyncPhase_Idle value)?  idle,TResult? Function( SyncPhase_Done value)?  done,TResult? Function( SyncPhase_Error value)?  error,TResult? Function( SyncPhase_Stopped value)?  stopped,}){
 final _that = this;
 switch (_that) {
 case SyncPhase_Started() when started != null:
 return started(_that);case SyncPhase_Log() when log != null:
-return log(_that);case SyncPhase_Done() when done != null:
+return log(_that);case SyncPhase_Prompt() when prompt != null:
+return prompt(_that);case SyncPhase_PromptResolved() when promptResolved != null:
+return promptResolved(_that);case SyncPhase_Idle() when idle != null:
+return idle(_that);case SyncPhase_Done() when done != null:
 return done(_that);case SyncPhase_Error() when error != null:
-return error(_that);case _:
+return error(_that);case SyncPhase_Stopped() when stopped != null:
+return stopped(_that);case _:
   return null;
 
 }
@@ -125,13 +137,17 @@ return error(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function()?  started,TResult Function( String line)?  log,TResult Function( BigInt fileCount)?  done,TResult Function( String message)?  error,required TResult orElse(),}) {final _that = this;
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function()?  started,TResult Function( String line)?  log,TResult Function( BigInt id,  PromptKindDto kind,  String question,  List<PromptChoice> keys)?  prompt,TResult Function( BigInt id)?  promptResolved,TResult Function( BigInt? nextPollSecs)?  idle,TResult Function( BigInt fileCount)?  done,TResult Function( String message)?  error,TResult Function()?  stopped,required TResult orElse(),}) {final _that = this;
 switch (_that) {
 case SyncPhase_Started() when started != null:
 return started();case SyncPhase_Log() when log != null:
-return log(_that.line);case SyncPhase_Done() when done != null:
+return log(_that.line);case SyncPhase_Prompt() when prompt != null:
+return prompt(_that.id,_that.kind,_that.question,_that.keys);case SyncPhase_PromptResolved() when promptResolved != null:
+return promptResolved(_that.id);case SyncPhase_Idle() when idle != null:
+return idle(_that.nextPollSecs);case SyncPhase_Done() when done != null:
 return done(_that.fileCount);case SyncPhase_Error() when error != null:
-return error(_that.message);case _:
+return error(_that.message);case SyncPhase_Stopped() when stopped != null:
+return stopped();case _:
   return orElse();
 
 }
@@ -149,13 +165,17 @@ return error(_that.message);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function()  started,required TResult Function( String line)  log,required TResult Function( BigInt fileCount)  done,required TResult Function( String message)  error,}) {final _that = this;
+@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function()  started,required TResult Function( String line)  log,required TResult Function( BigInt id,  PromptKindDto kind,  String question,  List<PromptChoice> keys)  prompt,required TResult Function( BigInt id)  promptResolved,required TResult Function( BigInt? nextPollSecs)  idle,required TResult Function( BigInt fileCount)  done,required TResult Function( String message)  error,required TResult Function()  stopped,}) {final _that = this;
 switch (_that) {
 case SyncPhase_Started():
 return started();case SyncPhase_Log():
-return log(_that.line);case SyncPhase_Done():
+return log(_that.line);case SyncPhase_Prompt():
+return prompt(_that.id,_that.kind,_that.question,_that.keys);case SyncPhase_PromptResolved():
+return promptResolved(_that.id);case SyncPhase_Idle():
+return idle(_that.nextPollSecs);case SyncPhase_Done():
 return done(_that.fileCount);case SyncPhase_Error():
-return error(_that.message);}
+return error(_that.message);case SyncPhase_Stopped():
+return stopped();}
 }
 /// A variant of `when` that fallback to returning `null`
 ///
@@ -169,13 +189,17 @@ return error(_that.message);}
 /// }
 /// ```
 
-@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function()?  started,TResult? Function( String line)?  log,TResult? Function( BigInt fileCount)?  done,TResult? Function( String message)?  error,}) {final _that = this;
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function()?  started,TResult? Function( String line)?  log,TResult? Function( BigInt id,  PromptKindDto kind,  String question,  List<PromptChoice> keys)?  prompt,TResult? Function( BigInt id)?  promptResolved,TResult? Function( BigInt? nextPollSecs)?  idle,TResult? Function( BigInt fileCount)?  done,TResult? Function( String message)?  error,TResult? Function()?  stopped,}) {final _that = this;
 switch (_that) {
 case SyncPhase_Started() when started != null:
 return started();case SyncPhase_Log() when log != null:
-return log(_that.line);case SyncPhase_Done() when done != null:
+return log(_that.line);case SyncPhase_Prompt() when prompt != null:
+return prompt(_that.id,_that.kind,_that.question,_that.keys);case SyncPhase_PromptResolved() when promptResolved != null:
+return promptResolved(_that.id);case SyncPhase_Idle() when idle != null:
+return idle(_that.nextPollSecs);case SyncPhase_Done() when done != null:
 return done(_that.fileCount);case SyncPhase_Error() when error != null:
-return error(_that.message);case _:
+return error(_that.message);case SyncPhase_Stopped() when stopped != null:
+return stopped();case _:
   return null;
 
 }
@@ -275,6 +299,216 @@ class _$SyncPhase_LogCopyWithImpl<$Res>
   return _then(SyncPhase_Log(
 line: null == line ? _self.line : line // ignore: cast_nullable_to_non_nullable
 as String,
+  ));
+}
+
+
+}
+
+/// @nodoc
+
+
+class SyncPhase_Prompt extends SyncPhase {
+  const SyncPhase_Prompt({required this.id, required this.kind, required this.question, required final  List<PromptChoice> keys}): _keys = keys,super._();
+  
+
+ final  BigInt id;
+ final  PromptKindDto kind;
+ final  String question;
+ final  List<PromptChoice> _keys;
+ List<PromptChoice> get keys {
+  if (_keys is EqualUnmodifiableListView) return _keys;
+  // ignore: implicit_dynamic_type
+  return EqualUnmodifiableListView(_keys);
+}
+
+
+/// Create a copy of SyncPhase
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$SyncPhase_PromptCopyWith<SyncPhase_Prompt> get copyWith => _$SyncPhase_PromptCopyWithImpl<SyncPhase_Prompt>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase_Prompt&&(identical(other.id, id) || other.id == id)&&(identical(other.kind, kind) || other.kind == kind)&&(identical(other.question, question) || other.question == question)&&const DeepCollectionEquality().equals(other._keys, _keys));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,id,kind,question,const DeepCollectionEquality().hash(_keys));
+
+@override
+String toString() {
+  return 'SyncPhase.prompt(id: $id, kind: $kind, question: $question, keys: $keys)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $SyncPhase_PromptCopyWith<$Res> implements $SyncPhaseCopyWith<$Res> {
+  factory $SyncPhase_PromptCopyWith(SyncPhase_Prompt value, $Res Function(SyncPhase_Prompt) _then) = _$SyncPhase_PromptCopyWithImpl;
+@useResult
+$Res call({
+ BigInt id, PromptKindDto kind, String question, List<PromptChoice> keys
+});
+
+
+
+
+}
+/// @nodoc
+class _$SyncPhase_PromptCopyWithImpl<$Res>
+    implements $SyncPhase_PromptCopyWith<$Res> {
+  _$SyncPhase_PromptCopyWithImpl(this._self, this._then);
+
+  final SyncPhase_Prompt _self;
+  final $Res Function(SyncPhase_Prompt) _then;
+
+/// Create a copy of SyncPhase
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? id = null,Object? kind = null,Object? question = null,Object? keys = null,}) {
+  return _then(SyncPhase_Prompt(
+id: null == id ? _self.id : id // ignore: cast_nullable_to_non_nullable
+as BigInt,kind: null == kind ? _self.kind : kind // ignore: cast_nullable_to_non_nullable
+as PromptKindDto,question: null == question ? _self.question : question // ignore: cast_nullable_to_non_nullable
+as String,keys: null == keys ? _self._keys : keys // ignore: cast_nullable_to_non_nullable
+as List<PromptChoice>,
+  ));
+}
+
+
+}
+
+/// @nodoc
+
+
+class SyncPhase_PromptResolved extends SyncPhase {
+  const SyncPhase_PromptResolved({required this.id}): super._();
+  
+
+ final  BigInt id;
+
+/// Create a copy of SyncPhase
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$SyncPhase_PromptResolvedCopyWith<SyncPhase_PromptResolved> get copyWith => _$SyncPhase_PromptResolvedCopyWithImpl<SyncPhase_PromptResolved>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase_PromptResolved&&(identical(other.id, id) || other.id == id));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,id);
+
+@override
+String toString() {
+  return 'SyncPhase.promptResolved(id: $id)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $SyncPhase_PromptResolvedCopyWith<$Res> implements $SyncPhaseCopyWith<$Res> {
+  factory $SyncPhase_PromptResolvedCopyWith(SyncPhase_PromptResolved value, $Res Function(SyncPhase_PromptResolved) _then) = _$SyncPhase_PromptResolvedCopyWithImpl;
+@useResult
+$Res call({
+ BigInt id
+});
+
+
+
+
+}
+/// @nodoc
+class _$SyncPhase_PromptResolvedCopyWithImpl<$Res>
+    implements $SyncPhase_PromptResolvedCopyWith<$Res> {
+  _$SyncPhase_PromptResolvedCopyWithImpl(this._self, this._then);
+
+  final SyncPhase_PromptResolved _self;
+  final $Res Function(SyncPhase_PromptResolved) _then;
+
+/// Create a copy of SyncPhase
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? id = null,}) {
+  return _then(SyncPhase_PromptResolved(
+id: null == id ? _self.id : id // ignore: cast_nullable_to_non_nullable
+as BigInt,
+  ));
+}
+
+
+}
+
+/// @nodoc
+
+
+class SyncPhase_Idle extends SyncPhase {
+  const SyncPhase_Idle({this.nextPollSecs}): super._();
+  
+
+ final  BigInt? nextPollSecs;
+
+/// Create a copy of SyncPhase
+/// with the given fields replaced by the non-null parameter values.
+@JsonKey(includeFromJson: false, includeToJson: false)
+@pragma('vm:prefer-inline')
+$SyncPhase_IdleCopyWith<SyncPhase_Idle> get copyWith => _$SyncPhase_IdleCopyWithImpl<SyncPhase_Idle>(this, _$identity);
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase_Idle&&(identical(other.nextPollSecs, nextPollSecs) || other.nextPollSecs == nextPollSecs));
+}
+
+
+@override
+int get hashCode => Object.hash(runtimeType,nextPollSecs);
+
+@override
+String toString() {
+  return 'SyncPhase.idle(nextPollSecs: $nextPollSecs)';
+}
+
+
+}
+
+/// @nodoc
+abstract mixin class $SyncPhase_IdleCopyWith<$Res> implements $SyncPhaseCopyWith<$Res> {
+  factory $SyncPhase_IdleCopyWith(SyncPhase_Idle value, $Res Function(SyncPhase_Idle) _then) = _$SyncPhase_IdleCopyWithImpl;
+@useResult
+$Res call({
+ BigInt? nextPollSecs
+});
+
+
+
+
+}
+/// @nodoc
+class _$SyncPhase_IdleCopyWithImpl<$Res>
+    implements $SyncPhase_IdleCopyWith<$Res> {
+  _$SyncPhase_IdleCopyWithImpl(this._self, this._then);
+
+  final SyncPhase_Idle _self;
+  final $Res Function(SyncPhase_Idle) _then;
+
+/// Create a copy of SyncPhase
+/// with the given fields replaced by the non-null parameter values.
+@pragma('vm:prefer-inline') $Res call({Object? nextPollSecs = freezed,}) {
+  return _then(SyncPhase_Idle(
+nextPollSecs: freezed == nextPollSecs ? _self.nextPollSecs : nextPollSecs // ignore: cast_nullable_to_non_nullable
+as BigInt?,
   ));
 }
 
@@ -412,5 +646,37 @@ as String,
 
 
 }
+
+/// @nodoc
+
+
+class SyncPhase_Stopped extends SyncPhase {
+  const SyncPhase_Stopped(): super._();
+  
+
+
+
+
+
+
+@override
+bool operator ==(Object other) {
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase_Stopped);
+}
+
+
+@override
+int get hashCode => runtimeType.hashCode;
+
+@override
+String toString() {
+  return 'SyncPhase.stopped()';
+}
+
+
+}
+
+
+
 
 // dart format on

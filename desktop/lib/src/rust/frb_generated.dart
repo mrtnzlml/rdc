@@ -597,6 +597,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  BigInt dco_decode_box_autoadd_u_64(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_u_64(raw);
+  }
+
+  @protected
   EditConnectionInput dco_decode_edit_connection_input(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
@@ -660,6 +666,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<PromptChoice> dco_decode_list_prompt_choice(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_prompt_choice).toList();
+  }
+
+  @protected
   String? dco_decode_opt_String(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw == null ? null : dco_decode_String(raw);
@@ -678,6 +690,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  BigInt? dco_decode_opt_box_autoadd_u_64(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_box_autoadd_u_64(raw);
+  }
+
+  @protected
   ProjectSummary dco_decode_project_summary(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
@@ -692,6 +710,24 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  PromptChoice dco_decode_prompt_choice(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 2)
+      throw Exception('unexpected arr length: expect 2 but see ${arr.length}');
+    return PromptChoice(
+      key: dco_decode_String(arr[0]),
+      label: dco_decode_String(arr[1]),
+    );
+  }
+
+  @protected
+  PromptKindDto dco_decode_prompt_kind_dto(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return PromptKindDto.values[raw as int];
+  }
+
+  @protected
   SyncPhase dco_decode_sync_phase(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     switch (raw[0]) {
@@ -700,9 +736,24 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       case 1:
         return SyncPhase_Log(line: dco_decode_String(raw[1]));
       case 2:
-        return SyncPhase_Done(fileCount: dco_decode_u_64(raw[1]));
+        return SyncPhase_Prompt(
+          id: dco_decode_u_64(raw[1]),
+          kind: dco_decode_prompt_kind_dto(raw[2]),
+          question: dco_decode_String(raw[3]),
+          keys: dco_decode_list_prompt_choice(raw[4]),
+        );
       case 3:
+        return SyncPhase_PromptResolved(id: dco_decode_u_64(raw[1]));
+      case 4:
+        return SyncPhase_Idle(
+          nextPollSecs: dco_decode_opt_box_autoadd_u_64(raw[1]),
+        );
+      case 5:
+        return SyncPhase_Done(fileCount: dco_decode_u_64(raw[1]));
+      case 6:
         return SyncPhase_Error(message: dco_decode_String(raw[1]));
+      case 7:
+        return SyncPhase_Stopped();
       default:
         throw Exception("unreachable");
     }
@@ -807,6 +858,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  BigInt sse_decode_box_autoadd_u_64(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_u_64(deserializer));
+  }
+
+  @protected
   EditConnectionInput sse_decode_edit_connection_input(
     SseDeserializer deserializer,
   ) {
@@ -894,6 +951,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<PromptChoice> sse_decode_list_prompt_choice(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <PromptChoice>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_prompt_choice(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
   String? sse_decode_opt_String(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
@@ -929,6 +1000,17 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  BigInt? sse_decode_opt_box_autoadd_u_64(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_box_autoadd_u_64(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
   ProjectSummary sse_decode_project_summary(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var var_id = sse_decode_String(deserializer);
@@ -944,6 +1026,21 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  PromptChoice sse_decode_prompt_choice(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_key = sse_decode_String(deserializer);
+    var var_label = sse_decode_String(deserializer);
+    return PromptChoice(key: var_key, label: var_label);
+  }
+
+  @protected
+  PromptKindDto sse_decode_prompt_kind_dto(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var inner = sse_decode_i_32(deserializer);
+    return PromptKindDto.values[inner];
+  }
+
+  @protected
   SyncPhase sse_decode_sync_phase(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
@@ -955,11 +1052,30 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         var var_line = sse_decode_String(deserializer);
         return SyncPhase_Log(line: var_line);
       case 2:
+        var var_id = sse_decode_u_64(deserializer);
+        var var_kind = sse_decode_prompt_kind_dto(deserializer);
+        var var_question = sse_decode_String(deserializer);
+        var var_keys = sse_decode_list_prompt_choice(deserializer);
+        return SyncPhase_Prompt(
+          id: var_id,
+          kind: var_kind,
+          question: var_question,
+          keys: var_keys,
+        );
+      case 3:
+        var var_id = sse_decode_u_64(deserializer);
+        return SyncPhase_PromptResolved(id: var_id);
+      case 4:
+        var var_nextPollSecs = sse_decode_opt_box_autoadd_u_64(deserializer);
+        return SyncPhase_Idle(nextPollSecs: var_nextPollSecs);
+      case 5:
         var var_fileCount = sse_decode_u_64(deserializer);
         return SyncPhase_Done(fileCount: var_fileCount);
-      case 3:
+      case 6:
         var var_message = sse_decode_String(deserializer);
         return SyncPhase_Error(message: var_message);
+      case 7:
+        return SyncPhase_Stopped();
       default:
         throw UnimplementedError('');
     }
@@ -1075,6 +1191,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_box_autoadd_u_64(BigInt self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_u_64(self, serializer);
+  }
+
+  @protected
   void sse_encode_edit_connection_input(
     EditConnectionInput self,
     SseSerializer serializer,
@@ -1147,6 +1269,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_list_prompt_choice(
+    List<PromptChoice> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_prompt_choice(item, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
@@ -1183,6 +1317,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_opt_box_autoadd_u_64(BigInt? self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_box_autoadd_u_64(self, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_project_summary(
     ProjectSummary self,
     SseSerializer serializer,
@@ -1195,6 +1339,22 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_prompt_choice(PromptChoice self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.key, serializer);
+    sse_encode_String(self.label, serializer);
+  }
+
+  @protected
+  void sse_encode_prompt_kind_dto(
+    PromptKindDto self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.index, serializer);
+  }
+
+  @protected
   void sse_encode_sync_phase(SyncPhase self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     switch (self) {
@@ -1203,12 +1363,31 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       case SyncPhase_Log(line: final line):
         sse_encode_i_32(1, serializer);
         sse_encode_String(line, serializer);
-      case SyncPhase_Done(fileCount: final fileCount):
+      case SyncPhase_Prompt(
+        id: final id,
+        kind: final kind,
+        question: final question,
+        keys: final keys,
+      ):
         sse_encode_i_32(2, serializer);
+        sse_encode_u_64(id, serializer);
+        sse_encode_prompt_kind_dto(kind, serializer);
+        sse_encode_String(question, serializer);
+        sse_encode_list_prompt_choice(keys, serializer);
+      case SyncPhase_PromptResolved(id: final id):
+        sse_encode_i_32(3, serializer);
+        sse_encode_u_64(id, serializer);
+      case SyncPhase_Idle(nextPollSecs: final nextPollSecs):
+        sse_encode_i_32(4, serializer);
+        sse_encode_opt_box_autoadd_u_64(nextPollSecs, serializer);
+      case SyncPhase_Done(fileCount: final fileCount):
+        sse_encode_i_32(5, serializer);
         sse_encode_u_64(fileCount, serializer);
       case SyncPhase_Error(message: final message):
-        sse_encode_i_32(3, serializer);
+        sse_encode_i_32(6, serializer);
         sse_encode_String(message, serializer);
+      case SyncPhase_Stopped():
+        sse_encode_i_32(7, serializer);
     }
   }
 

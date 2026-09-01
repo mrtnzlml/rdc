@@ -48,6 +48,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ProjectSummary dco_decode_box_autoadd_project_summary(dynamic raw);
 
   @protected
+  BigInt dco_decode_box_autoadd_u_64(dynamic raw);
+
+  @protected
   EditConnectionInput dco_decode_edit_connection_input(dynamic raw);
 
   @protected
@@ -69,6 +72,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<ProjectSummary> dco_decode_list_project_summary(dynamic raw);
 
   @protected
+  List<PromptChoice> dco_decode_list_prompt_choice(dynamic raw);
+
+  @protected
   String? dco_decode_opt_String(dynamic raw);
 
   @protected
@@ -78,7 +84,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ProjectSummary? dco_decode_opt_box_autoadd_project_summary(dynamic raw);
 
   @protected
+  BigInt? dco_decode_opt_box_autoadd_u_64(dynamic raw);
+
+  @protected
   ProjectSummary dco_decode_project_summary(dynamic raw);
+
+  @protected
+  PromptChoice dco_decode_prompt_choice(dynamic raw);
+
+  @protected
+  PromptKindDto dco_decode_prompt_kind_dto(dynamic raw);
 
   @protected
   SyncPhase dco_decode_sync_phase(dynamic raw);
@@ -128,6 +143,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  BigInt sse_decode_box_autoadd_u_64(SseDeserializer deserializer);
+
+  @protected
   EditConnectionInput sse_decode_edit_connection_input(
     SseDeserializer deserializer,
   );
@@ -153,6 +171,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  List<PromptChoice> sse_decode_list_prompt_choice(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   String? sse_decode_opt_String(SseDeserializer deserializer);
 
   @protected
@@ -164,7 +187,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  BigInt? sse_decode_opt_box_autoadd_u_64(SseDeserializer deserializer);
+
+  @protected
   ProjectSummary sse_decode_project_summary(SseDeserializer deserializer);
+
+  @protected
+  PromptChoice sse_decode_prompt_choice(SseDeserializer deserializer);
+
+  @protected
+  PromptKindDto sse_decode_prompt_kind_dto(SseDeserializer deserializer);
 
   @protected
   SyncPhase sse_decode_sync_phase(SseDeserializer deserializer);
@@ -227,6 +259,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_box_autoadd_u_64(BigInt self, SseSerializer serializer);
+
+  @protected
   void sse_encode_edit_connection_input(
     EditConnectionInput self,
     SseSerializer serializer,
@@ -260,6 +295,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_list_prompt_choice(
+    List<PromptChoice> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer);
 
   @protected
@@ -275,10 +316,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_box_autoadd_u_64(BigInt? self, SseSerializer serializer);
+
+  @protected
   void sse_encode_project_summary(
     ProjectSummary self,
     SseSerializer serializer,
   );
+
+  @protected
+  void sse_encode_prompt_choice(PromptChoice self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_prompt_kind_dto(PromptKindDto self, SseSerializer serializer);
 
   @protected
   void sse_encode_sync_phase(SyncPhase self, SseSerializer serializer);

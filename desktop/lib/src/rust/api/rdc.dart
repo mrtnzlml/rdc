@@ -10,7 +10,7 @@ part 'rdc.freezed.dart';
 
 // These functions are ignored because they are not marked as `pub`: `block_on`, `valid_env_name`, `write_credentials`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `LineForwarder`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `flush`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `from`, `write`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `assert_fields_are_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `flush`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `from`, `write`
 
 /// rdc's package version, surfaced to the app's About box.
 Future<String?> rdcVersion() => RustLib.instance.api.crateApiRdcRdcVersion();
@@ -83,9 +83,10 @@ Future<ProjectSummary> renameEnv({
   new_: new_,
 );
 
-/// Pull-only sync of one environment. Scaffolds init files, resolves the token
-/// (silent re-login in password mode), then runs `sync_no_push`. Progress is
-/// streamed as `SyncPhase`.
+/// Two-way sync of one environment. Scaffolds init files, resolves the token
+/// (silent re-login in password mode), then runs one reconciliation cycle
+/// under `EmbedSyncOptions::default()` (pull and push, prompting on a gate
+/// rather than bailing). Progress is streamed as `SyncPhase`.
 ///
 /// Returns `Ok(())` even when the sync itself fails — the terminal outcome
 /// (success or error) is conveyed to the caller via the `SyncPhase::Done` /
@@ -269,6 +270,44 @@ class ProjectSummary {
           envs == other.envs;
 }
 
+/// One answerable choice, as offered to the UI. `key` is a String rather
+/// than a char because FRB has no char; it is always exactly one character.
+class PromptChoice {
+  final String key;
+  final String label;
+
+  const PromptChoice({required this.key, required this.label});
+
+  @override
+  int get hashCode => key.hashCode ^ label.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is PromptChoice &&
+          runtimeType == other.runtimeType &&
+          key == other.key &&
+          label == other.label;
+}
+
+/// Mirrors `rdc::cli::stdin_coord::PromptKind` across the bridge.
+enum PromptKindDto {
+  conflict,
+  remoteDelete,
+  pushDrift,
+  bulkConfirm,
+  deleteGate,
+  deleteDrift,
+  mdhIndexDrop,
+  mdhRowDelete,
+
+  /// A coordinated read whose site never announced. Should be unreachable;
+  /// it exists so that if it ever happens the UI can say so instead of
+  /// silently mislabelling the prompt as a conflict. Render it as an
+  /// explicit "unrecognised prompt" state, not as a normal dialog.
+  unknown,
+}
+
 @freezed
 sealed class SyncPhase with _$SyncPhase {
   const SyncPhase._();
@@ -277,6 +316,27 @@ sealed class SyncPhase with _$SyncPhase {
 
   /// One line of rdc's real, rendered sync log (plain text, no color).
   const factory SyncPhase.log({required String line}) = SyncPhase_Log;
+
+  /// A cycle is blocked waiting for an answer. Reply with `answer_prompt`
+  /// using this `id`. The diff/list this refers to has already arrived as
+  /// `Log` lines.
+  const factory SyncPhase.prompt({
+    required BigInt id,
+    required PromptKindDto kind,
+    required String question,
+    required List<PromptChoice> keys,
+  }) = SyncPhase_Prompt;
+
+  /// The prompt with this id no longer needs an answer (the watch stopped,
+  /// or the cycle was torn down). Close the dialog.
+  const factory SyncPhase.promptResolved({required BigInt id}) =
+      SyncPhase_PromptResolved;
+
+  /// A watch is between cycles. `next_poll_secs` is None when polling is
+  /// disabled. rdc's own countdown never reaches an embedder — its
+  /// in-place status line is a no-op off a TTY — so the app draws its own.
+  const factory SyncPhase.idle({BigInt? nextPollSecs}) = SyncPhase_Idle;
   const factory SyncPhase.done({required BigInt fileCount}) = SyncPhase_Done;
   const factory SyncPhase.error({required String message}) = SyncPhase_Error;
+  const factory SyncPhase.stopped() = SyncPhase_Stopped;
 }

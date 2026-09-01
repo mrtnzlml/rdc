@@ -91,13 +91,56 @@ pub struct EditConnectionInput {
     pub password: Option<String>,
 }
 
+/// One answerable choice, as offered to the UI. `key` is a String rather
+/// than a char because FRB has no char; it is always exactly one character.
+#[derive(Debug, Clone)]
+pub struct PromptChoice {
+    pub key: String,
+    pub label: String,
+}
+
+/// Mirrors `rdc::cli::stdin_coord::PromptKind` across the bridge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKindDto {
+    Conflict,
+    RemoteDelete,
+    PushDrift,
+    BulkConfirm,
+    DeleteGate,
+    DeleteDrift,
+    MdhIndexDrop,
+    MdhRowDelete,
+    /// A coordinated read whose site never announced. Should be unreachable;
+    /// it exists so that if it ever happens the UI can say so instead of
+    /// silently mislabelling the prompt as a conflict. Render it as an
+    /// explicit "unrecognised prompt" state, not as a normal dialog.
+    Unknown,
+}
+
 #[derive(Debug, Clone)]
 pub enum SyncPhase {
     Started,
     /// One line of rdc's real, rendered sync log (plain text, no color).
     Log { line: String },
+    /// A cycle is blocked waiting for an answer. Reply with `answer_prompt`
+    /// using this `id`. The diff/list this refers to has already arrived as
+    /// `Log` lines.
+    Prompt {
+        id: u64,
+        kind: PromptKindDto,
+        question: String,
+        keys: Vec<PromptChoice>,
+    },
+    /// The prompt with this id no longer needs an answer (the watch stopped,
+    /// or the cycle was torn down). Close the dialog.
+    PromptResolved { id: u64 },
+    /// A watch is between cycles. `next_poll_secs` is None when polling is
+    /// disabled. rdc's own countdown never reaches an embedder — its
+    /// in-place status line is a no-op off a TTY — so the app draws its own.
+    Idle { next_poll_secs: Option<u64> },
     Done { file_count: u64 },
     Error { message: String },
+    Stopped,
 }
 
 // ---------------------------------------------------------------- version
@@ -461,9 +504,10 @@ pub fn rename_env(folder: String, old: String, new: String) -> Result<ProjectSum
 
 // ---------------------------------------------------------------- sync
 
-/// Pull-only sync of one environment. Scaffolds init files, resolves the token
-/// (silent re-login in password mode), then runs `sync_no_push`. Progress is
-/// streamed as `SyncPhase`.
+/// Two-way sync of one environment. Scaffolds init files, resolves the token
+/// (silent re-login in password mode), then runs one reconciliation cycle
+/// under `EmbedSyncOptions::default()` (pull and push, prompting on a gate
+/// rather than bailing). Progress is streamed as `SyncPhase`.
 ///
 /// Returns `Ok(())` even when the sync itself fails — the terminal outcome
 /// (success or error) is conveyed to the caller via the `SyncPhase::Done` /
@@ -483,11 +527,23 @@ pub fn sync_env(
         sink: sink.clone(),
         buf: Vec::new(),
     };
+    // TODO(task-11): no prompt route is installed here, so a gate this cycle
+    // hits falls through to `read_line_coordinated`'s stdin branch and reads
+    // this GUI process's stdin — which is EOF. That degrades to `Skip`/`N`,
+    // which is safe but silent. Task 11 installs a route for `sync_env` too
+    // (the same registry key a watch uses), so a one-shot sync prompts
+    // exactly like a watch does; delete this comment there.
     let result: Result<u64> = block_on(async {
         rdc::cli::init::write_scaffold_files(&folder, &env, &api_base, org_id)?;
         let token = rdc::secrets::resolve_token(&folder, &env, &api_base).await?;
-        rdc::cli::sync::embed::sync_no_push_logged(&folder, &env, &token, Box::new(forwarder))
-            .await?;
+        rdc::cli::sync::embed::sync_logged(
+            &folder,
+            &env,
+            &token,
+            rdc::cli::sync::embed::EmbedSyncOptions::default(),
+            Box::new(forwarder),
+        )
+        .await?;
         Ok(discover::count_files(&folder.join(format!("envs/{env}"))))
     });
 

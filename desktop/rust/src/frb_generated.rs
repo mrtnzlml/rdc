@@ -642,6 +642,18 @@ impl SseDecode for Vec<crate::api::rdc::ProjectSummary> {
     }
 }
 
+impl SseDecode for Vec<crate::api::rdc::PromptChoice> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut len_ = <i32>::sse_decode(deserializer);
+        let mut ans_ = Vec::with_capacity(len_ as usize);
+        for idx_ in 0..len_ {
+            ans_.push(<crate::api::rdc::PromptChoice>::sse_decode(deserializer));
+        }
+        return ans_;
+    }
+}
+
 impl SseDecode for Option<String> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -675,6 +687,17 @@ impl SseDecode for Option<crate::api::rdc::ProjectSummary> {
     }
 }
 
+impl SseDecode for Option<u64> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        if (<bool>::sse_decode(deserializer)) {
+            return Some(<u64>::sse_decode(deserializer));
+        } else {
+            return None;
+        }
+    }
+}
+
 impl SseDecode for crate::api::rdc::ProjectSummary {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -687,6 +710,37 @@ impl SseDecode for crate::api::rdc::ProjectSummary {
             name: var_name,
             folder: var_folder,
             envs: var_envs,
+        };
+    }
+}
+
+impl SseDecode for crate::api::rdc::PromptChoice {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_key = <String>::sse_decode(deserializer);
+        let mut var_label = <String>::sse_decode(deserializer);
+        return crate::api::rdc::PromptChoice {
+            key: var_key,
+            label: var_label,
+        };
+    }
+}
+
+impl SseDecode for crate::api::rdc::PromptKindDto {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <i32>::sse_decode(deserializer);
+        return match inner {
+            0 => crate::api::rdc::PromptKindDto::Conflict,
+            1 => crate::api::rdc::PromptKindDto::RemoteDelete,
+            2 => crate::api::rdc::PromptKindDto::PushDrift,
+            3 => crate::api::rdc::PromptKindDto::BulkConfirm,
+            4 => crate::api::rdc::PromptKindDto::DeleteGate,
+            5 => crate::api::rdc::PromptKindDto::DeleteDrift,
+            6 => crate::api::rdc::PromptKindDto::MdhIndexDrop,
+            7 => crate::api::rdc::PromptKindDto::MdhRowDelete,
+            8 => crate::api::rdc::PromptKindDto::Unknown,
+            _ => unreachable!("Invalid variant for PromptKindDto: {}", inner),
         };
     }
 }
@@ -704,16 +758,41 @@ impl SseDecode for crate::api::rdc::SyncPhase {
                 return crate::api::rdc::SyncPhase::Log { line: var_line };
             }
             2 => {
+                let mut var_id = <u64>::sse_decode(deserializer);
+                let mut var_kind = <crate::api::rdc::PromptKindDto>::sse_decode(deserializer);
+                let mut var_question = <String>::sse_decode(deserializer);
+                let mut var_keys = <Vec<crate::api::rdc::PromptChoice>>::sse_decode(deserializer);
+                return crate::api::rdc::SyncPhase::Prompt {
+                    id: var_id,
+                    kind: var_kind,
+                    question: var_question,
+                    keys: var_keys,
+                };
+            }
+            3 => {
+                let mut var_id = <u64>::sse_decode(deserializer);
+                return crate::api::rdc::SyncPhase::PromptResolved { id: var_id };
+            }
+            4 => {
+                let mut var_nextPollSecs = <Option<u64>>::sse_decode(deserializer);
+                return crate::api::rdc::SyncPhase::Idle {
+                    next_poll_secs: var_nextPollSecs,
+                };
+            }
+            5 => {
                 let mut var_fileCount = <u64>::sse_decode(deserializer);
                 return crate::api::rdc::SyncPhase::Done {
                     file_count: var_fileCount,
                 };
             }
-            3 => {
+            6 => {
                 let mut var_message = <String>::sse_decode(deserializer);
                 return crate::api::rdc::SyncPhase::Error {
                     message: var_message,
                 };
+            }
+            7 => {
+                return crate::api::rdc::SyncPhase::Stopped;
             }
             _ => {
                 unimplemented!("");
@@ -900,6 +979,52 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::rdc::ProjectSummary>
     }
 }
 // Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::rdc::PromptChoice {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.key.into_into_dart().into_dart(),
+            self.label.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::rdc::PromptChoice {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::rdc::PromptChoice>
+    for crate::api::rdc::PromptChoice
+{
+    fn into_into_dart(self) -> crate::api::rdc::PromptChoice {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::rdc::PromptKindDto {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        match self {
+            Self::Conflict => 0.into_dart(),
+            Self::RemoteDelete => 1.into_dart(),
+            Self::PushDrift => 2.into_dart(),
+            Self::BulkConfirm => 3.into_dart(),
+            Self::DeleteGate => 4.into_dart(),
+            Self::DeleteDrift => 5.into_dart(),
+            Self::MdhIndexDrop => 6.into_dart(),
+            Self::MdhRowDelete => 7.into_dart(),
+            Self::Unknown => 8.into_dart(),
+            _ => unreachable!(),
+        }
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::rdc::PromptKindDto
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::rdc::PromptKindDto>
+    for crate::api::rdc::PromptKindDto
+{
+    fn into_into_dart(self) -> crate::api::rdc::PromptKindDto {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for crate::api::rdc::SyncPhase {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         match self {
@@ -907,12 +1032,32 @@ impl flutter_rust_bridge::IntoDart for crate::api::rdc::SyncPhase {
             crate::api::rdc::SyncPhase::Log { line } => {
                 [1.into_dart(), line.into_into_dart().into_dart()].into_dart()
             }
+            crate::api::rdc::SyncPhase::Prompt {
+                id,
+                kind,
+                question,
+                keys,
+            } => [
+                2.into_dart(),
+                id.into_into_dart().into_dart(),
+                kind.into_into_dart().into_dart(),
+                question.into_into_dart().into_dart(),
+                keys.into_into_dart().into_dart(),
+            ]
+            .into_dart(),
+            crate::api::rdc::SyncPhase::PromptResolved { id } => {
+                [3.into_dart(), id.into_into_dart().into_dart()].into_dart()
+            }
+            crate::api::rdc::SyncPhase::Idle { next_poll_secs } => {
+                [4.into_dart(), next_poll_secs.into_into_dart().into_dart()].into_dart()
+            }
             crate::api::rdc::SyncPhase::Done { file_count } => {
-                [2.into_dart(), file_count.into_into_dart().into_dart()].into_dart()
+                [5.into_dart(), file_count.into_into_dart().into_dart()].into_dart()
             }
             crate::api::rdc::SyncPhase::Error { message } => {
-                [3.into_dart(), message.into_into_dart().into_dart()].into_dart()
+                [6.into_dart(), message.into_into_dart().into_dart()].into_dart()
             }
+            crate::api::rdc::SyncPhase::Stopped => [7.into_dart()].into_dart(),
             _ => {
                 unimplemented!("");
             }
@@ -1047,6 +1192,16 @@ impl SseEncode for Vec<crate::api::rdc::ProjectSummary> {
     }
 }
 
+impl SseEncode for Vec<crate::api::rdc::PromptChoice> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(self.len() as _, serializer);
+        for item in self {
+            <crate::api::rdc::PromptChoice>::sse_encode(item, serializer);
+        }
+    }
+}
+
 impl SseEncode for Option<String> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -1077,6 +1232,16 @@ impl SseEncode for Option<crate::api::rdc::ProjectSummary> {
     }
 }
 
+impl SseEncode for Option<u64> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.is_some(), serializer);
+        if let Some(value) = self {
+            <u64>::sse_encode(value, serializer);
+        }
+    }
+}
+
 impl SseEncode for crate::api::rdc::ProjectSummary {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -1084,6 +1249,37 @@ impl SseEncode for crate::api::rdc::ProjectSummary {
         <String>::sse_encode(self.name, serializer);
         <String>::sse_encode(self.folder, serializer);
         <Vec<crate::api::rdc::EnvSummary>>::sse_encode(self.envs, serializer);
+    }
+}
+
+impl SseEncode for crate::api::rdc::PromptChoice {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.key, serializer);
+        <String>::sse_encode(self.label, serializer);
+    }
+}
+
+impl SseEncode for crate::api::rdc::PromptKindDto {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(
+            match self {
+                crate::api::rdc::PromptKindDto::Conflict => 0,
+                crate::api::rdc::PromptKindDto::RemoteDelete => 1,
+                crate::api::rdc::PromptKindDto::PushDrift => 2,
+                crate::api::rdc::PromptKindDto::BulkConfirm => 3,
+                crate::api::rdc::PromptKindDto::DeleteGate => 4,
+                crate::api::rdc::PromptKindDto::DeleteDrift => 5,
+                crate::api::rdc::PromptKindDto::MdhIndexDrop => 6,
+                crate::api::rdc::PromptKindDto::MdhRowDelete => 7,
+                crate::api::rdc::PromptKindDto::Unknown => 8,
+                _ => {
+                    unimplemented!("");
+                }
+            },
+            serializer,
+        );
     }
 }
 
@@ -1098,13 +1294,36 @@ impl SseEncode for crate::api::rdc::SyncPhase {
                 <i32>::sse_encode(1, serializer);
                 <String>::sse_encode(line, serializer);
             }
-            crate::api::rdc::SyncPhase::Done { file_count } => {
+            crate::api::rdc::SyncPhase::Prompt {
+                id,
+                kind,
+                question,
+                keys,
+            } => {
                 <i32>::sse_encode(2, serializer);
+                <u64>::sse_encode(id, serializer);
+                <crate::api::rdc::PromptKindDto>::sse_encode(kind, serializer);
+                <String>::sse_encode(question, serializer);
+                <Vec<crate::api::rdc::PromptChoice>>::sse_encode(keys, serializer);
+            }
+            crate::api::rdc::SyncPhase::PromptResolved { id } => {
+                <i32>::sse_encode(3, serializer);
+                <u64>::sse_encode(id, serializer);
+            }
+            crate::api::rdc::SyncPhase::Idle { next_poll_secs } => {
+                <i32>::sse_encode(4, serializer);
+                <Option<u64>>::sse_encode(next_poll_secs, serializer);
+            }
+            crate::api::rdc::SyncPhase::Done { file_count } => {
+                <i32>::sse_encode(5, serializer);
                 <u64>::sse_encode(file_count, serializer);
             }
             crate::api::rdc::SyncPhase::Error { message } => {
-                <i32>::sse_encode(3, serializer);
+                <i32>::sse_encode(6, serializer);
                 <String>::sse_encode(message, serializer);
+            }
+            crate::api::rdc::SyncPhase::Stopped => {
+                <i32>::sse_encode(7, serializer);
             }
             _ => {
                 unimplemented!("");

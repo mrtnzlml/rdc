@@ -250,6 +250,11 @@ class AppState extends ChangeNotifier {
           case SyncPhase_Error(:final message):
             syncState[k] = SyncState.error;
             syncMessage[k] = message;
+          case SyncPhase_Prompt():
+          case SyncPhase_PromptResolved():
+          case SyncPhase_Idle():
+          case SyncPhase_Stopped():
+            break; // handled by the watch stream (see watchEnvItem)
         }
         notifyListeners();
       },
