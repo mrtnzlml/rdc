@@ -41,11 +41,21 @@ impl CancelToken {
     }
     /// Resolves once cancelled. Returns immediately if already cancelled,
     /// so a cancel that lands before the `select!` is not lost.
+    ///
+    /// Uses tokio's documented enable-then-check pattern rather than a bare
+    /// `notified().await`: `enable()` registers this waiter *before* we
+    /// check the flag, so a `cancel()` on another thread landing between
+    /// the check and the await is still delivered as a wakeup instead of
+    /// being missed (a `Notify::notify_waiters` stores no permit for a
+    /// waiter that subscribes after it fires).
     pub async fn cancelled(&self) {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         if self.is_cancelled() {
             return;
         }
-        self.notify.notified().await;
+        notified.await;
     }
 }
 
@@ -86,7 +96,7 @@ fn paint_polling_status(renderer: &crate::log::Log, interval_secs: u64, elapsed:
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CycleTrigger {
+pub(crate) enum CycleTrigger {
     /// A local file changed (after debounce).
     FileEvent,
     /// The poll timer fired.
@@ -99,10 +109,16 @@ pub enum CycleTrigger {
 }
 
 /// Everything `event_loop` (and the reconcile before it) needs that a
-/// non-CLI caller must be able to override: which project directory to
-/// treat as cwd, which token to use instead of on-disk secrets, and the
-/// same sync flags `rdc sync` exposes on the command line.
-pub struct WatchConfig<'a> {
+/// driver other than the CLI's `run_watch` must be able to override:
+/// which project directory to treat as cwd, which token to use instead of
+/// on-disk secrets, and the same sync flags `rdc sync` exposes on the
+/// command line.
+///
+/// Crate-internal: nothing outside `rdc` constructs one directly today —
+/// an embedder goes through a `pub` wrapper (in a later task) that builds
+/// this and calls `run_watch_with`. Only `CancelToken` needs to cross that
+/// boundary as its own type.
+pub(crate) struct WatchConfig<'a> {
     pub env: &'a str,
     pub cwd: Option<&'a Path>,
     pub token: Option<String>,
@@ -120,17 +136,23 @@ pub struct WatchConfig<'a> {
 /// in place and `run_cycle` should fall back to re-reading them (the CLI's
 /// `inquire`-backed prompt does this). The CLI wires this to
 /// `auth::refresh_token_for_401`; an embedder can prompt its own UI.
-pub type TokenRefresher =
+pub(crate) type TokenRefresher =
     Arc<dyn Fn(String) -> BoxFuture<'static, Result<Option<String>>> + Send + Sync>;
 
 /// Installed by the CLI to take ownership of the terminal's stdin. Given
 /// the event sender and the `sync_running` flag (a mid-cycle keypress must
-/// be dropped, not queued) plus the cancel token, it spawns the reader.
-/// Embedders pass `None`: they answer prompts through a `PromptRoute` and
-/// never touch stdin.
-pub type StdinHook = Box<
-    dyn FnOnce(tokio::sync::mpsc::Sender<CycleTrigger>, Arc<AtomicBool>, CancelToken) + Send,
->;
+/// be dropped, not queued), it spawns the reader. Embedders pass `None`:
+/// they answer prompts through a `PromptRoute` and never touch stdin.
+pub(crate) type StdinHook =
+    Box<dyn FnOnce(tokio::sync::mpsc::Sender<CycleTrigger>, Arc<AtomicBool>) + Send>;
+
+/// Invoked once, immediately after the initial reconcile and before the
+/// polling ticker starts. The CLI uses this — not `StdinHook` — to wire
+/// Ctrl-C: `StdinHook` only ever runs on a TTY, and gating signal handling
+/// on a TTY would leave the non-interactive (piped) case with no way to
+/// stop the process. An embedder that manages its own lifecycle (calling
+/// `CancelToken::cancel` from its own stop button) passes `None`.
+pub(crate) type PostReconcileHook = Box<dyn FnOnce(CancelToken) + Send>;
 
 pub async fn run_watch(
     env: &str,
@@ -146,12 +168,21 @@ pub async fn run_watch(
     let renderer = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
     let cancel = CancelToken::new();
 
-    // Wire ctrl-c → cancel.
-    let ctrlc_cancel = cancel.clone();
-    tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        ctrlc_cancel.cancel();
-    });
+    // Wire ctrl-c → cancel, but only AFTER the initial reconcile — see the
+    // `post_reconcile_hook` invocation in `run_watch_with`. Registering
+    // tokio's SIGINT handler suppresses the default process-kill, so doing
+    // this any earlier would make Ctrl-C inert (no default kill, and
+    // nothing reading the cancel flag yet) for the whole of the initial
+    // reconcile: the `EnvLock::acquire` wait, a large-org first cycle, and
+    // any conflict / remote-delete prompt it blocks on. Non-TTY-gated
+    // (unlike the stdin hook below) so the piped/CI case can still be
+    // killed.
+    let post_reconcile_hook: Option<PostReconcileHook> = Some(Box::new(|cancel: CancelToken| {
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            cancel.cancel();
+        });
+    }));
 
     // Stdin reader — the SOLE owner of the terminal's stdin while watching
     // (see `cli::stdin_coord`). It reads lines and routes each one:
@@ -178,7 +209,7 @@ pub async fn run_watch(
     // embedder answers prompts through a `PromptRoute` and never touches
     // stdin.
     let stdin_hook: Option<StdinHook> = if std::io::stdin().is_terminal() {
-        Some(Box::new(|stdin_tx, stdin_sync_running: Arc<AtomicBool>, _cancel| {
+        Some(Box::new(|stdin_tx, stdin_sync_running: Arc<AtomicBool>| {
             // Activate synchronously, before the first event-loop cycle can
             // run a prompt, so the coordinator is live when a prompt registers.
             let coord = crate::cli::stdin_coord::activate();
@@ -228,6 +259,7 @@ pub async fn run_watch(
         renderer,
         cancel,
         refresher,
+        post_reconcile_hook,
         stdin_hook,
     )
     .await?;
@@ -235,30 +267,37 @@ pub async fn run_watch(
     // Exit the process directly instead of returning `Ok(())` and letting
     // `main` fall into the tokio runtime's `Drop`.
     //
-    // The stdin reader task above is parked in a `tokio::io::stdin()`
-    // blocking read, which cannot be cancelled and only returns on EOF.
-    // Dropping the multi-threaded runtime blocks until that read completes,
-    // so a returned `Ok(())` would hang the process after Ctrl-C until the
-    // user also pressed Ctrl-D (EOF) — the exact bug this fixes. We only
-    // reach this point via the event loop's shutdown branch (Ctrl-C), so a
-    // clean `exit(0)` is the right outcome. The logger flushes on every
-    // event, so the "stopped" lines above are already on screen. Error
-    // paths still propagate through `?` and are handled by `main`'s
-    // `exit(1)`, which likewise bypasses the hanging `Drop`.
+    // The stdin reader task, spawned by the hook built above, is parked in
+    // a `tokio::io::stdin()` blocking read, which cannot be cancelled and
+    // only returns on EOF. Dropping the multi-threaded runtime blocks
+    // until that read completes, so a returned `Ok(())` would hang the
+    // process after Ctrl-C until the user also pressed Ctrl-D (EOF) — the
+    // exact bug this fixes. We only reach this point via the event loop's
+    // shutdown branch (Ctrl-C), so a clean `exit(0)` is the right outcome.
+    // The logger flushes on every event, so the "stopped" lines from
+    // `run_watch_with` are already on screen. Error paths still propagate
+    // through `?` and are handled by `main`'s `exit(1)`, which likewise
+    // bypasses the hanging `Drop`.
     std::process::exit(0)
 }
 
 /// Runs the reconcile-and-watch loop against `cfg`: the initial reconcile,
 /// the polling ticker, the file watcher, and `event_loop`. Everything here
-/// is non-terminal-specific — this does not take ownership of stdin,
-/// install a Ctrl-C handler, or exit the process. Those are `run_watch`'s
-/// job (the CLI caller); an embedder drives this directly instead, with
-/// its own `CancelToken` and (typically) no `stdin_hook`.
-pub async fn run_watch_with(
+/// is non-terminal-specific and installs no signal handler of its own —
+/// this does not take ownership of stdin or exit the process, and Ctrl-C
+/// wiring is `post_reconcile_hook`'s job, not this function's, precisely
+/// because it must run at a specific point (after the reconcile) rather
+/// than unconditionally at entry. Those are `run_watch`'s job (the CLI
+/// caller); an embedder drives this directly instead, with its own
+/// `CancelToken` and (typically) neither hook.
+///
+/// Crate-internal for now — see `WatchConfig`'s doc.
+pub(crate) async fn run_watch_with(
     cfg: WatchConfig<'_>,
     renderer: Arc<crate::log::Log>,
     cancel: CancelToken,
     refresher: TokenRefresher,
+    post_reconcile_hook: Option<PostReconcileHook>,
     stdin_hook: Option<StdinHook>,
 ) -> Result<()> {
     let cwd = match cfg.cwd {
@@ -287,6 +326,13 @@ pub async fn run_watch_with(
             cfg.token.clone(),
         )
         .await?;
+    }
+
+    // Fires exactly once, right after the reconcile above and before the
+    // ticker starts. The CLI uses this slot (not entry, not `StdinHook`)
+    // to arm Ctrl-C — see `run_watch`'s comment on why timing matters here.
+    if let Some(hook) = post_reconcile_hook {
+        hook(cancel.clone());
     }
 
     renderer.event(
@@ -359,7 +405,7 @@ pub async fn run_watch_with(
     let watcher = spawn_file_watcher(cfg.env.to_string(), env_root.clone(), events_tx.clone())?;
 
     if let Some(hook) = stdin_hook {
-        hook(events_tx.clone(), sync_running.clone(), cancel.clone());
+        hook(events_tx.clone(), sync_running.clone());
     }
 
     event_loop(
@@ -692,18 +738,28 @@ mod tests {
 
     #[tokio::test]
     async fn event_loop_uses_the_injected_cwd_not_the_process_cwd() {
-        // A project at `tmp`, and a process CWD somewhere else entirely.
-        // With cfg.cwd wired through, the loop must lock tmp's env lock and
-        // never look at the process CWD.
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join(".rdc/state")).unwrap();
-        let (_tx, rx) = tokio::sync::mpsc::channel::<CycleTrigger>(8);
-        let cancel = CancelToken::new();
-        cancel.cancel(); // shut down before any cycle runs
+        // The process CWD points at an empty, unrelated tempdir; `cfg.cwd`
+        // points at a DIFFERENT tempdir standing in for the real project
+        // root. A Poll trigger (not pre-cancelled) drives exactly one
+        // cycle. `run_cycle` is bound to fail — there is no rdc.toml in
+        // either tempdir — but `EnvLock::acquire` writes the lock file
+        // before that failure, so its location is proof of which root the
+        // loop actually used. If `cfg.cwd` were ignored, the lock would
+        // land under the process CWD instead (see the falsification note
+        // in the task 7 report: flipping `cwd` to `None` here does fail
+        // this assertion, and only this one).
+        let process_cwd = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(process_cwd.path()).unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<CycleTrigger>(8);
+        tx.send(CycleTrigger::Poll).await.unwrap();
+        let cancel = CancelToken::new(); // NOT pre-cancelled: the cycle must actually run
 
         let cfg = WatchConfig {
             env: "test",
-            cwd: Some(tmp.path()),
+            cwd: Some(project.path()),
             token: Some("tok".into()),
             interactive: false,
             allow_deletes: false,
@@ -722,14 +778,27 @@ mod tests {
             rx,
             cancel,
             None,
-            tmp.path().join("envs/test"),
+            project.path().join("envs/test"),
             None,
             Arc::new(AtomicBool::new(false)),
             Arc::new(tokio::sync::Notify::new()),
             &refresher,
         )
         .await;
-        assert!(result.is_ok(), "{result:?}");
+
+        std::env::set_current_dir(&saved_cwd).unwrap();
+
+        // The cycle fails (no rdc.toml anywhere) — that failure is not
+        // what this test is about.
+        assert!(result.is_err(), "{result:?}");
+        assert!(
+            project.path().join(".rdc/state/test.lock").exists(),
+            "EnvLock::acquire should have created the lock file under the injected cwd"
+        );
+        assert!(
+            !process_cwd.path().join(".rdc").exists(),
+            "the process CWD must never be touched when cfg.cwd is set"
+        );
     }
 
     #[tokio::test(start_paused = true)]
