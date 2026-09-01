@@ -530,17 +530,22 @@ pub fn sync_env(
 
     let cancel = rdc::cli::sync::watch::CancelToken::new();
     let (answer_tx, answer_rx) = std::sync::mpsc::channel::<String>();
-    let next_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let next_prompt_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let generation = crate::watch_registry::next_id();
     // Registered so `answer_prompt` can find this cycle. A watch on the same
     // env would contend for the env lock anyway, so displacing one here is
-    // the same rule `watch_env` applies.
+    // the same rule `watch_env` applies. Torn down below via `remove_if`,
+    // which only deletes OUR registration — see its doc for why a plain
+    // key-only remove is unsafe (it could delete a registration that has
+    // since displaced this one).
     if let Some(previous) = crate::watch_registry::insert(
         &folder,
         &env,
         crate::watch_registry::WatchHandle {
+            id: generation,
             cancel: cancel.clone(),
             answers: answer_tx,
-            next_prompt_id: next_id.clone(),
+            next_prompt_id: next_prompt_id.clone(),
         },
     ) {
         previous.cancel.cancel();
@@ -549,7 +554,8 @@ pub fn sync_env(
         std::sync::Arc::new(SinkPromptRoute {
             sink: sink.clone(),
             answers: std::sync::Mutex::new(answer_rx),
-            next_id,
+            next_id: next_prompt_id,
+            cancel: cancel.clone(),
         });
 
     let result: Result<u64> = block_on(async {
@@ -569,7 +575,7 @@ pub fn sync_env(
         Ok(discover::count_files(&folder_path.join(format!("envs/{env}"))))
     });
 
-    crate::watch_registry::remove(&folder, &env);
+    crate::watch_registry::remove_if(&folder, &env, generation);
     match result {
         Ok(file_count) => {
             // run_cycle omits its closing summary when a renderer is supplied,
@@ -618,22 +624,47 @@ impl std::io::Write for LineForwarder {
 
 // ---------------------------------------------------------------- watch
 
+/// Where a prompt (and its resolution) get announced. `StreamSink<SyncPhase>`
+/// is the production implementation (below); a fake stands in for it in
+/// tests, because `StreamSink::deserialize` needs a real Dart message-port
+/// handle and so cannot be built inside a plain `#[test]`.
+trait PromptSink {
+    /// Send one phase. `false` means the UI side is gone (closed stream).
+    fn emit(&self, phase: SyncPhase) -> bool;
+}
+
+impl PromptSink for StreamSink<SyncPhase> {
+    fn emit(&self, phase: SyncPhase) -> bool {
+        self.add(phase).is_ok()
+    }
+}
+
 /// Turns a blocked core prompt into a `SyncPhase::Prompt` on the stream and
 /// blocks until the UI answers through `answer_prompt`.
 ///
 /// `[e]` (shells out to $EDITOR) and `[h]` (a stateful per-hunk walk) are
 /// stripped from the offered keys: neither has a meaning in a GUI process.
-/// The core's own re-prompt loop covers the case where an answer arrives
-/// that is not in the offered set.
-struct SinkPromptRoute {
-    sink: StreamSink<SyncPhase>,
+/// `ask` also re-validates every incoming answer against that same filtered
+/// set rather than trusting every future caller to only ever send one of
+/// the offered keys — an `e`/`h` that did reach the core would spawn
+/// `$EDITOR` or enter the hunk walk, both of which wedge this thread.
+struct SinkPromptRoute<S: PromptSink = StreamSink<SyncPhase>> {
+    sink: S,
     answers: std::sync::Mutex<std::sync::mpsc::Receiver<String>>,
     next_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Cloned from the same `WatchHandle` registered for this cycle. Polled
+    /// by the wait loop below so a `stop_watch` that fires while this `ask`
+    /// is parked can unblock it — nothing else observes this token while a
+    /// prompt is in flight.
+    cancel: rdc::cli::sync::watch::CancelToken,
 }
 
-impl rdc::cli::sync::embed::PromptRoute for SinkPromptRoute {
+impl<S: PromptSink + Send + Sync> rdc::cli::sync::embed::PromptRoute for SinkPromptRoute<S> {
     fn ask(&self, prompt: &rdc::cli::sync::embed::Prompt) -> Option<String> {
         use std::sync::atomic::Ordering;
+        use std::sync::mpsc::RecvTimeoutError;
+        use std::time::Duration;
+
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let keys: Vec<PromptChoice> = prompt
             .keys
@@ -644,27 +675,44 @@ impl rdc::cli::sync::embed::PromptRoute for SinkPromptRoute {
                 label: k.label.clone(),
             })
             .collect();
+        // Exactly what was offered, as single characters. Empty means free
+        // text — `PromptKind::Unknown`'s fallback offers no keys at all —
+        // so accept whatever arrives rather than reject every answer
+        // forever.
+        let allowed: HashSet<char> = keys.iter().filter_map(|k| k.key.chars().next()).collect();
 
         let rx = self.answers.lock().unwrap();
         // Drop anything queued from a previous prompt so a late answer can
         // never be read as the answer to this one.
         while rx.try_recv().is_ok() {}
 
-        if self
-            .sink
-            .add(SyncPhase::Prompt {
-                id,
-                kind: kind_to_dto(prompt.kind),
-                question: prompt.question.clone(),
-                keys,
-            })
-            .is_err()
-        {
+        if !self.sink.emit(SyncPhase::Prompt {
+            id,
+            kind: kind_to_dto(prompt.kind),
+            question: prompt.question.clone(),
+            keys,
+        }) {
             return None; // Dart stream gone: degrade to EOF (skip / N).
         }
 
-        let answer = rx.recv().ok();
-        let _ = self.sink.add(SyncPhase::PromptResolved { id });
+        let answer = loop {
+            if self.cancel.is_cancelled() {
+                break None; // the watch was stopped while this prompt was parked
+            }
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(a) => {
+                    let first = a.trim().chars().next();
+                    if allowed.is_empty() || first.is_some_and(|c| allowed.contains(&c)) {
+                        break Some(a);
+                    }
+                    // Not one of the offered keys. Ignore it and keep
+                    // waiting for a real one rather than passing it through.
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break None,
+            }
+        };
+        let _ = self.sink.emit(SyncPhase::PromptResolved { id });
         answer
     }
 }
@@ -712,7 +760,9 @@ pub fn watch_env(
 
     let cancel = rdc::cli::sync::watch::CancelToken::new();
     let (answer_tx, answer_rx) = std::sync::mpsc::channel::<String>();
+    let generation = crate::watch_registry::next_id();
     let handle = crate::watch_registry::WatchHandle {
+        id: generation,
         cancel: cancel.clone(),
         answers: answer_tx,
         next_prompt_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
@@ -727,6 +777,7 @@ pub fn watch_env(
             sink: sink.clone(),
             answers: std::sync::Mutex::new(answer_rx),
             next_id: handle.next_prompt_id.clone(),
+            cancel: cancel.clone(),
         });
 
     let forwarder = LineForwarder {
@@ -751,7 +802,7 @@ pub fn watch_env(
         .await
     });
 
-    crate::watch_registry::remove(&folder, &env);
+    crate::watch_registry::remove_if(&folder, &env, generation);
     match result {
         Ok(()) => {
             let _ = sink.add(SyncPhase::Stopped);
@@ -765,7 +816,10 @@ pub fn watch_env(
     Ok(())
 }
 
-/// Ask a running watch to stop. No-op if that env is not being watched.
+/// Ask a running watch to stop. Also unblocks a cycle currently parked on a
+/// prompt (`SinkPromptRoute::ask` polls this same token): the poll loop
+/// reads the cancellation as end-of-input, exactly like a closed UI stream.
+/// No-op if that env is not being watched.
 pub fn stop_watch(folder: String, env: String) -> Result<()> {
     if let Some(h) = crate::watch_registry::get(&folder, &env) {
         h.cancel.cancel();
@@ -896,6 +950,7 @@ fn block_on<F: Future>(fut: F) -> F::Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rdc::cli::sync::embed::PromptRoute as _;
 
     #[test]
     fn project_summary_from_multi_env_project() {
@@ -1162,5 +1217,149 @@ mod tests {
         // original env, untouched on disk.
         let cfg = rdc::config::ProjectConfig::load(&folder.join("rdc.toml")).unwrap();
         assert_eq!(cfg.envs.keys().collect::<Vec<_>>(), vec!["main"]);
+    }
+
+    // ---------------------------------------------------------------- SinkPromptRoute
+
+    /// A `PromptSink` a test can inspect and "close", standing in for
+    /// `StreamSink<SyncPhase>` (which needs a live Dart message-port handle
+    /// and so cannot be constructed in a plain `#[test]`).
+    struct FakeSink {
+        emitted: std::sync::Mutex<Vec<SyncPhase>>,
+        closed: std::sync::atomic::AtomicBool,
+    }
+
+    impl FakeSink {
+        fn new() -> Self {
+            Self {
+                emitted: std::sync::Mutex::new(Vec::new()),
+                closed: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+        fn close(&self) {
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl PromptSink for FakeSink {
+        fn emit(&self, phase: SyncPhase) -> bool {
+            if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                return false;
+            }
+            self.emitted.lock().unwrap().push(phase);
+            true
+        }
+    }
+
+    fn route_with_channel() -> (SinkPromptRoute<FakeSink>, std::sync::mpsc::Sender<String>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let route = SinkPromptRoute {
+            sink: FakeSink::new(),
+            answers: std::sync::Mutex::new(rx),
+            next_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            cancel: rdc::cli::sync::watch::CancelToken::new(),
+        };
+        (route, tx)
+    }
+
+    fn sample_prompt() -> rdc::cli::sync::embed::Prompt {
+        rdc::cli::sync::embed::Prompt {
+            kind: rdc::cli::sync::embed::PromptKind::DeleteGate,
+            question: "Proceed with deletion? ".into(),
+            keys: vec![
+                rdc::cli::sync::embed::PromptKey::new('y', "yes"),
+                rdc::cli::sync::embed::PromptKey::new('e', "edit"),
+                rdc::cli::sync::embed::PromptKey::new('h', "hunk-by-hunk"),
+                rdc::cli::sync::embed::PromptKey::new('n', "no"),
+            ],
+        }
+    }
+
+    #[test]
+    fn ask_drains_a_stale_answer_before_waiting() {
+        let (route, tx) = route_with_channel();
+        // Leftover from an earlier, already-resolved prompt.
+        tx.send("stale".to_string()).unwrap();
+        let sender = tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            sender.send("y".to_string()).unwrap();
+        });
+        // If the stale answer were not drained, this would return "stale"
+        // immediately instead of blocking for the real one.
+        assert_eq!(route.ask(&sample_prompt()), Some("y".to_string()));
+    }
+
+    #[test]
+    fn ask_never_offers_e_or_h() {
+        let (route, tx) = route_with_channel();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            tx.send("y".to_string()).unwrap();
+        });
+        let _ = route.ask(&sample_prompt());
+        let emitted = route.sink.emitted.lock().unwrap();
+        match &emitted[0] {
+            SyncPhase::Prompt { keys, .. } => {
+                let offered: Vec<&str> = keys.iter().map(|k| k.key.as_str()).collect();
+                assert_eq!(offered, vec!["y", "n"], "e/h must be stripped from what the UI sees");
+            }
+            other => panic!("expected a Prompt phase, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_ignores_an_answer_outside_the_offered_keys() {
+        // `e` is a real key the CORE offered but that this bridge strips —
+        // it must never be accepted even if it somehow arrives on the
+        // answer channel (a future UI bug, not reachable today).
+        let (route, tx) = route_with_channel();
+        let sender = tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            sender.send("e".to_string()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            sender.send("y".to_string()).unwrap();
+        });
+        assert_eq!(route.ask(&sample_prompt()), Some("y".to_string()));
+    }
+
+    #[test]
+    fn ask_degrades_to_none_when_the_sink_is_closed() {
+        let (route, _tx) = route_with_channel();
+        route.sink.close();
+        // No answer will ever arrive (the sender is kept alive by `_tx`, so
+        // this can't return via a closed-channel `Disconnected` either) —
+        // the only way `ask` returns is the initial `emit` failing and
+        // short-circuiting before the wait loop is ever entered. If it
+        // didn't, this call would hang.
+        assert_eq!(route.ask(&sample_prompt()), None);
+    }
+
+    #[test]
+    fn ask_unblocks_when_cancelled_while_parked() {
+        let (route, _tx) = route_with_channel();
+        let cancel = route.cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            cancel.cancel();
+        });
+        // No answer is ever sent; without the cancellation check this would
+        // hang forever rather than returning within one poll interval.
+        assert_eq!(route.ask(&sample_prompt()), None);
+    }
+
+    #[test]
+    fn kind_to_dto_maps_every_variant_explicitly() {
+        use rdc::cli::sync::embed::PromptKind as K;
+        assert_eq!(kind_to_dto(K::Conflict), PromptKindDto::Conflict);
+        assert_eq!(kind_to_dto(K::RemoteDelete), PromptKindDto::RemoteDelete);
+        assert_eq!(kind_to_dto(K::PushDrift), PromptKindDto::PushDrift);
+        assert_eq!(kind_to_dto(K::BulkConfirm), PromptKindDto::BulkConfirm);
+        assert_eq!(kind_to_dto(K::DeleteGate), PromptKindDto::DeleteGate);
+        assert_eq!(kind_to_dto(K::DeleteDrift), PromptKindDto::DeleteDrift);
+        assert_eq!(kind_to_dto(K::MdhIndexDrop), PromptKindDto::MdhIndexDrop);
+        assert_eq!(kind_to_dto(K::MdhRowDelete), PromptKindDto::MdhRowDelete);
+        assert_eq!(kind_to_dto(K::Unknown), PromptKindDto::Unknown);
     }
 }
