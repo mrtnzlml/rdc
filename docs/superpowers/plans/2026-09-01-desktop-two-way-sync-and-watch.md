@@ -476,8 +476,16 @@ missing from this plan's own prompt inventory — the inventory listed the push-
 living only at `pull/common.rs`, but the push and pull *drivers* reach a different pair of
 resolvers:
 
-- `src/cli/resolve.rs:1259` in `resolve_push_drift`
-- `src/cli/resolve.rs:1388` in `resolve_combined_file`
+- `src/cli/resolve.rs:1259` in `resolve_combined_file` — **do this one first**
+- `src/cli/resolve.rs:1388` in `resolve_push_drift`
+
+Order matters here, and Task 2's reviewer established why. `resolve_combined_file` is called
+from `pull/hooks.rs`, `pull/queues.rs` and `pull/rules.rs` — the *same three drivers* that also
+reach `resolve_conflict_interactive`, which Task 2 already routed through the log. `hooks.rs`
+calls both, in the same function, in the same run. So until this one is fixed the desktop shows
+a body for some conflict prompts and none for others, which is harder to diagnose than a
+uniformly missing body. `resolve_push_drift` is push-phase only and interleaves with nothing,
+so its wider call-site ripple can follow.
 
 Both build `let stderr = std::io::stderr();` and hand `stderr.lock()` to `prompt_resolve`. Both
 are reachable from the desktop app's two-way cycle, so leaving them raw means a dialog with no
