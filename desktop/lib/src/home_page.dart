@@ -727,44 +727,44 @@ class _ConnBar extends StatelessWidget {
     final stopping = _isStopping(state, item.summary.folder, env.name);
     final syncBlocked = _syncBlocked(state, item.summary.folder, env.name);
 
-    // Capped (not just Flexible) now that this sits in a Wrap run rather
-    // than an Expanded slot: a Wrap doesn't hand a child a narrower budget
-    // to shrink into the way Row/Expanded did, so without a ceiling here a
-    // pathologically long project/env/host name would never hit the
-    // Text widgets' own ellipsis and could push this run arbitrarily wide.
-    final titleGroup = ConstrainedBox(
-      constraints: const BoxConstraints(maxWidth: 480),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Flexible(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text('${item.summary.name} · ${env.name}', maxLines: 1, overflow: TextOverflow.ellipsis,
-                    style: TextStyle(color: c.textPrimary, fontSize: 15, fontWeight: FontWeight.w600)),
-                const SizedBox(height: 2),
-                Text('${_host(env.apiBase)} · org ${env.orgId}', maxLines: 1, overflow: TextOverflow.ellipsis,
-                    style: monoStyle(c.textSecondary, 12)),
-              ],
-            ),
+    final titleGroup = Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Flexible(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text('${item.summary.name} · ${env.name}', maxLines: 1, overflow: TextOverflow.ellipsis,
+                  style: TextStyle(color: c.textPrimary, fontSize: 15, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 2),
+              Text('${_host(env.apiBase)} · org ${env.orgId}', maxLines: 1, overflow: TextOverflow.ellipsis,
+                  style: monoStyle(c.textSecondary, 12)),
+            ],
           ),
-          const SizedBox(width: 12),
-          // Flexible (not a rigid sibling) so the pill can also give up room
-          // under extreme width pressure instead of forcing a hard RenderFlex
-          // overflow; at any width with room to spare it just renders at its
-          // natural size, identical to before.
-          Flexible(child: _StatusPill(st: st)),
-        ],
-      ),
+        ),
+        const SizedBox(width: 12),
+        // Flexible (not a rigid sibling) so the pill can also give up room
+        // under extreme width pressure instead of forcing a hard RenderFlex
+        // overflow; at any width with room to spare it just renders at its
+        // natural size, identical to before.
+        Flexible(child: _StatusPill(st: st)),
+      ],
     );
 
-    // A Wrap, not a fixed row: no platform runner enforces a minimum window
-    // width (the macOS runner sets only an *initial* size, and there is no
-    // Dart-side floor either), so an ordinary drag can leave less room than
-    // five buttons need. A Wrap flows the overflow buttons onto a second
-    // line instead of throwing a RenderFlex overflow.
+    // Expanded (tight), not a plain Wrap child: a Wrap given the
+    // effectively-unbounded main-axis budget a Row hands its non-flex
+    // children never wraps — it just reports its natural, un-narrowed
+    // single-line width, which is exactly how this overflowed before. Being
+    // Expanded forces this cell to an exact, always-bounded width (2/3 of
+    // what's left after the title's own Expanded share and the spacer), so
+    // the inner Wrap has something real to wrap against: comfortably one
+    // line at the golden canvas and wider, flowing onto a second line as
+    // the window narrows — never a RenderFlex overflow. WrapAlignment.end
+    // keeps the buttons pinned to this cell's right edge (the row's right
+    // edge, since this is the last child) even when the cell is wider than
+    // the buttons actually need — the same "flush right, title yields
+    // first" look the old Expanded+plain-Row design had.
     final actions = Wrap(
       alignment: WrapAlignment.end,
       spacing: 8,
@@ -801,15 +801,16 @@ class _ConnBar extends StatelessWidget {
         color: c.bgCard,
         border: Border(bottom: BorderSide(color: c.border)),
       ),
-      // spaceBetween: when both groups fit on one line this pins the title
-      // to the left edge and the actions to the right edge — the same look
-      // as the old Expanded-based Row — and when they don't fit, the
-      // actions group simply drops to its own line below.
-      child: Wrap(
-        alignment: WrapAlignment.spaceBetween,
-        crossAxisAlignment: WrapCrossAlignment.center,
-        runSpacing: 10,
-        children: [titleGroup, actions],
+      child: Row(
+        children: [
+          // Title takes whatever share is left after the actions cell below
+          // claims its own (fixed, larger) share — exactly the old
+          // "Expanded so all slack lives here" comment, just against a
+          // sibling Expanded rather than a run of un-flexed buttons.
+          Expanded(child: titleGroup),
+          const SizedBox(width: 12),
+          Expanded(flex: 2, child: actions),
+        ],
       ),
     );
   }
