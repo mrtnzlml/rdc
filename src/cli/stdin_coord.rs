@@ -18,10 +18,130 @@
 //! `read_line_coordinated` falls back to reading the real stdin directly,
 //! so non-watch `rdc sync` / `deploy` behave exactly as before.
 
+use std::cell::RefCell;
 use std::io::{self, BufRead, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// One answerable choice in a prompt: the character the resolver matches on
+/// and the words the terminal shows beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptKey {
+    pub key: char,
+    pub label: String,
+}
+
+impl PromptKey {
+    // Only every prompt SITE (wired in the next task of this plan) builds
+    // `keys` with this; nothing in this task's production code calls it,
+    // and the workspace denies unused-item warnings outright.
+    #[allow(dead_code)]
+    pub fn new(key: char, label: &str) -> Self {
+        Self {
+            key,
+            label: label.to_string(),
+        }
+    }
+}
+
+/// Which decision is being asked. A non-terminal consumer uses this to
+/// title its dialog; the resolvers do not branch on it.
+///
+/// Only `Conflict` is constructed by this task's own code (`Prompt::unknown`);
+/// the rest are named ahead of the prompt sites that will construct them
+/// (`announce` call sites land in the next task of this plan). `dead_code`
+/// is denied workspace-wide, hence the explicit allow rather than leaving
+/// this route half-typed.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    Conflict,
+    RemoteDelete,
+    PushDrift,
+    BulkConfirm,
+    DeleteGate,
+    DeleteDrift,
+    MdhIndexDrop,
+    MdhRowDelete,
+}
+
+/// What a blocked prompt is asking, in machine-readable form. `question` is
+/// the same string the terminal shows, trailing `"> "` and all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prompt {
+    pub kind: PromptKind,
+    pub question: String,
+    pub keys: Vec<PromptKey>,
+}
+
+impl Prompt {
+    /// Fallback for a coordinated read whose site has not announced —
+    /// a free-text answer with no offered keys. Keeps an un-announced read
+    /// working rather than panicking.
+    fn unknown() -> Self {
+        Self {
+            kind: PromptKind::Conflict,
+            question: String::new(),
+            keys: Vec::new(),
+        }
+    }
+}
+
+/// Where a blocked prompt's question goes and where its answer comes from,
+/// when the consumer is not a terminal. Installed per thread, because a
+/// cycle never leaves its thread (engine concurrency is `buffer_unordered`
+/// on the current task, never `tokio::spawn` — see `api::mod`) and the
+/// process-global [`COORD`] has a single waiting slot, so two concurrent
+/// watches sharing it would hang the first one.
+pub trait PromptRoute: Send + Sync {
+    /// Block until the consumer answers. `None` means end of input; every
+    /// resolver already degrades safely on that (conflicts skip, gates
+    /// read as `N`).
+    fn ask(&self, prompt: &Prompt) -> Option<String>;
+}
+
+thread_local! {
+    static ROUTE: RefCell<Option<Arc<dyn PromptRoute>>> = const { RefCell::new(None) };
+    static PENDING: RefCell<Option<Prompt>> = const { RefCell::new(None) };
+}
+
+/// Install `route` for the calling thread until the returned guard drops.
+///
+/// Nothing in the CLI calls this — it is installed by a non-terminal
+/// consumer (the desktop bridge), which lands in a later task of this
+/// plan. `dead_code` is denied workspace-wide, hence the explicit allow
+/// rather than leaving this half-wired route unbuildable in the meantime.
+#[allow(dead_code)]
+#[must_use = "the route is uninstalled when the guard drops"]
+pub fn install_route(route: Arc<dyn PromptRoute>) -> RouteGuard {
+    ROUTE.with(|r| *r.borrow_mut() = Some(route));
+    RouteGuard(())
+}
+
+#[allow(dead_code)]
+pub struct RouteGuard(());
+
+impl Drop for RouteGuard {
+    fn drop(&mut self) {
+        ROUTE.with(|r| *r.borrow_mut() = None);
+        PENDING.with(|p| *p.borrow_mut() = None);
+    }
+}
+
+/// Declare what the next coordinated read is asking. Call immediately
+/// before writing the question. A no-op when no route is installed, which
+/// is every CLI invocation.
+///
+/// No production call site exists yet — every prompt site gains its
+/// `announce` call in the next task of this plan. Explicit allow for the
+/// same reason as [`install_route`].
+#[allow(dead_code)]
+pub fn announce(p: Prompt) {
+    if ROUTE.with(|r| r.borrow().is_some()) {
+        PENDING.with(|slot| *slot.borrow_mut() = Some(p));
+    }
+}
 
 /// Routing state shared between the stdin owner and interactive prompts.
 pub struct StdinCoordinator {
@@ -121,6 +241,15 @@ pub fn read_line_coordinated() -> io::Result<Option<String>> {
     // `CoordinatorStdin` — so this single call covers them all. No-op outside
     // watch (never armed) or off a TTY.
     maybe_ring_bell();
+    // A thread-local route (the desktop app) outranks the process-global
+    // coordinator (`rdc sync --watch` on a TTY), which outranks real stdin.
+    // The CLI never installs a route, so its path is unchanged.
+    if let Some(route) = ROUTE.with(|r| r.borrow().clone()) {
+        let prompt = PENDING
+            .with(|p| p.borrow_mut().take())
+            .unwrap_or_else(Prompt::unknown);
+        return Ok(route.ask(&prompt));
+    }
     if let Some(coord) = COORD.get() {
         return Ok(coord.recv_line());
     }
@@ -260,5 +389,105 @@ mod tests {
         // Buffer exhausted; without a global owner this would read real
         // stdin, so we don't call read_line again here.
         assert_eq!(cs.pos, cs.buf.len());
+    }
+
+    struct Canned {
+        answer: String,
+        seen: Mutex<Vec<Prompt>>,
+    }
+    impl PromptRoute for Canned {
+        fn ask(&self, prompt: &Prompt) -> Option<String> {
+            self.seen.lock().unwrap().push(prompt.clone());
+            Some(self.answer.clone())
+        }
+    }
+
+    #[test]
+    fn an_installed_route_answers_and_sees_the_announced_prompt() {
+        let route = Arc::new(Canned {
+            answer: "k".into(),
+            seen: Mutex::new(Vec::new()),
+        });
+        let guard = install_route(route.clone());
+        announce(Prompt {
+            kind: PromptKind::DeleteGate,
+            question: "Proceed with deletion? [y/N] ".into(),
+            keys: vec![PromptKey::new('y', "yes"), PromptKey::new('n', "no")],
+        });
+        assert_eq!(read_line_coordinated().unwrap(), Some("k".to_string()));
+        let seen = route.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].kind, PromptKind::DeleteGate);
+        assert_eq!(seen[0].keys.len(), 2);
+        drop(guard);
+    }
+
+    #[test]
+    fn a_pending_prompt_is_consumed_once() {
+        let route = Arc::new(Canned {
+            answer: "s".into(),
+            seen: Mutex::new(Vec::new()),
+        });
+        let guard = install_route(route.clone());
+        announce(Prompt {
+            kind: PromptKind::Conflict,
+            question: "q".into(),
+            keys: vec![PromptKey::new('s', "skip")],
+        });
+        let _ = read_line_coordinated().unwrap();
+        let _ = read_line_coordinated().unwrap();
+        let seen = route.seen.lock().unwrap();
+        // Second read saw the fallback, not a stale copy of the first.
+        assert_eq!(seen[0].question, "q");
+        assert_eq!(seen[1].question, "");
+        drop(guard);
+    }
+
+    /// The constraint that ruled out the process-global coordinator: two
+    /// watches must be able to prompt at the same time without either
+    /// answer landing on the wrong thread.
+    #[test]
+    fn routes_are_per_thread_and_do_not_cross_talk() {
+        let a = Arc::new(Canned {
+            answer: "A".into(),
+            seen: Mutex::new(Vec::new()),
+        });
+        let b = Arc::new(Canned {
+            answer: "B".into(),
+            seen: Mutex::new(Vec::new()),
+        });
+
+        let (a2, b2) = (a.clone(), b.clone());
+        let ta = std::thread::spawn(move || {
+            let _g = install_route(a2);
+            announce(Prompt {
+                kind: PromptKind::Conflict,
+                question: "from-a".into(),
+                keys: vec![],
+            });
+            read_line_coordinated().unwrap()
+        });
+        let tb = std::thread::spawn(move || {
+            let _g = install_route(b2);
+            announce(Prompt {
+                kind: PromptKind::Conflict,
+                question: "from-b".into(),
+                keys: vec![],
+            });
+            read_line_coordinated().unwrap()
+        });
+
+        assert_eq!(ta.join().unwrap(), Some("A".to_string()));
+        assert_eq!(tb.join().unwrap(), Some("B".to_string()));
+        assert_eq!(a.seen.lock().unwrap()[0].question, "from-a");
+        assert_eq!(b.seen.lock().unwrap()[0].question, "from-b");
+    }
+
+    #[test]
+    fn no_route_leaves_the_global_coordinator_path_intact() {
+        // Nothing installed on this thread: `read_line_coordinated` must not
+        // touch the thread-local branch. Exercised indirectly by the existing
+        // `delivers_to_waiting_prompt` test, which still passes.
+        assert!(ROUTE.with(|r| r.borrow().is_none()));
     }
 }
