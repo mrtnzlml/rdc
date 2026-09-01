@@ -3374,4 +3374,91 @@ mod tests {
         let r = prompt_remote_delete_with_color(input, &mut out, ObjectRef { kind: "queues", slug: "invoices" }, &path, "prod", ColorMode::Plain, None).unwrap();
         assert!(matches!(r, Resolution::KeepRemote));
     }
+
+    /// Byte-exact pin of the conflict prompt. Task 2 of the two-way-sync
+    /// plan swaps this prompt's output sink from `stderr().lock()` to
+    /// `Log::writer()`; the bytes must not move. If this test fails after
+    /// that change, the CLI's output changed and the change is wrong.
+    ///
+    /// `tempfile::tempdir()` mints a fresh random path every run, and that
+    /// path lands verbatim in the connector line (`render_connector` prints
+    /// `local_path.display()`). A pin containing it could never match twice,
+    /// let alone survive being committed. `redact_tempdir` swaps the actual
+    /// tempdir prefix for a stable placeholder before pinning, so the
+    /// committed file records everything the refactor could plausibly move
+    /// and nothing that is an artifact of this test run.
+    #[test]
+    fn conflict_prompt_bytes_are_pinned() {
+        use std::io::Cursor;
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("queues/invoices.json");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(&local, b"{\"name\":\"Invoices\"}").unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        let _ = prompt_resolve_with_color(
+            Cursor::new(b"s\n"),
+            &mut out,
+            1,
+            1,
+            ObjectRef { kind: "queues", slug: "invoices" },
+            &local,
+            b"{\"name\":\"Invoices EU\"}",
+            "dev",
+            ColorMode::Plain,
+        )
+        .unwrap();
+
+        let actual = redact_tempdir(&String::from_utf8_lossy(&out), dir.path());
+        insta_like_pin("conflict", &actual);
+    }
+
+    #[test]
+    fn remote_delete_prompt_bytes_are_pinned() {
+        use std::io::Cursor;
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("labels/audit-hold.json");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(&local, b"{\"name\":\"Audit hold\"}").unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        let _ = prompt_remote_delete_with_color(
+            Cursor::new(b"s\n"),
+            &mut out,
+            ObjectRef { kind: "labels", slug: "audit-hold" },
+            &local,
+            "dev",
+            ColorMode::Plain,
+            None,
+        )
+        .unwrap();
+
+        let actual = redact_tempdir(&String::from_utf8_lossy(&out), dir.path());
+        insta_like_pin("remote_delete", &actual);
+    }
+
+    /// Replaces the process-specific tempdir prefix with a stable
+    /// placeholder so a pin captured against a `tempfile::tempdir()` fixture
+    /// is reproducible across runs (and machines) instead of embedding a
+    /// fresh random path every time.
+    fn redact_tempdir(actual: &str, tmp: &std::path::Path) -> String {
+        actual.replace(&tmp.display().to_string(), "TMPDIR")
+    }
+
+    /// Writes the captured text to `testdata/prompt_pins/<name>.txt` on
+    /// first run and compares against it afterwards. Deliberately a plain
+    /// file rather than a new dev-dependency: the point is a byte record
+    /// that survives a refactor, and `git diff` on the file is the review.
+    fn insta_like_pin(name: &str, actual: &str) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/prompt_pins")
+            .join(format!("{name}.txt"));
+        if !path.exists() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, actual).unwrap();
+            panic!("wrote a new pin at {}; re-run to verify it", path.display());
+        }
+        let expected = std::fs::read_to_string(&path).unwrap();
+        pretty_assertions::assert_eq!(expected, actual, "prompt bytes moved: {name}");
+    }
 }
