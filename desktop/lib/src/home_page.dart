@@ -830,8 +830,7 @@ class _SyncLogCardState extends State<_SyncLogCard> {
 
 /// Shown when a project node (not one of its envs) is selected
 /// (`state.selectedEnv == null`): the Environments table for that project,
-/// with per-env Sync/Edit/Remove and an "Add environment" action, plus (for
-/// ≥2-env projects) the Promote panel below it.
+/// with per-env Sync/Edit/Remove and an "Add environment" action.
 class _ProjectView extends StatelessWidget {
   const _ProjectView({
     required this.state,
