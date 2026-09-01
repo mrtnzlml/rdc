@@ -469,6 +469,37 @@ In `src/cli/push/mdh.rs`, inside `prompt_confirm_index_drops`:
 
 In `src/cli/push/mdh_data.rs`, inside `prompt_confirm_row_deletes`, make the identical change with the text `"Proceed with the deletion(s)? [y/N] "`.
 
+- [ ] **Step 3b: Route the last two raw prompt sinks, in `resolve.rs`**
+
+Task 2 routed the sinks in `sync/execute.rs` and `pull/common.rs`. Two remain, and they were
+missing from this plan's own prompt inventory — the inventory listed the push-drift prompt as
+living only at `pull/common.rs`, but the push and pull *drivers* reach a different pair of
+resolvers:
+
+- `src/cli/resolve.rs:1259` in `resolve_push_drift`
+- `src/cli/resolve.rs:1388` in `resolve_combined_file`
+
+Both build `let stderr = std::io::stderr();` and hand `stderr.lock()` to `prompt_resolve`. Both
+are reachable from the desktop app's two-way cycle, so leaving them raw means a dialog with no
+diff in it — exactly the defect Task 2 existed to fix, surviving in the driver paths.
+
+Neither function currently takes a renderer. Add `progress: &Arc<Log>` as a parameter to each
+and pass `progress.writer()` to `prompt_resolve` in place of `stderr.lock()`. Then update every
+call site; `progress` is already in scope at all of them, so each is a one-argument edit:
+
+- `resolve_push_drift` — called from the `src/cli/push/*.rs` drivers (`engines.rs`,
+  `engine_fields.rs`, and others; `grep -rn "resolve_push_drift" src/cli/push/` for the list)
+  and from a test in `resolve.rs` itself.
+- `resolve_combined_file` — called from `src/cli/pull/hooks.rs` (two sites), `pull/queues.rs`
+  (two sites), `pull/rules.rs` (two sites), and two tests in `resolve.rs`.
+
+Do not change either function's behaviour, its prompt text, or its return type. This is a
+parameter addition and a sink swap, nothing else. Let the compiler enumerate the call sites
+rather than trusting the list above — it was assembled by grep and may be incomplete.
+
+After this step `grep -rn "stderr().lock()\|stderr.lock()" src/cli/` must return no hits
+outside comments.
+
 - [ ] **Step 4: Add a capture test for all four question strings**
 
 In `src/cli/push/deletes.rs`'s `mod tests` (create the module if the file has none):
@@ -525,8 +556,8 @@ Expected: no hits.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/cli/push/deletes.rs src/cli/push/mdh.rs src/cli/push/mdh_data.rs
-git commit -m "fix(push): route the four destructive questions through the renderer
+git add src/cli/push/deletes.rs src/cli/push/mdh.rs src/cli/push/mdh_data.rs src/cli/resolve.rs src/cli/push src/cli/pull
+git commit -m "fix(cli): route every remaining raw prompt sink through the renderer
 
 7e96b89 moved the gates' object lists onto the Log but left the questions
 themselves on raw stderr, so an embedder saw what would be deleted and
