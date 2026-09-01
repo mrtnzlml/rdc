@@ -453,6 +453,23 @@ impl Log {
         let _ = state.out.flush();
     }
 
+    /// Emit one pre-rendered change row (see `cli::change_view::render_row`).
+    ///
+    /// Rows carry their own 9-space indent so the verb lands in the action
+    /// column, and they deliberately have no timestamp: a row belongs to the
+    /// event line above it. Routing them through `Log` rather than `eprintln!`
+    /// is what lets an embedder (`Log::for_sink`) receive them at all.
+    pub fn row(&self, body: &str) {
+        let mut state = self.state.lock().unwrap();
+        if state.status_active {
+            let _ = state.out.write_all(b"\r\x1b[K");
+            state.status_active = false;
+        }
+        let _ = state.out.write_all(body.as_bytes());
+        let _ = state.out.write_all(b"\n");
+        let _ = state.out.flush();
+    }
+
     /// Run an inline interactive prompt (auth refresh, conflict resolver,
     /// destructive delete gate). Currently flushes pending output then
     /// runs the closure — kept as a method so callsites express intent
@@ -579,6 +596,21 @@ mod log_tests {
         let log = Log::for_test(ColorMode::Plain, Box::new(buf.clone()));
         log.block("one\ntwo\n");
         assert_eq!(buf.text(), "one\ntwo\n");
+    }
+
+    #[test]
+    fn row_writes_verbatim_with_no_timestamp() {
+        let buf = Buf::default();
+        let log = Log::for_test_with_time(
+            ColorMode::Plain,
+            Box::new(buf.clone()),
+            UNIX_EPOCH + Duration::from_secs(12 * 3600 + 60 + 14),
+        );
+        log.row("         patch  rules           finance-totals            +4    -4");
+        assert_eq!(
+            buf.text(),
+            "         patch  rules           finance-totals            +4    -4\n"
+        );
     }
 
     #[test]

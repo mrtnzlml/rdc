@@ -1591,12 +1591,12 @@ fn decide_color_mode(no_color_env: bool, is_tty: bool) -> ColorMode {
 // emphasis (`@@` hunk headers, conflict headers, action-letter brackets),
 // soft red for removed lines, sage green for added — chosen for
 // contrast on both light and dark terminal themes.
-const SGR_RESET: &str = "\x1b[0m";
-const SGR_AMBER_BOLD: &str = "\x1b[1;38;2;237;142;71m";
-const SGR_REMOVE_BOLD: &str = "\x1b[1;38;2;220;80;80m";
-const SGR_ADD: &str = "\x1b[38;2;120;180;90m";
-const SGR_ADD_BOLD: &str = "\x1b[1;38;2;120;180;90m";
-const SGR_DIM: &str = "\x1b[2m";
+pub(crate) const SGR_RESET: &str = "\x1b[0m";
+pub(crate) const SGR_AMBER_BOLD: &str = "\x1b[1;38;2;237;142;71m";
+pub(crate) const SGR_REMOVE_BOLD: &str = "\x1b[1;38;2;220;80;80m";
+pub(crate) const SGR_ADD: &str = "\x1b[38;2;120;180;90m";
+pub(crate) const SGR_ADD_BOLD: &str = "\x1b[1;38;2;120;180;90m";
+pub(crate) const SGR_DIM: &str = "\x1b[2m";
 
 // --- Styled diff renderer (line numbers, ± row backgrounds, JSON highlight) ---
 //

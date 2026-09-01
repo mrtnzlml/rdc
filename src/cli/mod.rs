@@ -461,6 +461,7 @@ fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
 }
 
 pub mod auth;
+pub mod change_view;
 pub mod deploy;
 pub mod gitlab_ci;
 pub mod regions;
