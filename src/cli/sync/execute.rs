@@ -36,7 +36,8 @@
 use crate::cli::pull::common::{PullCtx, RemoteCatalog};
 use crate::cli::resolve::{
     BulkChoice, BulkPrompt, ConflictStrategy, PullAborted, Resolution, detect_color_mode,
-    prompt_remote_delete, prompt_remote_delete_with_color, prompt_resolve_with_bytes_and_color,
+    ObjectRef, prompt_remote_delete, prompt_remote_delete_with_color,
+    prompt_resolve_with_bytes_and_color,
 };
 use crate::cli::stdin_coord::CoordinatorStdin;
 use crate::cli::sync::classify::{ClassifiedItem, SyncClass};
@@ -1526,6 +1527,7 @@ fn resolve_one_conflict<R: BufRead>(
                             &mut *stderr_lock,
                             idx_one_based,
                             total,
+                            ObjectRef { kind: &it.kind, slug: &it.slug },
                             &code_path,
                             &local_bytes,
                             &remote_bytes_for_prompt,
@@ -1580,6 +1582,7 @@ fn resolve_one_conflict<R: BufRead>(
                             &mut *stderr_lock,
                             idx_one_based,
                             total,
+                            ObjectRef { kind: &it.kind, slug: &it.slug },
                             &formula_path,
                             &local_b,
                             &remote_b,
@@ -1608,6 +1611,7 @@ fn resolve_one_conflict<R: BufRead>(
                     &mut *stderr_lock,
                     idx_one_based,
                     total,
+                    ObjectRef { kind: &it.kind, slug: &it.slug },
                     &local_path,
                     &local_json_bytes,
                     &remote_bytes,
@@ -2309,6 +2313,7 @@ async fn prune_mdh_orphans<R: BufRead>(
             let r = prompt_remote_delete(
                 &mut input,
                 std::io::stderr().lock(),
+                ObjectRef { kind: "mdh", slug: &slug },
                 &indexes_for_prompt,
                 &env,
             )?;
@@ -3171,6 +3176,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                         let r = prompt_remote_delete_with_color(
                             &mut input,
                             std::io::stderr().lock(),
+                            ObjectRef { kind: &it.kind, slug: &it.slug },
                             &local_for_prompt,
                             &env,
                             detect_color_mode(),

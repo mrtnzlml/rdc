@@ -110,6 +110,7 @@ pub async fn process(
             }
             let recorded_hash = apply_pull_action(
                 action,
+                crate::cli::resolve::ObjectRef { kind: KIND, slug: &lockfile_key },
                 &local_path,
                 &proposed,
                 remote_hash,

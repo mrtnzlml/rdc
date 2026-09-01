@@ -772,6 +772,7 @@ pub(crate) async fn apply_dataset_rows(
         // misfires on JSONL row data.
         apply_pull_action_with(
             action,
+            crate::cli::resolve::ObjectRef { kind: KIND, slug },
             &data_path,
             &proposed,
             remote_hash,
@@ -1112,6 +1113,7 @@ pub async fn process(
             } else {
                 apply_pull_action(
                     i_action,
+                    crate::cli::resolve::ObjectRef { kind: KIND, slug: slug.as_str() },
                     &ix_path,
                     &ix_proposed,
                     i_remote_hash,

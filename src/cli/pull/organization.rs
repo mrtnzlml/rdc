@@ -48,6 +48,7 @@ pub async fn process(
         let conflicts = if action == PullAction::Conflict { 1 } else { 0 };
         let recorded_hash = apply_pull_action(
             action,
+            crate::cli::resolve::ObjectRef { kind: KIND, slug: "self" },
             &path,
             &proposed,
             remote_hash,

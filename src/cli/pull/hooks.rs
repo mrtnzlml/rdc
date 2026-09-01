@@ -154,6 +154,7 @@ pub async fn process(
                     // path); pass `ctx.interactive` for consistency.
                     apply_pull_action(
                         action,
+                        crate::cli::resolve::ObjectRef { kind: KIND, slug: &slug },
                         &local_path,
                         &proposed_json,
                         remote_combined_hash.clone(),
@@ -217,6 +218,7 @@ pub async fn process(
                     let json_outcome = crate::cli::resolve::resolve_combined_file(
                         1,
                         total,
+                        crate::cli::resolve::ObjectRef { kind: KIND, slug: &slug },
                         &local_path,
                         local_json,
                         &proposed_json,
@@ -238,6 +240,7 @@ pub async fn process(
                                 let code_outcome = crate::cli::resolve::resolve_combined_file(
                                     2,
                                     total,
+                                    crate::cli::resolve::ObjectRef { kind: KIND, slug: &slug },
                                     &code_path,
                                     loc.as_bytes(),
                                     rem.as_bytes(),

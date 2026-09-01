@@ -25,8 +25,10 @@
 //! callers fall through to shadow-file (legacy behavior, CI-safe).
 
 use anyhow::{Context, Result};
+use crate::cli::change_view::{
+    ChangeRow, RowVerb, RowWidths, count_changes, render_connector, render_diff_body, render_row,
+};
 use similar::{Algorithm, TextDiff};
-use std::fmt::Write as FmtWrite;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 use std::process::Command;
@@ -47,6 +49,18 @@ pub fn line_diff<'old, 'new>(old: &'old str, new: &'new str) -> TextDiff<'old, '
     TextDiff::configure()
         .algorithm(Algorithm::Histogram)
         .diff_lines(old, new)
+}
+
+/// Which object a prompt is about, so the row above its diff can name the kind
+/// and the slug the way a plan row does.
+///
+/// The kind is the plural registry name (`kinds.rs`), never a hand-built
+/// string — that is what keeps a prompt, a plan row and an executed row all
+/// calling the same object by the same name.
+#[derive(Copy, Clone, Debug)]
+pub struct ObjectRef<'a> {
+    pub kind: &'a str,
+    pub slug: &'a str,
 }
 
 /// Outcome of presenting a single conflict to the user.
@@ -142,27 +156,6 @@ pub fn is_interactive(yes_flag: bool) -> bool {
     !yes_flag && std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
-/// Render a unified diff (3 lines of context) suitable for inline display.
-/// Returns the diff as a string; an empty string means the two slices are
-/// byte-identical.
-pub fn unified_diff(label_a: &str, a: &[u8], label_b: &str, b: &[u8]) -> String {
-    let a_str = String::from_utf8_lossy(a);
-    let b_str = String::from_utf8_lossy(b);
-    let diff = line_diff(a_str.as_ref(), b_str.as_ref());
-    let mut out = String::new();
-    writeln!(out, "--- {label_a}").expect("writing to String never fails");
-    writeln!(out, "+++ {label_b}").expect("writing to String never fails");
-    let mut any = false;
-    for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
-        any = true;
-        write!(out, "{hunk}").expect("writing to String never fails");
-    }
-    if !any {
-        return String::new();
-    }
-    out
-}
-
 /// Reshape bytes for diff display. When the bytes parse as JSON, return a
 /// stable pretty-printed form (2-space indent, BTreeMap-ordered keys, trailing
 /// newline) so per-field changes show on their own diff lines. Non-JSON inputs
@@ -185,6 +178,11 @@ pub fn prettify_json_for_diff(bytes: &[u8]) -> Vec<u8> {
     pretty
 }
 
+/// Whether a path's bytes should be syntax-highlighted as JSON.
+fn is_json_path(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "json")
+}
+
 /// Read base bytes from `local_path` if it exists; used for the
 /// "local has changes" / "remote has changes" header in the prompt.
 fn read_local(path: &Path) -> Result<Vec<u8>> {
@@ -199,6 +197,7 @@ pub fn prompt_resolve<R: BufRead, W: Write>(
     output: W,
     index: usize,
     total: usize,
+    obj: ObjectRef<'_>,
     local_path: &Path,
     remote_bytes: &[u8],
     env: &str,
@@ -209,6 +208,7 @@ pub fn prompt_resolve<R: BufRead, W: Write>(
         output,
         index,
         total,
+        obj,
         local_path,
         remote_bytes,
         env,
@@ -223,6 +223,7 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
     output: W,
     index: usize,
     total: usize,
+    obj: ObjectRef<'_>,
     local_path: &Path,
     remote_bytes: &[u8],
     env: &str,
@@ -234,6 +235,7 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
         output,
         index,
         total,
+        obj,
         local_path,
         &local_bytes,
         remote_bytes,
@@ -278,6 +280,7 @@ pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
     mut output: W,
     index: usize,
     total: usize,
+    obj: ObjectRef<'_>,
     local_path: &Path,
     local_bytes: &[u8],
     remote_bytes: &[u8],
@@ -320,34 +323,40 @@ pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
     let hunk_count = count_conflict_hunks(&local_display, &remote_display);
 
     writeln!(output)?;
-    let header = if hunk_count >= 2 {
-        format!(
-            "[{index}/{total}]  {} -- conflict ({hunk_count} hunks)",
-            local_path.display()
-        )
-    } else {
-        format!("[{index}/{total}]  {} -- conflict", local_path.display())
-    };
-    writeln!(output, "{}", colorize_header(&header, mode))?;
-    writeln!(output)?;
+    // The path and the hunk count moved onto the row / connector below, so the
+    // header is just the position in the run.
+    writeln!(
+        output,
+        "{}",
+        colorize_header(&format!("[{index}/{total}]  conflict"), mode)
+    )?;
 
-    // Same styled renderer every other diff surface uses, so the conflict
-    // preview shares the look. The `env` side is `+` (the prompt already
-    // names it: "[r] use {env}"); local is `-`.
+    // Row, then connector, then body — the same three parts every other
+    // surface uses. The `env` side is `+` (the prompt already names it:
+    // "[r] use {env}"); local is `-`.
     let left = String::from_utf8_lossy(&local_display);
     let right = String::from_utf8_lossy(&remote_display);
-    let p = local_path.display();
-    let diff = render_styled_diff(
-        &format!("{p} (local)"),
-        &format!("{p} ({env})"),
-        &left,
-        &right,
-        mode,
-    );
-    if diff.is_empty() {
+    let body = render_diff_body(&left, &right, is_json_path(local_path), mode);
+    if body.is_empty() {
         return Ok(Resolution::KeepLocal);
     }
-    write!(output, "{diff}")?;
+    let (added, removed) = count_changes(&left, &right);
+    let hunk_note = format!("{hunk_count} hunks");
+    let row = ChangeRow {
+        verb: RowVerb::Prompt,
+        kind: obj.kind,
+        name: obj.slug,
+        added: Some(added),
+        removed: Some(removed),
+        note: (hunk_count >= 2).then_some(hunk_note.as_str()),
+    };
+    writeln!(
+        output,
+        "{}",
+        render_row(&row, RowWidths::fit([(obj.kind, obj.slug)]), mode)
+    )?;
+    writeln!(output, "{}", render_connector(local_path, "local", env, mode))?;
+    write!(output, "{body}")?;
     writeln!(output)?;
 
     loop {
@@ -464,11 +473,12 @@ fn count_conflict_hunks(local: &[u8], remote: &[u8]) -> usize {
 pub fn prompt_remote_delete<R: BufRead, W: Write>(
     input: R,
     output: W,
+    obj: ObjectRef<'_>,
     local_path: &Path,
     env: &str,
 ) -> Result<Resolution> {
     let mode = detect_color_mode();
-    prompt_remote_delete_with_color(input, output, local_path, env, mode, None)
+    prompt_remote_delete_with_color(input, output, obj, local_path, env, mode, None)
 }
 
 /// Color-aware variant. Tests pin the mode; production goes through
@@ -476,6 +486,7 @@ pub fn prompt_remote_delete<R: BufRead, W: Write>(
 pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
     mut input: R,
     mut output: W,
+    obj: ObjectRef<'_>,
     local_path: &Path,
     env: &str,
     mode: ColorMode,
@@ -483,30 +494,59 @@ pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
 ) -> Result<Resolution> {
     let local_bytes = read_local(local_path)?;
     let preview = prettify_json_for_diff(&local_bytes);
-
-    writeln!(output)?;
-    let header = format!("{} -- deleted on {env}", local_path.display());
-    writeln!(output, "{}", colorize_header(&header, mode))?;
-    writeln!(output)?;
-    writeln!(output, "local has the file:")?;
-
-    // Elide the preview to ~40 lines for unwieldy bodies. The spec's
-    // open question allows this; revisit if user feedback says otherwise.
     let s = String::from_utf8_lossy(&preview);
+
+    // Elide unwieldy bodies so a 1,200-line schema cannot scroll the prompt
+    // off the screen. Same 40-line cap the hand-rolled preview used.
+    const LIMIT: usize = 40;
     let lines: Vec<&str> = s.lines().collect();
-    let limit = 40;
-    if lines.len() <= limit {
-        for ln in &lines {
-            writeln!(output, "  {ln}")?;
-        }
+    let elided = lines.len().saturating_sub(LIMIT);
+    let shown = if elided > 0 {
+        format!("{}\n", lines[..LIMIT].join("\n"))
     } else {
-        for ln in &lines[..limit] {
-            writeln!(output, "  {ln}")?;
-        }
-        writeln!(output, "  ... ({} more lines)", lines.len() - limit)?;
-    }
+        s.to_string()
+    };
+
+    // Row, connector, body — the same three parts a conflict uses. The local
+    // file is the `-` side and the env, which no longer has it, is the empty
+    // `+` side, so this reads as the one-sided deletion it is.
     writeln!(output)?;
-    writeln!(output, "{env} has it deleted.")?;
+    writeln!(
+        output,
+        "{}",
+        colorize_header(&format!("deleted on {env}"), mode)
+    )?;
+    let (added, removed) = count_changes(&shown, "");
+    let row = ChangeRow {
+        verb: RowVerb::Prompt,
+        kind: obj.kind,
+        name: obj.slug,
+        added: Some(added),
+        removed: Some(removed),
+        note: None,
+    };
+    writeln!(
+        output,
+        "{}",
+        render_row(&row, RowWidths::fit([(obj.kind, obj.slug)]), mode)
+    )?;
+    writeln!(
+        output,
+        "{}",
+        render_connector(local_path, "local", &format!("{env} (deleted)"), mode)
+    )?;
+    write!(
+        output,
+        "{}",
+        render_diff_body(&shown, "", is_json_path(local_path), mode)
+    )?;
+    if elided > 0 {
+        writeln!(
+            output,
+            "{}",
+            colorize_dim(&format!("         \u{2026} ({elided} more lines)"), mode)
+        )?;
+    }
     writeln!(output)?;
 
     loop {
@@ -969,12 +1009,12 @@ fn prompt_single_hunk<R: BufRead, W: Write>(
         push_line(&mut local_view, line);
         push_line(&mut remote_view, line);
     }
-    let p = local_path.display();
-    let diff = render_styled_diff(
-        &format!("{p} (local)"),
-        &format!("{p} ({env})"),
+    // No row here: the parent conflict prompt already named the object, and a
+    // hunk is a part of it rather than an object of its own.
+    let diff = render_diff_body(
         &local_view,
         &remote_view,
+        is_json_path(local_path),
         mode,
     );
     write!(output, "{diff}")?;
@@ -1181,6 +1221,7 @@ impl CombinedFileOutcome {
 pub fn resolve_combined_file(
     label_index: usize,
     label_total: usize,
+    obj: ObjectRef<'_>,
     local_path: &Path,
     local_bytes: &[u8],
     remote_bytes: &[u8],
@@ -1218,6 +1259,7 @@ pub fn resolve_combined_file(
         stderr.lock(),
         label_index,
         label_total,
+        obj,
         local_path,
         remote_bytes,
         paths.env(),
@@ -1327,6 +1369,7 @@ pub enum PushDriftOutcome {
 /// On `[a]bort`: returns a `PullAborted` error.
 pub fn resolve_push_drift(
     interactive: bool,
+    obj: ObjectRef<'_>,
     local_path: &Path,
     remote_bytes: &[u8],
     env: &str,
@@ -1345,6 +1388,7 @@ pub fn resolve_push_drift(
         stderr.lock(),
         1,
         1,
+        obj,
         local_path,
         remote_bytes,
         env,
@@ -1598,353 +1642,6 @@ pub(crate) const SGR_ADD: &str = "\x1b[38;2;120;180;90m";
 pub(crate) const SGR_ADD_BOLD: &str = "\x1b[1;38;2;120;180;90m";
 pub(crate) const SGR_DIM: &str = "\x1b[2m";
 
-// --- Styled diff renderer (line numbers, ± row backgrounds, JSON highlight) ---
-//
-// Row backgrounds use truecolor + the EL trick (`\x1b[K`): once a background
-// is active, erase-to-end-of-line fills the rest of the row with it, so a
-// removed/added row tints edge-to-edge regardless of content width.
-// Foreground tokens inside a tinted row end with `\x1b[39m` (reset fg, keep
-// bg) — never a full `\x1b[0m` — so the bg survives until the trailing
-// EL + reset.
-const SGR_BG_ADD: &str = "\x1b[48;2;20;48;28m"; // deep green (added row)
-const SGR_BG_REMOVE: &str = "\x1b[48;2;60;24;26m"; // deep red (removed row)
-const SGR_BG_ADD_HI: &str = "\x1b[48;2;38;92;52m"; // brighter green — changed span
-const SGR_BG_REMOVE_HI: &str = "\x1b[48;2;120;42;46m"; // brighter red — changed span
-const SGR_GUTTER: &str = "\x1b[38;2;120;120;120m"; // gray line numbers (context)
-const SGR_GUTTER_ADD: &str = "\x1b[38;2;135;190;120m"; // green line number (added)
-const SGR_GUTTER_REMOVE: &str = "\x1b[38;2;225;130;130m"; // red line number (removed)
-const SGR_FG_DEFAULT: &str = "\x1b[39m"; // reset fg, preserve bg
-const SGR_EOL: &str = "\x1b[K"; // erase to EOL → fills current bg
-const SGR_J_KEY: &str = "\x1b[38;2;126;167;255m"; // JSON keys
-const SGR_J_STR: &str = "\x1b[38;2;152;195;121m"; // JSON string values
-const SGR_J_NUM: &str = "\x1b[38;2;229;181;103m"; // JSON numbers
-const SGR_J_KW: &str = "\x1b[38;2;198;146;233m"; // true / false / null
-
-/// Render a styled diff for inline display — the single renderer behind every
-/// user-facing diff (dry-run/deploy previews and the conflict resolver), so
-/// they all share one look.
-///
-/// Layout: a `Verb(path)` header, an `Added N / removed M` summary, then
-/// line-numbered hunks (3 lines of context) with gray gutters, red/green row
-/// backgrounds on `-`/`+` lines, and simple JSON syntax highlighting (only
-/// when `path` ends in `.json`). `Verb` is `Create` (left empty) / `Delete`
-/// (right empty) / `Update`. In [`ColorMode::Plain`] the same layout renders
-/// with no SGR at all (line numbers + `-`/`+` markers). Returns `""` when the
-/// two sides are byte-identical.
-pub fn render_styled_diff(
-    left_label: &str,
-    right_label: &str,
-    left: &str,
-    right: &str,
-    mode: ColorMode,
-) -> String {
-    use similar::ChangeTag;
-    use std::fmt::Write as _;
-
-    let path = diff_display_path(left_label, right_label);
-    let left_ann = label_annotation(left_label);
-    let right_ann = label_annotation(right_label);
-    let diff = line_diff(left, right);
-    let groups = diff.grouped_ops(3);
-    if groups.is_empty() {
-        return String::new();
-    }
-
-    let (mut added, mut removed, mut max_line) = (0usize, 0usize, 1usize);
-    for op in groups.iter().flatten() {
-        for ch in diff.iter_changes(op) {
-            if let Some(i) = ch.old_index() {
-                max_line = max_line.max(i + 1);
-            }
-            if let Some(i) = ch.new_index() {
-                max_line = max_line.max(i + 1);
-            }
-            match ch.tag() {
-                ChangeTag::Insert => added += 1,
-                ChangeTag::Delete => removed += 1,
-                ChangeTag::Equal => {}
-            }
-        }
-    }
-
-    let w = max_line.to_string().len().max(3);
-    let verb = if left.is_empty() {
-        "Create"
-    } else if right.is_empty() {
-        "Delete"
-    } else {
-        "Update"
-    };
-    let is_json = path.ends_with(".json");
-    let plain = mode == ColorMode::Plain;
-    let s = |n: usize| if n == 1 { "" } else { "s" };
-
-    let mut out = String::new();
-    if plain {
-        let _ = writeln!(out, "{verb}({path})");
-        let _ = writeln!(
-            out,
-            "  Added {added} line{}, removed {removed} line{}",
-            s(added),
-            s(removed)
-        );
-    } else {
-        let _ = writeln!(out, "{SGR_AMBER_BOLD}{verb}{SGR_RESET}({path})");
-        let _ = writeln!(
-            out,
-            "  {SGR_DIM}\u{23bf} Added {added} line{}, removed {removed} line{}{SGR_RESET}",
-            s(added),
-            s(removed)
-        );
-    }
-
-    // Side legend (when both labels carry a ` (…)` annotation) so the reader
-    // knows what `-` and `+` mean — e.g. `- local  + remote`, or for a deploy
-    // preview `- tgt before  + tgt after`. The `-`/`+` tokens are colored bold
-    // red/green to mirror the `-`/`+` row colors below, so the side mapping
-    // reads at a glance — do not dim it back.
-    if let (Some(la), Some(ra)) = (left_ann, right_ann) {
-        let _ = if plain {
-            writeln!(out, "  - {la}   + {ra}")
-        } else {
-            writeln!(
-                out,
-                "  {SGR_REMOVE_BOLD}- {la}{SGR_RESET}   {SGR_ADD_BOLD}+ {ra}{SGR_RESET}"
-            )
-        };
-    }
-
-    for (gi, group) in groups.iter().enumerate() {
-        if gi > 0 {
-            let _ = if plain {
-                writeln!(out, "  \u{22ee}")
-            } else {
-                writeln!(out, "  {SGR_DIM}\u{22ee}{SGR_RESET}")
-            };
-        }
-        for op in group {
-            for change in diff.iter_inline_changes(op) {
-                // Reassemble the row text and record which byte ranges differ
-                // from the paired row (emphasized), for intra-line highlight.
-                let mut content = String::new();
-                let mut emph: Vec<(usize, usize)> = Vec::new();
-                for (emphasized, val) in change.iter_strings_lossy() {
-                    let start = content.len();
-                    content.push_str(&val);
-                    if emphasized {
-                        emph.push((start, content.len()));
-                    }
-                }
-                if content.ends_with('\n') {
-                    content.pop();
-                }
-                let clen = content.len();
-                for r in emph.iter_mut() {
-                    r.0 = r.0.min(clen);
-                    r.1 = r.1.min(clen);
-                }
-                emph.retain(|(s, e)| s < e);
-
-                let (marker, idx) = match change.tag() {
-                    ChangeTag::Equal => (' ', change.new_index()),
-                    ChangeTag::Delete => ('-', change.old_index()),
-                    ChangeTag::Insert => ('+', change.new_index()),
-                };
-                let n = idx.map(|i| i + 1).unwrap_or(0);
-
-                if plain {
-                    let _ = writeln!(out, "  {n:>w$} {marker} {content}");
-                    continue;
-                }
-                let _ = match change.tag() {
-                    ChangeTag::Delete => {
-                        let body = render_content(
-                            &content,
-                            is_json,
-                            Some(SGR_BG_REMOVE),
-                            SGR_BG_REMOVE_HI,
-                            &emph,
-                        );
-                        writeln!(
-                            out,
-                            "{SGR_BG_REMOVE}  {SGR_GUTTER_REMOVE}{n:>w$} {marker}{SGR_FG_DEFAULT} {body}{SGR_EOL}{SGR_RESET}"
-                        )
-                    }
-                    ChangeTag::Insert => {
-                        let body = render_content(
-                            &content,
-                            is_json,
-                            Some(SGR_BG_ADD),
-                            SGR_BG_ADD_HI,
-                            &emph,
-                        );
-                        writeln!(
-                            out,
-                            "{SGR_BG_ADD}  {SGR_GUTTER_ADD}{n:>w$} {marker}{SGR_FG_DEFAULT} {body}{SGR_EOL}{SGR_RESET}"
-                        )
-                    }
-                    ChangeTag::Equal => {
-                        let body = render_content(&content, is_json, None, "", &[]);
-                        writeln!(out, "  {SGR_GUTTER}{n:>w$}{SGR_RESET}   {body}")
-                    }
-                };
-            }
-        }
-    }
-    out
-}
-
-/// Derive the header path for [`render_styled_diff`] from the two side
-/// labels callers pass (e.g. `"queues/q/queue.json (local)"` and
-/// `"… (remote)"`, or `"/dev/null"` for a created/deleted side). Picks the
-/// non-`/dev/null` side and strips a trailing ` (…)` annotation.
-pub fn diff_display_path(a: &str, b: &str) -> String {
-    let pick = if a == "/dev/null" { b } else { a };
-    pick.rsplit_once(" (")
-        .map(|(p, _)| p)
-        .unwrap_or(pick)
-        .to_string()
-}
-
-/// Extract the ` (…)` annotation a caller appends to a diff side label
-/// (e.g. `"hooks/x.json (tgt before)"` → `"tgt before"`). Returns `None`
-/// for bare paths or `/dev/null`.
-fn label_annotation(label: &str) -> Option<&str> {
-    let start = label.rfind(" (")? + 2;
-    label[start..].strip_suffix(')')
-}
-
-/// JSON syntax-highlight spans for one line: `(start, end, fg)` byte ranges
-/// for `"keys"` (a string immediately followed by `:`), `"string values"`,
-/// numbers, and the literals `true`/`false`/`null`. Bytes not covered by any
-/// span render in the default foreground. Best-effort and line-local; never
-/// panics.
-fn json_fg_spans(line: &str) -> Vec<(usize, usize, &'static str)> {
-    let b = line.as_bytes();
-    let mut spans = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        let c = b[i];
-        if c == b'"' {
-            let start = i;
-            i += 1;
-            while i < b.len() {
-                match b[i] {
-                    b'\\' => i = (i + 2).min(b.len()),
-                    b'"' => {
-                        i += 1;
-                        break;
-                    }
-                    _ => i += 1,
-                }
-            }
-            let mut j = i;
-            while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
-                j += 1;
-            }
-            let color = if j < b.len() && b[j] == b':' {
-                SGR_J_KEY
-            } else {
-                SGR_J_STR
-            };
-            spans.push((start, i, color));
-        } else if c.is_ascii_digit() || (c == b'-' && i + 1 < b.len() && b[i + 1].is_ascii_digit())
-        {
-            let start = i;
-            i += 1;
-            while i < b.len()
-                && (b[i].is_ascii_digit() || matches!(b[i], b'.' | b'e' | b'E' | b'+' | b'-'))
-            {
-                i += 1;
-            }
-            spans.push((start, i, SGR_J_NUM));
-        } else if let Some(kw) = ["true", "false", "null"]
-            .into_iter()
-            .find(|kw| line[i..].starts_with(kw))
-            .filter(|kw| {
-                let e = i + kw.len();
-                e >= b.len() || !(b[e].is_ascii_alphanumeric() || b[e] == b'_')
-            })
-        {
-            spans.push((i, i + kw.len(), SGR_J_KW));
-            i += kw.len();
-        } else {
-            let ch = line[i..].chars().next().unwrap();
-            i += ch.len_utf8();
-        }
-    }
-    spans
-}
-
-/// Render one diff row's content (everything after the gutter + marker),
-/// combining two overlays: JSON syntax highlighting (foreground) and
-/// intra-line change emphasis — a brighter background (`hi_bg`) over the
-/// `emph` byte ranges, which are the substrings that actually differ from the
-/// paired row. `base_bg` is `Some` for changed (`-`/`+`) rows (the row's base
-/// background, which the caller has already set and whose trailing `\x1b[K`
-/// fills the rest of the line) and `None` for context rows. Foreground
-/// changes use `\x1b[39m` so the active background is never disturbed; the
-/// background is restored to `base_bg` before returning.
-fn render_content(
-    content: &str,
-    is_json: bool,
-    base_bg: Option<&str>,
-    hi_bg: &str,
-    emph: &[(usize, usize)],
-) -> String {
-    let fg = if is_json {
-        json_fg_spans(content)
-    } else {
-        Vec::new()
-    };
-    let mut bounds: Vec<usize> = vec![0, content.len()];
-    for (s, e, _) in &fg {
-        bounds.push(*s);
-        bounds.push(*e);
-    }
-    for (s, e) in emph {
-        bounds.push(*s);
-        bounds.push(*e);
-    }
-    bounds.sort_unstable();
-    bounds.dedup();
-
-    let mut out = String::new();
-    let mut cur_fg: Option<&str> = None;
-    let mut cur_emph = false;
-    for win in bounds.windows(2) {
-        let (a, z) = (win[0], win[1]);
-        if a >= z {
-            continue;
-        }
-        let seg_fg = fg
-            .iter()
-            .find(|(s, e, _)| *s <= a && a < *e)
-            .map(|(_, _, c)| *c);
-        let seg_emph = emph.iter().any(|(s, e)| *s <= a && a < *e);
-        if let Some(bg) = base_bg
-            && seg_emph != cur_emph
-        {
-            out.push_str(if seg_emph { hi_bg } else { bg });
-            cur_emph = seg_emph;
-        }
-        if seg_fg != cur_fg {
-            out.push_str(seg_fg.unwrap_or(SGR_FG_DEFAULT));
-            cur_fg = seg_fg;
-        }
-        out.push_str(&content[a..z]);
-    }
-    if cur_fg.is_some() {
-        out.push_str(SGR_FG_DEFAULT);
-    }
-    if let Some(bg) = base_bg
-        && cur_emph
-    {
-        out.push_str(bg);
-    }
-    out
-}
-
 /// Colorize the conflict header line in bold amber — matches the
 /// primary accent used by clap headers and prompt brackets.
 pub fn colorize_header(text: &str, mode: ColorMode) -> String {
@@ -2035,67 +1732,12 @@ pub fn colorize_dim(text: &str, mode: ColorMode) -> String {
     format!("{SGR_DIM}{text}{SGR_RESET}")
 }
 
-/// Print a styled diff (3-line context) of two text blobs. The `*_label`
-/// args supply the header path; the `-`/`+` sides are left/right. If the
-/// inputs are byte-equal, prints nothing and leaves `counter` untouched —
-/// callers can pass a no-op counter (`&mut 0`) when they only care about
-/// the side effect. Rendering goes through [`render_styled_diff`], the one
-/// renderer shared by the dry-run/deploy previews and the conflict resolver,
-/// so every diff looks the same: a `Verb(path)` header, an `Added N /
-/// removed M` summary, and line-numbered hunks with red/green row
-/// backgrounds + JSON syntax highlighting on a TTY (plain otherwise;
-/// respects `NO_COLOR`).
-pub fn print_unified(
-    left_label: &str,
-    right_label: &str,
-    left: &str,
-    right: &str,
-    counter: &mut usize,
-) {
-    if left == right {
-        return;
-    }
-    let mode = detect_color_mode();
-    let rendered = render_styled_diff(left_label, right_label, left, right, mode);
-    if rendered.is_empty() {
-        return;
-    }
-    print!("{rendered}");
-    *counter += 1;
-}
-
-/// Print a "new file" unified diff — the right side is empty so every line
-/// of `body` shows up as a `+` insertion. Used by the dry-run preview when
-/// reporting a would-be POST (no remote counterpart yet).
-pub fn print_new_file_diff(label: &str, body: &str) {
-    print_unified("/dev/null", label, "", body, &mut 0);
-}
-
-/// Mirror of [`print_new_file_diff`] for would-be deletions: every line of
-/// `body` shows up as a `-` removal. Used by `rdc deploy --mirror --dry-run`
-/// previews.
-pub fn print_deleted_file_diff(label: &str, body: &str) {
-    print_unified(label, "/dev/null", body, "", &mut 0);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
 
-    #[test]
-    fn unified_diff_empty_when_identical() {
-        assert!(unified_diff("a", b"hello\n", "b", b"hello\n").is_empty());
-    }
 
-    #[test]
-    fn unified_diff_renders_changed_lines() {
-        let d = unified_diff("local", b"a\nb\nc\n", "remote", b"a\nB\nc\n");
-        assert!(d.contains("--- local"), "got: {d}");
-        assert!(d.contains("+++ remote"), "got: {d}");
-        assert!(d.contains("-b"), "got: {d}");
-        assert!(d.contains("+B"), "got: {d}");
-    }
 
     #[test]
     fn prettify_splits_compact_json_into_per_field_lines() {
@@ -2113,22 +1755,6 @@ mod tests {
         assert_eq!(prettify_json_for_diff(py), py.to_vec());
     }
 
-    #[test]
-    fn diff_of_two_compact_json_objects_shows_per_field_lines() {
-        let local = br#"{"name":"x","status":"ready"}"#;
-        let remote = br#"{"name":"x","status":"pending"}"#;
-        let l = prettify_json_for_diff(local);
-        let r = prettify_json_for_diff(remote);
-        let d = unified_diff("local", &l, "remote", &r);
-        // The actual change (`status` field) must appear, and the
-        // unchanged `name` line must not be a `-`/`+` line.
-        assert!(d.contains("-  \"status\": \"ready\""), "got: {d}");
-        assert!(d.contains("+  \"status\": \"pending\""), "got: {d}");
-        assert!(
-            !d.contains("-  \"name\""),
-            "name should be in context only, got: {d}"
-        );
-    }
 
     #[test]
     fn validate_edited_rejects_unresolved_markers() {
@@ -2237,7 +1863,7 @@ mod tests {
 
         let input = Cursor::new(b"k\n");
         let mut output: Vec<u8> = Vec::new();
-        let r = prompt_resolve(input, &mut output, 1, 1, &path, b"remote\n", "test").unwrap();
+        let r = prompt_resolve(input, &mut output, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"remote\n", "test").unwrap();
         assert!(matches!(r, Resolution::KeepLocal));
         let s = String::from_utf8(output).unwrap();
         assert!(s.contains("[1/1]"), "output: {s}");
@@ -2251,7 +1877,7 @@ mod tests {
 
         let input = Cursor::new(b"r\n");
         let mut output: Vec<u8> = Vec::new();
-        let r = prompt_resolve(input, &mut output, 1, 1, &path, b"remote\n", "test").unwrap();
+        let r = prompt_resolve(input, &mut output, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"remote\n", "test").unwrap();
         assert!(matches!(r, Resolution::KeepRemote));
     }
 
@@ -2263,7 +1889,7 @@ mod tests {
 
         let input = Cursor::new(b"s\n");
         let mut output: Vec<u8> = Vec::new();
-        let r = prompt_resolve(input, &mut output, 2, 5, &path, b"remote\n", "test").unwrap();
+        let r = prompt_resolve(input, &mut output, 2, 5, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"remote\n", "test").unwrap();
         assert!(matches!(r, Resolution::Skip));
     }
 
@@ -2275,7 +1901,7 @@ mod tests {
 
         let input = Cursor::new(b"a\n");
         let mut output: Vec<u8> = Vec::new();
-        let r = prompt_resolve(input, &mut output, 1, 1, &path, b"remote\n", "test").unwrap();
+        let r = prompt_resolve(input, &mut output, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"remote\n", "test").unwrap();
         assert!(matches!(r, Resolution::Abort));
     }
 
@@ -2293,7 +1919,7 @@ mod tests {
 
         let input = Cursor::new(b"q\nx\n\nk\n");
         let mut output: Vec<u8> = Vec::new();
-        let r = prompt_resolve(input, &mut output, 1, 1, &path, b"remote\n", "test").unwrap();
+        let r = prompt_resolve(input, &mut output, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"remote\n", "test").unwrap();
         assert!(matches!(r, Resolution::KeepLocal));
         let s = String::from_utf8(output).unwrap();
         assert!(s.contains("unrecognized"), "output: {s}");
@@ -2308,7 +1934,7 @@ mod tests {
         // Empty input — first read_line returns 0 (EOF).
         let input = Cursor::new(b"");
         let mut output: Vec<u8> = Vec::new();
-        let r = prompt_resolve(input, &mut output, 1, 1, &path, b"remote\n", "test").unwrap();
+        let r = prompt_resolve(input, &mut output, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"remote\n", "test").unwrap();
         assert!(matches!(r, Resolution::Skip));
     }
 
@@ -2321,7 +1947,7 @@ mod tests {
         // No input read — function short-circuits because local == remote.
         let input = Cursor::new(b"");
         let mut output: Vec<u8> = Vec::new();
-        let r = prompt_resolve(input, &mut output, 1, 1, &path, b"same\n", "test").unwrap();
+        let r = prompt_resolve(input, &mut output, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"same\n", "test").unwrap();
         assert!(matches!(r, Resolution::KeepLocal));
     }
 
@@ -2340,7 +1966,7 @@ mod tests {
         std::fs::create_dir_all(paths.env_root()).unwrap();
         let path = paths.env_root().join("a.py");
         std::fs::write(&path, b"same\n").unwrap();
-        let out = resolve_combined_file(1, 2, &path, b"same\n", b"same\n", true, &paths).unwrap();
+        let out = resolve_combined_file(1, 2, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"same\n", b"same\n", true, &paths).unwrap();
         assert_eq!(out.bytes(), b"same\n");
         // Bytes-equal sides are a "Resolved" outcome — caller may advance.
         assert!(
@@ -2359,7 +1985,7 @@ mod tests {
         let path = paths.env_root().join("a.py");
         std::fs::write(&path, b"local\n").unwrap();
         let out =
-            resolve_combined_file(1, 1, &path, b"local\n", b"remote\n", false, &paths).unwrap();
+            resolve_combined_file(1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"local\n", b"remote\n", false, &paths).unwrap();
         assert_eq!(out.bytes(), b"local\n");
         // Non-interactive shadow-skip MUST signal preserve-base so the
         // caller does not advance the entity's combined hash.
@@ -2380,7 +2006,14 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"local\n").unwrap();
-        let r = resolve_push_drift(false, &path, b"remote\n", "test").unwrap();
+        let r = resolve_push_drift(
+            false,
+            ObjectRef { kind: "queues", slug: "invoices" },
+            &path,
+            b"remote\n",
+            "test",
+        )
+        .unwrap();
         assert!(matches!(r, PushDriftOutcome::Skip));
     }
 
@@ -2398,6 +2031,7 @@ mod tests {
             &mut output,
             1,
             1,
+            ObjectRef { kind: "queues", slug: "invoices" },
             &path,
             b"{\"name\":\"x\",\"modified_at\":\"t2\"}",
             "test",
@@ -2451,6 +2085,7 @@ mod tests {
             &mut output,
             1,
             1,
+            ObjectRef { kind: "queues", slug: "invoices" },
             &path,
             b"{\"name\":\"new\"}",
             "test",
@@ -2462,7 +2097,8 @@ mod tests {
         // marks changed rows with red/green backgrounds.
         assert!(s.contains(SGR_AMBER_BOLD), "no amber accent: {s:?}");
         assert!(
-            s.contains(SGR_BG_REMOVE) || s.contains(SGR_BG_ADD),
+            s.contains(crate::cli::change_view::SGR_BG_REMOVE)
+                || s.contains(crate::cli::change_view::SGR_BG_ADD),
             "no diff row background: {s:?}"
         );
     }
@@ -2480,6 +2116,7 @@ mod tests {
             &mut output,
             1,
             1,
+            ObjectRef { kind: "queues", slug: "invoices" },
             &path,
             b"{\"name\":\"new\"}",
             "test",
@@ -2617,6 +2254,7 @@ mod tests {
             &mut out,
             1,
             1,
+            ObjectRef { kind: "queues", slug: "invoices" },
             &local,
             remote,
             "production",
@@ -2632,7 +2270,10 @@ mod tests {
         // The env name now lives only in the prompt's `[r]` label, not the
         // diff body (the styled renderer headers with the file path). Confirm
         // the styled diff rendered and shows the changed value.
-        assert!(s.contains("Update("), "styled diff header missing: {s}");
+        assert!(
+            s.contains("\u{23bf} ") && s.contains("x.json"),
+            "connector line missing: {s}"
+        );
         assert!(
             s.contains("\"a\": 2"),
             "diff should show the remote value: {s}"
@@ -2640,129 +2281,7 @@ mod tests {
         assert!(!s.contains("[r]emote"), "old literal label leaked: {s}");
     }
 
-    #[test]
-    fn render_styled_diff_plain_layout() {
-        let l = "{\n  \"hidden\": true\n}\n";
-        let r = "{\n  \"hidden\": false\n}\n";
-        let out = render_styled_diff(
-            "q/schema.json (local)",
-            "q/schema.json (remote)",
-            l,
-            r,
-            ColorMode::Plain,
-        );
-        assert!(out.starts_with("Update(q/schema.json)\n"), "header: {out}");
-        assert!(
-            out.contains("Added 1 line, removed 1 line"),
-            "summary: {out}"
-        );
-        assert!(out.contains("- local   + remote"), "side legend: {out}");
-        assert!(out.contains(" - "), "removed marker: {out}");
-        assert!(out.contains(" + "), "added marker: {out}");
-        assert!(
-            out.contains("true") && out.contains("false"),
-            "both values: {out}"
-        );
-        assert!(
-            !out.contains('\u{1b}'),
-            "plain mode must carry no SGR: {out}"
-        );
-        // identical sides → empty
-        assert!(
-            render_styled_diff(
-                "q/x.json (local)",
-                "q/x.json (remote)",
-                l,
-                l,
-                ColorMode::Plain
-            )
-            .is_empty()
-        );
-        // verb reflects one-sided diffs
-        assert!(
-            render_styled_diff("/dev/null", "q/x.json", "", r, ColorMode::Plain)
-                .starts_with("Create(")
-        );
-        assert!(
-            render_styled_diff("q/x.json", "/dev/null", l, "", ColorMode::Plain)
-                .starts_with("Delete(")
-        );
-    }
 
-    #[test]
-    fn render_styled_diff_color_backgrounds_and_highlight() {
-        let l = "{\n  \"hidden\": true\n}\n";
-        let r = "{\n  \"hidden\": false\n}\n";
-        let out = render_styled_diff(
-            "q/schema.json (local)",
-            "q/schema.json (remote)",
-            l,
-            r,
-            ColorMode::Color,
-        );
-        assert!(
-            !out.contains('\u{25cf}'),
-            "decorative header bullet should be removed: {out:?}"
-        );
-        assert!(
-            out.contains(SGR_BG_REMOVE),
-            "removed row needs a red background"
-        );
-        assert!(
-            out.contains(SGR_BG_ADD),
-            "added row needs a green background"
-        );
-        assert!(
-            out.contains(SGR_EOL),
-            "rows must fill the background to the line end"
-        );
-        assert!(out.contains(SGR_J_KEY), "JSON keys should be highlighted");
-        assert!(out.contains(SGR_J_KW), "true/false should be highlighted");
-        // Colored gutters on changed rows.
-        assert!(
-            out.contains(SGR_GUTTER_REMOVE),
-            "removed line number should be red"
-        );
-        assert!(
-            out.contains(SGR_GUTTER_ADD),
-            "added line number should be green"
-        );
-        // Intra-line emphasis: the changed value carries the brighter bg.
-        assert!(
-            out.contains(SGR_BG_REMOVE_HI),
-            "changed span on removed row needs brighter red"
-        );
-        assert!(
-            out.contains(SGR_BG_ADD_HI),
-            "changed span on added row needs brighter green"
-        );
-        // Side legend tokens are color-coded (bold red/green) to mirror the
-        // -/+ rows, not dimmed.
-        assert!(
-            out.contains(&format!("{SGR_REMOVE_BOLD}- local")),
-            "legend '- local' should be bold red: {out:?}"
-        );
-        assert!(
-            out.contains(&format!("{SGR_ADD_BOLD}+ remote")),
-            "legend '+ remote' should be bold green: {out:?}"
-        );
-        // Non-.json content is not JSON-highlighted (but still gets row bg).
-        let py = render_styled_diff(
-            "hooks/h.py (local)",
-            "hooks/h.py (remote)",
-            "a = 1\n",
-            "a = 2\n",
-            ColorMode::Color,
-        );
-        assert!(
-            !py.contains(SGR_J_KEY) && !py.contains(SGR_J_NUM),
-            "non-json must skip syntax highlighting: {py:?}"
-        );
-        assert!(
-            py.contains(SGR_BG_ADD),
-            "non-json still gets row backgrounds"
-        );
-    }
 
     #[test]
     fn prompt_remote_delete_offers_restore_and_mirror_labels() {
@@ -2777,6 +2296,7 @@ mod tests {
         let res = prompt_remote_delete_with_color(
             input,
             &mut out,
+            ObjectRef { kind: "queues", slug: "invoices" },
             &local,
             "production",
             ColorMode::Plain,
@@ -2807,7 +2327,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let input = Cursor::new(b"k\n");
         let res =
-            prompt_remote_delete_with_color(input, &mut out, &local, "test", ColorMode::Plain, None)
+            prompt_remote_delete_with_color(input, &mut out, ObjectRef { kind: "queues", slug: "invoices" }, &local, "test", ColorMode::Plain, None)
                 .unwrap();
         assert!(matches!(res, Resolution::KeepLocal));
     }
@@ -2821,7 +2341,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let input = Cursor::new(b"r\n");
         let res =
-            prompt_remote_delete_with_color(input, &mut out, &local, "test", ColorMode::Plain, None)
+            prompt_remote_delete_with_color(input, &mut out, ObjectRef { kind: "queues", slug: "invoices" }, &local, "test", ColorMode::Plain, None)
                 .unwrap();
         assert!(matches!(res, Resolution::KeepRemote));
     }
@@ -2835,7 +2355,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let input = Cursor::new(b"a\n");
         let res =
-            prompt_remote_delete_with_color(input, &mut out, &local, "test", ColorMode::Plain, None)
+            prompt_remote_delete_with_color(input, &mut out, ObjectRef { kind: "queues", slug: "invoices" }, &local, "test", ColorMode::Plain, None)
                 .unwrap();
         assert!(matches!(res, Resolution::Abort));
     }
@@ -3026,7 +2546,7 @@ mod tests {
 
         let s = String::from_utf8_lossy(&output);
         assert!(
-            s.contains("Update(") && s.contains("x.py)"),
+            s.contains("x.py"),
             "styled renderer's header must appear: {s}"
         );
         assert!(
@@ -3063,6 +2583,7 @@ mod tests {
             &mut output,
             1,
             1,
+            ObjectRef { kind: "queues", slug: "invoices" },
             &path,
             b"a\nREMOTE\nb\n",
             "production",
@@ -3075,7 +2596,7 @@ mod tests {
             "single-hunk prompt must not offer [h]: {s}"
         );
         assert!(
-            !s.contains("hunks)"),
+            !s.contains("hunks"),
             "single-hunk header must not advertise count: {s}"
         );
 
@@ -3089,6 +2610,7 @@ mod tests {
             &mut output3,
             1,
             1,
+            ObjectRef { kind: "queues", slug: "invoices" },
             &path3,
             b"a\nfoo\nb\nbar\nc\nbaz\nd\n",
             "production",
@@ -3101,7 +2623,7 @@ mod tests {
             "multi-hunk prompt must offer [h] hunk-by-hunk: {s3}"
         );
         assert!(
-            s3.contains("(3 hunks)"),
+            s3.contains("3 hunks"),
             "multi-hunk header must advertise count: {s3}"
         );
     }
@@ -3671,6 +3193,7 @@ mod tests {
             &mut output,
             1,
             1,
+            ObjectRef { kind: "queues", slug: "invoices" },
             &path,
             b"a\nfoo\nb\nbar\nc\nbaz\nd\n",
             "test",
@@ -3679,7 +3202,7 @@ mod tests {
         .unwrap();
         let s = String::from_utf8(output).unwrap();
         assert!(
-            s.contains("(3 hunks)"),
+            s.contains("3 hunks"),
             "header should advertise hunk count: {s}"
         );
     }
@@ -3696,6 +3219,7 @@ mod tests {
             &mut output,
             1,
             1,
+            ObjectRef { kind: "queues", slug: "invoices" },
             &path,
             b"a\nREMOTE\nb\n",
             "test",
@@ -3704,7 +3228,7 @@ mod tests {
         .unwrap();
         let s = String::from_utf8(output).unwrap();
         assert!(
-            !s.contains("hunks)"),
+            !s.contains("hunks"),
             "single-hunk header must omit count: {s}"
         );
     }
@@ -3722,6 +3246,7 @@ mod tests {
             &mut output,
             1,
             1,
+            ObjectRef { kind: "queues", slug: "invoices" },
             &path,
             b"a\nfoo\nb\nbar\nc\nbaz\nd\n",
             "test",
@@ -3753,7 +3278,7 @@ mod tests {
         let input = Cursor::new(b"R\ny\n");
         let mut out: Vec<u8> = Vec::new();
         let r = prompt_resolve_with_bytes_and_color(
-            input, &mut out, 1, 3, &path,
+            input, &mut out, 1, 3, ObjectRef { kind: "queues", slug: "invoices" }, &path,
             b"{\"a\":1}", b"{\"a\":2}", "prod", ColorMode::Plain, Some(&bulk),
         )
         .unwrap();
@@ -3774,7 +3299,7 @@ mod tests {
         let input = Cursor::new(b"K\ny\n");
         let mut out: Vec<u8> = Vec::new();
         let r = prompt_resolve_with_bytes_and_color(
-            input, &mut out, 1, 3, &path,
+            input, &mut out, 1, 3, ObjectRef { kind: "queues", slug: "invoices" }, &path,
             b"{\"a\":1}", b"{\"a\":2}", "prod", ColorMode::Plain, Some(&bulk),
         )
         .unwrap();
@@ -3793,7 +3318,7 @@ mod tests {
         let input = Cursor::new(b"R\nn\nk\n");
         let mut out: Vec<u8> = Vec::new();
         let r = prompt_resolve_with_bytes_and_color(
-            input, &mut out, 1, 3, &path,
+            input, &mut out, 1, 3, ObjectRef { kind: "queues", slug: "invoices" }, &path,
             b"{\"a\":1}", b"{\"a\":2}", "prod", ColorMode::Plain, Some(&bulk),
         )
         .unwrap();
@@ -3807,7 +3332,7 @@ mod tests {
         let input = Cursor::new(b"R\n");
         let mut out: Vec<u8> = Vec::new();
         let r = prompt_resolve_with_bytes_and_color(
-            input, &mut out, 1, 1, &path,
+            input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path,
             b"{\"a\":1}", b"{\"a\":2}", "prod", ColorMode::Plain, None,
         )
         .unwrap();
@@ -3828,7 +3353,7 @@ mod tests {
         };
         let input = Cursor::new(b"R\ny\n");
         let mut out: Vec<u8> = Vec::new();
-        let r = prompt_remote_delete_with_color(input, &mut out, &path, "prod", ColorMode::Plain, Some(&bulk)).unwrap();
+        let r = prompt_remote_delete_with_color(input, &mut out, ObjectRef { kind: "queues", slug: "invoices" }, &path, "prod", ColorMode::Plain, Some(&bulk)).unwrap();
         assert!(matches!(r, Resolution::KeepRemoteAll));
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("[R] use prod for ALL"), "bulk options must be shown: {s}");
@@ -3846,7 +3371,7 @@ mod tests {
         std::fs::write(&path, b"{\"a\":1}\n").unwrap();
         let input = Cursor::new(b"r\n");
         let mut out: Vec<u8> = Vec::new();
-        let r = prompt_remote_delete_with_color(input, &mut out, &path, "prod", ColorMode::Plain, None).unwrap();
+        let r = prompt_remote_delete_with_color(input, &mut out, ObjectRef { kind: "queues", slug: "invoices" }, &path, "prod", ColorMode::Plain, None).unwrap();
         assert!(matches!(r, Resolution::KeepRemote));
     }
 }

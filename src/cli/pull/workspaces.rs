@@ -160,6 +160,7 @@ pub async fn refresh_backrefs(
         }
         let recorded = apply_pull_action(
             action,
+            crate::cli::resolve::ObjectRef { kind: KIND, slug: &slug },
             &ws_path,
             &proposed,
             remote_hash,

@@ -469,7 +469,12 @@ async fn push_one_drifted(
     let mut payload_to_send = payload_rule;
 
     use crate::cli::resolve::{PushDriftOutcome, resolve_push_drift};
-    match resolve_push_drift(interactive, local_json_path, &remote_json, env)? {
+    match resolve_push_drift(
+        interactive,
+        crate::cli::resolve::ObjectRef { kind: "rules", slug: slug },
+        local_json_path, &remote_json,
+        env,
+    )? {
         PushDriftOutcome::Patch { payload_override } => {
             if let Some(bytes) = payload_override {
                 let mut ov: serde_json::Value = serde_json::from_slice(&bytes)

@@ -227,6 +227,7 @@ pub async fn process(
             }
             let q_recorded = apply_pull_action(
                 q_action,
+                crate::cli::resolve::ObjectRef { kind: KIND_QUEUES, slug: &q_slug },
                 &queue_path,
                 &queue_proposed,
                 q_remote_hash,
@@ -425,6 +426,7 @@ pub async fn refresh_backrefs(
         }
         let recorded = apply_pull_action(
             action,
+            crate::cli::resolve::ObjectRef { kind: KIND_QUEUES, slug: &q_slug },
             &queue_path,
             &proposed,
             remote_hash,
@@ -614,6 +616,7 @@ fn write_schema_for_queue(
                 let json_outcome = crate::cli::resolve::resolve_combined_file(
                     1,
                     total,
+                    crate::cli::resolve::ObjectRef { kind: KIND_SCHEMAS, slug: &w.q_slug },
                     &schema_path,
                     local_json,
                     &remote_json_bytes,
@@ -638,6 +641,7 @@ fn write_schema_for_queue(
                     let outcome = crate::cli::resolve::resolve_combined_file(
                         i + 2,
                         total,
+                        crate::cli::resolve::ObjectRef { kind: KIND_SCHEMAS, slug: &w.q_slug },
                         &formula_path,
                         &local_bytes,
                         remote_bytes,
@@ -744,6 +748,7 @@ fn write_inbox_for_queue(
     }
     let i_recorded = apply_pull_action(
         i_action,
+        crate::cli::resolve::ObjectRef { kind: KIND_INBOXES, slug: &w.q_slug },
         &inbox_path,
         &inbox_proposed,
         i_remote_hash,

@@ -497,7 +497,12 @@ async fn push_one_drifted(
     // Drift detected. Spec §7.3 step 5: prompt on TTY; fall back to legacy
     // skip+warn otherwise.
     use crate::cli::resolve::{PushDriftOutcome, resolve_push_drift};
-    match resolve_push_drift(interactive, path, &remote_bytes, env)? {
+    match resolve_push_drift(
+        interactive,
+        crate::cli::resolve::ObjectRef { kind: "saved_views", slug: slug },
+        path, &remote_bytes,
+        env,
+    )? {
         PushDriftOutcome::Patch { payload_override } => {
             if let Some(bytes) = payload_override {
                 let mut ov: serde_json::Value = serde_json::from_slice(&bytes)

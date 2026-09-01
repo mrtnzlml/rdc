@@ -43,19 +43,19 @@ const NOTE_GAP: usize = 3;
 // removed/added row tints edge-to-edge regardless of content width. Foreground
 // tokens inside a tinted row end with `\x1b[39m` (reset fg, keep bg) — never a
 // full `\x1b[0m` — so the bg survives until the trailing EL + reset.
-const SGR_BG_ADD: &str = "\x1b[48;2;20;48;28m"; // deep green (added row)
-const SGR_BG_REMOVE: &str = "\x1b[48;2;60;24;26m"; // deep red (removed row)
-const SGR_BG_ADD_HI: &str = "\x1b[48;2;38;92;52m"; // brighter green — changed span
-const SGR_BG_REMOVE_HI: &str = "\x1b[48;2;120;42;46m"; // brighter red — changed span
-const SGR_GUTTER: &str = "\x1b[38;2;120;120;120m"; // gray line numbers (context)
-const SGR_GUTTER_ADD: &str = "\x1b[38;2;135;190;120m"; // green line number (added)
-const SGR_GUTTER_REMOVE: &str = "\x1b[38;2;225;130;130m"; // red line number (removed)
-const SGR_FG_DEFAULT: &str = "\x1b[39m"; // reset fg, preserve bg
-const SGR_EOL: &str = "\x1b[K"; // erase to EOL → fills current bg
-const SGR_J_KEY: &str = "\x1b[38;2;126;167;255m"; // JSON keys
-const SGR_J_STR: &str = "\x1b[38;2;152;195;121m"; // JSON string values
-const SGR_J_NUM: &str = "\x1b[38;2;229;181;103m"; // JSON numbers
-const SGR_J_KW: &str = "\x1b[38;2;198;146;233m"; // true / false / null
+pub(crate) const SGR_BG_ADD: &str = "\x1b[48;2;20;48;28m"; // deep green (added row)
+pub(crate) const SGR_BG_REMOVE: &str = "\x1b[48;2;60;24;26m"; // deep red (removed row)
+pub(crate) const SGR_BG_ADD_HI: &str = "\x1b[48;2;38;92;52m"; // brighter green — changed span
+pub(crate) const SGR_BG_REMOVE_HI: &str = "\x1b[48;2;120;42;46m"; // brighter red — changed span
+pub(crate) const SGR_GUTTER: &str = "\x1b[38;2;120;120;120m"; // gray line numbers (context)
+pub(crate) const SGR_GUTTER_ADD: &str = "\x1b[38;2;135;190;120m"; // green line number (added)
+pub(crate) const SGR_GUTTER_REMOVE: &str = "\x1b[38;2;225;130;130m"; // red line number (removed)
+pub(crate) const SGR_FG_DEFAULT: &str = "\x1b[39m"; // reset fg, preserve bg
+pub(crate) const SGR_EOL: &str = "\x1b[K"; // erase to EOL → fills current bg
+pub(crate) const SGR_J_KEY: &str = "\x1b[38;2;126;167;255m"; // JSON keys
+pub(crate) const SGR_J_STR: &str = "\x1b[38;2;152;195;121m"; // JSON string values
+pub(crate) const SGR_J_NUM: &str = "\x1b[38;2;229;181;103m"; // JSON numbers
+pub(crate) const SGR_J_KW: &str = "\x1b[38;2;198;146;233m"; // true / false / null
 
 // --- rows -------------------------------------------------------------------
 
@@ -83,16 +83,16 @@ pub enum RowVerb {
 }
 
 impl RowVerb {
-    /// Lowercase token, right-padded to exactly [`VERB_W`] characters so the
-    /// kind column always starts at the same offset.
+    /// The bare verb. [`render_row`] pads it to [`VERB_W`], so the width lives
+    /// in exactly one place and a future verb cannot shift the kind column.
     pub fn token(self) -> &'static str {
         match self {
-            RowVerb::Patch => "patch ",
-            RowVerb::Post => "post  ",
+            RowVerb::Patch => "patch",
+            RowVerb::Post => "post",
             RowVerb::Delete => "delete",
-            RowVerb::Pull => "pull  ",
+            RowVerb::Pull => "pull",
             RowVerb::Prompt => "prompt",
-            RowVerb::Drop => "drop  ",
+            RowVerb::Drop => "drop",
         }
     }
 
@@ -219,6 +219,7 @@ pub fn render_row(row: &ChangeRow<'_>, w: RowWidths, mode: ColorMode) -> String 
     let mut out = " ".repeat(INDENT);
 
     out.push_str(&row.verb.colorize(mode));
+    out.push_str(&" ".repeat(VERB_W.saturating_sub(row.verb.token().chars().count())));
     out.push(' ');
 
     if plain {
@@ -296,6 +297,25 @@ pub fn render_connector(
         }
     }
     out
+}
+
+/// Count added / removed lines between two texts — the numbers a row's `±`
+/// columns show. This is what the diff body's old `Added N lines, removed M
+/// lines` summary used to say; it now lives on the row instead.
+pub fn count_changes(left: &str, right: &str) -> (usize, usize) {
+    use similar::ChangeTag;
+    let diff = line_diff(left, right);
+    let (mut added, mut removed) = (0usize, 0usize);
+    for op in diff.grouped_ops(3).iter().flatten() {
+        for ch in diff.iter_changes(op) {
+            match ch.tag() {
+                ChangeTag::Insert => added += 1,
+                ChangeTag::Delete => removed += 1,
+                ChangeTag::Equal => {}
+            }
+        }
+    }
+    (added, removed)
 }
 
 // --- diff body --------------------------------------------------------------
@@ -665,7 +685,11 @@ mod tests {
             RowVerb::Prompt,
             RowVerb::Drop,
         ] {
-            assert_eq!(v.token().len(), VERB_W, "{v:?} token is not {VERB_W} chars");
+            assert!(
+                v.token().len() <= VERB_W,
+                "{v:?} token {:?} overflows the {VERB_W}-char action column",
+                v.token()
+            );
         }
     }
 
@@ -870,6 +894,14 @@ mod tests {
     fn one_sided_input_renders_every_line_as_a_deletion() {
         let out = render_diff_body(L, "", true, ColorMode::Plain);
         assert!(markers(&out).iter().all(|m| *m == '-'), "{out}");
+    }
+
+    #[test]
+    fn count_changes_matches_the_body() {
+        assert_eq!(count_changes(L, R), (2, 2));
+        assert_eq!(count_changes(L, L), (0, 0));
+        assert_eq!(count_changes(L, ""), (0, 4));
+        assert_eq!(count_changes("", R), (4, 0));
     }
 
     // --- connector ---------------------------------------------------------

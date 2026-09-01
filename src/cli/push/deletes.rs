@@ -147,33 +147,6 @@ fn reverse_dep_order_iter(t: &Tombstones) -> Vec<(&'static str, &BTreeMap<String
     ]
 }
 
-/// For `rdc push --dry-run --diff`: fetch each tombstone's remote body
-/// and print it as a deleted-file unified diff (`+++ /dev/null`).
-/// Best-effort — objects already absent on the remote are noted and
-/// skipped.
-pub async fn preview_tombstone_bodies(
-    client: &RossumClient,
-    tombstones: &Tombstones,
-) -> Result<()> {
-    for (kind, map) in reverse_dep_order_iter(tombstones) {
-        for (slug, id) in map {
-            let label = format!("{kind}/{slug}.json");
-            match fetch_remote_body(client, kind, *id).await {
-                Ok(Some(body)) => {
-                    crate::cli::resolve::print_deleted_file_diff(&label, &body);
-                }
-                Ok(None) => {
-                    eprintln!("  (already absent on remote: {kind}/{slug})");
-                }
-                Err(e) => {
-                    eprintln!("  (failed to fetch {kind}/{slug} for diff: {e:#})");
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Run the deletes phase. Drift-checks each tombstone, prompts the
 /// per-object resolver on drift, then issues `DELETE /<kind>/<id>` and
 /// cleans the lockfile entry.
@@ -466,86 +439,6 @@ async fn fetch_remote_modified_at(
     })
 }
 
-/// Fetch the remote object as pretty-printed JSON for the dry-run diff
-/// preview. Returns None on 404.
-async fn fetch_remote_body(client: &RossumClient, kind: &str, id: u64) -> Result<Option<String>> {
-    let value = match kind {
-        "hooks" => match client.get_hook(id, None).await {
-            Ok(h) => Some(serde_json::to_value(&h)?),
-            Err(e) if anyhow_has_status(&e, 404) => None,
-            Err(e) => return Err(e),
-        },
-        "workspaces" => match client.get_workspace(id, None).await {
-            Ok(w) => Some(serde_json::to_value(&w)?),
-            Err(e) if anyhow_has_status(&e, 404) => None,
-            Err(e) => return Err(e),
-        },
-        "inboxes" => match client.get_inbox(id, None).await {
-            Ok(i) => Some(serde_json::to_value(&i)?),
-            Err(e) if anyhow_has_status(&e, 404) => None,
-            Err(e) => return Err(e),
-        },
-        "schemas" => match client.get_schema(id, None).await {
-            Ok(s) => Some(serde_json::to_value(&s)?),
-            Err(e) if anyhow_has_status(&e, 404) => None,
-            Err(e) => return Err(e),
-        },
-        "labels" => client
-            .list_labels(None)
-            .await?
-            .into_iter()
-            .find(|x| x.id == id)
-            .map(|x| serde_json::to_value(&x))
-            .transpose()?,
-        "saved_views" => client
-            .list_saved_views(None)
-            .await?
-            .into_iter()
-            .find(|x| x.id == id)
-            .map(|x| serde_json::to_value(&x))
-            .transpose()?,
-        "rules" => client
-            .list_rules(None)
-            .await?
-            .into_iter()
-            .find(|x| x.id == id)
-            .map(|x| serde_json::to_value(&x))
-            .transpose()?,
-        "queues" => client
-            .list_queues(None)
-            .await?
-            .into_iter()
-            .find(|x| x.id == id)
-            .map(|x| serde_json::to_value(&x))
-            .transpose()?,
-        "engines" => client
-            .list_engines(None)
-            .await?
-            .into_iter()
-            .find(|x| x.id == id)
-            .map(|x| serde_json::to_value(&x))
-            .transpose()?,
-        "engine_fields" => client
-            .list_engine_fields(None)
-            .await?
-            .into_iter()
-            .find(|x| x.id == id)
-            .map(|x| serde_json::to_value(&x))
-            .transpose()?,
-        "email_templates" => client
-            .list_email_templates(None)
-            .await?
-            .into_iter()
-            .find(|x| x.id == id)
-            .map(|x| serde_json::to_value(&x))
-            .transpose()?,
-        _ => None,
-    };
-    match value {
-        Some(v) => Ok(Some(serde_json::to_string_pretty(&v)?)),
-        None => Ok(None),
-    }
-}
 
 // IsTerminal is referenced via the std::io trait in the public callsite
 // in mod.rs; the import here just keeps that surface obvious.

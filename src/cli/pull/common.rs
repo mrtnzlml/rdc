@@ -770,6 +770,7 @@ pub(crate) fn classify_combined_pull(
 /// advance.
 pub fn apply_pull_action(
     action: PullAction,
+    obj: crate::cli::resolve::ObjectRef<'_>,
     local_path: &Path,
     remote_bytes: &[u8],
     remote_hash: String,
@@ -781,6 +782,7 @@ pub fn apply_pull_action(
 ) -> Result<String> {
     apply_pull_action_with(
         action,
+        obj,
         local_path,
         remote_bytes,
         remote_hash,
@@ -804,6 +806,7 @@ pub fn apply_pull_action(
 /// decision half.
 pub fn apply_pull_action_with(
     action: PullAction,
+    obj: crate::cli::resolve::ObjectRef<'_>,
     local_path: &Path,
     remote_bytes: &[u8],
     remote_hash: String,
@@ -849,6 +852,7 @@ pub fn apply_pull_action_with(
         PullAction::Conflict => {
             let resolved_hash = if interactive {
                 resolve_conflict_interactive(
+                    obj,
                     local_path,
                     remote_bytes,
                     &remote_hash,
@@ -927,6 +931,7 @@ fn shadow_file_conflict(
 /// [`crate::cli::resolve::PullAborted`]-wrapping anyhow error so the
 /// pull runner can downcast and skip lockfile.save().
 fn resolve_conflict_interactive(
+    obj: crate::cli::resolve::ObjectRef<'_>,
     local_path: &Path,
     remote_bytes: &[u8],
     remote_hash: &str,
@@ -951,6 +956,7 @@ fn resolve_conflict_interactive(
         stderr.lock(),
         1, // No global counter yet — drivers don't share an index/total.
         1,
+        obj,
         local_path,
         remote_bytes,
         env,
@@ -1159,6 +1165,7 @@ mod tests {
         let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
         let h = apply_pull_action(
             PullAction::Write,
+            crate::cli::resolve::ObjectRef { kind: "hooks", slug: "x" },
             &path,
             b"hello",
             "h".repeat(64),
@@ -1184,6 +1191,7 @@ mod tests {
         let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
         let _ = apply_pull_action(
             PullAction::Conflict,
+            crate::cli::resolve::ObjectRef { kind: "hooks", slug: "x" },
             &path,
             b"remote",
             "h".repeat(64),
@@ -1304,6 +1312,7 @@ mod tests {
         let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
         let h = apply_pull_action(
             PullAction::NoChange,
+            crate::cli::resolve::ObjectRef { kind: "hooks", slug: "x" },
             &path,
             b"different remote bytes",
             "h".repeat(64),
@@ -1338,6 +1347,7 @@ mod tests {
         let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
         let recorded = apply_pull_action(
             PullAction::Conflict,
+            crate::cli::resolve::ObjectRef { kind: "hooks", slug: "x" },
             &path,
             remote,
             content_hash(remote, &Lockfile::default()),
@@ -1377,6 +1387,7 @@ mod tests {
         let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
         let recorded = apply_pull_action(
             PullAction::Conflict,
+            crate::cli::resolve::ObjectRef { kind: "hooks", slug: "x" },
             &path,
             remote,
             content_hash(remote, &Lockfile::default()),
@@ -1434,6 +1445,7 @@ mod tests {
         // branch — the site the blocker's fix converts.
         let recorded = apply_pull_action_with(
             PullAction::Conflict,
+            crate::cli::resolve::ObjectRef { kind: "hooks", slug: "x" },
             &path,
             remote,
             content_hash(remote, &Lockfile::default()),
@@ -1477,6 +1489,7 @@ mod tests {
         assert_eq!(action1, PullAction::Conflict);
         let recorded1 = apply_pull_action(
             action1,
+            crate::cli::resolve::ObjectRef { kind: "hooks", slug: "x" },
             &path,
             remote,
             remote_hash1,
