@@ -116,7 +116,8 @@ pub struct ChangeRow<'a> {
     pub kind: &'a str,
     /// The object's slug. Compound slugs (`email_templates` is
     /// `<ws>/<queue>/<name>`, `engine_fields` is `<engine>/<field>`) render
-    /// their container segments dim and the leaf at full weight.
+    /// their container segments dim and the leaf at full weight. Never
+    /// truncated — see [`RowWidths::MAX_NAME`].
     pub name: &'a str,
     /// Lines added / removed. `None` on both where a line count is meaningless
     /// (an MDH index has no body), which renders the columns blank.
@@ -140,7 +141,16 @@ impl RowWidths {
     pub const MIN_KIND: usize = 8;
     pub const MIN_NAME: usize = 12;
     /// Past this a name middle-elides, keeping the leaf.
-    pub const MAX_NAME: usize = 40;
+    /// The name column stops widening here. A longer name is NOT truncated —
+    /// it overflows, pushing its own `±` and note right while every other row
+    /// stays aligned.
+    ///
+    /// Measured against a real org: median name 29, p90 57, max 99. Truncating
+    /// to fit was the first design and it was wrong — `email_templates` slugs
+    /// are `<ws>/<queue>/<template>` where the template names are boilerplate,
+    /// so keeping the leaf and cutting the head rendered three distinct
+    /// objects as the same row. A wide line beats an ambiguous one.
+    pub const MAX_NAME: usize = 60;
 
     /// Fit to `(kind, name)` pairs, clamped to the minimums and the name cap.
     pub fn fit<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(pairs: I) -> Self {
@@ -154,29 +164,6 @@ impl RowWidths {
             name: n.min(Self::MAX_NAME),
         }
     }
-}
-
-/// Shorten `name` to at most `max` characters, keeping the leaf segment — the
-/// part that identifies the object — and eliding the containers before it.
-pub fn elide_name(name: &str, max: usize) -> String {
-    let n = name.chars().count();
-    if n <= max {
-        return name.to_string();
-    }
-    let leaf: String = match name.rfind('/') {
-        Some(i) => name[i + 1..].to_string(),
-        None => name.to_string(),
-    };
-    let leaf_len = leaf.chars().count();
-    // `…/` costs two; if the leaf alone cannot fit beside it, drop the
-    // containers entirely and trim the leaf from the left.
-    if leaf_len + 2 >= max {
-        let keep = max.saturating_sub(1);
-        let tail: String = leaf.chars().skip(leaf_len.saturating_sub(keep)).collect();
-        return format!("\u{2026}{tail}");
-    }
-    let head: String = name.chars().take(max - leaf_len - 2).collect();
-    format!("{head}\u{2026}/{leaf}")
 }
 
 /// Render the name with its container segments dimmed and the leaf at full
@@ -230,9 +217,11 @@ pub fn render_row(row: &ChangeRow<'_>, w: RowWidths, mode: ColorMode) -> String 
     out.push_str(&" ".repeat(w.kind.saturating_sub(row.kind.chars().count())));
     out.push(' ');
 
-    let name = elide_name(row.name, w.name);
-    out.push_str(&render_name(&name, mode));
-    out.push_str(&" ".repeat(w.name.saturating_sub(name.chars().count())));
+    // Never truncated. `saturating_sub` yields no padding for a name wider
+    // than the column, so an over-long name overflows into its own row's `±`
+    // and note rather than losing characters.
+    out.push_str(&render_name(row.name, mode));
+    out.push_str(&" ".repeat(w.name.saturating_sub(row.name.chars().count())));
 
     match (row.added, row.removed) {
         (Some(a), Some(r)) => {
@@ -798,18 +787,42 @@ mod tests {
         assert_eq!(fitted.name, RowWidths::MAX_NAME);
     }
 
+    /// Truncating to fit rendered three distinct `email_templates` objects as
+    /// the same row on a real org: their slugs are `<ws>/<queue>/<template>`,
+    /// the template names are boilerplate, and cutting the head threw away the
+    /// only part that differed. An over-long name now overflows instead.
     #[test]
-    fn long_name_middle_elides_preserving_leaf() {
-        let got = elide_name("main/invoices/rejection-default", 20);
-        assert_eq!(got, "m\u{2026}/rejection-default");
-        assert_eq!(got.chars().count(), 20);
-        // A leaf that cannot fit beside the containers drops them entirely.
-        let got = elide_name("ws/a-very-long-single-leaf-name", 10);
-        assert_eq!(got.chars().count(), 10);
-        assert!(got.starts_with('\u{2026}'), "{got:?}");
-        // Short enough is untouched.
-        assert_eq!(elide_name("orders", 22), "orders");
+    fn over_long_name_overflows_instead_of_truncating() {
+        let a = "shared-ap-services/invoices-inbound/default-rejection-template";
+        let b = "shared-ap-services/orders-inbound/default-rejection-template";
+        let w = RowWidths::fit([("email_templates", a), ("email_templates", b)]);
+        assert_eq!(w.name, RowWidths::MAX_NAME, "column stops widening at the cap");
+
+        let render = |name: &str| {
+            render_row(
+                &ChangeRow {
+                    verb: RowVerb::Pull,
+                    kind: "email_templates",
+                    name,
+                    added: None,
+                    removed: None,
+                    note: Some("new"),
+                },
+                w,
+                ColorMode::Plain,
+            )
+        };
+        let (ra, rb) = (render(a), render(b));
+        assert!(ra.contains(a), "name must survive whole: {ra:?}");
+        assert!(rb.contains(b), "name must survive whole: {rb:?}");
+        assert_ne!(ra, rb, "distinct objects must never render identically");
+        assert!(!ra.contains('\u{2026}'), "nothing may be elided: {ra:?}");
+
+        // A name inside the cap still pads to the column.
+        let short = render("orders");
+        assert_eq!(&short[32..32 + RowWidths::MAX_NAME], format!("{:<60}", "orders"));
     }
+
 
     // --- diff body ---------------------------------------------------------
 

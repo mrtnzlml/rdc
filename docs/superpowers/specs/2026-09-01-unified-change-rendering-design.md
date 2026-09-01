@@ -110,9 +110,17 @@ render dim; the leaf renders at full weight. Same rule as kind-vs-name, applied
 one level down.
 
 **Column widths** are sized to the widest entry in the batch, not fixed.
-Minimum kind width 8, minimum name width 12. Name is capped at 40 and
-middle-elided past that, preserving the leaf (`main/…/rejection-default`).
-Longest kind in the registry is `email_templates` (15).
+Minimum kind width 8, minimum name width 12; the name column stops widening at
+60. Longest kind in the registry is `email_templates` (15).
+
+**A name is never truncated.** One past the cap overflows, pushing its own `±`
+and note right while every other row stays aligned. The first design elided to
+fit — keep the leaf, cut the head — and a live run proved that wrong: 126 of
+418 rows elided and up to three *distinct* `email_templates` objects rendered
+as the same row, because their slugs are `<ws>/<queue>/<template>` where the
+template names are boilerplate and the container is the only discriminator.
+Measured on that org: median name 29, p90 57, max 99, so the cap keeps ~93% of
+rows aligned. A wide line beats an ambiguous one.
 
 > **As shipped:** each surface fits its own batch — the plan fits the plan, the
 > delete gate fits the tombstones, a conflict prompt fits its single object. So
