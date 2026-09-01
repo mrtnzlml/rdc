@@ -33,6 +33,10 @@ migrate_working_dir/
 /build/
 /coverage/
 
+# Golden test failure artifacts (written by `flutter test` on a golden
+# mismatch: master/test/diff PNGs for manual review)
+test/failures/
+
 # Rust bridge build output (compiled by Cargokit during `flutter build`)
 /rust/target/
 
